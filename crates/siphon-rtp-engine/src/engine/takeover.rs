@@ -8,11 +8,13 @@ use siphon_rtp_media::bridge::{run_bridge, BridgeEndReason, BridgeSession};
 use siphon_rtp_media::jitter::JitterBuffer;
 use siphon_rtp_media::leg::MediaLeg;
 use siphon_rtp_proto::{CmdResult, Event, ProfileFlags, WsBridgeEndReason, WsVadEngine};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use super::negotiate::{apply_received_from, random_ssrc};
-use super::{error_result, ok_empty, unknown_call, ClientId, Engine, PipelineKind};
+use crate::sdp;
+
+use super::negotiate::{apply_received_from, bridge_source_filter, random_ssrc};
+use super::{error_result, ok_empty, ok_sdp, unknown_call, ClientId, Engine, Leg, PipelineKind};
 
 /// Everything [`Engine::setup_ws_bridge`] needs to stand one WebSocket-takeover bridge up. A struct
 /// rather than a parameter list because a secure takeover adds the leg's SRTP state and its ICE gate
@@ -997,4 +999,125 @@ pub(super) fn ws_takeover_media_address(
     received_from: Option<std::net::IpAddr>,
 ) -> std::net::SocketAddr {
     apply_received_from(Some(signalled), received_from).unwrap_or(signalled)
+}
+
+/// What completing an answer on a WebSocket takeover call reads.
+#[derive(Clone, Copy)]
+pub(super) struct AnswerTakeover<'a> {
+    pub(super) call_id: &'a str,
+    pub(super) profile: &'a ProfileFlags,
+    /// The far party's SDP: B's answer, or B's re-offer when A is answering it.
+    pub(super) info: &'a sdp::MediaInfo,
+    pub(super) near: Leg,
+    /// A's effective ingress source: its offer's `received-from` IP on the signalled port.
+    pub(super) near_gate_rtp: Option<SocketAddr>,
+    /// A's negotiated codec, which the bridge decodes uplink and encodes downlink.
+    pub(super) near_codec: Option<&'a CodecSpec>,
+    /// A's offer was a secure (SRTP) profile.
+    pub(super) near_secure: bool,
+    /// A's offer carried ICE, so the call holds engine ICE credentials.
+    pub(super) ice_offerer: bool,
+    /// The bridge was already stood up at offer.
+    pub(super) already_ws: bool,
+    pub(super) to_tag: &'a str,
+    /// B's `received-from`, as this answer resolved it.
+    pub(super) far_received_from: Option<IpAddr>,
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Complete an answer on a call that is, or is now becoming, a WebSocket takeover: leg A's audio
+    /// goes to the WS server, A's far side, so the A↔B relay/transcode path is deliberately not wired.
+    /// The bridge is normally stood up at offer; a `ws_uri` arriving first at answer is set up here
+    /// against A's stored codec and address. `rewritten` is the SDP presented to A.
+    pub(super) async fn answer_ws_takeover(
+        &self,
+        takeover: &AnswerTakeover<'_>,
+        near_ice_candidates: Vec<siphon_rtp_ice::Candidate>,
+        rewritten: String,
+        answer_to_tag: String,
+    ) -> CmdResult {
+        let AnswerTakeover {
+            call_id,
+            profile,
+            info,
+            near,
+            near_gate_rtp,
+            near_codec,
+            near_secure,
+            ice_offerer,
+            already_ws,
+            to_tag,
+            far_received_from,
+        } = *takeover;
+        if !already_ws {
+            let Some(signalled) = near.remote_rtp else {
+                return error_result("ws bridge", &"near leg has no signalled address");
+            };
+            // Aim the downlink at leg A's offer `received-from` public IP when one was supplied,
+            // and gate its ingress on the same address — identical to the offer path.
+            let a_rtp = near_gate_rtp.unwrap_or(signalled);
+            if let Some(ws_uri) = profile.ws_uri.clone() {
+                // The same refusal the offer path makes, for a `ws_uri` that arrives first at
+                // answer: this answer is rewritten from B's SDP, so a secure offerer would get no
+                // engine keying and an ICE offerer no agent to re-point the bridge's egress —
+                // either way the takeover would terminate nothing. (`near_secure` and the near
+                // leg's ICE credentials were both captured at offer.)
+                if near_secure {
+                    return CmdResult::Error {
+                        reason: "answer: ws-takeover-secure-offerer: a WebSocket takeover \
+                                 (ws_uri) on a secure (SRTP) offerer is not supported on \
+                                 offer/answer — the answer to the offerer cannot carry the \
+                                 engine's own keying; use answer_local"
+                            .to_string(),
+                    };
+                }
+                if ice_offerer {
+                    return CmdResult::Error {
+                        reason: "answer: ws-takeover-ice-offerer: a WebSocket takeover (ws_uri) \
+                                 on an ICE offerer is not supported on offer/answer — no ICE \
+                                 agent is armed for a takeover leg here, so its downlink would \
+                                 never follow the selected pair; use answer_local, or \
+                                 ICE=remove to drop ICE"
+                            .to_string(),
+                    };
+                }
+                if let Err(reason) = self
+                    .setup_ws_bridge(WsBridgeSetup {
+                        call_id,
+                        ws_uri: &ws_uri,
+                        endpoint_a: near.rtp.id,
+                        a_rtp,
+                        codec: near_codec,
+                        accepted_source: bridge_source_filter(profile, a_rtp),
+                        // Refused above for both shapes that would need them.
+                        ice_pending: false,
+                        secure: None,
+                        noise_suppression: profile.noise_suppression,
+                        echo: crate::media_pipeline::EchoProfile::from_profile(profile),
+                        vad_config: WsVadConfig::from_profile(profile),
+                        wire_sample_rate: profile.ws_sample_rate,
+                        egress: None,
+                        takeover: None,
+                        socket: None,
+                    })
+                    .await
+                {
+                    return error_result("ws bridge", &reason);
+                }
+            }
+        }
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.to_tag = Some(to_tag.to_string());
+            // The far leg is present — this path ran only because the guard above unwrapped it.
+            if let Some(far) = call.far.as_mut() {
+                far.remote_rtp = Some(info.remote_rtp);
+                far.remote_rtcp = Some(info.remote_rtcp);
+            }
+            call.pipeline = PipelineKind::Ws;
+            call.far_received_from = far_received_from;
+            call.pending_far_reoffer = None;
+            call.near_local_candidates = near_ice_candidates;
+        }
+        ok_sdp(rewritten, Some(answer_to_tag))
+    }
 }
