@@ -4,7 +4,7 @@ use siphon_rtp_codec::factory;
 use siphon_rtp_datapath::{
     AddressFamily, Datapath, FlowAction, IceAgentMode, IceConfig, SourceFilter,
 };
-use siphon_rtp_dtls::{DtlsRole, Fingerprint as DtlsFingerprint};
+use siphon_rtp_dtls::Fingerprint as DtlsFingerprint;
 use siphon_rtp_media::mixer::Role;
 use siphon_rtp_media::playback::Gain;
 use siphon_rtp_media::player::{PcmPlayer, PcmRepeat};
@@ -398,12 +398,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None
         };
         let (secure, security) = if let Some((certificate, _)) = dtls_keys.as_ref() {
-            // The answer advertises the engine's fingerprint and its DTLS role — the complement of the
-            // offerer's `a=setup` (RFC 5763 §5): an `active` peer makes the engine passive (server).
-            let setup = match info.setup {
-                Some(sdp::Setup::Active) => sdp::Setup::Passive,
-                _ => sdp::Setup::Active,
-            };
+            // The answer advertises the engine's fingerprint and the answerer's DTLS role for the
+            // offerer's `a=setup` (RFC 4145 §4.1, RFC 5763 §5).
+            let (setup, _) = super::negotiate::answerer_dtls_setup(info.setup, None);
             (
                 None,
                 Some(SecurityAdvertisement::Dtls {
@@ -412,6 +409,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         bytes: certificate.fingerprint().bytes,
                     },
                     setup,
+                    // A seat is a new association each time it joins; the offer's `a=tls-id` is not
+                    // yet answered here.
+                    tls_id: None,
                 }),
             )
         } else if info.secure {
@@ -499,12 +499,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // still encrypted, which decrypts it on the seat's own `SecureLeg` once keyed. The seat was
         // taken `secure_pending`, so until then it is neither mixed nor sent to.
         if let Some((certificate, peer_fingerprint)) = dtls_keys {
-            // The offerer picks; the engine takes the complement (RFC 5763 §5), matching the
-            // `a=setup` advertised in the answer above.
-            let role = match info.setup {
-                Some(sdp::Setup::Active) => DtlsRole::Server,
-                _ => DtlsRole::Client,
-            };
+            // The role matching the `a=setup` advertised in the answer above (RFC 4145 §4.1, RFC 5763
+            // §5).
+            let (_, role) = super::negotiate::answerer_dtls_setup(info.setup, None);
             if let Err(error) = self
                 .datapath
                 .install_flow(endpoint.id, FlowAction::Redirect)

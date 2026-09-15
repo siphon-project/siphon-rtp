@@ -102,7 +102,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .to_string(),
             );
         }
-        if matches!(pipeline, PipelineKind::Srtp | PipelineKind::Dtls) {
+        if pipeline.is_crypto_bridge() {
             // The crypto *bridges* relay ciphertext without ever decoding it, so there is no
             // post-decode fan-out to tap. Note this rejects only the bridge kinds: a secure call that
             // runs through the media pipeline (`SrtpMedia` / `DtlsMedia`) decodes like any other and

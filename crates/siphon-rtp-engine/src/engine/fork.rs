@@ -82,9 +82,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         else {
             return unknown_call(call_id);
         };
-        // A secure (SRTP-bridge) or WS-bridge leg cannot be raw-tee'd: the on-the-wire bytes are
-        // encrypted / off to a WS server, not the leg's clear negotiated codec. Reject clearly.
-        if matches!(pipeline, PipelineKind::Srtp | PipelineKind::Ws) {
+        // A crypto-bridge leg (SDES or DTLS-SRTP, facing either party) or a WS-bridge leg cannot be
+        // raw-tee'd: the on-the-wire bytes are encrypted / off to a WS server, not the leg's clear
+        // negotiated codec, and a bridge has no media actor for the fork to attach to. Reject clearly
+        // rather than answer ok for a subscription that would never carry a packet.
+        if pipeline.is_crypto_bridge() || pipeline == PipelineKind::Ws {
             return error_result(
                 "subscribe_request",
                 &"SIPREC on a secure (SRTP) or WebSocket-bridged call is not supported yet",

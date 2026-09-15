@@ -84,7 +84,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         // A plain SRTP bridge / WS-bridge leg's DTMF is not clear telephone-events — reject clearly.
         // (A secure *transcode* call — SrtpMedia — decrypts to clear RTP in the actor, so it is fine.)
-        if matches!(pipeline, PipelineKind::Srtp | PipelineKind::Ws) {
+        if pipeline.is_crypto_bridge() || pipeline == PipelineKind::Ws {
             return error_result(
                 "block_dtmf",
                 &"blocking DTMF on a secure (SRTP) or WebSocket-bridged call is not supported",

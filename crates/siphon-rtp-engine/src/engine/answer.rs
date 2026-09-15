@@ -8,12 +8,13 @@ use siphon_rtp_proto::{CmdResult, ProfileFlags};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 
 use crate::ice::IceCredentials;
-use crate::sdp::{self, IceRewrite, TextRewrite};
+use crate::sdp::{self, IceRewrite, SecurityAdvertisement, TextRewrite};
 
 use super::install::{AnswerIce, AnswerText, AnswerWiring, AnsweredText};
 use super::negotiate::{
     answer_ice_rewrite, apply_received_from, far_security, near_security, peer_ice_credentials,
-    present_leg, same_codec, CodecPresentation, LegPresentation,
+    present_leg, same_codec, settle_secure_offerer, setup_for_role, CodecPresentation,
+    LegPresentation, NearDtlsAnswer,
 };
 use super::takeover::AnswerTakeover;
 use super::Leg;
@@ -57,15 +58,6 @@ fn lead_with_codec(info: &mut sdp::MediaInfo, codec: &CodecSpec) {
     {
         let payload_type = info.payload_types.remove(index);
         info.payload_types.insert(0, payload_type);
-    }
-}
-
-/// The engine's `a=setup` for the DTLS role it plays (RFC 4145 §4): the client is `active`, the
-/// server `passive`.
-fn setup_for_role(role: DtlsRole) -> sdp::Setup {
-    match role {
-        DtlsRole::Client => sdp::Setup::Active,
-        DtlsRole::Server => sdp::Setup::Passive,
     }
 }
 
@@ -272,6 +264,9 @@ struct AnswerPresentation<'a> {
     far_text_local_crypto: Option<CryptoAttribute>,
     far_dtls: bool,
     far_downgraded_to_plain: bool,
+    /// The DTLS keying A is answered with when the engine terminates A's DTLS-SRTP: the engine's
+    /// fingerprint, the `a=setup` it settled on and the `a=tls-id` it assigned.
+    near_dtls_presentation: Option<&'a (sdp::Fingerprint, sdp::Setup, Option<String>)>,
     secure_text_accepted: bool,
     text_accepted: bool,
     dtls_role: DtlsRole,
@@ -303,6 +298,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_text_local_crypto,
             far_dtls,
             far_downgraded_to_plain,
+            near_dtls_presentation,
             secure_text_accepted,
             text_accepted,
             dtls_role,
@@ -353,7 +349,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None => LegPresentation {
                 engine: near.engine_media(),
                 ice: answer_ice_rewrite(ice_creds, near_ice_candidates),
-                security: near_security(near_local_crypto, far_local_crypto.is_some() || far_dtls),
+                security: near_security(
+                    near_local_crypto,
+                    near_dtls_presentation.cloned(),
+                    far_local_crypto.is_some() || far_dtls,
+                ),
                 mux_override: near_mux_override,
                 text: if near.text.is_none() {
                     TextRewrite::None
@@ -407,7 +407,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     } else {
                         answer_ice_rewrite(ice_creds, far_ice_candidates)
                     },
-                    security: far_security(far_downgraded_to_plain, dtls, far_crypto),
+                    // A's answer is rewritten for B, so when the engine terminates A's keying (SDES or
+                    // DTLS) none of it may reach B: B's leg is plaintext unless B has keying of its own,
+                    // the same rule the original offer applied.
+                    security: far_security(far_downgraded_to_plain, dtls, far_crypto).or(
+                        (near_local_crypto.is_some() || near_dtls_presentation.is_some())
+                            .then_some(SecurityAdvertisement::Plain),
+                    ),
                     mux_override: far_mux_override,
                     text: if far.text.is_none() {
                         // No far text endpoint to anchor A's text to, and passing it through would
@@ -556,6 +562,7 @@ struct AnswerState {
     far_local_crypto: Option<CryptoAttribute>,
     near_local_crypto: Option<CryptoAttribute>,
     near_remote_crypto: Option<CryptoAttribute>,
+    near_dtls: Option<super::NearDtls>,
     far_dtls: bool,
     far_downgraded_to_plain: bool,
     near_secure: bool,
@@ -595,6 +602,9 @@ struct AnswerRecord<'a> {
     near_ice_candidates: Vec<siphon_rtp_ice::Candidate>,
     far_dtls: bool,
     dtls_role: DtlsRole,
+    /// A terminated DTLS offerer's settled association: the role the engine answered A with and the
+    /// `a=tls-id` it assigned, kept so a renegotiation re-presents both (RFC 8842 §5.3, §5.5).
+    near_dtls: Option<(DtlsRole, Option<String>)>,
 }
 
 /// Media-plane lifecycle: negotiation is complete — the call now relays or transcodes. The
@@ -661,6 +671,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     far_local_crypto: call.far_local_crypto,
                     near_local_crypto: call.near_local_crypto,
                     near_remote_crypto: call.near_remote_crypto,
+                    near_dtls: call.near_dtls.clone(),
                     far_dtls: call.far_dtls,
                     far_downgraded_to_plain: call.far_downgraded_to_plain,
                     near_secure: call.near_secure,
@@ -728,6 +739,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_ice_candidates,
             far_dtls,
             dtls_role,
+            near_dtls,
         } = record;
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.to_tag = Some(to_tag.to_string());
@@ -786,6 +798,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             if far_dtls {
                 call.far_dtls_role = Some(dtls_role);
             }
+            // A terminated DTLS offerer's settled role and `a=tls-id`, which a renegotiation keeps
+            // presenting while the association lasts (RFC 8842 §5.3, §5.5).
+            if let (Some((role, local_tls_id)), Some(stored)) = (near_dtls, call.near_dtls.as_mut())
+            {
+                stored.role = Some(role);
+                stored.local_tls_id = local_tls_id;
+            }
             // This answer completes whatever exchange was outstanding.
             call.pending_far_reoffer = None;
         }
@@ -833,6 +852,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_local_crypto,
             near_local_crypto,
             near_remote_crypto,
+            near_dtls,
             far_dtls,
             far_downgraded_to_plain,
             near_secure,
@@ -925,26 +945,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_local_crypto,
             near_local_crypto,
             far_dtls,
+            near_dtls.is_some(),
         );
-        // A secure offerer is terminated only in the crypto-bridge shape. Every other combination
-        // would have to thread A's `SecureLeg` onto the A-facing directions of the media actor — the
-        // other half of this work — and until it exists the honest answer is a refusal, not a call
-        // that answers `ok` and relays A's audio somewhere it should not go. `resolve_pipeline`
-        // already picked the shape, so this reads its verdict rather than re-deriving the conditions.
-        if near_local_crypto.is_some() && pipeline != PipelineKind::SrtpOfferer {
-            let why = if far_dtls || far_local_crypto.is_some() {
-                "both parties are secure, which needs a transcrypt between two different keys"
-            } else {
-                "the two legs' codecs differ, which needs the secure offerer's leg threaded into \
-                 the transcoding pipeline"
-            };
-            return CmdResult::Error {
-                reason: format!(
-                    "answer: secure-offerer-unsupported: {why}; a secure caller toward a plain \
-                     callee on a shared codec is supported"
-                ),
-            };
-        }
+        // A secure offerer is terminated only in the crypto-bridge shape, and a terminated DTLS
+        // offerer is answered as A's DTLS peer (see `settle_secure_offerer`).
+        let near_dtls_settled = match settle_secure_offerer(
+            pipeline,
+            (near_local_crypto.is_some(), near_dtls.as_ref()),
+            far_dtls || far_local_crypto.is_some(),
+            near_codec.as_ref(),
+            &info,
+            (reversed.is_some(), profile, self.engine_fingerprint()),
+        ) {
+            Ok(settled) => settled,
+            Err(result) => return *result,
+        };
         // rtpengine `ptime=<N>` override: force the packetization of the synthesized (transcoded)
         // egress toward both parties. Overriding the negotiated codec ptime here is the single source
         // of truth — it flows to the egress encoder's frame size and the repacketizer (the RTP cadence,
@@ -1012,6 +1027,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_text_local_crypto,
             far_dtls,
             far_downgraded_to_plain,
+            near_dtls_presentation: near_dtls_settled.as_ref().map(NearDtlsAnswer::presented),
             secure_text_accepted,
             text_accepted,
             dtls_role,
@@ -1102,6 +1118,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_telephone_event,
             ptime_override,
             dtls_role,
+            near_dtls: near_dtls_settled.as_ref().map(NearDtlsAnswer::wiring),
             agent_endpoints: &agent_endpoints,
         };
         // For a passthrough relay, remember the installed forward actions so `block` can flip the
@@ -1163,6 +1180,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_ice_candidates,
                 far_dtls,
                 dtls_role,
+                near_dtls: near_dtls_settled.map(NearDtlsAnswer::recorded),
             },
         );
 
@@ -1289,12 +1307,24 @@ fn resolve_pipeline(
     far_local_crypto: Option<CryptoAttribute>,
     near_local_crypto: Option<CryptoAttribute>,
     far_dtls: bool,
+    near_dtls: bool,
 ) -> PipelineKind {
     // Transcode when the two legs' primary codecs differ in encoding or clock rate.
     let transcode = match (near_codec, info.primary_codec()) {
         (Some(near), Some(far)) => !same_codec(near, &far),
         _ => false,
     };
+    let needs_decoded_audio = transcode
+        || profile.record_call
+        || profile.noise_suppression
+        || profile.echo_cancellation
+        || profile.beep_detection;
+    // A terminated DTLS-SRTP **offerer** toward a plain callee: the mirror of the DTLS far leg below,
+    // and like `SrtpOfferer` only in its crypto-bridge shape. Anything that needs the decoded audio
+    // falls through to a pipeline with no A-facing DTLS leg, which the caller then refuses.
+    if near_dtls && far_local_crypto.is_none() && !far_dtls && !needs_decoded_audio {
+        return PipelineKind::DtlsOfferer;
+    }
     if far_dtls {
         // DTLS-SRTP far leg. Route it through the media pipeline when something actually needs the
         // decoded audio — a codec mismatch, recording, noise suppression, echo cancellation or

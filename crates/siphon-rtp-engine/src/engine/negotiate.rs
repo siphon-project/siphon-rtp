@@ -109,7 +109,11 @@ pub(super) fn far_security(
     if downgraded_to_plain {
         Some(SecurityAdvertisement::Plain)
     } else if let Some((fingerprint, setup)) = dtls {
-        Some(SecurityAdvertisement::Dtls { fingerprint, setup })
+        Some(SecurityAdvertisement::Dtls {
+            fingerprint,
+            setup,
+            tls_id: None,
+        })
     } else {
         local_crypto.map(SecurityAdvertisement::Secure)
     }
@@ -119,6 +123,9 @@ pub(super) fn far_security(
 /// had to become one: it could previously only ever say "plaintext" or "unchanged", which is why a
 /// secure *offerer* was never terminated on this path.
 ///
+/// * `near_dtls` set — the engine terminates A's DTLS-SRTP, so it **is** A's DTLS peer: advertise
+///   its own fingerprint, the `a=setup` it settled on and the `a=tls-id` it assigned (RFC 5763 §5,
+///   RFC 8842 §5.3), and strip A's own keying.
 /// * `near_local_crypto` set — the engine minted its own SDES key for A, so it **is** A's
 ///   cryptographic far side: advertise that key and strip A's own (RFC 4568).
 /// * otherwise, a secure far leg means the engine terminates SRTP there and A's side is plaintext:
@@ -126,12 +133,180 @@ pub(super) fn far_security(
 /// * otherwise, leave the transport alone.
 pub(super) fn near_security(
     near_local_crypto: Option<CryptoAttribute>,
+    near_dtls: Option<(sdp::Fingerprint, sdp::Setup, Option<String>)>,
     far_secure: bool,
 ) -> Option<SecurityAdvertisement> {
+    if let Some((fingerprint, setup, tls_id)) = near_dtls {
+        return Some(SecurityAdvertisement::Dtls {
+            fingerprint,
+            setup,
+            tls_id,
+        });
+    }
     match near_local_crypto {
         Some(local) => Some(SecurityAdvertisement::Secure(local)),
         None => far_secure.then_some(SecurityAdvertisement::Plain),
     }
+}
+
+/// The `a=setup` and DTLS role the engine takes when it **answers** a DTLS-SRTP offer, following the
+/// answer table of RFC 4145 §4.1 and RFC 5763 §5.
+///
+/// * `actpass` leaves the choice to the answerer. RFC 5763 §5 recommends `active`, which lets the
+///   handshake run in parallel with the answer, so the engine is `active` unless a `dtls: passive`
+///   directive asks for `passive`.
+/// * `passive` makes the engine `active`.
+/// * `active`, or no `a=setup` at all, makes it `passive`: "The default value of the setup attribute
+///   in an offer/answer exchange is 'active' in the offer and 'passive' in the answer" (RFC 4145 §4.1).
+/// * `holdconn` is answered `passive` too. RFC 4145 answers it with `holdconn`, but a DTLS-SRTP offer
+///   carries `actpass` (RFC 8842 §5.2), and a passive engine never starts a handshake the offerer did
+///   not ask for.
+pub(super) fn answerer_dtls_setup(
+    offered: Option<sdp::Setup>,
+    directive: Option<DtlsDirective>,
+) -> (sdp::Setup, siphon_rtp_dtls::DtlsRole) {
+    let setup = match offered {
+        Some(sdp::Setup::Actpass) => match directive {
+            Some(DtlsDirective::Role(sdp::Setup::Passive)) => sdp::Setup::Passive,
+            _ => sdp::Setup::Active,
+        },
+        Some(sdp::Setup::Passive) => sdp::Setup::Active,
+        Some(sdp::Setup::Active | sdp::Setup::Holdconn) | None => sdp::Setup::Passive,
+    };
+    let role = match setup {
+        sdp::Setup::Active => siphon_rtp_dtls::DtlsRole::Client,
+        _ => siphon_rtp_dtls::DtlsRole::Server,
+    };
+    (setup, role)
+}
+
+/// A new unique `a=tls-id` value for a DTLS association the engine answers (RFC 8842 §5.3): 20 random
+/// octets as 40 lowercase hex digits, inside the RFC 8842 §4 grammar of 20 to 255 characters from
+/// ALPHA / DIGIT / `+` / `/` / `-` / `_`. `None` only when the OS random source fails, which the caller
+/// refuses on rather than answering with a predictable value.
+pub(super) fn generate_tls_id() -> Option<String> {
+    let mut bytes = [0u8; 20];
+    getrandom::fill(&mut bytes).ok()?;
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// The engine's `a=setup` for the DTLS role it plays (RFC 4145 §4): the client is `active`, the
+/// server `passive`.
+pub(super) fn setup_for_role(role: siphon_rtp_dtls::DtlsRole) -> sdp::Setup {
+    match role {
+        siphon_rtp_dtls::DtlsRole::Client => sdp::Setup::Active,
+        siphon_rtp_dtls::DtlsRole::Server => sdp::Setup::Passive,
+    }
+}
+
+/// How the engine answers a DTLS-SRTP offerer it terminates: what A is shown (the engine's
+/// fingerprint, its `a=setup` and its `a=tls-id`), the DTLS role the bridge runs, and A's own
+/// fingerprint, which the handshake verifies.
+pub(super) struct NearDtlsAnswer {
+    presentation: (sdp::Fingerprint, sdp::Setup, Option<String>),
+    role: siphon_rtp_dtls::DtlsRole,
+    peer_fingerprint: sdp::Fingerprint,
+}
+
+impl NearDtlsAnswer {
+    /// What A's answer presents.
+    pub(super) fn presented(&self) -> &(sdp::Fingerprint, sdp::Setup, Option<String>) {
+        &self.presentation
+    }
+
+    /// What the bridge is wired with: A's fingerprint and the settled role.
+    pub(super) fn wiring(&self) -> (&sdp::Fingerprint, siphon_rtp_dtls::DtlsRole) {
+        (&self.peer_fingerprint, self.role)
+    }
+
+    /// What the call records for a renegotiation: the settled role and the engine's `a=tls-id`.
+    pub(super) fn recorded(self) -> (siphon_rtp_dtls::DtlsRole, Option<String>) {
+        (self.role, self.presentation.2)
+    }
+}
+
+/// The secure-offerer checks an answer runs once its pipeline is resolved. A secure offerer (SDES or
+/// DTLS) is terminated only in the crypto-bridge shape. Every other combination would have to thread
+/// A's `SecureLeg` onto the A-facing directions of the media actor, and until that exists the honest
+/// answer is a refusal, not a call that answers `ok` and relays A's audio somewhere it should not go.
+/// `resolve_pipeline` already picked the shape, so this reads its verdict rather than re-deriving the
+/// conditions. A terminated DTLS offerer then has its association settled ([`near_dtls_answer`]).
+pub(super) fn settle_secure_offerer(
+    pipeline: super::PipelineKind,
+    (near_sdes, near_dtls): (bool, Option<&super::NearDtls>),
+    far_secure: bool,
+    near_codec: Option<&CodecSpec>,
+    info: &sdp::MediaInfo,
+    (reversed, profile, engine_fingerprint): (bool, &ProfileFlags, Option<sdp::Fingerprint>),
+) -> Result<Option<NearDtlsAnswer>, Box<siphon_rtp_proto::CmdResult>> {
+    if (near_sdes && pipeline != super::PipelineKind::SrtpOfferer)
+        || (near_dtls.is_some() && pipeline != super::PipelineKind::DtlsOfferer)
+    {
+        let codecs_differ = matches!(
+            (near_codec, info.primary_codec()),
+            (Some(near), Some(far)) if !same_codec(near, &far)
+        );
+        let why = if far_secure {
+            "both parties are secure, which needs a transcrypt between two different keys"
+        } else if codecs_differ {
+            "the two legs' codecs differ, which needs the secure offerer's leg threaded into the \
+             transcoding pipeline"
+        } else {
+            "the call needs the decoded audio (recording, noise suppression, echo cancellation or \
+             beep detection), which needs the secure offerer's leg threaded into the media pipeline"
+        };
+        return Err(Box::new(siphon_rtp_proto::CmdResult::Error {
+            reason: format!(
+                "answer: secure-offerer-unsupported: {why}; a secure caller toward a plain callee \
+                 on a shared codec is supported"
+            ),
+        }));
+    }
+    near_dtls
+        .map(|near| near_dtls_answer(near, reversed, profile, engine_fingerprint))
+        .transpose()
+}
+
+/// Settle a terminated DTLS offerer's association for an answer. B answering: the engine is A's
+/// answerer, so its role follows the RFC 4145 §4.1 answer table, with a `dtls` directive choosing only
+/// where A's `actpass` leaves the choice open ([`answerer_dtls_setup`]). A answering B's re-offer: A's
+/// association is left in the role B's original answer settled.
+pub(super) fn near_dtls_answer(
+    near: &super::NearDtls,
+    reversed: bool,
+    profile: &ProfileFlags,
+    engine_fingerprint: Option<sdp::Fingerprint>,
+) -> Result<NearDtlsAnswer, Box<siphon_rtp_proto::CmdResult>> {
+    let Some(fingerprint) = engine_fingerprint else {
+        return Err(Box::new(super::error_result(
+            "DTLS-SRTP answer",
+            &"engine has no DTLS certificate",
+        )));
+    };
+    let (setup, role) = match (reversed, near.role) {
+        (true, Some(role)) => (setup_for_role(role), role),
+        _ => answerer_dtls_setup(near.peer_setup, dtls_directive(profile)),
+    };
+    // RFC 8842 §5.3: an offer carrying `a=tls-id` gets a new unique value in the answer, and an offer
+    // without one gets none ("the answerer MUST NOT insert a 'tls-id' attribute"). A value the engine
+    // already assigned to this association is re-presented, never replaced.
+    let tls_id = match near.peer_tls_id {
+        None => None,
+        Some(_) => match near.local_tls_id.clone().or_else(generate_tls_id) {
+            Some(tls_id) => Some(tls_id),
+            None => {
+                return Err(Box::new(super::error_result(
+                    "DTLS-SRTP answer",
+                    &"no random source for a=tls-id",
+                )))
+            }
+        },
+    };
+    Ok(NearDtlsAnswer {
+        presentation: (fingerprint, setup, tls_id),
+        role,
+        peer_fingerprint: near.peer_fingerprint.clone(),
+    })
 }
 
 /// The ICE posture an **offer** presents for the far leg (RFC 8839 §5): `a=ice-mismatch` when the call

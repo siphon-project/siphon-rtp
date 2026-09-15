@@ -56,6 +56,9 @@ pub(super) struct AnswerWiring<'a> {
     pub(super) ptime_override: Option<u8>,
     /// The engine's DTLS role on a DTLS-SRTP far leg.
     pub(super) dtls_role: DtlsRole,
+    /// A terminated DTLS-SRTP offerer: A's fingerprint, which the handshake verifies, and the role
+    /// the engine answered A with. `None` unless the call is a [`PipelineKind::DtlsOfferer`].
+    pub(super) near_dtls: Option<(&'a sdp::Fingerprint, DtlsRole)>,
     /// Endpoints a full ICE agent runs on; a DTLS handshake waits for a selection only on those.
     pub(super) agent_endpoints: &'a [EndpointId],
 }
@@ -214,6 +217,43 @@ impl AnswerWiring<'_> {
                 }),
         }
     }
+
+    /// The DTLS-SRTP plan for a terminated DTLS **offerer**: A's leg is keyed by the handshake the
+    /// engine runs in the role it answered A with, against A's certificate fingerprint (RFC 5763 §5),
+    /// and B's stays plaintext. The mirror of [`Self::dtls_call_plan`] with the sides swapped: the
+    /// secure endpoint faces A, the plain one faces B, and B's separate RTCP port, when B does not
+    /// multiplex, rides the plain side (A, the DTLS peer, multiplexes).
+    fn offerer_dtls_call_plan(
+        &self,
+        a_rtp: SocketAddr,
+        certificate: DtlsCertificate,
+        peer_fingerprint: &sdp::Fingerprint,
+        role: DtlsRole,
+    ) -> DtlsCallPlan {
+        DtlsCallPlan {
+            plain_endpoint: self.far.rtp.id,
+            plain_source: bridge_source_filter(self.profile, self.far_gate_rtp),
+            plain_dst: self.far_media_dst,
+            secure_endpoint: self.near.rtp.id,
+            secure_source: bridge_source_filter(self.profile, self.near_gate_rtp.unwrap_or(a_rtp)),
+            secure_dst: self.near_media_dst.unwrap_or(a_rtp),
+            secure_local: self.near.rtp.local_addr,
+            certificate,
+            role,
+            peer_fingerprint: DtlsFingerprint::new(
+                peer_fingerprint.hash_function.clone(),
+                peer_fingerprint.bytes.clone(),
+            ),
+            // As on the far leg: hold the handshake for a selected pair only where a full ICE agent
+            // runs on A's leg (RFC 8445 §12).
+            gate_on_ice: self.agent_endpoints.contains(&self.near.rtp.id),
+            plain_rtcp: self.far.rtcp.map(|endpoint| crate::dtls_bridge::PlainRtcp {
+                endpoint: endpoint.id,
+                source: bridge_source_filter(self.profile, self.far_gate_rtcp),
+                dst: self.far_rtcp_dst,
+            }),
+        }
+    }
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -266,12 +306,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.install_srtp_bridge(wiring, near_local, near_remote, BridgeOp::Decrypt)?;
             }
             PipelineKind::Dtls => self.install_dtls_bridge(wiring)?,
+            PipelineKind::DtlsOfferer => self.install_dtls_offerer_bridge(wiring)?,
             PipelineKind::DtlsMedia => self.install_dtls_media(wiring, owner_events)?,
             PipelineKind::SrtpMedia => {
                 self.install_srtp_media(wiring, far_local_crypto, owner_events)?;
             }
             PipelineKind::Media => self.install_media(wiring, owner_events)?,
-            _ => return self.install_plain_relay(wiring),
+            // Named rather than a wildcard, so a new pipeline kind has to choose its install here
+            // instead of silently falling through to a plaintext relay.
+            PipelineKind::Passthrough | PipelineKind::Ws => {
+                return self.install_plain_relay(wiring)
+            }
         }
         Ok(Vec::new())
     }
@@ -400,6 +445,47 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // On a renegotiation of a live call, keep the association already running and just re-point
         // it: B keeps its own (RFC 8842 §5.5 — the fingerprint did not change), so a fresh
         // registration would wait for a handshake that never comes.
+        if !self.dtls_bridge().renegotiate(&plan) {
+            self.dtls_bridge().register(plan);
+        }
+        Ok(())
+    }
+
+    /// A terminated DTLS-SRTP **offerer** (A) toward a plain callee → the same userspace DTLS bridge
+    /// with the sides swapped: the handshake keys A's leg in the role the engine answered A with,
+    /// authenticated against the fingerprint A offered (RFC 5763 §5), and B's leg stays plaintext. A
+    /// multiplexes RTCP (the offer refuses one that does not); when B does not, B's separate RTCP port
+    /// is bridged as well (RFC 5761 §5.1.1).
+    fn install_dtls_offerer_bridge(&self, wiring: &AnswerWiring<'_>) -> Result<(), Box<CmdResult>> {
+        let Some(certificate) = self.dtls_certificate.clone() else {
+            return Err(boxed_error_result(
+                "DTLS-SRTP offerer",
+                &"engine has no DTLS certificate",
+            ));
+        };
+        // `answer` sets this exactly when it resolved `DtlsOfferer`, so its absence is an internal
+        // invariant; refuse rather than install a bridge with nothing to authenticate the peer against.
+        let Some((peer_fingerprint, role)) = wiring.near_dtls else {
+            return Err(boxed_error_result(
+                "DTLS-SRTP offerer",
+                &"no stored keying for the offerer (internal)",
+            ));
+        };
+        let Some(a_rtp) = wiring.near.remote_rtp else {
+            return Err(boxed_error_result(
+                "DTLS bridge",
+                &"near leg has no signalled address",
+            ));
+        };
+        let plan = wiring.offerer_dtls_call_plan(a_rtp, certificate, peer_fingerprint, role);
+        self.redirect_endpoints(
+            [wiring.near.rtp.id, wiring.far.rtp.id]
+                .into_iter()
+                .chain(plan.plain_rtcp.map(|rtcp| rtcp.endpoint)),
+            "install DTLS offerer bridge redirect",
+        )?;
+        // As for a DTLS far leg: a renegotiation that keeps A's association re-points it rather than
+        // waiting for a handshake A will never start again (RFC 8842 §5.5).
         if !self.dtls_bridge().renegotiate(&plan) {
             self.dtls_bridge().register(plan);
         }
@@ -1011,7 +1097,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // it cannot run in-kernel (SRTP must be terminated in userspace), so it is registered on the
         // text processor from the start: both text endpoints `Redirect`ed, one `SecureLeg` per leg with
         // its OWN SDES keys (near = engine↔A, far = engine↔B), and held there for the call's life
-        // (docs/security-and-nat.md Layer 5d — mirrors the audio SDES bridge). A→B text is decrypted on
+        // (docs/security-and-nat.md Layer 5f — mirrors the audio SDES bridge). A→B text is decrypted on
         // the near leg and re-encrypted on the far leg (and B→A the reverse), so the two sides re-key
         // independently and no plaintext ever crosses to a secure peer. A mixed secure/plaintext text
         // bridge was refused above (declined), never keyed here.

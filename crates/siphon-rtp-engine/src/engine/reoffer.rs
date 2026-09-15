@@ -40,6 +40,8 @@ struct ReofferState {
     /// The engine's own SDES key toward A, so a re-offer re-presents the key A already holds rather
     /// than minting a new one (RFC 4568 — a re-offer restates the session, it does not re-key it).
     near_local_crypto: Option<CryptoAttribute>,
+    /// A terminated DTLS-SRTP offerer, re-presented to A with the engine's own fingerprint.
+    near_dtls: Option<super::NearDtls>,
     far_dtls: bool,
     far_downgraded_to_plain: bool,
     far_text_local_crypto: Option<CryptoAttribute>,
@@ -72,6 +74,7 @@ impl ReofferState {
             far_ice_removed: call.far_ice_removed,
             far_local_crypto: call.far_local_crypto,
             near_local_crypto: call.near_local_crypto,
+            near_dtls: call.near_dtls.clone(),
             far_dtls: call.far_dtls,
             far_downgraded_to_plain: call.far_downgraded_to_plain,
             far_text_local_crypto: call.far_text_local_crypto,
@@ -445,7 +448,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // presented leg — the key that party already holds (RFC 4568: a re-offer re-presents the key,
         // it never mints one). That key always exists once the secure text leg registered at answer;
         // fail closed rather than present a secure stream as plaintext if it is somehow absent
-        // (docs/security-and-nat.md Layer 5d — never bridge or present secure↔insecure).
+        // (docs/security-and-nat.md Layer 5f — never bridge or present secure↔insecure).
         let presented_text_key = match presented_party {
             Party::Far => state.far_text_local_crypto,
             Party::Near => state.near_text_local_crypto,
@@ -534,6 +537,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ice: answer_ice_rewrite(ice_creds.as_ref(), &presented_candidates),
                     security: near_security(
                         state.near_local_crypto,
+                        // A terminated DTLS offerer is offered the engine's own fingerprint again
+                        // with `actpass` and the `a=tls-id` already assigned to it, which is how a
+                        // subsequent offer keeps the association (RFC 8842 §5.5).
+                        state.near_dtls.as_ref().zip(self.engine_fingerprint()).map(
+                            |(near, fingerprint)| {
+                                (fingerprint, sdp::Setup::Actpass, near.local_tls_id.clone())
+                            },
+                        ),
                         state.far_local_crypto.is_some() || state.far_dtls,
                     ),
                     mux_override,

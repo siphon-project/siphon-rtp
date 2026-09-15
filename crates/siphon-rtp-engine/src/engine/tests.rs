@@ -11341,9 +11341,13 @@ async fn offer_far_sdp(sdp: &str, profile: ProfileFlags) -> String {
 #[tokio::test]
 async fn offer_dtls_off_downgrades_far_leg_to_plaintext() {
     // rtpengine DTLS=off (RFC 3264): a UDP/TLS far transport plus `dtls: off` yields plaintext
-    // RTP/AVP with the offer's DTLS keying stripped — no `a=fingerprint`/`a=setup`.
+    // RTP/AVP with the offer's DTLS keying stripped — no `a=fingerprint`/`a=setup`. The offerer
+    // multiplexes RTCP, as a DTLS caller terminated toward a plain far leg has to (a non-muxed one
+    // is refused, see `a_dtls_offerer_that_does_not_multiplex_rtcp_is_refused_and_frees_its_ports`).
+    let offer =
+        dtls_offer_sdp().replace("a=setup:actpass\r\n", "a=rtcp-mux\r\na=setup:actpass\r\n");
     let far = offer_far_sdp(
-        dtls_offer_sdp(),
+        &offer,
         ProfileFlags {
             transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
             dtls: Some("off".into()),
@@ -11950,6 +11954,813 @@ async fn a_reversed_answer_presents_the_callees_own_rtcp_mux_not_the_callers() {
         "B's leg keeps separate RTCP, so the answer it receives carries no a=rtcp-mux"
     );
     assert_ne!(to_b.remote_rtcp, to_b.remote_rtp);
+}
+
+/// A DTLS-SRTP offer (`UDP/TLS/RTP/SAVPF`, muxed RTCP) whose `a=setup` and `a=tls-id` lines are
+/// optional, for the tests that turn on their absence (RFC 4145 §4.1, RFC 8842 §5.3). The fingerprint
+/// is optional too, for the offer that cannot be keyed.
+fn dtls_offer_with(
+    rtp: SocketAddr,
+    fingerprint: Option<&siphon_rtp_dtls::Fingerprint>,
+    setup: Option<&str>,
+    tls_id: Option<&str>,
+) -> String {
+    let mut sdp = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+        ip = rtp.ip(),
+        port = rtp.port(),
+    );
+    if let Some(setup) = setup {
+        sdp.push_str(&format!("a=setup:{setup}\r\n"));
+    }
+    if let Some(tls_id) = tls_id {
+        sdp.push_str(&format!("a=tls-id:{tls_id}\r\n"));
+    }
+    if let Some(fingerprint) = fingerprint {
+        let hex = fingerprint
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        sdp.push_str(&format!(
+            "a=fingerprint:{hash} {hex}\r\n",
+            hash = fingerprint.hash_function
+        ));
+    }
+    sdp
+}
+
+/// A plain-RTP far-leg profile: the ask that terminates a DTLS offerer.
+fn plain_far_leg() -> ProfileFlags {
+    ProfileFlags {
+        transport_protocol: Some("RTP/AVP".into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_dtls_offerer_toward_a_plain_callee_is_answered_with_the_engines_own_fingerprint() {
+    // A WebRTC caller (RFC 5764) toward a plain callee: `transport_protocol: RTP/AVP` asks for a plain
+    // far leg, so the engine terminates A's DTLS. B is offered plain RTP without A's keying, and A is
+    // answered as a DTLS peer with the engine's own certificate (RFC 8842 §5.3), the `active` role RFC
+    // 5763 §5 recommends against `actpass`, and the RTCP multiplexing A offered — even though B, whose
+    // SDP the answer is rewritten from, does not multiplex.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+
+    let offered = offer_from_a(
+        &engine,
+        "dtls-offerer",
+        dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+        plain_far_leg(),
+    )
+    .await;
+    assert!(
+        !offered.secure && !offered.dtls,
+        "B is offered plain RTP/AVP"
+    );
+    assert!(
+        offered.fingerprint.is_none(),
+        "A's fingerprint never reaches B"
+    );
+    assert!(offered.setup.is_none(), "nor A's a=setup");
+
+    let answered = answer_from_b(
+        &engine,
+        "dtls-offerer",
+        sdp_for(addr_b, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(answered.dtls, "A is answered UDP/TLS/RTP/SAVPF");
+    assert_eq!(
+        answered.fingerprint,
+        engine.engine_fingerprint(),
+        "with the engine's own fingerprint"
+    );
+    assert_eq!(
+        answered.setup,
+        Some(sdp::Setup::Active),
+        "RFC 5763 §5: the answerer to actpass should be active"
+    );
+    assert!(
+        answered.rtcp_mux,
+        "A multiplexes RTCP and is answered with a=rtcp-mux"
+    );
+}
+
+#[tokio::test]
+async fn a_dtls_offerer_is_terminated_by_dtls_off_alone() {
+    // `dtls: off` with no transport asks for the same plain far leg (rtpengine DTLS=off).
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let offered = offer_from_a(
+        &engine,
+        "dtls-off",
+        dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+        ProfileFlags {
+            dtls: Some("off".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(!offered.dtls && offered.fingerprint.is_none(), "B is plain");
+    let answered = answer_from_b(
+        &engine,
+        "dtls-off",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(answered.dtls, "A is answered as a DTLS peer");
+    assert_eq!(answered.fingerprint, engine.engine_fingerprint());
+}
+
+#[tokio::test]
+async fn a_dtls_offerer_without_a_transport_directive_still_passes_through() {
+    // Two DTLS peers may run their association end to end through the relay: with no far-leg
+    // transport or DTLS directive the offer's keying is passed through untouched, as before.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let offered = offer_from_a(
+        &engine,
+        "dtls-passthrough",
+        dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(offered.dtls, "B is offered the caller's own DTLS transport");
+    assert_eq!(
+        offered.fingerprint.map(|fingerprint| fingerprint.bytes),
+        Some(caller.fingerprint().bytes),
+        "with the caller's own fingerprint"
+    );
+    assert_eq!(offered.setup, Some(sdp::Setup::Actpass));
+}
+
+#[tokio::test]
+async fn a_dtls_offerer_without_a_fingerprint_is_refused_and_frees_its_ports() {
+    // RFC 5763 §5: the endpoint MUST use the certificate fingerprint attribute. Without one there is
+    // nothing to authenticate the handshake against, so the offer is refused rather than answered.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "dtls-no-fingerprint".into(),
+                from_tag: "a".into(),
+                sdp: dtls_offer_with(addr_a, None, Some("actpass"), None),
+                profile: plain_far_leg(),
+            },
+        )
+        .await;
+    match offer {
+        CmdResult::Error { reason } => assert!(
+            reason.contains("secure-offerer-unkeyable"),
+            "refused as unkeyable: {reason}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(engine.session_count(), 0, "no call is left behind");
+    assert!(engine.endpoint_calls.is_empty(), "and no port is held");
+}
+
+#[tokio::test]
+async fn a_dtls_offerer_that_does_not_multiplex_rtcp_is_refused_and_frees_its_ports() {
+    // A DTLS-SRTP session protects one UDP port pair (RFC 5764 §3), and the bridge keys the caller's
+    // RTP port only. A caller keeping RTCP on a port of its own would be answered with an RTCP flow
+    // that nothing keys, so it is refused instead.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let sdp = dtls_offer_with(addr_a, Some(&caller.fingerprint()), Some("actpass"), None)
+        .replace("a=rtcp-mux\r\n", "");
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "dtls-no-mux".into(),
+                from_tag: "a".into(),
+                sdp,
+                profile: plain_far_leg(),
+            },
+        )
+        .await;
+    match offer {
+        CmdResult::Error { reason } => assert!(
+            reason.contains("secure-offerer-unsupported") && reason.contains("rtcp-mux"),
+            "refused for its RTCP port: {reason}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(engine.session_count(), 0, "no call is left behind");
+    assert!(engine.endpoint_calls.is_empty(), "and no port is held");
+}
+
+#[tokio::test]
+async fn a_dtls_offerer_toward_a_secure_callee_is_refused() {
+    // Terminating A's DTLS toward a secure B would need a transcrypt between two keys, which does not
+    // exist; offering B the engine's own keying while answering A in plain is worse. Refuse both.
+    for transport in ["RTP/SAVP", "UDP/TLS/RTP/SAVPF"] {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dtls-to-secure".into(),
+                    from_tag: "a".into(),
+                    sdp: dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+                    profile: ProfileFlags {
+                        transport_protocol: Some(transport.into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        match offer {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("secure-offerer-unsupported"),
+                "{transport}: {reason}"
+            ),
+            other => panic!("{transport}: expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "{transport}: nothing left behind"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dtls_offerer_needing_decoded_audio_is_refused() {
+    // Only the crypto-bridge shape is wired for a DTLS caller. Anything that needs the decoded audio
+    // (recording here, a codec the caller did not offer below) is refused, never relayed in the clear.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    offer_from_a(
+        &engine,
+        "dtls-record",
+        dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+        plain_far_leg(),
+    )
+    .await;
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "dtls-record".into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp: sdp_for(addr_b, true),
+                profile: ProfileFlags {
+                    record_call: true,
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    match answer {
+        CmdResult::Error { reason } => assert!(
+            reason.contains("secure-offerer-unsupported"),
+            "recording: {reason}"
+        ),
+        other => panic!("recording: expected a refusal, got {other:?}"),
+    }
+
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    offer_from_a(
+        &engine,
+        "dtls-transcode",
+        dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+        ProfileFlags {
+            transport_protocol: Some("RTP/AVP".into()),
+            flags: vec!["codec-transcode-PCMA".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "dtls-transcode".into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    match answer {
+        CmdResult::Error { reason } => assert!(
+            reason.contains("secure-offerer-unsupported"),
+            "transcode: {reason}"
+        ),
+        other => panic!("transcode: expected a refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_dtls_offerer_without_a_setup_gets_the_rfc_4145_default_role() {
+    // RFC 4145 §4.1: "The default value of the setup attribute in an offer/answer exchange is 'active'
+    // in the offer and 'passive' in the answer." An offer with no `a=setup` is therefore active, and
+    // the engine answers passive. The other offered roles map as RFC 4145 §4.1's table says, and a
+    // `dtls` answer directive chooses only when the offer left the choice open (`actpass`).
+    let cases = [
+        (None, None, sdp::Setup::Passive),
+        (Some("active"), None, sdp::Setup::Passive),
+        (Some("passive"), None, sdp::Setup::Active),
+        (Some("actpass"), None, sdp::Setup::Active),
+        (Some("actpass"), Some("passive"), sdp::Setup::Passive),
+        (Some("active"), Some("active"), sdp::Setup::Passive),
+    ];
+    for (offered_setup, directive, expected) in cases {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+        offer_from_a(
+            &engine,
+            "dtls-role",
+            dtls_offer_with(addr_a, Some(&caller.fingerprint()), offered_setup, None),
+            plain_far_leg(),
+        )
+        .await;
+        let answered = answer_from_b(
+            &engine,
+            "dtls-role",
+            sdp_for(addr_b, true),
+            ProfileFlags {
+                dtls: directive.map(str::to_string),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            answered.setup,
+            Some(expected),
+            "offer {offered_setup:?} with directive {directive:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dtls_offerers_answer_carries_a_tls_id_only_when_its_offer_did() {
+    // RFC 8842 §5.3: an offer carrying `a=tls-id` for a new association gets "a new unique attribute
+    // value" in the answer; an offer without one gets none ("the answerer MUST NOT insert a 'tls-id'
+    // attribute in the answer").
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    for offered_tls_id in [None, Some("0123456789abcdefghij")] {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        offer_from_a(
+            &engine,
+            "dtls-tls-id",
+            dtls_offer_with(
+                addr_a,
+                Some(&caller.fingerprint()),
+                Some("actpass"),
+                offered_tls_id,
+            ),
+            plain_far_leg(),
+        )
+        .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dtls-tls-id".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let text = ok_sdp_text(&answer);
+        let answered_tls_id = text
+            .lines()
+            .find_map(|line| line.strip_prefix("a=tls-id:"))
+            .map(str::to_string);
+        match offered_tls_id {
+            None => assert_eq!(
+                answered_tls_id, None,
+                "no tls-id offered, none answered: {text}"
+            ),
+            Some(offered) => {
+                let answered = answered_tls_id.expect("a tls-id is answered");
+                assert_ne!(answered, offered, "a new value, never the caller's own");
+                assert!(
+                    (20..=255).contains(&answered.len())
+                        && answered
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "+/-_".contains(c)),
+                    "RFC 8842 §4 tls-id-value grammar: {answered}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dtls_offerer_is_bridged_to_a_plain_callee_end_to_end() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_dtls::DtlsCertificate;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // A offers `actpass`, so the engine answers `active` and starts the handshake as the DTLS client
+    // (RFC 5763 §5) toward A's signalled address; A is the server. A's SRTP must reach B in the clear,
+    // and B's plaintext must reach A as SRTP that A's own keyed leg decrypts.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let socket_a = Arc::new(
+        UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a"),
+    );
+    let addr_a = socket_a.local_addr().expect("addr a");
+    let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let caller = DtlsCertificate::generate().expect("caller cert");
+
+    let offered = offer_from_a(
+        &engine,
+        "dtls-offerer-e2e",
+        dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+        plain_far_leg(),
+    )
+    .await;
+    let answered = answer_from_b(
+        &engine,
+        "dtls-offerer-e2e",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let engine_near = answered.remote_rtp;
+    let engine_far = offered.remote_rtp;
+    let engine_fingerprint = answered
+        .fingerprint
+        .clone()
+        .expect("the engine's fingerprint in A's answer");
+
+    let mut caller_leg = peer_dtls_handshake_server(
+        socket_a.clone(),
+        addr_a,
+        engine_near,
+        &caller,
+        &engine_fingerprint,
+    )
+    .await;
+
+    // A → engine: SRTP, relayed to B in the clear. Retry across the window between A finishing its
+    // handshake and the engine installing its leg.
+    let media = rtp(0x0A0A_0A0A);
+    let mut buffer = [0u8; 2048];
+    let mut at_b = None;
+    for _ in 0..25 {
+        let mut sealed = Vec::new();
+        caller_leg
+            .protect(&media, &mut sealed)
+            .expect("caller protect");
+        socket_a
+            .send_to(&sealed, engine_near)
+            .await
+            .expect("a send");
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(150), phone_b.recv_from(&mut buffer)).await
+        {
+            at_b = Some(buffer[..len].to_vec());
+            break;
+        }
+    }
+    assert_eq!(
+        at_b.expect("B received A's media"),
+        media,
+        "A's SRTP reaches B decrypted"
+    );
+
+    // B → engine: plaintext, relayed to A as SRTP.
+    let reply = rtp(0x0B0B_0B0B);
+    phone_b.send_to(&reply, engine_far).await.expect("b send");
+    let (len, _) = timeout(Duration::from_secs(2), socket_a.recv_from(&mut buffer))
+        .await
+        .expect("A received B's media")
+        .expect("a recv");
+    let mut recovered = Vec::new();
+    caller_leg
+        .unprotect(&buffer[..len], &mut recovered)
+        .expect("caller unprotect");
+    assert_eq!(recovered, reply, "B's RTP reaches A as SRTP");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_local_answers_a_dtls_offer_without_a_setup_passive() {
+    // RFC 4145 §4.1: an offer without `a=setup` is `active`, and its answerer is `passive`. The
+    // single-leg takeover used to answer such an offer `active`, so both ends took the DTLS client
+    // role and the handshake could not complete.
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let (ws_uri, _frames, _downlink) = takeover_ws_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "no-setup-takeover".into(),
+                from_tag: "tag-a".into(),
+                sdp: dtls_offer_with(addr_a, Some(&caller.fingerprint()), None, None),
+                profile: ProfileFlags {
+                    ws_uri: Some(ws_uri),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let answer = sdp::parse(&ok_sdp_text(&result)).expect("takeover answer");
+    assert_eq!(answer.setup, Some(sdp::Setup::Passive), "answer_local");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conference_seat_answers_a_dtls_offer_without_a_setup_passive() {
+    // The same RFC 4145 §4.1 answer table on a conference seat, which also answered `active`.
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let webrtc_addr = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 3), 40_000));
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "no-setup-room".into(),
+                from_tag: "tag-webrtc".into(),
+                sdp: dtls_conference_offer(webrtc_addr, Some(&caller.fingerprint()))
+                    .replace("a=setup:actpass\r\n", ""),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let answer = sdp::parse(&ok_sdp_text(&joined)).expect("seat answer");
+    assert_eq!(answer.setup, Some(sdp::Setup::Passive), "conference seat");
+}
+
+#[tokio::test]
+async fn a_reversed_answer_never_hands_the_callee_a_terminated_dtls_offerers_keying() {
+    // A's answer to a re-offer from B is rewritten for B. When the engine terminates A's DTLS, none of
+    // A's keying may reach B in it: B's leg stays the plain RTP the original offer presented.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    offer_from_a(
+        &engine,
+        "dtls-reversed",
+        dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+        plain_far_leg(),
+    )
+    .await;
+    answer_from_b(
+        &engine,
+        "dtls-reversed",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+
+    let reoffer = reoffer_from(
+        &engine,
+        "dtls-reversed",
+        "b",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let to_a = sdp::parse(&ok_sdp_text(&reoffer)).expect("re-offer to A");
+    assert!(to_a.dtls, "A is re-offered its DTLS leg");
+    assert_eq!(
+        to_a.fingerprint,
+        engine.engine_fingerprint(),
+        "with the engine's fingerprint"
+    );
+    assert_eq!(to_a.setup, Some(sdp::Setup::Actpass), "RFC 8842 §5.5");
+
+    // The engine answered `active` to A's `actpass`, so A keeps the association by answering `passive`.
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "dtls-reversed".into(),
+                from_tag: "b".into(),
+                to_tag: "a".into(),
+                sdp: dtls_offer_with(addr_a, Some(&caller.fingerprint()), Some("passive"), None),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let text = ok_sdp_text(&answer);
+    let to_b = sdp::parse(&text).expect("answer to B");
+    assert!(!to_b.dtls && !to_b.secure, "B stays on plain RTP: {text}");
+    assert!(
+        to_b.fingerprint.is_none() && to_b.setup.is_none() && to_b.tls_id.is_none(),
+        "none of A's DTLS keying reaches B: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_reversed_answer_never_hands_the_callee_a_terminated_sdes_offerers_key() {
+    // The SDES twin: A's answer to a re-offer from B carries A's own `a=crypto`, and on a call where
+    // the engine terminates A's SRTP that key must not reach B, who was offered plain RTP.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    offer_from_a(
+        &engine,
+        "sdes-reversed",
+        sdes_offerer_sdp(addr_a, &caller_key),
+        ProfileFlags::default(),
+    )
+    .await;
+    answer_from_b(
+        &engine,
+        "sdes-reversed",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+
+    let reoffer = reoffer_from(
+        &engine,
+        "sdes-reversed",
+        "b",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let to_a = sdp::parse(&ok_sdp_text(&reoffer)).expect("re-offer to A");
+    assert!(to_a.secure, "A is re-offered its SDES leg");
+
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "sdes-reversed".into(),
+                from_tag: "b".into(),
+                to_tag: "a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let text = ok_sdp_text(&answer);
+    let to_b = sdp::parse(&text).expect("answer to B");
+    assert!(!to_b.secure, "B stays on plain RTP: {text}");
+    assert!(to_b.crypto.is_empty(), "A's key never reaches B: {text}");
+}
+
+#[tokio::test]
+async fn a_bridge_facing_a_secure_offerer_refuses_every_verb_that_needs_decoded_audio() {
+    // A crypto bridge relays SRTP without decoding it, whichever party it faces, so a pcap or WAV
+    // recording, a WebSocket tee, a SIPREC fork and a DTMF block have nothing to attach to. On the
+    // bridge facing an SDES offerer each of these answered `ok` for something that never carried a
+    // packet; on it and on the DTLS offerer's bridge every one is refused, as on a bridge facing the
+    // callee.
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let caller_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let mut not_refused = Vec::new();
+    for offerer in ["sdes", "dtls"] {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let call_id = format!("{offerer}-offerer-verbs");
+        let (offer, profile) = if offerer == "sdes" {
+            (
+                sdes_offerer_sdp(addr_a, &caller_key),
+                ProfileFlags::default(),
+            )
+        } else {
+            (
+                dtls_offerer_sdp(addr_a, &caller_cert.fingerprint(), "actpass"),
+                plain_far_leg(),
+            )
+        };
+        offer_from_a(&engine, &call_id, offer, profile).await;
+        answer_from_b(
+            &engine,
+            &call_id,
+            sdp_for(addr_b, true),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let dir = tempfile::tempdir().expect("recording dir");
+        let recording =
+            |format: Option<siphon_rtp_proto::RecordingFormat>| Command::StartRecording {
+                call_id: call_id.clone(),
+                from_tag: "a".into(),
+                recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                format,
+                direction: None,
+                channels: None,
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
+            };
+        let verbs = [
+            (
+                "start_recording pcap",
+                engine.handle(CLIENT, recording(None)).await,
+            ),
+            (
+                "start_recording wav",
+                engine
+                    .handle(
+                        CLIENT,
+                        recording(Some(siphon_rtp_proto::RecordingFormat::Wav)),
+                    )
+                    .await,
+            ),
+            (
+                "attach_ws_tee",
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::AttachWsTee {
+                            call_id: call_id.clone(),
+                            from_tag: "a".into(),
+                            ws_uri: "ws://127.0.0.1:1/tee".into(),
+                            direction: WsTeeDirection::Caller,
+                            channels: None,
+                            sample_rate: None,
+                        },
+                    )
+                    .await,
+            ),
+            (
+                "subscribe_request",
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::SubscribeRequest {
+                            call_id: call_id.clone(),
+                            from_tags: vec!["a".into()],
+                            sdp: None,
+                            profile: Default::default(),
+                        },
+                    )
+                    .await,
+            ),
+            (
+                "block_dtmf",
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::BlockDtmf {
+                            call_id: call_id.clone(),
+                            from_tag: "a".into(),
+                            to_tag: None,
+                        },
+                    )
+                    .await,
+            ),
+        ];
+        for (verb, result) in verbs {
+            match result {
+                // Every refusal names the secure call; a tee toward the unreachable placeholder server
+                // would fail too, but for a different reason, so the reason is what is asserted.
+                CmdResult::Error { reason } if reason.contains("secure") => {}
+                other => not_refused.push(format!("{offerer} offerer, {verb}: {other:?}")),
+            }
+        }
+    }
+    assert!(
+        not_refused.is_empty(),
+        "not refused as a secure call:\n{}",
+        not_refused.join("\n")
+    );
 }
 
 /// Drive a DTLS peer's client-side handshake against `engine_far` over `socket`, returning its

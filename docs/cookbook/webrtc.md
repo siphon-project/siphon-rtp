@@ -32,6 +32,11 @@ Rust, at different levels of maturity. This page says exactly which level.
   `answer_local` only, with the full ICE agent when the caller offers ICE; the
   two-leg `offer`/`answer` refuses it rather than answering a call it cannot
   bridge. See [Voice-AI](voice-ai.md#which-callers-a-takeover-supports).
+- A DTLS-SRTP caller bridged to a **plain callee** on the two-party
+  `offer`/`answer` relay. Ask for a plaintext far leg and the engine terminates
+  the caller's DTLS, answers it with its own fingerprint, and relays plaintext
+  to the callee. See
+  [A WebRTC caller toward a plain callee](#a-webrtc-caller-toward-a-plain-callee).
 
 - Relayed (TURN) candidates: the engine can act as a TURN *client* as well as a
   server, allocating a relayed candidate and ChannelData-framing media through it.
@@ -105,6 +110,52 @@ What the handshake enforces, per spec:
 
 An answer missing `a=fingerprint` is an error. If certificate generation failed
 at startup (it is logged), DTLS offers are rejected rather than served unkeyed.
+
+## A WebRTC caller toward a plain callee
+
+The mirror of the section above: the browser offers DTLS-SRTP and the callee (a
+SIP trunk, a PBX) speaks plain RTP. Ask for a plaintext far leg on the offer,
+with a `transport_protocol` that has no `SAVP`, or with `dtls: off`:
+
+```json
+{"id": 1, "command": "offer",
+ "call_id": "web-9b2e@203.0.113.40", "from_tag": "as3d7a",
+ "sdp": "<the browser's UDP/TLS/RTP/SAVPF offer>",
+ "profile": {"transport_protocol": "RTP/AVP"}}
+```
+
+The callee is offered `RTP/AVP` with none of the caller's `a=fingerprint`,
+`a=setup` or `a=tls-id`. The answer delivered to the caller is rewritten from
+the callee's, and presents the engine as the caller's DTLS peer:
+
+```
+m=audio 40000 UDP/TLS/RTP/SAVPF 0
+a=rtcp-mux
+a=fingerprint:sha-256 3E:91:0C:2A:7D:55:18:C4:60:B2:8F:04:D1:73:AA:26:5B:E8:39:C7:12:4F:9D:81:06:EE:57:A3:B0:1C:64:F2
+a=setup:active
+```
+
+- **Role.** The engine answers by the RFC 4145 §4.1 table: `actpass` gets
+  `active` (RFC 5763 §5 recommends it, so the handshake does not wait on the
+  answer's delivery), `passive` gets `active`, and `active` or no `a=setup` at
+  all gets `passive`. `dtls: passive` on the `answer` profile makes the engine
+  `passive` where the offer left the choice open.
+- **`a=tls-id`.** A new value when the offer carried one, none when it did not
+  (RFC 8842 §5.3).
+- **RTCP.** The caller must offer `a=rtcp-mux`: the bridge runs one DTLS
+  association, on the RTP port. The callee may keep RTCP on its own port.
+- **ICE.** A caller that offers ICE is answered with the engine's ICE
+  credentials and candidates as on any ICE leg; under `--ice-full` the handshake
+  waits for the selected pair.
+- **No directive.** Without a plaintext far leg asked for, the caller's keying
+  passes through to the callee untouched, for a callee that is itself a DTLS
+  peer.
+
+Refused with `secure-offerer-unsupported`: a secure far leg (`RTP/SAVP`, or
+`UDP/TLS` without `dtls: off`), a caller without `a=rtcp-mux`, and an `answer`
+that needs the decoded audio (a codec change, recording, noise suppression, echo
+cancellation or beep detection). An offer without `a=fingerprint` is refused
+with `secure-offerer-unkeyable`, and its ports are freed.
 
 ## ICE: what ICE-lite means here
 

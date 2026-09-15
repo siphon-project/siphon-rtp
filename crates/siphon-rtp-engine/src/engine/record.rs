@@ -114,10 +114,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         else {
             return unknown_call(call_id);
         };
-        if matches!(
-            pipeline,
-            PipelineKind::Srtp | PipelineKind::SrtpMedia | PipelineKind::Ws
-        ) {
+        // Every crypto bridge carries ciphertext on the wire (the SDES and DTLS bridges, facing either
+        // party), as does a secure transcode, and a WS-bridged call carries no two-party media at all.
+        if pipeline.is_crypto_bridge()
+            || matches!(pipeline, PipelineKind::SrtpMedia | PipelineKind::Ws)
+        {
             return error_result(
                 "start_recording",
                 &"recording a secure (SRTP) or WebSocket-bridged call is not supported yet",
@@ -312,7 +313,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 "a WebSocket-takeover call (ws_uri) has no relay path to record".to_string(),
             );
         }
-        if matches!(pipeline, PipelineKind::Srtp | PipelineKind::Dtls) {
+        if pipeline.is_crypto_bridge() {
             return Err(
                 "recording a secure crypto-bridge call is not supported — the bridge relays \
                  ciphertext without decoding; a transcoded secure call records fine"

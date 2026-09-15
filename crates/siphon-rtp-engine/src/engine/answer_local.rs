@@ -104,6 +104,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // A single-leg call's keying lives on the takeover leg, not on the two-party pair.
                 near_local_crypto: None,
                 near_remote_crypto: None,
+                near_dtls: None,
                 near_codec: None,
                 // A single-leg local answer never reaches `answer`, so the offered set is unused.
                 near_offered_codecs: Vec::new(),
@@ -292,12 +293,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &"ws-takeover-unkeyable: engine has no DTLS certificate",
                 );
             };
-            // The offerer picks; the engine takes the complement (RFC 5763 §5) — matching the
-            // `a=setup` this answer advertised.
-            let role = match peer_setup {
-                Some(sdp::Setup::Active) => DtlsRole::Server,
-                _ => DtlsRole::Client,
-            };
+            // The role matching the `a=setup` this answer advertised (RFC 4145 §4.1, RFC 5763 §5).
+            let (_, role): (sdp::Setup, DtlsRole) =
+                super::negotiate::answerer_dtls_setup(*peer_setup, None);
             self.dtls_bridge().register_for_pipeline(
                 DtlsCallPlan {
                     // A takeover leg is one muxed endpoint; the "plain" side is unused in pipeline
@@ -577,12 +575,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         &"ws-takeover-unkeyable: engine has no DTLS certificate",
                     );
                 };
-                // RFC 5763 §5: the answerer takes the role opposite the offerer's — an `active`
-                // offerer makes the engine passive (the DTLS server), anything else makes it active.
-                let setup = match peer_setup {
-                    Some(sdp::Setup::Active) => sdp::Setup::Passive,
-                    _ => sdp::Setup::Active,
-                };
+                // The answerer's `a=setup` for the offerer's (RFC 4145 §4.1, RFC 5763 §5): an
+                // `active` offerer, or one that sent no `a=setup`, makes the engine passive (the DTLS
+                // server); `passive` or `actpass` makes it active.
+                let (setup, _) = super::negotiate::answerer_dtls_setup(*peer_setup, None);
                 let fingerprint = certificate.fingerprint();
                 (
                     Some(SecurityAdvertisement::Dtls {
@@ -591,6 +587,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             bytes: fingerprint.bytes,
                         },
                         setup,
+                        tls_id: None,
                     }),
                     None,
                 )

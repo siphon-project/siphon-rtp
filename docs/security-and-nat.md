@@ -531,6 +531,18 @@ is wrong, and encryption defeats A2 eavesdrop.
 > **A DTLS leg reaches the media pipeline** (`PipelineKind::DtlsMedia`) and can be seated in a
 > conference, so a WebRTC leg can be transcoded, recorded, noise-suppressed, WS-teed or mixed rather
 > than only relayed — see Layer 5d.
+>
+> **A DTLS-SRTP offerer is terminated on the two-party relay** (`PipelineKind::DtlsOfferer`) when its
+> offer asks for a plaintext far leg (`dtls: off`, or a transport without `SAVP`). It is the same
+> `DtlsBridge` with the sides swapped: the secure endpoint faces the caller, the plain one the callee,
+> and the callee's separate RTCP port rides the plain side. The caller's `a=fingerprint`, `a=setup`
+> and `a=tls-id` are kept on the call from the offer (`Call.near_dtls`) and never presented to the
+> callee; the answer settles the engine's role (RFC 4145 §4.1) and its own `a=tls-id` (RFC 8842 §5.3)
+> and records them for a renegotiation. Both bridge endpoints re-enforce `bridge_source_filter` before
+> any crypto, exactly as on the far-leg bridge. A secure far leg, a caller that does not multiplex
+> RTCP, and a call that needs the decoded audio are refused (`secure-offerer-unsupported`), and a
+> caller with no `a=fingerprint` is refused as unkeyable, rather than any of them being relayed in
+> the clear.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The
@@ -795,7 +807,7 @@ so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the 
   room's endpoint set for the idle reap (text activity keeps the seat) and is freed with the participant
   on leave/teardown.
 
-### Layer 5d — The RFC 4103 Real-Time Text (RTT) relay path
+### Layer 5f — The RFC 4103 Real-Time Text (RTT) relay path
 A VoLTE/IMS call may carry a second media stream: an `m=text` line (RFC 4103, T.140 over RTP, usually
 RFC 2198 RED-wrapped) alongside the audio. The engine parses it (section-aware SDP), anchors it to a
 **separate** engine endpoint per leg, and relays it. **RTPBleed is per-stream**, so the text stream is

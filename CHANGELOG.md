@@ -7,6 +7,39 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **A DTLS-SRTP (WebRTC) caller can be bridged to a plain callee on the two-party relay.** An
+  `offer` of `UDP/TLS/RTP/SAVP[F]` that asks for a plaintext far leg (`dtls: off`, or a
+  `transport_protocol` that is not a secure profile) now terminates the caller's DTLS. The callee is
+  offered plain RTP without the caller's `a=fingerprint`, `a=setup` or `a=tls-id`. The caller is
+  answered as a DTLS peer: the engine's own `a=fingerprint`, an `a=setup` from the RFC 4145 §4.1
+  answer table (`active` against `actpass`, as RFC 5763 §5 recommends, unless a `dtls: passive` answer
+  directive asks for `passive`), and a new `a=tls-id` only when the offer carried one (RFC 8842
+  §5.3). The handshake keys the caller's leg in that role, against the fingerprint it offered, and the
+  userspace DTLS bridge relays plaintext to the callee (`PipelineKind::DtlsOfferer`), including the
+  callee's separate RTCP port when it does not multiplex. Before, the caller's keying was relayed to
+  a callee that refuses it, or, with `dtls: off`, the caller was answered in plain RTP it has to
+  reject, so the call connected with no media. 0.6.0 listed this shape as not done. With no transport
+  or DTLS directive the offer's keying still passes through untouched, for a callee that is itself a
+  DTLS peer.
+
+  Refused rather than half-carried, each with `secure-offerer-unsupported`: a secure far leg (a
+  transcrypt between two keys), a caller that does not multiplex RTCP (a DTLS-SRTP session protects
+  one port pair, RFC 5764 §3, and the bridge runs one), and a call that needs the decoded audio (a
+  codec change, recording, noise suppression, echo cancellation or beep detection). A caller with no
+  `a=fingerprint` (RFC 5763 §5) is refused with `secure-offerer-unkeyable`, and its ports are freed.
+
+### Security
+
+- **A secure caller's own SRTP key no longer reaches the callee when the callee re-offers.** When the
+  engine terminates an SDES-SRTP caller toward a plain callee, the caller's answer to a re-offer from
+  the callee is rewritten for the callee, and that rewrite passed the caller's `a=crypto` and
+  `RTP/SAVP` straight through: the callee was handed the key the caller encrypts its media with, and
+  told the leg was secure while the engine kept sending it plain RTP. The answer now presents the
+  callee's leg as the plain RTP the original offer presented, the rule the offer already applied. A
+  terminated DTLS-SRTP caller's `a=fingerprint`, `a=setup` and `a=tls-id` are stripped the same way.
+
 ### Fixed
 
 - **A call that ends under a decoded recording now finishes the recording before the call is reported
@@ -16,6 +49,17 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   entry leaked per call ended under a recording). Both now detach the recording and wait for its
   header to be finalized, so `recording_finished` naming `call_ended` is already queued when they
   return, which is the ordering the control reference already promised.
+- **A bridge facing a secure caller refuses the verbs that need decoded audio, as a bridge facing the
+  callee does.** On an SDES-SRTP caller terminated toward a plain callee, `subscribe_request` answered
+  `ok` with a SIPREC offer for a fork that would never carry a packet, and `start_recording` (pcap or
+  WAV), `attach_ws_tee` and `block_dtmf` failed with an unrelated error ("media actor unavailable", or
+  the tee's WebSocket dial). A crypto bridge relays SRTP without decoding it whichever party it faces,
+  so all five are now refused as a secure call up front, on that bridge and on the new DTLS-SRTP
+  caller's bridge.
+- **A DTLS-SRTP offer without `a=setup` is answered `passive` by `answer_local` and by a conference
+  seat.** RFC 4145 §4.1 makes an offer that omits the attribute `active` and its answerer `passive`.
+  Both paths answered such an offer `active`, so both ends took the DTLS client role and the handshake
+  could not complete. They now follow the same RFC 4145 §4.1 answer table as the two-party relay.
 - **RTCP now crosses a DTLS-SRTP bridge whose plain side keeps RTCP on its own port.** The bridge
   only ever relayed the two RTP endpoints. When the plain party did not multiplex RTCP (RFC 5761
   §5.1.1), the DTLS peer's SRTCP was decrypted onto the plain party's RTP port, and the plain

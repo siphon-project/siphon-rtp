@@ -1179,7 +1179,8 @@ pub struct ProfileFlags {
     /// `remove` | `force` | `force-relay`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ice: Option<String>,
-    /// `passive` | `active` | `off`.
+    /// `passive` | `active` | `actpass` | `off`: the offered far-leg `a=setup`, or `off` for a plain far
+    /// leg (terminating a DTLS-SRTP caller); on `answer`, `passive` answers such a caller passive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dtls: Option<String>,
     /// SDP fields to rewrite (e.g. `["origin"]`).

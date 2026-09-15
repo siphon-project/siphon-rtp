@@ -175,6 +175,8 @@ struct OfferSecurity {
     near_remote_crypto: Option<CryptoAttribute>,
     /// The fingerprint and `a=setup` a DTLS far leg advertises.
     far_dtls_presentation: Option<(sdp::Fingerprint, sdp::Setup)>,
+    /// A DTLS-SRTP offerer the engine terminates, with A's keying from its offer.
+    near_dtls: Option<super::NearDtls>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -218,8 +220,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // a key of our own there is nothing to advertise and A's own key was passed through to B
         // instead — handing a third party the offerer's SRTP key while answering A in the clear.
         //
-        // SDES only. A DTLS offerer is refused below: binding a handshake to the signalling needs an
-        // `a=fingerprint` in A's answer *and* an ICE agent on A's leg, neither of which this path has.
+        // SDES only here. A DTLS-SRTP offerer is keyed by a handshake, not by a key in the SDP, and is
+        // decided below.
         let near_sdes = info.secure && !info.dtls;
         let near_remote_crypto = info.crypto.first().copied();
         let near_local_crypto = if near_sdes {
@@ -240,11 +242,64 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"secure-offerer-unkeyable: the RTP/SAVP offer carries no usable a=crypto",
             )));
         }
-        // A **DTLS** offerer is deliberately untouched here. Terminating one needs the engine's own
-        // `a=fingerprint` in A's answer plus a full ICE agent on A's leg — the same missing piece
-        // `answer_local` names for a DTLS offerer without a takeover — and refusing it outright would
-        // break `dtls: off`, the rtpengine directive that legitimately downgrades such an offer. So
-        // its existing behaviour is kept byte for byte, and only the SDES path changes.
+        // A **DTLS-SRTP** offerer (`UDP/TLS/RTP/SAVP[F]`, RFC 5764). With no far-leg transport and no
+        // DTLS directive its keying passes through to B untouched, as before: two DTLS peers may run
+        // their association end to end through the relay. Asking for a plaintext far leg (`dtls: off`,
+        // or a transport that is not a secure profile) terminates it instead: the engine becomes A's
+        // DTLS peer, answers A with its own fingerprint, and presents B plain RTP. Asking for a secure
+        // far leg is refused: SDES toward B would need a transcrypt between two keys, and a DTLS far leg
+        // a second association, and neither exists.
+        let near_dtls = if info.dtls {
+            if far_sdes || far_dtls {
+                return Err(Box::new(error_result(
+                    "offer",
+                    &"secure-offerer-unsupported: a DTLS-SRTP offerer toward a secure far leg needs a \
+                      transcrypt between two keys; a DTLS caller toward a plain callee is supported",
+                )));
+            }
+            let plain_far =
+                dtls_off || (!far_transport.is_empty() && !far_transport.contains("SAVP"));
+            if plain_far {
+                // RFC 5763 §5: "The endpoint MUST use the certificate fingerprint attribute". Without
+                // one there is nothing to authenticate the handshake against.
+                let Some(peer_fingerprint) = info.fingerprint.clone() else {
+                    return Err(Box::new(error_result(
+                        "offer",
+                        &"secure-offerer-unkeyable: the UDP/TLS/RTP/SAVP offer carries no \
+                          a=fingerprint",
+                    )));
+                };
+                // A DTLS-SRTP session protects a single UDP port pair (RFC 5764 §3), and the bridge
+                // runs one, on A's RTP port. A caller that does not multiplex RTCP onto it (RFC 5761)
+                // would need a second association for its RTCP port, so it is refused rather than
+                // answered with an RTCP flow that never gets keyed.
+                if !info.rtcp_mux {
+                    return Err(Box::new(error_result(
+                        "offer",
+                        &"secure-offerer-unsupported: a DTLS-SRTP offerer that does not multiplex \
+                          RTCP needs a DTLS association per port; offer a=rtcp-mux",
+                    )));
+                }
+                // A's answer has to carry the engine's own fingerprint (RFC 8842 §5.3).
+                if self.engine_fingerprint().is_none() {
+                    return Err(Box::new(error_result(
+                        "DTLS-SRTP offer",
+                        &"engine has no DTLS certificate",
+                    )));
+                }
+                Some(super::NearDtls {
+                    peer_fingerprint,
+                    peer_setup: info.setup,
+                    peer_tls_id: info.tls_id.clone(),
+                    role: None,
+                    local_tls_id: None,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let far_dtls_presentation = if far_dtls {
             let Some(fingerprint) = self.engine_fingerprint() else {
                 return Err(Box::new(error_result(
@@ -263,6 +318,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_local_crypto,
             near_remote_crypto,
             far_dtls_presentation,
+            near_dtls,
         })
     }
 }
@@ -344,7 +400,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // second in-kernel relay. A **secure** (`RTP/SAVP` + `a=crypto`) stream is anchored as an
         // SDES-SRTP text leg: the engine mints its own far text SDES key, advertises `RTP/SAVP` + our
         // `a=crypto` to B, and terminates SRTP in the userspace text processor (docs/security-and-nat.md
-        // Layer 5d — mirrors the audio SDES bridge). A secure text stream we cannot key (no usable
+        // Layer 5f — mirrors the audio SDES bridge). A secure text stream we cannot key (no usable
         // `a=crypto`) is declined (`m=text 0`, RFC 3264 §6), never downgraded to plaintext. Text RTCP is
         // not separately endpointed (single text port; text SRTCP rides the muxed port).
         let text_offered_secure = info.text.as_ref().is_some_and(|text| text.secure);
@@ -561,6 +617,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_local_crypto,
             near_remote_crypto,
             far_dtls_presentation,
+            near_dtls,
         } = match self.offer_security(profile, &info) {
             Ok(security) => security,
             Err(result) => {
@@ -582,7 +639,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 engine: far_leg.engine_media(),
                 ice: ice_rewrite,
                 security: far_security_with_secure_near(
-                    near_local_crypto.is_some(),
+                    near_local_crypto.is_some() || near_dtls.is_some(),
                     far_downgraded_to_plain,
                     far_dtls_presentation,
                     far_local_crypto,
@@ -725,6 +782,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_secure: info.secure,
                 near_local_crypto,
                 near_remote_crypto,
+                // A's DTLS keying when the engine terminates it; the role and the engine's `a=tls-id`
+                // are settled by the answer.
+                near_dtls,
                 near_codec: near_codec.clone(),
                 near_offered_codecs,
                 near_codec_withheld,
