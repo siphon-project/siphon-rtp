@@ -145,8 +145,11 @@ a=setup:active
 - **RTCP.** The caller must offer `a=rtcp-mux`: the bridge runs one DTLS
   association, on the RTP port. The callee may keep RTCP on its own port.
 - **ICE.** A caller that offers ICE is answered with the engine's ICE
-  credentials and candidates as on any ICE leg; under `--ice-full` the handshake
-  waits for the selected pair.
+  credentials and candidates as on any ICE leg. The handshake waits for ICE:
+  under `--ice-full` for the selected pair, and on the default ICE-lite
+  responder for the first connectivity check it validates. Records and media
+  then go to that address, not to the caller's `c=` (RFC 8445 §12.1.1), which
+  is what a browser behind NAT needs.
 - **No directive.** Without a plaintext far leg asked for, the caller's keying
   passes through to the callee untouched, for a callee that is itself a DTLS
   peer.

@@ -407,7 +407,9 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
   - The adopted source is written into the kernel flow by `Datapath::adopt_source` (full agent) or by
     the userspace ice-lite responder on the datapath thread, and is **re-stamped on every flow
     install** — a rebuilt rule would otherwise drop the flag mid-call and quietly revert the leg to
-    the signalled-source gate.
+    the signalled-source gate. It is also published per endpoint (`Datapath::watch_ice_validated`) to a
+    userspace consumer that owns a leg's egress, which is how the DTLS bridge learns where an ice-lite
+    peer is.
   - **The classifier's `REDIRECT` arm applies the same gate**, for the same reason the loopback
     backend's does: a redirected ICE endpoint's consumer gates by address, and an ICE leg's address
     gate is open. `apply_ice_posture` already stamped the flag and the adopted source onto a Redirect
@@ -544,7 +546,10 @@ is wrong, and encryption defeats A2 eavesdrop.
 > and `a=tls-id` are kept on the call from the offer (`Call.near_dtls`) and never presented to the
 > callee; the answer settles the engine's role (RFC 4145 §4.1) and its own `a=tls-id` (RFC 8842 §5.3)
 > and records them for a renegotiation. Both bridge endpoints re-enforce `bridge_source_filter` before
-> any crypto, exactly as on the far-leg bridge. A secure far leg, a caller that does not multiplex
+> any crypto, exactly as on the far-leg bridge, except that an ICE-gated caller's endpoint runs that
+> filter open and leaves the discrimination to the datapath's layer-4 gate (see the source gate below).
+> The handshake, and the records and SRTP toward the caller, go to the source ICE validated rather than
+> to the caller's `c=`. A secure far leg, a caller that does not multiplex
 > RTCP, and a call that needs the decoded audio are refused (`secure-offerer-unsupported`), and a
 > caller with no `a=fingerprint` is refused as unkeyable, rather than any of them being relayed in
 > the clear. A renegotiation from either party restates the caller's keying on `Call.near_dtls`: the
@@ -557,7 +562,15 @@ is wrong, and encryption defeats A2 eavesdrop.
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The
   bridge therefore **re-enforces** the signalled-source gate itself (`bridge_source_filter`, the same
   `Exact`/`Subnet`/`Any` policy as `ingress_rule`) before any crypto — an off-path spray is dropped at
-  the bridge, not decrypted. SRTP auth (HMAC-SHA1-80) is the second line: a forged packet from the
+  the bridge, not decrypted. **On an ICE-gated DTLS leg the filter on the secure endpoint is
+  `SourceFilter::Any`**, as on an ICE conference seat (Layer 5c): the peer's checks, records and media
+  legitimately come from a transport the SDP never carried (RFC 8445 §7.3.1.3), and the datapath's
+  layer-4 gate on the redirected path already admits only the source a MESSAGE-INTEGRITY-authenticated
+  check adopted, so an address gate as well would drop a NATed peer's handshake. Which posture applies
+  is read from the datapath (`Datapath::watch_ice_validated` is `Some` only for an endpoint carrying ICE
+  credentials), never from the SDP, so a leg whose ICE the answer cleared (a non-ICE or
+  `a=ice-mismatch` peer, `ice: remove`) keeps its signalled-source gate. SRTP auth (HMAC-SHA1-80) is
+  the second line: a forged packet from the
   gated address still fails authentication and is dropped (the rollover counter advances only after
   auth succeeds). **Anti-replay is the third line** (RFC 3711 §3.3.2, enforced in
   `SrtpContext::unprotect` / `SrtcpContext::unprotect`): a per-SSRC 64-packet sliding window over the
@@ -566,6 +579,16 @@ is wrong, and encryption defeats A2 eavesdrop.
   re-forwarded. The window is recorded only *after* authentication, so a forged packet can never
   advance or poison it; on an HA takeover the standby anchors the window at the checkpointed rollover
   index and keeps rejecting the primary's last-seen packet.
+- **An ICE DTLS leg keys the path ICE validated** (RFC 8445 §12, §12.1.1; `DtlsCallPlan::gate_on_ice`).
+  The handshake is held until ICE has chosen the peer's transport: a full agent's selection, or on the
+  ICE-lite responder the source of the first check it validates. The datapath publishes that source
+  per endpoint (`Datapath::watch_ice_validated`), from the same writes that set the adopted source:
+  `handle_stun` and `adopt_source` on UDP, `IceDemux` and `adopt_source` on XDP. The bridge follows it
+  for the life of the association, so records and SRTP never go to a NATed peer's unusable `c=`, and a
+  later validated source re-points them. A backend without the seam starts at the signalled address as
+  before, since nothing would release the wait. Proven by
+  `a_full_ice_dtls_offerer_is_keyed_on_the_pair_ice_selected_not_its_connection_address` and
+  `an_ice_lite_dtls_offerer_is_keyed_on_the_source_its_check_validated`.
 - **A plain peer's separate RTCP port on the DTLS bridge.** When the plain party does not multiplex
   RTCP (RFC 5761 §5.1.1), its RTCP endpoint is redirected into the DTLS bridge as a third flow and
   gated exactly like its RTP endpoint, to the plain party's signalled RTCP source
@@ -738,7 +761,9 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
     open.
   - **A DTLS-SRTP seat under full ICE holds its handshake for the selection** (RFC 8445 §12,
     `gate_on_ice`) — but only when an agent is actually running on it, since otherwise no selection is
-    coming and waiting would hang a working seat.
+    coming and waiting would hang a working seat. The two-party DTLS bridge also follows an ice-lite
+    validation (`Datapath::watch_ice_validated`); a DTLS seat and a secure WS takeover do not yet, so
+    an ice-lite one still starts its handshake at the signalled address.
 
 ### Layer 5c — The conference (MCU) Redirect path
 The N-party conference mixer (`engine/src/conference.rs`) is another `FlowAction::Redirect` consumer,

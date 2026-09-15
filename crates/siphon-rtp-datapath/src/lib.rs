@@ -647,6 +647,29 @@ pub trait Datapath: Send + Sync {
     /// Default: no-op, for a backend with no ICE support at all.
     fn adopt_source(&self, _endpoint: EndpointId, _source: SocketAddr) {}
 
+    /// Follow the source ICE validates for `endpoint`: the push side of
+    /// [`ice_validated_source`](Self::ice_validated_source), for a consumer that owns a leg's egress
+    /// in userspace and has to aim it at the valid pair without polling. RFC 8445 §12.1.1: a lite
+    /// agent "MUST NOT send data until it has a valid list that contains at least one valid pair for
+    /// each component", and then sends to that pair's remote candidate. An ice-lite endpoint's valid
+    /// pair is the source of the check its responder authenticated, so this is the only signal such a
+    /// consumer gets.
+    ///
+    /// The receiver holds the validated source (`None` until a check validates one) and changes
+    /// whenever the responder or [`adopt_source`](Self::adopt_source) adopts a different one. Its
+    /// sender is dropped, closing the receiver, when the endpoint's ICE credentials are cleared or the
+    /// endpoint is removed.
+    ///
+    /// `None` for an endpoint that carries no ICE credentials, whose traffic no check gates, and by
+    /// default for a backend without the seam, whose consumer then keeps its pre-validation behaviour
+    /// rather than waiting forever for a source nothing will publish.
+    fn watch_ice_validated(
+        &self,
+        _endpoint: EndpointId,
+    ) -> Option<tokio::sync::watch::Receiver<Option<SocketAddr>>> {
+        None
+    }
+
     /// The address `endpoint` is currently **latching** to — the peer's observed source, adopted by
     /// symmetric RTP (docs/security-and-nat.md §4 layer 3) or written by an ICE selection — or
     /// `None` when nothing has been observed yet.

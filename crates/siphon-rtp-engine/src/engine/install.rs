@@ -3,7 +3,9 @@
 //! plain relay, and the RFC 4103 text stream.
 
 use siphon_rtp_codec::factory::CodecSpec;
-use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, IceAgentMode, IceConfig, LatchPolicy};
+use siphon_rtp_datapath::{
+    Datapath, EndpointId, FlowAction, IceAgentMode, IceConfig, LatchPolicy, SourceFilter,
+};
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_proto::{CmdResult, Event, ProfileFlags};
 use siphon_rtp_srtp::leg::SecureLeg;
@@ -182,13 +184,17 @@ impl AnswerWiring<'_> {
         a_rtp: SocketAddr,
         certificate: DtlsCertificate,
         peer_fingerprint: sdp::Fingerprint,
+        ice_validated: Option<tokio::sync::watch::Receiver<Option<SocketAddr>>>,
     ) -> DtlsCallPlan {
         DtlsCallPlan {
             plain_endpoint: self.near.rtp.id,
             plain_source: bridge_source_filter(self.profile, self.near_gate_rtp.unwrap_or(a_rtp)),
             plain_dst: self.near_media_dst.unwrap_or(a_rtp),
             secure_endpoint: self.far.rtp.id,
-            secure_source: bridge_source_filter(self.profile, self.far_gate_rtp),
+            secure_source: ice_bridge_source(
+                ice_validated.as_ref(),
+                bridge_source_filter(self.profile, self.far_gate_rtp),
+            ),
             secure_dst: self.far_media_dst,
             secure_local: self.far.rtp.local_addr,
             certificate,
@@ -197,10 +203,12 @@ impl AnswerWiring<'_> {
                 peer_fingerprint.hash_function,
                 peer_fingerprint.bytes,
             ),
-            // Hold the handshake for ICE only when a full agent is actually running on this leg
-            // (RFC 8445 §12). Without one there is no selection coming, and gating would hang a
-            // leg that works perfectly well against its signalled address.
-            gate_on_ice: self.agent_endpoints.contains(&self.far.rtp.id),
+            // Hold the handshake on an ICE-gated leg, for a full agent's selection or for the first
+            // check the ice-lite responder validates (RFC 8445 §12, §12.1.1). A leg without ICE, or on
+            // a backend that cannot publish the validated source, starts at its signalled address:
+            // nothing would ever release the wait.
+            gate_on_ice: ice_validated.is_some() || self.agent_endpoints.contains(&self.far.rtp.id),
+            ice_validated,
             // A's separate RTCP port when A does not multiplex, gated to A's effective RTCP source
             // like the RTP side. B, the DTLS peer, multiplexes (see `PlainRtcp`).
             plain_rtcp: self
@@ -229,13 +237,17 @@ impl AnswerWiring<'_> {
         certificate: DtlsCertificate,
         peer_fingerprint: &sdp::Fingerprint,
         role: DtlsRole,
+        ice_validated: Option<tokio::sync::watch::Receiver<Option<SocketAddr>>>,
     ) -> DtlsCallPlan {
         DtlsCallPlan {
             plain_endpoint: self.far.rtp.id,
             plain_source: bridge_source_filter(self.profile, self.far_gate_rtp),
             plain_dst: self.far_media_dst,
             secure_endpoint: self.near.rtp.id,
-            secure_source: bridge_source_filter(self.profile, self.near_gate_rtp.unwrap_or(a_rtp)),
+            secure_source: ice_bridge_source(
+                ice_validated.as_ref(),
+                bridge_source_filter(self.profile, self.near_gate_rtp.unwrap_or(a_rtp)),
+            ),
             secure_dst: self.near_media_dst.unwrap_or(a_rtp),
             secure_local: self.near.rtp.local_addr,
             certificate,
@@ -244,15 +256,33 @@ impl AnswerWiring<'_> {
                 peer_fingerprint.hash_function.clone(),
                 peer_fingerprint.bytes.clone(),
             ),
-            // As on the far leg: hold the handshake for a selected pair only where a full ICE agent
-            // runs on A's leg (RFC 8445 §12).
-            gate_on_ice: self.agent_endpoints.contains(&self.near.rtp.id),
+            // As on the far leg: hold the handshake wherever A's leg is ICE-gated (RFC 8445 §12,
+            // §12.1.1).
+            gate_on_ice: ice_validated.is_some()
+                || self.agent_endpoints.contains(&self.near.rtp.id),
+            ice_validated,
             plain_rtcp: self.far.rtcp.map(|endpoint| crate::dtls_bridge::PlainRtcp {
                 endpoint: endpoint.id,
                 source: bridge_source_filter(self.profile, self.far_gate_rtcp),
                 dst: self.far_rtcp_dst,
             }),
         }
+    }
+}
+
+/// A DTLS bridge's own source gate on its secure endpoint. On an ICE-gated endpoint it runs open, as
+/// every redirected ICE consumer's does: the datapath's layer-4 gate already admits only the source a
+/// connectivity check authenticated, and that source legitimately need not be the signalled address
+/// (RFC 8445 §7.3.1.3), so gating on the address too would drop a NATed peer's handshake
+/// (docs/security-and-nat.md §4 layer 4). Anywhere else, the signalled-source gate.
+fn ice_bridge_source(
+    ice_validated: Option<&tokio::sync::watch::Receiver<Option<SocketAddr>>>,
+    signalled: SourceFilter,
+) -> SourceFilter {
+    if ice_validated.is_some() {
+        SourceFilter::Any
+    } else {
+        signalled
     }
 }
 
@@ -435,7 +465,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"near leg has no signalled address",
             ));
         };
-        let plan = wiring.dtls_call_plan(a_rtp, certificate, peer_fingerprint);
+        let plan = wiring.dtls_call_plan(
+            a_rtp,
+            certificate,
+            peer_fingerprint,
+            self.datapath.watch_ice_validated(wiring.far.rtp.id),
+        );
         self.redirect_endpoints(
             [wiring.near.rtp.id, wiring.far.rtp.id]
                 .into_iter()
@@ -477,7 +512,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"near leg has no signalled address",
             ));
         };
-        let plan = wiring.offerer_dtls_call_plan(a_rtp, certificate, peer_fingerprint, role);
+        let plan = wiring.offerer_dtls_call_plan(
+            a_rtp,
+            certificate,
+            peer_fingerprint,
+            role,
+            self.datapath.watch_ice_validated(wiring.near.rtp.id),
+        );
         self.redirect_endpoints(
             [wiring.near.rtp.id, wiring.far.rtp.id]
                 .into_iter()
@@ -554,7 +595,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // it completes. As on the bridge path, a renegotiation keeps the live association, which also
         // re-keys the actor this answer just rebuilt (it starts pending, and the handshake that would
         // key it already happened).
-        let plan = wiring.dtls_call_plan(inputs.a_rtp, certificate, peer_fingerprint);
+        let plan = wiring.dtls_call_plan(
+            inputs.a_rtp,
+            certificate,
+            peer_fingerprint,
+            self.datapath.watch_ice_validated(far.rtp.id),
+        );
         if !self.dtls_bridge().renegotiate(&plan) {
             self.dtls_bridge().register_for_pipeline(
                 plan,

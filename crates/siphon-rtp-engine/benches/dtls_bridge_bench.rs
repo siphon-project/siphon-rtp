@@ -160,6 +160,7 @@ fn dtls_bridge_handle(criterion: &mut Criterion) {
             role: DtlsRole::Server,
             peer_fingerprint: peer_cert.fingerprint(),
             gate_on_ice: false,
+            ice_validated: None,
             plain_rtcp: rtcp,
         }
     };

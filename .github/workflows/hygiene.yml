@@ -57,7 +57,6 @@ jobs:
           crates/siphon-rtp-codec/src/amr/nb/enc_cb.rs 1905 # reference port
           crates/siphon-rtp-codec/src/amr/wb/enc_acelp.rs 1850 # reference port
           crates/siphon-rtp-codec/src/opus/enc/encoder.rs 1791 # reference port
-          crates/siphon-rtp-xdp/src/lib.rs 1567 # excluded workspace
           '
           status=0
           while IFS= read -r file; do
