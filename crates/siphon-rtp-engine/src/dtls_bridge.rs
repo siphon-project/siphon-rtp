@@ -284,6 +284,21 @@ pub struct DtlsBridge<D: Datapath> {
     pipeline_keys: Arc<DashMap<EndpointId, Arc<Mutex<SecureLeg>>>>,
 }
 
+/// Dropping the bridge aborts every session it still owns, as per-call teardown does through
+/// `retire`. Dropping the `JoinHandle`s alone would only detach those tasks, and a
+/// pending handshake whose transport channels went with the bridge does not end: the DTLS connection's
+/// reader retries every read that fails at once, and a passive handshake has no timeout to stop it.
+/// That keeps a worker busy for good, so a runtime shutting down, as the engine's does, never finishes.
+impl<D: Datapath> Drop for DtlsBridge<D> {
+    fn drop(&mut self) {
+        for session in &self.sessions {
+            for task in session.value() {
+                task.abort();
+            }
+        }
+    }
+}
+
 impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
     /// Create an empty bridge over `datapath` (a clone of the engine's datapath, used to transmit).
     #[must_use]
@@ -970,6 +985,57 @@ mod tests {
                 .map(|entry| *entry.borrow()),
             Some(Some(signalled)),
             "ungated legs start immediately at the signalled address"
+        );
+    }
+
+    #[test]
+    fn dropping_the_bridge_ends_a_pending_handshake() {
+        // A passive handshake with no peer never finishes on its own. When the bridge that owns it is
+        // dropped, the handshake's transport channels go with it, so every read the DTLS connection's
+        // reader makes fails at once, and that reader retries any read error that is not a fatal alert.
+        // A task the bridge merely detached keeps that loop running, and once such loops occupy every
+        // worker a runtime shutting down waits on workers that never park. Dropping the bridge has to
+        // end the handshakes instead. One pending handshake per worker reproduces it.
+        const WORKERS: usize = 2;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(WORKERS)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let datapath = UdpLoopbackDatapath::new();
+            let bridge = DtlsBridge::new(datapath.clone());
+            for _ in 0..WORKERS {
+                let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+                let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+                bridge.register(DtlsCallPlan {
+                    plain_endpoint: plain.id,
+                    plain_source: SourceFilter::Any,
+                    plain_dst: "192.0.2.1:20000".parse().expect("addr"),
+                    secure_endpoint: secure.id,
+                    secure_source: SourceFilter::Any,
+                    secure_dst: "192.0.2.7:30000".parse().expect("addr"),
+                    secure_local: secure.local_addr,
+                    certificate: DtlsCertificate::generate().expect("cert"),
+                    role: DtlsRole::Server,
+                    peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
+                    gate_on_ice: false,
+                    plain_rtcp: None,
+                });
+            }
+            // Let the handshakes start and wait for a ClientHello that never comes.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(bridge);
+        });
+        // Off the runtime, so a runtime whose workers are all stuck cannot stall the test itself: give
+        // a handshake that outlived its bridge time to start retrying its closed transport.
+        std::thread::sleep(Duration::from_millis(300));
+        let shutdown_started = std::time::Instant::now();
+        runtime.shutdown_timeout(Duration::from_secs(3));
+        let shutdown = shutdown_started.elapsed();
+        assert!(
+            shutdown < Duration::from_secs(2),
+            "a pending handshake outlived its bridge and held a worker for {shutdown:?}"
         );
     }
 
