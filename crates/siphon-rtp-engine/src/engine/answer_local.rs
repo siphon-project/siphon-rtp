@@ -99,6 +99,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_dtls: false,
                 far_dtls_role: None,
                 far_downgraded_to_plain: false,
+                far_rtcp_fallback: false,
                 // Recorded for symmetry; a single-leg call never reaches `answer`.
                 near_secure: info.secure,
                 // A single-leg call's keying lives on the takeover leg, not on the two-party pair.

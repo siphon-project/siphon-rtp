@@ -513,8 +513,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // per side (force mux, demux, or reject). This drives the per-leg port count *and* the far
         // SDP's `a=rtcp-mux` presentation — resolved once here so allocation and rewrite agree.
         let (near_mux, far_mux) = resolve_rtcp_mux(info.rtcp_mux, &profile.rtcp_mux);
+        // Settled before any port is bound: whether the engine terminates the offerer's keying decides
+        // whether B's leg needs a fallback RTCP port, and a refusal then has nothing to free.
+        let OfferSecurity {
+            far_downgraded_to_plain,
+            far_dtls,
+            far_local_crypto,
+            near_local_crypto,
+            near_remote_crypto,
+            far_dtls_presentation,
+            near_dtls,
+        } = match self.offer_security(profile, &info) {
+            Ok(security) => security,
+            Err(result) => return *result,
+        };
+        // A terminated DTLS-SRTP offerer multiplexes RTCP and B is offered the same, but B may decline
+        // `a=rtcp-mux` (RFC 5761 §5.1.1). So B's leg also binds a separate RTCP port, advertised with
+        // `a=rtcp` beside `a=rtcp-mux`, which an offer may carry together; the DTLS bridge carries RTCP
+        // on it when B declines, and the answer releases it when B multiplexes after all.
+        let far_rtcp_fallback = far_mux && near_dtls.is_some();
         let near_per_leg = if near_mux { 1 } else { 2 };
-        let far_per_leg = if far_mux { 1 } else { 2 };
+        let far_per_leg = if far_mux && !far_rtcp_fallback { 1 } else { 2 };
         // Named-interface selection (rtpengine `direction`): `direction[0]` picks the near (A) leg's
         // interface and `direction[1]` the far (B) leg's. Each resolves to a bind IP the datapath
         // sources the leg from and an advertised IP put into that leg's rewritten SDP
@@ -542,7 +561,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let near_rtp = near_endpoints[0];
         let far_rtp = far_endpoints[0];
         let near_rtcp = (!near_mux).then(|| near_endpoints[1]);
-        let far_rtcp = (!far_mux).then(|| far_endpoints[1]);
+        let far_rtcp = (!far_mux || far_rtcp_fallback).then(|| far_endpoints[1]);
         // Each leg's advertised IP: the interface override, else the address the datapath actually
         // bound (the pre-interface behaviour). The advertised IP is presentation-only — it never feeds
         // the source gate or latch, so it is not an RTPbleed vector (docs/security-and-nat.md §12.1).
@@ -609,22 +628,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_mismatch,
             far_ice_removed,
         );
-
-        let OfferSecurity {
-            far_downgraded_to_plain,
-            far_dtls,
-            far_local_crypto,
-            near_local_crypto,
-            near_remote_crypto,
-            far_dtls_presentation,
-            near_dtls,
-        } = match self.offer_security(profile, &info) {
-            Ok(security) => security,
-            Err(result) => {
-                self.free(&endpoints).await;
-                return *result;
-            }
-        };
 
         // RFC 5761: when a `rtcp-mux` directive was given, present the resolved far-side mux to B
         // explicitly (force `a=rtcp-mux` on, or strip it); otherwise mirror the offer (`None`).
@@ -778,6 +781,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // Decided by B's answer.
                 far_dtls_role: None,
                 far_downgraded_to_plain,
+                far_rtcp_fallback,
                 // A's own posture, for the late-`ws_uri` takeover guard in `answer`.
                 near_secure: info.secure,
                 near_local_crypto,

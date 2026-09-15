@@ -291,6 +291,10 @@ struct Call {
     /// `far_local_crypto` and `far_dtls` are both empty for it, exactly as for a far leg that simply
     /// passes the offerer's transport through — and a re-offer from A must present B the same.
     far_downgraded_to_plain: bool,
+    /// Whether B's leg holds a fallback RTCP port offered beside `a=rtcp-mux` for a terminated
+    /// DTLS-SRTP offerer (RFC 5761 §5.1.1), not yet settled by B's answer: kept if B declines
+    /// multiplexing, released if B multiplexes. Cleared by the first answer either way.
+    far_rtcp_fallback: bool,
     /// Whether the **offerer's own** `m=audio` was a secure profile (`RTP/SAVP[F]` or
     /// `UDP/TLS/RTP/SAVP[F]`), captured at offer. Distinct from `far_local_crypto`/`far_dtls`, which
     /// describe the leg the engine *offers* to B. Read by `answer` to refuse a WebSocket takeover

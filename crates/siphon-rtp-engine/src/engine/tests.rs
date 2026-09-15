@@ -12476,6 +12476,175 @@ async fn a_dtls_offerer_is_bridged_to_a_plain_callee_end_to_end() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_muxed_dtls_offerers_rtcp_reaches_a_callee_that_declines_rtcp_mux() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_dtls::DtlsCertificate;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // A is a WebRTC caller: DTLS-SRTP with RTCP multiplexed. B, the plain callee, declines
+    // `a=rtcp-mux` and keeps RTCP on its own port (RFC 5761 §5.1.1, RFC 3605). The offer toward B
+    // therefore has to carry a separate RTCP port beside `a=rtcp-mux`, which an offer may do, so that
+    // B's RTCP has somewhere to land; the bridge then carries it to A as SRTCP on the muxed leg, and
+    // A's SRTCP to B's RTCP port in the clear.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let socket_a = Arc::new(
+        UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a"),
+    );
+    let addr_a = socket_a.local_addr().expect("addr a");
+    let (_phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let (phone_b_rtcp, addr_b_rtcp) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let caller = DtlsCertificate::generate().expect("caller cert");
+    let call_id = "dtls-offerer-rtcp-fallback";
+
+    let offered = offer_from_a(
+        &engine,
+        call_id,
+        dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+        plain_far_leg(),
+    )
+    .await;
+    assert!(offered.rtcp_mux, "B is offered A's multiplexing");
+    assert!(
+        engine
+            .calls
+            .get(call_id)
+            .and_then(|call| call.far)
+            .and_then(|far| far.rtcp)
+            .is_some(),
+        "and a separate RTCP port on B's leg, in case B declines it"
+    );
+    let engine_far_rtcp = offered.remote_rtcp;
+
+    let answer_sdp = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp:{rtcp_port}\r\n",
+        ip = addr_b.ip(),
+        port = addr_b.port(),
+        rtcp_port = addr_b_rtcp.port(),
+    );
+    let answered = answer_from_b(&engine, call_id, answer_sdp, ProfileFlags::default()).await;
+    let engine_near = answered.remote_rtp;
+    let engine_fingerprint = answered
+        .fingerprint
+        .clone()
+        .expect("the engine's fingerprint in A's answer");
+    let mut caller_leg = peer_dtls_handshake_server(
+        socket_a.clone(),
+        addr_a,
+        engine_near,
+        &caller,
+        &engine_fingerprint,
+    )
+    .await;
+
+    // B → engine: plain RTCP on B's own RTCP port, relayed to A as SRTCP on the muxed leg.
+    let report = vec![0x80, 201, 0x00, 0x01, 0x0B, 0x0B, 0x0B, 0x0B];
+    let mut buffer = [0u8; 2048];
+    let mut at_a = None;
+    for _ in 0..25 {
+        phone_b_rtcp
+            .send_to(&report, engine_far_rtcp)
+            .await
+            .expect("b rtcp send");
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(150), socket_a.recv_from(&mut buffer)).await
+        {
+            at_a = Some(buffer[..len].to_vec());
+            break;
+        }
+    }
+    let mut recovered = Vec::new();
+    caller_leg
+        .unprotect(&at_a.expect("A received B's RTCP"), &mut recovered)
+        .expect("caller unprotects SRTCP");
+    assert_eq!(recovered, report, "B's RTCP reaches A as SRTCP");
+
+    // A → engine: SRTCP on the muxed leg, relayed to B's RTCP port in the clear.
+    let a_report = vec![0x80, 201, 0x00, 0x01, 0x0A, 0x0A, 0x0A, 0x0A];
+    let mut at_b_rtcp = None;
+    for _ in 0..25 {
+        let mut sealed = Vec::new();
+        caller_leg
+            .protect(&a_report, &mut sealed)
+            .expect("caller protects SRTCP");
+        socket_a
+            .send_to(&sealed, engine_near)
+            .await
+            .expect("a send");
+        if let Ok(Ok((len, _))) = timeout(
+            Duration::from_millis(150),
+            phone_b_rtcp.recv_from(&mut buffer),
+        )
+        .await
+        {
+            at_b_rtcp = Some(buffer[..len].to_vec());
+            break;
+        }
+    }
+    assert_eq!(
+        at_b_rtcp.expect("B received A's RTCP"),
+        a_report,
+        "A's SRTCP reaches B's RTCP port decrypted"
+    );
+}
+
+#[tokio::test]
+async fn a_dtls_offerers_fallback_rtcp_port_is_freed_when_the_callee_multiplexes() {
+    // The separate RTCP port offered beside `a=rtcp-mux` exists only in case B declines it. When B
+    // accepts, RTCP rides the RTP port (RFC 5761 §5.1.1) and the fallback port is released rather than
+    // held, unused, for the life of the call.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let call_id = "dtls-offerer-rtcp-accepted";
+    offer_from_a(
+        &engine,
+        call_id,
+        dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+        plain_far_leg(),
+    )
+    .await;
+    let fallback = engine
+        .calls
+        .get(call_id)
+        .and_then(|call| call.far)
+        .and_then(|far| far.rtcp)
+        .map(|endpoint| endpoint.id)
+        .expect("a fallback RTCP port is bound at offer");
+    answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(
+        engine
+            .calls
+            .get(call_id)
+            .and_then(|call| call.far)
+            .is_some_and(|far| far.rtcp.is_none()),
+        "B multiplexes, so its leg keeps no RTCP port"
+    );
+    assert!(
+        !engine.endpoint_calls.contains_key(&fallback),
+        "and the fallback port is released"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn answer_local_answers_a_dtls_offer_without_a_setup_passive() {
     // RFC 4145 §4.1: an offer without `a=setup` is `active`, and its answerer is `passive`. The
     // single-leg takeover used to answer such an offer `active`, so both ends took the DTLS client
