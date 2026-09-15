@@ -5,7 +5,20 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.7.1] — 2026-09-15
+
+A WebRTC (DTLS-SRTP) caller can now reach a plain RTP callee through `offer`/`answer`, and stays keyed
+across a renegotiation from either side. Two keying fixes ride along: a caller whose SRTP the engine
+terminates no longer has its own `a=crypto`, or its DTLS `a=fingerprint`/`a=setup`/`a=tls-id`, handed
+to the callee when either party renegotiates.
+
+**A patch.** `siphon-rtp-proto` changes only a doc comment (`ProfileFlags::dtls`); every type and the
+JSON wire are unchanged, so a controller on `^0.7` needs nothing. The internal path-deps move from
+`"0.7.0"` to `"0.7.1"`.
+
+**Still to come.** A DTLS-SRTP caller that does not multiplex RTCP is refused rather than bridged, and
+without `--ice-full` its handshake runs toward the signalled address rather than waiting for a
+validated ICE check.
 
 ### Added
 
