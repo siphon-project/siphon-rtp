@@ -251,6 +251,12 @@ struct Call {
     /// B presents these to A again, for the same reason [`Self::far_local_candidates`] exists. Empty
     /// before an answer, and for a non-ICE call.
     near_local_candidates: Vec<siphon_rtp_ice::Candidate>,
+    /// Whether `ice: remove` took ICE off the **far** leg, at offer or on a re-offer from A since.
+    /// B is then presented no ICE and its leg is never armed with it, whatever B's own SDP carries,
+    /// while [`Self::ice`] may still hold the engine's credentials for an ICE offerer on the near leg
+    /// (RFC 8839 §4.2.5 — A cannot use ICE unless its answer carries them). Kept because those
+    /// credentials alone no longer say whether B's leg uses ICE.
+    far_ice_removed: bool,
     from_tag: String,
     to_tag: Option<String>,
     near: Leg,

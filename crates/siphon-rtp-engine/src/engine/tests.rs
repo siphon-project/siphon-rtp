@@ -13757,6 +13757,426 @@ async fn a_non_ice_answer_clears_the_ice_gate_gathering_installed_on_the_far_leg
     assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
 }
 
+// ---- `ice: remove` overrides the far offer only ------------------------------------------------
+
+/// Every ICE attribute an SDP can carry, from the engine or from a peer (RFC 8839 §5, RFC 8838 §14).
+const ICE_ATTRIBUTES: [&str; 6] = [
+    "a=ice-lite",
+    "a=ice-ufrag",
+    "a=ice-pwd",
+    "a=candidate",
+    "a=end-of-candidates",
+    "a=ice-options",
+];
+
+/// Assert `sdp` carries no ICE attribute at all.
+fn assert_no_ice(sdp: &str, why: &str) {
+    for attribute in ICE_ATTRIBUTES {
+        assert!(
+            !sdp.contains(attribute),
+            "{why}: found {attribute} in {sdp}"
+        );
+    }
+}
+
+/// `sdp`'s lines with the engine's own audio port masked, so two calls presenting the same input
+/// compare line for line.
+fn with_engine_port_masked(sdp: &str) -> Vec<String> {
+    sdp.lines()
+        .map(|line| match line.strip_prefix("m=audio ") {
+            Some(rest) => format!(
+                "m=audio PORT {}",
+                rest.split_once(' ').map_or("", |(_, formats)| formats)
+            ),
+            None => line.to_string(),
+        })
+        .collect()
+}
+
+/// `offer` from A (tag `a`) and return the SDP text delivered to B.
+async fn offer_text_from_a(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+    sdp: String,
+    profile: ProfileFlags,
+) -> String {
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.into(),
+                from_tag: "a".into(),
+                sdp,
+                profile,
+            },
+        )
+        .await;
+    ok_sdp_text(&offer)
+}
+
+/// `answer` from B (tags `a` → `b`) and return the SDP text delivered to A.
+async fn answer_text_from_b(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+    sdp: String,
+    profile: ProfileFlags,
+) -> String {
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: call_id.into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp,
+                profile,
+            },
+        )
+        .await;
+    ok_sdp_text(&answer)
+}
+
+/// The profile carrying `ice: remove`.
+fn ice_remove_profile() -> ProfileFlags {
+    ProfileFlags {
+        ice: Some("remove".into()),
+        ..Default::default()
+    }
+}
+
+/// Send one RTP packet from B to the call's far leg and assert it reaches A: proof the far leg is
+/// not behind the ICE layer-4 gate, which would drop media from a source that never ran a check.
+async fn assert_b_media_reaches_a(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+    phone_a: &UdpSocket,
+    phone_b: &UdpSocket,
+) {
+    let far_rtp = engine
+        .calls
+        .get(call_id)
+        .map(|call| call.far_leg().rtp.local_addr)
+        .expect("call exists");
+    phone_b
+        .send_to(&rtp(0x0B0B_0B0B), far_rtp)
+        .await
+        .expect("send from B");
+    let mut buffer = [0u8; 2048];
+    let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+        .await
+        .expect("B's media reaches A — the far leg is not ICE-gated")
+        .expect("recv");
+    assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ice_remove_strips_the_far_leg_and_keeps_the_offerers_ice() {
+    // `ice: remove` overrides the ICE posture of the far offer (docs/control/json.md), so it keeps ICE
+    // away from B. It must not take ICE away from the offerer: RFC 8839 §4.2.5 has an agent indicate
+    // ICE support by the ice-ufrag and ice-pwd in its offer or answer, so an answer to A without them
+    // turns ICE off on A's leg too.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+
+    let offer = offer_text_from_a(
+        &engine,
+        "remove-far",
+        ice_offer_with_candidate(addr_a),
+        ice_remove_profile(),
+    )
+    .await;
+    assert_no_ice(&offer, "B's offer under ice: remove");
+
+    let answer = answer_text_from_b(
+        &engine,
+        "remove-far",
+        sdp_for(addr_b, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(answer.contains("a=ice-lite"), "{answer}");
+    let near = sdp::parse(&answer).expect("parse the answer A receives");
+    let engine_ufrag = near
+        .ice_ufrag
+        .clone()
+        .unwrap_or_else(|| panic!("A's answer carries the engine's ice-ufrag: {answer}"));
+    let engine_pwd = near
+        .ice_pwd
+        .clone()
+        .unwrap_or_else(|| panic!("A's answer carries the engine's ice-pwd: {answer}"));
+    assert_ne!(
+        engine_ufrag, A_UFRAG,
+        "the engine's own credentials, not A's"
+    );
+    assert!(
+        near.candidates
+            .iter()
+            .any(|candidate| candidate.address == near.remote_rtp),
+        "A is given the near leg's own candidate: {answer}"
+    );
+
+    // A's connectivity check against the near leg is answered under the engine's credentials.
+    let username = format!("{engine_ufrag}:{A_UFRAG}");
+    let check = siphon_rtp_stun::binding_request(&[9u8; 12], &username, engine_pwd.as_bytes());
+    phone_a
+        .send_to(&check, near.remote_rtp)
+        .await
+        .expect("send check");
+    let mut buffer = [0u8; 2048];
+    let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+        .await
+        .expect("the near leg answers A's check")
+        .expect("recv response");
+    let response = siphon_rtp_stun::parse(&buffer[..len]).expect("parse response");
+    assert_eq!(response.message_type, siphon_rtp_stun::BINDING_SUCCESS);
+    assert!(siphon_rtp_stun::verify_message_integrity(
+        &buffer[..len],
+        engine_pwd.as_bytes()
+    ));
+
+    assert_b_media_reaches_a(&engine, "remove-far", &phone_a, &phone_b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ice_remove_toward_an_offerer_without_ice_changes_nothing() {
+    // A plain offerer has no ICE for `remove` to keep on its leg or strip from B's, so both
+    // presentations are exactly what the same call gets with no directive.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+
+    let removed_offer = offer_text_from_a(
+        &engine,
+        "remove-plain",
+        sdp_for(addr_a, true),
+        ice_remove_profile(),
+    )
+    .await;
+    let removed_answer = answer_text_from_b(
+        &engine,
+        "remove-plain",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let mirrored_offer = offer_text_from_a(
+        &engine,
+        "mirror-plain",
+        sdp_for(addr_a, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let mirrored_answer = answer_text_from_b(
+        &engine,
+        "mirror-plain",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+
+    assert_no_ice(&removed_offer, "B's offer");
+    assert_no_ice(&removed_answer, "A's answer");
+    assert_eq!(
+        with_engine_port_masked(&removed_offer),
+        with_engine_port_masked(&mirrored_offer)
+    );
+    assert_eq!(
+        with_engine_port_masked(&removed_answer),
+        with_engine_port_masked(&mirrored_answer)
+    );
+    assert!(
+        engine
+            .calls
+            .get("remove-plain")
+            .is_some_and(|call| call.ice.is_none()),
+        "no engine credentials are minted for a plain offerer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ice_remove_never_arms_the_far_leg_when_b_answers_with_ice_anyway() {
+    // B was offered no ICE, so ICE in its answer is not a usable ICE session: the engine's credentials
+    // were only ever given to A. Arming B's leg on them would put the layer-4 gate on a party that
+    // cannot pass it and drop its media for the life of the call.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+
+    offer_text_from_a(
+        &engine,
+        "remove-b-ice",
+        ice_offer_with_candidate(addr_a),
+        ice_remove_profile(),
+    )
+    .await;
+    let b_answer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:BBBBBB\r\na=ice-pwd:bpasswordbpasswordbpas\r\n\
+             m=audio {port} RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:peer 1 UDP 2130706431 {ip} {port} typ host\r\n",
+        ip = addr_b.ip(),
+        port = addr_b.port()
+    );
+    let answer =
+        answer_text_from_b(&engine, "remove-b-ice", b_answer, ProfileFlags::default()).await;
+    let near = sdp::parse(&answer).expect("parse the answer A receives");
+    assert!(
+        near.ice_ufrag.is_some(),
+        "A keeps the engine's ICE: {answer}"
+    );
+    assert!(!answer.contains("BBBBBB"), "B's ICE is not passed to A");
+    assert!(
+        engine
+            .calls
+            .get("remove-b-ice")
+            .is_some_and(|call| call.far_remote_ice.is_none()),
+        "B's credentials are not recorded for a leg that runs without ICE"
+    );
+
+    assert_b_media_reaches_a(&engine, "remove-b-ice", &phone_a, &phone_b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reoffer_under_ice_remove_keeps_b_free_of_ice_and_a_on_the_engines_ice() {
+    // A re-offer re-presents B's leg as B last saw it, with no ICE, whether or not it restates the
+    // directive, and across an ICE restart from A (RFC 8445 §9). A's leg keeps the engine's ICE through
+    // all of it.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let call_id = "remove-reoffer";
+
+    offer_text_from_a(
+        &engine,
+        call_id,
+        ice_offer_with_candidate(addr_a),
+        ice_remove_profile(),
+    )
+    .await;
+    let answered = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(answered.ice_ufrag.is_some(), "A is answered with ICE");
+
+    let restated = reoffer_from(
+        &engine,
+        call_id,
+        "a",
+        reoffer_sdp(addr_a, A_UFRAG, A_PWD),
+        ice_remove_profile(),
+    )
+    .await;
+    assert_no_ice(&ok_sdp_text(&restated), "re-offer restating ice: remove");
+    let unrestated = reoffer_from(
+        &engine,
+        call_id,
+        "a",
+        reoffer_sdp(addr_a, A_UFRAG, A_PWD),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert_no_ice(&ok_sdp_text(&unrestated), "re-offer without the directive");
+    let reanswered = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert_eq!(
+        reanswered.ice_ufrag, answered.ice_ufrag,
+        "no restart, A keeps the same engine ICE"
+    );
+    assert!(!reanswered.candidates.is_empty());
+
+    let restarted = reoffer_from(
+        &engine,
+        call_id,
+        "a",
+        reoffer_sdp(addr_a, "CCCCCC", "cpasswordcpasswordcpas"),
+        ice_remove_profile(),
+    )
+    .await;
+    assert_no_ice(&ok_sdp_text(&restarted), "re-offer restarting A's ICE");
+    let restart_answer = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(
+        restart_answer.ice_ufrag.is_some(),
+        "A keeps ICE across a restart"
+    );
+    assert_ne!(
+        restart_answer.ice_ufrag, answered.ice_ufrag,
+        "a restart mints fresh engine credentials"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ice_remove_still_drops_ice_for_a_ws_takeover() {
+    // A takeover leg runs no ICE agent on offer/answer (see `offer_takeover_refusal`), so for a
+    // takeover `remove` keeps taking ICE off A's leg, whether `ws_uri` is named at offer or first at
+    // answer.
+    let (ws_at_offer, _offer_frames, _offer_downlink) = takeover_ws_server().await;
+    let (ws_at_answer, _answer_frames, _answer_downlink) = takeover_ws_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+
+    offer_text_from_a(
+        &engine,
+        "ws-at-offer",
+        ice_offer_with_candidate(addr_a),
+        ProfileFlags {
+            ws_uri: Some(ws_at_offer),
+            ..ice_remove_profile()
+        },
+    )
+    .await;
+    let answer = answer_text_from_b(
+        &engine,
+        "ws-at-offer",
+        sdp_for(addr_b, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert_no_ice(&answer, "takeover named at offer");
+
+    offer_text_from_a(
+        &engine,
+        "ws-at-answer",
+        ice_offer_with_candidate(addr_a),
+        ice_remove_profile(),
+    )
+    .await;
+    let answer = answer_text_from_b(
+        &engine,
+        "ws-at-answer",
+        sdp_for(addr_b, false),
+        ProfileFlags {
+            ws_uri: Some(ws_at_answer),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_no_ice(&answer, "takeover named first at answer");
+    assert!(
+        engine
+            .calls
+            .get("ws-at-answer")
+            .is_some_and(|call| call.ice.is_none()),
+        "the takeover leg holds no engine ICE credentials"
+    );
+}
+
 // ---- RFC 8838 trickle ------------------------------------------------------------------------
 
 /// Stand up a full-ICE call and return its near RTP endpoint id.

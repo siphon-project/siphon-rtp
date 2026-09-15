@@ -79,19 +79,21 @@ fn offer_takeover_refusal(profile: &ProfileFlags, info: &sdp::MediaInfo) -> Opti
     None
 }
 
-/// An offer's ICE posture: the control directive, whether the offer's ICE was altered in transit
-/// (RFC 8839 §5.3), and the engine's own credentials when the leg uses ICE.
+/// An offer's ICE posture: whether `ice: remove` takes ICE off the far leg, whether the offer's ICE
+/// was altered in transit (RFC 8839 §5.3), and the engine's own credentials when a leg uses ICE.
 fn offer_ice(
     profile: &ProfileFlags,
     info: &sdp::MediaInfo,
     call_id: &str,
-) -> (Option<IceDirective>, bool, Option<ice::IceCredentials>) {
+) -> (bool, bool, Option<ice::IceCredentials>) {
     // ICE-lite posture (docs/security-and-nat.md §4 layer 4): mint our own short-term credentials
-    // when the leg uses ICE — advertised in the rewritten SDP and installed on the endpoints so
+    // when a leg uses ICE — advertised in the rewritten SDP and installed on the endpoints so
     // the responder can validate the peer's connectivity checks. The control `profile.ice` field
     // overrides the SDP-derived default (RFC 8445): `force`/`force-relay` mint them regardless of
-    // the offer, `remove` suppresses them, otherwise mirror whether the offer carried ICE.
+    // the offer, `remove` takes ICE off the far leg only, otherwise mirror whether the offer carried
+    // ICE.
     let ice_directive = ice_directive(profile);
+    let far_ice_removed = ice_directive == Some(IceDirective::Remove);
     // RFC 8839 §5.3: the offer carried candidates but its default destination is none of them, so
     // the SDP was rewritten in transit (a SIP ALG). ICE describes a topology that no longer
     // matches where media actually goes, so it must not be used — we say `a=ice-mismatch` and both
@@ -112,7 +114,12 @@ fn offer_ice(
     let want_ice = match ice_directive {
         _ if ice_mismatch => false,
         Some(IceDirective::Force) => true,
-        Some(IceDirective::Remove) => false,
+        // `remove` keeps ICE away from B, not from an ICE offerer: A indicates ICE support by its
+        // `a=ice-ufrag`/`a=ice-pwd` and cannot use ICE unless the answer carries ours (RFC 8839
+        // §4.2.5), so credentials are still minted for A's leg and only the far presentation strips
+        // them. A takeover leg is the exception — no ICE agent runs for it on offer/answer (see
+        // `offer_takeover_refusal`), so there `remove` takes ICE off A's leg as well.
+        Some(IceDirective::Remove) => info.is_ice() && profile.ws_uri.is_none(),
         None => info.is_ice(),
     };
     let ice_creds = if want_ice {
@@ -120,7 +127,38 @@ fn offer_ice(
     } else {
         None
     };
-    (ice_directive, ice_mismatch, ice_creds)
+    (far_ice_removed, ice_mismatch, ice_creds)
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// The candidates the far leg is offered with, gathered before the offer is written — the offer
+    /// *is* the candidate list, and without trickle there is no second chance to add to it (RFC 8445
+    /// §5.1.1). Host-only gathering (the default) is instant and touches no socket; with a STUN server
+    /// configured this costs one bounded round trip on the control path.
+    ///
+    /// None without credentials, and none for a far leg `ice: remove` took ICE off: it presents no
+    /// candidates, and gathering against a server would install the ICE responder on endpoints whose
+    /// peer never runs a check.
+    async fn far_offer_candidates(
+        &self,
+        far_leg: &Leg,
+        ice_creds: Option<&ice::IceCredentials>,
+        far_ice_removed: bool,
+    ) -> Vec<siphon_rtp_ice::Candidate> {
+        match ice_creds {
+            Some(creds) if !far_ice_removed => {
+                self.gather_leg_candidates(
+                    far_leg,
+                    &IceConfig {
+                        local_ufrag: creds.ufrag.clone(),
+                        local_pwd: creds.pwd.clone(),
+                    },
+                )
+                .await
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// The transport security an offer settles for both legs.
@@ -405,7 +443,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return refusal;
         }
 
-        let (ice_directive, ice_mismatch, ice_creds) = offer_ice(profile, &info, &call_id);
+        let (far_ice_removed, ice_mismatch, ice_creds) = offer_ice(profile, &info, &call_id);
 
         // One RTP endpoint per leg, plus a companion RTCP endpoint unless the stream is muxed. The
         // *near* leg binds the family of the offer's signalled `c=` line (RFC 4566 §5.7). The *far*
@@ -503,31 +541,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None if text_offered_secure => TextRewrite::Decline,
             None => TextRewrite::None,
         };
-        // ICE rewrite mode (RFC 8839 §5): re-originate ICE-lite when we minted creds; on `ice: remove`
-        // with none minted, strip the peer's ICE without advertising our own; otherwise pass it
+        // ICE rewrite mode (RFC 8839 §5): re-originate ICE-lite when we minted creds; when `ice: remove`
+        // took ICE off the far leg, strip the peer's ICE without advertising our own; otherwise pass it
         // through. `IceAdvertisement` borrows `ice_creds`, so it is built here and kept alive to rewrite.
-        // Gather the far leg's candidates before the offer is written — the offer *is* the candidate
-        // list, and without trickle there is no second chance to add to it (RFC 8445 §5.1.1). Host-only
-        // gathering (the default) is instant and touches no socket; with a STUN server configured this
-        // costs one bounded round trip on the control path.
-        let far_ice_candidates = match ice_creds.as_ref() {
-            Some(creds) => {
-                self.gather_leg_candidates(
-                    &far_leg,
-                    &IceConfig {
-                        local_ufrag: creds.ufrag.clone(),
-                        local_pwd: creds.pwd.clone(),
-                    },
-                )
-                .await
-            }
-            None => Vec::new(),
-        };
+        let far_ice_candidates = self
+            .far_offer_candidates(&far_leg, ice_creds.as_ref(), far_ice_removed)
+            .await;
         let ice_rewrite = offer_ice_rewrite(
             ice_creds.as_ref(),
             &far_ice_candidates,
             ice_mismatch,
-            ice_directive,
+            far_ice_removed,
         );
 
         let OfferSecurity {
@@ -675,6 +699,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_local_candidates: far_ice_candidates.clone(),
                 // Gathered at answer, when the near leg is first presented to A.
                 near_local_candidates: Vec::new(),
+                far_ice_removed,
                 from_tag,
                 to_tag: None,
                 near: Leg {

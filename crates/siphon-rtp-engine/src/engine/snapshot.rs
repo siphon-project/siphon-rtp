@@ -486,6 +486,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // call gathers them again — host candidates on the same ports come out the same.
                 far_local_candidates: Vec::new(),
                 near_local_candidates: Vec::new(),
+                // Not in the snapshot. A later re-offer from A presents B's leg with the engine's ICE
+                // unless it restates `ice: remove` — the same gap `far_downgraded_to_plain` has below.
+                far_ice_removed: false,
                 from_tag: snapshot.from_tag,
                 to_tag: snapshot.to_tag,
                 near,
