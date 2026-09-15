@@ -55,8 +55,10 @@ table:
 | anything else | dropped | |
 
 So a single engine endpoint per WebRTC leg carries the whole stack, and RTCP is
-expected muxed on it too (`a=rtcp-mux`, RFC 5761, as WebRTC requires; a
-non-muxed DTLS leg's companion RTCP port is a follow-up).
+expected muxed on it too (`a=rtcp-mux`, RFC 5761, as WebRTC requires). The plain
+side of a DTLS bridge does not have to mux: when it keeps RTCP on its own port
+(RFC 5761 §5.1.1), the bridge relays RTCP to and from that port and carries it as
+SRTCP on the muxed DTLS leg.
 
 ## DTLS-SRTP: offer, answer, handshake
 

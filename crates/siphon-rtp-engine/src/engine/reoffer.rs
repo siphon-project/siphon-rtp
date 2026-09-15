@@ -457,9 +457,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
         let presented_media = presented_leg.engine_media();
-        // RFC 5761: present the leg's bound mux state when a `rtcp-mux` directive asks for it, exactly
-        // as `offer` and `answer` do.
-        let mux_override = (!profile.rtcp_mux.is_empty()).then_some(presented_leg.rtcp.is_none());
+        // RFC 5761: present the leg's bound mux state when a `rtcp-mux` directive asks for it, or when
+        // the re-offering party's SDP disagrees with it, exactly as `answer` does. The presented SDP is
+        // rewritten from the other party's, whose `a=rtcp-mux` line says nothing about this leg.
+        let presented_muxed = presented_leg.rtcp.is_none();
+        let mux_override = (!profile.rtcp_mux.is_empty() || info.rtcp_mux != presented_muxed)
+            .then_some(presented_muxed);
         let codec_policy = parse_codec_flags(&profile.flags);
         let presentation = match presented_party {
             // Delivered to B: the far leg, presented as the original offer presented it.

@@ -34,6 +34,9 @@ struct ReversedAnswer {
     near_text_local_crypto: Option<CryptoAttribute>,
     /// The engine's DTLS role on the far leg, kept unless B's re-offer forces the other one.
     far_dtls_role: Option<DtlsRole>,
+    /// Whether A's answer carries `a=rtcp-mux`. The SDP presented to B is rewritten from A's answer,
+    /// not from B's re-offer, so this is what its `a=rtcp-mux` line starts from.
+    near_rtcp_mux: bool,
 }
 
 /// Move `codec` to the head of `info`'s format list, so the codec machinery reads it as the
@@ -224,6 +227,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         .is_some_and(|text| text.remote_rtp.port() != 0),
                     near_text_local_crypto: call.near_text_local_crypto,
                     far_dtls_role: call.far_dtls_role,
+                    near_rtcp_mux: answered.rtcp_mux,
                 };
                 drop(call);
                 (far, Some(context))
@@ -304,9 +308,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             dtls_role,
         } = *presented;
         // RFC 5761: each leg's mux state was fixed at offer — its companion RTCP endpoint exists iff it
-        // is non-muxed. When a `rtcp-mux` directive drove that decision, present it explicitly so the
-        // SDP matches the ports the engine actually bound; otherwise mirror the input (`None`).
+        // is non-muxed. The SDP presented to a party is rewritten from the *other* party's, so its
+        // `a=rtcp-mux` line must not decide what this party is told. Present the leg's own state
+        // explicitly whenever a directive drove it or the input disagrees with it, so the SDP matches
+        // the ports the engine actually bound; an answer carries `a=rtcp-mux` only if the offer did
+        // (RFC 5761 §5.1.1). When they agree, mirror the input (`None`) and leave its bytes alone.
         let mux_directive = !profile.rtcp_mux.is_empty();
+        // The SDP rewritten here is the answer as received: B's answer when B answered, A's when A
+        // answered B's re-offer. Its `a=rtcp-mux` line is the input each override starts from.
+        let input_mux = reversed.map_or(info.rtcp_mux, |reversed| reversed.near_rtcp_mux);
+        let near_mux_override =
+            (mux_directive || input_mux != near.rtcp.is_none()).then_some(near.rtcp.is_none());
+        let far_mux_override =
+            (mux_directive || input_mux != far.rtcp.is_none()).then_some(far.rtcp.is_none());
         // A transcoding call sends each party its own codec, so the SDP it is presented must advertise
         // that codec, never leak the other party's (RFC 3264 §6). A plain relay / SRTP bridge / WS leg
         // shares one codec across both sides, so its SDP already presents it — left untouched.
@@ -340,7 +354,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 engine: near.engine_media(),
                 ice: answer_ice_rewrite(ice_creds, near_ice_candidates),
                 security: near_security(near_local_crypto, far_local_crypto.is_some() || far_dtls),
-                mux_override: mux_directive.then_some(near.rtcp.is_none()),
+                mux_override: near_mux_override,
                 text: if near.text.is_none() {
                     TextRewrite::None
                 } else if secure_text_accepted {
@@ -394,7 +408,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         answer_ice_rewrite(ice_creds, far_ice_candidates)
                     },
                     security: far_security(far_downgraded_to_plain, dtls, far_crypto),
-                    mux_override: mux_directive.then_some(far.rtcp.is_none()),
+                    mux_override: far_mux_override,
                     text: if far.text.is_none() {
                         // No far text endpoint to anchor A's text to, and passing it through would
                         // hand B A's own text address.

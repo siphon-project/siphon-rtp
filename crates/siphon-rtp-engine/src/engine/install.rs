@@ -198,6 +198,20 @@ impl AnswerWiring<'_> {
             // (RFC 8445 §12). Without one there is no selection coming, and gating would hang a
             // leg that works perfectly well against its signalled address.
             gate_on_ice: self.agent_endpoints.contains(&self.far.rtp.id),
+            // A's separate RTCP port when A does not multiplex, gated to A's effective RTCP source
+            // like the RTP side. B, the DTLS peer, multiplexes (see `PlainRtcp`).
+            plain_rtcp: self
+                .near
+                .rtcp
+                .zip(self.near.remote_rtcp)
+                .map(|(endpoint, a_rtcp)| crate::dtls_bridge::PlainRtcp {
+                    endpoint: endpoint.id,
+                    source: bridge_source_filter(
+                        self.profile,
+                        self.near_gate_rtcp.unwrap_or(a_rtcp),
+                    ),
+                    dst: self.near_rtcp_dst.unwrap_or(a_rtcp),
+                }),
         }
     }
 }
@@ -355,7 +369,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// DTLS-SRTP far (B) leg → userspace DTLS bridge: the handshake keys the leg, then SRTP/SRTCP is
     /// terminated on B and plaintext relayed on A. B's answer must carry its certificate fingerprint
     /// (RFC 5763 §5) to authenticate the handshake; the engine takes the DTLS role opposite the peer's
-    /// `a=setup`. (rtcp-mux is assumed, as WebRTC mandates — non-muxed DTLS RTCP is a follow-up.)
+    /// `a=setup`. B multiplexes RTCP, as WebRTC requires; when A does not, A's separate RTCP port is
+    /// bridged as well, carried as SRTCP on B's leg (RFC 5761 §5.1.1).
     fn install_dtls_bridge(&self, wiring: &AnswerWiring<'_>) -> Result<(), Box<CmdResult>> {
         let Some(certificate) = self.dtls_certificate.clone() else {
             return Err(boxed_error_result(
@@ -375,11 +390,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"near leg has no signalled address",
             ));
         };
+        let plan = wiring.dtls_call_plan(a_rtp, certificate, peer_fingerprint);
         self.redirect_endpoints(
-            [wiring.near.rtp.id, wiring.far.rtp.id],
+            [wiring.near.rtp.id, wiring.far.rtp.id]
+                .into_iter()
+                .chain(plan.plain_rtcp.map(|rtcp| rtcp.endpoint)),
             "install DTLS bridge redirect",
         )?;
-        let plan = wiring.dtls_call_plan(a_rtp, certificate, peer_fingerprint);
         // On a renegotiation of a live call, keep the association already running and just re-point
         // it: B keeps its own (RFC 8842 §5.5 — the fingerprint did not change), so a fresh
         // registration would wait for a handshake that never comes.

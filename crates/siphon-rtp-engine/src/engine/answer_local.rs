@@ -318,6 +318,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // RFC 8445 §12: key the pair ICE chose, but only when an agent is actually
                     // running — otherwise no selection is coming and the handshake would hang.
                     gate_on_ice: ice_pending,
+                    plain_rtcp: None,
                 },
                 crate::dtls_bridge::PipelineTarget::Ws {
                     ws: self.ws.clone(),
