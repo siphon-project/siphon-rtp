@@ -375,7 +375,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ));
         }
         self.media.deregister(call_id);
-        self.promote_to_processing(call_id).await?;
+        self.promote_to_processing(call_id, false).await?;
         // Re-attach every answered subscription's raw tee to the new actor.
         let tees: Vec<(bool, RawTee)> = self
             .subscriptions

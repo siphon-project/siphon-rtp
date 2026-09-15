@@ -21,6 +21,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   on the plain side. The offer now binds a separate RTCP port beside `a=rtcp-mux` (advertised with
   `a=rtcp` when it is not RTP port + 1). The answer keeps it when the callee declines multiplexing, so
   the bridge carries RTCP both ways, and frees it when the callee multiplexes.
+- **`echo` on a call not yet in the media pipeline no longer sends the caller comfort noise first.**
+  A single-leg (offer-only) call is promoted with comfort-noise idle egress, and the new actor's
+  playout tick fires as soon as the actor runs. Echo was switched on by a control message only after
+  the promotion returned, so that first tick could send the caller a frame of comfort noise ahead of
+  its own reflected audio. The promotion now builds the actor with echo already on, the same way a
+  secure caller's actor is built already gated.
 
 ## [0.7.1] — 2026-09-15
 
