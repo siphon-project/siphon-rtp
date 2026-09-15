@@ -129,6 +129,12 @@ harness = false
 name = "sdp_rewrite_bench"
 harness = false
 
+# The per-packet cost of the DTLS-SRTP bridge relay — keyed SRTP and SRTCP in both directions, the
+# RTCP split onto a plain peer's separate RTCP port, and the unkeyed drop before the handshake.
+[[bench]]
+name = "dtls_bridge_bench"
+harness = false
+
 [lints]
 workspace = true
 

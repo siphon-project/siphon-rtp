@@ -11668,6 +11668,290 @@ async fn dtls_srtp_offer_answer_bridges_media_end_to_end() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dtls_far_legs_srtcp_reaches_a_non_muxed_caller_on_its_rtcp_port() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_dtls::DtlsCertificate;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // A offers plaintext with RTCP on its own port (no `a=rtcp-mux`, an explicit `a=rtcp`, RFC
+    // 3605); B is a WebRTC peer, DTLS-SRTP and muxed. The bridge must carry RTCP between A's RTCP
+    // port and B's muxed leg in both directions, as SRTCP on B's side (RFC 5761 §5.1.1, RFC 3711
+    // §3.4). Before, only the two RTP endpoints were bridged and A's RTCP port had no flow at all.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+
+    let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+    let (phone_a_rtcp, addr_a_rtcp) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+    let peer_b = Arc::new(
+        UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+            .await
+            .expect("bind b"),
+    );
+    let addr_b = peer_b.local_addr().expect("addr b");
+
+    let offer_sdp = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp:{rtcp_port}\r\n",
+        ip = addr_a.ip(),
+        port = addr_a.port(),
+        rtcp_port = addr_a_rtcp.port(),
+    );
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "dtls-rtcp".into(),
+                from_tag: "tag-a".into(),
+                sdp: offer_sdp,
+                profile: ProfileFlags {
+                    transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply");
+    let engine_fingerprint = offer_reply
+        .fingerprint
+        .clone()
+        .expect("engine a=fingerprint");
+    let engine_far = offer_reply.remote_rtp;
+
+    let peer_cert = DtlsCertificate::generate().expect("peer cert");
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "dtls-rtcp".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: dtls_answer_sdp(addr_b, 0, "PCMU", &peer_cert, sdp::Setup::Active),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let answer_reply = sdp::parse(&ok_sdp_text(&answer)).expect("answer reply");
+    assert_eq!(
+        engine.calls.get("dtls-rtcp").map(|call| call.pipeline),
+        Some(PipelineKind::Dtls),
+        "same codec on both legs: the DTLS bridge"
+    );
+    let engine_near_rtcp = answer_reply.remote_rtcp;
+    assert_ne!(
+        engine_near_rtcp, answer_reply.remote_rtp,
+        "A is answered with a separate RTCP port"
+    );
+
+    let mut peer_leg = peer_dtls_handshake(
+        peer_b.clone(),
+        addr_b,
+        engine_far,
+        &peer_cert,
+        &engine_fingerprint,
+    )
+    .await;
+
+    // B → engine: SRTCP on its muxed leg, relayed to A's RTCP port in the clear.
+    let report = vec![0x80, 201, 0x00, 0x01, 0x0B, 0x0B, 0x0B, 0x0B];
+    let mut buffer = [0u8; 2048];
+    let mut at_a_rtcp = None;
+    for _ in 0..25 {
+        let mut sealed = Vec::new();
+        peer_leg
+            .protect(&report, &mut sealed)
+            .expect("peer protect");
+        peer_b.send_to(&sealed, engine_far).await.expect("b send");
+        if let Ok(Ok((len, _))) = timeout(
+            Duration::from_millis(150),
+            phone_a_rtcp.recv_from(&mut buffer),
+        )
+        .await
+        {
+            at_a_rtcp = Some(buffer[..len].to_vec());
+            break;
+        }
+    }
+    assert_eq!(
+        at_a_rtcp.expect("A's RTCP port received B's report"),
+        report,
+        "B's SRTCP is decrypted onto A's RTCP port"
+    );
+    assert!(
+        timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer))
+            .await
+            .is_err(),
+        "RTCP never lands on A's RTP port"
+    );
+
+    // A's RTCP port → engine: plaintext RTCP, relayed to B as SRTCP.
+    let report_ab = vec![0x80, 201, 0x00, 0x01, 0x0A, 0x0A, 0x0A, 0x0A];
+    phone_a_rtcp
+        .send_to(&report_ab, engine_near_rtcp)
+        .await
+        .expect("a send rtcp");
+    let (len, _) = timeout(Duration::from_secs(2), peer_b.recv_from(&mut buffer))
+        .await
+        .expect("B received A's report")
+        .expect("b recv");
+    let mut recovered = Vec::new();
+    peer_leg
+        .unprotect(&buffer[..len], &mut recovered)
+        .expect("peer unprotect");
+    assert_eq!(recovered, report_ab, "A's RTCP reaches B as SRTCP");
+}
+
+#[tokio::test]
+async fn an_answer_presents_the_callers_own_rtcp_mux_not_the_callees() {
+    // RFC 5761 §5.1.1: an answer carries `a=rtcp-mux` only if the offer did. The answer A receives is
+    // rewritten from B's, so a B that multiplexes must not make A's answer claim multiplexing A never
+    // offered, and a B that does not must not take it away from an A that did.
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    offer_from_a(
+        &engine,
+        "mux-apart",
+        sdp_for(addr_a, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    let answered = answer_from_b(
+        &engine,
+        "mux-apart",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(
+        !answered.rtcp_mux,
+        "A offered separate RTCP and is answered without a=rtcp-mux"
+    );
+    assert_ne!(
+        answered.remote_rtcp, answered.remote_rtp,
+        "A is given the engine's own RTCP port"
+    );
+
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    offer_from_a(
+        &engine,
+        "mux-kept",
+        sdp_for(addr_a, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let answered = answer_from_b(
+        &engine,
+        "mux-kept",
+        sdp_for(addr_b, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(
+        answered.rtcp_mux,
+        "A offered multiplexing and is answered with it, whatever B chose"
+    );
+}
+
+#[tokio::test]
+async fn a_reoffer_presents_the_receivers_own_rtcp_mux_not_the_reofferers() {
+    // A re-offer from B is presented to A on the near leg, rewritten from B's SDP. B now asking for
+    // multiplexing says nothing about the ports the engine bound for A, so A must not be offered
+    // `a=rtcp-mux` on a leg that keeps RTCP on its own port.
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    offer_from_a(
+        &engine,
+        "reoffer-mux",
+        sdp_for(addr_a, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    answer_from_b(
+        &engine,
+        "reoffer-mux",
+        sdp_for(addr_b, false),
+        ProfileFlags::default(),
+    )
+    .await;
+
+    let reoffer = reoffer_from(
+        &engine,
+        "reoffer-mux",
+        "b",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let to_a = sdp::parse(&ok_sdp_text(&reoffer)).expect("parse the re-offer A receives");
+    assert!(
+        !to_a.rtcp_mux,
+        "A's leg keeps separate RTCP, so its re-offer carries no a=rtcp-mux"
+    );
+    assert_ne!(to_a.remote_rtcp, to_a.remote_rtp);
+}
+
+#[tokio::test]
+async fn a_reversed_answer_presents_the_callees_own_rtcp_mux_not_the_callers() {
+    // When A answers a re-offer from B, the SDP delivered to B is rewritten from A's answer, not from
+    // B's re-offer. A answering with `a=rtcp-mux` must not hand that to B, whose leg the engine bound
+    // with separate RTCP.
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    offer_from_a(
+        &engine,
+        "reversed-mux",
+        sdp_for(addr_a, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    answer_from_b(
+        &engine,
+        "reversed-mux",
+        sdp_for(addr_b, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    reoffer_from(
+        &engine,
+        "reversed-mux",
+        "b",
+        sdp_for(addr_b, false),
+        ProfileFlags::default(),
+    )
+    .await;
+
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "reversed-mux".into(),
+                from_tag: "b".into(),
+                to_tag: "a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let to_b = sdp::parse(&ok_sdp_text(&answer)).expect("parse the answer B receives");
+    assert!(
+        !to_b.rtcp_mux,
+        "B's leg keeps separate RTCP, so the answer it receives carries no a=rtcp-mux"
+    );
+    assert_ne!(to_b.remote_rtcp, to_b.remote_rtp);
+}
+
 /// Drive a DTLS peer's client-side handshake against `engine_far` over `socket`, returning its
 /// keyed `SecureLeg`. Factored out of the DTLS end-to-end tests, which otherwise repeat 40 lines
 /// of transport pumping apiece.

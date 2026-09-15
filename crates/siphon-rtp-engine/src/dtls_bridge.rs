@@ -17,7 +17,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use siphon_rtp_datapath::{classify, Datapath, EndpointId, PacketClass, RxPacket, SourceFilter};
 use siphon_rtp_dtls::{handshake, DtlsCertificate, DtlsRole, DtlsTransport, Fingerprint};
-use siphon_rtp_srtp::leg::SecureLeg;
+use siphon_rtp_srtp::leg::{is_rtcp, PacketKind, SecureLeg};
 use tokio::task::JoinHandle;
 
 use crate::x3::X3Tap;
@@ -192,6 +192,12 @@ struct Flow {
     /// `Direction::handle` — tapping here as well would deliver every packet twice, once as
     /// ciphertext.
     x3: Option<X3Tap>,
+    /// This endpoint is the plain peer's separate RTCP port, so only RTCP is relayed from it
+    /// (classified by packet type, RFC 5761 §4).
+    rtcp_only: bool,
+    /// Where RTCP decrypted on this flow goes when the plain peer has a separate RTCP port: that
+    /// endpoint and the peer's RTCP address. `None` sends RTCP wherever RTP goes.
+    rtcp_out: Option<(EndpointId, SocketAddr)>,
 }
 
 /// Block until the leg's destination is decided. Returns `Err` if the leg is torn down first (every
@@ -237,6 +243,27 @@ pub struct DtlsCallPlan {
     /// reached, so the handshake would burn its retransmissions and fail a call ICE could have
     /// completed. `false` keeps the pre-ICE behaviour: start immediately at `secure_dst`.
     pub gate_on_ice: bool,
+    /// The plain peer's separate RTCP port, when it does not multiplex RTCP with RTP. `None` for a
+    /// plain peer that does, whose RTCP rides `plain_endpoint`. Ignored by
+    /// [`DtlsBridge::register_for_pipeline`], whose actor relays RTCP itself.
+    pub plain_rtcp: Option<PlainRtcp>,
+}
+
+/// A plain peer's separate RTCP port (RFC 5761 §5.1.1: a peer that declines multiplexing sends and
+/// receives RTCP on its own port).
+///
+/// There is no secure-side counterpart. The DTLS peer multiplexes: DTLS-SRTP keys each component
+/// with its own association (RFC 5764 §4.1), and WebRTC, the reason this bridge exists, requires
+/// multiplexing. So its SRTCP arrives on the secure endpoint beside its SRTP, and plain RTCP leaves
+/// through the secure endpoint as SRTCP.
+#[derive(Clone, Copy)]
+pub struct PlainRtcp {
+    /// The engine endpoint facing the plain peer's RTCP port.
+    pub endpoint: EndpointId,
+    /// Signalled-source gate for that endpoint.
+    pub source: SourceFilter,
+    /// The plain peer's RTCP address, where decrypted RTCP is forwarded.
+    pub dst: SocketAddr,
 }
 
 /// The DTLS bridge registry: redirected endpoint → its `Flow`, plus the per-call handshake/drain
@@ -285,6 +312,61 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         self.pipeline_keys.remove(&secure_endpoint);
     }
 
+    /// The flow on a plain peer's separate RTCP port: RTCP only, encrypted as SRTCP on the shared leg
+    /// toward the DTLS peer's current address.
+    fn plain_rtcp_flow(
+        rtcp: PlainRtcp,
+        secure_endpoint: EndpointId,
+        destination: SecureDestination,
+        secure: SharedSecureLeg,
+    ) -> Flow {
+        Flow {
+            direction: Direction::Encrypt,
+            accepted_source: rtcp.source,
+            out_endpoint: secure_endpoint,
+            out_dst: None,
+            secure_dst: Some(destination),
+            secure,
+            // X3 content is the call's media, tapped on the RTP endpoints; RTCP is not content.
+            x3: None,
+            rtcp_only: true,
+            rtcp_out: None,
+        }
+    }
+
+    /// After a renegotiation, follow the plain peer's RTCP layout on the kept leg: drop the flow on
+    /// a port it no longer uses, and re-gate or add the flow on the port it uses now. Whether a peer
+    /// multiplexes is settled per offer/answer (RFC 5761 §5.1.1), so a re-offer can change it.
+    fn follow_plain_rtcp(
+        &self,
+        plan: &DtlsCallPlan,
+        previous: Option<EndpointId>,
+        secure: SharedSecureLeg,
+    ) {
+        let current = plan.plain_rtcp.map(|rtcp| rtcp.endpoint);
+        if let Some(previous) = previous.filter(|previous| Some(*previous) != current) {
+            self.flows.remove(&previous);
+        }
+        let Some(rtcp) = plan.plain_rtcp else {
+            return;
+        };
+        if let Some(mut flow) = self.flows.get_mut(&rtcp.endpoint) {
+            flow.accepted_source = rtcp.source;
+            return;
+        }
+        let Some(destination) = self
+            .destinations
+            .get(&plan.secure_endpoint)
+            .map(|entry| entry.value().clone())
+        else {
+            return;
+        };
+        self.flows.insert(
+            rtcp.endpoint,
+            Self::plain_rtcp_flow(rtcp, plan.secure_endpoint, destination, secure),
+        );
+    }
+
     /// Keep the DTLS association already running on `plan`'s secure endpoint across a renegotiation,
     /// re-pointing it at the addresses and gates the new SDP settled on. Returns `false` when there is
     /// nothing to keep — no association on that endpoint, or the peer's fingerprint or the engine's
@@ -310,9 +392,19 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             flow.accepted_source = plan.plain_source;
             flow.out_dst = flow.out_dst.map(|_| plan.plain_dst);
         }
+        let mut relayed_rtcp = None;
         if let Some(mut flow) = self.flows.get_mut(&plan.secure_endpoint) {
             flow.accepted_source = plan.secure_source;
             flow.out_dst = flow.out_dst.map(|_| plan.plain_dst);
+            // Only a relaying leg carries plain RTCP; a pipeline leg's actor relays its own.
+            if matches!(flow.direction, Direction::Decrypt { .. }) {
+                let previous = flow.rtcp_out.map(|(endpoint, _)| endpoint);
+                flow.rtcp_out = plan.plain_rtcp.map(|rtcp| (rtcp.endpoint, rtcp.dst));
+                relayed_rtcp = Some((previous, flow.secure.clone()));
+            }
+        }
+        if let Some((previous, secure)) = relayed_rtcp {
+            self.follow_plain_rtcp(plan, previous, secure);
         }
         // Where the DTLS peer is now. On an ICE leg the agent owns this and re-selects for itself, so
         // a signalled address must never clobber a selected pair (RFC 8445 §12).
@@ -416,6 +508,17 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             })
         };
 
+        // A new association can come with a different plain RTCP layout: drop the flow on a port the
+        // plain peer no longer uses. Read first, so no map guard is held across the removal.
+        let previous_rtcp = self
+            .flows
+            .get(&plan.secure_endpoint)
+            .and_then(|flow| flow.rtcp_out.map(|(endpoint, _)| endpoint));
+        if let Some(previous) = previous_rtcp
+            .filter(|previous| Some(*previous) != plan.plain_rtcp.map(|rtcp| rtcp.endpoint))
+        {
+            self.flows.remove(&previous);
+        }
         self.flows.insert(
             plan.plain_endpoint,
             Flow {
@@ -427,8 +530,22 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure_dst: Some(destination.clone()),
                 secure: secure.clone(),
                 x3: None,
+                rtcp_only: false,
+                rtcp_out: None,
             },
         );
+        // The plain peer's separate RTCP port, when it has one: RTCP only, as SRTCP on the same leg.
+        if let Some(rtcp) = plan.plain_rtcp {
+            self.flows.insert(
+                rtcp.endpoint,
+                Self::plain_rtcp_flow(
+                    rtcp,
+                    plan.secure_endpoint,
+                    destination.clone(),
+                    secure.clone(),
+                ),
+            );
+        }
         self.flows.insert(
             plan.secure_endpoint,
             Flow {
@@ -440,6 +557,9 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure_dst: None,
                 secure,
                 x3: None,
+                rtcp_only: false,
+                // Decrypted RTCP goes to the plain peer's own RTCP port when it has one.
+                rtcp_out: plan.plain_rtcp.map(|rtcp| (rtcp.endpoint, rtcp.dst)),
             },
         );
         self.sessions
@@ -550,6 +670,9 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure_dst: Some(destination.clone()),
                 secure: Arc::new(Mutex::new(None)),
                 x3: None,
+                // The per-call actor relays RTCP itself (`plan.plain_rtcp` is not used here).
+                rtcp_only: false,
+                rtcp_out: None,
             },
         );
         self.sessions
@@ -619,20 +742,30 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
     /// Handle one redirected datagram: gate the source, then either feed the DTLS handshake or apply
     /// the flow's SRTP crypto and forward it. Anything unkeyed, un-gated, or un-decryptable is dropped.
     pub async fn handle(&self, packet: RxPacket) {
-        let Some((direction, accepted_source, out_endpoint, out_dst, secure, x3)) =
-            self.flows.get(&packet.endpoint).map(|flow| {
-                (
-                    flow.direction.clone(),
-                    flow.accepted_source,
-                    flow.out_endpoint,
-                    // Toward the DTLS peer the destination follows ICE, so read the published one;
-                    // toward the plain peer it is the signalled address.
-                    flow.out_dst
-                        .or_else(|| flow.secure_dst.as_ref().and_then(|dst| *dst.borrow())),
-                    flow.secure.clone(),
-                    flow.x3.clone(),
-                )
-            })
+        let Some((
+            direction,
+            accepted_source,
+            out_endpoint,
+            out_dst,
+            secure,
+            x3,
+            rtcp_only,
+            rtcp_out,
+        )) = self.flows.get(&packet.endpoint).map(|flow| {
+            (
+                flow.direction.clone(),
+                flow.accepted_source,
+                flow.out_endpoint,
+                // Toward the DTLS peer the destination follows ICE, so read the published one;
+                // toward the plain peer it is the signalled address.
+                flow.out_dst
+                    .or_else(|| flow.secure_dst.as_ref().and_then(|dst| *dst.borrow())),
+                flow.secure.clone(),
+                flow.x3.clone(),
+                flow.rtcp_only,
+                flow.rtcp_out,
+            )
+        })
         else {
             return; // not a DTLS-bridge endpoint
         };
@@ -667,6 +800,11 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         if classify(&packet.data) != PacketClass::Media {
             return;
         }
+        // A plain peer's separate RTCP port relays RTCP only (RFC 5761 §4 packet-type demux), so it
+        // cannot be used to inject RTP toward the DTLS peer.
+        if rtcp_only && !is_rtcp(&packet.data) {
+            return;
+        }
 
         // Pipeline mode: hand the still-encrypted media to the per-call actor, which owns the
         // `SecureLeg` and decrypts it on its own `secure_ingress` — the same path SDES secure
@@ -697,10 +835,19 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 }
             }
         };
-        if let Err(error) = transformed {
-            tracing::debug!(?error, "DTLS bridge crypto failed; dropping packet");
-            return;
-        }
+        let kind = match transformed {
+            Ok(kind) => kind,
+            Err(error) => {
+                tracing::debug!(?error, "DTLS bridge crypto failed; dropping packet");
+                return;
+            }
+        };
+        // Decrypted RTCP goes to the plain peer's separate RTCP port when it has one (RFC 5761
+        // §5.1.1); RTP, and RTCP toward a multiplexing plain peer, go where the flow forwards.
+        let (out_endpoint, out_dst) = match (kind, rtcp_out) {
+            (PacketKind::Rtcp, Some(rtcp)) => rtcp,
+            _ => (out_endpoint, out_dst),
+        };
 
         // Accepted: past the source gate, past the keyed check and past the crypto. Stamp liveness for
         // the idle sweep, exactly as the SDES bridge does and for the same reason — a `Redirect` leg
@@ -755,6 +902,7 @@ mod tests {
             role: DtlsRole::Server,
             peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
             gate_on_ice: true,
+            plain_rtcp: None,
         });
 
         // Nothing decided yet: the leg has no destination, so the handshake has not begun and the
@@ -813,6 +961,7 @@ mod tests {
             role: DtlsRole::Server,
             peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
             gate_on_ice: false,
+            plain_rtcp: None,
         });
         assert_eq!(
             bridge
@@ -918,6 +1067,7 @@ mod tests {
             role: DtlsRole::Server,
             peer_fingerprint: peer_cert.fingerprint(),
             gate_on_ice: false,
+            plain_rtcp: None,
         });
 
         // Dispatch the datapath's redirect stream into the bridge.
@@ -1023,6 +1173,7 @@ mod tests {
             peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
             // The non-ICE path: the destination is known at registration.
             gate_on_ice: false,
+            plain_rtcp: None,
         });
 
         // An SRTP-shaped packet from the signalled secure source, but no handshake has happened → the
@@ -1046,5 +1197,227 @@ mod tests {
         assert!(bridge.owns(secure.id) && bridge.owns(plain.id));
         bridge.deregister([plain.id, secure.id]);
         assert!(!bridge.owns(secure.id) && !bridge.owns(plain.id));
+    }
+
+    /// An empty RTCP receiver report (RFC 3550 §6.4.2): V=2, RC=0, PT=201, length 1, sender SSRC.
+    fn rtcp_receiver_report(ssrc: u32) -> Vec<u8> {
+        let mut packet = vec![0x80, 201, 0x00, 0x01];
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rtcp_crosses_between_a_separate_plain_port_and_the_muxed_dtls_leg() {
+        // RFC 5761 §5.1.1: a plain peer that does not multiplex sends and receives RTCP on its own
+        // port, while the DTLS peer multiplexes. SRTCP from the DTLS peer must reach that port as
+        // plaintext, never the plain peer's RTP port, and plaintext RTCP from it must reach the DTLS
+        // peer as SRTCP (RFC 3711 §3.4). RTP keeps its own ports.
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let plain_rtcp = datapath.alloc_endpoint().await.expect("alloc plain rtcp");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        for endpoint in [plain.id, plain_rtcp.id, secure.id] {
+            datapath
+                .install_flow(endpoint, FlowAction::Redirect)
+                .expect("redirect");
+        }
+
+        let phone_a = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a");
+        let addr_a = phone_a.local_addr().expect("addr a");
+        let phone_a_rtcp = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a rtcp");
+        let addr_a_rtcp = phone_a_rtcp.local_addr().expect("addr a rtcp");
+        let peer_b = Arc::new(
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind b"),
+        );
+        let addr_b = peer_b.local_addr().expect("addr b");
+
+        let engine_cert = DtlsCertificate::generate().expect("engine cert");
+        let peer_cert = DtlsCertificate::generate().expect("peer cert");
+        let bridge = Arc::new(DtlsBridge::new(datapath.clone()));
+        bridge.register(DtlsCallPlan {
+            plain_endpoint: plain.id,
+            plain_source: SourceFilter::Exact(addr_a.ip()),
+            plain_dst: addr_a,
+            secure_endpoint: secure.id,
+            secure_source: SourceFilter::Exact(addr_b.ip()),
+            secure_dst: addr_b,
+            secure_local: secure.local_addr,
+            certificate: engine_cert.clone(),
+            role: DtlsRole::Server,
+            peer_fingerprint: peer_cert.fingerprint(),
+            gate_on_ice: false,
+            plain_rtcp: Some(PlainRtcp {
+                endpoint: plain_rtcp.id,
+                source: SourceFilter::Exact(addr_a_rtcp.ip()),
+                dst: addr_a_rtcp,
+            }),
+        });
+        let rx = datapath.rx();
+        let dispatch = bridge.clone();
+        tokio::spawn(async move {
+            while let Ok(packet) = rx.recv_async().await {
+                dispatch.handle(packet).await;
+            }
+        });
+
+        let (b_transport, b_channels) = DtlsTransport::new(addr_b, secure.local_addr);
+        let (b_reader, b_writer) = pump(peer_b.clone(), b_channels, secure.local_addr);
+        let mut peer_leg = timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake(
+                Arc::new(b_transport),
+                &peer_cert,
+                DtlsRole::Client,
+                &engine_cert.fingerprint(),
+            ),
+        )
+        .await
+        .expect("handshake did not time out")
+        .expect("peer handshake");
+        b_reader.abort();
+        b_writer.abort();
+
+        // B → engine: SRTCP, relayed onto A's RTCP port in the clear. Retry to absorb the window
+        // between B finishing and the engine installing its leg.
+        let report = rtcp_receiver_report(0x0B0B_0B0B);
+        let mut buffer = [0u8; 2048];
+        let mut at_a_rtcp = None;
+        for _ in 0..25 {
+            let mut sealed = Vec::new();
+            peer_leg
+                .protect(&report, &mut sealed)
+                .expect("peer protect rtcp");
+            peer_b
+                .send_to(&sealed, secure.local_addr)
+                .await
+                .expect("b send rtcp");
+            if let Ok(Ok((len, _))) = timeout(
+                Duration::from_millis(150),
+                phone_a_rtcp.recv_from(&mut buffer),
+            )
+            .await
+            {
+                at_a_rtcp = Some(buffer[..len].to_vec());
+                break;
+            }
+        }
+        assert_eq!(
+            at_a_rtcp.expect("A's RTCP port received B's report"),
+            report,
+            "B's SRTCP is decrypted onto A's RTCP port"
+        );
+        assert!(
+            timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "RTCP never lands on A's RTP port"
+        );
+
+        // B → engine: SRTP media still goes to A's RTP port.
+        let media = rtp(3000, 0x0B0B_0B0B);
+        let mut sealed = Vec::new();
+        peer_leg
+            .protect(&media, &mut sealed)
+            .expect("peer protect rtp");
+        peer_b
+            .send_to(&sealed, secure.local_addr)
+            .await
+            .expect("b send rtp");
+        let (len, _) = timeout(RECV_TIMEOUT, phone_a.recv_from(&mut buffer))
+            .await
+            .expect("A received the media")
+            .expect("a recv");
+        assert_eq!(&buffer[..len], media.as_slice(), "RTP keeps A's RTP port");
+
+        // A's RTCP port → engine: plaintext RTCP, relayed to B as SRTCP on the muxed leg.
+        let report_ab = rtcp_receiver_report(0x0A0A_0A0A);
+        phone_a_rtcp
+            .send_to(&report_ab, plain_rtcp.local_addr)
+            .await
+            .expect("a send rtcp");
+        let (len, _) = timeout(RECV_TIMEOUT, peer_b.recv_from(&mut buffer))
+            .await
+            .expect("B received A's report")
+            .expect("b recv");
+        let mut recovered = Vec::new();
+        peer_leg
+            .unprotect(&buffer[..len], &mut recovered)
+            .expect("peer unprotect rtcp");
+        assert_eq!(recovered, report_ab, "A's RTCP reaches B as SRTCP");
+
+        // An RTP packet sent to A's RTCP port is not RTCP, so it goes nowhere.
+        phone_a_rtcp
+            .send_to(&rtp(4000, 0x0A0A_0A0A), plain_rtcp.local_addr)
+            .await
+            .expect("a send stray rtp");
+        assert!(
+            timeout(Duration::from_millis(150), peer_b.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "only RTCP crosses the RTCP port"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renegotiation_adds_and_removes_the_plain_rtcp_flow() {
+        // Whether the plain party multiplexes is settled per offer/answer (RFC 5761 §5.1.1), so a
+        // re-offer can move it between a muxed and a separate RTCP port. The association is the
+        // same one (RFC 8842 §3.1: same role, same fingerprint), so it is kept, and the RTCP flow
+        // must follow the new layout without a handshake.
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let plain_rtcp = datapath.alloc_endpoint().await.expect("alloc plain rtcp");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        let certificate = DtlsCertificate::generate().expect("cert");
+        let peer = DtlsCertificate::generate()
+            .expect("peer cert")
+            .fingerprint();
+        let plan = |rtcp: Option<PlainRtcp>| DtlsCallPlan {
+            plain_endpoint: plain.id,
+            plain_source: SourceFilter::Any,
+            plain_dst: "192.0.2.1:20000".parse().expect("addr"),
+            secure_endpoint: secure.id,
+            secure_source: SourceFilter::Any,
+            secure_dst: "192.0.2.7:30000".parse().expect("addr"),
+            secure_local: secure.local_addr,
+            certificate: certificate.clone(),
+            role: DtlsRole::Server,
+            peer_fingerprint: Fingerprint::new(peer.hash_function.clone(), peer.bytes.clone()),
+            gate_on_ice: false,
+            plain_rtcp: rtcp,
+        };
+        let separate = PlainRtcp {
+            endpoint: plain_rtcp.id,
+            source: SourceFilter::Any,
+            dst: "192.0.2.1:20001".parse().expect("addr"),
+        };
+
+        let bridge = DtlsBridge::new(datapath.clone());
+        bridge.register(plan(None));
+        assert!(
+            !bridge.owns(plain_rtcp.id),
+            "a muxed plain peer has no RTCP flow"
+        );
+
+        assert!(
+            bridge.renegotiate(&plan(Some(separate))),
+            "association kept"
+        );
+        assert!(
+            bridge.owns(plain_rtcp.id),
+            "the separate RTCP port is bridged after the re-offer"
+        );
+
+        assert!(bridge.renegotiate(&plan(None)), "association kept");
+        assert!(
+            !bridge.owns(plain_rtcp.id),
+            "and released when the plain peer multiplexes again"
+        );
     }
 }

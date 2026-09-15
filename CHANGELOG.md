@@ -16,6 +16,21 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   entry leaked per call ended under a recording). Both now detach the recording and wait for its
   header to be finalized, so `recording_finished` naming `call_ended` is already queued when they
   return, which is the ordering the control reference already promised.
+- **RTCP now crosses a DTLS-SRTP bridge whose plain side keeps RTCP on its own port.** The bridge
+  only ever relayed the two RTP endpoints. When the plain party did not multiplex RTCP (RFC 5761
+  §5.1.1), the DTLS peer's SRTCP was decrypted onto the plain party's RTP port, and the plain
+  party's RTCP port had no flow, so its reports never reached the DTLS peer. SRTCP from the DTLS
+  peer is now decrypted onto the plain party's RTCP port, and RTCP from that port is carried as
+  SRTCP on the DTLS leg. That port accepts only RTCP, gated to the plain party's signalled source
+  like the RTP side, and it follows a re-offer that moves the plain party between multiplexed and
+  separate RTCP. The DTLS leg itself still multiplexes, as WebRTC requires.
+- **An answer or re-offer now tells each party the RTCP multiplexing the engine bound for it.** The
+  SDP presented to one party is rewritten from the other party's, and without an `rtcp_mux` directive
+  that party's `a=rtcp-mux` line was copied across. A caller that offered separate RTCP was answered
+  with `a=rtcp-mux` whenever the callee multiplexed, which RFC 5761 §5.1.1 does not allow (an answer
+  carries it only if the offer did), so the caller moved its RTCP onto the RTP port while the engine
+  kept sending to the RTCP port it had bound. The line now follows the leg's own ports whenever the
+  two parties differ, and is left byte for byte as before when they agree.
 
 ## [0.7.0] — 2026-09-14
 

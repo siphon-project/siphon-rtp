@@ -545,6 +545,14 @@ is wrong, and encryption defeats A2 eavesdrop.
   re-forwarded. The window is recorded only *after* authentication, so a forged packet can never
   advance or poison it; on an HA takeover the standby anchors the window at the checkpointed rollover
   index and keeps rejecting the primary's last-seen packet.
+- **A plain peer's separate RTCP port on the DTLS bridge.** When the plain party does not multiplex
+  RTCP (RFC 5761 §5.1.1), its RTCP endpoint is redirected into the DTLS bridge as a third flow and
+  gated exactly like its RTP endpoint, to the plain party's signalled RTCP source
+  (`bridge_source_filter`). That flow relays RTCP only: anything the RFC 5761 §4 packet-type demux
+  does not classify as RTCP is dropped before the crypto, so the port cannot carry RTP toward the DTLS
+  peer. SRTCP from the DTLS peer reaches that port only after the same gate, key and authentication as
+  SRTP. The DTLS leg itself always multiplexes: RFC 5764 §4.1 keys each component with its own
+  association, and WebRTC requires multiplexing.
 - **Idle reap.** A packet that clears the gate *and* the crypto stamps the endpoint's activity
   (`Datapath::note_activity`); one that fails either does **not**, so neither an off-path spray nor a
   forged packet can hold a dead call open. This has to be done by the bridge itself, and the reason is
