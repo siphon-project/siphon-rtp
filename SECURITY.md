@@ -37,7 +37,7 @@ fixes.
 ## Supply chain
 
 Every tagged release ships an SBOM (SPDX 2.3 + CycloneDX 1.4), and dependency
-advisories are audited on a schedule with `cargo-deny`. The engine takes **zero C
+advisories are audited daily, and before every release, with `cargo-deny`. The engine takes **zero C
 library dependencies** (a CI-enforced hard rule), which keeps the attack surface to
 Rust and the audited crate graph. See
 [Supply chain & SBOM](https://rtp.siphon-sip.org/supply-chain/) for how to consume
