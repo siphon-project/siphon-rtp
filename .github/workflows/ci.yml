@@ -105,14 +105,50 @@ jobs:
       # deps), licenses (OSI-permissive allow-list) and sources (crates.io only). All three are a
       # pure function of the dependency graph, so their verdict only changes when a PR changes the
       # graph — a PR that pulls in a GPL crate, a git source or a duplicate-version blowup fails
-      # right here. Time-varying RustSec advisories deliberately live in audit.yml (weekly + on
-      # main) so a new advisory against unchanged code never turns a green PR red. cargo-deny is
-      # installed pinned and run directly (not the cargo-deny-action, whose injected --log-level
-      # flag broke on the cargo-deny 0.19 CLI, which removed that global flag).
+      # right here. Time-varying RustSec advisories are the `advisories` job below, kept out of the
+      # rollup. cargo-deny is installed pinned and run directly (not the cargo-deny-action, whose
+      # injected --log-level flag broke on the cargo-deny 0.19 CLI, which removed that global flag).
       - name: Install cargo-deny (pinned)
         run: cargo install cargo-deny --version 0.19.9 --locked
-      - name: Check bans + licenses + sources
-        run: cargo deny --all-features check bans licenses sources
+      # Every lockfile in the repository, not only the root one: the fuzz harness and the excluded XDP
+      # workspace resolve their own dependency graphs, and a check on the root manifest reads neither.
+      # All three are held to the one root deny.toml, and all three are checked before the step fails.
+      - name: Check bans + licenses + sources on every lockfile
+        run: |
+          status=0
+          for manifest in Cargo.toml fuzz/Cargo.toml crates/siphon-rtp-xdp/Cargo.toml; do
+            echo "::group::$manifest"
+            cargo deny --manifest-path "$manifest" --all-features check --config deny.toml \
+              bans licenses sources || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+  # ── RustSec advisories on every lockfile, informational on a PR ─────────────────────────────
+  # Advisories are time-varying: one can be filed against a dependency no PR touched. So this job is
+  # deliberately NOT in the `ci` rollup, and a new advisory never fails "CI passed" on unrelated code.
+  # It still runs on every PR, so a vulnerable dependency is a red check on the PR about to merge, a
+  # release PR included. The release workflow gates on advisories before it publishes anything, and
+  # audit.yml runs them daily on main.
+  advisories:
+    name: cargo-deny advisories (informational)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny (pinned)
+        run: cargo install cargo-deny --version 0.19.9 --locked
+      - name: Check advisories on every lockfile
+        run: |
+          status=0
+          for manifest in Cargo.toml fuzz/Cargo.toml crates/siphon-rtp-xdp/Cargo.toml; do
+            echo "::group::$manifest"
+            cargo deny --manifest-path "$manifest" --all-features check --config deny.toml \
+              advisories || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
 
   # ── SBOM (SPDX 2.3 + CycloneDX 1.4) — supply-chain inventory, uploaded as an artifact ─────
   sbom:
@@ -352,7 +388,8 @@ jobs:
   # Single required status check for branch protection: green only if every job above is green.
   # perf-gate is included: it runs on pull_request (success) and is skipped on the push-to-main build,
   # and `if: always()` + the failure/cancelled check treats a skipped job as non-failing. xdp-integration
-  # is included now that it runs on a hosted runner for every PR and push.
+  # is included now that it runs on a hosted runner for every PR and push. `advisories` is the one job
+  # left out, on purpose: its verdict moves with the RustSec database, not with the PR.
   ci:
     name: CI passed
     if: always()

@@ -1,15 +1,17 @@
 name: Security audit
 
-# RustSec advisories are time-varying: a new advisory can land against an unchanged dependency, so
-# this runs on a schedule (and whenever the dependency set changes) instead of gating every PR.
+# RustSec advisories are time-varying: a new advisory can land against an unchanged dependency. This
+# runs them daily, so one surfaces within a day rather than a week, and on any push to main that changes
+# a dependency set. Pull requests get the same check as an informational job in ci.yml, and release.yaml
+# gates on it before anything is published.
 on:
   schedule:
-    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+    - cron: "0 6 * * *" # daily 06:00 UTC
   push:
     branches: [main]
     paths:
       - "**/Cargo.toml"
-      - "Cargo.lock"
+      - "**/Cargo.lock"
       - "deny.toml"
   workflow_dispatch:
 
@@ -27,5 +29,15 @@ jobs:
       # --log-level flag broke on the cargo-deny 0.19 CLI, which removed that global flag).
       - name: Install cargo-deny (pinned)
         run: cargo install cargo-deny --version 0.19.9 --locked
-      - name: Check advisories
-        run: cargo deny --all-features check advisories
+      # Every lockfile: the workspace, the fuzz harness and the excluded XDP workspace each pin their own
+      # versions, and the XDP lockfile held a yanked `spin` that a root-only audit never read.
+      - name: Check advisories on every lockfile
+        run: |
+          status=0
+          for manifest in Cargo.toml fuzz/Cargo.toml crates/siphon-rtp-xdp/Cargo.toml; do
+            echo "::group::$manifest"
+            cargo deny --manifest-path "$manifest" --all-features check --config deny.toml \
+              advisories || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"

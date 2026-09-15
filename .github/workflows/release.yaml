@@ -68,6 +68,25 @@ jobs:
             exit 1
           fi
 
+  # ── Dependency gate ──────────────────────────────────────────────────────
+  # Nothing is published from a tree cargo-deny rejects: the zero-C ban list, the licence allow-list,
+  # crates.io-only sources and RustSec advisories, on the root lockfile the binaries, the image and the
+  # contract crate are all built from. Advisories are time-varying, so a tag cut from a commit whose PR
+  # was green can still carry a vulnerability filed since, and this is the last point that stops it: a
+  # crates.io version cannot be deleted once it is published, only yanked.
+  deny:
+    name: cargo-deny (release gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny (pinned)
+        run: cargo install cargo-deny --version 0.19.9 --locked
+      - name: Check bans + licenses + sources + advisories
+        run: cargo deny --all-features check --config deny.toml bans licenses sources advisories
+
   # ── Publish the control contract to crates.io ────────────────────────────
   # `siphon-rtp-proto` is the only published crate: it is the JSON control contract a controller
   # compiles against, so it must exist on crates.io at the same version as the engine that speaks it.
@@ -81,7 +100,7 @@ jobs:
   crates-io:
     name: publish siphon-rtp-proto to crates.io
     runs-on: ubuntu-latest
-    needs: verify-version
+    needs: [verify-version, deny]
     permissions:
       contents: read
       id-token: write
@@ -99,7 +118,7 @@ jobs:
 
   # ── Build the engine binary + tarball (per target) ───────────────────────
   build:
-    needs: verify-version
+    needs: [verify-version, deny]
     if: github.event_name == 'push'
     strategy:
       matrix:
@@ -233,7 +252,7 @@ jobs:
   # ── SBOM (SPDX 2.3 + CycloneDX 1.4), attached to the release ─────────────
   sbom:
     runs-on: ubuntu-latest
-    needs: verify-version
+    needs: [verify-version, deny]
     if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7

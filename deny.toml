@@ -1,6 +1,8 @@
 # cargo-deny — enforces siphon-rtp's hard rules at the dependency-graph level.
-# Local: `cargo deny check`  ·  CI: bans+licenses+sources gate every PR (ci.yml); advisories run
-# weekly + on main (audit.yml). Docs: https://embarkstudios.github.io/cargo-deny/
+# Local: `cargo deny check`  ·  CI: bans+licenses+sources gate every PR on all three lockfiles
+# (workspace, fuzz/, crates/siphon-rtp-xdp/; ci.yml); advisories are reported on every PR (ci.yml), run
+# daily + on main (audit.yml) and gate the release (release.yaml).
+# Docs: https://embarkstudios.github.io/cargo-deny/
 
 [graph]
 # Evaluate the graph for the Linux media-plane targets we actually ship on.
@@ -82,6 +84,12 @@ confidence-threshold = 0.9
 # are kept on purpose as pre-approved permissive licences; an unused *permissive* allowance carries
 # no signal, so do not let it spam the CI log.
 unused-allowed-license = "allow"
+# `libfuzzer-sys` bundles libFuzzer, which is LLVM source under LLVM's pre-2019 licence (NCSA, a
+# permissive OSI-approved licence). It is reachable only from the fuzz harness in `fuzz/`, which no
+# shipped binary includes, so NCSA is allowed for that one crate rather than added to `allow` above.
+exceptions = [
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
+]
 
 [sources]
 unknown-registry = "deny"

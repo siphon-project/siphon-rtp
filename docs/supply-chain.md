@@ -139,15 +139,25 @@ An SBOM is a snapshot; advisories are continuous. A crate that was clean at rele
 a RustSec advisory filed a week later without a line of code changing. siphon-rtp splits the
 [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) checks accordingly:
 
-- **Per-PR (`ci.yml`, the `deny` job):** `cargo deny check bans licenses sources`. The
-  time-invariant policy: the zero-C ban list, the OSI-permissive licence allow-list and the
-  crates.io-only source rule. All three read only the dependency graph, so their verdict changes
-  only when a PR changes that graph — no unrelated PR is ever failed by them.
-- **Scheduled (`audit.yml`):** `cargo deny check advisories` runs **weekly (Mondays 06:00 UTC)**,
-  on any push that touches the dependency set (`Cargo.toml`, `Cargo.lock`, `deny.toml`), and on
-  demand. Time-varying RustSec advisories live here so a new advisory never turns a green PR red
-  on unchanged code, but still surfaces within a week.
+- **Per-PR (`ci.yml`, the `deny` job):** `cargo deny check bans licenses sources` on every
+  lockfile in the repository: the workspace, the fuzz harness (`fuzz/`) and the excluded XDP
+  workspace (`crates/siphon-rtp-xdp/`), all against the one `deny.toml`. The time-invariant
+  policy: the zero-C ban list, the OSI-permissive licence allow-list and the crates.io-only source
+  rule. All three read only the dependency graph, so their verdict changes only when a PR changes
+  that graph — no unrelated PR is ever failed by them.
+- **Per-PR advisories (`ci.yml`, the `advisories` job):** `cargo deny check advisories` on the
+  same three lockfiles, reported on every PR but left out of the `CI passed` rollup. A new advisory
+  against unchanged code never fails a PR, and a vulnerable dependency is still a red check on the
+  PR in front of whoever merges it, a release PR included.
+- **Scheduled (`audit.yml`):** `cargo deny check advisories` on all three lockfiles runs **daily
+  (06:00 UTC)**, on any push to `main` that touches the dependency set (any `Cargo.toml` or
+  `Cargo.lock`, or `deny.toml`), and on demand, so a new advisory surfaces within a day.
+- **Release gate (`release.yaml`, the `deny` job):** the full `cargo deny check` (bans, licenses,
+  sources and advisories) on the workspace lockfile must pass before the contract crate is
+  published to crates.io and before any binary, package or image is built.
 - **Yanked crates fail the audit** (`yanked = "deny"`).
+- **Licence exceptions are per crate.** `libfuzzer-sys`, reached only from the fuzz harness, may
+  carry LLVM's NCSA licence; nothing else may, and NCSA is not on the general allow-list.
 - **Ignores are explicit and justified in `deny.toml`**, each with the reason and the exit
   condition recorded (currently three unmaintained-crate notices reached transitively:
   `paste` via the jemalloc stats dev-dependency, `bincode` 1.x via `webrtc-dtls`, and
@@ -159,7 +169,11 @@ Run the same checks on your own checkout:
 ```sh
 cargo install cargo-deny
 cargo deny check bans licenses sources   # the per-PR gate
-cargo deny check advisories              # the scheduled audit
+cargo deny check advisories              # the per-PR report and the daily audit
+cargo deny check                         # the release gate: all four
+# The other two lockfiles, against the same deny.toml:
+cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml
+cargo deny --manifest-path crates/siphon-rtp-xdp/Cargo.toml check --config deny.toml
 ```
 
 Beyond dependencies, CI also fuzzes the RTP/RTCP parser with `cargo-fuzz` (libFuzzer) on every
