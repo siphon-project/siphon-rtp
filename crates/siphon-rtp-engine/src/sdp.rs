@@ -1575,8 +1575,10 @@ pub fn rewrite(
                 // RFC 8839 §5.6 / RFC 8838 §4.1: we *accept* trickled candidates, so say so — that is
                 // what lets a browser send its offer immediately and stream candidates afterwards.
                 // We never trickle our own: gathering finishes before we answer, which is why the
-                // end-of-candidates marker below is also true.
-                writer.add("a=ice-options:trickle".to_string());
+                // end-of-candidates marker below is also true. `ice2` is mandatory for an RFC 8445
+                // agent: RFC 8839 §4.2.1.5 requires it in every offer (§4.3.1) and answer (§4.3.2),
+                // and a peer that does not see it may fall back to treating us as RFC 5245.
+                writer.add("a=ice-options:trickle ice2".to_string());
                 // RFC 8838 §14: our list is complete before the SDP is built (gathering runs to
                 // completion, or to its deadline, on the control path), so say so — a trickle-capable
                 // peer can stop waiting for more instead of holding its checklist open.
@@ -4646,6 +4648,40 @@ mod tests {
         // where the session region's own attribute block is.
         assert!(!section.contains(&"a=ice-lite"), "{section:?}");
         assert!(result.sdp.contains("a=ice-lite"));
+    }
+
+    #[test]
+    fn a_re_originated_ice_block_advertises_ice2_as_rfc_8839_requires() {
+        // RFC 8839 §4.2.1.5: an agent compliant with RFC 8445 MUST include `a=ice-options` with the
+        // `ice2` value, in an offer (§4.3.1) and in an answer (§4.3.2) alike; without it the peer may
+        // treat the engine as an RFC 5245 agent. The re-originated block is what both carry, and the
+        // peer's own `a=ice-options` is stripped with the rest of its ICE, so exactly one line remains.
+        let sdp = media_level_conn_ice_offer("192.0.2.10", 20100);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let candidates = gathered_host_candidates("127.0.0.1:30168");
+        let advert = IceAdvertisement {
+            ufrag: "ENGUF",
+            pwd: "engpassword01234567",
+            candidates: &candidates,
+        };
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Reoriginate(advert),
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        let options: Vec<&str> = result
+            .sdp
+            .lines()
+            .filter_map(|line| line.strip_prefix("a=ice-options:"))
+            .collect();
+        assert_eq!(options.len(), 1, "one ice-options line: {}", result.sdp);
+        let tokens: Vec<&str> = options[0].split_whitespace().collect();
+        assert!(tokens.contains(&"ice2"), "RFC 8839 §4.3: {tokens:?}");
+        assert!(tokens.contains(&"trickle"), "RFC 8838 §4.1: {tokens:?}");
     }
 
     #[test]

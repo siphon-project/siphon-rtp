@@ -5,6 +5,16 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **The engine's ICE now advertises `ice2`.** RFC 8839 §4.2.1.5 requires an RFC 8445 agent to put the
+  `ice2` value in `a=ice-options`, in every offer (§4.3.1) and answer (§4.3.2), and a peer that does not
+  see it may treat the agent as an RFC 5245 one. The re-originated ICE block, which both the offer
+  toward the callee and the answer toward the caller carry, advertised only `trickle`. It now carries
+  `a=ice-options:trickle ice2`.
+
 ## [0.7.1] — 2026-09-15
 
 A WebRTC (DTLS-SRTP) caller can now reach a plain RTP callee through `offer`/`answer`, and stays keyed

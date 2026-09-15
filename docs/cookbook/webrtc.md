@@ -200,8 +200,9 @@ gather concurrently, so that delay is paid once per leg.
 ## Trickle (RFC 8838)
 
 Browsers trickle: they send the offer immediately and stream candidates as they
-are gathered. The engine **accepts** those — it advertises `a=ice-options:trickle`
-and takes late candidates through the control plane:
+are gathered. The engine **accepts** those — it advertises `a=ice-options:trickle ice2`
+(`ice2` marks an RFC 8445 agent, RFC 8839 §4.2.1.5) and takes late candidates
+through the control plane:
 
 ```json
 {"id": 7, "command": "ice_candidate",
