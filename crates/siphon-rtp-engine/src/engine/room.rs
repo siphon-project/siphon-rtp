@@ -536,6 +536,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // until there is a selection — but only when a full agent is actually running on
                     // this seat, since otherwise no selection is coming and waiting would hang it.
                     gate_on_ice: ice_pending,
+                    ice_validated: None,
                     plain_rtcp: None,
                 },
                 crate::dtls_bridge::PipelineTarget::Conference {

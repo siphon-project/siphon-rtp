@@ -213,6 +213,32 @@ async fn wait_for_destination(
     }
 }
 
+/// Copy an ICE-gated leg's validated source into its DTLS destination for as long as the association
+/// lives (RFC 8445 §12.1.1: no data before a valid pair, then data to that pair's remote candidate).
+/// Ends when the datapath drops the publisher, because the endpoint's ICE credentials were cleared or
+/// the endpoint was removed, or when the association is retired, which aborts it.
+fn follow_ice_validation(
+    mut validated: tokio::sync::watch::Receiver<Option<SocketAddr>>,
+    destination: SecureDestination,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if let Some(source) = *validated.borrow_and_update() {
+                destination.send_if_modified(|current| {
+                    if *current == Some(source) {
+                        return false;
+                    }
+                    *current = Some(source);
+                    true
+                });
+            }
+            if validated.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
 /// A whole call's DTLS-SRTP bridge plan: the two endpoint flows plus the handshake parameters.
 pub struct DtlsCallPlan {
     /// The insecure endpoint (plaintext RTP in, SRTP out to the DTLS peer).
@@ -235,14 +261,21 @@ pub struct DtlsCallPlan {
     pub role: DtlsRole,
     /// The DTLS peer's certificate fingerprint (from its SDP `a=fingerprint`), verified per RFC 5763 §5.
     pub peer_fingerprint: Fingerprint,
-    /// Hold the handshake until ICE selects a candidate pair, and then use the selected address.
+    /// Hold the handshake until ICE has chosen the peer's transport, and then use that address.
     ///
-    /// `true` on a leg running the full ICE agent: RFC 8445 §12 has media (and therefore the DTLS
-    /// handshake that keys it) use the selected pair, and starting earlier means handshaking against
+    /// `true` on an ICE-gated leg: under a full agent the handshake waits for the selected pair
+    /// (RFC 8445 §12), and on an ice-lite leg for the first source a connectivity check validates
+    /// (RFC 8445 §12.1.1, followed through `ice_validated`). Starting earlier means handshaking against
     /// the signalled address — which for a NATed or symmetric-NAT peer is not where it can be
     /// reached, so the handshake would burn its retransmissions and fail a call ICE could have
-    /// completed. `false` keeps the pre-ICE behaviour: start immediately at `secure_dst`.
+    /// completed. `false` keeps the non-ICE behaviour: start immediately at `secure_dst`.
     pub gate_on_ice: bool,
+    /// The secure endpoint's ICE-validated source as the datapath publishes it
+    /// ([`siphon_rtp_datapath::Datapath::watch_ice_validated`]), which the bridge follows for the life
+    /// of the association: the first source releases a held handshake, and a later one re-points the
+    /// records and media. `Some` exactly when the endpoint is ICE-gated on a backend that publishes it.
+    /// A full agent's selection arrives here too, since `adopt_source` publishes it.
+    pub ice_validated: Option<tokio::sync::watch::Receiver<Option<SocketAddr>>>,
     /// The plain peer's separate RTCP port, when it does not multiplex RTCP with RTP. `None` for a
     /// plain peer that does, whose RTCP rides `plain_endpoint`. Ignored by
     /// [`DtlsBridge::register_for_pipeline`], whose actor relays RTCP itself.
@@ -577,8 +610,12 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 rtcp_out: plan.plain_rtcp.map(|rtcp| (rtcp.endpoint, rtcp.dst)),
             },
         );
-        self.sessions
-            .insert(plan.secure_endpoint, vec![drain, shake]);
+        let mut tasks = vec![drain, shake];
+        tasks.extend(
+            plan.ice_validated
+                .map(|validated| follow_ice_validation(validated, destination.clone())),
+        );
+        self.sessions.insert(plan.secure_endpoint, tasks);
         self.destinations.insert(plan.secure_endpoint, destination);
     }
 
@@ -690,8 +727,12 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 rtcp_out: None,
             },
         );
-        self.sessions
-            .insert(plan.secure_endpoint, vec![drain, shake]);
+        let mut tasks = vec![drain, shake];
+        tasks.extend(
+            plan.ice_validated
+                .map(|validated| follow_ice_validation(validated, destination.clone())),
+        );
+        self.sessions.insert(plan.secure_endpoint, tasks);
         self.destinations.insert(plan.secure_endpoint, destination);
     }
 
@@ -917,6 +958,7 @@ mod tests {
             role: DtlsRole::Server,
             peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
             gate_on_ice: true,
+            ice_validated: None,
             plain_rtcp: None,
         });
 
@@ -955,6 +997,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ice_lite_leg_follows_the_source_its_checks_validate() {
+        // RFC 8445 §12.1.1: an ice-lite leg sends nothing before a valid pair, then sends to that pair's
+        // remote candidate. The datapath publishes the validated source and the bridge follows it, with
+        // no selection event from an agent.
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        let signalled: SocketAddr = "192.0.2.7:30000".parse().expect("addr");
+        let validated: SocketAddr = "203.0.113.9:41000".parse().expect("addr");
+        let moved: SocketAddr = "203.0.113.9:41002".parse().expect("addr");
+        let publisher = tokio::sync::watch::Sender::new(None);
+
+        let bridge = DtlsBridge::new(datapath.clone());
+        bridge.register(DtlsCallPlan {
+            plain_endpoint: plain.id,
+            plain_source: SourceFilter::Any,
+            plain_dst: "192.0.2.1:20000".parse().expect("addr"),
+            secure_endpoint: secure.id,
+            secure_source: SourceFilter::Any,
+            secure_dst: signalled,
+            secure_local: secure.local_addr,
+            certificate: DtlsCertificate::generate().expect("cert"),
+            role: DtlsRole::Server,
+            peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
+            gate_on_ice: true,
+            ice_validated: Some(publisher.subscribe()),
+            plain_rtcp: None,
+        });
+        let mut destination = bridge
+            .destinations
+            .get(&secure.id)
+            .map(|entry| entry.subscribe())
+            .expect("the leg is registered");
+        assert_eq!(
+            *destination.borrow_and_update(),
+            None,
+            "held: no destination before a check validates one"
+        );
+
+        publisher.send_replace(Some(validated));
+        tokio::time::timeout(std::time::Duration::from_secs(1), destination.changed())
+            .await
+            .expect("followed")
+            .expect("leg alive");
+        assert_eq!(
+            *destination.borrow_and_update(),
+            Some(validated),
+            "the leg keys and sends where the check came from, not the signalled address"
+        );
+
+        publisher.send_replace(Some(moved));
+        tokio::time::timeout(std::time::Duration::from_secs(1), destination.changed())
+            .await
+            .expect("followed")
+            .expect("leg alive");
+        assert_eq!(
+            *destination.borrow_and_update(),
+            Some(moved),
+            "a later validated source re-points it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_non_gated_leg_has_its_destination_from_registration() {
         // The pre-ICE behaviour is preserved exactly: without a full agent there is no selection
         // coming, and gating would hang a leg that works fine against its signalled address.
@@ -976,6 +1081,7 @@ mod tests {
             role: DtlsRole::Server,
             peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
             gate_on_ice: false,
+            ice_validated: None,
             plain_rtcp: None,
         });
         assert_eq!(
@@ -1020,6 +1126,7 @@ mod tests {
                     role: DtlsRole::Server,
                     peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
                     gate_on_ice: false,
+                    ice_validated: None,
                     plain_rtcp: None,
                 });
             }
@@ -1133,6 +1240,7 @@ mod tests {
             role: DtlsRole::Server,
             peer_fingerprint: peer_cert.fingerprint(),
             gate_on_ice: false,
+            ice_validated: None,
             plain_rtcp: None,
         });
 
@@ -1239,6 +1347,7 @@ mod tests {
             peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
             // The non-ICE path: the destination is known at registration.
             gate_on_ice: false,
+            ice_validated: None,
             plain_rtcp: None,
         });
 
@@ -1318,6 +1427,7 @@ mod tests {
             role: DtlsRole::Server,
             peer_fingerprint: peer_cert.fingerprint(),
             gate_on_ice: false,
+            ice_validated: None,
             plain_rtcp: Some(PlainRtcp {
                 endpoint: plain_rtcp.id,
                 source: SourceFilter::Exact(addr_a_rtcp.ip()),
@@ -1456,6 +1566,7 @@ mod tests {
             role: DtlsRole::Server,
             peer_fingerprint: Fingerprint::new(peer.hash_function.clone(), peer.bytes.clone()),
             gate_on_ice: false,
+            ice_validated: None,
             plain_rtcp: rtcp,
         };
         let separate = PlainRtcp {

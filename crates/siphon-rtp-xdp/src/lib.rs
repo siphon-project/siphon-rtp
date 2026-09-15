@@ -95,9 +95,11 @@ use siphon_rtp_ebpf_common::{
 };
 
 pub mod headers;
+mod ice_demux;
 pub mod neighbor;
 pub mod xsk;
 
+use ice_demux::{publish_adopted, IceDemux, StunDisposition};
 use neighbor::{NeighborResolver, Resolution, ResolverConfig};
 
 /// `#[repr(transparent)]` POD wrappers so the shared ABI types can key/value aya maps.
@@ -427,6 +429,10 @@ struct Inner {
     /// media-timeout sweep and be reaped. The loopback backend gets this for free (its responder
     /// stamps the same counter media does); this is what keeps the two backends agreeing.
     ice_last_check: Arc<DashMap<EndpointId, u64>>,
+    /// Per-endpoint publisher of the adopted source, created when a consumer subscribes through
+    /// [`Datapath::watch_ice_validated`]. Shared with the datapath thread, which publishes when the
+    /// ice-lite responder adopts a source; [`Datapath::adopt_source`] publishes on the control plane.
+    ice_validated: Arc<DashMap<EndpointId, tokio::sync::watch::Sender<Option<SocketAddr>>>>,
     next_id: AtomicU64,
     next_port: AtomicU64,
     /// Real-time monotonic origin for **arrival** timestamps and `now_micros` (RTCP interarrival
@@ -513,6 +519,9 @@ impl XdpDatapath {
         let ice_agents: Arc<DashMap<EndpointId, IceAgentRegistration>> = Arc::new(DashMap::new());
         let ice_adopted: Arc<DashMap<EndpointId, SocketAddr>> = Arc::new(DashMap::new());
         let ice_last_check: Arc<DashMap<EndpointId, u64>> = Arc::new(DashMap::new());
+        let ice_validated: Arc<
+            DashMap<EndpointId, tokio::sync::watch::Sender<Option<SocketAddr>>>,
+        > = Arc::new(DashMap::new());
         let shared_loader = Arc::new(Mutex::new(loader));
         let start = std::time::Instant::now();
         // Same-instant CLOCK_MONOTONIC reading (the domain of the kernel's bpf_ktime_get_ns per-flow
@@ -531,6 +540,7 @@ impl XdpDatapath {
             ice_agents: ice_agents.clone(),
             ice_adopted: ice_adopted.clone(),
             ice_last_check: ice_last_check.clone(),
+            ice_validated: ice_validated.clone(),
             next_id: AtomicU64::new(0),
             next_port: AtomicU64::new(0),
             start,
@@ -570,6 +580,7 @@ impl XdpDatapath {
                         ice_agents,
                         adopted: ice_adopted,
                         last_check: ice_last_check,
+                        validated: ice_validated,
                     },
                     thread_loader,
                     tos,
@@ -895,108 +906,6 @@ fn apply_forward_target(
     }
 }
 
-/// The ICE state the datapath thread needs to demux STUN out of the redirected stream: the
-/// per-endpoint credentials (to answer a check) and the full-agent registrations (where to forward
-/// it). Shared with the control plane by `Arc`, so a `set_ice` / `set_ice_agent` between bursts is
-/// visible on the very next packet.
-#[derive(Clone)]
-struct IceDemux {
-    ice: Arc<DashMap<EndpointId, IceConfig>>,
-    ice_agents: Arc<DashMap<EndpointId, IceAgentRegistration>>,
-    /// The source ICE has adopted per endpoint — the userspace record behind
-    /// [`Datapath::ice_validated_source`]. Written by the ice-lite responder on this thread and by
-    /// [`Datapath::adopt_source`] on the control plane; the kernel flow's latch fields are the
-    /// enforcement copy of the same decision.
-    adopted: Arc<DashMap<EndpointId, SocketAddr>>,
-    /// Tick of the last validated check per endpoint — see `Inner::ice_last_check`.
-    last_check: Arc<DashMap<EndpointId, u64>>,
-}
-
-/// One STUN datagram's disposition on the datapath thread, decided by [`IceDemux::classify`].
-#[derive(Debug, PartialEq, Eq)]
-enum StunDisposition {
-    /// Not an ICE endpoint — leave the datagram on the normal redirect path (a TURN allocation actor
-    /// on a `Redirect` flow legitimately receives STUN-shaped bytes).
-    NotIce,
-    /// Consumed by ICE. It has already been forwarded to the agent; the two remaining side-effects
-    /// are the caller's, so the decision itself stays I/O-free and testable without a NIC:
-    /// transmit `respond` back to the source, and write `adopt` into the kernel's layer-4 gate.
-    Consumed {
-        /// The ice-lite responder's Binding success response, when the check authenticated.
-        respond: Option<Vec<u8>>,
-        /// A newly adopted media source — `None` when nothing changed, so the kernel map is written
-        /// once per adoption rather than once per check.
-        adopt: Option<SocketAddr>,
-    },
-}
-
-impl IceDemux {
-    /// Decide what happens to a STUN datagram that arrived on `endpoint` from `source`, performing
-    /// the forward-to-agent side-effect. Mirrors the loopback backend's `recv_loop` demux exactly:
-    /// forward to the agent first (so it sees Binding responses too), then let the responder answer
-    /// unless the endpoint is [`IceAgentMode::ForwardOnly`] — where answering behind a full agent's
-    /// back would adopt a source the checklist never selected.
-    fn classify(
-        &self,
-        endpoint: EndpointId,
-        source: SocketAddr,
-        datagram: &[u8],
-        tick: u64,
-    ) -> StunDisposition {
-        let registration = self.ice_agents.get(&endpoint).map(|entry| entry.clone());
-        if let Some(registration) = registration.as_ref() {
-            // Bounded sink, drop-on-full — never stall the datapath thread on a slow consumer.
-            let _ = registration.events.try_send(IceDatapathEvent {
-                endpoint,
-                source,
-                arrival_tick: tick,
-                datagram: Bytes::copy_from_slice(datagram),
-            });
-            if registration.mode == IceAgentMode::ForwardOnly {
-                return StunDisposition::Consumed {
-                    respond: None,
-                    adopt: None,
-                };
-            }
-        }
-        let Some(config) = self.ice.get(&endpoint).map(|entry| entry.clone()) else {
-            // No ICE credentials at all. If a full agent is registered the datagram is still ICE's
-            // (it was forwarded above); otherwise this is not an ICE endpoint and the datagram
-            // belongs on the redirect path.
-            return match registration {
-                Some(_) => StunDisposition::Consumed {
-                    respond: None,
-                    adopt: None,
-                },
-                None => StunDisposition::NotIce,
-            };
-        };
-        match siphon_rtp_datapath::respond_to_stun_check(datagram, &config, source) {
-            siphon_rtp_datapath::StunCheckOutcome::Respond(response) => {
-                // An authenticated check proves the path is alive, so it counts as activity for the
-                // media-timeout sweep exactly as it does on the loopback backend — otherwise a leg
-                // still establishing (or held, exchanging only consent checks) would be reaped.
-                self.last_check.insert(endpoint, tick);
-                // A check that authenticated: ICE supersedes blind latching, so this source becomes
-                // the media path (RFC 8445 §7.3). Report the adoption only when it *changes*, so the
-                // kernel map is written once per path rather than on every repeated check.
-                let changed = self.adopted.get(&endpoint).map(|entry| *entry) != Some(source);
-                if changed {
-                    self.adopted.insert(endpoint, source);
-                }
-                StunDisposition::Consumed {
-                    respond: Some(response),
-                    adopt: changed.then_some(source),
-                }
-            }
-            siphon_rtp_datapath::StunCheckOutcome::Drop => StunDisposition::Consumed {
-                respond: None,
-                adopt: None,
-            },
-        }
-    }
-}
-
 /// Write an ICE-adopted source into `endpoint`'s kernel flow, which is what the classifier's layer-4
 /// gate compares every media datagram against (`rewrite::ice_media_allowed`). Until this lands, an
 /// ICE flow forwards nothing at all — that is the intended posture: media follows ICE's decision, not
@@ -1109,6 +1018,7 @@ fn datapath_loop(
                         }
                         if let Some(adopted) = adopt {
                             adopt_source_in_kernel(&loader, &endpoints, endpoint, adopted);
+                            publish_adopted(&ice.adopted, &ice.validated, endpoint);
                         }
                         continue;
                     }
@@ -1390,6 +1300,7 @@ impl Datapath for XdpDatapath {
         self.inner.ice_agents.remove(&endpoint);
         self.inner.ice_adopted.remove(&endpoint);
         self.inner.ice_last_check.remove(&endpoint);
+        self.inner.ice_validated.remove(&endpoint);
     }
 
     async fn send(
@@ -1507,6 +1418,7 @@ impl Datapath for XdpDatapath {
                 self.inner.ice_agents.remove(&endpoint);
                 self.inner.ice_adopted.remove(&endpoint);
                 self.inner.ice_last_check.remove(&endpoint);
+                self.inner.ice_validated.remove(&endpoint);
             }
         }
         // Flip the kernel flow's ICE byte. That is what makes the classifier redirect STUN here
@@ -1541,6 +1453,26 @@ impl Datapath for XdpDatapath {
     fn adopt_source(&self, endpoint: EndpointId, source: SocketAddr) {
         self.inner.ice_adopted.insert(endpoint, source);
         adopt_source_in_kernel(&self.inner.loader, &self.inner.endpoints, endpoint, source);
+        publish_adopted(&self.inner.ice_adopted, &self.inner.ice_validated, endpoint);
+    }
+
+    fn watch_ice_validated(
+        &self,
+        endpoint: EndpointId,
+    ) -> Option<tokio::sync::watch::Receiver<Option<SocketAddr>>> {
+        // Only an endpoint with credentials is gated on a check; see the loopback backend.
+        if !self.inner.ice.contains_key(&endpoint) {
+            return None;
+        }
+        let subscription = self
+            .inner
+            .ice_validated
+            .entry(endpoint)
+            .or_insert_with(|| tokio::sync::watch::Sender::new(None))
+            .subscribe();
+        // Catch up with a source adopted before this endpoint had a publisher.
+        publish_adopted(&self.inner.ice_adopted, &self.inner.ice_validated, endpoint);
+        Some(subscription)
     }
 
     fn rx(&self) -> flume::Receiver<RxPacket> {
@@ -1878,6 +1810,7 @@ mod tests {
             ice_agents: Arc::new(DashMap::new()),
             adopted: Arc::new(DashMap::new()),
             last_check: Arc::new(DashMap::new()),
+            validated: Arc::new(DashMap::new()),
         }
     }
 
@@ -1933,6 +1866,34 @@ mod tests {
             second,
             StunDisposition::Consumed { adopt: None, .. }
         ));
+    }
+
+    #[test]
+    fn an_adoption_is_published_to_a_subscriber_once_per_change() {
+        // `Datapath::watch_ice_validated`: a userspace consumer that owns a leg's egress follows the
+        // source the ice-lite responder adopts (RFC 8445 §12.1.1), and a repeated check wakes nobody.
+        let demux = demux();
+        let config = ice_config();
+        demux.ice.insert(ICE_ENDPOINT, config.clone());
+        let publisher = tokio::sync::watch::Sender::new(None);
+        let mut validated = publisher.subscribe();
+        demux.validated.insert(ICE_ENDPOINT, publisher);
+
+        let check = signed_check(&config);
+        let StunDisposition::Consumed { adopt: Some(_), .. } =
+            demux.classify(ICE_ENDPOINT, peer(), &check, 0)
+        else {
+            panic!("a valid check adopts its source");
+        };
+        publish_adopted(&demux.adopted, &demux.validated, ICE_ENDPOINT);
+        assert!(validated.has_changed().expect("publisher alive"));
+        assert_eq!(*validated.borrow_and_update(), Some(peer()));
+
+        publish_adopted(&demux.adopted, &demux.validated, ICE_ENDPOINT);
+        assert!(
+            !validated.has_changed().expect("publisher alive"),
+            "the same source again is not a change"
+        );
     }
 
     #[test]

@@ -13374,6 +13374,11 @@ async fn peer_dtls_handshake_server(
         tokio::spawn(async move {
             let mut buffer = [0u8; 2048];
             while let Ok((len, _)) = socket.recv_from(&mut buffer).await {
+                // RFC 7983 §7: only DTLS records (first byte 20..=63) belong to the handshake. On an
+                // ICE leg the same socket also receives the engine's STUN, as a real peer's does.
+                if !(20..=63).contains(&buffer[0]) {
+                    continue;
+                }
                 if inbound
                     .send_async(Bytes::copy_from_slice(&buffer[..len]))
                     .await
@@ -18460,6 +18465,315 @@ async fn a_full_ice_leg_opens_its_media_path_only_after_a_pair_is_selected() {
         .expect("media reaches B once ICE has chosen a pair")
         .expect("recv");
     assert_eq!(&buffer[..len], rtp(0x0A0A_0A0A).as_slice());
+}
+
+/// A WebRTC-shaped DTLS-SRTP offerer behind a NAT: its `c=` and default candidate carry an address
+/// nothing answers on (TEST-NET-1, RFC 5737), while its real transport is the host candidate `real`.
+/// This is the shape ICE exists for: the checks, the DTLS records and the media all come from `real`,
+/// never from the address the connection line names (RFC 8445 §7.3.1.3).
+fn nated_ice_dtls_offerer_sdp(
+    signalled: SocketAddr,
+    real: SocketAddr,
+    fingerprint: &siphon_rtp_dtls::Fingerprint,
+) -> String {
+    let hex = fingerprint
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {s_ip}\r\ns=-\r\nc=IN IP4 {s_ip}\r\nt=0 0\r\n\
+         a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+         m=audio {s_port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+         a=setup:actpass\r\na=fingerprint:{hash} {hex}\r\n\
+         a=candidate:host 1 UDP 2130706431 {r_ip} {r_port} typ host\r\n\
+         a=candidate:default 1 UDP 1694498815 {s_ip} {s_port} typ srflx raddr {r_ip} rport {r_port}\r\n\
+         a=end-of-candidates\r\n",
+        s_ip = signalled.ip(),
+        s_port = signalled.port(),
+        r_ip = real.ip(),
+        r_port = real.port(),
+        hash = fingerprint.hash_function,
+    )
+}
+
+/// Media both ways through a keyed DTLS offerer bridge: A's SRTP reaches B decrypted, and B's RTP
+/// reaches A as SRTP that A's own leg decrypts. A's first packet is retried across the window between
+/// A finishing its handshake and the engine installing its key.
+async fn assert_offerer_bridge_relays_both_ways(
+    socket_a: &UdpSocket,
+    caller_leg: &mut siphon_rtp_srtp::leg::SecureLeg,
+    engine_near: SocketAddr,
+    phone_b: &UdpSocket,
+    engine_far: SocketAddr,
+) {
+    let media = rtp(0x0A0A_0A0A);
+    let mut buffer = [0u8; 2048];
+    let mut at_b = None;
+    for _ in 0..25 {
+        let mut sealed = Vec::new();
+        caller_leg
+            .protect(&media, &mut sealed)
+            .expect("caller protect");
+        socket_a
+            .send_to(&sealed, engine_near)
+            .await
+            .expect("a send");
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(150), phone_b.recv_from(&mut buffer)).await
+        {
+            at_b = Some(buffer[..len].to_vec());
+            break;
+        }
+    }
+    assert_eq!(
+        at_b.expect("B received A's media"),
+        media,
+        "A's SRTP reaches B decrypted"
+    );
+
+    let reply = rtp(0x0B0B_0B0B);
+    phone_b.send_to(&reply, engine_far).await.expect("b send");
+    let recovered = loop {
+        let (len, _) = timeout(Duration::from_secs(2), socket_a.recv_from(&mut buffer))
+            .await
+            .expect("A received B's media")
+            .expect("a recv");
+        // RFC 7983 §7: skip a late STUN response or DTLS retransmission; SRTP is 128..=191.
+        if !(128..=191).contains(&buffer[0]) {
+            continue;
+        }
+        let mut recovered = Vec::new();
+        caller_leg
+            .unprotect(&buffer[..len], &mut recovered)
+            .expect("caller unprotect");
+        break recovered;
+    };
+    assert_eq!(recovered, reply, "B's RTP reaches A as SRTP");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_ice_dtls_offerer_is_keyed_on_the_pair_ice_selected_not_its_connection_address() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_dtls::DtlsCertificate;
+
+    // RFC 8445 §12: an ICE peer's data, its DTLS records included (RFC 5764 §4.1), comes from the pair
+    // ICE selected, and for a NATed browser that is not its `c=`. The datapath's layer-4 gate already
+    // admits only that validated source on the bridge's endpoint, so the bridge must not drop it again
+    // for not being the connection address.
+    let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let socket_a = Arc::new(
+        UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a"),
+    );
+    let addr_a = socket_a.local_addr().expect("addr a");
+    let signalled: SocketAddr = "192.0.2.10:40000".parse().expect("signalled address");
+    let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let caller = DtlsCertificate::generate().expect("caller cert");
+    let call_id = "full-ice-dtls-offerer";
+
+    let offered = offer_from_a(
+        &engine,
+        call_id,
+        nated_ice_dtls_offerer_sdp(signalled, addr_a, &caller.fingerprint()),
+        plain_far_leg(),
+    )
+    .await;
+    let answered = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let engine_near = answered.remote_rtp;
+    let engine_far = offered.remote_rtp;
+    let engine_fingerprint = answered
+        .fingerprint
+        .clone()
+        .expect("the engine's fingerprint in A's answer");
+    let near_rtp = engine
+        .calls
+        .get(call_id)
+        .map(|call| call.near.rtp.id)
+        .expect("call");
+
+    // Drive both agents until the engine selects A's real transport.
+    let mut peer = peer_agent(&answered, addr_a);
+    let mut buffer = [0u8; 2048];
+    let mut now = 0u64;
+    while now < 4_000 && engine.datapath().ice_validated_source(near_rtp).is_none() {
+        for action in peer.poll(now) {
+            if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                socket_a.send_to(&datagram, to).await.expect("peer send");
+            }
+        }
+        engine.drive_ice_agents(now).await;
+        while let Ok(Ok((len, from))) =
+            timeout(Duration::from_millis(20), socket_a.recv_from(&mut buffer)).await
+        {
+            if siphon_rtp_stun::parse(&buffer[..len]).is_err() {
+                continue; // the released handshake's first flight, which DTLS retransmits
+            }
+            for action in peer.on_datagram(addr_a, from, &buffer[..len], now) {
+                if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                    socket_a.send_to(&datagram, to).await.expect("peer send");
+                }
+            }
+            engine.drive_ice_agents(now).await;
+        }
+        now += 20;
+    }
+    assert_eq!(
+        engine.datapath().ice_validated_source(near_rtp),
+        Some(addr_a),
+        "ICE selected A's real transport, not its connection address"
+    );
+
+    let mut caller_leg = peer_dtls_handshake_server(
+        socket_a.clone(),
+        addr_a,
+        engine_near,
+        &caller,
+        &engine_fingerprint,
+    )
+    .await;
+    assert_offerer_bridge_relays_both_ways(
+        &socket_a,
+        &mut caller_leg,
+        engine_near,
+        &phone_b,
+        engine_far,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ice_lite_dtls_offerer_is_keyed_on_the_source_its_check_validated() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_dtls::DtlsCertificate;
+
+    // RFC 8445 §12.1.1: a lite implementation "MUST NOT send data until it has a valid list that
+    // contains at least one valid pair for each component", and data then goes to that pair's remote
+    // candidate. A lite engine's valid pair is the source of the check it validated, so its DTLS
+    // records (RFC 5764 §4.1) go there, not to the `c=` a NATed browser signals.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let socket_a = Arc::new(
+        UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a"),
+    );
+    let addr_a = socket_a.local_addr().expect("addr a");
+    let signalled: SocketAddr = "192.0.2.10:40000".parse().expect("signalled address");
+    let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let caller = DtlsCertificate::generate().expect("caller cert");
+    let call_id = "lite-ice-dtls-offerer";
+
+    let offered = offer_from_a(
+        &engine,
+        call_id,
+        nated_ice_dtls_offerer_sdp(signalled, addr_a, &caller.fingerprint()),
+        plain_far_leg(),
+    )
+    .await;
+    let answered = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let engine_near = answered.remote_rtp;
+    let engine_far = offered.remote_rtp;
+    let engine_fingerprint = answered
+        .fingerprint
+        .clone()
+        .expect("the engine's fingerprint in A's answer");
+    let engine_ufrag = answered.ice_ufrag.clone().expect("engine ufrag");
+    let engine_pwd = answered.ice_pwd.clone().expect("engine pwd");
+
+    // A, the full agent of the pair, checks the engine from its real transport.
+    let check = siphon_rtp_stun::binding_request(
+        &[7u8; 12],
+        &format!("{engine_ufrag}:{A_UFRAG}"),
+        engine_pwd.as_bytes(),
+    );
+    socket_a
+        .send_to(&check, engine_near)
+        .await
+        .expect("send check");
+
+    let mut caller_leg = peer_dtls_handshake_server(
+        socket_a.clone(),
+        addr_a,
+        engine_near,
+        &caller,
+        &engine_fingerprint,
+    )
+    .await;
+    assert_offerer_bridge_relays_both_ways(
+        &socket_a,
+        &mut caller_leg,
+        engine_near,
+        &phone_b,
+        engine_far,
+    )
+    .await;
+
+    // The bridge's own filter is open on this ICE leg, so prove the datapath's layer-4 gate stands in
+    // front of it: SRTP that authenticates, under a sequence number the replay window has not seen, is
+    // still dropped when it arrives from a source no check validated (docs/security-and-nat.md §4).
+    let stranger = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 4), 0))
+        .await
+        .expect("bind stranger");
+    let mut sealed = Vec::new();
+    caller_leg
+        .protect(&g711_rtp(0, 100, 0x0A0A_0A0A, 0x00), &mut sealed)
+        .expect("caller protect");
+    stranger
+        .send_to(&sealed, engine_near)
+        .await
+        .expect("stranger send");
+    let mut buffer = [0u8; 2048];
+    assert!(
+        timeout(Duration::from_millis(300), phone_b.recv_from(&mut buffer))
+            .await
+            .is_err(),
+        "authenticated SRTP from a source no check validated never reaches B"
+    );
+    // The same stream's next packet from the validated source still does.
+    let next = g711_rtp(0, 101, 0x0A0A_0A0A, 0x00);
+    let mut sealed = Vec::new();
+    caller_leg
+        .protect(&next, &mut sealed)
+        .expect("caller protect");
+    socket_a
+        .send_to(&sealed, engine_near)
+        .await
+        .expect("a send");
+    let (len, _) = timeout(Duration::from_secs(1), phone_b.recv_from(&mut buffer))
+        .await
+        .expect("the validated source's next packet reaches B")
+        .expect("b recv");
+    assert_eq!(&buffer[..len], next.as_slice());
 }
 
 // ---- Full ICE on a conference seat (RFC 8445 + the room actor) ------------------------------

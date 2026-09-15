@@ -27,6 +27,19 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   the promotion returned, so that first tick could send the caller a frame of comfort noise ahead of
   its own reflected audio. The promotion now builds the actor with echo already on, the same way a
   secure caller's actor is built already gated.
+- **A DTLS-SRTP leg behind NAT is keyed on the address ICE validated, not on its `c=`.** A WebRTC peer's
+  checks, handshake and media come from the transport ICE chose, which for a browser behind NAT is not
+  the address its SDP signals (RFC 8445 §7.3.1.3). Two things broke that on the DTLS bridge, on a
+  terminated DTLS-SRTP caller and on a DTLS callee alike. The bridge gated the secure endpoint on the
+  signalled address, so under `--ice-full` the peer's handshake was dropped even after ICE selected its
+  real transport. And on the default ICE-lite responder the engine started the handshake toward `c=` at
+  once and never moved it, where RFC 8445 §12.1.1 has a lite agent send nothing before a valid pair and
+  then send to it. On an ICE-gated leg the bridge now leaves source gating to the datapath's
+  check-validated gate, which already admits only the authenticated source, and holds the handshake
+  until ICE has validated the peer's transport: the full agent's selection, or the source of the first
+  check the ICE-lite responder accepts. Records and SRTP follow that source. The datapath publishes it
+  through a new `Datapath::watch_ice_validated`, on both the UDP and XDP backends. A DTLS conference seat
+  and a secure WebSocket takeover still start an ICE-lite handshake at the signalled address.
 
 ## [0.7.1] — 2026-09-15
 

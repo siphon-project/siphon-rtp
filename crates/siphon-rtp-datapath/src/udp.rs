@@ -209,6 +209,10 @@ struct Inner {
     /// Endpoints whose STUN the datapath forwards **without answering** — a full RFC 8445 agent owns
     /// request handling there (see [`IceAgentMode::ForwardOnly`]). Absent ⇒ the responder still runs.
     ice_forward_only: DashMap<EndpointId, ()>,
+    /// Per-endpoint publisher of the ICE-validated source, created when a consumer subscribes through
+    /// [`Datapath::watch_ice_validated`]. Written wherever `latched` is written on an ICE endpoint: the
+    /// responder's validated check and [`Datapath::adopt_source`].
+    ice_validated: DashMap<EndpointId, tokio::sync::watch::Sender<Option<SocketAddr>>>,
     redirect_tx: flume::Sender<RxPacket>,
     redirect_rx: flume::Receiver<RxPacket>,
     /// Telemetry tap: when enabled, relayed RTCP is copied here (bounded, dropped on backpressure).
@@ -400,6 +404,22 @@ impl Inner {
         }
     }
 
+    /// Publish `endpoint`'s ICE-validated source to its subscribers, if it has any. The source is read
+    /// inside the publisher's own lock, so a check validated while a subscription is being set up can
+    /// never be overwritten by an older reading.
+    fn publish_ice_validated(&self, endpoint: EndpointId) {
+        if let Some(publisher) = self.ice_validated.get(&endpoint) {
+            publisher.send_if_modified(|published| {
+                let validated = self.latched.get(&endpoint).map(|latch| latch.source);
+                if *published == validated {
+                    return false;
+                }
+                *published = validated;
+                true
+            });
+        }
+    }
+
     /// Apply the SSRC-consistent latch ([`source_latch_verdict`]) to a packet arriving on `endpoint`
     /// from `source`, storing what it learns. Returns [`LatchOutcome::Reject`] for a likely hijack (a
     /// new source that cannot prove it is the latched stream); the caller then drops it.
@@ -526,6 +546,7 @@ impl UdpLoopbackDatapath {
                 turn_relay: DashMap::new(),
                 ice_events: DashMap::new(),
                 ice_forward_only: DashMap::new(),
+                ice_validated: DashMap::new(),
                 redirect_tx,
                 redirect_rx,
                 observe_enabled: AtomicBool::new(false),
@@ -797,6 +818,7 @@ async fn handle_stun(
     inner
         .latched
         .insert(endpoint, SourceLatch { source, ssrc: None });
+    inner.publish_ice_validated(endpoint);
     stats
         .last_seen
         .store(inner.clock.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1029,6 +1051,7 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner.latched.remove(&endpoint);
         self.inner.ice.remove(&endpoint);
         self.inner.ice_events.remove(&endpoint);
+        self.inner.ice_validated.remove(&endpoint);
     }
 
     async fn send(
@@ -1124,6 +1147,7 @@ impl Datapath for UdpLoopbackDatapath {
                 self.inner.ice.remove(&endpoint);
                 self.inner.ice_events.remove(&endpoint);
                 self.inner.ice_forward_only.remove(&endpoint);
+                self.inner.ice_validated.remove(&endpoint);
             }
         }
     }
@@ -1156,6 +1180,7 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner
             .latched
             .insert(endpoint, SourceLatch { source, ssrc: None });
+        self.inner.publish_ice_validated(endpoint);
     }
 
     fn latched_source(&self, endpoint: EndpointId) -> Option<SocketAddr> {
@@ -1173,6 +1198,26 @@ impl Datapath for UdpLoopbackDatapath {
             return None;
         }
         self.inner.latched.get(&endpoint).map(|latch| latch.source)
+    }
+
+    fn watch_ice_validated(
+        &self,
+        endpoint: EndpointId,
+    ) -> Option<tokio::sync::watch::Receiver<Option<SocketAddr>>> {
+        // The same credential test as `ice_validated_source`: on a non-ICE endpoint `latched` is a media
+        // latch no check authenticated, and nothing gates that endpoint on a check anyway.
+        if !self.inner.ice.contains_key(&endpoint) {
+            return None;
+        }
+        let subscription = self
+            .inner
+            .ice_validated
+            .entry(endpoint)
+            .or_insert_with(|| tokio::sync::watch::Sender::new(None))
+            .subscribe();
+        // Catch up with a check validated before this endpoint had a publisher.
+        self.inner.publish_ice_validated(endpoint);
+        Some(subscription)
     }
 
     fn observe_rtcp(&self) -> flume::Receiver<ObservedRtcp> {
@@ -2655,6 +2700,97 @@ mod tests {
             datapath.ice_validated_source(leg.id),
             Some(peer_addr),
             "the validated check's source is the selected path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watch_ice_validated_follows_each_validated_source_until_ice_is_cleared() {
+        // The push side of `ice_validated_source`, for a consumer that owns a leg's egress in userspace:
+        // RFC 8445 §12.1.1 has an ice-lite leg send nothing before a valid pair, and then send to it.
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        assert!(
+            datapath.watch_ice_validated(plain.id).is_none(),
+            "an endpoint without ICE credentials has no validated source to follow"
+        );
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        datapath.set_ice(
+            leg.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        let mut validated = datapath
+            .watch_ice_validated(leg.id)
+            .expect("an ICE endpoint can be followed");
+        assert_eq!(
+            *validated.borrow_and_update(),
+            None,
+            "nothing validated yet"
+        );
+
+        // A forgery publishes nothing.
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        attacker
+            .send_to(
+                &stun::binding_request(&[3u8; 12], "ENG:remote", b"WRONG"),
+                leg.local_addr,
+            )
+            .await
+            .expect("send forged");
+        assert!(
+            timeout(NEGATIVE, validated.changed()).await.is_err(),
+            "a check failing MESSAGE-INTEGRITY publishes nothing"
+        );
+
+        // The peer's valid check publishes its source.
+        let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        peer.send_to(
+            &stun::binding_request(&[4u8; 12], "ENG:remote", b"engpass"),
+            leg.local_addr,
+        )
+        .await
+        .expect("send check");
+        timeout(std::time::Duration::from_secs(1), validated.changed())
+            .await
+            .expect("published")
+            .expect("publisher alive");
+        assert_eq!(*validated.borrow_and_update(), Some(peer_addr));
+        let _ = recv(&peer).await;
+
+        // A later subscriber starts at the validated source instead of waiting for the next check.
+        assert_eq!(
+            *datapath
+                .watch_ice_validated(leg.id)
+                .expect("still an ICE endpoint")
+                .borrow(),
+            Some(peer_addr)
+        );
+
+        // A valid check from another transport re-points it, exactly as the responder re-adopts.
+        let (moved, moved_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+        moved
+            .send_to(
+                &stun::binding_request(&[5u8; 12], "ENG:remote", b"engpass"),
+                leg.local_addr,
+            )
+            .await
+            .expect("send check");
+        timeout(std::time::Duration::from_secs(1), validated.changed())
+            .await
+            .expect("re-published")
+            .expect("publisher alive");
+        assert_eq!(*validated.borrow_and_update(), Some(moved_addr));
+
+        // Clearing the credentials closes the subscription, so a follower stops instead of waiting.
+        datapath.set_ice(leg.id, None);
+        assert!(
+            timeout(std::time::Duration::from_secs(1), validated.changed())
+                .await
+                .expect("closed promptly")
+                .is_err(),
+            "the publisher is dropped with the endpoint's ICE state"
         );
     }
 
