@@ -1169,3 +1169,91 @@ async fn secure_ws_takeover_does_not_leak() {
     }
     gate.assert_no_leak();
 }
+
+/// One terminated DTLS-SRTP offerer churn cycle: `offer` from a WebRTC-shaped caller asking for a
+/// plain far leg (the caller's keying is kept on the call) → a plain `answer` from a callee that keeps
+/// RTCP on its own port (which registers the DTLS bridge, spawning its handshake and record-drain
+/// tasks against a caller that never answers) → `delete`, which has to abort both tasks and free
+/// every port.
+///
+/// The caller offers `a=setup:active`, so the engine waits as the DTLS server and sends nothing
+/// toward the documentation address the caller signals.
+async fn dtls_offerer_offer_answer_delete(
+    engine: &Engine<UdpLoopbackDatapath>,
+    fingerprint: &siphon_rtp_dtls::Fingerprint,
+    index: usize,
+) {
+    let call_id = format!("dtls-offerer-soak-{index}");
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: dtls_offerer_sdp("198.51.100.1", 40_000, fingerprint),
+                    profile: siphon_rtp_proto::ProfileFlags {
+                        transport_protocol: Some("RTP/AVP".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await,
+        "offer from a DTLS-SRTP caller toward a plain callee",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for("203.0.113.1", 41_000),
+                    profile: Default::default(),
+                },
+            )
+            .await,
+        "plain answer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id,
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dtls_offerer_relay_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let certificate = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let fingerprint = certificate.fingerprint();
+
+    // On top of a relay's endpoints and registry entry, each call registers a DTLS bridge whose two
+    // tasks `delete` has to abort. Same segment size as the plain relay.
+    let mut gate = LeakGate::new("dtls offerer relay", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            dtls_offerer_offer_answer_delete(&engine, &fingerprint, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}

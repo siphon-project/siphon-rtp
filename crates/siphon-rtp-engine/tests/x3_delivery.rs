@@ -578,3 +578,281 @@ async fn delivery_never_speaks_plaintext_to_a_non_tls_peer() {
 
     delivery_handle.abort();
 }
+
+/// A terminated DTLS-SRTP offerer's crypto bridge faces the caller with its *secure* endpoint and
+/// the callee with its plain one, the reverse of a DTLS callee. So drive `attach_x3` on such a call
+/// through the engine's own command path, against the stub Mediation Function, and pin that each
+/// party's content arrives as plaintext RTP labelled from the target's side, with that party's own
+/// source address and the engine port it sent to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_x3_on_a_terminated_dtls_offerer_delivers_both_parties_in_the_clear() {
+    use siphon_rtp_datapath::Datapath as _;
+    use siphon_rtp_dtls::{handshake, DtlsCertificate, DtlsRole, DtlsTransport, Fingerprint};
+    use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_proto::{CmdResult, Command, ProfileFlags, X3TargetLeg};
+    use tokio::net::UdpSocket;
+
+    const CALL: &str = "x3-dtls-offerer";
+    let pki = pki();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mdf");
+    let mediation = listener.local_addr().expect("mdf addr");
+    let acceptor = acceptor(&pki);
+
+    let engine =
+        siphon_rtp_engine::Engine::new(siphon_rtp_datapath::udp::UdpLoopbackDatapath::new())
+            .with_x3(pki.config.clone());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let client = siphon_rtp_engine::ClientId(1);
+
+    let caller_socket = Arc::new(UdpSocket::bind("127.0.0.2:0").await.expect("bind caller"));
+    let caller = caller_socket.local_addr().expect("caller addr");
+    let callee_socket = UdpSocket::bind("127.0.0.3:0").await.expect("bind callee");
+    let callee = callee_socket.local_addr().expect("callee addr");
+    let certificate = DtlsCertificate::generate().expect("caller cert");
+    let fingerprint = certificate.fingerprint();
+    let hex = fingerprint
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let engine_sdp = |result: &CmdResult| match result {
+        CmdResult::Ok {
+            sdp: Some(text), ..
+        } => siphon_rtp_engine::sdp::parse(text).expect("parse the engine's sdp"),
+        other => panic!("expected Ok with sdp, got {other:?}"),
+    };
+
+    // A WebRTC-shaped caller asking for a plain callee, so the engine terminates its DTLS and answers
+    // `active` to its `actpass` (RFC 5763 §5): the caller is the DTLS server.
+    let offered = engine_sdp(
+        &engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: CALL.into(),
+                    from_tag: "tag-a".into(),
+                    sdp: format!(
+                        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+                         m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n\
+                         a=rtcp-mux\r\na=setup:actpass\r\na=fingerprint:{hash} {hex}\r\n",
+                        ip = caller.ip(),
+                        port = caller.port(),
+                        hash = fingerprint.hash_function,
+                    ),
+                    profile: ProfileFlags {
+                        transport_protocol: Some("RTP/AVP".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await,
+    );
+    let answered = engine_sdp(
+        &engine
+            .handle(
+                client,
+                Command::Answer {
+                    call_id: CALL.into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: format!(
+                        "v=0\r\no=- 2 2 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+                         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+                        ip = callee.ip(),
+                        port = callee.port(),
+                    ),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await,
+    );
+    let engine_toward_caller = answered.remote_rtp;
+    let engine_toward_callee = offered.remote_rtp;
+    let engine_fingerprint = answered
+        .fingerprint
+        .expect("the engine's fingerprint in the caller's answer");
+
+    let attached = engine
+        .handle(
+            client,
+            Command::AttachX3 {
+                call_id: CALL.into(),
+                from_tag: "tag-a".into(),
+                delivery: mediation.to_string(),
+                xid: XID_TEXT.parse::<Xid>().expect("xid"),
+                correlation_id: CORRELATION_ID,
+                target_leg: X3TargetLeg::Caller,
+            },
+        )
+        .await;
+    assert!(
+        matches!(attached, CmdResult::Ok { .. }),
+        "attach_x3 on a terminated DTLS offerer, got {attached:?}"
+    );
+
+    // The caller's half of the handshake, over its own socket.
+    let (transport, channels) = DtlsTransport::new(caller, engine_toward_caller);
+    let reader = {
+        let socket = caller_socket.clone();
+        let inbound = channels.inbound;
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 2048];
+            while let Ok((len, _)) = socket.recv_from(&mut buffer).await {
+                if inbound
+                    .send_async(bytes::Bytes::copy_from_slice(&buffer[..len]))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    };
+    let writer = {
+        let socket = caller_socket.clone();
+        let outbound = channels.outbound;
+        tokio::spawn(async move {
+            while let Ok(record) = outbound.recv_async().await {
+                if socket.send_to(&record, engine_toward_caller).await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
+    let expected = Fingerprint::new(
+        engine_fingerprint.hash_function.clone(),
+        engine_fingerprint.bytes.clone(),
+    );
+    let mut caller_leg = timeout(
+        SHORT,
+        handshake(
+            Arc::new(transport),
+            &certificate,
+            DtlsRole::Server,
+            &expected,
+        ),
+    )
+    .await
+    .expect("handshake did not time out")
+    .expect("caller handshake");
+    reader.abort();
+    writer.abort();
+
+    // Caller → callee: SRTP in, RTP out. Retry across the window between the caller finishing its
+    // handshake and the engine installing the key, then collect whatever the retries still delivered.
+    // X3 content is taken only after the bridge decrypted a packet, so it must be exactly these.
+    let mut buffer = [0u8; 2048];
+    let mut at_callee = Vec::new();
+    let mut sequence = 1u16;
+    while at_callee.is_empty() && sequence <= 25 {
+        let mut sealed = Vec::new();
+        caller_leg
+            .protect(&rtp(sequence), &mut sealed)
+            .expect("caller protect");
+        caller_socket
+            .send_to(&sealed, engine_toward_caller)
+            .await
+            .expect("caller send");
+        sequence += 1;
+        if let Ok(Ok((len, _))) = timeout(
+            Duration::from_millis(150),
+            callee_socket.recv_from(&mut buffer),
+        )
+        .await
+        {
+            at_callee.push(buffer[..len].to_vec());
+        }
+    }
+    while let Ok(Ok((len, _))) = timeout(
+        Duration::from_millis(200),
+        callee_socket.recv_from(&mut buffer),
+    )
+    .await
+    {
+        at_callee.push(buffer[..len].to_vec());
+    }
+    assert!(
+        !at_callee.is_empty(),
+        "the callee received the caller's media"
+    );
+
+    // Callee → caller: RTP in, SRTP out.
+    let reply = rtp(500);
+    callee_socket
+        .send_to(&reply, engine_toward_callee)
+        .await
+        .expect("callee send");
+    let (len, _) = timeout(SHORT, caller_socket.recv_from(&mut buffer))
+        .await
+        .expect("the caller received the callee's media")
+        .expect("caller recv");
+    let mut recovered = Vec::new();
+    caller_leg
+        .unprotect(&buffer[..len], &mut recovered)
+        .expect("caller unprotect");
+    assert_eq!(
+        recovered, reply,
+        "the callee's RTP reaches the caller as SRTP"
+    );
+
+    // The delivery connection buffered all of that; now let it through.
+    let (stream, _) = timeout(SHORT, listener.accept())
+        .await
+        .expect("no timeout")
+        .expect("accept");
+    let mut tls = timeout(SHORT, acceptor.accept(stream))
+        .await
+        .expect("no timeout")
+        .expect("mutual TLS handshake");
+    let pdus = read_pdus(&mut tls, at_callee.len() + 1).await;
+    let (from_caller, from_callee) = pdus.split_at(at_callee.len());
+
+    for (pdu, relayed) in from_caller.iter().zip(&at_callee) {
+        assert_eq!(
+            &pdu.payload, relayed,
+            "the caller's content is the RTP the bridge decrypted, never the SRTP it received"
+        );
+        assert_eq!(
+            pdu.header.payload_direction,
+            PayloadDirection::FromTarget.to_u16(),
+            "the caller is the target, so its own media is sent from the target"
+        );
+        assert_eq!(
+            attribute(&pdu.attributes, attribute_type::SOURCE_IPV4).as_deref(),
+            Some([127, 0, 0, 2].as_slice()),
+            "stamped with the caller's source"
+        );
+        assert_eq!(
+            attribute(&pdu.attributes, attribute_type::DESTINATION_PORT).as_deref(),
+            Some(engine_toward_caller.port().to_be_bytes().as_slice()),
+            "and the engine port facing the caller"
+        );
+    }
+    let from_callee = &from_callee[0];
+    assert_eq!(
+        from_callee.payload, reply,
+        "the callee's content is the RTP it sent, not the SRTP the bridge emitted"
+    );
+    assert_eq!(
+        from_callee.header.payload_direction,
+        PayloadDirection::ToTarget.to_u16()
+    );
+    assert_eq!(
+        attribute(&from_callee.attributes, attribute_type::SOURCE_IPV4).as_deref(),
+        Some([127, 0, 0, 3].as_slice()),
+        "stamped with the callee's source"
+    );
+    assert_eq!(
+        attribute(&from_callee.attributes, attribute_type::DESTINATION_PORT).as_deref(),
+        Some(engine_toward_callee.port().to_be_bytes().as_slice()),
+        "and the engine port facing the callee"
+    );
+}
