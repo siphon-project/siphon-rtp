@@ -269,8 +269,10 @@ pub(super) fn settle_secure_offerer(
 
 /// Settle a terminated DTLS offerer's association for an answer. B answering: the engine is A's
 /// answerer, so its role follows the RFC 4145 §4.1 answer table, with a `dtls` directive choosing only
-/// where A's `actpass` leaves the choice open ([`answerer_dtls_setup`]). A answering B's re-offer: A's
-/// association is left in the role B's original answer settled.
+/// where A's `actpass` leaves the choice open ([`answerer_dtls_setup`]). A kept association keeps its
+/// roles instead: B answering A's `actpass` re-offer (RFC 8842 §5.5), or A answering B's re-offer,
+/// whose answer already settled the role on the call. A directive never overrides a role in force,
+/// which would force a new handshake mid-call.
 pub(super) fn near_dtls_answer(
     near: &super::NearDtls,
     reversed: bool,
@@ -283,8 +285,10 @@ pub(super) fn near_dtls_answer(
             &"engine has no DTLS certificate",
         )));
     };
-    let (setup, role) = match (reversed, near.role) {
-        (true, Some(role)) => (setup_for_role(role), role),
+    let (setup, role) = match (reversed, near.role, near.peer_setup) {
+        (true, Some(role), _) | (false, Some(role), Some(sdp::Setup::Actpass)) => {
+            (setup_for_role(role), role)
+        }
         _ => answerer_dtls_setup(near.peer_setup, dtls_directive(profile)),
     };
     // RFC 8842 §5.3: an offer carrying `a=tls-id` gets a new unique value in the answer, and an offer

@@ -542,7 +542,11 @@ is wrong, and encryption defeats A2 eavesdrop.
 > any crypto, exactly as on the far-leg bridge. A secure far leg, a caller that does not multiplex
 > RTCP, and a call that needs the decoded audio are refused (`secure-offerer-unsupported`), and a
 > caller with no `a=fingerprint` is refused as unkeyable, rather than any of them being relayed in
-> the clear.
+> the clear. A renegotiation from either party restates the caller's keying on `Call.near_dtls`: the
+> same fingerprint and `a=tls-id` keep the running association and its roles (RFC 8842 §5.5), a changed
+> one is a new association the bridge handshakes afresh (RFC 8842 §3.1), and a re-offer or answer from
+> the caller without a fingerprint is refused. Neither the offer, the answer nor either direction of a
+> renegotiation ever presents the caller's keying to the callee.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The

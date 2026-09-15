@@ -124,6 +124,31 @@ fn far_reoffer_security_refusal(state: &ReofferState, info: &sdp::MediaInfo) -> 
     None
 }
 
+/// Why a re-offer from A cannot be taken on a call whose DTLS-SRTP the engine terminates on A's leg, or
+/// `None` when it keeps an association the answer can key. The engine is A's DTLS peer, so A must still
+/// offer a DTLS transport with a certificate fingerprint (RFC 5763 §5), on the multiplexed port the
+/// bridge keys (RFC 5764 §3). Anything else would bridge A in the clear or leave the bridge with no
+/// certificate to verify.
+fn near_reoffer_security_refusal(state: &ReofferState, info: &sdp::MediaInfo) -> Option<String> {
+    (state.near_dtls.is_some() && !(info.dtls && info.fingerprint.is_some() && info.rtcp_mux)).then(
+        || {
+            "the caller's DTLS-SRTP leg (RFC 5764) is terminated by the engine, and A's re-offer does \
+             not keep it on a multiplexed UDP/TLS transport with an a=fingerprint; not supported on a \
+             live call"
+                .to_string()
+        },
+    )
+}
+
+/// Why this re-offer cannot be taken on the re-offering party's secure leg, or `None`: B's re-offer
+/// against [`far_reoffer_security_refusal`], A's against [`near_reoffer_security_refusal`].
+fn reoffer_security_refusal(state: &ReofferState, info: &sdp::MediaInfo) -> Option<String> {
+    match state.party {
+        Party::Far => far_reoffer_security_refusal(state, info),
+        Party::Near => near_reoffer_security_refusal(state, info),
+    }
+}
+
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// A re-offer's ICE candidates: the offering leg's, for its rebuilt agent, and the presented
     /// leg's, for the SDP. Both are the ones already advertised when stored — the ports are unchanged,
@@ -269,13 +294,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // engine would have to bridge B in the clear or invent keying it cannot answer with — never
         // silently (docs/security-and-nat.md Layer 5). The answer to it re-presents the engine's own
         // key or fingerprint, so B must still offer something that answer can select (RFC 4568 §5.1.2:
-        // the answer picks one offered `a=crypto` and keeps its suite).
-        if party == Party::Far {
-            if let Some(reason) = far_reoffer_security_refusal(&state, &info) {
-                return CmdResult::Error {
-                    reason: format!("re-offer: {reason}"),
-                };
-            }
+        // the answer picks one offered `a=crypto` and keeps its suite). A DTLS-SRTP leg the engine
+        // terminates on A's side holds A's re-offer to the same rule.
+        if let Some(reason) = reoffer_security_refusal(&state, &info) {
+            return CmdResult::Error {
+                reason: format!("re-offer: {reason}"),
+            };
         }
 
         // B's leg carries no ICE once `ice: remove` took it off: at offer, and kept so a re-offer
@@ -400,6 +424,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.near_remote_ice = new_remote_ice;
                     call.near_remote_candidates = info.candidates.clone();
                     call.near_peer_is_lite = info.ice_lite;
+                    // A's re-offer restates its DTLS keying. A changed certificate or `a=tls-id` starts
+                    // a new association, which the answer settles afresh (RFC 8842 §3.1, §5.5).
+                    call.near_dtls
+                        .iter_mut()
+                        .for_each(|near_dtls| near_dtls.restate(&info));
                     if profile.received_from.is_some() {
                         call.offer_received_from = profile.received_from;
                     }
@@ -501,11 +530,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         ice_mismatch,
                         far_ice_removed,
                     ),
+                    // A terminated secure offerer's keying never reaches B: B's leg stays the plain
+                    // RTP the original offer presented, unless B has keying of its own.
                     security: far_security(
                         state.far_downgraded_to_plain,
                         dtls,
                         state.far_local_crypto,
-                    ),
+                    )
+                    .or((state.near_local_crypto.is_some()
+                        || state.near_dtls.is_some())
+                    .then_some(sdp::SecurityAdvertisement::Plain)),
                     mux_override,
                     text,
                     codec: CodecPresentation::Policy(&codec_policy),

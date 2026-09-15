@@ -12763,6 +12763,319 @@ async fn a_bridge_facing_a_secure_offerer_refuses_every_verb_that_needs_decoded_
     );
 }
 
+#[tokio::test]
+async fn a_reoffer_from_a_terminated_secure_offerer_never_hands_the_callee_its_keying() {
+    // A re-offer from A is rewritten for B. When the engine terminates A's SRTP, none of A's keying
+    // may reach B in it: B's leg stays the plain RTP the original offer presented.
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let caller_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    for offerer in ["sdes", "dtls"] {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let call_id = format!("{offerer}-reoffer-from-a");
+        let (offer, profile) = if offerer == "sdes" {
+            (
+                sdes_offerer_sdp(addr_a, &caller_key),
+                ProfileFlags::default(),
+            )
+        } else {
+            (
+                dtls_offer_with(
+                    addr_a,
+                    Some(&caller_cert.fingerprint()),
+                    Some("actpass"),
+                    Some("0123456789abcdefghij"),
+                ),
+                plain_far_leg(),
+            )
+        };
+        offer_from_a(&engine, &call_id, offer.clone(), profile.clone()).await;
+        answer_from_b(
+            &engine,
+            &call_id,
+            sdp_for(addr_b, true),
+            ProfileFlags::default(),
+        )
+        .await;
+        let reoffer = reoffer_from(&engine, &call_id, "a", offer, profile).await;
+        let text = ok_sdp_text(&reoffer);
+        let to_b = sdp::parse(&text).expect("re-offer to B");
+        assert!(
+            !to_b.secure && !to_b.dtls,
+            "{offerer}: B stays on plain RTP: {text}"
+        );
+        assert!(
+            to_b.crypto.is_empty()
+                && to_b.fingerprint.is_none()
+                && to_b.setup.is_none()
+                && to_b.tls_id.is_none(),
+            "{offerer}: none of A's keying reaches B: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_reoffer_from_a_terminated_dtls_offerer_that_drops_its_keying_is_refused() {
+    // The engine is A's DTLS peer, so A's re-offer has to keep an association the answer can key: a
+    // DTLS transport with a fingerprint (RFC 5763 §5) on the multiplexed port. Anything else would
+    // bridge A in the clear or leave the bridge without a certificate to verify.
+    let caller_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    offer_from_a(
+        &engine,
+        "dtls-reoffer-drops",
+        dtls_offerer_sdp(addr_a, &caller_cert.fingerprint(), "actpass"),
+        plain_far_leg(),
+    )
+    .await;
+    answer_from_b(
+        &engine,
+        "dtls-reoffer-drops",
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    for (case, reoffer) in [
+        ("plain RTP", sdp_for(addr_a, true)),
+        (
+            "no fingerprint",
+            dtls_offer_with(addr_a, None, Some("actpass"), None),
+        ),
+    ] {
+        match reoffer_from(&engine, "dtls-reoffer-drops", "a", reoffer, plain_far_leg()).await {
+            CmdResult::Error { reason } => {
+                assert!(reason.contains("DTLS"), "{case}: {reason}");
+            }
+            other => panic!("{case}: expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_reoffer_from_a_dtls_offerer_keeps_or_replaces_its_association_as_rfc_8842_says() {
+    // RFC 8842 §5.5: a subsequent offer with the same fingerprint and `a=tls-id` keeps the
+    // association, so the answer keeps the roles and repeats the `a=tls-id` it assigned (§5.3). A
+    // changed `a=tls-id` or fingerprint is a new association (§3.1), answered with a new `a=tls-id`
+    // and handshaken against the new certificate.
+    let caller_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let other_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("second caller cert");
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let call_id = "dtls-reoffer-association";
+    let first_tls_id = "0123456789abcdefghij";
+    let second_tls_id = "klmnopqrstuvwxyz0123";
+
+    offer_from_a(
+        &engine,
+        call_id,
+        dtls_offer_with(
+            addr_a,
+            Some(&caller_cert.fingerprint()),
+            Some("active"),
+            Some(first_tls_id),
+        ),
+        plain_far_leg(),
+    )
+    .await;
+    let first = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert_eq!(first.setup, Some(sdp::Setup::Passive), "A offered active");
+    assert!(first.tls_id.is_some(), "A offered a tls-id");
+
+    ok_sdp_text(
+        &reoffer_from(
+            &engine,
+            call_id,
+            "a",
+            dtls_offer_with(
+                addr_a,
+                Some(&caller_cert.fingerprint()),
+                Some("actpass"),
+                Some(first_tls_id),
+            ),
+            plain_far_leg(),
+        )
+        .await,
+    );
+    let kept = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert_eq!(
+        kept.setup,
+        Some(sdp::Setup::Passive),
+        "the kept association keeps the engine's role"
+    );
+    assert_eq!(kept.tls_id, first.tls_id, "and repeats its tls-id");
+
+    ok_sdp_text(
+        &reoffer_from(
+            &engine,
+            call_id,
+            "a",
+            dtls_offer_with(
+                addr_a,
+                Some(&caller_cert.fingerprint()),
+                Some("actpass"),
+                Some(second_tls_id),
+            ),
+            plain_far_leg(),
+        )
+        .await,
+    );
+    let renewed = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(renewed.tls_id.is_some(), "a new association has a tls-id");
+    assert_ne!(
+        renewed.tls_id, first.tls_id,
+        "a new association gets a new tls-id"
+    );
+
+    ok_sdp_text(
+        &reoffer_from(
+            &engine,
+            call_id,
+            "a",
+            dtls_offer_with(
+                addr_a,
+                Some(&other_cert.fingerprint()),
+                Some("actpass"),
+                Some(second_tls_id),
+            ),
+            plain_far_leg(),
+        )
+        .await,
+    );
+    answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let stored = engine
+        .calls
+        .get(call_id)
+        .expect("call")
+        .near_dtls
+        .clone()
+        .expect("A's DTLS is terminated");
+    assert_eq!(
+        stored.peer_fingerprint.bytes,
+        other_cert.fingerprint().bytes,
+        "the handshake verifies the certificate A now offers"
+    );
+}
+
+#[tokio::test]
+async fn a_reversed_answer_settles_a_dtls_offerers_role_and_fingerprint_from_that_answer() {
+    // B re-offers, so the engine offers A `actpass` (RFC 8842 §5.5) and A's answer picks the roles:
+    // `active` makes the engine the DTLS server (RFC 4145 §4.1). A new fingerprint in that answer is
+    // the certificate the handshake has to verify. An answer without one cannot key A's leg at all.
+    let caller_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let other_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("second caller cert");
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let call_id = "dtls-reversed-roles";
+    offer_from_a(
+        &engine,
+        call_id,
+        dtls_offerer_sdp(addr_a, &caller_cert.fingerprint(), "actpass"),
+        plain_far_leg(),
+    )
+    .await;
+    let first = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert_eq!(
+        first.setup,
+        Some(sdp::Setup::Active),
+        "the engine began as the client"
+    );
+
+    ok_sdp_text(
+        &reoffer_from(
+            &engine,
+            call_id,
+            "b",
+            sdp_for(addr_b, true),
+            ProfileFlags::default(),
+        )
+        .await,
+    );
+    let reversed_answer = |sdp: String| Command::Answer {
+        call_id: call_id.into(),
+        from_tag: "b".into(),
+        to_tag: "a".into(),
+        sdp,
+        profile: ProfileFlags::default(),
+    };
+    match engine
+        .handle(
+            CLIENT,
+            reversed_answer(dtls_offer_with(addr_a, None, Some("active"), None)),
+        )
+        .await
+    {
+        CmdResult::Error { reason } => assert!(reason.contains("fingerprint"), "{reason}"),
+        other => panic!("an answer without a fingerprint must be refused, got {other:?}"),
+    }
+
+    ok_sdp_text(
+        &engine
+            .handle(
+                CLIENT,
+                reversed_answer(dtls_offer_with(
+                    addr_a,
+                    Some(&other_cert.fingerprint()),
+                    Some("active"),
+                    None,
+                )),
+            )
+            .await,
+    );
+    let stored = engine
+        .calls
+        .get(call_id)
+        .expect("call")
+        .near_dtls
+        .clone()
+        .expect("A's DTLS is terminated");
+    assert_eq!(
+        stored.role,
+        Some(siphon_rtp_dtls::DtlsRole::Server),
+        "A answered active"
+    );
+    assert_eq!(
+        stored.peer_fingerprint.bytes,
+        other_cert.fingerprint().bytes,
+        "the handshake verifies the certificate A answered with"
+    );
+}
+
 /// Drive a DTLS peer's client-side handshake against `engine_far` over `socket`, returning its
 /// keyed `SecureLeg`. Factored out of the DTLS end-to-end tests, which otherwise repeat 40 lines
 /// of transport pumping apiece.

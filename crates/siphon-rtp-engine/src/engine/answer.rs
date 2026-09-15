@@ -157,6 +157,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 let Some(mut call) = self.calls.get_mut(call_id) else {
                     return Err(Box::new(unknown_call(call_id)));
                 };
+                // A terminated DTLS offerer answers the engine's `actpass` re-offer (RFC 8842 §5.5): its
+                // answer settles the roles and names the certificate the handshake verifies. Without an
+                // `a=fingerprint` it cannot key A's leg (RFC 5763 §5), so it is refused before anything
+                // on the call changes.
+                if let Some(near_dtls) = call.near_dtls.as_mut() {
+                    let Some(fingerprint) = answered.fingerprint.clone() else {
+                        return Err(Box::new(error_result(
+                            "answer",
+                            &"the caller's answer to a re-offer on its DTLS-SRTP leg carries no \
+                              a=fingerprint",
+                        )));
+                    };
+                    near_dtls.answered(fingerprint, answered.setup, answered.tls_id.clone());
+                }
                 call.near.remote_rtp = Some(answered.remote_rtp);
                 call.near.remote_rtcp = Some(answered.remote_rtcp);
                 let answered_codecs = answered.audio_codecs();

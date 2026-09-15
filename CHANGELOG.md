@@ -30,15 +30,23 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   codec change, recording, noise suppression, echo cancellation or beep detection). A caller with no
   `a=fingerprint` (RFC 5763 §5) is refused with `secure-offerer-unkeyable`, and its ports are freed.
 
+  A renegotiation from either party keeps the caller's association while its fingerprint and
+  `a=tls-id` stay the same: the engine keeps its role and repeats its `a=tls-id` (RFC 8842 §5.3,
+  §5.5), and to the caller's answer to a re-offer from the callee it takes the complement of the
+  caller's `a=setup`. A changed fingerprint or `a=tls-id` is a new association (RFC 8842 §3.1),
+  answered with a new `a=tls-id` and handshaken against the new certificate. A re-offer or answer from
+  the caller that drops DTLS, its fingerprint or RTCP multiplexing is refused.
+
 ### Security
 
-- **A secure caller's own SRTP key no longer reaches the callee when the callee re-offers.** When the
-  engine terminates an SDES-SRTP caller toward a plain callee, the caller's answer to a re-offer from
-  the callee is rewritten for the callee, and that rewrite passed the caller's `a=crypto` and
-  `RTP/SAVP` straight through: the callee was handed the key the caller encrypts its media with, and
-  told the leg was secure while the engine kept sending it plain RTP. The answer now presents the
-  callee's leg as the plain RTP the original offer presented, the rule the offer already applied. A
-  terminated DTLS-SRTP caller's `a=fingerprint`, `a=setup` and `a=tls-id` are stripped the same way.
+- **A secure caller's own SRTP key no longer reaches the callee in a renegotiation.** When the engine
+  terminates an SDES-SRTP caller toward a plain callee, both the caller's re-offer and the caller's
+  answer to a re-offer from the callee are rewritten for the callee, and both rewrites passed the
+  caller's `a=crypto` and `RTP/SAVP` straight through: the callee was handed the key the caller
+  encrypts its media with, and told the leg was secure while the engine kept sending it plain RTP.
+  Both now present the callee's leg as the plain RTP the original offer presented, the rule the offer
+  already applied. A terminated DTLS-SRTP caller's `a=fingerprint`, `a=setup` and `a=tls-id` are
+  stripped the same way.
 
 ### Fixed
 
