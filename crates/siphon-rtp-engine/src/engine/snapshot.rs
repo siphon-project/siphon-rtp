@@ -510,6 +510,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // one relays correctly; a later re-offer from A mirrors A's transport to B instead of
                 // forcing `RTP/AVP` — the same gap the other un-snapshotted presentation state has.
                 far_downgraded_to_plain: false,
+                // Only a terminated DTLS offerer's call holds one, and a DTLS call is never restored.
+                far_rtcp_fallback: false,
                 // A restored call is a plaintext or SDES *far* leg; the offerer's own posture is
                 // not in the snapshot and a restored call is never re-answered.
                 near_secure: false,

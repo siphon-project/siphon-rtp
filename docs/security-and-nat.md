@@ -536,7 +536,11 @@ is wrong, and encryption defeats A2 eavesdrop.
 > **A DTLS-SRTP offerer is terminated on the two-party relay** (`PipelineKind::DtlsOfferer`) when its
 > offer asks for a plaintext far leg (`dtls: off`, or a transport without `SAVP`). It is the same
 > `DtlsBridge` with the sides swapped: the secure endpoint faces the caller, the plain one the callee,
-> and the callee's separate RTCP port rides the plain side. The caller's `a=fingerprint`, `a=setup`
+> and the callee's separate RTCP port rides the plain side. Because the caller multiplexes, the callee
+> is offered `a=rtcp-mux` with a separate RTCP port bound beside it (RFC 5761 §5.1.1): the first answer
+> keeps that port when the callee declines multiplexing (`Call.far_rtcp_fallback` marks it until then)
+> and frees it when the callee multiplexes. The port is gated like any plain RTCP endpoint, from the
+> callee's answered `a=rtcp` or RTP port + 1. The caller's `a=fingerprint`, `a=setup`
 > and `a=tls-id` are kept on the call from the offer (`Call.near_dtls`) and never presented to the
 > callee; the answer settles the engine's role (RFC 4145 §4.1) and its own `a=tls-id` (RFC 8842 §5.3)
 > and records them for a renegotiation. Both bridge endpoints re-enforce `bridge_source_filter` before

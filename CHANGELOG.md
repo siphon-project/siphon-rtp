@@ -14,6 +14,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   see it may treat the agent as an RFC 5245 one. The re-originated ICE block, which both the offer
   toward the callee and the answer toward the caller carry, advertised only `trickle`. It now carries
   `a=ice-options:trickle ice2`.
+- **A DTLS-SRTP caller's RTCP now reaches a callee that declines `a=rtcp-mux`.** The caller
+  multiplexes, so its plain callee was offered `a=rtcp-mux` on a single port. A callee may answer
+  without it (RFC 5761 §5.1.1) and keep RTCP on a port of its own, and its RTCP was then aimed at a
+  port the engine had never bound for the call, while the caller's SRTCP had no RTCP port to leave by
+  on the plain side. The offer now binds a separate RTCP port beside `a=rtcp-mux` (advertised with
+  `a=rtcp` when it is not RTP port + 1). The answer keeps it when the callee declines multiplexing, so
+  the bridge carries RTCP both ways, and frees it when the callee multiplexes.
 
 ## [0.7.1] — 2026-09-15
 

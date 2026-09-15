@@ -735,6 +735,35 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         (near_candidates, far_candidates)
     }
 
+    /// Settle the fallback RTCP port B's leg was offered beside `a=rtcp-mux` for a terminated DTLS-SRTP
+    /// offerer, now that B has answered (RFC 5761 §5.1.1). Kept when B declined multiplexing, so B's
+    /// RTCP has a port for the DTLS bridge to carry; released when B multiplexes, so it is not held
+    /// unused for the life of the call. The first answer settles it either way. The registry guard is
+    /// released before the endpoint is freed.
+    async fn settle_far_rtcp_fallback(
+        &self,
+        call_id: &str,
+        mut far: Leg,
+        info: &sdp::MediaInfo,
+    ) -> Leg {
+        let released = match self.calls.get_mut(call_id) {
+            Some(mut call) if call.far_rtcp_fallback => {
+                call.far_rtcp_fallback = false;
+                let released = if info.rtcp_mux { far.rtcp.take() } else { None };
+                if let Some(stored) = call.far.as_mut().filter(|_| released.is_some()) {
+                    stored.rtcp = None;
+                }
+                released
+            }
+            _ => None,
+        };
+        if let Some(endpoint) = released {
+            self.endpoint_calls.remove(&endpoint.id);
+            self.free(&[endpoint]).await;
+        }
+        far
+    }
+
     /// Record an installed answer on the call: B's addresses and codec, the pipeline and its flows,
     /// the text stream's state, and what the next renegotiation keeps.
     fn record_answer(&self, call_id: &str, record: AnswerRecord<'_>) {
@@ -886,6 +915,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(state) => state,
             Err(result) => return *result,
         };
+        let far = self.settle_far_rtcp_fallback(call_id, far, &info).await;
         // The owner's async event sink (DTMF events flow here from the media actor), if registered.
         let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
         // Cloned up front for the secure text actor: `owner_events` is moved into the audio pipeline's
