@@ -38,8 +38,15 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   check-validated gate, which already admits only the authenticated source, and holds the handshake
   until ICE has validated the peer's transport: the full agent's selection, or the source of the first
   check the ICE-lite responder accepts. Records and SRTP follow that source. The datapath publishes it
-  through a new `Datapath::watch_ice_validated`, on both the UDP and XDP backends. A DTLS conference seat
-  and a secure WebSocket takeover still start an ICE-lite handshake at the signalled address.
+  through a new `Datapath::watch_ice_validated`, on both the UDP and XDP backends.
+- **A DTLS-SRTP conference seat, and a DTLS leg that gains ICE on a re-offer, follow the validated source
+  too.** An ICE-lite conference seat started its handshake at `c=` exactly as the two-party bridge had.
+  And a re-offer that first added ICE to a live DTLS leg kept its association (the certificate had not
+  changed, RFC 8842 §5.5) without ever re-pointing it, so the other party's audio kept going to the
+  address the caller had left. The seat now holds its handshake for, and sends its records to, the
+  source ICE validated, and a kept association follows the validated source of whatever ICE session its
+  renegotiation settled on. A secure WebSocket takeover runs ICE only under a full agent, whose
+  selection it already waited for.
 
 ## [0.7.1] — 2026-09-15
 

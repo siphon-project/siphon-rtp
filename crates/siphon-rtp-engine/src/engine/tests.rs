@@ -18776,6 +18776,265 @@ async fn an_ice_lite_dtls_offerer_is_keyed_on_the_source_its_check_validated() {
     assert_eq!(&buffer[..len], next.as_slice());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ice_lite_dtls_conference_seat_is_keyed_on_the_source_its_check_validated() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_dtls::DtlsCertificate;
+
+    // The seat twin of `an_ice_lite_dtls_offerer_is_keyed_on_the_source_its_check_validated`. A seat's
+    // handshake runs through the bridge's pipeline registration, which has to hold for the check the
+    // ice-lite responder validates and follow its source (RFC 8445 §12.1.1) just as the two-party
+    // bridge does, instead of starting at the `c=` a NATed browser signals.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+
+    // A plain participant to give the room something to mix.
+    let (plain, plain_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+    let plain_answer = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "lite-dtls-room".into(),
+                from_tag: "tag-plain".into(),
+                sdp: sdp_for(plain_addr, true),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let plain_engine_addr = sdp::parse(&ok_sdp_text(&plain_answer))
+        .expect("plain answer")
+        .remote_rtp;
+
+    // The WebRTC participant behind NAT: its `c=` is not where it can be reached.
+    let webrtc = Arc::new(
+        UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+            .await
+            .expect("bind webrtc"),
+    );
+    let webrtc_addr = webrtc.local_addr().expect("webrtc addr");
+    let signalled: SocketAddr = "192.0.2.10:40000".parse().expect("signalled address");
+    let peer_cert = DtlsCertificate::generate().expect("peer cert");
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "lite-dtls-room".into(),
+                from_tag: "tag-webrtc".into(),
+                sdp: nated_ice_dtls_offerer_sdp(signalled, webrtc_addr, &peer_cert.fingerprint()),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let answer = sdp::parse(&ok_sdp_text(&joined)).expect("dtls answer");
+    let engine_seat = answer.remote_rtp;
+    let engine_fingerprint = answer.fingerprint.clone().expect("engine a=fingerprint");
+    let engine_ufrag = answer.ice_ufrag.clone().expect("engine ufrag");
+    let engine_pwd = answer.ice_pwd.clone().expect("engine pwd");
+
+    // The participant checks the seat from its real transport.
+    let check = siphon_rtp_stun::binding_request(
+        &[7u8; 12],
+        &format!("{engine_ufrag}:{A_UFRAG}"),
+        engine_pwd.as_bytes(),
+    );
+    webrtc
+        .send_to(&check, engine_seat)
+        .await
+        .expect("send check");
+
+    let mut peer_leg = peer_dtls_handshake_server(
+        webrtc.clone(),
+        webrtc_addr,
+        engine_seat,
+        &peer_cert,
+        &engine_fingerprint,
+    )
+    .await;
+
+    // Keyed. The participant talks first, which moves the room's reply latch onto its real transport,
+    // and then the room's mix reaches it as SRTP it can decrypt.
+    let mut buffer = [0u8; 2048];
+    let mut mixed = None;
+    for sequence in 100..250u16 {
+        let mut sealed = Vec::new();
+        peer_leg
+            .protect(&g711_rtp(0, sequence, 0x0C0C_0C0C, 0x7F), &mut sealed)
+            .expect("participant protect");
+        webrtc
+            .send_to(&sealed, engine_seat)
+            .await
+            .expect("participant send");
+        plain
+            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), plain_engine_addr)
+            .await
+            .expect("plain send");
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(60), webrtc.recv_from(&mut buffer)).await
+        {
+            let mut plain_rtp = Vec::new();
+            if peer_leg.unprotect(&buffer[..len], &mut plain_rtp).is_ok() {
+                mixed = Some(plain_rtp);
+                break;
+            }
+        }
+    }
+    assert!(
+        mixed.is_some(),
+        "the seat keyed by its validated source receives the room mix as decryptable SRTP"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reoffer_that_adds_ice_to_a_kept_dtls_association_follows_the_validated_source() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_dtls::DtlsCertificate;
+
+    // A DTLS-SRTP caller starts without ICE, then re-offers with it from a new transport, as a client
+    // that moved network does. Its certificate is unchanged, so the association is kept (RFC 8842
+    // §5.5) and no handshake runs to re-point anything: the kept association has to follow the source
+    // the new ICE session validates (RFC 8445 §12.1.1), or B's audio keeps going to the address A left.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let socket_a = Arc::new(
+        UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a"),
+    );
+    let addr_a = socket_a.local_addr().expect("addr a");
+    let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let caller = DtlsCertificate::generate().expect("caller cert");
+    let call_id = "dtls-offerer-adds-ice";
+
+    let offered = offer_from_a(
+        &engine,
+        call_id,
+        dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+        plain_far_leg(),
+    )
+    .await;
+    let answered = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    let engine_near = answered.remote_rtp;
+    let engine_far = offered.remote_rtp;
+    let engine_fingerprint = answered
+        .fingerprint
+        .clone()
+        .expect("the engine's fingerprint in A's answer");
+    let mut caller_leg = peer_dtls_handshake_server(
+        socket_a.clone(),
+        addr_a,
+        engine_near,
+        &caller,
+        &engine_fingerprint,
+    )
+    .await;
+    assert_offerer_bridge_relays_both_ways(
+        &socket_a,
+        &mut caller_leg,
+        engine_near,
+        &phone_b,
+        engine_far,
+    )
+    .await;
+
+    // A moves to a new transport behind NAT and re-offers with ICE and the same certificate.
+    let moved = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 4), 0))
+        .await
+        .expect("bind moved");
+    let moved_addr = moved.local_addr().expect("moved addr");
+    let signalled: SocketAddr = "192.0.2.10:40000".parse().expect("signalled address");
+    let reoffered = reoffer_from(
+        &engine,
+        call_id,
+        "a",
+        nated_ice_dtls_offerer_sdp(signalled, moved_addr, &caller.fingerprint()),
+        plain_far_leg(),
+    )
+    .await;
+    assert!(
+        matches!(reoffered, CmdResult::Ok { .. }),
+        "re-offer ok: {reoffered:?}"
+    );
+    let reanswered = answer_from_b(
+        &engine,
+        call_id,
+        sdp_for(addr_b, true),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert_eq!(
+        reanswered
+            .fingerprint
+            .as_ref()
+            .map(|fingerprint| fingerprint.bytes.clone()),
+        Some(engine_fingerprint.bytes.clone()),
+        "the association is kept"
+    );
+    let engine_ufrag = reanswered.ice_ufrag.clone().expect("engine ufrag");
+    let engine_pwd = reanswered.ice_pwd.clone().expect("engine pwd");
+
+    // The new ICE session validates A's new transport.
+    let check = siphon_rtp_stun::binding_request(
+        &[9u8; 12],
+        &format!("{engine_ufrag}:{A_UFRAG}"),
+        engine_pwd.as_bytes(),
+    );
+    moved
+        .send_to(&check, engine_near)
+        .await
+        .expect("send check");
+    let mut buffer = [0u8; 2048];
+    timeout(Duration::from_secs(1), moved.recv_from(&mut buffer))
+        .await
+        .expect("the check is answered")
+        .expect("recv check response");
+
+    // B's audio now reaches A's new transport, still keyed by the association A kept.
+    let reply = g711_rtp(0, 500, 0x0B0B_0B0B, 0x11);
+    let mut recovered = None;
+    for _ in 0..10 {
+        phone_b.send_to(&reply, engine_far).await.expect("b send");
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(150), moved.recv_from(&mut buffer)).await
+        {
+            // RFC 7983 §7: SRTP is 128..=191; skip a late STUN response.
+            if !(128..=191).contains(&buffer[0]) {
+                continue;
+            }
+            let mut plain = Vec::new();
+            if caller_leg.unprotect(&buffer[..len], &mut plain).is_ok() {
+                recovered = Some(plain);
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        recovered.expect("B's audio follows A to the transport its new ICE check validated"),
+        reply
+    );
+}
+
 // ---- Full ICE on a conference seat (RFC 8445 + the room actor) ------------------------------
 
 // ---- Relayed candidates (RFC 5766 TURN client end-to-end) -----------------------------------

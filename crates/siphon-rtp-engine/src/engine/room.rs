@@ -515,6 +515,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.free(&to_free).await;
                 return error_result("conference_join: install DTLS redirect", &error);
             }
+            // The seat's validated source as the datapath publishes it: a full agent's selection, or
+            // the source of the check the ice-lite responder authenticated. `None` without ICE.
+            let ice_validated = self.datapath.watch_ice_validated(endpoint.id);
             self.dtls_bridge().register_for_pipeline(
                 DtlsCallPlan {
                     // A conference seat is one muxed endpoint; the "plain" side is unused in
@@ -532,11 +535,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         peer_fingerprint.hash_function,
                         peer_fingerprint.bytes,
                     ),
-                    // RFC 8445 §12: a DTLS-SRTP seat keys the pair ICE chose, so hold the handshake
-                    // until there is a selection — but only when a full agent is actually running on
-                    // this seat, since otherwise no selection is coming and waiting would hang it.
-                    gate_on_ice: ice_pending,
-                    ice_validated: None,
+                    // RFC 8445 §12, §12.1.1: a DTLS-SRTP seat keys the transport ICE chose. A full
+                    // agent's selection and an ice-lite responder's validated check both arrive
+                    // through `ice_validated`, so the handshake waits for either and its records
+                    // follow it; a seat without ICE starts at once, since nothing would release it.
+                    gate_on_ice: ice_pending || ice_validated.is_some(),
+                    ice_validated,
                     plain_rtcp: None,
                 },
                 crate::dtls_bridge::PipelineTarget::Conference {
