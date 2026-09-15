@@ -11,7 +11,7 @@
 //!    Forward-path gate, so it is re-enforced here);
 //! 2. for a **secure** (SDES-SRTP, `RTP/SAVP`) text leg, decrypts the ingress SRTP packet **first**
 //!    (fail-closed: a packet that fails auth/replay is dropped, never forwarded), so everything below
-//!    operates on plaintext (RFC 3711; docs/security-and-nat.md Layer 5d) — this is what a secure text
+//!    operates on plaintext (RFC 3711; docs/security-and-nat.md Layer 5f) — this is what a secure text
 //!    stream runs on *from the start* (SRTP cannot relay in-kernel, so it is never on the `Forward`
 //!    fast path);
 //! 3. RED-depacketizes (RFC 2198) + reassembles the T.140 stream ([`siphon_rtp_media::t140`]),
@@ -79,7 +79,7 @@ struct TextDirection {
     /// Secure (SDES-SRTP) ingress: when the *sending* party's text leg is `RTP/SAVP`, this is the
     /// **sending leg's** [`SecureLeg`] — the ingress datagram is decrypted (fail-closed on auth/replay)
     /// before it is observed or forwarded, exactly as the audio SDES leg decrypts before the tee/relay
-    /// (RFC 3711; docs/security-and-nat.md Layer 5d). `None` for a plaintext text stream. The `Mutex`
+    /// (RFC 3711; docs/security-and-nat.md Layer 5f). `None` for a plaintext text stream. The `Mutex`
     /// is uncontended in practice — the single owner is this call's actor — and never held across an
     /// `.await` (all crypto happens inside the synchronous [`TextCall::process`]).
     secure_ingress: Option<Arc<Mutex<SecureLeg>>>,
@@ -348,7 +348,7 @@ impl TextCall {
 
         // Secure (SDES-SRTP) ingress: decrypt before anything observes or forwards it, so the RED/T.140
         // reassembler, the peer forward, and the latch all operate on plaintext (RFC 3711;
-        // docs/security-and-nat.md Layer 5d). `SecureLeg` auto-demuxes SRTP vs SRTCP. A failed unprotect
+        // docs/security-and-nat.md Layer 5f). `SecureLeg` auto-demuxes SRTP vs SRTCP. A failed unprotect
         // (bad auth / replay / wrong key) is **fail-closed**: drop the datagram — never forward garbage
         // to the peer, never observe it, never move the latch — but keep the path alive (the source is
         // the authentic, signalled one; a transient reorder/rekey must not reap a live text call),

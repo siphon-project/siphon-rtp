@@ -69,10 +69,10 @@ behind it is not built:
 - **both parties secure** — a transcrypt between two different keys;
 - **a codec mismatch** on a secure caller — its `SecureLeg` would have to be
   threaded into the transcoding pipeline;
-- a **DTLS-SRTP (WebRTC) offerer** on either path — it needs the engine's own
-  `a=fingerprint` in the caller's answer plus a full ICE agent on its leg. On
-  `answer_local` it is answered `secure-offerer-unsupported`, naming DTLS; on the
-  two-party relay its keying is relayed as before, unchanged.
+- a **DTLS-SRTP (WebRTC) offerer** on `answer_local` — it needs a full ICE agent
+  on the promoted leg. It is answered `secure-offerer-unsupported`, naming DTLS.
+  On the two-party relay a DTLS caller toward a plain callee *is* terminated; see
+  [WebRTC legs](webrtc.md#a-webrtc-caller-toward-a-plain-callee).
 
 ## Native JSON exchange
 

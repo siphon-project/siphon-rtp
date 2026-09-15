@@ -122,7 +122,11 @@ pub(super) fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSn
         PipelineKind::Media => PipelineSnapshot::Media,
         PipelineKind::SrtpMedia => PipelineSnapshot::SrtpMedia,
         PipelineKind::Ws => PipelineSnapshot::Ws,
-        PipelineKind::Dtls | PipelineKind::DtlsMedia => PipelineSnapshot::Dtls,
+        // A terminated DTLS offerer is a DTLS call too, and restore refuses the DTLS kind: an
+        // established DTLS association cannot move to a standby.
+        PipelineKind::Dtls | PipelineKind::DtlsMedia | PipelineKind::DtlsOfferer => {
+            PipelineSnapshot::Dtls
+        }
     }
 }
 
@@ -514,6 +518,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // peer never received.
                 near_local_crypto: None,
                 near_remote_crypto: None,
+                // A terminated DTLS offerer is never checkpointed (its pipeline maps to the refused
+                // DTLS snapshot), so a restored call never carries A's DTLS keying.
+                near_dtls: None,
                 // Set for a transcode (`Media`) call; `None` for relay/bridge, which don't transcode.
                 near_codec: media.near_codec,
                 // The offered set is not carried in the HA snapshot: a restored call is already

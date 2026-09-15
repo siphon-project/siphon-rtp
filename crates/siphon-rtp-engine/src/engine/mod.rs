@@ -304,6 +304,10 @@ struct Call {
     /// A's own SDES key, from its offer — what decrypts A's ingress. The near twin of
     /// `far_remote_crypto`.
     near_remote_crypto: Option<CryptoAttribute>,
+    /// A DTLS-SRTP offerer the engine terminates: `Some` means the engine is A's DTLS peer and answers
+    /// A with its own fingerprint, the DTLS twin of `near_local_crypto`. `None` for any other offerer,
+    /// including a DTLS one whose keying is passed through to B untouched.
+    near_dtls: Option<NearDtls>,
     /// The near (offerer) leg's primary audio codec, captured at offer — paired with the answer's
     /// codec to decide whether the call transcodes (the media slow path). Replaced at answer by the
     /// codec B actually selected whenever that codec is one A offered (RFC 3264 §6.1 — see
@@ -422,6 +426,70 @@ struct Call {
     /// `None` for a plaintext / audio-only call. (HA follow-up: the HA `CallSnapshot` does not yet carry
     /// this — secure-text HA restore is deferred.)
     near_text_local_crypto: Option<CryptoAttribute>,
+}
+
+/// A DTLS-SRTP offerer the engine terminates (RFC 5764): A's keying from its offer, and what the
+/// engine settled toward A when it answered. The near-leg twin of the far leg's DTLS state.
+#[derive(Debug, Clone)]
+struct NearDtls {
+    /// A's certificate fingerprint (`a=fingerprint`, RFC 8122), which the handshake verifies
+    /// (RFC 5763 §5).
+    peer_fingerprint: sdp::Fingerprint,
+    /// A's `a=setup`, `None` when A sent none (RFC 4145 §4.1 then defaults the offer to `active`).
+    peer_setup: Option<sdp::Setup>,
+    /// A's `a=tls-id` (RFC 8842 §4), `None` when A sent none.
+    peer_tls_id: Option<String>,
+    /// The engine's DTLS role toward A, settled at answer. `None` before an answer.
+    role: Option<DtlsRole>,
+    /// The engine's own `a=tls-id` toward A: assigned for a new association when A signalled one, and
+    /// repeated for as long as that association is kept (RFC 8842 §5.3). `None` when A sent none.
+    local_tls_id: Option<String>,
+}
+
+impl NearDtls {
+    /// Take A's keying from a subsequent offer (RFC 8842 §5.5). A different certificate fingerprint or
+    /// `a=tls-id` is a new association (RFC 8842 §3.1): the settled role and the engine's own
+    /// `a=tls-id` are dropped, so the answer settles both afresh (RFC 8842 §5.3). A re-offer without a
+    /// fingerprint changes nothing here; the re-offer refuses it before any state is touched.
+    fn restate(&mut self, offer: &sdp::MediaInfo) {
+        let Some(fingerprint) = offer.fingerprint.clone() else {
+            return;
+        };
+        let (setup, tls_id) = (offer.setup, offer.tls_id.clone());
+        let same_association = self
+            .peer_fingerprint
+            .hash_function
+            .eq_ignore_ascii_case(&fingerprint.hash_function)
+            && self.peer_fingerprint.bytes == fingerprint.bytes
+            && self.peer_tls_id == tls_id;
+        if !same_association {
+            self.role = None;
+            self.local_tls_id = None;
+        }
+        self.peer_fingerprint = fingerprint;
+        self.peer_setup = setup;
+        self.peer_tls_id = tls_id;
+    }
+
+    /// Take A's keying from its answer to the engine's subsequent offer, which offered `actpass`
+    /// (RFC 8842 §5.5). The answerer picks, so the engine takes the complement of A's `a=setup`, and an
+    /// answer without one is `passive` (RFC 4145 §4.1). An `actpass` or `holdconn` answer picks
+    /// nothing, and the role in force is kept.
+    fn answered(
+        &mut self,
+        fingerprint: sdp::Fingerprint,
+        setup: Option<sdp::Setup>,
+        tls_id: Option<String>,
+    ) {
+        self.role = match setup {
+            Some(sdp::Setup::Active) => Some(DtlsRole::Server),
+            Some(sdp::Setup::Passive) | None => Some(DtlsRole::Client),
+            Some(sdp::Setup::Actpass | sdp::Setup::Holdconn) => self.role,
+        };
+        self.peer_fingerprint = fingerprint;
+        self.peer_setup = setup;
+        self.peer_tls_id = tls_id;
+    }
 }
 
 /// A runtime reason a plain passthrough relay is held in the userspace media pipeline (promoted off
@@ -671,6 +739,23 @@ enum PipelineKind {
     /// The [`crate::dtls_bridge::DtlsBridge`] keeps the RFC 7983 demux and the handshake; the actor
     /// owns the crypto and is keyed asynchronously when the handshake completes.
     DtlsMedia,
+    /// Userspace DTLS-SRTP bridge where the **near** (offerer) leg is the DTLS one: a WebRTC caller
+    /// toward a plain callee. The mirror of [`PipelineKind::Dtls`], with the bridge's secure side
+    /// facing A and the engine's own fingerprint in A's answer, as [`PipelineKind::SrtpOfferer`]
+    /// mirrors [`PipelineKind::Srtp`].
+    DtlsOfferer,
+}
+
+impl PipelineKind {
+    /// Whether the call's media runs through a crypto bridge, which relays SRTP without decoding it.
+    /// Nothing that needs the decoded audio (a recording, a tee, a SIPREC fork, a DTMF block) has
+    /// anything to attach to on such a call.
+    fn is_crypto_bridge(self) -> bool {
+        matches!(
+            self,
+            Self::Srtp | Self::SrtpOfferer | Self::Dtls | Self::DtlsOfferer
+        )
+    }
 }
 
 /// The session engine, generic over a [`Datapath`] backend.

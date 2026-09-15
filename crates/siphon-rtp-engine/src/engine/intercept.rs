@@ -156,7 +156,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // A crypto bridge relays without decoding, so its media never reaches the pipeline. This
             // is the ordinary same-codec WebRTC / SDES shape, so it is a tap site rather than a
             // rejection — a warrant has to be servable on any call.
-            PipelineKind::Srtp | PipelineKind::SrtpOfferer | PipelineKind::Dtls => {
+            // A terminated DTLS offerer taps the same way: each tap sits on its own party's ingress
+            // endpoint, and the bridge hands it the plaintext side of that endpoint's transform.
+            PipelineKind::Srtp
+            | PipelineKind::SrtpOfferer
+            | PipelineKind::Dtls
+            | PipelineKind::DtlsOfferer => {
                 let Some(b_endpoint) = b_endpoint else {
                     return Err("the call has no answered second leg to intercept".to_string());
                 };

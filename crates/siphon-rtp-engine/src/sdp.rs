@@ -61,6 +61,9 @@ pub struct MediaInfo {
     pub fingerprint: Option<Fingerprint>,
     /// The peer's DTLS role (`a=setup`, RFC 4145 / RFC 5763) — who initiates the DTLS handshake.
     pub setup: Option<Setup>,
+    /// The peer's `a=tls-id` (RFC 8842 §4), which names its DTLS association: a changed value is an
+    /// explicit request for a new one (RFC 8842 §3.1). `None` when the SDP carries none.
+    pub tls_id: Option<String>,
     /// Whether the `m=audio` transport is a DTLS-keyed profile (`UDP/TLS/RTP/SAVP[F]`, RFC 5764): SRTP
     /// keyed by the DTLS handshake (`a=fingerprint`), not by SDES `a=crypto`. Implies [`Self::secure`].
     pub dtls: bool,
@@ -511,6 +514,8 @@ struct AudioScan {
     /// The peer's DTLS fingerprint / setup role (`a=fingerprint` / `a=setup`), session- or media-level.
     fingerprint: Option<Fingerprint>,
     setup: Option<Setup>,
+    /// The peer's `a=tls-id` (RFC 8842 §4), session- or media-level.
+    tls_id: Option<String>,
     /// Peer ICE credentials (`a=ice-ufrag` / `a=ice-pwd`), session- or media-level.
     ice_ufrag: Option<String>,
     ice_pwd: Option<String>,
@@ -762,6 +767,7 @@ fn scan(sdp: &str) -> AudioScan {
         crypto: Vec::new(),
         fingerprint: None,
         setup: None,
+        tls_id: None,
         ice_ufrag: None,
         ice_pwd: None,
         sections: Vec::new(),
@@ -901,6 +907,13 @@ fn scan(sdp: &str) -> AudioScan {
                             scan.setup = Some(setup);
                         }
                     }
+                } else if let Some(tls_id) = value.strip_prefix("tls-id:") {
+                    // RFC 8842 §4 `a=tls-id` — session- or media-level; media-level wins.
+                    let tls_id = tls_id.trim();
+                    if session_or_audio && !tls_id.is_empty() && (in_audio || scan.tls_id.is_none())
+                    {
+                        scan.tls_id = Some(tls_id.to_string());
+                    }
                 } else if let Some(direction) = MediaDirection::parse(value) {
                     // RFC 4566 §6 / RFC 8866 §6.7 direction attribute — session- or media-level, with
                     // media-level winning, exactly like the ICE credentials and `a=setup` above. It is
@@ -1011,6 +1024,7 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
             .is_some_and(|transport| transport.contains("UDP/TLS")),
         fingerprint: scan.fingerprint.clone(),
         setup: scan.setup,
+        tls_id: scan.tls_id.clone(),
         ice_ufrag: scan.ice_ufrag.clone(),
         ice_pwd: scan.ice_pwd.clone(),
         candidates: scan.candidates.clone(),
@@ -1135,6 +1149,9 @@ pub enum SecurityAdvertisement {
         fingerprint: Fingerprint,
         /// The engine's DTLS role (`a=setup`): `Actpass` in an offer, `Passive`/`Active` in an answer.
         setup: Setup,
+        /// The `a=tls-id` the engine assigned to the association (RFC 8842 §4), rendered only when set:
+        /// an answerer MUST NOT insert one the offer did not carry (RFC 8842 §5.3).
+        tls_id: Option<String>,
     },
 }
 
@@ -1420,11 +1437,13 @@ pub fn rewrite(
                 continue;
             }
             // Re-originating secure keying: drop the peer's `a=crypto` (SDES) and
-            // `a=fingerprint`/`a=setup` (DTLS); we advertise our own below (or none, for a downgrade).
+            // `a=fingerprint`/`a=setup`/`a=tls-id` (DTLS, RFC 8842 §4); we advertise our own below (or
+            // none, for a downgrade). A `tls-id` names the peer's own association, never the engine's.
             if security.is_some()
                 && (line.starts_with("a=crypto:")
                     || line.starts_with("a=fingerprint:")
-                    || line.starts_with("a=setup:"))
+                    || line.starts_with("a=setup:")
+                    || line.starts_with("a=tls-id:"))
             {
                 continue;
             }
@@ -1438,7 +1457,7 @@ pub fn rewrite(
         // Secure-text anchor: drop the peer's own text `a=crypto` (we advertise the engine's below on
         // the `m=text` line), scoped to the text section so it never touches the audio/other sections —
         // exactly the section scoping that keeps a secure-audio rewrite from stripping a text section's
-        // keying (RFC 4568 SDES; docs/security-and-nat.md Layer 5d).
+        // keying (RFC 4568 SDES; docs/security-and-nat.md Layer 5f).
         if matches!(text, TextRewrite::AnchorSecure { .. })
             && current_kind == Some(MediaKind::Text)
             && line.starts_with("a=crypto:")
@@ -1520,14 +1539,22 @@ pub fn rewrite(
                 }
             }
             // Advertise the engine's own keying on a secure leg: the SDES `a=crypto` (RFC 4568) or the
-            // DTLS `a=fingerprint` + `a=setup` (RFC 5764 / RFC 5763).
+            // DTLS `a=fingerprint` + `a=setup` (RFC 5764 / RFC 5763), with the `a=tls-id` the engine
+            // assigned when it has one (RFC 8842 §5.3).
             match &security {
                 Some(SecurityAdvertisement::Secure(crypto)) => {
                     writer.add(format!("a={}", crypto.to_attribute_value()));
                 }
-                Some(SecurityAdvertisement::Dtls { fingerprint, setup }) => {
+                Some(SecurityAdvertisement::Dtls {
+                    fingerprint,
+                    setup,
+                    tls_id,
+                }) => {
                     writer.add(format!("a={}", fingerprint.to_attribute_value()));
                     writer.add(format!("a=setup:{}", setup.token()));
+                    if let Some(tls_id) = tls_id {
+                        writer.add(format!("a=tls-id:{tls_id}"));
+                    }
                 }
                 Some(SecurityAdvertisement::Plain) | None => {}
             }
@@ -3403,6 +3430,7 @@ mod tests {
             Some(SecurityAdvertisement::Dtls {
                 fingerprint,
                 setup: Setup::Passive,
+                tls_id: None,
             }),
             None,
             TextRewrite::None,
@@ -3428,6 +3456,72 @@ mod tests {
             !result.sdp.contains("a=setup:actpass"),
             "peer setup must be stripped"
         );
+    }
+
+    #[test]
+    fn a_tls_id_is_read_media_level_first_and_only_the_engines_own_is_presented() {
+        // RFC 8842 §4: `a=tls-id` may sit at session or media level, and the media-level value wins,
+        // as for `a=setup`. A rewrite that re-originates DTLS keying drops the peer's value, which names
+        // the peer's association, and renders the engine's own only when one was assigned (RFC 8842
+        // §5.3: an answerer MUST NOT insert one the offer did not carry).
+        let session_only =
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n\
+             a=tls-id:sessionlevelvalue0000000\r\n\
+             m=audio 49170 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=setup:actpass\r\na=fingerprint:sha-256 AB:CD:EF:01\r\n";
+        assert_eq!(
+            parse(session_only).expect("parse").tls_id.as_deref(),
+            Some("sessionlevelvalue0000000")
+        );
+        let both_levels =
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n\
+             a=tls-id:sessionlevelvalue0000000\r\n\
+             m=audio 49170 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=setup:actpass\r\na=tls-id:medialevelvalue00000000\r\n\
+             a=fingerprint:sha-256 AB:CD:EF:01\r\n";
+        assert_eq!(
+            parse(both_levels).expect("parse").tls_id.as_deref(),
+            Some("medialevelvalue00000000")
+        );
+        assert_eq!(
+            parse(&dtls_offer("203.0.113.7", 49170))
+                .expect("parse")
+                .tls_id,
+            None
+        );
+
+        let fingerprint = Fingerprint {
+            hash_function: "sha-256".to_string(),
+            bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        for (assigned, expected) in [
+            (None, vec![]),
+            (
+                Some("enginevalue0000000000"),
+                vec!["a=tls-id:enginevalue0000000000"],
+            ),
+        ] {
+            let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+            let result = rewrite(
+                both_levels,
+                engine,
+                IceRewrite::Keep,
+                Some(SecurityAdvertisement::Dtls {
+                    fingerprint: fingerprint.clone(),
+                    setup: Setup::Active,
+                    tls_id: assigned.map(str::to_string),
+                }),
+                None,
+                TextRewrite::None,
+            )
+            .expect("rewrite");
+            let presented: Vec<&str> = result
+                .sdp
+                .lines()
+                .filter(|line| line.starts_with("a=tls-id:"))
+                .collect();
+            assert_eq!(presented, expected, "{}", result.sdp);
+        }
     }
 
     #[test]
@@ -4500,6 +4594,7 @@ mod tests {
             Some(SecurityAdvertisement::Dtls {
                 fingerprint,
                 setup: Setup::Passive,
+                tls_id: None,
             }),
             None,
             TextRewrite::None,
