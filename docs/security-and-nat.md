@@ -329,7 +329,8 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     gather concurrently, so that delay is paid once per leg, not once per component.
   - We still gather fully before answering and mark the list `a=end-of-candidates` (RFC 8838 §14),
     but we now **accept** trickled remote candidates (`a=ice-options:trickle`) even though we do not
-    send our own.
+    send our own. The same line carries `ice2`, which RFC 8839 §4.2.1.5 requires of an RFC 8445 agent
+    in every offer and answer.
   - **Enforcement:** `siphon-rtp-ice/src/gather.rs` (the pure plan), `Engine::gather_leg_candidates` /
     `run_gatherer` (its I/O), `sdp::IceAdvertisement` (emission).
 - **The full agent (`--ice-full`) changes who decides the media path**, which is why it belongs in this

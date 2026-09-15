@@ -197,7 +197,7 @@ pub enum Command {
     ///
     /// The engine does not trickle candidates of its own: it gathers to completion before it answers
     /// (see `a=end-of-candidates` in its SDP), so there are none to send afterwards. It advertises
-    /// `a=ice-options:trickle` because it *accepts* them — which is the half of RFC 8838 that
+    /// `a=ice-options:trickle ice2` because it *accepts* them, the half of RFC 8838 that
     /// matters against a browser.
     IceCandidate {
         call_id: String,
