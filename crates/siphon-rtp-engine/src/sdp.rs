@@ -1572,12 +1572,10 @@ pub fn rewrite(
                 for candidate in ice.candidates {
                     writer.add(candidate.to_attribute_line());
                 }
-                // RFC 8839 §5.6 / RFC 8838 §4.1: we *accept* trickled candidates, so say so — that is
-                // what lets a browser send its offer immediately and stream candidates afterwards.
-                // We never trickle our own: gathering finishes before we answer, which is why the
-                // end-of-candidates marker below is also true. `ice2` is mandatory for an RFC 8445
-                // agent: RFC 8839 §4.2.1.5 requires it in every offer (§4.3.1) and answer (§4.3.2),
-                // and a peer that does not see it may fall back to treating us as RFC 5245.
+                // RFC 8838 §4.1: we accept trickled candidates but never trickle our own, since
+                // gathering finishes first (so end-of-candidates below is true). RFC 8839 §4.2.1.5:
+                // an RFC 8445 agent MUST also carry `ice2`, in every offer (§4.3.1) and answer
+                // (§4.3.2), or a peer may treat it as RFC 5245.
                 writer.add("a=ice-options:trickle ice2".to_string());
                 // RFC 8838 §14: our list is complete before the SDP is built (gathering runs to
                 // completion, or to its deadline, on the control path), so say so — a trickle-capable
