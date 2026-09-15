@@ -50,6 +50,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **A runtime shutting down while DTLS-SRTP handshakes are pending no longer hangs.** Dropping the DTLS
+  bridge only detached its handshake tasks. A pending handshake's transport channels went with the
+  bridge, so the DTLS connection's reader retried a read that failed at once, in a tight loop, and a
+  passive handshake has no timeout to end it. With such a handshake on every runtime worker, shutdown
+  waited on workers that never parked, and each of them spun a core until it did. The bridge now aborts
+  every session it still owns when it is dropped, as per-call teardown already did.
 - **A call that ends under a decoded recording now finishes the recording before the call is reported
   gone.** `delete` and the media-timeout sweep released the media actor and left the WAV writer to
   finish on its own, so `delete` could answer before the file was finalized, `recording_finished`
