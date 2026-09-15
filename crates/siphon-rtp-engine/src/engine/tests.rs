@@ -9325,6 +9325,54 @@ async fn echo_promotes_an_offer_only_call_reflects_audio_then_disable_tears_down
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_echo_promotion_sends_no_comfort_noise_before_the_echo_engages() {
+    // A single-leg call is promoted with comfort-noise idle egress, and its actor's playout tick fires
+    // the moment the actor is registered. Turning echo on with a control message only *after* the
+    // promotion lets that tick send the caller comfort noise ahead of its own audio, which is what the
+    // caller then hears first. The hold taken for echo has to build the actor with echo already on:
+    // promoted for echo and never told again, the call sends the caller nothing until it speaks.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (phone_a, addr_a) = phone().await;
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "echo-comfort".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(offered, CmdResult::Ok { .. }),
+        "offer ok, got {offered:?}"
+    );
+
+    engine
+        .hold_in_userspace(
+            "echo-comfort",
+            PromotionReason::Echo,
+            PromoteMode::Processing,
+        )
+        .await
+        .expect("promote the offer-only call for echo");
+    assert!(
+        engine.media().is_transcoding_call("echo-comfort"),
+        "the offer-only relay was promoted to a processing MediaCall"
+    );
+
+    // Ten playout ticks: an actor built without the echo posture sends a comfort frame on each.
+    let mut buffer = [0u8; 2048];
+    assert!(
+        timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer))
+            .await
+            .is_err(),
+        "a call promoted for echo sends the caller nothing before the caller speaks"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn play_media_promotes_an_offer_only_call_and_plays_the_prompt() {
     // A UAS IVR offers but never answers (single-leg). A prompt must play on it *before* any echo,
     // so `play_media` promotes the offer-only relay into a processing MediaCall (the same promote

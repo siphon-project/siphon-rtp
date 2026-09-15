@@ -102,7 +102,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// directions re-enforce the exact same per-leg source filter, docs/security-and-nat.md §4);
     /// building errors only if a codec has no encoder (e.g. AMR-WB without the `amr` build feature). The
     /// owner's event sink is wired so DTMF still surfaces (the SBC ends the echo test on `#`).
-    pub(super) async fn promote_to_processing(&self, call_id: &str) -> Result<(), String> {
+    ///
+    /// `echo` builds the actor with echo-test mode already on, for a promotion the `echo` verb asked
+    /// for; see the construction below for why that cannot be left to a control message.
+    pub(super) async fn promote_to_processing(
+        &self,
+        call_id: &str,
+        echo: bool,
+    ) -> Result<(), String> {
         let Some((
             owner,
             from_tag,
@@ -307,11 +314,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         //
         // Gating here rather than with a control message is what closes it completely — a message
         // would race the very tick it is meant to beat.
-        let call = if near_secure {
+        let mut call = if near_secure {
             call.with_near_secure_pending()
         } else {
             call
         };
+        // The same race for the `echo` verb: the actor's playout tick fires the moment it runs, and on
+        // a comfort-idle single-leg call it emits comfort noise unless echo is on. Echo turned on by a
+        // control message after this returns would send the caller that noise ahead of its own
+        // reflected audio, so the actor starts in echo mode instead.
+        if echo {
+            call.set_echo(true);
+        }
         self.media
             .register(call, self.datapath.clone(), owner_events);
 
@@ -373,7 +387,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if pipeline == PipelineKind::Passthrough && !self.media.is_media_call(call_id) {
             match mode {
                 PromoteMode::RelayOnly => self.promote_passthrough(call_id).await?,
-                PromoteMode::Processing => self.promote_to_processing(call_id).await?,
+                PromoteMode::Processing => {
+                    self.promote_to_processing(call_id, matches!(reason, PromotionReason::Echo))
+                        .await?;
+                }
             }
         } else if mode == PromoteMode::Processing && self.media.is_relay_call(call_id) {
             // A relay-only promotion (recording / DTMF-block on a plain relay) is already up, but echo
