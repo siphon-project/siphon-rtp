@@ -8,7 +8,7 @@ use siphon_rtp_proto::{CmdResult, ProfileFlags};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 
 use crate::ice::IceCredentials;
-use crate::sdp::{self, TextRewrite};
+use crate::sdp::{self, IceRewrite, TextRewrite};
 
 use super::install::{AnswerIce, AnswerText, AnswerWiring, AnsweredText};
 use super::negotiate::{
@@ -260,6 +260,8 @@ struct AnswerPresentation<'a> {
     ice_creds: Option<&'a IceCredentials>,
     near_ice_candidates: &'a Vec<siphon_rtp_ice::Candidate>,
     far_ice_candidates: &'a Vec<siphon_rtp_ice::Candidate>,
+    /// `ice: remove` took ICE off the far leg.
+    far_ice_removed: bool,
     near_local_crypto: Option<CryptoAttribute>,
     far_local_crypto: Option<CryptoAttribute>,
     near_text_local_crypto: Option<CryptoAttribute>,
@@ -290,6 +292,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_creds,
             near_ice_candidates,
             far_ice_candidates,
+            far_ice_removed,
             near_local_crypto,
             far_local_crypto,
             near_text_local_crypto,
@@ -383,7 +386,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 });
                 LegPresentation {
                     engine: far.engine_media(),
-                    ice: answer_ice_rewrite(ice_creds, far_ice_candidates),
+                    // B's leg as the original offer presented it: without ICE when `ice: remove` took
+                    // it off, whatever credentials the call holds for A's leg (RFC 8839 §4.2.5).
+                    ice: if far_ice_removed {
+                        IceRewrite::Strip
+                    } else {
+                        answer_ice_rewrite(ice_creds, far_ice_candidates)
+                    },
                     security: far_security(far_downgraded_to_plain, dtls, far_crypto),
                     mux_override: mux_directive.then_some(far.rtcp.is_none()),
                     text: if far.text.is_none() {
@@ -529,6 +538,7 @@ struct AnswerState {
     near_peer_is_lite: bool,
     near_local_candidates: Vec<siphon_rtp_ice::Candidate>,
     far_local_candidates: Vec<siphon_rtp_ice::Candidate>,
+    far_ice_removed: bool,
     far_local_crypto: Option<CryptoAttribute>,
     near_local_crypto: Option<CryptoAttribute>,
     near_remote_crypto: Option<CryptoAttribute>,
@@ -633,6 +643,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_peer_is_lite: call.near_peer_is_lite,
                     near_local_candidates: call.near_local_candidates.clone(),
                     far_local_candidates: call.far_local_candidates.clone(),
+                    far_ice_removed: call.far_ice_removed,
                     far_local_crypto: call.far_local_crypto,
                     near_local_crypto: call.near_local_crypto,
                     near_remote_crypto: call.near_remote_crypto,
@@ -655,6 +666,34 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             _ => Err(Box::new(unknown_call(call_id))),
         }
+    }
+
+    /// Each leg's ICE candidates for an answer: the near leg's are what A was (or is now being) shown,
+    /// the far leg's what B was offered. Gathered the first time a leg is presented — for the same
+    /// reason the far leg's were at offer, the SDP carrying them is the complete list that party will
+    /// ever see from us — and re-used after that, since the ports never move. None without
+    /// credentials, and none for a far leg `ice: remove` took ICE off, which presents none and so
+    /// gathers none.
+    async fn answer_candidates(
+        &self,
+        (near, near_stored): (&Leg, &[siphon_rtp_ice::Candidate]),
+        (far, far_stored): (&Leg, &[siphon_rtp_ice::Candidate]),
+        creds: Option<&IceCredentials>,
+        far_ice_removed: bool,
+    ) -> (
+        Vec<siphon_rtp_ice::Candidate>,
+        Vec<siphon_rtp_ice::Candidate>,
+    ) {
+        let Some(creds) = creds else {
+            return (Vec::new(), Vec::new());
+        };
+        let near_candidates = self.leg_candidates(near, near_stored, creds).await;
+        let far_candidates = if far_ice_removed {
+            Vec::new()
+        } else {
+            self.leg_candidates(far, far_stored, creds).await
+        };
+        (near_candidates, far_candidates)
     }
 
     /// Record an installed answer on the call: B's addresses and codec, the pipeline and its flows,
@@ -719,8 +758,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
             call.far_remote_crypto = info.crypto.first().copied();
             // B's ICE credentials from its answer — what an outbound consent check to B is addressed
-            // and signed with (RFC 8445 §7.1.2).
-            call.far_remote_ice = peer_ice_credentials(info);
+            // and signed with (RFC 8445 §7.1.2). None on a far leg `ice: remove` took ICE off: B was
+            // given no engine credentials, so ICE in its SDP is not a session with us.
+            call.far_remote_ice = if call.far_ice_removed {
+                None
+            } else {
+                peer_ice_credentials(info)
+            };
             // B's hint as this answer resolved it, for the next renegotiation to keep or refresh.
             call.far_received_from = far_received_from;
             // What A has now been shown for the near leg, re-presented on a re-offer from B.
@@ -771,6 +815,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_peer_is_lite,
             near_local_candidates,
             far_local_candidates,
+            far_ice_removed,
             far_local_crypto,
             near_local_crypto,
             near_remote_crypto,
@@ -902,19 +947,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 PipelineKind::Media | PipelineKind::SrtpMedia | PipelineKind::DtlsMedia
             );
 
-        // Each leg's ICE candidates: the near leg's are what A was (or is now being) shown, the far
-        // leg's what B was offered. Gathered the first time a leg is presented — for the same reason
-        // the far leg's were at offer, the SDP carrying them is the complete list that party will ever
-        // see from us — and re-used after that, since the ports never move.
-        let (near_ice_candidates, far_ice_candidates) = match ice_creds.as_ref() {
-            Some(creds) => (
-                self.leg_candidates(&near, &near_local_candidates, creds)
-                    .await,
-                self.leg_candidates(&far, &far_local_candidates, creds)
-                    .await,
-            ),
-            None => (Vec::new(), Vec::new()),
-        };
+        // A call that becomes a takeover here keeps the takeover meaning of `ice: remove`: no ICE agent
+        // runs for a takeover leg on offer/answer (see `offer_takeover_refusal`), so a `ws_uri` named
+        // first at answer drops the credentials minted for A's leg, as naming it at offer would have.
+        let ice_creds = ice_creds.filter(|_| !(far_ice_removed && becoming_ws));
+        let (near_ice_candidates, far_ice_candidates) = self
+            .answer_candidates(
+                (&near, &near_local_candidates),
+                (&far, &far_local_candidates),
+                ice_creds.as_ref(),
+                far_ice_removed,
+            )
+            .await;
         let AnswerTextAcceptance {
             secure_text_accepted,
             text_accepted,
@@ -947,6 +991,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_creds: ice_creds.as_ref(),
             near_ice_candidates: &near_ice_candidates,
             far_ice_candidates: &far_ice_candidates,
+            far_ice_removed,
             near_local_crypto,
             far_local_crypto,
             near_text_local_crypto,
@@ -990,9 +1035,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
 
         // ICE applies to a leg only when both ends use it: `near` faces A (which offered ICE iff we
-        // minted creds), `far` faces B (ICE iff its answer carries ICE).
+        // minted creds), `far` faces B (ICE iff its answer carries ICE and `ice: remove` left ICE on
+        // B's leg — the credentials alone do not say, since `remove` still mints them for A).
         let near_ice = ice_creds.is_some();
-        let far_ice = ice_creds.is_some() && info.is_ice();
+        let far_ice = ice_creds.is_some() && info.is_ice() && !far_ice_removed;
 
         // Enable the ICE connectivity-check responder on the endpoints facing an ICE peer *before*
         // any relay flow is installed, so an ICE leg is STUN-gated from its first packet — the
@@ -1013,6 +1059,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_ice_candidates: &far_ice_candidates,
                 reversed: reversed.is_some(),
                 near_peer_is_lite,
+                far_ice_removed,
             }),
             None => Vec::new(),
         };

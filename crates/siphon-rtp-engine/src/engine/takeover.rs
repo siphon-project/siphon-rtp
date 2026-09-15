@@ -656,8 +656,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return Err(
                 "ws-takeover-ice-offerer: a WebSocket takeover on an ICE leg is not supported here — \
                  no ICE agent is armed for a takeover leg on a two-leg call, so its downlink would \
-                 never follow the selected pair; negotiate the takeover with answer_local, or \
-                 ICE=remove to drop ICE"
+                 never follow the selected pair; negotiate the takeover with answer_local, or name \
+                 ws_uri on the offer together with ICE=remove to drop ICE"
                     .to_string(),
             );
         }
@@ -1015,7 +1015,7 @@ pub(super) struct AnswerTakeover<'a> {
     pub(super) near_codec: Option<&'a CodecSpec>,
     /// A's offer was a secure (SRTP) profile.
     pub(super) near_secure: bool,
-    /// A's offer carried ICE, so the call holds engine ICE credentials.
+    /// This answer presents A's leg with the engine's ICE credentials (A offered ICE, or `ice: force`).
     pub(super) ice_offerer: bool,
     /// The bridge was already stood up at offer.
     pub(super) already_ws: bool,
@@ -1117,6 +1117,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.far_received_from = far_received_from;
             call.pending_far_reoffer = None;
             call.near_local_candidates = near_ice_candidates;
+            // A leg answered without the engine's ICE holds no engine credentials: a takeover named
+            // first at answer on a call offered with `ice: remove` dropped the ones minted for A.
+            if !ice_offerer {
+                call.ice = None;
+            }
         }
         ok_sdp(rewritten, Some(answer_to_tag))
     }

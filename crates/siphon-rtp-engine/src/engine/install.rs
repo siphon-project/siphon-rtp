@@ -687,6 +687,8 @@ pub(super) struct AnswerIce<'a> {
     /// A is answering a re-offer from B.
     pub(super) reversed: bool,
     pub(super) near_peer_is_lite: bool,
+    /// `ice: remove` took ICE off the far leg: B's leg is never armed, whatever B's SDP carries.
+    pub(super) far_ice_removed: bool,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -706,6 +708,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_ice_candidates,
             reversed,
             near_peer_is_lite,
+            far_ice_removed,
         } = *ice;
         let mut agent_endpoints: Vec<EndpointId> = Vec::new();
         let config = IceConfig {
@@ -728,11 +731,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 "peer answered a=ice-mismatch (RFC 8839 §5.3) — running the far leg without ICE"
             );
             None
+        } else if far_ice_removed {
+            // `ice: remove` took ICE off the far leg at offer: B was never given the engine's
+            // credentials (RFC 8839 §4.2.5), so ICE in its SDP cannot describe a session with us.
+            None
         } else {
             peer_ice_credentials(info)
         };
-        if !info.is_ice() || info.ice_mismatch {
-            // B answered without ICE. Gathering at offer time installed the responder on the far
+        // B's leg uses ICE only when B's SDP carries it unaltered and `ice: remove` left it on.
+        let far_uses_ice = info.is_ice() && !info.ice_mismatch && !far_ice_removed;
+        if !far_uses_ice {
+            // B's leg runs without ICE. Gathering at offer time installed the responder on the far
             // endpoints (that is how it received its own Binding responses), and leaving it there
             // would arm the layer-4 gate — which forwards media *only* from a STUN-validated
             // source — on a leg that will never send a check, blackholing B's media. Clear it, so
@@ -744,7 +753,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let sides = [
             (near.endpoint_ids().collect::<Vec<_>>(), near_remote_ice),
             (
-                if info.is_ice() && !info.ice_mismatch {
+                if far_uses_ice {
                     far.endpoint_ids().collect::<Vec<_>>()
                 } else {
                     Vec::new()
@@ -774,7 +783,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_controlling,
             ),
             (
-                if info.is_ice() && !info.ice_mismatch {
+                if far_uses_ice {
                     far.endpoint_ids().collect::<Vec<_>>()
                 } else {
                     Vec::new()

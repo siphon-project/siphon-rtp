@@ -134,25 +134,31 @@ pub(super) fn near_security(
     }
 }
 
-/// The ICE posture an **offer** presents for a leg (RFC 8839 §5): ICE-lite re-originated with the
-/// engine's credentials and the leg's gathered candidates when the call has credentials; otherwise
-/// `a=ice-mismatch` when the offerer's SDP was altered in transit (§5.3, so it stops waiting for
-/// checks that will never come), the offerer's ICE stripped on `ice: remove`, or passed through.
+/// The ICE posture an **offer** presents for the far leg (RFC 8839 §5): `a=ice-mismatch` when the call
+/// holds no credentials because the offerer's SDP was altered in transit (§5.3, so it stops waiting for
+/// checks that will never come); the offerer's ICE stripped when `ice: remove` took ICE off the far
+/// leg; ICE-lite re-originated with the engine's credentials and the leg's gathered candidates when the
+/// call has credentials; otherwise passed through.
+///
+/// `far_ice_removed` wins over the credentials. Under `remove` they exist only for an ICE offerer,
+/// which still needs the engine's `a=ice-ufrag`/`a=ice-pwd` in its answer to use ICE at all (RFC 8839
+/// §4.2.5) — they belong to the near leg, and presenting them to B would put ICE on the one leg the
+/// directive keeps it off.
 pub(super) fn offer_ice_rewrite<'a>(
     credentials: Option<&'a IceCredentials>,
     candidates: &'a [siphon_rtp_ice::Candidate],
     mismatch: bool,
-    directive: Option<IceDirective>,
+    far_ice_removed: bool,
 ) -> IceRewrite<'a> {
-    match (credentials, directive) {
-        (Some(credentials), _) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+    match credentials {
+        None if mismatch => IceRewrite::Mismatch,
+        _ if far_ice_removed => IceRewrite::Strip,
+        Some(credentials) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
             ufrag: credentials.ufrag.as_str(),
             pwd: credentials.pwd.as_str(),
             candidates,
         }),
-        (None, _) if mismatch => IceRewrite::Mismatch,
-        (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
-        (None, _) => IceRewrite::Keep,
+        None => IceRewrite::Keep,
     }
 }
 
@@ -285,7 +291,9 @@ pub(super) enum IceDirective {
     /// ICE (RFC 8445). `force-relay` (relay-only candidates) degrades to `force`: the engine has no
     /// TURN allocator, so only its host candidate is offered — documented in `docs/control/json.md`.
     Force,
-    /// `remove` — strip the peer's ICE and advertise none (RFC 8839 §5).
+    /// `remove` — present the far leg without ICE: strip the offerer's ICE from B's offer and advertise
+    /// none there (RFC 8839 §5). The near leg keeps the engine's ICE toward an ICE offerer, which
+    /// cannot use ICE unless its answer carries it (RFC 8839 §4.2.5); a takeover leg is the exception.
     Remove,
 }
 

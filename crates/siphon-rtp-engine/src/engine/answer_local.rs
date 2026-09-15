@@ -76,6 +76,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_peer_is_lite: false,
                 far_local_candidates: Vec::new(),
                 near_local_candidates: Vec::new(),
+                // No far leg to take ICE off.
+                far_ice_removed: false,
                 from_tag,
                 to_tag: None,
                 near: Leg {

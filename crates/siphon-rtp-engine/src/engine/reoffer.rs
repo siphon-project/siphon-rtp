@@ -34,6 +34,8 @@ struct ReofferState {
     previous_codec: Option<CodecSpec>,
     near_local_candidates: Vec<siphon_rtp_ice::Candidate>,
     far_local_candidates: Vec<siphon_rtp_ice::Candidate>,
+    /// `ice: remove` took ICE off the far leg (RFC 8839 §4.2.5).
+    far_ice_removed: bool,
     far_local_crypto: Option<CryptoAttribute>,
     /// The engine's own SDES key toward A, so a re-offer re-presents the key A already holds rather
     /// than minting a new one (RFC 4568 — a re-offer restates the session, it does not re-key it).
@@ -67,6 +69,7 @@ impl ReofferState {
             previous_codec,
             near_local_candidates: call.near_local_candidates.clone(),
             far_local_candidates: call.far_local_candidates.clone(),
+            far_ice_removed: call.far_ice_removed,
             far_local_crypto: call.far_local_crypto,
             near_local_crypto: call.near_local_crypto,
             far_dtls: call.far_dtls,
@@ -116,6 +119,46 @@ fn far_reoffer_security_refusal(state: &ReofferState, info: &sdp::MediaInfo) -> 
         );
     }
     None
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// A re-offer's ICE candidates: the offering leg's, for its rebuilt agent, and the presented
+    /// leg's, for the SDP. Both are the ones already advertised when stored — the ports are unchanged,
+    /// which is exactly the property that lets media keep flowing across a restart — and are gathered
+    /// only when there is nothing stored (ICE added mid-call, or a call restored from a snapshot). A
+    /// far leg `ice: remove` took ICE off presents none, so it gathers none either.
+    async fn reoffer_candidates(
+        &self,
+        state: &ReofferState,
+        (offering_leg, presented_leg): (Leg, Leg),
+        presented_party: Party,
+        creds: &IceCredentials,
+        far_ice_removed: bool,
+    ) -> (
+        Vec<siphon_rtp_ice::Candidate>,
+        Vec<siphon_rtp_ice::Candidate>,
+    ) {
+        let (offering_stored, presented_stored) = match state.party {
+            Party::Near => (&state.near_local_candidates, &state.far_local_candidates),
+            Party::Far => (&state.far_local_candidates, &state.near_local_candidates),
+        };
+        let uses_ice = |leg_party: Party| leg_party == Party::Near || !far_ice_removed;
+        let offering = if uses_ice(state.party) {
+            self.leg_candidates(&offering_leg, offering_stored, creds)
+                .await
+        } else {
+            Vec::new()
+        };
+        let presented = if presented_party == state.party {
+            offering.clone()
+        } else if uses_ice(presented_party) {
+            self.leg_candidates(&presented_leg, presented_stored, creds)
+                .await
+        } else {
+            Vec::new()
+        };
+        (offering, presented)
+    }
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -232,8 +275,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        // RFC 8445 §9.1.1.1: an ICE restart is signalled by new credentials on the re-offer.
-        let new_remote_ice = peer_ice_credentials(&info);
+        // B's leg carries no ICE once `ice: remove` took it off: at offer, and kept so a re-offer
+        // presents B's leg as B last saw it, or by this re-offer toward B restating the directive. A's
+        // own leg keeps the engine's ICE either way (RFC 8839 §4.2.5).
+        let far_ice_removed = state.far_ice_removed
+            || (presented_party == Party::Far
+                && ice_directive(profile) == Some(IceDirective::Remove));
+        // RFC 8445 §9.1.1.1: an ICE restart is signalled by new credentials on the re-offer. B's are not
+        // read on a leg without ICE, so they neither restart ICE nor arm an agent there.
+        let new_remote_ice =
+            peer_ice_credentials(&info).filter(|_| !(party == Party::Far && far_ice_removed));
         let ice_restart = match (state.previous_remote_ice.as_ref(), new_remote_ice.as_ref()) {
             (Some(previous), Some(new)) => previous != new,
             // Peer added ICE where it had none, or dropped it: both change the ICE session.
@@ -259,26 +310,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
 
-        // The offering leg's candidates, for its rebuilt agent, and the presented leg's, for the SDP.
-        // Both are the ones already advertised when stored — the ports are unchanged, which is exactly
-        // the property that lets media keep flowing across a restart — and are gathered only when
-        // there is nothing stored (ICE added mid-call, or a call restored from a snapshot).
+        // See `reoffer_candidates`: stored candidates are re-used, and B's leg has none without ICE.
         let (offering_candidates, presented_candidates) = match ice_creds.as_ref() {
             Some(creds) => {
-                let (offering_stored, presented_stored) = match party {
-                    Party::Near => (&state.near_local_candidates, &state.far_local_candidates),
-                    Party::Far => (&state.far_local_candidates, &state.near_local_candidates),
-                };
-                let offering = self
-                    .leg_candidates(&offering_leg, offering_stored, creds)
-                    .await;
-                let presented = if presented_party == party {
-                    offering.clone()
-                } else {
-                    self.leg_candidates(&presented_leg, presented_stored, creds)
-                        .await
-                };
-                (offering, presented)
+                self.reoffer_candidates(
+                    &state,
+                    (offering_leg, presented_leg),
+                    presented_party,
+                    creds,
+                    far_ice_removed,
+                )
+                .await
             }
             None => (Vec::new(), Vec::new()),
         };
@@ -383,6 +425,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
             call.ice = ice_creds.clone();
+            // Kept for the answer that completes this exchange, which must not arm B's leg either.
+            call.far_ice_removed = far_ice_removed;
             // Both legs' candidates, as now advertised or about to be: the presented leg's are what its
             // party is being told, the offering leg's what its rebuilt agent runs on.
             if ice_creds.is_some() {
@@ -449,7 +493,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         ice_creds.as_ref(),
                         &presented_candidates,
                         ice_mismatch,
-                        ice_directive(profile),
+                        far_ice_removed,
                     ),
                     security: far_security(
                         state.far_downgraded_to_plain,
