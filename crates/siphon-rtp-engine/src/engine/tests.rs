@@ -9652,9 +9652,15 @@ async fn a_recording_is_finalized_when_the_call_ends_under_it() {
         )
         .await;
 
-    let (_id, path, duration_ms, reason) = next_recording_finished(&events)
-        .await
-        .expect("teardown still produces a completion event");
+    // Read without waiting: `delete` finalizes the recording before it answers, so the registry is
+    // already empty and the completion already queued the moment it returns. A controller that
+    // deletes the call and immediately opens the file must find it closed, not racing a writer.
+    assert!(
+        engine.recordings.is_empty(),
+        "the call's recording is ended, not left registered"
+    );
+    let (_id, path, duration_ms, reason) = queued_recording_finished(&events)
+        .expect("the completion event is queued before delete returns");
     assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::CallEnded);
     assert!(
         duration_ms > 0,
@@ -9663,6 +9669,107 @@ async fn a_recording_is_finalized_when_the_call_ends_under_it() {
     let bytes = std::fs::read(path.expect("path")).expect("read");
     let parsed = siphon_rtp_media::player::WavSource::parse(&bytes)
         .expect("a hangup still leaves a valid WAV");
+    assert!(
+        !parsed.samples().is_empty(),
+        "the header was finalized, so the file declares the audio it holds"
+    );
+}
+
+/// The `recording_finished` event already queued on `events`, skipping anything else. It does not
+/// wait: it is for a verb that promises the recording is finalized before the verb returns.
+fn queued_recording_finished(
+    events: &flume::Receiver<Event>,
+) -> Option<(
+    String,
+    Option<String>,
+    u64,
+    siphon_rtp_proto::RecordingEndReason,
+)> {
+    while let Ok(event) = events.try_recv() {
+        if let Event::RecordingFinished {
+            recording_id,
+            path,
+            duration_ms,
+            reason,
+            ..
+        } = event
+        {
+            return Some((recording_id, path, duration_ms, reason));
+        }
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recording_is_finalized_when_the_media_timeout_reaps_the_call() {
+    // A caller whose network drops never hangs up, so the media-timeout sweep is what ends the call.
+    // It shares `delete`'s teardown and must end the recording the same way: a finalized file, a
+    // `call_ended` completion, and nothing left registered once the reap returns.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone, addr) = phone().await;
+    let engine_near = voicemail_call(&engine, "vm-reaped", addr).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let started = engine
+        .handle(
+            CLIENT,
+            Command::StartRecording {
+                call_id: "vm-reaped".into(),
+                from_tag: "tag-a".into(),
+                recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                direction: None,
+                channels: None,
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
+            },
+        )
+        .await;
+    assert!(matches!(
+        started,
+        CmdResult::Ok {
+            recording_id: Some(_),
+            ..
+        }
+    ));
+    for sequence in 0..6u16 {
+        phone
+            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), engine_near)
+            .await
+            .expect("caller send");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // The caller goes quiet for longer than the media timeout.
+    engine.datapath().advance_clock(10);
+    assert_eq!(engine.reap_idle(5, 0).await, vec!["vm-reaped".to_string()]);
+
+    assert!(
+        engine.recordings.is_empty(),
+        "the reaped call's recording is ended, not left registered"
+    );
+    let (_id, path, duration_ms, reason) = queued_recording_finished(&events)
+        .expect("the completion event is queued before the reap returns");
+    assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::CallEnded);
+    assert!(
+        duration_ms > 0,
+        "the audio recorded before the timeout is kept"
+    );
+    let bytes = std::fs::read(path.expect("path")).expect("read");
+    let parsed = siphon_rtp_media::player::WavSource::parse(&bytes)
+        .expect("a reaped call still leaves a valid WAV");
     assert!(
         !parsed.samples().is_empty(),
         "the header was finalized, so the file declares the audio it holds"

@@ -5,6 +5,18 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **A call that ends under a decoded recording now finishes the recording before the call is reported
+  gone.** `delete` and the media-timeout sweep released the media actor and left the WAV writer to
+  finish on its own, so `delete` could answer before the file was finalized, `recording_finished`
+  arrived at some later moment, and the recording was never removed from the engine's registry (one
+  entry leaked per call ended under a recording). Both now detach the recording and wait for its
+  header to be finalized, so `recording_finished` naming `call_ended` is already queued when they
+  return, which is the ordering the control reference already promised.
+
 ## [0.7.0] — 2026-09-14
 
 G.729, RFC 6035 voice-quality reports, and one SSRC latch for the whole relay. The latch work closes a

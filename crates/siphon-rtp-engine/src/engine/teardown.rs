@@ -266,6 +266,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Any WS tee riding the same fan-out closes with the call, so its controller gets a final
         // `ws_tee_ended` (with the lifetime frame counters) rather than a silently dead stream.
         self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+        // …and any decoded recording, while the media actor still holds its sinks. Detaching them is
+        // what makes the writer finalize the header and emit `recording_finished` naming `call_ended`,
+        // and awaiting it is what keeps the call from being reported gone while its file is still
+        // being written. Left to `media.deregister` below, the writer finished whenever the dropped
+        // actor let go of it, after `delete` had already answered, and the recording stayed registered.
+        self.stop_wav_recordings_for_call(call_id, RecordingEndReason::CallEnded)
+            .await;
         // …and any lawful interception, for the same reason: a final `x3_ended` with the delivery
         // counts, and no delivery task outliving the call it was intercepting.
         self.stop_x3(call_id, X3EndReason::CallEnded).await;
