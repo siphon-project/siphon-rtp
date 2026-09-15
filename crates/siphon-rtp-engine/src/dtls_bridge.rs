@@ -306,6 +306,10 @@ pub struct DtlsBridge<D: Datapath> {
     datapath: D,
     flows: DashMap<EndpointId, Flow>,
     sessions: DashMap<EndpointId, Vec<JoinHandle<()>>>,
+    /// Per ICE-gated secure endpoint, the task that follows its validated source into its destination.
+    /// Kept apart from the session so a renegotiation can start, replace or stop it while the
+    /// association it re-points keeps running.
+    followers: DashMap<EndpointId, JoinHandle<()>>,
     /// Per secure endpoint, the published DTLS destination — how ICE releases and re-points a leg.
     destinations: DashMap<EndpointId, SecureDestination>,
     /// Per secure endpoint, the identity of the association running on it, so a renegotiation can
@@ -329,6 +333,9 @@ impl<D: Datapath> Drop for DtlsBridge<D> {
                 task.abort();
             }
         }
+        for follower in &self.followers {
+            follower.value().abort();
+        }
     }
 }
 
@@ -340,6 +347,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             datapath,
             flows: DashMap::new(),
             sessions: DashMap::new(),
+            followers: DashMap::new(),
             destinations: DashMap::new(),
             associations: DashMap::new(),
             pipeline_keys: Arc::new(DashMap::new()),
@@ -356,8 +364,33 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 task.abort();
             }
         }
+        self.follow(secure_endpoint, None, None);
         self.associations.remove(&secure_endpoint);
         self.pipeline_keys.remove(&secure_endpoint);
+    }
+
+    /// Follow `validated` into `secure_endpoint`'s DTLS destination, replacing whatever followed it
+    /// before, or stop following when there is nothing to follow (RFC 8445 §12.1.1: data goes to the
+    /// valid pair's remote candidate, and a later validated source moves it).
+    fn follow(
+        &self,
+        secure_endpoint: EndpointId,
+        validated: Option<tokio::sync::watch::Receiver<Option<SocketAddr>>>,
+        destination: Option<SecureDestination>,
+    ) {
+        let previous = match validated.zip(destination) {
+            Some((validated, destination)) => self.followers.insert(
+                secure_endpoint,
+                follow_ice_validation(validated, destination),
+            ),
+            None => self
+                .followers
+                .remove(&secure_endpoint)
+                .map(|(_, previous)| previous),
+        };
+        if let Some(previous) = previous {
+            previous.abort();
+        }
     }
 
     /// The flow on a plain peer's separate RTCP port: RTCP only, encrypted as SRTCP on the shared leg
@@ -467,6 +500,18 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 });
             }
         }
+        // A renegotiation can add ICE to a leg that had none, or restart it, and the kept association
+        // runs no handshake that would re-point it: follow the validated source the new ICE session
+        // publishes (RFC 8445 §12.1.1), or stop following once the leg has no ICE.
+        let destination = self
+            .destinations
+            .get(&plan.secure_endpoint)
+            .map(|entry| entry.value().clone());
+        self.follow(
+            plan.secure_endpoint,
+            plan.ice_validated.clone(),
+            destination,
+        );
         // A pipeline leg's actor is rebuilt by the renegotiation that got us here, and it starts
         // pending — hand it the key this association already produced.
         if let Some(flow) = self.flows.get(&plan.secure_endpoint) {
@@ -610,12 +655,13 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 rtcp_out: plan.plain_rtcp.map(|rtcp| (rtcp.endpoint, rtcp.dst)),
             },
         );
-        let mut tasks = vec![drain, shake];
-        tasks.extend(
-            plan.ice_validated
-                .map(|validated| follow_ice_validation(validated, destination.clone())),
+        self.sessions
+            .insert(plan.secure_endpoint, vec![drain, shake]);
+        self.follow(
+            plan.secure_endpoint,
+            plan.ice_validated,
+            Some(destination.clone()),
         );
-        self.sessions.insert(plan.secure_endpoint, tasks);
         self.destinations.insert(plan.secure_endpoint, destination);
     }
 
@@ -727,12 +773,13 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 rtcp_out: None,
             },
         );
-        let mut tasks = vec![drain, shake];
-        tasks.extend(
-            plan.ice_validated
-                .map(|validated| follow_ice_validation(validated, destination.clone())),
+        self.sessions
+            .insert(plan.secure_endpoint, vec![drain, shake]);
+        self.follow(
+            plan.secure_endpoint,
+            plan.ice_validated,
+            Some(destination.clone()),
         );
-        self.sessions.insert(plan.secure_endpoint, tasks);
         self.destinations.insert(plan.secure_endpoint, destination);
     }
 

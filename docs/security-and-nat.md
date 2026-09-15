@@ -612,7 +612,9 @@ is wrong, and encryption defeats A2 eavesdrop.
 - **A renegotiation keeps the crypto, and keeps it continuous.** Completing an offer/answer on a live
   call re-runs the answer path, which rebuilds the leg's wiring; two things have to survive that, and
   both are enforced rather than left to chance. A **DTLS association** is kept and re-pointed (each
-  side's gate, the plain peer's address, and — on a non-ICE leg — the DTLS peer's) whenever the peer's
+  side's gate, the plain peer's address, and the DTLS peer's: the signalled one on a non-ICE leg, and on
+  an ICE leg the validated source of the ICE session the renegotiation settled on, including one it has
+  just added, since no handshake runs to move it) whenever the peer's
   fingerprint and the engine's role are unchanged: RFC 8842 §5.5 has the peer keep its own association
   in exactly that case, so tearing ours down leaves the leg waiting for a handshake that never comes.
   A change to either **is** a new association (§3.1) and re-handshakes. The **SRTP rollover** is
@@ -759,11 +761,12 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
     2-party `ice_failed` teardown to reap, so `drive_ice_agents` drops it from the room (and tears the
     room down if it was the last member) rather than leaving it seated behind a gate that can never
     open.
-  - **A DTLS-SRTP seat under full ICE holds its handshake for the selection** (RFC 8445 §12,
-    `gate_on_ice`) — but only when an agent is actually running on it, since otherwise no selection is
-    coming and waiting would hang a working seat. The two-party DTLS bridge also follows an ice-lite
-    validation (`Datapath::watch_ice_validated`); a DTLS seat and a secure WS takeover do not yet, so
-    an ice-lite one still starts its handshake at the signalled address.
+  - **A DTLS-SRTP seat holds its handshake for ICE** (RFC 8445 §12, §12.1.1, `gate_on_ice`): a full
+    agent's selection, or on an ice-lite seat the source of the check the responder validated, both
+    published through `Datapath::watch_ice_validated`, and the handshake records follow that source. A
+    seat without ICE starts at once, since nothing would release the wait. A secure WS takeover runs
+    ICE only under a full agent, so its handshake always waits for the selection. Proven by
+    `an_ice_lite_dtls_conference_seat_is_keyed_on_the_source_its_check_validated`.
 
 ### Layer 5c — The conference (MCU) Redirect path
 The N-party conference mixer (`engine/src/conference.rs`) is another `FlowAction::Redirect` consumer,
