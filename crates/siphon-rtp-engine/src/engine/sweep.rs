@@ -155,6 +155,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         // A seat can own more than one endpoint (audio plus an RFC 9071 text leg),
                         // so free every one `leave` hands back — not just the ICE one that failed.
                         for seat_endpoint in self.conference.leave(&conference_id, &tag) {
+                            self.stop_seat_ice_follow(&[seat_endpoint]);
                             self.endpoint_calls.remove(&seat_endpoint);
                             self.datapath.remove_endpoint(seat_endpoint).await;
                         }
@@ -443,6 +444,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .reap_idle(now, idle_ticks, held_idle_ticks, |endpoint| {
                 self.datapath.last_activity(endpoint)
             });
+        self.stop_seat_ice_follow(&freed);
         for endpoint in &freed {
             self.datapath.remove_endpoint(*endpoint).await;
             self.endpoint_calls.remove(endpoint);

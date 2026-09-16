@@ -757,6 +757,16 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
     seat, and must not be read as one; it is deliberately open so the *datapath* gate can be the
     discriminator. Both halves are armed by the credentials `conference_join` installs
     (`set_ice` / `set_ice_agent`) — without them an ICE seat would fall back to that open filter alone.
+  - **An ice-lite seat's egress follows the validated source too** (RFC 8445 §12.1.1: data goes to the
+    valid pair's remote candidate). It has no agent to call `ice_selected`, so the daemon subscribes to
+    `Datapath::watch_ice_validated` when it seats the participant and hands the room the same
+    `ConferenceControl::IceSelected` a full agent's selection would — re-pointing `egress_dst` and
+    narrowing the gate to the validated transport. Before that the room aimed the mix at the signalled
+    `c=` until the seat's own first packet moved the reply latch, so a seat that listens before it
+    talks (a webinar attendee, a muted participant) heard nothing at all while its mix went to an
+    address that never asked for it. The follower is aborted on every path that drops the seat —
+    `conference_leave`, a failed checklist, and the idle reap — so it never outlives it. Proven by
+    `an_ice_lite_conference_seat_is_sent_the_mix_at_the_source_its_check_validated`.
   - **A failed checklist removes the seat** (§8.1.2). A participant has no `MediaCall` for the
     2-party `ice_failed` teardown to reap, so `drive_ice_agents` drops it from the room (and tears the
     room down if it was the last member) rather than leaving it seated behind a gate that can never

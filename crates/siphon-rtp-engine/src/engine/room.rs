@@ -485,6 +485,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.free(&to_free).await;
             return error_result("conference_join", &"failed to seat participant");
         }
+        // Seated: aim the room's egress at whatever ICE validates for this seat, for as long as it is
+        // seated. A no-op on a seat without ICE.
+        self.follow_seat_ice(endpoint.id);
         self.endpoint_calls
             .insert(endpoint.id, conference_id.to_string());
         // The text endpoint is correlated to the same conference, so RTCP telemetry / reap accounting
@@ -507,6 +510,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .install_flow(endpoint.id, FlowAction::Redirect)
             {
                 self.conference.leave(conference_id, &from_tag);
+                self.stop_seat_ice_follow(&[endpoint.id]);
                 let mut to_free = vec![endpoint];
                 to_free.extend(text_endpoint);
                 if let Some(text_endpoint) = text_endpoint {
@@ -581,6 +585,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(rewritten) => ok_sdp(rewritten.sdp, Some(from_tag)),
             Err(error) => {
                 let _ = self.conference.leave(conference_id, &from_tag);
+                self.stop_seat_ice_follow(&[endpoint.id]);
                 self.endpoint_calls.remove(&endpoint.id);
                 self.datapath.remove_endpoint(endpoint.id).await;
                 if let Some(text_endpoint) = text_endpoint {
@@ -592,6 +597,50 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Follow a seat's ICE-validated source into the room's egress (RFC 8445 §12.1.1: data goes to the
+    /// valid pair's remote candidate), by handing the room the same `IceSelected` a full agent's
+    /// selection does.
+    ///
+    /// A full-agent seat is re-pointed by its own checklist through `drive_ice_agents`. An **ice-lite**
+    /// seat has no agent to select a pair at all, and without this the room kept aiming its mix at the
+    /// `c=` a NATed participant signalled until that participant's own first packet moved the reply
+    /// latch — so a seat that listens before it talks (a webinar attendee, a muted participant) heard
+    /// nothing, and its mix went to an address that never asked for it.
+    ///
+    /// A no-op for a seat the datapath does not gate on ICE, whose reply address is the signalled one.
+    fn follow_seat_ice(&self, endpoint: siphon_rtp_datapath::EndpointId) {
+        let Some(mut validated) = self.datapath.watch_ice_validated(endpoint) else {
+            return;
+        };
+        let conference = self.conference.clone();
+        let follower = tokio::spawn(async move {
+            loop {
+                let current = *validated.borrow_and_update();
+                // `ice_selected` resolves the seat from its endpoint, and reports `false` once the
+                // participant has left — there is nothing left to re-point then.
+                if current.is_some_and(|remote| !conference.ice_selected(endpoint, remote)) {
+                    return;
+                }
+                if validated.changed().await.is_err() {
+                    return; // the datapath dropped the publisher: the endpoint's ICE state is gone
+                }
+            }
+        });
+        if let Some(previous) = self.seat_ice_followers.insert(endpoint, follower) {
+            previous.abort();
+        }
+    }
+
+    /// Stop following ICE validation for seats their room has dropped. Idempotent: an endpoint that
+    /// never had a follower (a seat without ICE) simply has nothing to abort.
+    pub(super) fn stop_seat_ice_follow(&self, endpoints: &[siphon_rtp_datapath::EndpointId]) {
+        for endpoint in endpoints {
+            if let Some((_, follower)) = self.seat_ice_followers.remove(endpoint) {
+                follower.abort();
+            }
+        }
+    }
+
     /// Remove a participant from a conference ([`Command::ConferenceLeave`]), freeing its endpoints —
     /// audio plus its text endpoint when it had one (RFC 9071) — and tearing the room down once empty.
     pub(super) async fn conference_leave(&self, conference_id: &str, from_tag: &str) -> CmdResult {
@@ -599,6 +648,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if endpoints.is_empty() {
             return error_result("conference_leave", &"no such conference participant");
         }
+        self.stop_seat_ice_follow(&endpoints);
         for endpoint in endpoints {
             self.endpoint_calls.remove(&endpoint);
             self.datapath.remove_endpoint(endpoint).await;

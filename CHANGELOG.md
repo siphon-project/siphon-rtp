@@ -48,6 +48,14 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   renegotiation settled on. A secure WebSocket takeover runs ICE only under a full agent, whose
   selection it already waited for.
 
+- **An ICE-lite conference seat is sent the mix at the transport its connectivity check validated.**
+  Only a full-agent seat was re-pointed when ICE chose (`ConferenceControl::IceSelected`); an ice-lite
+  seat has no agent to choose at all, so the room kept aiming its mix at the `c=` the participant
+  signalled and moved only when that participant's own first packet latched the reply. A NATed seat
+  that listens before it talks therefore heard nothing, and its mix went to an address that never
+  asked for it, against RFC 8445 §12.1.1. An ICE seat now follows `Datapath::watch_ice_validated` for
+  as long as it is seated, and hands the room the same selection a full agent would.
+
 ## [0.7.1] — 2026-09-15
 
 A WebRTC (DTLS-SRTP) caller can now reach a plain RTP callee through `offer`/`answer`, and stays keyed

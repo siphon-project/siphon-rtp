@@ -791,6 +791,10 @@ pub struct Engine<D: Datapath> {
     /// The conference (MCU) slow path: per-room N-party mixers. Shared with the redirect dispatcher,
     /// which routes conference-owned participant endpoints' datagrams here (see [`crate::conference`]).
     conference: Arc<ConferenceRegistry>,
+    /// Per conference seat, the task following its ICE-validated source into the room's egress. Only
+    /// an ICE seat has one, and it is aborted wherever the seat is dropped (leave, ICE failure, idle
+    /// reap), so it never outlives the participant.
+    seat_ice_followers: DashMap<EndpointId, tokio::task::JoinHandle<()>>,
     /// The RFC 4103 Real-Time Text observability slow path: per-call text processors that RED/T.140
     /// observe a promoted `m=text` stream (recording / `text_events`) then forward it verbatim. Shared
     /// with the redirect dispatcher, which routes text-owned endpoints' datagrams here (see
