@@ -298,6 +298,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.release_client_call(call.owner);
     }
 
+    /// Retire `endpoints` from the SRTP/DTLS bridge — the bridge half of dropping a leg that is not a
+    /// whole call. Frees each flow, its destination watch and its association, and aborts the tasks
+    /// driving it.
+    ///
+    /// Call teardown reaches the bridge through [`Self::teardown_call`] / [`Self::finish_call`], but a
+    /// conference seat can be dropped while its room lives on — `conference_leave`, a failed
+    /// checklist, the idle reap. Those paths freed the datapath endpoint and stopped the ICE follower
+    /// while leaving the bridge registration behind, so a DTLS seat's handshake and drain tasks
+    /// outlived the participant and a long-running room accumulated one set per seat that had come and
+    /// gone. Idempotent: an endpoint the bridge never owned has nothing to drop.
+    pub(super) fn retire_dtls_endpoints(&self, endpoints: &[EndpointId]) {
+        self.bridge.deregister(endpoints.iter().copied());
+    }
+
     /// Sum the datapath byte/packet counters across every endpoint a leg owns (RTP + optional RTCP) —
     /// the same aggregation [`Self::query`] does, for the CDR's per-leg `in/out` figures.
     fn leg_counters(&self, leg: &Leg) -> siphon_rtp_datapath::EndpointStats {

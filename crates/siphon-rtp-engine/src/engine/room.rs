@@ -586,6 +586,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Err(error) => {
                 let _ = self.conference.leave(conference_id, &from_tag);
                 self.stop_seat_ice_follow(&[endpoint.id]);
+                self.retire_dtls_endpoints(&[endpoint.id]);
                 self.endpoint_calls.remove(&endpoint.id);
                 self.datapath.remove_endpoint(endpoint.id).await;
                 if let Some(text_endpoint) = text_endpoint {
@@ -649,6 +650,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return error_result("conference_leave", &"no such conference participant");
         }
         self.stop_seat_ice_follow(&endpoints);
+        self.retire_dtls_endpoints(&endpoints);
         for endpoint in endpoints {
             self.endpoint_calls.remove(&endpoint);
             self.datapath.remove_endpoint(endpoint).await;
