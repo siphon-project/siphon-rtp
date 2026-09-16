@@ -13411,8 +13411,18 @@ async fn peer_dtls_handshake_server(
     .await
     .expect("handshake did not time out")
     .expect("peer handshake");
+    // As the DTLS **server**, this peer's handshake returns with its last flight (RFC 6347 §4.2.4,
+    // flight 6: ChangeCipherSpec + Finished) queued on the transport rather than sent, and webrtc-dtls
+    // never re-sends it once `handshake` has returned. Aborting the writer here can therefore discard
+    // that flight outright, leaving this side keyed while the engine, the DTLS client, waits forever —
+    // which is exactly what a CI run of `a_dtls_participant_joins_a_conference...` showed: the peer
+    // handshake succeeded and no mix ever arrived. Stop reading, which ends the DTLS connection and
+    // drops the transport, then let the writer drain what is queued and exit on its own.
     reader.abort();
-    writer.abort();
+    timeout(Duration::from_secs(2), writer)
+        .await
+        .expect("the peer's last flight drains")
+        .expect("writer task");
     leg
 }
 
