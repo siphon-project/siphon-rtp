@@ -2886,6 +2886,100 @@ async fn conference_reaps_idle_participants() {
     );
 }
 
+/// Seat a WebRTC-shaped (DTLS-SRTP) participant and return its seat endpoint. No handshake is driven:
+/// `register_for_pipeline` installs the bridge flow at join time, which is all these tests need.
+async fn seat_dtls_participant(
+    engine: &Engine<UdpLoopbackDatapath>,
+    conference_id: &str,
+    tag: &str,
+) -> siphon_rtp_datapath::EndpointId {
+    use siphon_rtp_dtls::DtlsCertificate;
+
+    let socket = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+        .await
+        .expect("bind the webrtc participant");
+    let addr = socket.local_addr().expect("participant address");
+    let peer_certificate = DtlsCertificate::generate().expect("peer certificate");
+    let fingerprint = peer_certificate.fingerprint();
+    let peer_hex = fingerprint
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+         a=setup:actpass\r\na=fingerprint:{hash} {peer_hex}\r\n",
+        ip = addr.ip(),
+        port = addr.port(),
+        hash = fingerprint.hash_function,
+    );
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: conference_id.into(),
+                from_tag: tag.into(),
+                sdp: offer,
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    assert!(matches!(joined, CmdResult::Ok { .. }), "seated: {joined:?}");
+    let seat = engine
+        .conference()
+        .participant_at_tag(conference_id, tag)
+        .expect("the seat is registered");
+    assert!(
+        engine.dtls_bridge().owns(seat),
+        "a DTLS seat registers a bridge flow when it joins"
+    );
+    seat
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conference_leave_retires_the_seats_dtls_bridge() {
+    // A seat's DTLS registration is call state like any other, so leaving the room must free it.
+    // `conference_leave` freed the datapath endpoint and stopped the ICE follower but never told the
+    // bridge, leaving the flow, its association and its handshake/drain tasks behind the participant.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let seat = seat_dtls_participant(&engine, "dtls-teardown", "webrtc").await;
+
+    let left = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceLeave {
+                conference_id: "dtls-teardown".into(),
+                from_tag: "webrtc".into(),
+            },
+        )
+        .await;
+    assert!(matches!(left, CmdResult::Ok { .. }), "left: {left:?}");
+    assert!(
+        !engine.dtls_bridge().owns(seat),
+        "leaving the room retires the seat's DTLS bridge"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reaping_an_idle_conference_seat_retires_its_dtls_bridge() {
+    // Same leak by the other route: the idle sweep drops an abandoned seat without telling the bridge.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let seat = seat_dtls_participant(&engine, "dtls-reap", "webrtc").await;
+
+    engine.datapath().advance_clock(100);
+    assert!(
+        engine.reap_idle_conferences(3, 0).await >= 1,
+        "the silent seat is reaped"
+    );
+    assert!(
+        !engine.dtls_bridge().owns(seat),
+        "the idle reap retires the seat's DTLS bridge"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listen_only_conference_seat_is_not_reaped_for_being_silent() {
     // A webinar attendee joins `recvonly` and never sends a packet for the whole session — that is

@@ -5,6 +5,19 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **Dropping a conference seat now retires its DTLS bridge registration.** A DTLS seat registers a
+  bridge flow when it joins, carrying its association, its destination watch and the tasks driving its
+  handshake. Call teardown reached those, but a seat can be dropped while the room lives on —
+  `conference_leave`, a failed connectivity checklist, the idle reap — and those paths freed the
+  datapath endpoint and stopped the ICE follower while leaving the bridge registration behind. A
+  seat's handshake and drain tasks therefore outlived the participant, and a long-running room
+  accumulated one set per seat that had come and gone. Each of those paths now retires the endpoint
+  from the bridge beside the follower it already stopped.
+
 ## [0.7.2] — 2026-09-16
 
 ### Fixed

@@ -777,6 +777,15 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
     seat without ICE starts at once, since nothing would release the wait. A secure WS takeover runs
     ICE only under a full agent, so its handshake always waits for the selection. Proven by
     `an_ice_lite_dtls_conference_seat_is_keyed_on_the_source_its_check_validated`.
+  - **Dropping a seat retires its bridge registration.** A DTLS seat registers a bridge flow when it
+    joins, carrying its association, its destination watch and the tasks driving its handshake. Call
+    teardown reaches those through `finish_call`, but a seat can be dropped while the room lives on —
+    `conference_leave`, a failed checklist, the idle reap — and those paths freed the datapath endpoint
+    and stopped the ICE follower while leaving the bridge registration behind, so a seat's handshake
+    and drain tasks outlived the participant and the room accumulated them. Each of those paths now
+    also retires the endpoint from the bridge, beside the follower it already stopped. Proven by
+    `a_conference_leave_retires_the_seats_dtls_bridge` and
+    `reaping_an_idle_conference_seat_retires_its_dtls_bridge`.
 
 ### Layer 5c — The conference (MCU) Redirect path
 The N-party conference mixer (`engine/src/conference.rs`) is another `FlowAction::Redirect` consumer,
