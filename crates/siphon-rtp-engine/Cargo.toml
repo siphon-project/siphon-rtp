@@ -99,6 +99,8 @@ siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.7.2" }
 siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.7.2" }
 siphon-rtp-media = { path = "../siphon-rtp-media", version = "0.7.2" }
 siphon-rtp-hep = { path = "../siphon-rtp-hep", version = "0.7.2" }
+# The DTLS bridge bench drives a peer `DtlsSession` and protects RTP with the leg it derives.
+siphon-rtp-srtp = { path = "../siphon-rtp-srtp", version = "0.7.2" }
 bytes = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }

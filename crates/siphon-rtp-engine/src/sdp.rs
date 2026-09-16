@@ -2283,7 +2283,7 @@ mod tests {
         // it anchors transport, not session state (RFC 3264 §8.4 is the endpoints' business).
         let sdp = format!("{}a=inactive\r\n", offer("203.0.113.7", 30000));
         let engine = EngineMedia {
-            rtp: "198.51.100.1:40000".parse().expect("addr"),
+            rtp: "198.51.100.1:40000".parse::<SocketAddr>().expect("addr"),
             rtcp: None,
             advertised_ip: "198.51.100.1".parse().expect("ip"),
         };
@@ -2338,7 +2338,7 @@ mod tests {
         );
         assert_eq!(
             info.candidates[1].related,
-            Some("10.0.0.5:45000".parse().expect("addr")),
+            Some("10.0.0.5:45000".parse::<SocketAddr>().expect("addr")),
             "the srflx base survives"
         );
     }
@@ -2734,8 +2734,14 @@ mod tests {
     #[test]
     fn parse_defaults_rtcp_to_rtp_plus_one() {
         let info = parse(&offer("203.0.113.7", 49170)).expect("parse");
-        assert_eq!(info.remote_rtp, "203.0.113.7:49170".parse().unwrap());
-        assert_eq!(info.remote_rtcp, "203.0.113.7:49171".parse().unwrap());
+        assert_eq!(
+            info.remote_rtp,
+            "203.0.113.7:49170".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            info.remote_rtcp,
+            "203.0.113.7:49171".parse::<SocketAddr>().unwrap()
+        );
         assert!(!info.rtcp_mux);
     }
 
@@ -2744,7 +2750,10 @@ mod tests {
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp:53000\r\n");
         let info = parse(&sdp).expect("parse");
-        assert_eq!(info.remote_rtcp, "203.0.113.7:53000".parse().unwrap());
+        assert_eq!(
+            info.remote_rtcp,
+            "203.0.113.7:53000".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -2763,8 +2772,8 @@ mod tests {
         // `a_default_rtcp_port_is_not_advertised`.
         let sdp = offer("203.0.113.7", 49170);
         let engine = EngineMedia::new(
-            "127.0.0.1:40000".parse().unwrap(),
-            Some("127.0.0.1:41001".parse().unwrap()),
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+            Some("127.0.0.1:41001".parse::<SocketAddr>().unwrap()),
         );
         let result = rewrite(
             &sdp,
@@ -2777,7 +2786,7 @@ mod tests {
         .expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
-            "203.0.113.7:49170".parse().unwrap()
+            "203.0.113.7:49170".parse::<SocketAddr>().unwrap()
         );
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0 8 96"));
@@ -2788,7 +2797,10 @@ mod tests {
         assert!(!result.sdp.contains("203.0.113.7"));
         let reparsed = parse(&result.sdp).expect("reparse");
         assert_eq!(reparsed.remote_rtp, engine.rtp);
-        assert_eq!(reparsed.remote_rtcp, "127.0.0.1:41001".parse().unwrap());
+        assert_eq!(
+            reparsed.remote_rtcp,
+            "127.0.0.1:41001".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -2796,8 +2808,8 @@ mod tests {
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp:53000\r\n");
         let engine = EngineMedia::new(
-            "127.0.0.1:40000".parse().unwrap(),
-            Some("127.0.0.1:40001".parse().unwrap()),
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+            Some("127.0.0.1:40001".parse::<SocketAddr>().unwrap()),
         );
         let result = rewrite(
             &sdp,
@@ -2822,7 +2834,7 @@ mod tests {
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp:53000\r\n");
         sdp.push_str("a=rtcp-mux\r\n");
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -2843,7 +2855,7 @@ mod tests {
     fn mux_override_true_forces_rtcp_mux_when_the_offer_had_none() {
         // RFC 5761: `mux_override = Some(true)` emits `a=rtcp-mux` even though the offer carried none.
         let sdp = offer("203.0.113.7", 49170); // no a=rtcp-mux
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -2867,7 +2879,7 @@ mod tests {
         // The offer already advertised mux; forcing mux must not produce a duplicate `a=rtcp-mux`.
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp-mux\r\n");
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -2892,8 +2904,8 @@ mod tests {
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp-mux\r\n");
         let engine = EngineMedia::new(
-            "127.0.0.1:40000".parse().unwrap(),
-            Some("127.0.0.1:41001".parse().unwrap()),
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+            Some("127.0.0.1:41001".parse::<SocketAddr>().unwrap()),
         );
         let result = rewrite(
             &sdp,
@@ -2919,7 +2931,7 @@ mod tests {
         // `None` is the default: the offer's `a=rtcp-mux` intent passes through untouched.
         let mut muxed = offer("203.0.113.7", 49170);
         muxed.push_str("a=rtcp-mux\r\n");
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         assert!(rewrite(
             &muxed,
             engine,
@@ -2934,8 +2946,8 @@ mod tests {
         // A non-muxed offer stays non-muxed under `None`.
         let plain = offer("203.0.113.7", 49170);
         let engine = EngineMedia::new(
-            "127.0.0.1:40000".parse().unwrap(),
-            Some("127.0.0.1:40001".parse().unwrap()),
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+            Some("127.0.0.1:40001".parse::<SocketAddr>().unwrap()),
         );
         assert!(!rewrite(
             &plain,
@@ -2953,12 +2965,12 @@ mod tests {
     #[test]
     fn media_level_connection_overrides_session_level() {
         let sdp = "v=0\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\nc=IN IP4 198.51.100.9\r\n";
-        let engine = EngineMedia::new("127.0.0.1:41000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:41000".parse::<SocketAddr>().unwrap(), None);
         let result =
             rewrite(sdp, engine, IceRewrite::Keep, None, None, TextRewrite::None).expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
-            "198.51.100.9:5000".parse().unwrap()
+            "198.51.100.9:5000".parse::<SocketAddr>().unwrap()
         );
         assert!(result.sdp.contains("c=IN IP4 10.0.0.1"));
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
@@ -2984,8 +2996,14 @@ mod tests {
     fn parse_recognizes_ipv6_session_connection() {
         // RFC 4566 §5.7: `c=IN IP6 <addr>` carries the remote v6 transport; remote_rtp/rtcp become v6.
         let info = parse(&offer_v6("2001:db8::1", 49170)).expect("parse v6");
-        assert_eq!(info.remote_rtp, "[2001:db8::1]:49170".parse().unwrap());
-        assert_eq!(info.remote_rtcp, "[2001:db8::1]:49171".parse().unwrap());
+        assert_eq!(
+            info.remote_rtp,
+            "[2001:db8::1]:49170".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            info.remote_rtcp,
+            "[2001:db8::1]:49171".parse::<SocketAddr>().unwrap()
+        );
         assert!(info.remote_rtp.is_ipv6());
         assert!(!info.rtcp_mux);
     }
@@ -2995,7 +3013,10 @@ mod tests {
         // A media-level `c=IN IP6` overrides a session-level one, exactly as for IPv4.
         let sdp = "v=0\r\nc=IN IP6 2001:db8::a\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\nc=IN IP6 2001:db8::b\r\n";
         let info = parse(sdp).expect("parse v6 media-level");
-        assert_eq!(info.remote_rtp, "[2001:db8::b]:5000".parse().unwrap());
+        assert_eq!(
+            info.remote_rtp,
+            "[2001:db8::b]:5000".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -3014,8 +3035,8 @@ mod tests {
         // engine endpoint's family), the engine's v6 address, and the engine ports.
         let sdp = offer_v6("2001:db8::1", 49170);
         let engine = EngineMedia::new(
-            "[::1]:40000".parse().unwrap(),
-            Some("[::1]:41001".parse().unwrap()),
+            "[::1]:40000".parse::<SocketAddr>().unwrap(),
+            Some("[::1]:41001".parse::<SocketAddr>().unwrap()),
         );
         let result = rewrite(
             &sdp,
@@ -3028,7 +3049,7 @@ mod tests {
         .expect("rewrite v6");
         assert_eq!(
             result.media.remote_rtp,
-            "[2001:db8::1]:49170".parse().unwrap()
+            "[2001:db8::1]:49170".parse::<SocketAddr>().unwrap()
         );
         assert!(result.sdp.contains("c=IN IP6 ::1"), "{}", result.sdp);
         assert!(
@@ -3048,7 +3069,10 @@ mod tests {
         // The rewritten SDP reparses to the v6 engine transport.
         let reparsed = parse(&result.sdp).expect("reparse v6");
         assert_eq!(reparsed.remote_rtp, engine.rtp);
-        assert_eq!(reparsed.remote_rtcp, "[::1]:41001".parse().unwrap());
+        assert_eq!(
+            reparsed.remote_rtcp,
+            "[::1]:41001".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -3057,7 +3081,7 @@ mod tests {
         let sdp = "v=0\r\no=- 1 1 IN IP6 host.invalid\r\ns=-\r\nc=IN IP6 2001:db8::7\r\nt=0 0\r\n\
              a=ice-ufrag:PEERUF\r\na=ice-pwd:peerpassword01234567\r\n\
              m=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
-        let engine = EngineMedia::new("[::1]:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("[::1]:40000".parse::<SocketAddr>().unwrap(), None);
         let candidates = gathered_host_candidates("[::1]:40000");
         let advert = IceAdvertisement {
             ufrag: "ENGUF",
@@ -3098,7 +3122,7 @@ mod tests {
         // Regression: a v4 engine endpoint must still emit `c=IN IP4` (addrtype follows the family),
         // proving the addrtype is picked from the endpoint, not hardcoded either way.
         let sdp = offer("203.0.113.7", 49170);
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -3135,7 +3159,7 @@ mod tests {
         #[test]
         fn parsers_never_panic(text in "(?s).{0,400}") {
             let _ = parse(&text);
-            let engine = EngineMedia::new("192.0.2.1:10000".parse().expect("addr"), None);
+            let engine = EngineMedia::new("192.0.2.1:10000".parse::<SocketAddr>().expect("addr"), None);
             let _ = rewrite(&text, engine, IceRewrite::Keep, None, None, TextRewrite::None);
             let _ = force_answer_codec(&text, &CodecSpec::new(0, "PCMU", 8000, 1, 20), Some(96));
         }
@@ -3178,7 +3202,7 @@ mod tests {
     #[test]
     fn rewrite_re_originates_ice_as_ice_lite() {
         let sdp = ice_offer("203.0.113.7", 49170);
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let candidates = gathered_host_candidates("127.0.0.1:40000");
         let advert = IceAdvertisement {
             ufrag: "ENGUF",
@@ -3211,7 +3235,10 @@ mod tests {
         assert_eq!(candidate.component, 1);
         assert_eq!(candidate.kind, siphon_rtp_ice::CandidateKind::Host);
         assert_eq!(candidate.priority, 2_130_706_431);
-        assert_eq!(candidate.address, "127.0.0.1:40000".parse().expect("addr"));
+        assert_eq!(
+            candidate.address,
+            "127.0.0.1:40000".parse::<SocketAddr>().expect("addr")
+        );
         // Gathering is complete before the SDP is written, so we say so (RFC 8838 §14).
         assert!(result.sdp.contains("a=end-of-candidates"));
         // The peer's ICE attributes are gone.
@@ -3225,7 +3252,7 @@ mod tests {
     #[test]
     fn rewrite_without_ice_leaves_no_ice_lines() {
         let sdp = offer("203.0.113.7", 49170);
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -3244,7 +3271,7 @@ mod tests {
         // `IceRewrite::Keep` (a plain relay) forwards the peer's ICE attributes untouched — it is the
         // decoupled counterpart of `Strip`, which removes them.
         let sdp = ice_offer("203.0.113.7", 49170);
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -3268,7 +3295,7 @@ mod tests {
         // rtpengine `ICE=remove` (RFC 8839 §5): strip the offerer's ICE lines and advertise none of
         // our own — the leg falls back to the signalled media address.
         let sdp = ice_offer("203.0.113.7", 49170);
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -3418,7 +3445,7 @@ mod tests {
         // Answer a DTLS-SRTP leg: force `UDP/TLS/RTP/SAVPF`, advertise the engine's fingerprint + role,
         // and re-originate (strip) the peer's `a=fingerprint`/`a=setup`.
         let sdp = dtls_offer("203.0.113.7", 49170);
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let fingerprint = Fingerprint {
             hash_function: "sha-256".to_string(),
             bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
@@ -3501,7 +3528,7 @@ mod tests {
                 vec!["a=tls-id:enginevalue0000000000"],
             ),
         ] {
-            let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+            let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
             let result = rewrite(
                 both_levels,
                 engine,
@@ -3529,7 +3556,7 @@ mod tests {
         use siphon_rtp_srtp::sdes::CryptoSuite;
         // Bridge an AVP offer up to SAVP: force the transport and advertise the engine's key.
         let sdp = offer("203.0.113.7", 49170);
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let ours = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
         let result = rewrite(
             &sdp,
@@ -3554,7 +3581,7 @@ mod tests {
     fn rewrite_plain_forces_avp_and_strips_crypto() {
         // Bridge a SAVP answer down to AVP: force the transport and drop the peer's a=crypto.
         let sdp = savp_offer("203.0.113.7", 49170);
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -4084,14 +4111,23 @@ mod tests {
     fn parses_audio_and_text_offer() {
         // RFC 4103: the `m=text` stream is parsed alongside audio, with its t140/red payload types.
         let info = parse(&audio_text_offer("RTP/AVP")).expect("parse");
-        assert_eq!(info.remote_rtp, "198.51.100.1:5000".parse().unwrap());
+        assert_eq!(
+            info.remote_rtp,
+            "198.51.100.1:5000".parse::<SocketAddr>().unwrap()
+        );
         let text = info.text.expect("text stream parsed");
-        assert_eq!(text.remote_rtp, "198.51.100.1:5002".parse().unwrap());
+        assert_eq!(
+            text.remote_rtp,
+            "198.51.100.1:5002".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(text.t140_payload_type, Some(99));
         assert_eq!(text.red_payload_type, Some(98));
         assert!(!text.secure, "RTP/AVP text is plaintext");
         // RFC 3550: default RTCP is RTP port + 1 when neither `a=rtcp` nor mux is present.
-        assert_eq!(text.remote_rtcp, "198.51.100.1:5003".parse().unwrap());
+        assert_eq!(
+            text.remote_rtcp,
+            "198.51.100.1:5003".parse::<SocketAddr>().unwrap()
+        );
         // An audio-only offer has no text stream.
         assert!(parse(&offer("203.0.113.7", 49170))
             .expect("parse")
@@ -4146,8 +4182,8 @@ mod tests {
         // key, and advertises the engine's own SDES `a=crypto` for the text leg (RFC 4568). The audio
         // section is untouched (its own security is a separate directive).
         let sdp = secure_text_offer();
-        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        let text_engine = EngineMedia::new("127.0.0.1:40002".parse().unwrap(), None);
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
+        let text_engine = EngineMedia::new("127.0.0.1:40002".parse::<SocketAddr>().unwrap(), None);
         let our_text_key =
             CryptoAttribute::generate(7, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
         let result = rewrite(
@@ -4190,7 +4226,10 @@ mod tests {
         // Reparse: the text stream now resolves to the engine endpoint and reports secure + our key.
         let reparsed = parse(&result.sdp).expect("reparse");
         let text = reparsed.text.expect("text");
-        assert_eq!(text.remote_rtp, "127.0.0.1:40002".parse().unwrap());
+        assert_eq!(
+            text.remote_rtp,
+            "127.0.0.1:40002".parse::<SocketAddr>().unwrap()
+        );
         assert!(text.secure);
         assert_eq!(text.crypto.first().map(|crypto| crypto.tag), Some(7));
     }
@@ -4200,8 +4239,8 @@ mod tests {
         // TextRewrite::Anchor anchors BOTH the audio and the text stream to their engine endpoints, so
         // neither leaks the UE's address (RFC 3264 §5).
         let sdp = audio_text_offer("RTP/AVP");
-        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        let text_engine = EngineMedia::new("127.0.0.1:40002".parse().unwrap(), None);
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
+        let text_engine = EngineMedia::new("127.0.0.1:40002".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             audio_engine,
@@ -4234,10 +4273,13 @@ mod tests {
         assert!(result.sdp.contains("a=rtpmap:98 red/1000"));
         // Reparse: both streams now resolve to the engine endpoints.
         let reparsed = parse(&result.sdp).expect("reparse");
-        assert_eq!(reparsed.remote_rtp, "127.0.0.1:40000".parse().unwrap());
+        assert_eq!(
+            reparsed.remote_rtp,
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(
             reparsed.text.expect("text").remote_rtp,
-            "127.0.0.1:40002".parse().unwrap()
+            "127.0.0.1:40002".parse::<SocketAddr>().unwrap()
         );
     }
 
@@ -4245,7 +4287,7 @@ mod tests {
     fn rewrite_decline_zeroes_the_text_port_and_leaves_audio() {
         // TextRewrite::Decline rejects the text stream (`m=text 0`, RFC 3264 §6) while anchoring audio.
         let sdp = audio_text_offer("RTP/SAVP");
-        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             audio_engine,
@@ -4272,7 +4314,7 @@ mod tests {
         // TextRewrite::None passes the text section through verbatim (the default for callers that do
         // not anchor text) while still anchoring audio.
         let sdp = audio_text_offer("RTP/AVP");
-        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             audio_engine,
@@ -4319,7 +4361,7 @@ mod tests {
         // REGRESSION: a secure-audio rewrite (force RTP/SAVP + our crypto, strip peer ICE) must scope
         // its crypto/ICE strips to the audio section — never touching the plaintext text section.
         let sdp = secure_audio_plaintext_text_offer();
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let ours = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
         let result = rewrite(
             &sdp,
@@ -4377,7 +4419,10 @@ mod tests {
         );
         let text = result.media.text.expect("text parsed");
         assert!(!text.secure);
-        assert_eq!(text.remote_rtp, "198.51.100.9:5002".parse().unwrap());
+        assert_eq!(
+            text.remote_rtp,
+            "198.51.100.9:5002".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -4397,7 +4442,7 @@ mod tests {
             "a=rtpmap:96 VP8/90000\r\n",
             "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:VIDEOKEYvideokeyVIDEOKEYvideokeyVIDEOKEYvid\r\n"
         );
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let ours = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
         let result = rewrite(
             sdp,
@@ -4511,8 +4556,8 @@ mod tests {
         // derive, and it must land in the attribute region, not between `m=` and `c=`.
         let sdp = media_level_conn_offer("192.0.2.10", 20100);
         let engine = EngineMedia::new(
-            "127.0.0.1:30168".parse().unwrap(),
-            Some("127.0.0.1:41001".parse().unwrap()),
+            "127.0.0.1:30168".parse::<SocketAddr>().unwrap(),
+            Some("127.0.0.1:41001".parse::<SocketAddr>().unwrap()),
         );
         let result = rewrite(
             &sdp,
@@ -4534,13 +4579,16 @@ mod tests {
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(!result.sdp.contains("192.0.2.10"));
         let reparsed = parse(&result.sdp).expect("reparse");
-        assert_eq!(reparsed.remote_rtcp, "127.0.0.1:41001".parse().unwrap());
+        assert_eq!(
+            reparsed.remote_rtcp,
+            "127.0.0.1:41001".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]
     fn a_forced_rtcp_mux_attribute_is_emitted_after_a_media_level_connection_line() {
         let sdp = media_level_conn_offer("192.0.2.10", 20100);
-        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -4560,7 +4608,7 @@ mod tests {
     fn an_sdes_crypto_attribute_is_emitted_after_a_media_level_connection_line() {
         use siphon_rtp_srtp::sdes::CryptoSuite;
         let sdp = media_level_conn_offer("192.0.2.10", 20100);
-        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
         let ours = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
         let result = rewrite(
             &sdp,
@@ -4580,7 +4628,7 @@ mod tests {
     #[test]
     fn a_dtls_fingerprint_and_setup_are_emitted_after_a_media_level_connection_line() {
         let sdp = media_level_conn_offer("192.0.2.10", 20100);
-        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
         let fingerprint = Fingerprint::parse(
             "fingerprint:sha-256 \
              AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:\
@@ -4611,7 +4659,7 @@ mod tests {
         // The largest block the engine contributes: ufrag, pwd, every candidate, the trickle option
         // and the end-of-candidates marker, all of which used to land between `m=` and `c=`.
         let sdp = media_level_conn_ice_offer("192.0.2.10", 20100);
-        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
         let candidates = gathered_host_candidates("127.0.0.1:30168");
         let advert = IceAdvertisement {
             ufrag: "ENGUF",
@@ -4655,7 +4703,7 @@ mod tests {
         // treat the engine as an RFC 5245 agent. The re-originated block is what both carry, and the
         // peer's own `a=ice-options` is stripped with the rest of its ICE, so exactly one line remains.
         let sdp = media_level_conn_ice_offer("192.0.2.10", 20100);
-        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
         let candidates = gathered_host_candidates("127.0.0.1:30168");
         let advert = IceAdvertisement {
             ufrag: "ENGUF",
@@ -4685,7 +4733,7 @@ mod tests {
     #[test]
     fn an_ice_mismatch_attribute_is_emitted_after_a_media_level_connection_line() {
         let sdp = media_level_conn_ice_offer("192.0.2.10", 20100);
-        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -4720,8 +4768,8 @@ mod tests {
             "a=rtpmap:99 t140/1000\r\n",
             "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n",
         );
-        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        let text_engine = EngineMedia::new("127.0.0.1:40002".parse().unwrap(), None);
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
+        let text_engine = EngineMedia::new("127.0.0.1:40002".parse::<SocketAddr>().unwrap(), None);
         let our_text_key =
             CryptoAttribute::generate(7, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
         let result = rewrite(
@@ -4749,7 +4797,10 @@ mod tests {
         assert_eq!(result.sdp.matches("c=IN IP4 127.0.0.1").count(), 2);
         let reparsed = parse(&result.sdp).expect("reparse");
         let text_info = reparsed.text.expect("text");
-        assert_eq!(text_info.remote_rtp, "127.0.0.1:40002".parse().unwrap());
+        assert_eq!(
+            text_info.remote_rtp,
+            "127.0.0.1:40002".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(text_info.crypto.first().map(|crypto| crypto.tag), Some(7));
     }
 
@@ -4770,8 +4821,8 @@ mod tests {
             "a=rtpmap:0 PCMU/8000\r\n",
         );
         let engine = EngineMedia::new(
-            "127.0.0.1:30168".parse().unwrap(),
-            Some("127.0.0.1:41001".parse().unwrap()),
+            "127.0.0.1:30168".parse::<SocketAddr>().unwrap(),
+            Some("127.0.0.1:41001".parse::<SocketAddr>().unwrap()),
         );
         let result = rewrite(
             sdp,
@@ -4814,8 +4865,8 @@ mod tests {
             "a=sendrecv\r\n",
         );
         let engine = EngineMedia::new(
-            "127.0.0.1:30168".parse().unwrap(),
-            Some("127.0.0.1:41001".parse().unwrap()),
+            "127.0.0.1:30168".parse::<SocketAddr>().unwrap(),
+            Some("127.0.0.1:41001".parse::<SocketAddr>().unwrap()),
         );
         let result =
             rewrite(sdp, engine, IceRewrite::Keep, None, None, TextRewrite::None).expect("rewrite");
@@ -4850,7 +4901,7 @@ mod tests {
             "c=IN IP4 192.0.2.10\r\n",
             "b=AS:512\r\n",
         );
-        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
         let result =
             rewrite(sdp, engine, IceRewrite::Keep, None, None, TextRewrite::None).expect("rewrite");
         assert_eq!(
@@ -4874,8 +4925,8 @@ mod tests {
         // before the reorder.
         let sdp = offer("203.0.113.7", 49170);
         let engine = EngineMedia::new(
-            "127.0.0.1:40000".parse().unwrap(),
-            Some("127.0.0.1:41001".parse().unwrap()),
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+            Some("127.0.0.1:41001".parse::<SocketAddr>().unwrap()),
         );
         let result = rewrite(
             &sdp,
@@ -4908,7 +4959,7 @@ mod tests {
         // the terminator back. That empty line must stay at the end of the section rather than being
         // hoisted into the prelude, which would put a blank line in the middle of the body.
         let sdp = media_level_conn_offer("192.0.2.10", 20100);
-        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,
@@ -4933,8 +4984,8 @@ mod tests {
         // non-mux anchor.
         let sdp = offer("203.0.113.7", 49170);
         let engine = EngineMedia::new(
-            "127.0.0.1:40000".parse().unwrap(),
-            Some("127.0.0.1:40001".parse().unwrap()),
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+            Some("127.0.0.1:40001".parse::<SocketAddr>().unwrap()),
         );
         let result = rewrite(
             &sdp,
@@ -4952,7 +5003,10 @@ mod tests {
         );
         // The peer derives it, and so does our own parser — the round trip is unchanged.
         let reparsed = parse(&result.sdp).expect("reparse");
-        assert_eq!(reparsed.remote_rtcp, "127.0.0.1:40001".parse().unwrap());
+        assert_eq!(
+            reparsed.remote_rtcp,
+            "127.0.0.1:40001".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -4964,8 +5018,8 @@ mod tests {
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp:53000\r\n");
         let engine = EngineMedia::new(
-            "127.0.0.1:40000".parse().unwrap(),
-            Some("127.0.0.1:40001".parse().unwrap()),
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+            Some("127.0.0.1:40001".parse::<SocketAddr>().unwrap()),
         );
         let result = rewrite(
             &sdp,

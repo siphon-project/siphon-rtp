@@ -224,7 +224,7 @@ mod tests {
 
     fn params() -> ConsentParams {
         ConsentParams {
-            remote_addr: "192.0.2.7:40000".parse().expect("addr"),
+            remote_addr: "192.0.2.7:40000".parse::<SocketAddr>().expect("addr"),
             local_ufrag: "lFrag".into(),
             remote_ufrag: "rFrag".into(),
             remote_pwd: "remote-ice-password-000".into(),
@@ -251,7 +251,7 @@ mod tests {
         let action = checker.poll(0);
         assert!(matches!(
             action,
-            ConsentAction::SendCheck { dst, .. } if dst == "192.0.2.7:40000".parse().unwrap()
+            ConsentAction::SendCheck { dst, .. } if dst == "192.0.2.7:40000".parse::<SocketAddr>().unwrap()
         ));
         let datagram = sent(action);
         let message = stun::parse(&datagram).expect("valid check");
@@ -274,7 +274,7 @@ mod tests {
         let request = stun::parse(datagram).expect("parse check");
         stun::binding_success_response(
             &request.transaction_id,
-            "192.0.2.7:40000".parse().expect("addr"),
+            "192.0.2.7:40000".parse::<SocketAddr>().expect("addr"),
             Some(pwd),
         )
     }
@@ -346,7 +346,7 @@ mod tests {
         // Wrong transaction id.
         let wrong_txn = stun::binding_success_response(
             &[0xffu8; 12],
-            "192.0.2.7:40000".parse().unwrap(),
+            "192.0.2.7:40000".parse::<SocketAddr>().unwrap(),
             Some(b"remote-ice-password-000"),
         );
         assert!(!checker.on_response(&wrong_txn, 5));
@@ -355,7 +355,7 @@ mod tests {
         let request = stun::parse(&check).expect("parse");
         let forged = stun::binding_success_response(
             &request.transaction_id,
-            "192.0.2.7:40000".parse().unwrap(),
+            "192.0.2.7:40000".parse::<SocketAddr>().unwrap(),
             Some(b"WRONG-PASSWORD"),
         );
         assert!(!checker.on_response(&forged, 5));

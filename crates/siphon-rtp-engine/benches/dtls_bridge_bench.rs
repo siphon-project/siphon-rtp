@@ -38,10 +38,10 @@ use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, RxPacket, SourceFilter};
-use siphon_rtp_dtls::{handshake, DtlsCertificate, DtlsChannels, DtlsRole, DtlsTransport};
+use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, DtlsSession, Fingerprint};
 use siphon_rtp_engine::dtls_bridge::{DtlsBridge, DtlsCallPlan, PlainRtcp};
+use siphon_rtp_srtp::leg::SecureLeg;
 use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
 
 /// 8 kHz / 20 ms of µ-law.
 const FRAME_BYTES: usize = 160;
@@ -72,35 +72,60 @@ fn packet(endpoint: EndpointId, source: SocketAddr, data: Bytes) -> RxPacket {
     }
 }
 
-/// Carry the DTLS peer's handshake over its socket: datagrams in, records out to `engine_secure`.
-fn pump(
+/// Drive the DTLS peer's handshake over its socket until it keys, and return its `SecureLeg`.
+///
+/// Sans-I/O, so one loop rather than a transport plus two pump tasks. The peer is the DTLS **client**
+/// here, so it needs no post-key retention: the engine owns the last flight in that direction
+/// (RFC 6347 §4.2.4).
+async fn peer_handshake(
     socket: Arc<UdpSocket>,
-    channels: DtlsChannels,
     engine_secure: SocketAddr,
-) -> (JoinHandle<()>, JoinHandle<()>) {
-    let recv_socket = socket.clone();
-    let inbound = channels.inbound;
-    let reader = tokio::spawn(async move {
-        let mut buffer = [0u8; 2048];
-        while let Ok((len, _)) = recv_socket.recv_from(&mut buffer).await {
-            if inbound
-                .send_async(Bytes::copy_from_slice(&buffer[..len]))
+    peer_cert: &DtlsCertificate,
+    engine_fingerprint: &Fingerprint,
+) -> SecureLeg {
+    use std::time::Instant;
+
+    let mut session = DtlsSession::new(
+        peer_cert,
+        DtlsRole::Client,
+        engine_fingerprint.clone(),
+        Duration::from_millis(200),
+    )
+    .expect("peer session");
+    session.start(Instant::now()).expect("peer first flight");
+    while let Some(record) = session.poll_transmit() {
+        socket
+            .send_to(&record, engine_secure)
+            .await
+            .expect("peer send");
+    }
+
+    let mut buffer = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !session.is_keyed() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = session.poll_timeout().map_or(remaining, |at| {
+            at.saturating_duration_since(Instant::now()).min(remaining)
+        });
+        match tokio::time::timeout(wait, socket.recv_from(&mut buffer)).await {
+            Ok(Ok((len, _))) => {
+                session
+                    .handle_datagram(Instant::now(), &buffer[..len])
+                    .expect("peer accepts the record");
+            }
+            _ => session.handle_timeout(Instant::now()).expect("peer timer"),
+        }
+        while let Some(record) = session.poll_transmit() {
+            socket
+                .send_to(&record, engine_secure)
                 .await
-                .is_err()
-            {
-                break;
-            }
+                .expect("peer send");
         }
-    });
-    let outbound = channels.outbound;
-    let writer = tokio::spawn(async move {
-        while let Ok(record) = outbound.recv_async().await {
-            if socket.send_to(&record, engine_secure).await.is_err() {
-                break;
-            }
-        }
-    });
-    (reader, writer)
+    }
+    session
+        .keying()
+        .map(|keying| keying.to_secure_leg())
+        .expect("the peer's DTLS handshake completed")
 }
 
 fn dtls_bridge_handle(criterion: &mut Criterion) {
@@ -193,18 +218,13 @@ fn dtls_bridge_handle(criterion: &mut Criterion) {
                 dispatch.handle(packet).await;
             }
         });
-        let (b_transport, b_channels) = DtlsTransport::new(addr_b, secure.local_addr);
-        let (reader, writer) = pump(peer_b.clone(), b_channels, secure.local_addr);
-        let mut leg = handshake(
-            Arc::new(b_transport),
+        let mut leg = peer_handshake(
+            peer_b.clone(),
+            secure.local_addr,
             &peer_cert,
-            DtlsRole::Client,
             &engine_cert.fingerprint(),
         )
-        .await
-        .expect("peer handshake");
-        reader.abort();
-        writer.abort();
+        .await;
         dispatcher.abort();
 
         // The engine installs its leg a moment after the peer finishes: wait until a packet relays.

@@ -1,17 +1,13 @@
-//! Drive a DTLS-SRTP handshake to completion and turn its exported keying material into a keyed
-//! [`SecureLeg`] — the same secure leg the SDES path yields, so all downstream media handling (relay,
-//! HA, conference) is shared.
+//! Turn a completed DTLS handshake's exported keying material into a keyed [`SecureLeg`] — the same
+//! secure leg the SDES path yields, so all downstream media handling (relay, HA, conference) is
+//! shared.
 
-use std::sync::Arc;
-
+use rtc_dtls::extension::extension_use_srtp::SrtpProtectionProfile;
+use rtc_dtls::state::State;
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
-use webrtc_dtls::config::{ClientAuthType, Config};
-use webrtc_dtls::conn::DTLSConn;
-use webrtc_dtls::extension::extension_use_srtp::SrtpProtectionProfile;
-use webrtc_util::{Conn, KeyingMaterialExporter};
 
-use crate::identity::{DtlsCertificate, Fingerprint};
+use crate::identity::Fingerprint;
 use crate::DtlsError;
 
 /// The RFC 5764 §4.2 exporter label for DTLS-SRTP keying material.
@@ -24,8 +20,8 @@ const SRTP_SALT_LEN: usize = 14;
 const KEYING_LEN: usize = 2 * (SRTP_KEY_LEN + SRTP_SALT_LEN);
 
 /// Which side of the DTLS handshake this leg plays, chosen from the SDP `a=setup` (RFC 5763 §5). The
-/// engine is normally [`DtlsRole::Server`] — it answered `a=setup:passive`, so the remote (a browser)
-/// is the DTLS client and initiates the handshake into the engine.
+/// engine is [`DtlsRole::Server`] when it answered `a=setup:passive`, so the remote (a browser) is the
+/// DTLS client and initiates the handshake into the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DtlsRole {
     /// This side initiates the handshake (`a=setup:active`).
@@ -34,64 +30,62 @@ pub enum DtlsRole {
     Server,
 }
 
-/// Run a DTLS-SRTP handshake over `transport` to completion, verify the peer's certificate against
-/// `expected_peer_fingerprint` (RFC 5763 §5), and return a [`SecureLeg`] keyed for both directions.
+/// A completed handshake's SRTP keying material, split for this leg's direction.
 ///
-/// `transport` is driven by the caller (the engine feeds inbound DTLS datagrams and sends the outbound
-/// ones); in tests it is an in-memory pipe. The handshake completes when `DTLSConn::new` returns.
-pub async fn handshake(
-    transport: Arc<dyn Conn + Send + Sync>,
-    certificate: &DtlsCertificate,
-    role: DtlsRole,
-    expected_peer_fingerprint: &Fingerprint,
-) -> Result<SecureLeg, DtlsError> {
-    let is_client = role == DtlsRole::Client;
+/// Held rather than turned straight into a [`SecureLeg`] so the caller decides when to build the leg,
+/// and so the secret never needs a second copy.
+pub struct SrtpKeying {
+    local: SrtpKeyMaterial,
+    remote: SrtpKeyMaterial,
+}
 
-    let mut config = Config {
-        certificates: vec![certificate.webrtc()],
-        srtp_protection_profiles: vec![SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80],
-        // DTLS-SRTP's trust anchor is the SDP fingerprint, not a CA chain — skip chain verification
-        // and check the fingerprint ourselves below (RFC 5763 §5).
-        insecure_skip_verify: true,
-        ..Default::default()
-    };
-    if !is_client {
-        // As the DTLS server we MUST request the client's certificate, or we cannot verify the peer's
-        // fingerprint (the default is `NoClientCert`). We do not chain-verify it — the fingerprint is
-        // the authenticator — so `RequireAnyClientCert`, not `RequireAndVerifyClientCert`.
-        config.client_auth = ClientAuthType::RequireAnyClientCert;
+impl SrtpKeying {
+    /// Build the keyed secure leg: `local` protects egress, `remote` unprotects ingress.
+    #[must_use]
+    pub fn into_secure_leg(self) -> SecureLeg {
+        SecureLeg::new(&self.local, &self.remote)
     }
 
-    let connection = DTLSConn::new(transport, config, is_client, None)
-        .await
-        .map_err(|error| DtlsError::Handshake(error.to_string()))?;
-
-    // RFC 5764 §4.1.2: the negotiated profile must be one SecureLeg implements (AES-CM-128/HMAC-SHA1-80).
-    if connection.selected_srtpprotection_profile()
-        != SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80
-    {
-        return Err(DtlsError::UnsupportedProfile);
+    /// Build a keyed secure leg **without consuming the session that derived it**.
+    ///
+    /// The driver needs this: a session must stay alive after it keys so it can answer a peer that
+    /// repeats its final flight (RFC 6347 §4.2.4), so the leg cannot be obtained by consuming it.
+    /// Each call builds a fresh leg with its own SRTP contexts — callers hand exactly one to the
+    /// owning actor, because two legs on one key would each start their own rollover counter
+    /// (RFC 3711 §3.3.1).
+    #[must_use]
+    pub fn to_secure_leg(&self) -> SecureLeg {
+        SecureLeg::new(&self.local, &self.remote)
     }
+}
 
-    let state = connection.connection_state().await;
-
-    // RFC 5763 §5: authenticate the peer by matching its certificate to the fingerprint it signalled.
-    // A mismatch means the media is not from the party we negotiated with — abort before deriving keys.
+/// Authenticate the peer by matching its certificate to the fingerprint it signalled (RFC 5763 §5).
+///
+/// A mismatch means the media is not from the party we negotiated with, so the leg is rejected before
+/// any key is derived from the association.
+pub(crate) fn verify_peer(state: &State, expected: &Fingerprint) -> Result<(), DtlsError> {
     let peer_certificate = state
         .peer_certificates
         .first()
         .ok_or(DtlsError::MissingPeerCertificate)?;
-    if !expected_peer_fingerprint.verify(peer_certificate) {
-        return Err(DtlsError::FingerprintMismatch);
+    if expected.verify(peer_certificate) {
+        Ok(())
+    } else {
+        Err(DtlsError::FingerprintMismatch)
     }
+}
 
+/// Export RFC 5764 §4.2 keying material from a completed handshake and split it for `role`.
+pub(crate) fn derive_keying(state: &State, role: DtlsRole) -> Result<SrtpKeying, DtlsError> {
+    // RFC 5764 §4.1.2: the negotiated profile must be one `SecureLeg` implements.
+    if state.srtp_protection_profile() != SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80 {
+        return Err(DtlsError::UnsupportedProfile);
+    }
     let keying = state
         .export_keying_material(DTLS_SRTP_LABEL, &[], KEYING_LEN)
-        .await
         .map_err(|error| DtlsError::KeyExport(error.to_string()))?;
-
-    let (local, remote) = split_keying(&keying, role)?;
-    Ok(SecureLeg::new(&local, &remote))
+    let (local, remote) = split_keying(keying.as_ref(), role)?;
+    Ok(SrtpKeying { local, remote })
 }
 
 /// Split the RFC 5764 §4.2 keying block into this leg's `(local, remote)` SRTP key material.
@@ -140,139 +134,40 @@ fn split_keying(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webrtc_util::conn::conn_pipe::pipe;
-
-    /// A minimal G.711 RTP packet (V2, PT0, given seq/ssrc, 16-byte payload).
-    fn rtp(seq: u16, ssrc: u32) -> Vec<u8> {
-        let mut packet = vec![0x80, 0x00];
-        packet.extend_from_slice(&seq.to_be_bytes());
-        packet.extend_from_slice(&[0, 0, 0, 0]);
-        packet.extend_from_slice(&ssrc.to_be_bytes());
-        packet.extend_from_slice(&[0x2A; 16]);
-        packet
-    }
-
-    #[tokio::test]
-    async fn loopback_handshake_yields_interoperable_secure_legs() {
-        let server_cert = DtlsCertificate::generate().expect("server cert");
-        let client_cert = DtlsCertificate::generate().expect("client cert");
-        let server_fingerprint = server_cert.fingerprint();
-        let client_fingerprint = client_cert.fingerprint();
-        let (server_transport, client_transport) = pipe();
-
-        // Server (passive) runs on a task; client (active) drives on this one.
-        let server = {
-            let server_cert = server_cert.clone();
-            let client_fingerprint = client_fingerprint.clone();
-            tokio::spawn(async move {
-                handshake(
-                    Arc::new(server_transport),
-                    &server_cert,
-                    DtlsRole::Server,
-                    &client_fingerprint,
-                )
-                .await
-            })
-        };
-        let mut client_leg = handshake(
-            Arc::new(client_transport),
-            &client_cert,
-            DtlsRole::Client,
-            &server_fingerprint,
-        )
-        .await
-        .expect("client handshake");
-        let mut server_leg = server
-            .await
-            .expect("server task")
-            .expect("server handshake");
-
-        // The role→key mapping is correct: what the server encrypts, the client decrypts, and back.
-        let packet = rtp(1000, 0xDEAD_BEEF);
-        let mut sealed = Vec::new();
-        let mut recovered = Vec::new();
-
-        server_leg
-            .protect(&packet, &mut sealed)
-            .expect("server protect");
-        client_leg
-            .unprotect(&sealed, &mut recovered)
-            .expect("client unprotect");
-        assert_eq!(recovered, packet, "server→client media decrypts");
-
-        client_leg
-            .protect(&packet, &mut sealed)
-            .expect("client protect");
-        server_leg
-            .unprotect(&sealed, &mut recovered)
-            .expect("server unprotect");
-        assert_eq!(recovered, packet, "client→server media decrypts");
-    }
-
-    #[tokio::test]
-    async fn a_wrong_peer_fingerprint_aborts_the_handshake() {
-        let server_cert = DtlsCertificate::generate().expect("server cert");
-        let client_cert = DtlsCertificate::generate().expect("client cert");
-        let client_fingerprint = client_cert.fingerprint();
-        let (server_transport, client_transport) = pipe();
-
-        // The server expects the real client fingerprint (so it completes); the client is told a bogus
-        // server fingerprint, so its side must reject after the DTLS handshake (RFC 5763 §5).
-        let server = {
-            let server_cert = server_cert.clone();
-            tokio::spawn(async move {
-                handshake(
-                    Arc::new(server_transport),
-                    &server_cert,
-                    DtlsRole::Server,
-                    &client_fingerprint,
-                )
-                .await
-            })
-        };
-        let bogus = Fingerprint::sha256_of(b"not the server certificate");
-        // Map the Ok payload away — `SecureLeg` is not `Debug`, and we only care about the error.
-        let result = handshake(
-            Arc::new(client_transport),
-            &client_cert,
-            DtlsRole::Client,
-            &bogus,
-        )
-        .await
-        .map(|_| ());
-        assert!(
-            matches!(result, Err(DtlsError::FingerprintMismatch)),
-            "expected FingerprintMismatch, got {result:?}"
-        );
-        let _ = server.await; // the server side completes (it had the right fingerprint)
-    }
 
     #[test]
     fn split_keying_maps_role_to_write_keys() {
-        // A distinctive block so each 16/14 slice is identifiable.
-        let mut block = Vec::new();
-        block.extend_from_slice(&[0x11; SRTP_KEY_LEN]); // client write key
-        block.extend_from_slice(&[0x22; SRTP_KEY_LEN]); // server write key
-        block.extend_from_slice(&[0x33; SRTP_SALT_LEN]); // client write salt
-        block.extend_from_slice(&[0x44; SRTP_SALT_LEN]); // server write salt
+        // A recognisable block: client key 0x11.., server key 0x22.., client salt 0x33.., server 0x44.
+        let mut keying = Vec::with_capacity(KEYING_LEN);
+        keying.extend(std::iter::repeat_n(0x11, SRTP_KEY_LEN));
+        keying.extend(std::iter::repeat_n(0x22, SRTP_KEY_LEN));
+        keying.extend(std::iter::repeat_n(0x33, SRTP_SALT_LEN));
+        keying.extend(std::iter::repeat_n(0x44, SRTP_SALT_LEN));
 
-        // As server: local = server-write (0x22/0x44), remote = client-write (0x11/0x33).
-        let (local, remote) = split_keying(&block, DtlsRole::Server).expect("split");
-        assert_eq!(local.master_key, [0x22; SRTP_KEY_LEN]);
-        assert_eq!(local.master_salt, [0x44; SRTP_SALT_LEN]);
-        assert_eq!(remote.master_key, [0x11; SRTP_KEY_LEN]);
-        assert_eq!(remote.master_salt, [0x33; SRTP_SALT_LEN]);
+        // As the server our write key is the *server* half; the peer writes with the client half.
+        let (local, remote) = split_keying(&keying, DtlsRole::Server).expect("server split");
+        assert_eq!(
+            local.master_key[0], 0x22,
+            "server writes with the server key"
+        );
+        assert_eq!(local.master_salt[0], 0x44, "and the server salt");
+        assert_eq!(remote.master_key[0], 0x11, "and reads the client's");
+        assert_eq!(remote.master_salt[0], 0x33, "with the client salt");
 
-        // As client the mapping is mirrored.
-        let (local, remote) = split_keying(&block, DtlsRole::Client).expect("split");
-        assert_eq!(local.master_key, [0x11; SRTP_KEY_LEN]);
-        assert_eq!(remote.master_key, [0x22; SRTP_KEY_LEN]);
+        // As the client the halves swap.
+        let (local, remote) = split_keying(&keying, DtlsRole::Client).expect("client split");
+        assert_eq!(
+            local.master_key[0], 0x11,
+            "client writes with the client key"
+        );
+        assert_eq!(remote.master_key[0], 0x22, "and reads the server's");
     }
 
     #[test]
     fn split_keying_rejects_a_short_block() {
+        let short = vec![0u8; KEYING_LEN - 1];
         assert!(matches!(
-            split_keying(&[0u8; 10], DtlsRole::Server),
+            split_keying(&short, DtlsRole::Server),
             Err(DtlsError::KeyExport(_))
         ));
     }

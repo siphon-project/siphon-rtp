@@ -5,24 +5,36 @@
 //! generates a self-signed certificate, advertises its SHA-256 fingerprint in SDP, and on the other
 //! side checks that the peer's presented certificate hashes to the fingerprint the peer signalled.
 
+use std::sync::Arc;
+
+use rtc_dtls::crypto::Certificate;
+use rtc_dtls::crypto_provider::{default_provider, RTCCryptoProvider};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 use crate::DtlsError;
 
 /// A self-signed DTLS certificate for a secure leg, plus the DER of its leaf certificate (the input to
-/// the fingerprint). Cheap to clone (the inner key material is reference-counted by `webrtc-dtls`).
+/// the fingerprint) and the crypto provider that minted it.
+///
+/// The provider is held rather than re-derived because the private key was imported through it: the
+/// handshake config has to be built with the **same** provider, or the key it signs with and the one
+/// it was parsed by disagree.
 #[derive(Clone)]
 pub struct DtlsCertificate {
-    inner: webrtc_dtls::crypto::Certificate,
+    inner: Certificate,
     leaf_der: Vec<u8>,
+    provider: Arc<dyn RTCCryptoProvider>,
 }
 
 impl DtlsCertificate {
-    /// Generate a fresh self-signed certificate (ECDSA P-256, as `webrtc-dtls` mints and WebRTC uses).
+    /// Generate a fresh self-signed certificate on the default crypto provider (ring, the only backend
+    /// this crate enables — `crypto-aws-lc-rs` is C-backed and stays off, see `deny.toml`).
     pub fn generate() -> Result<Self, DtlsError> {
+        let provider =
+            default_provider().map_err(|error| DtlsError::Certificate(error.to_string()))?;
         let inner =
-            webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["siphon-rtp".to_owned()])
+            Certificate::generate_self_signed(vec!["siphon-rtp".to_owned()], provider.crypto())
                 .map_err(|error| DtlsError::Certificate(error.to_string()))?;
         let leaf_der = inner
             .certificate
@@ -30,7 +42,11 @@ impl DtlsCertificate {
             .ok_or_else(|| DtlsError::Certificate("empty certificate chain".to_owned()))?
             .as_ref()
             .to_vec();
-        Ok(Self { inner, leaf_der })
+        Ok(Self {
+            inner,
+            leaf_der,
+            provider,
+        })
     }
 
     /// The SHA-256 fingerprint of the leaf certificate — the value to advertise in `a=fingerprint`.
@@ -39,9 +55,14 @@ impl DtlsCertificate {
         Fingerprint::sha256_of(&self.leaf_der)
     }
 
-    /// The inner `webrtc-dtls` certificate, for building a handshake `Config`.
-    pub(crate) fn webrtc(&self) -> webrtc_dtls::crypto::Certificate {
+    /// The inner `rtc-dtls` certificate, for building a handshake config.
+    pub(crate) fn inner(&self) -> Certificate {
         self.inner.clone()
+    }
+
+    /// The provider this certificate's key was imported through — the handshake config must use it.
+    pub(crate) fn provider(&self) -> Arc<dyn RTCCryptoProvider> {
+        self.provider.clone()
     }
 }
 

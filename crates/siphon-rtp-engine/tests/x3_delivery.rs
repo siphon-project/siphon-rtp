@@ -587,7 +587,7 @@ async fn delivery_never_speaks_plaintext_to_a_non_tls_peer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attach_x3_on_a_terminated_dtls_offerer_delivers_both_parties_in_the_clear() {
     use siphon_rtp_datapath::Datapath as _;
-    use siphon_rtp_dtls::{handshake, DtlsCertificate, DtlsRole, DtlsTransport, Fingerprint};
+    use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, DtlsSession, Fingerprint};
     use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher;
     use siphon_rtp_proto::{CmdResult, Command, ProfileFlags, X3TargetLeg};
     use tokio::net::UdpSocket;
@@ -698,53 +698,50 @@ async fn attach_x3_on_a_terminated_dtls_offerer_delivers_both_parties_in_the_cle
         "attach_x3 on a terminated DTLS offerer, got {attached:?}"
     );
 
-    // The caller's half of the handshake, over its own socket.
-    let (transport, channels) = DtlsTransport::new(caller, engine_toward_caller);
-    let reader = {
-        let socket = caller_socket.clone();
-        let inbound = channels.inbound;
-        tokio::spawn(async move {
-            let mut buffer = [0u8; 2048];
-            while let Ok((len, _)) = socket.recv_from(&mut buffer).await {
-                if inbound
-                    .send_async(bytes::Bytes::copy_from_slice(&buffer[..len]))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-    };
-    let writer = {
-        let socket = caller_socket.clone();
-        let outbound = channels.outbound;
-        tokio::spawn(async move {
-            while let Ok(record) = outbound.recv_async().await {
-                if socket.send_to(&record, engine_toward_caller).await.is_err() {
-                    break;
-                }
-            }
-        })
-    };
+    // The caller's half of the handshake, over its own socket. Sans-I/O, so this is one loop rather
+    // than a transport plus two pump tasks: read a datagram, feed it in, send back whatever the
+    // session queued. The caller is the DTLS **server** here, and its last flight (RFC 6347 §4.2.4)
+    // is drained below before this returns.
     let expected = Fingerprint::new(
         engine_fingerprint.hash_function.clone(),
         engine_fingerprint.bytes.clone(),
     );
-    let mut caller_leg = timeout(
-        SHORT,
-        handshake(
-            Arc::new(transport),
-            &certificate,
-            DtlsRole::Server,
-            &expected,
-        ),
+    let mut session = DtlsSession::new(
+        &certificate,
+        DtlsRole::Server,
+        expected,
+        Duration::from_millis(200),
     )
-    .await
-    .expect("handshake did not time out")
-    .expect("caller handshake");
-    reader.abort();
-    writer.abort();
+    .expect("caller session");
+    let mut handshake_buffer = [0u8; 2048];
+    let handshake_deadline = std::time::Instant::now() + SHORT;
+    while std::time::Instant::now() < handshake_deadline && !session.is_keyed() {
+        let now = std::time::Instant::now();
+        let remaining = handshake_deadline.saturating_duration_since(now);
+        let wait = session.poll_timeout().map_or(remaining, |at| {
+            at.saturating_duration_since(now).min(remaining)
+        });
+        match timeout(wait, caller_socket.recv_from(&mut handshake_buffer)).await {
+            Ok(Ok((len, _))) => {
+                session
+                    .handle_datagram(std::time::Instant::now(), &handshake_buffer[..len])
+                    .expect("the caller accepts the record");
+            }
+            _ => session
+                .handle_timeout(std::time::Instant::now())
+                .expect("caller timer"),
+        }
+        while let Some(record) = session.poll_transmit() {
+            caller_socket
+                .send_to(&record, engine_toward_caller)
+                .await
+                .expect("caller send");
+        }
+    }
+    let mut caller_leg = session
+        .keying()
+        .map(|keying| keying.to_secure_leg())
+        .expect("the caller's DTLS handshake completed");
 
     // Caller → callee: SRTP in, RTP out. Retry across the window between the caller finishing its
     // handshake and the engine installing the key, then collect whatever the retries still delivered.

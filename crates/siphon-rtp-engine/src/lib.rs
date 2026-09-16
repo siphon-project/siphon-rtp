@@ -19,6 +19,7 @@ pub mod conference;
 pub mod config;
 pub mod daemon;
 pub mod dtls_bridge;
+mod dtls_session;
 pub mod engine;
 pub mod ha;
 pub mod ice;
