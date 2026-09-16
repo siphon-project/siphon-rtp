@@ -18893,6 +18893,119 @@ async fn an_ice_lite_dtls_conference_seat_is_keyed_on_the_source_its_check_valid
     );
 }
 
+/// A NATed ICE participant: its `c=` and default candidate carry an address nothing answers on
+/// (TEST-NET-1, RFC 5737) while its real transport is the host candidate `real` — the shape a browser
+/// behind NAT joins a room with. Plaintext, so the seat's keying is not part of what it tests.
+fn nated_ice_offer_sdp(signalled: SocketAddr, real: SocketAddr) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {s_ip}\r\ns=-\r\nc=IN IP4 {s_ip}\r\nt=0 0\r\n\
+         a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+         m=audio {s_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+         a=candidate:host 1 UDP 2130706431 {r_ip} {r_port} typ host\r\n\
+         a=candidate:default 1 UDP 1694498815 {s_ip} {s_port} typ srflx raddr {r_ip} rport {r_port}\r\n\
+         a=end-of-candidates\r\n",
+        s_ip = signalled.ip(),
+        s_port = signalled.port(),
+        r_ip = real.ip(),
+        r_port = real.port(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ice_lite_conference_seat_is_sent_the_mix_at_the_source_its_check_validated() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+
+    // RFC 8445 §12.1.1: data goes to the valid pair's remote candidate. An ice-lite seat has no agent
+    // to call `ice_selected`, so the room aimed its mix at the `c=` a NATed participant signalled and
+    // moved only when that participant's own first packet latched the reply. A seat that listens
+    // before it talks — a webinar attendee, a muted participant — then hears nothing at all, and its
+    // mix goes to an address that never asked for it.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+
+    // A talker, so the room has something to mix.
+    let (talker, talker_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+    let talker_answer = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "lite-ice-room".into(),
+                from_tag: "tag-talker".into(),
+                sdp: sdp_for(talker_addr, true),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let talker_engine_addr = sdp::parse(&ok_sdp_text(&talker_answer))
+        .expect("talker answer")
+        .remote_rtp;
+
+    // The NATed ICE participant.
+    let (attendee, attendee_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let signalled: SocketAddr = "192.0.2.10:40000".parse().expect("signalled address");
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "lite-ice-room".into(),
+                from_tag: "tag-attendee".into(),
+                sdp: nated_ice_offer_sdp(signalled, attendee_addr),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let answer = sdp::parse(&ok_sdp_text(&joined)).expect("attendee answer");
+    let engine_seat = answer.remote_rtp;
+    let engine_ufrag = answer.ice_ufrag.clone().expect("engine ufrag");
+    let engine_pwd = answer.ice_pwd.clone().expect("engine pwd");
+
+    // It validates its real transport with one check, then stays silent, as a listening seat does.
+    let check = siphon_rtp_stun::binding_request(
+        &[7u8; 12],
+        &format!("{engine_ufrag}:{A_UFRAG}"),
+        engine_pwd.as_bytes(),
+    );
+    attendee
+        .send_to(&check, engine_seat)
+        .await
+        .expect("send check");
+
+    // The talker speaks; the mix has to reach the transport the check validated.
+    let mut buffer = [0u8; 2048];
+    let mut heard = false;
+    for sequence in 0..150u16 {
+        talker
+            .send_to(
+                &g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF),
+                talker_engine_addr,
+            )
+            .await
+            .expect("talker send");
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(60), attendee.recv_from(&mut buffer)).await
+        {
+            // RFC 7983 §7: skip the Binding success response; RTP is 128..=191.
+            if len > 0 && (128..=191).contains(&buffer[0]) {
+                heard = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        heard,
+        "the room sends the mix to the transport the seat's check validated, not to its c="
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reoffer_that_adds_ice_to_a_kept_dtls_association_follows_the_validated_source() {
     use crate::srtp_bridge::run_redirect_dispatcher;

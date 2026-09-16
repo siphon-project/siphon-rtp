@@ -56,6 +56,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             media: Arc::new(MediaRegistry::default()),
             ws: Arc::new(WsRegistry::default()),
             conference: Arc::new(ConferenceRegistry::default()),
+            seat_ice_followers: DashMap::new(),
             text: Arc::new(TextRegistry::default()),
             subscriptions: DashMap::new(),
             metrics: Arc::new(Metrics::new()),
