@@ -16,24 +16,20 @@ keywords = ["dtls", "srtp", "webrtc", "rtp", "voip"]
 categories = ["network-programming", "cryptography"]
 
 [dependencies]
-# DTLS handshake + SRTP key export — pure RustCrypto (p256/aes-gcm/x25519-dalek), no C, no ring.
-webrtc-dtls = "0.12"
-# The `Conn` transport trait + `KeyingMaterialExporter` the handshake drives over.
-webrtc-util = "0.11"
+# Sans-I/O DTLS handshake + RFC 5764 key export: it owns no socket, reads no clock and spawns no
+# task, so the engine drives it and the handshake's lifetime is ours to control. Pinned exactly —
+# the 0.20/0.21 line moves fast, and a `[patch.crates-io]` in the workspace root points this at the
+# fork carrying the RFC 6347 §4.2.4 last-flight retransmission fix until upstream takes it.
+rtc-dtls = { version = "=0.21.0-rc.2", default-features = false, features = ["crypto-ring"] }
+# `TransportProtocol` for the endpoint constructor. Its three features are empty markers, so none.
+rtc-shared = { version = "=0.21.0-rc.2", default-features = false }
 # The SRTP secure leg the exported keying material is fed into (shared with the SDES path).
 siphon-rtp-srtp = { path = "../siphon-rtp-srtp" }
 # Certificate fingerprints (RFC 8122): SHA-256 default, SHA-384/512 + SHA-1 for interop.
 sha2 = "0.10"
 sha1 = "0.10"
-# The `Conn` trait is `#[async_trait]`.
-async-trait = "0.1"
 bytes = { workspace = true }
-flume = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-# In-memory handshake driving in the loopback tests.
-tokio = { workspace = true }
 
 [lints]
 workspace = true

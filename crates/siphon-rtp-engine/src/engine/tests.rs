@@ -11658,8 +11658,7 @@ async fn a_transcoding_dtls_call_answers_a_with_its_own_codec() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dtls_srtp_offer_answer_bridges_media_end_to_end() {
     use crate::srtp_bridge::run_redirect_dispatcher;
-    use bytes::Bytes;
-    use siphon_rtp_dtls::{handshake, DtlsCertificate, DtlsRole, DtlsTransport};
+    use siphon_rtp_dtls::DtlsCertificate;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -11743,52 +11742,15 @@ async fn dtls_srtp_offer_answer_bridges_media_end_to_end() {
     );
 
     // B drives its side of the DTLS handshake (client) against the engine's far endpoint.
-    let (b_transport, b_channels) = DtlsTransport::new(addr_b, engine_far);
-    let reader = {
-        let socket = peer_b.clone();
-        let inbound = b_channels.inbound;
-        tokio::spawn(async move {
-            let mut buffer = [0u8; 2048];
-            while let Ok((len, _)) = socket.recv_from(&mut buffer).await {
-                if inbound
-                    .send_async(Bytes::copy_from_slice(&buffer[..len]))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-    };
-    let writer = {
-        let socket = peer_b.clone();
-        let outbound = b_channels.outbound;
-        tokio::spawn(async move {
-            while let Ok(record) = outbound.recv_async().await {
-                if socket.send_to(&record, engine_far).await.is_err() {
-                    break;
-                }
-            }
-        })
-    };
-    let engine_fingerprint = siphon_rtp_dtls::Fingerprint::new(
-        engine_fingerprint.hash_function,
-        engine_fingerprint.bytes,
-    );
-    let mut peer_leg = timeout(
-        Duration::from_secs(5),
-        handshake(
-            Arc::new(b_transport),
-            &peer_cert,
-            DtlsRole::Client,
-            &engine_fingerprint,
-        ),
+    let mut peer_leg = drive_peer_dtls(
+        peer_b.clone(),
+        engine_far,
+        &peer_cert,
+        &engine_fingerprint,
+        siphon_rtp_dtls::DtlsRole::Client,
+        false,
     )
-    .await
-    .expect("handshake did not time out")
-    .expect("peer handshake");
-    reader.abort();
-    writer.abort();
+    .await;
 
     // B → engine SRTP is decrypted and relayed to A as plaintext. Retry to absorb the tiny window
     // between B finishing and the engine installing its leg.
@@ -13397,53 +13359,92 @@ async fn peer_dtls_handshake(
     peer_cert: &siphon_rtp_dtls::DtlsCertificate,
     engine_fingerprint: &sdp::Fingerprint,
 ) -> siphon_rtp_srtp::leg::SecureLeg {
-    use bytes::Bytes;
-    use siphon_rtp_dtls::{handshake, DtlsRole, DtlsTransport};
-    use std::time::Duration;
+    let _ = peer_addr;
+    drive_peer_dtls(
+        socket,
+        engine_far,
+        peer_cert,
+        engine_fingerprint,
+        siphon_rtp_dtls::DtlsRole::Client,
+        false,
+    )
+    .await
+}
+
+/// Drive one side of a DTLS handshake over `socket` until it keys, and return its [`SecureLeg`].
+///
+/// Sans-I/O, so this is one loop rather than a transport plus two pump tasks: read a datagram, feed
+/// it in, send back whatever the session queued. `dtls_only` applies the RFC 7983 §7 demux, which an
+/// ICE leg needs because the same socket also carries the engine's STUN.
+async fn drive_peer_dtls(
+    socket: Arc<UdpSocket>,
+    engine_far: SocketAddr,
+    peer_cert: &siphon_rtp_dtls::DtlsCertificate,
+    engine_fingerprint: &sdp::Fingerprint,
+    role: siphon_rtp_dtls::DtlsRole,
+    dtls_only: bool,
+) -> siphon_rtp_srtp::leg::SecureLeg {
+    use std::time::{Duration, Instant};
     use tokio::time::timeout;
 
-    let (transport, channels) = DtlsTransport::new(peer_addr, engine_far);
-    let reader = {
-        let socket = socket.clone();
-        let inbound = channels.inbound;
-        tokio::spawn(async move {
-            let mut buffer = [0u8; 2048];
-            while let Ok((len, _)) = socket.recv_from(&mut buffer).await {
-                if inbound
-                    .send_async(Bytes::copy_from_slice(&buffer[..len]))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-    };
-    let writer = {
-        let socket = socket.clone();
-        let outbound = channels.outbound;
-        tokio::spawn(async move {
-            while let Ok(record) = outbound.recv_async().await {
-                if socket.send_to(&record, engine_far).await.is_err() {
-                    break;
-                }
-            }
-        })
-    };
     let expected = siphon_rtp_dtls::Fingerprint::new(
         engine_fingerprint.hash_function.clone(),
         engine_fingerprint.bytes.clone(),
     );
-    let leg = timeout(
-        Duration::from_secs(5),
-        handshake(Arc::new(transport), peer_cert, DtlsRole::Client, &expected),
-    )
-    .await
-    .expect("handshake did not time out")
-    .expect("peer handshake");
-    // The pump only carries the handshake; stop it so the test owns the socket for media.
-    reader.abort();
-    writer.abort();
+    let mut session =
+        siphon_rtp_dtls::DtlsSession::new(peer_cert, role, expected, Duration::from_millis(200))
+            .expect("peer session");
+
+    // A client opens with its own flight; a server waits to be spoken to.
+    session.start(Instant::now()).expect("peer first flight");
+    while let Some(record) = session.poll_transmit() {
+        socket
+            .send_to(&record, engine_far)
+            .await
+            .expect("peer send");
+    }
+
+    let mut buffer = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // A retransmission timer may come due before anything arrives.
+        let wait = session.poll_timeout().map_or(remaining, |at| {
+            at.saturating_duration_since(Instant::now()).min(remaining)
+        });
+        match timeout(wait, socket.recv_from(&mut buffer)).await {
+            Ok(Ok((len, _))) => {
+                if !dtls_only || (20..=63).contains(&buffer[0]) {
+                    session
+                        .handle_datagram(Instant::now(), &buffer[..len])
+                        .expect("peer accepts the record");
+                }
+            }
+            // Timed out: fire the retransmission timer if one was due.
+            _ => {
+                session.handle_timeout(Instant::now()).expect("peer timer");
+            }
+        }
+        while let Some(record) = session.poll_transmit() {
+            socket
+                .send_to(&record, engine_far)
+                .await
+                .expect("peer send");
+        }
+        if session.is_keyed() {
+            break;
+        }
+    }
+    let Some(leg) = session.keying().map(|keying| keying.to_secure_leg()) else {
+        panic!("the peer's DTLS handshake did not complete");
+    };
+
+    // As the DTLS **server** this peer owns the last flight (RFC 6347 §4.2.4). It is already on the
+    // wire: the loop above drains `poll_transmit` after every record it handles, so the flight was
+    // sent before the session keyed — which is what the old fixture had to work around by awaiting a
+    // writer task's drain. Nothing is held open here on purpose: blocking on this socket afterwards
+    // would consume engine→peer media the test itself is waiting for. Real loss is the production
+    // driver's problem, and it retains the association for exactly that reason.
     leg
 }
 
@@ -13456,68 +13457,20 @@ async fn peer_dtls_handshake_server(
     peer_cert: &siphon_rtp_dtls::DtlsCertificate,
     engine_fingerprint: &sdp::Fingerprint,
 ) -> siphon_rtp_srtp::leg::SecureLeg {
-    use bytes::Bytes;
-    use siphon_rtp_dtls::{handshake, DtlsRole, DtlsTransport};
-    use std::time::Duration;
-    use tokio::time::timeout;
-
-    let (transport, channels) = DtlsTransport::new(peer_addr, engine_far);
-    let reader = {
-        let socket = socket.clone();
-        let inbound = channels.inbound;
-        tokio::spawn(async move {
-            let mut buffer = [0u8; 2048];
-            while let Ok((len, _)) = socket.recv_from(&mut buffer).await {
-                // RFC 7983 §7: only DTLS records (first byte 20..=63) belong to the handshake. On an
-                // ICE leg the same socket also receives the engine's STUN, as a real peer's does.
-                if !(20..=63).contains(&buffer[0]) {
-                    continue;
-                }
-                if inbound
-                    .send_async(Bytes::copy_from_slice(&buffer[..len]))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-    };
-    let writer = {
-        let socket = socket.clone();
-        let outbound = channels.outbound;
-        tokio::spawn(async move {
-            while let Ok(record) = outbound.recv_async().await {
-                if socket.send_to(&record, engine_far).await.is_err() {
-                    break;
-                }
-            }
-        })
-    };
-    let expected = siphon_rtp_dtls::Fingerprint::new(
-        engine_fingerprint.hash_function.clone(),
-        engine_fingerprint.bytes.clone(),
-    );
-    let leg = timeout(
-        Duration::from_secs(5),
-        handshake(Arc::new(transport), peer_cert, DtlsRole::Server, &expected),
+    let _ = peer_addr;
+    // The peer is the DTLS **server** here, so it owns the last flight (RFC 6347 §4.2.4) and its
+    // session keeps answering repeats until the engine has clearly completed — the previous stack
+    // could not do that at all, which is what made `a_dtls_participant_joins_a_conference...` flake:
+    // the peer keyed, its flight 6 was discarded with the transport, and the engine waited forever.
+    drive_peer_dtls(
+        socket,
+        engine_far,
+        peer_cert,
+        engine_fingerprint,
+        siphon_rtp_dtls::DtlsRole::Server,
+        true,
     )
     .await
-    .expect("handshake did not time out")
-    .expect("peer handshake");
-    // As the DTLS **server**, this peer's handshake returns with its last flight (RFC 6347 §4.2.4,
-    // flight 6: ChangeCipherSpec + Finished) queued on the transport rather than sent, and webrtc-dtls
-    // never re-sends it once `handshake` has returned. Aborting the writer here can therefore discard
-    // that flight outright, leaving this side keyed while the engine, the DTLS client, waits forever —
-    // which is exactly what a CI run of `a_dtls_participant_joins_a_conference...` showed: the peer
-    // handshake succeeded and no mix ever arrived. Stop reading, which ends the DTLS connection and
-    // drops the transport, then let the writer drain what is queued and exit on its own.
-    reader.abort();
-    timeout(Duration::from_secs(2), writer)
-        .await
-        .expect("the peer's last flight drains")
-        .expect("writer task");
-    leg
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

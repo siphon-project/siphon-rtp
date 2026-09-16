@@ -3,12 +3,16 @@
 //! (`UDP/TLS/RTP/SAVPF`) leg, e.g. a WebRTC browser bridged to a PSTN side.
 //!
 //! Structurally it is the [`crate::srtp_bridge::SrtpBridge`] with a handshake in front. On register,
-//! a task drives the DTLS handshake ([`siphon_rtp_dtls::handshake`]) over the datapath's `Redirect`
+//! one task per leg drives the association (the driver in `dtls_session.rs`) over the `Redirect`
 //! path: inbound DTLS records (the ones the RFC 7983 demux classifies [`PacketClass::Dtls`]) are fed
-//! to it and outbound records are sent via [`Datapath::send`]. Until the handshake completes there is
-//! no [`SecureLeg`], so media is dropped; once it does, both directions relay exactly as the SDES
-//! bridge — plain→secure `protect`s, secure→plain `unprotect`s. Because `Redirect` bypasses the
+//! to it and the records it wants sent go out via [`Datapath::send`]. Until the handshake completes
+//! there is no [`SecureLeg`], so media is dropped; once it does, both directions relay exactly as the
+//! SDES bridge — plain→secure `protect`s, secure→plain `unprotect`s. Because `Redirect` bypasses the
 //! datapath's source gate, the bridge re-enforces it (RTPBleed defence) before any crypto.
+//!
+//! The driver outlives the handshake on purpose: a completed association must still answer a peer
+//! that repeats its final flight (RFC 6347 §4.2.4), which the previous stack could not do because its
+//! handshake task returned — and with it went the only thing that could have re-sent that flight.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -16,21 +20,27 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use dashmap::DashMap;
 use siphon_rtp_datapath::{classify, Datapath, EndpointId, PacketClass, RxPacket, SourceFilter};
-use siphon_rtp_dtls::{handshake, DtlsCertificate, DtlsRole, DtlsTransport, Fingerprint};
+use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint};
 use siphon_rtp_srtp::leg::{is_rtcp, PacketKind, SecureLeg};
 use tokio::task::JoinHandle;
 
+use crate::dtls_session::{spawn_session, DriverPlan, SessionOutcome};
 use crate::x3::X3Tap;
 
+/// How many inbound DTLS records a leg's driver will queue. Bounded so a stalled association cannot
+/// grow an unbounded queue on a traffic spike; [`DtlsBridge::handle`] drops the newest when it is
+/// full, which for a handshake simply triggers a DTLS retransmission.
+const INBOUND_CAPACITY: usize = 64;
+
 /// A shared secure leg that is `None` until the DTLS handshake installs it.
-type SharedSecureLeg = Arc<Mutex<Option<SecureLeg>>>;
+pub(crate) type SharedSecureLeg = Arc<Mutex<Option<SecureLeg>>>;
 
 /// Where a DTLS leg's encrypted traffic goes, published so it can change under the tasks reading it.
 ///
 /// `None` means **not yet decided**: on a full-ICE leg the destination is not known until ICE selects
 /// a candidate pair, and the handshake must not start before then. On a non-ICE leg it is `Some` from
 /// registration and never changes.
-type SecureDestination = Arc<tokio::sync::watch::Sender<Option<SocketAddr>>>;
+pub(crate) type SecureDestination = Arc<tokio::sync::watch::Sender<Option<SocketAddr>>>;
 
 /// Which direction of the bridge a redirected endpoint carries.
 #[derive(Clone)]
@@ -107,7 +117,7 @@ impl PipelineTarget {
     /// actor is rebuilt by every renegotiation of the call: without a copy here, the rebuilt actor
     /// would sit pending forever waiting for a handshake the peer has no reason to repeat (RFC 8842
     /// §5.5 — it keeps the association). The other two targets own legs that no re-offer rebuilds.
-    fn key(
+    pub(crate) fn key(
         &self,
         leg: SecureLeg,
         retained: &DashMap<EndpointId, Arc<Mutex<SecureLeg>>>,
@@ -198,19 +208,6 @@ struct Flow {
     /// Where RTCP decrypted on this flow goes when the plain peer has a separate RTCP port: that
     /// endpoint and the peer's RTCP address. `None` sends RTCP wherever RTP goes.
     rtcp_out: Option<(EndpointId, SocketAddr)>,
-}
-
-/// Block until the leg's destination is decided. Returns `Err` if the leg is torn down first (every
-/// sender dropped), so the handshake task exits instead of waiting forever.
-async fn wait_for_destination(
-    mut gate: tokio::sync::watch::Receiver<Option<SocketAddr>>,
-) -> Result<SocketAddr, tokio::sync::watch::error::RecvError> {
-    loop {
-        if let Some(destination) = *gate.borrow_and_update() {
-            return Ok(destination);
-        }
-        gate.changed().await?;
-    }
 }
 
 /// Copy an ICE-gated leg's validated source into its DTLS destination for as long as the association
@@ -305,7 +302,10 @@ pub struct PlainRtcp {
 pub struct DtlsBridge<D: Datapath> {
     datapath: D,
     flows: DashMap<EndpointId, Flow>,
-    sessions: DashMap<EndpointId, Vec<JoinHandle<()>>>,
+    /// Per secure endpoint, the single task driving its DTLS association (see `dtls_session.rs`).
+    /// One task, not two: the sans-I/O session is fed and drained by the same loop, and it outlives
+    /// the handshake so a repeated peer flight can still be answered.
+    sessions: DashMap<EndpointId, JoinHandle<()>>,
     /// Per ICE-gated secure endpoint, the task that follows its validated source into its destination.
     /// Kept apart from the session so a renegotiation can start, replace or stop it while the
     /// association it re-points keeps running.
@@ -322,16 +322,14 @@ pub struct DtlsBridge<D: Datapath> {
 }
 
 /// Dropping the bridge aborts every session it still owns, as per-call teardown does through
-/// `retire`. Dropping the `JoinHandle`s alone would only detach those tasks, and a
-/// pending handshake whose transport channels went with the bridge does not end: the DTLS connection's
-/// reader retries every read that fails at once, and a passive handshake has no timeout to stop it.
-/// That keeps a worker busy for good, so a runtime shutting down, as the engine's does, never finishes.
+/// `retire`. Dropping the `JoinHandle`s alone would only *detach* those drivers, leaving each one
+/// awaiting records for an endpoint nobody can reach any more — and a driver that has keyed holds its
+/// association open for the retention window on top of that, so a runtime shutting down, as the
+/// engine's does, would wait on tasks that have no reason to end.
 impl<D: Datapath> Drop for DtlsBridge<D> {
     fn drop(&mut self) {
         for session in &self.sessions {
-            for task in session.value() {
-                task.abort();
-            }
+            session.value().abort();
         }
         for follower in &self.followers {
             follower.value().abort();
@@ -355,14 +353,12 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
     }
 
     /// Abort and forget the session currently owning `secure_endpoint` — the displaced half of a
-    /// re-registration, and part of teardown. Dropping the [`JoinHandle`]s alone only *detaches*
-    /// those tasks: the old handshake and record drain would keep running against the same endpoint,
-    /// unreachable and forever.
+    /// re-registration, and part of teardown. Dropping the [`JoinHandle`] alone only *detaches* the
+    /// driver: it would keep pumping the old association against the same endpoint, unreachable and
+    /// forever, and would still be answering retransmissions for a leg that no longer exists.
     fn retire(&self, secure_endpoint: EndpointId) {
-        if let Some((_, tasks)) = self.sessions.remove(&secure_endpoint) {
-            for task in tasks {
-                task.abort();
-            }
+        if let Some((_, task)) = self.sessions.remove(&secure_endpoint) {
+            task.abort();
         }
         self.follow(secure_endpoint, None, None);
         self.associations.remove(&secure_endpoint);
@@ -549,57 +545,22 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         // Undecided until ICE selects a pair on a gated leg; fixed from the start otherwise.
         let initial = (!plan.gate_on_ice).then_some(plan.secure_dst);
         let destination: SecureDestination = Arc::new(tokio::sync::watch::Sender::new(initial));
-        let (transport, channels) = DtlsTransport::new(plan.secure_local, plan.secure_dst);
-        let dtls_in = channels.inbound;
+        // Bounded so a stalled association cannot grow an unbounded queue. `handle` drops the newest
+        // on a full mailbox, which for a handshake just triggers a DTLS retransmission.
+        let (dtls_in, inbound) = flume::bounded(INBOUND_CAPACITY);
 
-        // Drain outbound DTLS records to the peer via the secure endpoint. Ends when the transport is
-        // dropped (post-handshake) or the session is aborted. The destination is read per record, so
-        // records emitted after ICE re-points the leg go to the selected pair.
-        let drain = {
-            let datapath = self.datapath.clone();
-            let outbound = channels.outbound;
-            let secure_endpoint = plan.secure_endpoint;
-            let destination = destination.clone();
-            tokio::spawn(async move {
-                while let Ok(record) = outbound.recv_async().await {
-                    let Some(dst) = *destination.borrow() else {
-                        // No pair yet: a record produced before ICE decided has nowhere legitimate to
-                        // go. Dropping it is correct — the handshake has not started either.
-                        continue;
-                    };
-                    if let Err(error) = datapath.send(secure_endpoint, dst, &record).await {
-                        tracing::debug!(%error, "DTLS record send failed");
-                    }
-                }
-            })
-        };
-
-        // Drive the handshake; install the SecureLeg on success.
-        let shake = {
-            let secure = secure.clone();
-            let certificate = plan.certificate;
-            let role = plan.role;
-            let peer_fingerprint = plan.peer_fingerprint;
-            let gate = destination.subscribe();
-            tokio::spawn(async move {
-                // RFC 8445 §12: wait for ICE to choose the path before keying it.
-                if let Err(error) = wait_for_destination(gate).await {
-                    tracing::debug!(%error, "DTLS leg torn down before ICE selected a pair");
-                    return;
-                }
-                match handshake(Arc::new(transport), &certificate, role, &peer_fingerprint).await {
-                    Ok(leg) => {
-                        if let Ok(mut guard) = secure.lock() {
-                            *guard = Some(leg);
-                        }
-                        tracing::info!("DTLS-SRTP handshake complete; secure leg installed");
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "DTLS-SRTP handshake failed; media stays dropped");
-                    }
-                }
-            })
-        };
+        let session = spawn_session(DriverPlan {
+            datapath: self.datapath.clone(),
+            secure_endpoint: plan.secure_endpoint,
+            destination: destination.clone(),
+            inbound,
+            certificate: plan.certificate,
+            role: plan.role,
+            peer_fingerprint: plan.peer_fingerprint,
+            outcome: SessionOutcome::Relay {
+                secure: secure.clone(),
+            },
+        });
 
         // A new association can come with a different plain RTCP layout: drop the flow on a port the
         // plain peer no longer uses. Read first, so no map guard is held across the removal.
@@ -655,8 +616,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 rtcp_out: plan.plain_rtcp.map(|rtcp| (rtcp.endpoint, rtcp.dst)),
             },
         );
-        self.sessions
-            .insert(plan.secure_endpoint, vec![drain, shake]);
+        self.sessions.insert(plan.secure_endpoint, session);
         self.follow(
             plan.secure_endpoint,
             plan.ice_validated,
@@ -693,66 +653,24 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         );
         let initial = (!plan.gate_on_ice).then_some(plan.secure_dst);
         let destination: SecureDestination = Arc::new(tokio::sync::watch::Sender::new(initial));
-        let (transport, channels) = DtlsTransport::new(plan.secure_local, plan.secure_dst);
-        let dtls_in = channels.inbound;
+        let (dtls_in, inbound) = flume::bounded(INBOUND_CAPACITY);
         let keyed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let drain = {
-            let datapath = self.datapath.clone();
-            let outbound = channels.outbound;
-            let secure_endpoint = plan.secure_endpoint;
-            let destination = destination.clone();
-            tokio::spawn(async move {
-                while let Ok(record) = outbound.recv_async().await {
-                    let Some(dst) = *destination.borrow() else {
-                        continue; // no ICE-selected pair yet — the handshake has not started either
-                    };
-                    if let Err(error) = datapath.send(secure_endpoint, dst, &record).await {
-                        tracing::debug!(%error, "DTLS record send failed");
-                    }
-                }
-            })
-        };
-
-        let shake = {
-            let certificate = plan.certificate;
-            let role = plan.role;
-            let peer_fingerprint = plan.peer_fingerprint;
-            let gate = destination.subscribe();
-            let keyed = keyed.clone();
-            let target = target.clone();
-            let retained = self.pipeline_keys.clone();
-            let secure_endpoint = plan.secure_endpoint;
-            tokio::spawn(async move {
-                // RFC 8445 §12: key the path ICE chose, not the signalled one.
-                if let Err(error) = wait_for_destination(gate).await {
-                    tracing::debug!(%error, "DTLS leg torn down before ICE selected a pair");
-                    return;
-                }
-                match handshake(Arc::new(transport), &certificate, role, &peer_fingerprint).await {
-                    Ok(leg) => {
-                        // Key the actor before releasing media, so its mailbox holds the key first.
-                        if target.key(leg, &retained, secure_endpoint) {
-                            keyed.store(true, std::sync::atomic::Ordering::SeqCst);
-                            tracing::info!(
-                                target: "siphon_rtp::media",
-                                "DTLS-SRTP handshake complete; slow path keyed"
-                            );
-                        } else {
-                            // The owner went away mid-handshake: leave the leg unkeyed so media keeps
-                            // being dropped rather than reaching a consumer that never got the key.
-                            tracing::warn!(
-                                target: "siphon_rtp::media",
-                                "DTLS-SRTP handshake completed but its actor is gone; media stays dropped"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "DTLS-SRTP handshake failed; media stays dropped");
-                    }
-                }
-            })
-        };
+        let session = spawn_session(DriverPlan {
+            datapath: self.datapath.clone(),
+            secure_endpoint: plan.secure_endpoint,
+            destination: destination.clone(),
+            inbound,
+            certificate: plan.certificate,
+            role: plan.role,
+            peer_fingerprint: plan.peer_fingerprint,
+            outcome: SessionOutcome::Pipeline {
+                target: target.clone(),
+                keyed: keyed.clone(),
+                retained: self.pipeline_keys.clone(),
+                secure_endpoint: plan.secure_endpoint,
+            },
+        });
 
         self.flows.insert(
             plan.secure_endpoint,
@@ -773,8 +691,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 rtcp_out: None,
             },
         );
-        self.sessions
-            .insert(plan.secure_endpoint, vec![drain, shake]);
+        self.sessions.insert(plan.secure_endpoint, session);
         self.follow(
             plan.secure_endpoint,
             plan.ice_validated,
@@ -1198,7 +1115,6 @@ mod tests {
 
     use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
     use siphon_rtp_datapath::FlowAction;
-    use siphon_rtp_dtls::DtlsChannels;
     use tokio::net::UdpSocket;
     use tokio::time::timeout;
 
@@ -1214,36 +1130,60 @@ mod tests {
         packet
     }
 
-    /// Bridge B's socket to a DTLS transport: pump inbound datagrams in, outbound records out to
-    /// `engine_secure`. Returns the transport plus the two pump tasks.
-    fn pump(
+    /// Drive B's side of a handshake over its socket until it keys, and return its [`SecureLeg`].
+    ///
+    /// Sans-I/O, so this is one loop rather than a transport plus two pump tasks. B is the DTLS
+    /// **client** in these tests, so it needs no post-key retention: the engine owns the last flight
+    /// in that direction (RFC 6347 §4.2.4).
+    async fn peer_handshake(
         socket: Arc<UdpSocket>,
-        channels: DtlsChannels,
         engine_secure: SocketAddr,
-    ) -> (JoinHandle<()>, JoinHandle<()>) {
-        let recv_socket = socket.clone();
-        let inbound = channels.inbound;
-        let reader = tokio::spawn(async move {
-            let mut buffer = [0u8; 2048];
-            while let Ok((len, _)) = recv_socket.recv_from(&mut buffer).await {
-                if inbound
-                    .send_async(Bytes::copy_from_slice(&buffer[..len]))
+        peer_cert: &siphon_rtp_dtls::DtlsCertificate,
+        engine_fingerprint: &Fingerprint,
+    ) -> SecureLeg {
+        use std::time::Instant;
+
+        let mut session = siphon_rtp_dtls::DtlsSession::new(
+            peer_cert,
+            DtlsRole::Client,
+            engine_fingerprint.clone(),
+            Duration::from_millis(200),
+        )
+        .expect("peer session");
+        session.start(Instant::now()).expect("peer first flight");
+        while let Some(record) = session.poll_transmit() {
+            socket
+                .send_to(&record, engine_secure)
+                .await
+                .expect("peer send");
+        }
+
+        let mut buffer = [0u8; 2048];
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        while Instant::now() < deadline && !session.is_keyed() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait = session.poll_timeout().map_or(remaining, |at| {
+                at.saturating_duration_since(Instant::now()).min(remaining)
+            });
+            match timeout(wait, socket.recv_from(&mut buffer)).await {
+                Ok(Ok((len, _))) => {
+                    session
+                        .handle_datagram(Instant::now(), &buffer[..len])
+                        .expect("peer accepts the record");
+                }
+                _ => session.handle_timeout(Instant::now()).expect("peer timer"),
+            }
+            while let Some(record) = session.poll_transmit() {
+                socket
+                    .send_to(&record, engine_secure)
                     .await
-                    .is_err()
-                {
-                    break;
-                }
+                    .expect("peer send");
             }
-        });
-        let outbound = channels.outbound;
-        let writer = tokio::spawn(async move {
-            while let Ok(record) = outbound.recv_async().await {
-                if socket.send_to(&record, engine_secure).await.is_err() {
-                    break;
-                }
-            }
-        });
-        (reader, writer)
+        }
+        session
+            .keying()
+            .map(|keying| keying.to_secure_leg())
+            .expect("the peer's DTLS handshake completed")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1301,23 +1241,13 @@ mod tests {
         });
 
         // Drive B's side of the DTLS handshake (client) over its socket.
-        let (b_transport, b_channels) = DtlsTransport::new(addr_b, secure.local_addr);
-        let (b_reader, b_writer) = pump(peer_b.clone(), b_channels, secure.local_addr);
-        let mut peer_leg = timeout(
-            HANDSHAKE_TIMEOUT,
-            handshake(
-                Arc::new(b_transport),
-                &peer_cert,
-                DtlsRole::Client,
-                &engine_cert.fingerprint(),
-            ),
+        let mut peer_leg = peer_handshake(
+            peer_b.clone(),
+            secure.local_addr,
+            &peer_cert,
+            &engine_cert.fingerprint(),
         )
-        .await
-        .expect("handshake did not time out")
-        .expect("peer handshake");
-        // The pump only carries the handshake; stop it so the test owns peer_b's socket for media.
-        b_reader.abort();
-        b_writer.abort();
+        .await;
 
         // B → engine: SRTP media, decrypted and relayed to phone A.
         // Retry to absorb the tiny window between B finishing and the engine installing its leg.
@@ -1489,22 +1419,13 @@ mod tests {
             }
         });
 
-        let (b_transport, b_channels) = DtlsTransport::new(addr_b, secure.local_addr);
-        let (b_reader, b_writer) = pump(peer_b.clone(), b_channels, secure.local_addr);
-        let mut peer_leg = timeout(
-            HANDSHAKE_TIMEOUT,
-            handshake(
-                Arc::new(b_transport),
-                &peer_cert,
-                DtlsRole::Client,
-                &engine_cert.fingerprint(),
-            ),
+        let mut peer_leg = peer_handshake(
+            peer_b.clone(),
+            secure.local_addr,
+            &peer_cert,
+            &engine_cert.fingerprint(),
         )
-        .await
-        .expect("handshake did not time out")
-        .expect("peer handshake");
-        b_reader.abort();
-        b_writer.abort();
+        .await;
 
         // B → engine: SRTCP, relayed onto A's RTCP port in the clear. Retry to absorb the window
         // between B finishing and the engine installing its leg.

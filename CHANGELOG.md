@@ -7,6 +7,26 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Changed
+
+- **DTLS-SRTP now runs on a sans-I/O stack, and a lost last flight no longer strands a call.** RFC 6347
+  §4.2.4 makes the sender of the last handshake flight responsible for retransmitting it: that side
+  cannot know its flight arrived, so when the peer repeats its own final flight, the last flight has to
+  be sent again. The engine never did. When it was the DTLS **server** and its flight 6
+  (ChangeCipherSpec + Finished) was lost, the peer retransmitted until it gave up while the engine
+  considered the handshake complete and exported its keying material — a call that is up, carries no
+  media, and logs nothing. Neither the previous DTLS implementation nor its successor can do this
+  unaided (both complete their state machine and stop re-entering it), and replaying the cached records
+  verbatim does not work either, because the peer's replay window (§4.1.2.6) drops them: a conforming
+  retransmission needs fresh record sequence numbers from the state machine. The DTLS crate was
+  therefore rebuilt on a sans-I/O handshake the engine drives itself — one task per leg instead of two
+  detached ones — so the association outlives its handshake and answers repeats for 60 s after keying,
+  rate limited to one flight per 200 ms per leg. The fix itself is carried as a patched dependency and
+  has been filed upstream. Along the way the association is now addressed by a fixed internal key, so
+  an ICE re-point moves where records are sent without ever starting a second handshake, and a second
+  completion can no longer re-key a live leg (which would have restarted its SRTP rollover counters
+  mid-call, RFC 3711 §3.3.1).
+
 ### Fixed
 
 - **Dropping a conference seat now retires its DTLS bridge registration.** A DTLS seat registers a

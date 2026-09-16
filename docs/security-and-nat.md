@@ -694,7 +694,7 @@ Everything after that belongs to the per-call `MediaCall` actor:
 | Sub-stream (RFC 7983) | Handled by |
 |---|---|
 | STUN | the ICE responder / agent (Layer 4) |
-| DTLS | the handshake task in `dtls_bridge.rs` |
+| DTLS | the leg's **session driver** (`dtls_session.rs`) — one task per leg, not two |
 | SRTP / SRTCP media | forwarded **still encrypted** to the `MediaCall` actor, which decrypts on its own `secure_ingress` |
 
 Forwarding media encrypted — rather than decrypting in the bridge and passing plaintext on — keeps a
@@ -719,6 +719,26 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
   published to the bridge. Because the actor's mailbox is FIFO and the bridge releases no media until
   that flag is set, the key is always already queued ahead of the first media packet. A handshake
   that completes after the call is gone leaves the leg unkeyed, so media keeps being dropped.
+- **The association outlives its handshake, because RFC 6347 §4.2.4 requires it.** The sender of the
+  last flight cannot know it arrived, so when the peer repeats its own final flight, ours has to be
+  sent again. The previous stack could not: its handshake future returned at completion and took with
+  it the only thing that could have re-sent that flight, so a lost flight 6 left a DTLS **server**
+  keyed while the peer retransmitted until it gave up — a call that is up, carries no media, and logs
+  nothing. The leg's driver now holds the association for 60 s after keying, restarted whenever a
+  repeat is answered, and post-handshake records still reach it. Answers are limited to one flight per
+  200 ms per leg. That limit is a CPU guard, **not** an anti-amplification one: the source is already
+  gated twice (Layer 4, then the bridge's own `accepted_source`) and our last flight is *smaller* than
+  the certificate-bearing flight that triggers it, so the factor is below one. It sits on the response
+  side rather than on intake, because throttling intake would starve the retransmission we owe.
+- **One association, whatever the source.** The driver addresses its association by a fixed internal
+  key rather than by the peer's address, so an ICE re-point moves where records are *sent* without
+  starting a second handshake — and a second handshake is exactly what a silent, healthy-looking call
+  is made of. Feeding it a moved-but-already-gated source is safe because the record MAC and epoch
+  authenticate the records themselves; the corollary is that the source gate and the RFC 7983 demux
+  must run **before** the driver sees a datagram, which is where the bridge applies them.
+- **Completion keys once.** Answering a retransmitted last flight can report completion a second time.
+  Re-deriving would install fresh SRTP contexts and restart their rollover counters mid-call
+  (RFC 3711 §3.3.1), so the session keys exactly once and any later completion is ignored.
 - **Source gate and latch (RTPBleed, restated).** Unchanged and applied twice: the bridge re-enforces
   the signalled-source gate before the demux (`Redirect` bypasses the datapath's Forward-path gate),
   and the actor re-enforces it again per direction before any decode. The SSRC-consistent latch still

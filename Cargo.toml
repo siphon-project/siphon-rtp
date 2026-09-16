@@ -120,3 +120,23 @@ tikv-jemalloc-ctl = { version = "0.6", features = [
 [profile.release]
 debug = true
 strip = false
+
+# rtc-dtls cannot retransmit its last handshake flight: `send()` arms no retransmit timer for it,
+# `Endpoint::handle_timeout` gates its only `handshake_timeout` call behind
+# `!is_handshake_completed()`, and `Endpoint::read` re-enters the state machine only while the
+# handshake is incomplete — so the `// Retransmit last flight` branch is unreachable and a completed
+# DTLS server answers a repeated peer flight with nothing. RFC 6347 §4.2.4 requires the last-flight
+# sender to re-send, and a verbatim replay of the cached records would be dropped by the peer's replay
+# window (§4.1.2.6), so the retransmission has to come from the state machine. Filed upstream as
+# webrtc-rs/rtc#243; this pin carries it until that merges, after which the pin (and the `allow-git`
+# entry it needs in deny.toml) comes out again.
+#
+# The siblings are patched from the same source on purpose. A patched `rtc-dtls` depends on
+# `rtc-shared`/`rtc-crypto` by path *inside* that repository, so patching only `rtc-dtls` leaves two
+# copies of each sibling in the graph — one from crates.io, one from git — at the same version but
+# from different sources, which makes them distinct crates whose types do not unify (`expected
+# TransportProtocol, found TransportProtocol`). Patching all three keeps exactly one copy of each.
+[patch.crates-io]
+rtc-dtls = { git = "https://github.com/killdashnine/rtc", branch = "fix/dtls-last-flight-retransmit" }
+rtc-shared = { git = "https://github.com/killdashnine/rtc", branch = "fix/dtls-last-flight-retransmit" }
+rtc-crypto = { git = "https://github.com/killdashnine/rtc", branch = "fix/dtls-last-flight-retransmit" }
