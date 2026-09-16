@@ -3,7 +3,7 @@
 //! (`UDP/TLS/RTP/SAVPF`) leg, e.g. a WebRTC browser bridged to a PSTN side.
 //!
 //! Structurally it is the [`crate::srtp_bridge::SrtpBridge`] with a handshake in front. On register,
-//! one task per leg drives the association ([`crate::dtls_session`]) over the datapath's `Redirect`
+//! one task per leg drives the association (the driver in `dtls_session.rs`) over the `Redirect`
 //! path: inbound DTLS records (the ones the RFC 7983 demux classifies [`PacketClass::Dtls`]) are fed
 //! to it and the records it wants sent go out via [`Datapath::send`]. Until the handshake completes
 //! there is no [`SecureLeg`], so media is dropped; once it does, both directions relay exactly as the
@@ -302,9 +302,9 @@ pub struct PlainRtcp {
 pub struct DtlsBridge<D: Datapath> {
     datapath: D,
     flows: DashMap<EndpointId, Flow>,
-    /// Per secure endpoint, the single task driving its DTLS association (see
-    /// [`crate::dtls_session`]). One task, not two: the sans-I/O session is fed and drained by the
-    /// same loop, and it outlives the handshake so a repeated peer flight can still be answered.
+    /// Per secure endpoint, the single task driving its DTLS association (see `dtls_session.rs`).
+    /// One task, not two: the sans-I/O session is fed and drained by the same loop, and it outlives
+    /// the handshake so a repeated peer flight can still be answered.
     sessions: DashMap<EndpointId, JoinHandle<()>>,
     /// Per ICE-gated secure endpoint, the task that follows its validated source into its destination.
     /// Kept apart from the session so a renegotiation can start, replace or stop it while the
