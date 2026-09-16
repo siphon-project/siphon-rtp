@@ -5,7 +5,7 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.7.2] — 2026-09-16
 
 ### Fixed
 
@@ -47,7 +47,6 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   source ICE validated, and a kept association follows the validated source of whatever ICE session its
   renegotiation settled on. A secure WebSocket takeover runs ICE only under a full agent, whose
   selection it already waited for.
-
 - **An ICE-lite conference seat is sent the mix at the transport its connectivity check validated.**
   Only a full-agent seat was re-pointed when ICE chose (`ConferenceControl::IceSelected`); an ice-lite
   seat has no agent to choose at all, so the room kept aiming its mix at the `c=` the participant
