@@ -1191,12 +1191,35 @@ Distinct from the media latch but part of the same security surface.
   `PoolExhausted`, so `offer` fails cleanly and frees the ports on `delete` instead of exhausting
   host FDs. **Remaining:** a **per-client quota** (needs control-client identity) and wiring the cap
   to daemon config.
-- **Control authz.** **Landed:** every call is owned by the `ClientId` of the control connection
-  that created it via `offer`; `answer` / `query` / `delete` from any other client see the call as
-  unknown (so a client cannot tear down, inspect, or even probe for a call it does not own). The
-  engine threads `ClientId` from the server, which assigns one per accepted connection. **Caveat:**
-  this binds identity to the *connection*; it assumes one persistent control connection per SIPhon
-  instance. A shared identity across a connection pool needs the deferred control-channel auth.
+- **Control authz.** **Landed:** every call is owned by the `ClientId` of the control client that
+  created it via `offer`; `answer` / `query` / `delete` from any other client see the call as
+  unknown (so a client cannot tear down, inspect, or even probe for a call it does not own), and
+  `list` returns only the caller's own calls.
+- **Control-client identity survives a reconnect.** **Landed:** `Authenticate` carries an optional
+  `controller_id`, the stable identity of the controller *process*. The server resolves it to a
+  `ClientId` — minted from the connection's own ordinal on first sight, returned unchanged on every
+  later connection — so a reconnect re-attaches to the calls, the event sink and the quota row it
+  already owned. A connection that presents no id keeps connection-scoped identity, which is the
+  previous behaviour exactly.
+  This is not a restart-only concern: the controller reconnects with backoff for the life of its
+  process, and identity bound to the socket meant a TCP blip stranded every call that was live at
+  that moment — `delete` answered `unknown call` so signalling could never tear the call down, a
+  re-INVITE could not be renegotiated, the call-id was poisoned for the life of the dialog, and the
+  `CallSummary` media CDR was pushed to a client that had gone. Ports, FDs and pipelines then stayed
+  held until the idle reaper found them, and an orphan whose media still flowed was never idle.
+  **Every scope is unchanged:** `list` and `delete` stay owner-scoped, and no all-scope variant of
+  either exists — widening them would let one node delete another node's live calls on a shared
+  engine. Once identity is stable the existing owner-scoped `list` is exactly the enumeration a
+  controller's startup orphan reap needs, and it is safe on a shared engine by construction.
+  A controller id is an **identity claim, not a credential**: where a secret is configured it is
+  honoured only on a connection that presented the matching token; where none is configured any
+  client can claim any id, which is the posture the whole control plane already has without a
+  secret (see *Channel security* below for what closes that). It is claimed once per connection,
+  never over live calls, and is bounded in length — the engine retains a row per identity for as
+  long as that identity owns calls, and drops it as soon as no connection is attached and no call is
+  left under it. **Remaining:** one live connection per identity — a second closes the first, newest
+  wins, logged at `warn`. A genuine controller *pool* sharing one identity needs the event sink to
+  become a set.
 - **Channel security.** **Landed:** optional shared-secret authentication — when
   `$SIPHON_RTP_CONTROL_SECRET` is set, or `--control-secret-file` /
   `$SIPHON_RTP_CONTROL_SECRET_FILE` names a file holding the secret, a control connection must send
