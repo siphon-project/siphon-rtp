@@ -64,15 +64,26 @@ callee — is now wired in three places:
   [A secure caller toward a plain callee](#a-secure-caller-toward-a-plain-callee).
 
 Three shapes are refused rather than half-carried, each because the media path
-behind it is not built:
+behind it is not built. **Which verb refuses matters**, so each says:
 
-- **both parties secure** — a transcrypt between two different keys;
+- **both parties secure** — a transcrypt between two different keys. Refused on
+  the **`offer`**. The far leg's security comes from the offer's own
+  `transport_protocol`, so the engine knows this before it hands back an SDP, and
+  declines there rather than after the callee has rung and answered. The same
+  applies to an SDES caller aimed at a DTLS far leg, which needs two keying
+  mechanisms bridged rather than two keys;
 - **a codec mismatch** on a secure caller — its `SecureLeg` would have to be
-  threaded into the transcoding pipeline;
+  threaded into the transcoding pipeline. Refused on the **`answer`**, because
+  only the answer names the callee's codec. Likewise a `record_call`,
+  `noise_suppression`, `echo_cancellation` or `beep_detection` flag that first
+  appears on the answer profile;
 - a **DTLS-SRTP (WebRTC) offerer** on `answer_local` — it needs a full ICE agent
   on the promoted leg. It is answered `secure-offerer-unsupported`, naming DTLS.
   On the two-party relay a DTLS caller toward a plain callee *is* terminated; see
   [WebRTC legs](webrtc.md#a-webrtc-caller-toward-a-plain-callee).
+
+Every one of them carries the stable `secure-offerer-unsupported` token, so a
+controller can match on it without parsing the sentence that follows.
 
 ## Native JSON exchange
 

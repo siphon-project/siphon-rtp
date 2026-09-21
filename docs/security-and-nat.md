@@ -557,6 +557,21 @@ is wrong, and encryption defeats A2 eavesdrop.
 > one is a new association the bridge handshakes afresh (RFC 8842 §3.1), and a re-offer or answer from
 > the caller without a fingerprint is refused. Neither the offer, the answer nor either direction of a
 > renegotiation ever presents the caller's keying to the callee.
+>
+> **An SDES-SRTP offerer toward a secure far leg is refused on the `offer`, not the `answer`**
+> (`engine/src/engine/offer.rs`, `offer_security`). It is the SDES mirror of the DTLS refusal above,
+> and where it is decided is part of the security posture rather than an ergonomic detail. The far
+> leg's security (`Call.far_local_crypto` / `Call.far_dtls`) is settled from the **offer's** own
+> `transport_protocol` and merely read back at the answer, so the predicate an answer would test is
+> already true when the offer is handled. Deciding it at the answer meant the engine handed out an
+> SDP, the callee rang and picked up, and only then was the call torn down — a refusal that arrives
+> after both parties are in conversation is worse than the same refusal before either is disturbed,
+> and it tempts a controller into passing the media through unanchored to make the symptom go away.
+> The answer's `settle_secure_offerer` keeps the cases only the answer can know: the two legs'
+> codecs differing, a decode-forcing flag (`record_call`, `noise_suppression`, `echo_cancellation`,
+> `beep_detection`) first named on the answer profile, and a renegotiation that changes the posture.
+> An SDES caller aimed at a **DTLS** far leg is refused the same way and stays refused: that needs
+> two keying mechanisms bridged, not two keys.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The

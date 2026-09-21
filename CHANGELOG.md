@@ -9,6 +9,23 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Changed
 
+- **A secure caller toward a secure callee is now refused on the `offer`, not the `answer`.** The
+  engine does not bridge two SDES-SRTP parties — that needs a transcrypt between two different keys,
+  and the A-facing `SecureLeg` is not threaded into the media path yet — but it was deciding that one
+  verb too late. `resolve_pipeline` runs at the answer, so an SRTP caller dialling an SRTP callee got
+  an SDP back, the callee rang, the callee picked up, and only then did the call collapse with
+  `secure-offerer-unsupported` and a 500 to a caller who was already saying hello. Nothing about the
+  decision needed the answer: the far leg's security is settled from the **offer's** own
+  `transport_protocol` and stored on the call, so the predicate the answer tested was already true
+  when the offer was handled. The `offer` now returns that refusal and creates no call, which also
+  removes the incentive to paper over the symptom by relaying the pair unanchored. An SDES caller
+  aimed at a DTLS far leg is refused there too, and stays refused: that one needs two keying
+  mechanisms bridged rather than two keys. The answer keeps the cases only an answer can know — the
+  two legs' codecs differing, a `record_call` / `noise_suppression` / `echo_cancellation` /
+  `beep_detection` flag first named on the answer profile, and a renegotiation that changes the
+  posture. The `secure-offerer-unsupported` token is unchanged, so a controller matching on it needs
+  no edit; only the verb that carries it moves.
+
 - **DTLS-SRTP now runs on a sans-I/O stack, and a lost last flight no longer strands a call.** RFC 6347
   §4.2.4 makes the sender of the last handshake flight responsible for retransmitting it: that side
   cannot know its flight arrived, so when the peer repeats its own final flight, the last flight has to
