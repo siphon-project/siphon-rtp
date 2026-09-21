@@ -359,7 +359,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // it ends, say so once — a detach that beat it to the latch has already reported `Detached`.
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let bridge_task = {
-            let events = self.events.get(&owner).map(|sink| sink.value().clone());
+            let events = self.event_sink(owner);
             let call_id = call_id.to_string();
             let from_tag = from_tag.clone();
             let stream_id = stream_id.clone();
@@ -838,10 +838,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // so the two race, and the task would win often enough to report a controller's detach or a
         // re-point as `call_ended`. The reason a caller states is authoritative; the task's own is
         // for the ends nobody asked for.
-        let events = self
-            .events
-            .get(&bridge.owner)
-            .map(|sink| sink.value().clone());
+        let events = self.event_sink(bridge.owner);
         emit_ws_bridge_ended(
             events.as_ref(),
             &bridge.ended,

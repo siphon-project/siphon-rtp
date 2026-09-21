@@ -64,10 +64,46 @@ Two more per-connection guards apply regardless of auth:
 - A token-bucket rate cap (`--max-control-rps`, default 200 requests/second, 0 disables).
   A breach is answered `{"result": "error", "reason": "rate limit exceeded"}` before any
   work is done.
-- Ownership: a call is private to the connection that created it. `query`, `delete`,
-  `checkpoint`, and the media-control verbs on someone else's call answer as if the call
-  did not exist, and `list` returns only your own calls. See
-  [Security and NAT](../security-and-nat.md) for the threat model.
+- Ownership: a call is private to the client that created it — the connection, unless it
+  presented a `controller_id` (below). `query`, `delete`, `checkpoint`, and the
+  media-control verbs on someone else's call answer as if the call did not exist, and `list`
+  returns only your own calls. See [Security and NAT](../security-and-nat.md) for the threat
+  model.
+
+## Controller identity
+
+`authenticate` carries an optional `controller_id` — the stable identity of the controller
+*process*, not of the connection:
+
+```json
+{"id": 0, "command": "authenticate", "token": "the-shared-secret", "controller_id": "sbc-1"}
+```
+
+Present it and the engine resolves it to the same internal client identity on every
+connection, so a reconnect re-attaches to the calls that identity already owns, to its event
+stream and to its quota. Omit it and identity is the connection, which is the behaviour of
+every client built before the field existed: those calls become unreachable the moment the
+socket drops, `delete` answers `unknown call`, and their `call_summary` CDRs are lost.
+
+Send `authenticate` **unconditionally** when a controller id is configured, including when
+the engine has no secret — otherwise the id is never presented and the reconnect gets a fresh
+identity. With no secret the `token` is ignored.
+
+Derive the id from something that outlives both the connection and the process (a pod or host
+name) and never mix in a boot epoch or a PID, which defeats the point. Rules:
+
+- Claimed once per connection: re-presenting the same id is a no-op, a different one is
+  refused. It cannot be claimed by a connection that has already created calls.
+- At most 128 bytes and not empty.
+- It is an identity claim, not a credential. Where a secret is configured the engine honours
+  it only on a connection that presented the matching token; where none is configured any
+  client can claim any id, exactly as any client can already reach the whole control plane.
+- One live connection per identity. A second connection claiming an identity that is already
+  attached takes it, and the older connection is closed. A real controller pool sharing one
+  identity is not supported yet.
+
+Ownership is unaffected: a stable identity does not widen `list` or `delete`, so a controller
+still sees and deletes only its own calls, and a shared engine stays safe to enumerate.
 
 ## Request catalogue
 

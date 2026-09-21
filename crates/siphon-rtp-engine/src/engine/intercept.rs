@@ -209,7 +209,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let counters = factory.counters().clone();
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let transport = {
-            let events = self.events.get(&owner).map(|sink| sink.value().clone());
+            let events = self.event_sink(owner);
             let task = X3DeliveryTask {
                 delivery: delivery_channel,
                 address: delivery.to_string(),
@@ -321,10 +321,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // cancellation, so returning here would leave the task holding its TLS socket and its buffer.
         session.transport.abort();
         let _ = session.transport.await;
-        let events = self
-            .events
-            .get(&session.owner)
-            .map(|sink| sink.value().clone());
+        let events = self.event_sink(session.owner);
         emit_x3_ended(
             events.as_ref(),
             &session.ended,

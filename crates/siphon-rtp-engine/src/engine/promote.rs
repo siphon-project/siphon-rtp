@@ -285,7 +285,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .install_flow(*endpoint, FlowAction::Redirect)
                 .map_err(|error| format!("install processing redirect: {error}"))?;
         }
-        let owner_events = self.events.get(&owner).map(|sink| sink.value().clone());
+        let owner_events = self.event_sink(owner);
         let call = MediaCall::new(
             call_id.to_string(),
             from_tag,
@@ -570,7 +570,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .map_err(|error| format!("install text redirect: {error}"))?;
         }
         let call = TextCall::new(call_id, from_tag, to_tag, a_to_b, b_to_a, layout.latch);
-        let owner_events = self.events.get(&owner).map(|sink| sink.value().clone());
+        let owner_events = self.event_sink(owner);
         self.text
             .register(call, self.datapath.clone(), owner_events);
         Ok(())

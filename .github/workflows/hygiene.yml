@@ -52,7 +52,7 @@ jobs:
           crates/siphon-rtp-engine/src/conference.rs 2712 # large, no function over 250 lines
           crates/siphon-rtp-engine/src/sdp.rs 2171 # large, no function over 250 lines; +27 for RFC 8842 a=tls-id
           crates/siphon-rtp-dsp/src/aec.rs 2554 # one algorithm
-          crates/siphon-rtp-proto/src/lib.rs 2094 # the control contract, type definitions
+          crates/siphon-rtp-proto/src/lib.rs 2121 # the control contract, type definitions; +27 for the authenticate controller id
           crates/siphon-rtp-codec/src/opus/celt/encoder.rs 1996 # reference port
           crates/siphon-rtp-codec/src/amr/nb/enc_cb.rs 1905 # reference port
           crates/siphon-rtp-codec/src/amr/wb/enc_acelp.rs 1850 # reference port

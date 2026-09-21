@@ -51,6 +51,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             max_calls_per_client,
             client_calls: DashMap::new(),
             events: DashMap::new(),
+            next_client_generation: std::sync::atomic::AtomicU64::new(0),
+            controllers: DashMap::new(),
+            controller_ids: DashMap::new(),
             endpoint_calls: DashMap::new(),
             bridge,
             media: Arc::new(MediaRegistry::default()),
@@ -297,6 +300,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     #[must_use]
     pub fn session_count(&self) -> usize {
         self.calls.len()
+    }
+
+    /// Number of stable controller identities the engine is holding.
+    ///
+    /// A row is retained across a control disconnect only while the identity still owns calls, so
+    /// at a quiesced steady state with every call torn down this is **0**. The memory-leak soak
+    /// gates on that: the retention is what keeps a reconnect able to find its own calls, and it is
+    /// also the one thing here that a peer could otherwise make the engine remember without bound.
+    #[must_use]
+    pub fn controller_count(&self) -> usize {
+        self.controllers.len()
     }
 
     /// Live WebSocket tees — one per teed call (the `siphon_rtp_ws_tees` gauge).

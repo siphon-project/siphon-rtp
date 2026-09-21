@@ -137,6 +137,13 @@ harness = false
 name = "dtls_bridge_bench"
 harness = false
 
+# The per-connection cost of resolving a control client's stable `controller_id` to the identity
+# call ownership is keyed by: first sight, a second connection evicting the first, and the claim +
+# release lifecycle that reaps the row again.
+[[bench]]
+name = "control_identity_bench"
+harness = false
+
 [lints]
 workspace = true
 

@@ -278,7 +278,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let start = tee_start_message(&stream_id, call_id, plan.format, plan.tracks.clone());
         let transport = {
-            let events = self.events.get(&owner).map(|sink| sink.value().clone());
+            let events = self.event_sink(owner);
             let frames = plan.frames;
             let recycle = plan.recycle;
             let mixer = plan.mixer.clone();
@@ -480,7 +480,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // cancel-safe select loop, so this resolves promptly with `JoinError::Cancelled`.
         tee.transport.abort();
         let _ = tee.transport.await;
-        let events = self.events.get(&tee.owner).map(|sink| sink.value().clone());
+        let events = self.event_sink(tee.owner);
         emit_ws_tee_ended(
             events.as_ref(),
             &tee.ended,

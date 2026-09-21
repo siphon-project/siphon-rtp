@@ -466,7 +466,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text: text_config,
             routing: routing_of(role),
         };
-        let events = self.events.get(&client).map(|sink| sink.value().clone());
+        let events = self.event_sink(client);
         let joined_tick = self.datapath.now_ticks();
         // A seat that offered `a=recvonly` / `a=inactive` told us it will not send (RFC 4566 §6), so
         // the idle sweep must not read its silence as a dead path — a held seat and a listen-only
@@ -962,7 +962,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         let source_reason = Arc::new(std::sync::Mutex::new(RecordingEndReason::CallEnded));
         let writer = {
-            let events = self.events.get(&client).map(|sink| sink.value().clone());
+            let events = self.event_sink(client);
             let conference_id = conference_id.to_string();
             let recording_id = recording_id.clone();
             let path = path.clone();

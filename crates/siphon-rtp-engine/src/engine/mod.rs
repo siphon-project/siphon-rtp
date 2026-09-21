@@ -89,12 +89,95 @@ pub struct TurnServerConfig {
     pub password: String,
 }
 
-/// Identity of a control client — one persistent JSON-over-TCP connection. A call is owned by the
-/// client that created it via `offer`; only that client may answer, query, or delete it (A3 —
-/// docs/security-and-nat.md §5). This assumes one persistent control connection per SIPhon instance;
-/// a shared identity across a connection pool needs the deferred control-channel auth.
+/// Identity of a control client. A call is owned by the client that created it via `offer`; only
+/// that client may answer, query, or delete it (A3 — docs/security-and-nat.md §5).
+///
+/// A connection that presents no `controller_id` at `Authenticate` gets one of these per accepted
+/// connection, so its identity dies with the socket. A connection that does present one resolves to
+/// the `ClientId` already minted for that identity ([`Engine::attach_controller`]), so a reconnect
+/// re-attaches to the calls, the event sink and the quota row it already owned. Without that, a TCP
+/// blip strands every call that was live at the moment it happened: `delete` answers `unknown call`,
+/// a re-offer cannot renegotiate, the call-id cannot be reused, and the `CallSummary` CDR is pushed
+/// to a client that is gone.
+///
+/// Still one live connection per identity: a controller *pool* sharing one identity needs the event
+/// sink to become a set, which this does not do (the second connection wins and the first is closed).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ClientId(pub u64);
+
+/// Which registration of a [`ClientId`]'s event sink a control connection holds.
+///
+/// A reconnecting controller resolves to the *same* `ClientId` as the connection it replaces, so
+/// without this the old connection's teardown would remove the new connection's sink — and the
+/// engine would silently drop every event for that client, `CallSummary` included. Every release is
+/// therefore conditional on the generation the releasing connection registered.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ClientGeneration(u64);
+
+/// One control client's event channel, stamped with the registration that installed it.
+///
+/// The engine keeps **both** halves, and the channel belongs to the `ClientId` rather than to the
+/// connection draining it: a reconnecting controller re-registers over the same entry and gets a
+/// clone of the same receiver. That is what keeps a live call's events flowing across a control
+/// blip — the slow-path actors (media pipeline, conference, recording, WS bridge/tee, X3) are
+/// handed a *cloned sender* when their pipeline is installed and hold it for the pipeline's life,
+/// so a channel replaced underneath them would leave them emitting into a socket that is gone.
+///
+/// Bounded, so an event pushed while no connection is attached is queued for the reconnect rather
+/// than blocking the engine — and dropped once the queue fills, as it already is for a connection
+/// that cannot keep up.
+struct ClientSink {
+    generation: ClientGeneration,
+    sender: flume::Sender<Event>,
+    receiver: flume::Receiver<Event>,
+}
+
+/// A stable controller identity and the connection currently attached to it.
+struct ControllerIdentity {
+    /// The `ClientId` every connection presenting this controller id resolves to. Minted from the
+    /// ordinal of the first connection that presented it, and then fixed for the row's life.
+    client: ClientId,
+    /// The connection attached right now: the generation of the event sink it registered, and the
+    /// trigger that closes it when a newer connection claims the same identity. `None` between
+    /// connections, which is what lets [`Engine::release_client_call`] reap the row.
+    attached: Option<(ClientGeneration, crate::shutdown::ShutdownTrigger)>,
+}
+
+/// What a control connection gets back when it claims a stable controller identity.
+pub struct ControllerAttachment {
+    /// The `ClientId` every verb on the connection is keyed by from now on.
+    pub client: ClientId,
+    /// The generation to hand [`Engine::deregister_client`] / [`Engine::detach_controller`] when
+    /// the connection ends.
+    pub generation: ClientGeneration,
+    /// The event receiver, re-registered under [`Self::client`].
+    pub events: flume::Receiver<Event>,
+    /// Trips when a newer connection claims the same identity, at which point this one must close.
+    pub evicted: crate::shutdown::Shutdown,
+}
+
+/// Why a control connection's `controller_id` claim was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ControllerAttachError {
+    /// An empty id is a provisioning mistake, not an identity.
+    #[error("controller id must not be empty")]
+    Empty,
+    /// Longer than [`siphon_rtp_proto::MAX_CONTROLLER_ID_LEN`].
+    #[error(
+        "controller id must be at most {} bytes",
+        siphon_rtp_proto::MAX_CONTROLLER_ID_LEN
+    )]
+    TooLong,
+    /// The connection already created calls under its connection identity. Moving it to a stable
+    /// identity now would strand exactly those calls — the failure this whole mechanism exists to
+    /// prevent — so the claim is refused instead.
+    #[error("controller id must be claimed before the connection creates a call")]
+    CallsAlreadyOwned,
+    /// A second, different id on a connection that already claimed one. The identity decides which
+    /// calls the connection owns, so it is claimed once or not at all.
+    #[error("controller id already claimed by this connection")]
+    AlreadyClaimed,
+}
 
 /// Milliseconds since the Unix epoch by the wall clock, for reports that must line up with other
 /// network records (RFC 6035 §4.6.2.2). Never for the media-timeout sweep, which runs on the
@@ -773,8 +856,20 @@ pub struct Engine<D: Datapath> {
     max_calls_per_client: usize,
     /// Live call count per client, for the per-client quota.
     client_calls: DashMap<ClientId, usize>,
-    /// Per-client async event sinks, registered by the control server one per connection.
-    events: DashMap<ClientId, flume::Sender<Event>>,
+    /// Per-client async event channels, registered by the control server as each connection
+    /// arrives. Keyed by [`ClientId`], not by connection, so a reconnecting controller re-registers
+    /// over the same channel — see [`ClientSink`].
+    events: DashMap<ClientId, ClientSink>,
+    /// Stamps each event-sink registration so a superseded connection cannot release its
+    /// successor's sink. See [`ClientGeneration`].
+    next_client_generation: std::sync::atomic::AtomicU64,
+    /// Stable control-client identity: the `controller_id` a connection presents at `Authenticate`
+    /// → the [`ClientId`] ownership, the quota and event delivery are keyed by. A row outlives the
+    /// connection that created it, which is what makes a reconnect re-attach to its own calls.
+    controllers: DashMap<Arc<str>, ControllerIdentity>,
+    /// Reverse index of [`Self::controllers`], so releasing a client's last call can reap its
+    /// identity row once no connection is attached to it.
+    controller_ids: DashMap<ClientId, Arc<str>>,
     /// Reverse index endpoint → call-id, correlating observed RTCP back to its call (HEP telemetry).
     endpoint_calls: DashMap<EndpointId, String>,
     /// The userspace SRTP bridge: the `Redirect`-path crypto for secure (`RTP/SAVP`) legs. Shared
@@ -1002,6 +1097,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         if drained {
             self.client_calls.remove_if(&client, |_, &count| count == 0);
+            // A controller identity outlives its connection only so the calls it owns stay
+            // reachable. With the last one released there is nothing left to re-attach to, so the
+            // row goes — otherwise a control plane reachable without a secret could be made to
+            // retain one row per identity it is ever shown.
+            self.reap_detached_controller(client);
         }
     }
 

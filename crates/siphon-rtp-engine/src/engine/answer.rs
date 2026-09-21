@@ -917,7 +917,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let far = self.settle_far_rtcp_fallback(call_id, far, &info).await;
         // The owner's async event sink (DTMF events flow here from the media actor), if registered.
-        let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
+        let owner_events = self.event_sink(client);
         // Cloned up front for the secure text actor: `owner_events` is moved into the audio pipeline's
         // actor registration below, so the secure-text branch (which registers its own text actor after
         // that) takes its event sink here. `Event::Text` flows only when the controller asked for it.

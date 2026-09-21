@@ -8740,6 +8740,7 @@ async fn unsupported_command_reports_error() {
             CLIENT,
             Command::Authenticate {
                 token: "s3cret".into(),
+                controller_id: None,
             },
         )
         .await;
@@ -23640,4 +23641,397 @@ async fn blocking_a_taken_over_call_is_refused_rather_than_undoing_the_takeover(
             .expect("a send");
     }
     assert_eq!(expect_bridge_uplink(&frames).await.len(), 320);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stable control-client identity (docs/security-and-nat.md §5).
+//
+// `ClientId` used to be the accept-loop ordinal, so it died with the socket and every call that was
+// live at a control reconnect was stranded: `delete` answered `unknown call`, a re-offer could not
+// renegotiate, the call-id could not be reused, and the `CallSummary` CDR was pushed to a client
+// that was gone. A `controller_id` presented at `Authenticate` resolves to the same `ClientId`
+// across connections; every ownership scope is unchanged.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_controller_identity_resolves_to_the_same_client_across_connections() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+
+    let first = engine
+        .attach_controller("sbc-1", ClientId(100))
+        .expect("first connection claims the identity");
+    assert_eq!(
+        first.client,
+        ClientId(100),
+        "first sight mints the identity from the connection's own ordinal"
+    );
+    // The identity is kept for the sake of the calls it owns, so give it one.
+    engine
+        .handle(
+            first.client,
+            Command::Offer {
+                call_id: "up".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr, false),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    engine.deregister_client(first.client, first.generation);
+    engine.detach_controller("sbc-1", first.generation);
+
+    // A different ordinal, because it is a different connection — and the same resolved identity.
+    let second = engine
+        .attach_controller("sbc-1", ClientId(101))
+        .expect("reconnect re-attaches");
+    assert_eq!(
+        second.client,
+        ClientId(100),
+        "a reconnect resolves to the ClientId already minted for the identity"
+    );
+}
+
+#[tokio::test]
+async fn a_reconnecting_controller_still_owns_its_calls_and_a_stranger_does_not() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+
+    let first = engine
+        .attach_controller("sbc-1", ClientId(100))
+        .expect("claim");
+    let offer = engine
+        .handle(
+            first.client,
+            Command::Offer {
+                call_id: "survives".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr, false),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(matches!(offer, CmdResult::Ok { .. }));
+
+    // The connection drops with the call still up.
+    engine.deregister_client(first.client, first.generation);
+    engine.detach_controller("sbc-1", first.generation);
+
+    // A stranger presenting a different identity sees nothing — A3 holds across the reconnect, not
+    // just within a connection.
+    let stranger = engine
+        .attach_controller("sbc-2", ClientId(101))
+        .expect("claim");
+    assert_ne!(stranger.client, first.client);
+    assert_eq!(
+        engine.handle(stranger.client, Command::List).await,
+        CmdResult::List {
+            call_ids: Vec::new()
+        },
+        "another controller cannot enumerate these calls"
+    );
+    let stranger_delete = engine
+        .handle(
+            stranger.client,
+            Command::Delete {
+                call_id: "survives".into(),
+                from_tag: "a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(stranger_delete, CmdResult::Error { .. }),
+        "another controller cannot delete them either"
+    );
+
+    // The same identity, on a new connection, gets its call back — listable and deletable.
+    let second = engine
+        .attach_controller("sbc-1", ClientId(102))
+        .expect("reconnect");
+    assert_eq!(
+        engine.handle(second.client, Command::List).await,
+        CmdResult::List {
+            call_ids: vec!["survives".to_string()]
+        },
+        "the reconnect enumerates the call it owned"
+    );
+    let delete = engine
+        .handle(
+            second.client,
+            Command::Delete {
+                call_id: "survives".into(),
+                from_tag: "a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(delete, CmdResult::Ok { .. }),
+        "the reconnect can tear down the call it owned: {delete:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_call_summary_that_predates_a_reconnect_reaches_the_new_connection() {
+    // The regression test for the lost media CDR, and the one that proves the sink race is handled:
+    // the old connection's teardown must not remove the new connection's event sink.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+
+    let first = engine
+        .attach_controller("sbc-1", ClientId(100))
+        .expect("claim");
+    engine
+        .handle(
+            first.client,
+            Command::Offer {
+                call_id: "cdr".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr, false),
+                profile: Default::default(),
+            },
+        )
+        .await;
+
+    // Reconnect, with the *old* connection's teardown running after the new one has registered —
+    // the ordering that used to silence the new connection.
+    let second = engine
+        .attach_controller("sbc-1", ClientId(101))
+        .expect("reconnect");
+    engine.deregister_client(first.client, first.generation);
+    engine.detach_controller("sbc-1", first.generation);
+
+    engine
+        .handle(
+            second.client,
+            Command::Delete {
+                call_id: "cdr".into(),
+                from_tag: "a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+
+    let summary = second
+        .events
+        .try_iter()
+        .find(|event| matches!(event, Event::CallSummary { .. }))
+        .expect("the CDR for a call that predates the reconnect arrives on the new connection");
+    match summary {
+        Event::CallSummary { call_id, .. } => assert_eq!(call_id, "cdr"),
+        other => panic!("expected a call summary, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_second_connection_on_one_identity_evicts_the_first() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let first = engine
+        .attach_controller("sbc-1", ClientId(100))
+        .expect("claim");
+    assert!(
+        !first.evicted.is_cancelled(),
+        "a sole connection is never evicted"
+    );
+
+    let second = engine
+        .attach_controller("sbc-1", ClientId(101))
+        .expect("second connection");
+    assert_eq!(second.client, first.client);
+    assert!(
+        first.evicted.is_cancelled(),
+        "newest wins: the older connection is told to close"
+    );
+    assert!(!second.evicted.is_cancelled());
+}
+
+#[tokio::test]
+async fn an_evicted_connection_cannot_release_its_successors_sink() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let first = engine
+        .attach_controller("sbc-1", ClientId(100))
+        .expect("claim");
+    let second = engine
+        .attach_controller("sbc-1", ClientId(101))
+        .expect("reconnect");
+
+    // The superseded connection tears down after its replacement registered. Both releases are
+    // generation-scoped, so neither touches the live registration.
+    engine.deregister_client(first.client, first.generation);
+    engine.detach_controller("sbc-1", first.generation);
+
+    engine.push_event(
+        second.client,
+        Event::MediaTimeout {
+            call_id: "probe".into(),
+            from_tag: "a".into(),
+            reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
+        },
+    );
+    assert!(
+        matches!(second.events.try_recv(), Ok(Event::MediaTimeout { .. })),
+        "the live connection still has its event sink"
+    );
+    assert_eq!(
+        engine
+            .attach_controller("sbc-1", ClientId(102))
+            .expect("third connection")
+            .client,
+        first.client,
+        "and the identity row survived the superseded connection's detach"
+    );
+}
+
+#[tokio::test]
+async fn events_emitted_while_no_connection_is_attached_arrive_on_the_reconnect() {
+    // The slow-path actors (media pipeline, conference, recording, WS bridge/tee, X3) hold a sender
+    // cloned when their pipeline was installed, so the channel belongs to the identity rather than
+    // to the connection draining it.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+    let first = engine
+        .attach_controller("sbc-1", ClientId(100))
+        .expect("claim");
+    engine
+        .handle(
+            first.client,
+            Command::Offer {
+                call_id: "emitting".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr, false),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let pipeline_sink = engine
+        .event_sink(first.client)
+        .expect("a pipeline clones the sender when it is installed");
+
+    engine.deregister_client(first.client, first.generation);
+    engine.detach_controller("sbc-1", first.generation);
+    assert!(
+        pipeline_sink
+            .send(Event::MediaTimeout {
+                call_id: "probe".into(),
+                from_tag: "a".into(),
+                reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
+            })
+            .is_ok(),
+        "a live pipeline keeps emitting across the blip"
+    );
+
+    let second = engine
+        .attach_controller("sbc-1", ClientId(101))
+        .expect("reconnect");
+    assert!(
+        matches!(second.events.try_recv(), Ok(Event::MediaTimeout { .. })),
+        "and the reconnect drains what it emitted"
+    );
+}
+
+#[tokio::test]
+async fn a_controller_identity_is_reaped_once_nothing_depends_on_it() {
+    // The row is retained only to keep a disconnected controller's calls reachable. Without the
+    // reap, a control plane reachable without a secret would retain one row per identity shown.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+
+    let first = engine
+        .attach_controller("sbc-1", ClientId(100))
+        .expect("claim");
+    engine
+        .handle(
+            first.client,
+            Command::Offer {
+                call_id: "held".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr, false),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    engine.deregister_client(first.client, first.generation);
+    engine.detach_controller("sbc-1", first.generation);
+
+    // A call is still up, so the identity is kept: a reconnect resolves to the same ClientId.
+    assert_eq!(
+        engine
+            .attach_controller("sbc-1", ClientId(101))
+            .expect("reconnect")
+            .client,
+        first.client
+    );
+
+    // Release the last call with no connection attached, and the row goes with it.
+    let second_generation = engine.attach_controller("sbc-1", ClientId(102)).expect("x");
+    engine
+        .handle(
+            second_generation.client,
+            Command::Delete {
+                call_id: "held".into(),
+                from_tag: "a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    engine.deregister_client(second_generation.client, second_generation.generation);
+    engine.detach_controller("sbc-1", second_generation.generation);
+
+    assert_eq!(
+        engine
+            .attach_controller("sbc-1", ClientId(200))
+            .expect("fresh claim")
+            .client,
+        ClientId(200),
+        "with no calls and no connection the identity is forgotten and re-minted"
+    );
+}
+
+#[tokio::test]
+async fn a_controller_identity_claim_is_range_checked_and_refused_over_live_calls() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+
+    assert!(
+        matches!(
+            engine.attach_controller("", ClientId(1)),
+            Err(ControllerAttachError::Empty)
+        ),
+        "an empty controller id is not an identity"
+    );
+    let too_long = "c".repeat(siphon_rtp_proto::MAX_CONTROLLER_ID_LEN + 1);
+    assert!(
+        matches!(
+            engine.attach_controller(&too_long, ClientId(1)),
+            Err(ControllerAttachError::TooLong)
+        ),
+        "an over-long controller id is refused"
+    );
+    let longest = "c".repeat(siphon_rtp_proto::MAX_CONTROLLER_ID_LEN);
+    assert!(
+        engine.attach_controller(&longest, ClientId(1)).is_ok(),
+        "the bound itself is accepted"
+    );
+
+    // A connection that already created calls cannot be re-keyed onto a stable identity: it would
+    // strand exactly those calls, which is the failure this mechanism exists to prevent.
+    engine
+        .handle(
+            ClientId(2),
+            Command::Offer {
+                call_id: "already".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr, false),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            engine.attach_controller("sbc-1", ClientId(2)),
+            Err(ControllerAttachError::CallsAlreadyOwned)
+        ),
+        "a connection that already owns calls cannot be re-keyed"
+    );
 }

@@ -49,7 +49,11 @@ impl Control {
         self.next_id += 1;
         let bytes = frame::encode(&Request { id, command }).expect("encode request");
         self.stream.write_all(&bytes).await.expect("write request");
+        self.read_response(id).await
+    }
 
+    /// Read frames until the response correlating to `id` arrives.
+    async fn read_response(&mut self, id: u64) -> CmdResult {
         let mut chunk = [0u8; 4096];
         loop {
             // The control connection interleaves async server events (e.g. the `Event::CallSummary`
@@ -73,6 +77,19 @@ impl Control {
             assert_ne!(read, 0, "control connection closed unexpectedly");
             self.buffer.extend_from_slice(&chunk[..read]);
         }
+    }
+
+    /// Send a request whose command body is written out verbatim, for a frame no `Command` can
+    /// express — such as one from a controller built before a field existed. `body` is the
+    /// command's JSON object without the surrounding braces.
+    async fn request_raw(&mut self, body: &str) -> CmdResult {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = format!("{{\"id\":{id},{}", body.trim_start_matches('{'));
+        let value: serde_json::Value = serde_json::from_str(&request).expect("raw request is JSON");
+        let bytes = frame::encode(&value).expect("encode raw request");
+        self.stream.write_all(&bytes).await.expect("write request");
+        self.read_response(id).await
     }
 
     /// Read the next frame as a server-initiated [`Event`] (no request correlation).
@@ -1673,7 +1690,8 @@ async fn control_requires_authentication_when_a_secret_is_configured() {
     assert!(matches!(
         control
             .request(Command::Authenticate {
-                token: "wrong".into()
+                token: "wrong".into(),
+                controller_id: None,
             })
             .await,
         CmdResult::Error { .. }
@@ -1682,7 +1700,8 @@ async fn control_requires_authentication_when_a_secret_is_configured() {
     assert!(matches!(
         control
             .request(Command::Authenticate {
-                token: "s3cret".into()
+                token: "s3cret".into(),
+                controller_id: None,
             })
             .await,
         CmdResult::Ok { .. }
@@ -2087,5 +2106,430 @@ async fn detach_x3_is_refused_for_an_unknown_call() {
     assert!(
         matches!(result, CmdResult::Error { .. }),
         "an unknown call must be refused, got {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stable control-client identity over the real control socket (docs/security-and-nat.md §5).
+//
+// A `ClientId` used to be the accept-loop ordinal, so a TCP blip between the controller and the
+// engine stranded every call that was live at that moment: `delete` answered `unknown call`, a
+// re-offer could not renegotiate, the call-id could not be reused, and the `CallSummary` CDR went
+// to a client that was gone. A `controller_id` presented at `Authenticate` re-attaches all of it.
+// ---------------------------------------------------------------------------------------------
+
+/// Serve one engine on a fresh loopback control listener, returning the address to connect to.
+async fn control_listener(
+    engine: Arc<Engine<UdpLoopbackDatapath>>,
+    secret: Option<String>,
+) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    tokio::spawn(async move {
+        let _ = server::serve_with_auth(engine, listener, secret).await;
+    });
+    control_addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnecting_controller_keeps_the_calls_it_owned() {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let control_addr = control_listener(engine, None).await;
+    let (_phone, addr) = phone().await;
+
+    let mut first = Control::connect(control_addr).await;
+    assert!(matches!(
+        first
+            .request(Command::Authenticate {
+                token: String::new(),
+                controller_id: Some("sbc-1".into()),
+            })
+            .await,
+        CmdResult::Ok { .. }
+    ));
+    assert!(matches!(
+        first
+            .request(Command::Offer {
+                call_id: "blip".into(),
+                from_tag: "ft".into(),
+                sdp: sdp_for(addr),
+                profile: Default::default(),
+            })
+            .await,
+        CmdResult::Ok { .. }
+    ));
+
+    // The control connection drops with the call still up — no restart, just a blip.
+    drop(first);
+
+    let mut second = Control::connect(control_addr).await;
+    second
+        .request(Command::Authenticate {
+            token: String::new(),
+            controller_id: Some("sbc-1".into()),
+        })
+        .await;
+    assert_eq!(
+        second.request(Command::List).await,
+        CmdResult::List {
+            call_ids: vec!["blip".to_string()]
+        },
+        "the reconnect enumerates the call it owned"
+    );
+    assert!(
+        matches!(
+            second
+                .request(Command::Query {
+                    call_id: "blip".into(),
+                    from_tag: "ft".into(),
+                    to_tag: None,
+                })
+                .await,
+            CmdResult::Ok { .. }
+        ),
+        "and can query it"
+    );
+    assert!(
+        matches!(
+            second
+                .request(Command::Delete {
+                    call_id: "blip".into(),
+                    from_tag: "ft".into(),
+                    to_tag: None,
+                })
+                .await,
+            CmdResult::Ok { .. }
+        ),
+        "and can tear it down, which is what a BYE after the blip needs"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_summary_for_a_call_that_predates_a_reconnect_arrives_on_the_new_connection() {
+    // The regression test for the lost media CDR: every call that was up at a reconnect used to
+    // push its `CallSummary` into a sink that had already gone away.
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let control_addr = control_listener(engine, None).await;
+    let (_phone, addr) = phone().await;
+
+    let mut first = Control::connect(control_addr).await;
+    first
+        .request(Command::Authenticate {
+            token: String::new(),
+            controller_id: Some("sbc-1".into()),
+        })
+        .await;
+    first
+        .request(Command::Offer {
+            call_id: "cdr".into(),
+            from_tag: "ft".into(),
+            sdp: sdp_for(addr),
+            profile: Default::default(),
+        })
+        .await;
+    drop(first);
+
+    let mut second = Control::connect(control_addr).await;
+    second
+        .request(Command::Authenticate {
+            token: String::new(),
+            controller_id: Some("sbc-1".into()),
+        })
+        .await;
+    second
+        .request(Command::Delete {
+            call_id: "cdr".into(),
+            from_tag: "ft".into(),
+            to_tag: None,
+        })
+        .await;
+
+    match second.recv_event().await {
+        Event::CallSummary {
+            call_id, reason, ..
+        } => {
+            assert_eq!(call_id, "cdr");
+            assert_eq!(reason, "delete");
+        }
+        other => panic!("expected the media CDR on the new connection, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_stays_invisible_to_another_identity_and_to_a_connection_with_none() {
+    // A3 across reconnects, not just within a connection: stable identity must not widen any scope.
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let control_addr = control_listener(engine, None).await;
+    let (_phone, addr) = phone().await;
+
+    let mut owner = Control::connect(control_addr).await;
+    owner
+        .request(Command::Authenticate {
+            token: String::new(),
+            controller_id: Some("sbc-a".into()),
+        })
+        .await;
+    owner
+        .request(Command::Offer {
+            call_id: "owned".into(),
+            from_tag: "ft".into(),
+            sdp: sdp_for(addr),
+            profile: Default::default(),
+        })
+        .await;
+    drop(owner);
+
+    let mut stranger = Control::connect(control_addr).await;
+    stranger
+        .request(Command::Authenticate {
+            token: String::new(),
+            controller_id: Some("sbc-b".into()),
+        })
+        .await;
+    assert_eq!(
+        stranger.request(Command::List).await,
+        CmdResult::List {
+            call_ids: Vec::new()
+        },
+        "another controller identity sees nothing"
+    );
+    assert!(matches!(
+        stranger
+            .request(Command::Delete {
+                call_id: "owned".into(),
+                from_tag: "ft".into(),
+                to_tag: None,
+            })
+            .await,
+        CmdResult::Error { .. }
+    ));
+
+    // A connection that presents no identity at all behaves exactly as it did before: its identity
+    // is the connection, and it owns nothing it did not create.
+    let mut anonymous = Control::connect(control_addr).await;
+    assert_eq!(
+        anonymous.request(Command::List).await,
+        CmdResult::List {
+            call_ids: Vec::new()
+        }
+    );
+    assert!(matches!(
+        anonymous
+            .request(Command::Delete {
+                call_id: "owned".into(),
+                from_tag: "ft".into(),
+                to_tag: None,
+            })
+            .await,
+        CmdResult::Error { .. }
+    ));
+
+    // The owner comes back and finds its call where it left it.
+    let mut owner = Control::connect(control_addr).await;
+    owner
+        .request(Command::Authenticate {
+            token: String::new(),
+            controller_id: Some("sbc-a".into()),
+        })
+        .await;
+    assert_eq!(
+        owner.request(Command::List).await,
+        CmdResult::List {
+            call_ids: vec!["owned".to_string()]
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authenticate_frame_from_a_client_that_predates_the_field_is_accepted() {
+    // Wire compatibility in the direction that matters: an older controller sends a frame with no
+    // `controller_id` at all, and a newer engine must authenticate it and behave exactly as before.
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let control_addr = control_listener(engine, Some("s3cret".to_string())).await;
+
+    let mut control = Control::connect(control_addr).await;
+    let result = control
+        .request_raw(r#"{"command":"authenticate","token":"s3cret"}"#)
+        .await;
+    assert!(
+        matches!(result, CmdResult::Ok { .. }),
+        "an authenticate frame without the field is accepted: {result:?}"
+    );
+    assert_eq!(control.request(Command::Ping).await, CmdResult::Pong);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_connection_cannot_claim_a_controller_identity() {
+    // A controller id is an identity claim, not a credential. Where a secret is configured it is
+    // honoured only on a connection that presented the matching token.
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let control_addr = control_listener(engine, Some("s3cret".to_string())).await;
+    let (_phone, addr) = phone().await;
+
+    let mut owner = Control::connect(control_addr).await;
+    owner
+        .request(Command::Authenticate {
+            token: "s3cret".into(),
+            controller_id: Some("sbc-1".into()),
+        })
+        .await;
+    owner
+        .request(Command::Offer {
+            call_id: "guarded".into(),
+            from_tag: "ft".into(),
+            sdp: sdp_for(addr),
+            profile: Default::default(),
+        })
+        .await;
+    drop(owner);
+
+    let mut impostor = Control::connect(control_addr).await;
+    assert!(
+        matches!(
+            impostor
+                .request(Command::Authenticate {
+                    token: "wrong".into(),
+                    controller_id: Some("sbc-1".into()),
+                })
+                .await,
+            CmdResult::Error { .. }
+        ),
+        "a wrong token is refused, id or no id"
+    );
+    assert!(
+        matches!(
+            impostor.request(Command::List).await,
+            CmdResult::Error { .. }
+        ),
+        "and the connection is still unauthenticated, so it reaches no call at all"
+    );
+
+    // Each `authenticate` is judged on its own token: authenticating once does not make a later
+    // frame with a wrong one succeed, which is what would otherwise let it carry an id claim.
+    let mut authenticated = Control::connect(control_addr).await;
+    assert!(matches!(
+        authenticated
+            .request(Command::Authenticate {
+                token: "s3cret".into(),
+                controller_id: None,
+            })
+            .await,
+        CmdResult::Ok { .. }
+    ));
+    assert!(
+        matches!(
+            authenticated
+                .request(Command::Authenticate {
+                    token: "wrong".into(),
+                    controller_id: Some("sbc-1".into()),
+                })
+                .await,
+            CmdResult::Error { .. }
+        ),
+        "a wrong token is refused even on an already-authenticated connection"
+    );
+    assert_eq!(
+        authenticated.request(Command::List).await,
+        CmdResult::List {
+            call_ids: Vec::new()
+        },
+        "and the refused claim left it on its own identity"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_connection_on_one_identity_closes_the_first() {
+    // v1 posture: newest wins. A real controller pool sharing one identity needs the event sink to
+    // become a set, which this deliberately does not do.
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let control_addr = control_listener(engine, None).await;
+
+    let mut first = Control::connect(control_addr).await;
+    first
+        .request(Command::Authenticate {
+            token: String::new(),
+            controller_id: Some("sbc-1".into()),
+        })
+        .await;
+
+    let mut second = Control::connect(control_addr).await;
+    second
+        .request(Command::Authenticate {
+            token: String::new(),
+            controller_id: Some("sbc-1".into()),
+        })
+        .await;
+
+    // The superseded connection is closed by the engine, not merely ignored.
+    let mut chunk = [0u8; 64];
+    let read = timeout(Duration::from_secs(2), first.stream.read(&mut chunk))
+        .await
+        .expect("the older connection is closed promptly")
+        .expect("read");
+    assert_eq!(read, 0, "the older connection sees EOF");
+
+    // And the newer one is fully live.
+    assert_eq!(second.request(Command::Ping).await, CmdResult::Pong);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_controller_identity_cannot_be_claimed_over_live_calls_or_swapped_mid_connection() {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let control_addr = control_listener(engine, None).await;
+    let (_phone, addr) = phone().await;
+
+    let mut control = Control::connect(control_addr).await;
+    control
+        .request(Command::Authenticate {
+            token: String::new(),
+            controller_id: Some("sbc-1".into()),
+        })
+        .await;
+    // Re-presenting the same id is a no-op: a controller that re-authenticates has not moved.
+    assert!(matches!(
+        control
+            .request(Command::Authenticate {
+                token: String::new(),
+                controller_id: Some("sbc-1".into()),
+            })
+            .await,
+        CmdResult::Ok { .. }
+    ));
+    // A different one is refused — the identity decides which calls the connection owns.
+    assert!(matches!(
+        control
+            .request(Command::Authenticate {
+                token: String::new(),
+                controller_id: Some("sbc-2".into()),
+            })
+            .await,
+        CmdResult::Error { .. }
+    ));
+
+    // And a connection that already created calls cannot be re-keyed onto one.
+    let mut late = Control::connect(control_addr).await;
+    late.request(Command::Offer {
+        call_id: "late".into(),
+        from_tag: "ft".into(),
+        sdp: sdp_for(addr),
+        profile: Default::default(),
+    })
+    .await;
+    assert!(matches!(
+        late.request(Command::Authenticate {
+            token: String::new(),
+            controller_id: Some("sbc-3".into()),
+        })
+        .await,
+        CmdResult::Error { .. }
+    ));
+    assert_eq!(
+        late.request(Command::List).await,
+        CmdResult::List {
+            call_ids: vec!["late".to_string()]
+        },
+        "the refused claim left the connection on its own identity, calls intact"
     );
 }

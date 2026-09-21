@@ -7,6 +7,25 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **A control client can present a stable identity that survives a reconnect.** `authenticate` now
+  carries an optional `controller_id`, and the engine resolves it to the same internal client
+  identity on every connection, so a reconnect re-attaches to the calls that identity owns, to its
+  event stream and to its quota. Identity used to be the accept-loop ordinal, which died with the
+  socket — and because a controller reconnects with backoff for the life of its process, this was
+  never a restart-only concern. A TCP blip stranded every call that was live at that moment, with
+  nothing in either log saying so: `delete` answered `unknown call`, so a BYE could never tear the
+  call down; a re-INVITE could not be renegotiated; the call-id was refused for a fresh offer and
+  stayed poisoned for the life of the dialog; the media CDR was pushed to a client that had gone;
+  and the ports, descriptors and pipelines stayed held until the idle reaper found them — which for
+  an orphan whose media was still flowing was never. A connection that presents no id is unchanged
+  in every respect, and a frame from a client built before the field is accepted as it always was.
+  No ownership scope was widened to do it: `list` and `delete` stay owner-scoped, so enumerating a
+  shared engine is still safe by construction. The id is an identity claim rather than a credential
+  — where a secret is configured it is honoured only on a connection that presented the matching
+  token — and one identity carries one live connection, a second claim closing the first.
+
 ### Changed
 
 - **DTLS-SRTP now runs on a sans-I/O stack, and a lost last flight no longer strands a call.** RFC 6347
