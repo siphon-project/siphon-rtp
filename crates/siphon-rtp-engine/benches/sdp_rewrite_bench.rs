@@ -120,6 +120,7 @@ fn sdp_rewrite(criterion: &mut Criterion) {
                 None,
                 None,
                 TextRewrite::None,
+                sdp::ImageRewrite::None,
             )
             .expect("rewrite")
         });
@@ -134,6 +135,7 @@ fn sdp_rewrite(criterion: &mut Criterion) {
                 None,
                 None,
                 TextRewrite::None,
+                sdp::ImageRewrite::None,
             )
             .expect("rewrite")
         });
@@ -149,6 +151,7 @@ fn sdp_rewrite(criterion: &mut Criterion) {
                 None,
                 None,
                 TextRewrite::None,
+                sdp::ImageRewrite::None,
             )
             .expect("rewrite")
         });
@@ -168,6 +171,7 @@ fn sdp_rewrite(criterion: &mut Criterion) {
                 None,
                 None,
                 TextRewrite::None,
+                sdp::ImageRewrite::None,
             )
             .expect("rewrite")
         });

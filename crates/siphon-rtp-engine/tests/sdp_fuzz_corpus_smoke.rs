@@ -107,6 +107,7 @@ fn drive(text: &str) {
             None,
             mux_override,
             sdp::TextRewrite::None,
+            sdp::ImageRewrite::None,
         );
         // A body the rewriter *accepted* is one it re-originated and put on the wire, so it has to be
         // conformant — whatever the input looked like. (A rejected body never reaches a peer.)
@@ -114,6 +115,28 @@ fn drive(text: &str) {
             assert_rfc4566_line_order(&rewritten.sdp, text);
         }
     }
+    // Anchoring or declining a T.38 section re-originates it, so it is held in §5 order too — and a
+    // fax-only body takes its own entry points, which no rewrite above reaches.
+    for image in [
+        sdp::ImageRewrite::Anchor(engine()),
+        sdp::ImageRewrite::Decline,
+    ] {
+        if let Ok(rewritten) = sdp::rewrite(
+            text,
+            engine(),
+            sdp::IceRewrite::Keep,
+            None,
+            None,
+            sdp::TextRewrite::None,
+            image,
+        ) {
+            assert_rfc4566_line_order(&rewritten.sdp, text);
+        }
+        if let Ok(rewritten) = sdp::rewrite_image_only(text, engine(), image) {
+            assert_rfc4566_line_order(&rewritten.sdp, text);
+        }
+    }
+    let _ = sdp::parse_session(text);
 }
 
 #[test]

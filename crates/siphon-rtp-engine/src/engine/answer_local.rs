@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::dtls_bridge::DtlsCallPlan;
 use crate::ice;
 use crate::media_pipeline::MediaControl;
-use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
+use crate::sdp::{self, EngineMedia, IceRewrite, ImageRewrite, SecurityAdvertisement, TextRewrite};
 
 use super::negotiate::{
     bridge_source_filter, filter_component, ice_directive, ice_tie_breaker, parse_codec_flags,
@@ -680,7 +680,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 security,
                 mux_override,
                 TextRewrite::None,
-            ) {
+            ImageRewrite::None,
+                ) {
                 Ok(rewritten) => rewritten,
                 Err(error) => {
                     self.free(&endpoints).await;
