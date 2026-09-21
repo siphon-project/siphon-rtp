@@ -10,8 +10,8 @@ use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_hep::protocol_type;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event,
-    MediaTimeoutReason, PlayMediaSource, PlayRepeat, ProfileFlags, SessionStats, WsBridgeEndReason,
-    WsTeeDirection, WsVadEngine,
+    MediaTimeoutReason, PlayMediaSource, PlayRepeat, ProfileFlags, RecordingFormat, SessionStats,
+    WsBridgeEndReason, WsTeeDirection, WsVadEngine,
 };
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
@@ -8796,6 +8796,339 @@ async fn silence_on_a_passthrough_call_is_rejected() {
         matches!(result, CmdResult::Error { .. }),
         "silence needs a media call"
     );
+}
+
+// ---- `fax_passthrough`: the call is pinned to opaque relay ----
+
+/// An offer/answer on exactly one G.711 variant: payload type 0 (µ-law) or 8 (A-law). The pair
+/// matters — it is the cheapest way to reach an *implicit* transcode, which is the case
+/// `fax_passthrough` exists to refuse.
+fn sdp_one_g711(rtp: SocketAddr, payload_type: u8) -> String {
+    let encoding_name = if payload_type == 0 { "PCMU" } else { "PCMA" };
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP {payload_type}\r\n\
+         a=rtpmap:{payload_type} {encoding_name}/8000\r\na=rtcp-mux\r\n",
+        ip = rtp.ip(),
+        port = rtp.port()
+    )
+}
+
+/// Offer and answer a fax-pinned call, each leg on the G.711 variant given. Returns the answer.
+async fn fax_pinned_call(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+    near: (SocketAddr, u8),
+    far: (SocketAddr, u8),
+) -> CmdResult {
+    let profile = || ProfileFlags {
+        fax_passthrough: true,
+        ..Default::default()
+    };
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_one_g711(near.0, near.1),
+                profile: profile(),
+            },
+        )
+        .await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_one_g711(far.0, far.1),
+                profile: profile(),
+            },
+        )
+        .await
+}
+
+/// The happy path: both legs on the same codec, so the pin costs nothing and the call stays on the
+/// opaque relay it was always going to use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fax_pinned_call_on_one_codec_answers_as_a_plain_relay() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let answer = fax_pinned_call(&engine, "fax-relay", (addr_a, 0), (addr_b, 0)).await;
+    assert!(
+        matches!(answer, CmdResult::Ok { sdp: Some(_), .. }),
+        "same-codec fax relay must answer: {answer:?}"
+    );
+    assert!(
+        !engine.media().is_media_call("fax-relay"),
+        "a fax relay must not run a media actor"
+    );
+}
+
+/// The whole point of the flag. Nothing in this offer/answer asked for a transcode — it falls out
+/// of A being on µ-law and B answering A-law — and the requantization it would cause is invisible
+/// to every counter while the fax simply fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fax_pinned_call_refuses_an_answer_that_would_transcode() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let answer = fax_pinned_call(&engine, "fax-transcode", (addr_a, 0), (addr_b, 8)).await;
+    let CmdResult::Error { reason } = answer else {
+        panic!("a µ-law/A-law fax call must be refused, not transcoded: {answer:?}");
+    };
+    assert!(
+        reason.contains("fax-passthrough-would-transcode"),
+        "{reason}"
+    );
+    // The reason names both codecs, because "answer the offered codec" is only actionable if the
+    // controller can see which two disagreed.
+    assert!(reason.contains("PCMA"), "{reason}");
+    assert!(reason.contains("PCMU"), "{reason}");
+
+    // Without the pin the same pair is an ordinary transcoding call, so the refusal is the flag's
+    // doing and not a codec-negotiation regression.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "plain-transcode".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_one_g711(addr_a, 0),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "plain-transcode".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_one_g711(addr_b, 8),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(answer, CmdResult::Ok { sdp: Some(_), .. }),
+        "an unpinned µ-law/A-law call still transcodes: {answer:?}"
+    );
+}
+
+/// Every mid-call verb that would pull the relay into the decoding pipeline is refused for as long
+/// as the pin holds. Accumulated rather than asserted one at a time, so adding a verb that promotes
+/// for processing without gating it here fails this test by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fax_pinned_call_refuses_every_verb_that_would_decode_it() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let answer = fax_pinned_call(&engine, "fax-verbs", (addr_a, 0), (addr_b, 0)).await;
+    assert!(
+        matches!(answer, CmdResult::Ok { sdp: Some(_), .. }),
+        "{answer:?}"
+    );
+
+    // The same call unpinned, as the control: a verb this engine would have refused anyway proves
+    // nothing about the pin.
+    let control = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_c, addr_c) = phone().await;
+    let (_phone_d, addr_d) = phone().await;
+    control
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "control".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_one_g711(addr_c, 0),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    control
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "control".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_one_g711(addr_d, 0),
+                profile: Default::default(),
+            },
+        )
+        .await;
+
+    let recordings = tempfile::tempdir().expect("temp dir");
+    let verbs = |call_id: &str| {
+        let call_id = call_id.to_string();
+        let from_tag = "tag-a".to_string();
+        // The verbs that promote a plain relay with `PromoteMode::Processing`, which is what the pin
+        // gates. `silence media` is deliberately not here: it never promotes, it requires a call
+        // that is *already* media-processing, so on a fax-pinned relay it is refused a step earlier
+        // and for a different reason.
+        vec![
+            (
+                "echo",
+                Command::Echo {
+                    call_id: call_id.clone(),
+                    from_tag: from_tag.clone(),
+                    to_tag: None,
+                    enabled: true,
+                },
+            ),
+            (
+                "play media",
+                Command::PlayMedia {
+                    call_id: call_id.clone(),
+                    from_tag: from_tag.clone(),
+                    source: PlayMediaSource::Tone {
+                        tone: "ringback_eu".into(),
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
+                    to_tag: None,
+                },
+            ),
+            (
+                "start recording (wav)",
+                Command::StartRecording {
+                    call_id,
+                    from_tag,
+                    recording_dir: Some(recordings.path().display().to_string()),
+                    format: Some(RecordingFormat::Wav),
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
+                },
+            ),
+        ]
+    };
+
+    let mut not_refused = Vec::new();
+    for (name, command) in verbs("fax-verbs") {
+        match engine.handle(CLIENT, command).await {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("fax-passthrough-needs-decoded-audio"),
+                "{name} was refused, but not by the fax pin: {reason}"
+            ),
+            _ => not_refused.push(name),
+        }
+    }
+    assert!(
+        not_refused.is_empty(),
+        "these verbs decode the audio and must be refused on a fax-pinned call: {not_refused:?}"
+    );
+    assert!(
+        !engine.media().is_media_call("fax-verbs"),
+        "a refused verb must not have promoted the call anyway"
+    );
+
+    let mut refused_without_the_pin = Vec::new();
+    for (name, command) in verbs("control") {
+        if matches!(
+            control.handle(CLIENT, command).await,
+            CmdResult::Error { .. }
+        ) {
+            refused_without_the_pin.push(name);
+        }
+    }
+    assert!(
+        refused_without_the_pin.is_empty(),
+        "the control call must accept these, or the test above proves nothing: \
+         {refused_without_the_pin:?}"
+    );
+}
+
+/// The complement, and the reason the gate is on the promotion *mode* rather than on the call: the
+/// verbs that promote for verbatim relay never decode, so the pin has no quarrel with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fax_pinned_call_still_allows_the_verbatim_relay_verbs() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let answer = fax_pinned_call(&engine, "fax-relay-verbs", (addr_a, 0), (addr_b, 0)).await;
+    assert!(
+        matches!(answer, CmdResult::Ok { sdp: Some(_), .. }),
+        "{answer:?}"
+    );
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let recording = engine
+        .handle(
+            CLIENT,
+            Command::StartRecording {
+                call_id: "fax-relay-verbs".into(),
+                from_tag: "tag-a".into(),
+                recording_dir: Some(directory.path().display().to_string()),
+                format: None,
+                direction: None,
+                channels: None,
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
+            },
+        )
+        .await;
+    assert!(
+        !matches!(recording, CmdResult::Error { .. }),
+        "a pcap recording captures the wire bytes and never decodes: {recording:?}"
+    );
+
+    let blocked = engine
+        .handle(
+            CLIENT,
+            Command::BlockDtmf {
+                call_id: "fax-relay-verbs".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert!(
+        !matches!(blocked, CmdResult::Error { .. }),
+        "a DTMF block drops packets, it does not decode them: {blocked:?}"
+    );
+}
+
+/// The profile half of the rule, refused at the offer before a port is allocated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fax_pinned_offer_that_also_asks_for_decoded_audio_is_refused() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "fax-contradiction".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_one_g711(addr_a, 0),
+                profile: ProfileFlags {
+                    fax_passthrough: true,
+                    noise_suppression: true,
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let CmdResult::Error { reason } = result else {
+        panic!("a self-contradictory fax profile must be refused: {result:?}");
+    };
+    assert!(
+        reason.contains("fax-passthrough-needs-decoded-audio"),
+        "{reason}"
+    );
+    assert!(reason.contains("noise_suppression"), "{reason}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

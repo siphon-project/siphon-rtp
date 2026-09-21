@@ -569,6 +569,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // known (near), which is the documented relay-path limitation.
                 far_telephone_event: None,
                 pipeline: media.pipeline,
+                fax_passthrough: snapshot.fax_passthrough,
                 relay_flows: media.relay_flows,
                 promotion_reasons: HashSet::new(),
                 // The source gate is reconstructed from the snapshot's per-flow `accepted_source`

@@ -241,6 +241,97 @@ pub(crate) fn validate_echo_delay_search_ms(profile: &ProfileFlags) -> Result<()
     ))
 }
 
+/// Check that a fax-pinned profile asks for nothing that would decode the audio.
+///
+/// `fax_passthrough` asserts the payload leaves the engine exactly as it arrived, so a profile that
+/// also asks for a feature needing the decoded PCM is self-contradictory. Refusing it at the control
+/// plane is the whole point: honouring either half silently would leave the controller to discover
+/// which one won from the audio, and for a fax that means a transmission that fails with no error
+/// recorded anywhere. Every flag named here is a term of `resolve_pipeline`'s `needs_decoded_audio`,
+/// i.e. each one on its own forces the userspace media path.
+///
+/// The other half of the same rule — a codec mismatch, which is an *implicit* transcode — is not
+/// visible in the profile and is enforced at the answer, where both legs' codecs are known.
+///
+/// # Errors
+/// The reason string, ready to return as a `CmdResult::Error`.
+/// Check a profile's cross-field rules before a call is set up — every check that can be made from
+/// the profile alone, in one call so an entry point takes one refusal branch rather than one per
+/// rule. Run at `offer`, `answer` and `answer_local` before any port is allocated.
+///
+/// # Errors
+/// The reason string, ready to return as a `CmdResult::Error`.
+pub(crate) fn validate_profile(profile: &ProfileFlags) -> Result<(), String> {
+    validate_echo_delay_search_ms(profile)?;
+    validate_fax_passthrough(profile)
+}
+
+pub(crate) fn validate_fax_passthrough(profile: &ProfileFlags) -> Result<(), String> {
+    if !profile.fax_passthrough {
+        return Ok(());
+    }
+    let mut requested = Vec::new();
+    if profile.noise_suppression {
+        requested.push("noise_suppression");
+    }
+    if profile.echo_cancellation {
+        requested.push("echo_cancellation");
+    }
+    if profile.beep_detection {
+        requested.push("beep_detection");
+    }
+    if profile.record_call {
+        requested.push("record_call");
+    }
+    if profile.ws_uri.is_some() {
+        requested.push("ws_uri");
+    }
+    if !requested.is_empty() {
+        // Name every conflict, not the first one: a controller fixing them one offer at a time
+        // learns the rule an error at a time.
+        return Err(format!(
+            "fax-passthrough-needs-decoded-audio: fax_passthrough forwards the payload verbatim, \
+             so it cannot be combined with {} — each needs the decoded audio, and a fax does not \
+             survive a decode/re-encode cycle",
+            requested.join(", ")
+        ));
+    }
+    // Codec manipulation is the *implicit* route to the same place: every directive here can leave
+    // the two legs on different codecs, which `resolve_pipeline` turns into a transcode nobody asked
+    // for. The answer would refuse that anyway, but refusing the directive at the offer names the
+    // actual mistake and does it before any port is allocated. `codec-except-` / `codec-accept-` are
+    // a keep-list — they only prevent a strip — so they stay allowed.
+    // Matched exactly as `parse_codec_flags` matches them — `strip_prefix`, so case-sensitively on
+    // the prefix. A looser match here would refuse a string the parser ignores, which is a different
+    // rule in a second place rather than the same rule enforced earlier.
+    const TRANSCODING_DIRECTIVES: [&str; 5] = [
+        "codec-transcode-",
+        "codec-mask-",
+        "codec-consume-",
+        "codec-strip-",
+        "codec-offer-",
+    ];
+    let manipulating: Vec<&str> = profile
+        .flags
+        .iter()
+        .filter(|flag| {
+            TRANSCODING_DIRECTIVES
+                .iter()
+                .any(|prefix| flag.starts_with(prefix))
+        })
+        .map(String::as_str)
+        .collect();
+    if !manipulating.is_empty() {
+        return Err(format!(
+            "fax-passthrough-would-transcode: fax_passthrough forwards the payload verbatim, so it \
+             cannot be combined with the codec directive(s) {} — each can leave the two legs on \
+             different codecs, which the engine bridges by decoding and re-encoding",
+            manipulating.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// A preallocated FIFO of far-end **reference** PCM: the egress samples one direction produced toward
 /// its receiving party, buffered for the *opposite* direction's [`EchoCanceller`] to cancel that
 /// party's uplink echo against (the audio played toward a party is the reference for cancelling the
@@ -9167,6 +9258,110 @@ mod tests {
             "{window_error}"
         );
         assert_ne!(tail_error, window_error);
+    }
+
+    /// One flag that contradicts the opaque-relay pin: its name as a controller spells it, and how
+    /// to set it on a profile.
+    type ConflictingFlag = (&'static str, fn(&mut ProfileFlags));
+
+    /// `fax_passthrough` asserts the payload leaves the engine as it arrived, so every flag that
+    /// needs the decoded audio contradicts it — and the refusal names all of them at once, so a
+    /// controller does not discover the rule one offer at a time.
+    #[test]
+    fn a_fax_pinned_profile_refuses_every_flag_that_needs_the_decoded_audio() {
+        let pinned = || ProfileFlags {
+            fax_passthrough: true,
+            ..ProfileFlags::default()
+        };
+        // A bare pin asks for nothing else, so there is nothing to contradict.
+        assert!(validate_fax_passthrough(&pinned()).is_ok());
+
+        let conflicts: [ConflictingFlag; 5] = [
+            ("noise_suppression", |profile| {
+                profile.noise_suppression = true;
+            }),
+            ("echo_cancellation", |profile| {
+                profile.echo_cancellation = true;
+            }),
+            ("beep_detection", |profile| profile.beep_detection = true),
+            ("record_call", |profile| profile.record_call = true),
+            ("ws_uri", |profile| {
+                profile.ws_uri = Some("ws://example.invalid/stream".to_string());
+            }),
+        ];
+
+        for (name, set) in conflicts {
+            let mut profile = pinned();
+            set(&mut profile);
+            let error = validate_fax_passthrough(&profile).expect_err(name);
+            assert!(
+                error.contains("fax-passthrough-needs-decoded-audio"),
+                "{name}: {error}"
+            );
+            assert!(error.contains(name), "{name} unnamed in: {error}");
+
+            // Without the pin the same profile is none of this validator's business — it must not
+            // start refusing ordinary media-processing calls.
+            let mut unpinned = ProfileFlags::default();
+            set(&mut unpinned);
+            assert!(validate_fax_passthrough(&unpinned).is_ok(), "{name}");
+        }
+
+        let mut every_conflict = pinned();
+        for (_, set) in conflicts {
+            set(&mut every_conflict);
+        }
+        let error = validate_fax_passthrough(&every_conflict).expect_err("all five conflict");
+        for (name, _) in conflicts {
+            assert!(error.contains(name), "{name} missing from: {error}");
+        }
+    }
+
+    /// The *implicit* route to a decode is a codec directive: nothing asks for a transcode, it falls
+    /// out of the two legs ending up on different codecs. A pinned profile refuses the directives
+    /// that can cause that, and keeps the keep-list, which cannot.
+    #[test]
+    fn a_fax_pinned_profile_refuses_codec_manipulation_but_keeps_the_keep_list() {
+        let with_flag = |flag: &str| {
+            validate_fax_passthrough(&ProfileFlags {
+                fax_passthrough: true,
+                flags: vec![flag.to_string()],
+                ..ProfileFlags::default()
+            })
+        };
+        for flag in [
+            "codec-transcode-PCMA",
+            "codec-mask-PCMU",
+            "codec-consume-PCMU",
+            "codec-strip-PCMA",
+            "codec-strip-all",
+            "codec-offer-PCMU",
+        ] {
+            let error = with_flag(flag).expect_err(flag);
+            assert!(
+                error.contains("fax-passthrough-would-transcode"),
+                "{flag}: {error}"
+            );
+            assert!(error.contains(flag), "{flag} unnamed in: {error}");
+        }
+
+        // `codec-except-` / `codec-accept-` are a keep-list: they only stop a strip, so they cannot
+        // move a leg onto a codec the other side is not on.
+        assert!(with_flag("codec-except-PCMU").is_ok());
+        assert!(with_flag("codec-accept-PCMU").is_ok());
+        // An unrelated flag is left alone.
+        assert!(with_flag("symmetric").is_ok());
+
+        // Matched exactly as `parse_codec_flags` matches it. The prefix is case-sensitive there, so
+        // this spelling is not a directive at all and refusing it would be a second, stricter rule.
+        assert!(with_flag("CODEC-TRANSCODE-PCMA").is_ok());
+
+        // And none of it applies without the pin.
+        assert!(validate_fax_passthrough(&ProfileFlags {
+            flags: vec!["codec-transcode-PCMA".to_string()],
+            ..ProfileFlags::default()
+        })
+        .is_ok());
     }
 
     /// The accepted bounds, pinned as literals.

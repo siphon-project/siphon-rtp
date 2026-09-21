@@ -450,6 +450,12 @@ struct Call {
     far_telephone_event: Option<u8>,
     /// How this call's media is handled once answered (set in `answer`).
     pipeline: PipelineKind,
+    /// Whether the controller pinned this call to opaque relay (`ProfileFlags.fax_passthrough`),
+    /// captured at offer. It is an assertion about the payload, so it outlives the offer: a mid-call
+    /// verb that would pull the relay into the processing pipeline is refused for as long as the call
+    /// lives. Verbatim-relay promotions (pcap recording, DTMF block, X3) are unaffected — they never
+    /// decode.
+    fax_passthrough: bool,
     /// For a passthrough relay, the forward actions installed at answer — kept so `block`/`unblock`
     /// can flip the endpoints to `Drop` and restore them. Empty for media/SRTP calls.
     relay_flows: Vec<(EndpointId, FlowAction)>,
@@ -794,6 +800,7 @@ impl Call {
             from_tag: self.from_tag.clone(),
             to_tag: self.to_tag.clone(),
             pipeline: pipeline_snapshot(self.pipeline),
+            fax_passthrough: self.fax_passthrough,
             ice: self.ice.as_ref().map(|ice| ha::IceSnapshot {
                 ufrag: ice.ufrag.clone(),
                 pwd: ice.pwd.clone(),
@@ -908,6 +915,20 @@ impl PipelineKind {
         matches!(
             self,
             Self::Srtp | Self::SrtpOfferer | Self::SrtpTranscrypt | Self::Dtls | Self::DtlsOfferer
+        )
+    }
+
+    /// Whether the call's media is decoded to PCM and re-encoded on its way through the engine — the
+    /// complement of the payload leaving exactly as it arrived. The relay and the crypto bridges
+    /// forward the payload verbatim (a bridge re-encrypts, it does not re-encode); the rest run a
+    /// [`MediaCall`] actor over decoded samples.
+    ///
+    /// Used to refuse a call that asked for opaque relay (`fax_passthrough`) and then resolved to a
+    /// pipeline that would requantize it.
+    fn decodes_audio(self) -> bool {
+        matches!(
+            self,
+            Self::Media | Self::SrtpMedia | Self::DtlsMedia | Self::Ws
         )
     }
 }

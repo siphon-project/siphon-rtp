@@ -45,6 +45,12 @@ pub struct CallSnapshot {
     pub to_tag: Option<String>,
     /// How the call's media is carried (relay / SRTP / transcode / …).
     pub pipeline: PipelineSnapshot,
+    /// Whether the call is pinned to opaque relay (`ProfileFlags.fax_passthrough`). Carried because
+    /// it is a safety assertion about the payload, not a tuning knob: losing it across a failover
+    /// would let a later verb pull a restored fax call into the decoding pipeline. Defaulted, so a
+    /// snapshot written before this field restores as unpinned — the behaviour it was written with.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fax_passthrough: bool,
     /// The engine's ICE-lite credentials, if the call negotiated ICE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ice: Option<IceSnapshot>,
@@ -421,6 +427,7 @@ mod tests {
             from_tag: "alice-tag".into(),
             to_tag: Some("bob-tag".into()),
             pipeline: PipelineSnapshot::Passthrough,
+            fax_passthrough: false,
             ice: Some(IceSnapshot {
                 ufrag: "ufrag".into(),
                 pwd: "password".into(),
