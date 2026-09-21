@@ -232,7 +232,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let media = self.media.clone();
         let limits = self.media_fetch_limits.clone();
         let tls = self.ws_tls_client_config();
-        let events = self.events.get(&request.client).map(|entry| entry.clone());
+        let events = self.event_sink(request.client);
         let pending = PendingFetch {
             call_id: request.call_id.clone(),
             from_tag: request.from_tag.clone(),

@@ -485,7 +485,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // went away and nobody asked them to.
         let source_reason = Arc::new(std::sync::Mutex::new(RecordingEndReason::CallEnded));
         let writer = {
-            let events = self.events.get(&owner).map(|sink| sink.value().clone());
+            let events = self.event_sink(owner);
             let call_id = call_id.to_string();
             let from_tag = from_tag.to_string();
             let to_tag = to_tag.clone();

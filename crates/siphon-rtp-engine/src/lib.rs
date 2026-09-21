@@ -39,6 +39,6 @@ pub mod ws_bridge;
 pub mod x3;
 
 pub use daemon::{run_with_datapath, EngineArgs, RunConfig};
-pub use engine::{ClientId, Engine};
+pub use engine::{ClientGeneration, ClientId, ControllerAttachError, ControllerAttachment, Engine};
 pub use interface::{Interface, InterfaceAddress, InterfaceEntry, InterfaceTable};
 pub use metrics::Metrics;

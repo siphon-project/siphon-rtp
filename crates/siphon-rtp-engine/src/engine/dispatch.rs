@@ -2,31 +2,205 @@
 
 use siphon_rtp_datapath::Datapath;
 use siphon_rtp_proto::{CmdResult, Command, Event, RecordingFormat};
+use std::sync::Arc;
 
 use super::play::PlayOptions;
 use super::record::WavRecordingRequest;
-use super::{ok_empty, ClientId, Engine};
+use super::{
+    ok_empty, ClientGeneration, ClientId, ClientSink, ControllerAttachError, ControllerAttachment,
+    ControllerIdentity, Engine,
+};
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
-    /// Register `client`'s async event sink — one persistent control connection — and return the
-    /// receiver the control server drains to the wire. Bounded: events are dropped under
-    /// backpressure rather than blocking the engine on a slow control consumer.
+    /// Register `client`'s async event sink and return the receiver the control server drains to
+    /// the wire. Bounded: events are dropped under backpressure rather than blocking the engine on
+    /// a slow control consumer.
+    ///
+    /// For a caller that keeps the receiver for its own lifetime. A control connection uses
+    /// [`Self::register_client_generation`] instead, because it has to be able to release its own
+    /// registration without touching a successor's.
     pub fn register_client(&self, client: ClientId) -> flume::Receiver<Event> {
-        let (sender, receiver) = flume::bounded(64);
-        self.events.insert(client, sender);
-        receiver
+        self.register_client_generation(client).1
     }
 
-    /// Drop `client`'s event sink when its control connection closes.
-    pub fn deregister_client(&self, client: ClientId) {
-        self.events.remove(&client);
+    /// Register `client`'s async event sink, returning the generation stamped on this registration
+    /// alongside the receiver. Pass the generation back to [`Self::deregister_client`]: a
+    /// reconnecting controller resolves to the same `ClientId`, so an unconditional release would
+    /// let the connection being replaced silence the one replacing it.
+    ///
+    /// Re-registering an existing `ClientId` (a controller reconnect) keeps its channel and hands
+    /// back a clone of the same receiver, so events a live pipeline emits follow the controller to
+    /// its new connection.
+    pub fn register_client_generation(
+        &self,
+        client: ClientId,
+    ) -> (ClientGeneration, flume::Receiver<Event>) {
+        let generation = ClientGeneration(
+            self.next_client_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let mut sink = self.events.entry(client).or_insert_with(|| {
+            let (sender, receiver) = flume::bounded(64);
+            ClientSink {
+                generation,
+                sender,
+                receiver,
+            }
+        });
+        sink.generation = generation;
+        (generation, sink.receiver.clone())
+    }
+
+    /// A clone of `client`'s event sender, for a slow-path actor that emits events for the life of
+    /// a pipeline rather than once. `None` when the client has no registered channel.
+    pub(super) fn event_sink(&self, client: ClientId) -> Option<flume::Sender<Event>> {
+        self.events.get(&client).map(|sink| sink.sender.clone())
+    }
+
+    /// Release the event-sink registration a control connection made at `generation`.
+    ///
+    /// Conditional on the generation: a sink registered by a *later* connection on the same
+    /// `ClientId` is left alone, or the connection being replaced would silence the one replacing
+    /// it. And for a `ClientId` that stands for a stable controller identity the channel itself is
+    /// kept — the calls it owns are still relaying and their pipelines still hold senders cloned
+    /// from it, so the events they emit across the blip wait for the reconnect instead of
+    /// disappearing into a channel nothing drains. The channel goes when the identity itself is
+    /// reaped — once no connection is attached and no call is left under it.
+    pub fn deregister_client(&self, client: ClientId, generation: ClientGeneration) {
+        if self.controller_ids.contains_key(&client) {
+            return;
+        }
+        self.events
+            .remove_if(&client, |_, sink| sink.generation == generation);
+    }
+
+    /// Resolve the stable `controller_id` a control connection presents to the [`ClientId`] the
+    /// engine keys call ownership, the per-client quota and event delivery on — minting it from
+    /// `proposed` (the connection's own ordinal) the first time the identity is seen, and returning
+    /// the one already minted on every later connection.
+    ///
+    /// That is what makes a control reconnect re-attach to the calls it already owns instead of
+    /// stranding them under an identity that can never be presented again
+    /// (docs/security-and-nat.md §5). Every ownership scope stays exactly as it was: `list` and
+    /// `delete` remain owner-scoped, and a connection presenting a different id (or none) still
+    /// cannot see these calls.
+    ///
+    /// The connection's event sink is re-registered under the resolved id as part of the attach, so
+    /// the caller must release its previous registration first.
+    ///
+    /// Two live connections on one identity: **newest wins** — the older one's
+    /// [`Shutdown`](crate::shutdown::Shutdown) is tripped and it closes. A genuine controller pool
+    /// sharing an identity needs the event sink to become a set, which is deliberately not part of
+    /// this.
+    pub fn attach_controller(
+        &self,
+        controller_id: &str,
+        proposed: ClientId,
+    ) -> Result<ControllerAttachment, ControllerAttachError> {
+        if controller_id.is_empty() {
+            return Err(ControllerAttachError::Empty);
+        }
+        if controller_id.len() > siphon_rtp_proto::MAX_CONTROLLER_ID_LEN {
+            return Err(ControllerAttachError::TooLong);
+        }
+        // Re-keying a connection that already owns calls would strand them under an identity
+        // nothing can present — the exact failure this mechanism exists to prevent.
+        if self.client_call_count(proposed) > 0 {
+            return Err(ControllerAttachError::CallsAlreadyOwned);
+        }
+
+        let key: Arc<str> = Arc::from(controller_id);
+        let (trigger, evicted) = crate::shutdown::channel();
+        // One `entry` so two connections racing the same first sight cannot mint two ids for it.
+        let mut row = self
+            .controllers
+            .entry(Arc::clone(&key))
+            .or_insert(ControllerIdentity {
+                client: proposed,
+                attached: None,
+            });
+        let client = row.client;
+        let (generation, events) = self.register_client_generation(client);
+        let superseded = row.attached.replace((generation, trigger));
+        drop(row);
+        self.controller_ids.insert(client, key);
+
+        if let Some((_, superseded)) = superseded {
+            tracing::warn!(
+                target: "siphon_rtp::control",
+                controller_id,
+                client = client.0,
+                "a second control connection claimed this controller identity; closing the older one"
+            );
+            superseded.trigger();
+        }
+        tracing::info!(
+            target: "siphon_rtp::control",
+            controller_id,
+            client = client.0,
+            "control connection attached to its controller identity"
+        );
+        Ok(ControllerAttachment {
+            client,
+            generation,
+            events,
+            evicted,
+        })
+    }
+
+    /// Release the attachment a connection made at `generation`. A newer connection may already
+    /// have taken the identity, in which case this is a no-op — only the connection still attached
+    /// may detach it.
+    ///
+    /// The identity row itself survives while its client still owns calls; that retention is the
+    /// whole point, since the next connection presenting the same id resolves to the same
+    /// `ClientId` and re-attaches to them.
+    pub fn detach_controller(&self, controller_id: &str, generation: ClientGeneration) {
+        let client = {
+            let Some(mut row) = self.controllers.get_mut(controller_id) else {
+                return;
+            };
+            if row
+                .attached
+                .as_ref()
+                .is_none_or(|(attached, _)| *attached != generation)
+            {
+                return;
+            }
+            row.attached = None;
+            row.client
+        };
+        self.reap_detached_controller(client);
+    }
+
+    /// Drop a controller identity once nothing depends on it: no connection attached, and no calls
+    /// left under its `ClientId`.
+    pub(super) fn reap_detached_controller(&self, client: ClientId) {
+        if self.client_call_count(client) > 0 {
+            return;
+        }
+        let key = match self.controller_ids.get(&client) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => return,
+        };
+        // The predicate runs under the shard lock, so a connection that attached in the meantime
+        // keeps its row rather than racing the reap.
+        let removed = self.controllers.remove_if(&key, |_, row| {
+            row.client == client && row.attached.is_none()
+        });
+        if removed.is_some() {
+            self.controller_ids.remove(&client);
+            // The channel is kept alive for the identity's sake alone (see
+            // [`Self::deregister_client`]), so it goes at the same moment the identity does.
+            self.events.remove(&client);
+        }
     }
 
     /// Push an asynchronous event to `client`, dropping it if the client is gone or its queue is
     /// full (late events are worthless — never block the engine on a slow consumer).
     pub(super) fn push_event(&self, client: ClientId, event: Event) {
-        if let Some(sender) = self.events.get(&client) {
-            if sender.try_send(event).is_err() {
+        if let Some(sink) = self.events.get(&client) {
+            if sink.sender.try_send(event).is_err() {
                 tracing::debug!(?client, "control event dropped (queue full or closed)");
             }
         }

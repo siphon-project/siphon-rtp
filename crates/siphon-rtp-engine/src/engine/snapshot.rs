@@ -781,7 +781,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             secure_parts = Some((far_local, far_remote, leg, rtcp_relays));
         }
-        let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
+        let owner_events = self.event_sink(client);
         let media_call = MediaCall::new(
             snapshot.call_id.clone(),
             snapshot.from_tag.clone(),

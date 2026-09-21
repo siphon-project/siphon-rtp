@@ -8,11 +8,11 @@
 use std::sync::Arc;
 
 use siphon_rtp_datapath::Datapath;
-use siphon_rtp_proto::{frame, CmdResult, Command, Request, Response};
+use siphon_rtp_proto::{frame, CmdResult, Command, Event, Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::engine::{ClientId, Engine};
+use crate::engine::{ClientGeneration, ClientId, ControllerAttachError, Engine};
 use crate::metrics::RateLimiter;
 use crate::shutdown::Shutdown;
 
@@ -88,16 +88,67 @@ where
     }
 }
 
-/// Deregisters a client's event sink when its connection ends, on every exit path (clean close,
-/// error, or task drop).
-struct ClientGuard<D: Datapath + Clone + Send + 'static> {
+/// Everything a `controller_id` claim rewrites about a live connection: the [`ClientId`] its verbs
+/// are keyed by, the event receiver drained to the socket, the flag a newer connection on the same
+/// identity trips, and the registrations its teardown releases.
+///
+/// Releasing on drop covers every exit path (clean close, error, eviction, or task drop), and both
+/// releases are conditional on the generation *this* connection registered — a reconnecting
+/// controller resolves to the same `ClientId`, so an unconditional release would let the connection
+/// being replaced silence the one replacing it.
+struct ConnectionIdentity<D: Datapath + Clone + Send + 'static> {
     engine: Arc<Engine<D>>,
     client: ClientId,
+    generation: ClientGeneration,
+    /// The stable identity this connection claimed, if it claimed one.
+    controller: Option<String>,
+    events: flume::Receiver<Event>,
+    evicted: Shutdown,
 }
 
-impl<D: Datapath + Clone + Send + 'static> Drop for ClientGuard<D> {
+impl<D: Datapath + Clone + Send + 'static> ConnectionIdentity<D> {
+    /// Claim the stable identity `controller_id`, re-keying this connection onto the [`ClientId`]
+    /// the engine already minted for it (docs/security-and-nat.md §5).
+    ///
+    /// Claimed once or not at all: the identity decides which calls the connection owns, so letting
+    /// it change mid-connection would strand them exactly as a reconnect does today. Re-presenting
+    /// the *same* id is a no-op, since a controller that re-authenticates has not changed identity.
+    fn claim(&mut self, controller_id: &str) -> Result<(), ControllerAttachError> {
+        if let Some(claimed) = &self.controller {
+            return if claimed == controller_id {
+                Ok(())
+            } else {
+                Err(ControllerAttachError::AlreadyClaimed)
+            };
+        }
+        // The attach registers a sink under the resolved id, so the connection-ordinal one goes
+        // first — otherwise it would linger in the registry with nothing left to release it.
+        self.engine.deregister_client(self.client, self.generation);
+        let attachment = match self.engine.attach_controller(controller_id, self.client) {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                // The claim failed but the connection lives on, so put it back on its own identity.
+                let (generation, events) = self.engine.register_client_generation(self.client);
+                self.generation = generation;
+                self.events = events;
+                return Err(error);
+            }
+        };
+        self.client = attachment.client;
+        self.generation = attachment.generation;
+        self.events = attachment.events;
+        self.evicted = attachment.evicted;
+        self.controller = Some(controller_id.to_string());
+        Ok(())
+    }
+}
+
+impl<D: Datapath + Clone + Send + 'static> Drop for ConnectionIdentity<D> {
     fn drop(&mut self) {
-        self.engine.deregister_client(self.client);
+        self.engine.deregister_client(self.client, self.generation);
+        if let Some(controller) = &self.controller {
+            self.engine.detach_controller(controller, self.generation);
+        }
     }
 }
 
@@ -119,11 +170,19 @@ async fn handle_connection<D>(
 where
     D: Datapath + Clone + Send + 'static,
 {
-    let events = engine.register_client(client);
+    let (generation, events) = engine.register_client_generation(client);
     let metrics = engine.metrics();
-    let _guard = ClientGuard {
+    // A connection that claims no identity is never evicted: it holds the trigger for its own
+    // placeholder flag for its whole life, so the flag neither trips nor resolves on a dropped
+    // sender. A successful claim replaces the flag with the registry-backed one.
+    let (_never_evicted, evicted) = crate::shutdown::channel();
+    let mut identity = ConnectionIdentity {
         engine: engine.clone(),
         client,
+        generation,
+        controller: None,
+        events,
+        evicted,
     };
     // Split so the inbound-read future and the event/response writes borrow disjoint halves.
     let (mut read_half, mut write_half) = stream.into_split();
@@ -154,25 +213,44 @@ where
                         }
                     } else {
                         match request.command {
-                            Command::Authenticate { token } => match secret.as_deref() {
-                                None => auth_ok(),
-                                Some(secret)
-                                    if tokens_match(token.as_bytes(), secret.as_bytes()) =>
-                                {
-                                    authenticated = true;
-                                    auth_ok()
+                            Command::Authenticate {
+                                token,
+                                controller_id,
+                            } => {
+                                // Judged on this frame's token alone, so a wrong one is refused
+                                // whether or not the connection authenticated earlier.
+                                let accepted = match secret.as_deref() {
+                                    None => true,
+                                    Some(secret) => {
+                                        tokens_match(token.as_bytes(), secret.as_bytes())
+                                    }
+                                };
+                                authenticated |= accepted;
+                                // A controller id is an identity claim, not a credential: where a
+                                // secret is configured it is honoured only on a connection that
+                                // presented the matching token (docs/security-and-nat.md §5).
+                                match (accepted, controller_id) {
+                                    (false, _) => CmdResult::Error {
+                                        reason: "authentication failed".to_string(),
+                                    },
+                                    (true, None) => auth_ok(),
+                                    (true, Some(controller_id)) => {
+                                        match identity.claim(&controller_id) {
+                                            Ok(()) => auth_ok(),
+                                            Err(error) => CmdResult::Error {
+                                                reason: error.to_string(),
+                                            },
+                                        }
+                                    }
                                 }
-                                Some(_) => CmdResult::Error {
-                                    reason: "authentication failed".to_string(),
-                                },
-                            },
+                            }
                             command if !authenticated => {
                                 let _ = command;
                                 CmdResult::Error {
                                     reason: "authentication required".to_string(),
                                 }
                             }
-                            command => engine.handle(client, command).await,
+                            command => engine.handle(identity.client, command).await,
                         }
                     };
                     let response = Response {
@@ -205,13 +283,23 @@ where
                 }
                 buffer.extend_from_slice(&chunk[..read]);
             }
-            event = events.recv_async() => {
+            event = identity.events.recv_async() => {
                 if let Ok(event) = event {
                     match frame::encode(&event) {
                         Ok(bytes) => write_half.write_all(&bytes).await?,
                         Err(error) => tracing::error!(%error, "failed to encode control event"),
                     }
                 }
+            }
+            () = identity.evicted.cancelled() => {
+                // A newer connection claimed this connection's controller identity. Newest wins,
+                // so this one closes rather than two connections sharing one identity's calls.
+                tracing::warn!(
+                    target: "siphon_rtp::control",
+                    client = identity.client.0,
+                    "control connection superseded by a newer one on the same controller identity"
+                );
+                return Ok(());
             }
             _ = refill.tick() => {
                 rate_limiter.refill(1);

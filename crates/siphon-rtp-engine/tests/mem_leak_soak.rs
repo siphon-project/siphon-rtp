@@ -320,6 +320,94 @@ async fn offer_answer_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize)
     assert_ok(&delete, "delete");
 }
 
+/// Churn one control connection that presents a **new** stable identity, carries a call through
+/// `offer → answer → delete`, and disconnects — the shape that retains most.
+///
+/// An identity row outlives the connection that created it, deliberately: that retention is what
+/// lets a reconnect find the calls it already owns. So it is also the one piece of engine state a
+/// peer could make grow without bound, one row per id it is ever shown, and on a control plane
+/// reachable without a secret it can choose every one of them. Hence a distinct id per cycle rather
+/// than a realistic handful: the row, its reverse index and its event channel all have to come back
+/// once no connection is attached and no call is left under it.
+async fn controller_connect_call_disconnect(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let controller_id = format!("soak-controller-{index}");
+    let call_id = format!("soak-identity-{index}");
+    let attachment = engine
+        .attach_controller(&controller_id, ClientId(1_000_000 + index as u64))
+        .expect("claim");
+
+    let offer = engine
+        .handle(
+            attachment.client,
+            Command::Offer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for("198.51.100.1", 40_000),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&offer, "offer");
+
+    let answer = engine
+        .handle(
+            attachment.client,
+            Command::Answer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for("203.0.113.1", 41_000),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&answer, "answer");
+
+    let delete = engine
+        .handle(
+            attachment.client,
+            Command::Delete {
+                call_id,
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert_ok(&delete, "delete");
+
+    // The connection ends, which is what releases the identity now that it owns nothing.
+    engine.deregister_client(attachment.client, attachment.generation);
+    engine.detach_controller(&controller_id, attachment.generation);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controller_identity_churn_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    let mut gate = LeakGate::new("controller identity churn", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            controller_connect_call_disconnect(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(
+            engine.controller_count(),
+            0,
+            "no identity outlives both its connection and its last call"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// Churn one relay through `offer → answer → re-offer from A → answer → re-offer from B → A's
 /// reversed answer → delete`. Each re-offer records its party's state and each answer re-runs the
 /// media wiring on the live call; a re-offer from B also holds its SDP on the call until A answers.
