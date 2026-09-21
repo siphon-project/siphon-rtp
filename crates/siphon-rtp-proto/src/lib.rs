@@ -92,6 +92,14 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// SDP and play-media blobs are the only large payloads and stay well under this.
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
+/// Longest [`Command::Authenticate::controller_id`] the engine accepts, in bytes.
+///
+/// A stable controller identity is a hostname or a pod name, so the bound is generous for every
+/// real one. It exists because the engine retains a row per identity it is shown for as long as
+/// that identity owns calls, and a control plane reachable without a secret would otherwise let a
+/// peer choose how much the engine remembers.
+pub const MAX_CONTROLLER_ID_LEN: usize = 128;
+
 /// Smallest [`ProfileFlags::echo_delay_search_ms`] the engine accepts as a **search window**, in
 /// milliseconds. The floor keeps a request from rounding to a degenerate range.
 ///
@@ -721,9 +729,28 @@ pub enum Command {
     /// Stop lawful-interception content delivery for a call, closing the delivery connection.
     /// Idempotent: detaching a call with no interception is not an error.
     DetachX3 { call_id: String, from_tag: String },
-    /// Authenticate the control connection with the server's shared secret. Handled by the control
-    /// server (not the session engine); required as the first command when a secret is configured.
-    Authenticate { token: String },
+    /// Authenticate the control connection with the server's shared secret, and optionally present
+    /// the stable identity the controller reconnects under. Handled by the control server (not the
+    /// session engine); required as the first command when a secret is configured.
+    Authenticate {
+        token: String,
+        /// Stable identity of the controller *process*, so the calls it owns, its event sink and
+        /// its per-client quota row survive a reconnect instead of being stranded under an
+        /// identity that can never be presented again (docs/security-and-nat.md §5). Derive it
+        /// from something that outlives the connection *and* the process — a pod or host name —
+        /// and never mix in a boot epoch, which would defeat the point.
+        ///
+        /// Absent ⇒ identity is the connection, which is exactly today's behaviour: `default`
+        /// keeps a client that predates the field working against a newer engine, and
+        /// `skip_serializing_if` keeps the frame byte-identical to the old one when there is no
+        /// id to present, so a newer client also works against an older engine.
+        ///
+        /// It is an identity *claim*, not a credential: where a secret is configured the engine
+        /// honours it only on a connection that presented the matching token. At most
+        /// [`MAX_CONTROLLER_ID_LEN`] bytes, and not empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controller_id: Option<String>,
+    },
 }
 
 /// A 16-byte lawful-interception task identifier (XID), provisioned over X1 and carried opaquely in
@@ -2962,6 +2989,11 @@ mod tests {
             },
             Command::Authenticate {
                 token: "s3cret".into(),
+                controller_id: None,
+            },
+            Command::Authenticate {
+                token: "s3cret".into(),
+                controller_id: Some("sbc-1".into()),
             },
         ];
         for command in &commands {
@@ -2970,6 +3002,45 @@ mod tests {
                 command: command.clone(),
             });
         }
+    }
+
+    #[test]
+    fn authenticate_accepts_a_frame_without_a_controller_id() {
+        // Forward compatibility in the direction that matters most: a controller built before the
+        // field exists sends exactly this frame, and a newer engine must still authenticate it.
+        let json = r#"{"command":"authenticate","token":"s3cret"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::Authenticate {
+                token,
+                controller_id,
+            } => {
+                assert_eq!(token, "s3cret");
+                assert_eq!(controller_id, None, "absent ⇒ identity is the connection");
+            }
+            other => panic!("expected authenticate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authenticate_without_a_controller_id_keeps_the_old_wire_shape() {
+        // The other direction: a newer controller with no id to present must not emit a field an
+        // older engine would have to tolerate, so `None` serialises the key away entirely.
+        let frame = serde_json::to_string(&Command::Authenticate {
+            token: "s3cret".into(),
+            controller_id: None,
+        })
+        .expect("serialize");
+        assert_eq!(frame, r#"{"command":"authenticate","token":"s3cret"}"#);
+
+        let frame = serde_json::to_string(&Command::Authenticate {
+            token: "s3cret".into(),
+            controller_id: Some("sbc-1".into()),
+        })
+        .expect("serialize");
+        assert_eq!(
+            frame,
+            r#"{"command":"authenticate","token":"s3cret","controller_id":"sbc-1"}"#
+        );
     }
 
     #[test]
