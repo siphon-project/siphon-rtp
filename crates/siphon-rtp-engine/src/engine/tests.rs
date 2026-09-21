@@ -6525,17 +6525,19 @@ async fn a_secure_caller_reaches_a_plain_callee_through_the_bridge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
-    // The two shapes that are *not* wired refuse rather than answering `ok` and relaying the
-    // caller's audio somewhere it should not go. Both need A's `SecureLeg` threaded into the
-    // transcoding pipeline, which is the other half of this work.
+    // The shapes that are *not* wired refuse rather than answering `ok` and relaying the caller's
+    // audio somewhere it should not go. **Which verb refuses is itself the assertion.** A secure
+    // far leg is settled from the offer's own profile and only read back at the answer, so that
+    // refusal belongs on the `offer`, before either party has been rung. A codec mismatch is not
+    // known until B has answered, so that one can only be refused there.
     let caller_key =
         CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
 
-    // (a) both parties secure — a transcrypt between two different keys.
+    // (a) both parties secure — a transcrypt between two different keys. Refused on the OFFER: the
+    // callee is never rung for a call the engine already knows it cannot carry.
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_phone_a, addr_a) = phone().await;
-    let (_phone_b, addr_b) = phone().await;
-    engine
+    let result = engine
         .handle(
             CLIENT,
             Command::Offer {
@@ -6549,20 +6551,6 @@ async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
             },
         )
         .await;
-    let callee_key =
-        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
-    let result = engine
-        .handle(
-            CLIENT,
-            Command::Answer {
-                call_id: "both-secure".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdes_offerer_sdp(addr_b, &callee_key),
-                profile: Default::default(),
-            },
-        )
-        .await;
     match result {
         CmdResult::Error { reason } => {
             assert!(reason.contains("secure-offerer-unsupported"), "{reason}");
@@ -6570,8 +6558,43 @@ async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
         }
         other => panic!("expected a refusal for secure↔secure, got {other:?}"),
     }
+    assert!(!engine.calls.contains_key("both-secure"));
+    assert_eq!(engine.client_call_count(CLIENT), 0, "no quota slot leaked");
 
-    // (b) a codec mismatch — the secure offerer's leg would have to reach the transcoder.
+    // (a2) an SDES caller toward a **DTLS** far leg: two keying mechanisms, not two keys. Also the
+    // offer, and this one stays refused even once the SDES↔SDES transcrypt lands.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "sdes-toward-dtls".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: ProfileFlags {
+                    transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    match result {
+        CmdResult::Error { reason } => {
+            assert!(reason.contains("secure-offerer-unsupported"), "{reason}");
+            assert!(
+                reason.contains("DTLS-SRTP"),
+                "the refusal names which far posture it cannot key against, got: {reason}"
+            );
+        }
+        other => panic!("expected a refusal for SDES↔DTLS, got {other:?}"),
+    }
+    assert!(!engine.calls.contains_key("sdes-toward-dtls"));
+    assert_eq!(engine.client_call_count(CLIENT), 0, "no quota slot leaked");
+
+    // (b) a codec mismatch — the secure offerer's leg would have to reach the transcoder. Only B's
+    // answer names B's codec, so this one is still refused on the ANSWER. That the offer above is
+    // refused earlier while this one is not is the whole distinction.
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_phone_a, addr_a) = phone().await;
     let (_phone_b, addr_b) = phone().await;
