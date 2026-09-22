@@ -132,7 +132,7 @@ per-leg media interface (below).
 | `address_family` | string | `IP4` \| `IP6` for the far leg's engine endpoints (v4/v6 interworking). |
 | `flags` | string list | Behavioral flags plus the codec directives (`codec-transcode-X`, `codec-mask-X`, `codec-strip-X`, `codec-offer-X`, `codec-except-X`, `ptime=N`, ...). |
 | `direction` | string list | Named-interface selection (rtpengine-style). Two interface names: the first for the caller-facing (A / near) leg, the second for the callee-facing (B / far) leg — so an inbound leg lands on `internal` and the outbound leg on `external`. Each interface has a bind IP and an advertised (public) IP (see the daemon `[[interface]]` config). An absent or unknown name falls back to the default interface (logged). With no `[[interface]]` configured, both legs use the single synthesised `default` interface. |
-| `record_call`, `record_path` | bool, string | Record this call from setup; output directory. |
+| `record_call`, `record_path` | bool, string | Record this call from setup; `record_path` is the output **directory**, and each direction lands in it as `<call_id>-a.wav` / `<call_id>-b.wav` when the call ends. Recording needs the decoded audio, so naming it forces the call onto the media path even where the two legs share a codec and would otherwise have been relayed or crypto-bridged — including on a secure leg, where the engine decrypts, records and re-encrypts. Distinct from the `start_recording` verb, which captures raw RTP to pcap and refuses a secure call. |
 | `noise_suppression` | bool | Single-channel noise suppression on this leg's decoded ingress before it is transcoded/relayed (and captured by recording/forks). Engaged only on a userspace-transcoded leg whose codec is 8 or 16 kHz; inert on an in-kernel passthrough or a 48 kHz codec. Setting it forces a same-codec call off the in-kernel fast path onto the media slow path (like `record_call`). Native extension; not set over NG. |
 | `echo_cancellation` | bool | Acoustic/line echo cancellation on this leg's send path, using the audio played *toward* that party as the far-end reference (on a WebSocket voice-AI bridge, the AI downlink cancels the phone's echo of the AI). Runs at the codec's native 8 or 16 kHz; a codec at another rate passes through uncancelled. Wired on transcode and WebSocket-bridge legs, **not** on SRTP/DTLS-secured legs. Setting it promotes a same-codec plaintext call to the userspace pipeline. Native extension; not set over NG. |
 | `echo_delay_search_ms` | int | How far from the reference the echo canceller looks for the returning echo — the GCC-PHAT bulk-delay search window. Unset ⇒ 256 ms. This is **not** an acoustic loudspeaker→mic delay: the reference is what the engine sent *toward* a party and the echo arrives on that party's uplink, so the whole media path is in the loop twice with the acoustic reflection between. A LAN softphone returns inside tens of ms; a handset behind a mobile network and a PSTN carrier is conventionally 100–200 ms *each way* first. **An echo outside the window is not found and the failure is quiet** — the estimator commits the tallest lag it can see, so a too-narrow window yields a lock on noise and a canceller that runs and cancels nothing, with every status field still healthy. Watch `siphon_rtp_aec_delay_weak_locks_total` and the `siphon_rtp::media` log target. Range 16–1000 ms as a search window, and the same 16–1000 ms when `echo_long_tail` reads it as a tail instead — two separate bounds that happen to coincide, so validate against the reading you are asking for; outside the applicable one the offer/answer is rejected, and a value the negotiated rate cannot express is clamped down with a warning rather than dropping the canceller. Widening is not free — crossing 256 ms at a 16 kHz rate doubles the estimator's per-leg memory and its time to first lock (1.5 s → 3.1 s of far-end speech). Inert without `echo_cancellation`. Native extension; not set over NG. |
@@ -180,15 +180,24 @@ per-leg media interface (below).
 
 | Verb | Fields | Result |
 |---|---|---|
-| `checkpoint` | `call_id`, `from_tag` | `{"result": "checkpoint", "snapshot": "..."}`. An opaque blob; store it verbatim, keyed by call. Ownership-gated. |
+| `checkpoint` | `call_id`, `from_tag` | `{"result": "checkpoint", "snapshot": "..."}`. An opaque blob; store it verbatim, keyed by call. Ownership-gated. A call whose media path the snapshot cannot describe is **refused here**, naming what is missing, rather than returning a blob that fails at failover. |
 | `restore` | `snapshot` | Rebuilds the call on this (standby) node at the snapshot's exact ports, so a floating-IP failover needs no re-INVITE. |
 
-`restore` currently rebuilds four call shapes: a plain passthrough relay, an SDES-SRTP
-bridge, a plaintext transcode call, and a secure transcode call (`SrtpMedia`). A
-WebSocket-bridged or DTLS-SRTP call keeps live state that a snapshot cannot recover (a running
-WS actor, or handshake-derived DTLS keys) and is rejected with
-`restore of a ... call is not yet supported`. Restoring a `call_id` that already exists
-on the node is also rejected.
+`restore` rebuilds four call shapes: a plain passthrough relay, an SDES-SRTP bridge, a
+plaintext transcode call, and a secure transcode call (`SrtpMedia`). Everything else is
+refused by `checkpoint` in the first place, because the snapshot record describes exactly
+one topology — a two-party call whose *far* side may be secure — and the rest have state
+it has nowhere to put:
+
+- a **secure caller** (its own keying is not in the record, so a standby would resume the
+  call with the caller demoted to plaintext);
+- a **secure↔secure** call, bridged or transcoding (two secure legs, one record);
+- a **DTLS-SRTP** call (keys come from the handshake, not the SDP);
+- a **WebSocket-bridged** call (no far leg to replicate at all).
+
+`restore` keeps its own checks as defence in depth, so a hand-crafted blob is still
+rejected with `restore of a ... call is not yet supported`. Restoring a `call_id` that
+already exists on the node is also rejected.
 
 ### Media control
 

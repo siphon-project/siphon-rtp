@@ -84,6 +84,36 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **`checkpoint` now refuses a call it cannot replicate, instead of handing back a blob that fails
+  at failover.** The HA snapshot record describes one topology — a two-party call whose *far* side
+  may be secure — and `restore` has always rejected anything else. It rejected it at the worst
+  possible moment, though: during the failover, having accepted a `checkpoint` that looked like it
+  worked. A **secure caller** was the sharp edge, because it was recorded as a plain `Srtp` bridge,
+  so the eventual rejection named a kind the call never was (`restore of a Srtp call is not yet
+  supported`) and a standby that did accept it would have resumed the call with the caller demoted
+  to plaintext. `checkpoint` now declines a secure-offerer, secure↔secure or DTLS-SRTP call up
+  front and says which part of its state the record cannot hold, while an operator can still act on
+  it. `restore` keeps its own checks as defence in depth. A WebSocket-bridged call was already
+  declined for having no far leg at all, and keeps that more specific reason.
+
+- **A `record_call` recording is now actually written.** Two independent defects, either of which
+  was enough to lose the file, and both silent: the call answered `ok` and carried audio throughout.
+
+  The media actor writes the WAV in the code that runs *after* its mailbox loop ends, and that code
+  was unreachable. Tearing a call down sent the actor a `Stop` and then aborted its task on the very
+  next line; the actor was parked on its mailbox, so the abort dropped that future and the teardown
+  never ran. This lost the recording on **every** pipeline, plaintext included. A stopped actor now
+  gets a bounded grace period to finish before it is aborted. (`start_recording`, the pcap verb, is
+  a different mechanism and was never affected — the engine stops those from its own registry.)
+
+  Separately, a call only reaches a media actor at all when something needs the decoded audio, and
+  the secure-far-leg arm of that decision tested a shorter list than every other arm: a codec
+  mismatch and beep detection, but not `record_call`, `noise_suppression` or `echo_cancellation`. An
+  `RTP/AVP` ↔ `RTP/SAVP` call on a shared codec therefore resolved to the crypto bridge, which has
+  no media actor, no recorder and no use for `record_path`; noise suppression and echo cancellation
+  were inert on those calls for the same reason. All four arms now read one definition, so a new
+  flag is added in one place.
+
 - **A bridged leg now replies where its peer's media actually comes from.** `symmetric` (and the
   default signalled gate) admitted a NATed phone's packets from its NAT binding, and the SRTP bridge
   then kept answering the private address in the phone's `c=` line for the rest of the call — so

@@ -7053,6 +7053,294 @@ async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secure_offerer_call_refuses_a_checkpoint_instead_of_failing_at_failover() {
+    // The HA record describes one topology: a two-party call whose *far* side may be secure. A
+    // secure **offerer** has keying it has nowhere to put, and it used to be recorded as a plain
+    // `Srtp` bridge — so `checkpoint` returned a blob that looked usable, and the failure surfaced
+    // at `restore`, under a kind the call never was ("restore of a Srtp call is not yet supported").
+    // Refuse at checkpoint, while the operator can still act on it, and name the real obstacle.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "offerer-ha".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "offerer-ha".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for(addr_b, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_eq!(
+        engine.calls.get("offerer-ha").expect("call").pipeline,
+        PipelineKind::SrtpOfferer,
+        "precondition: a secure caller toward a plain callee"
+    );
+    match engine
+        .handle(
+            CLIENT,
+            Command::Checkpoint {
+                call_id: "offerer-ha".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await
+    {
+        CmdResult::Error { reason } => {
+            assert!(
+                reason.contains("secure caller's own keying"),
+                "the refusal names the missing state, got: {reason}"
+            );
+            assert!(
+                !reason.contains("Srtp call"),
+                "and never blames a kind this call is not, got: {reason}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        engine.calls.contains_key("offerer-ha"),
+        "refusing to replicate the call does not end it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recorded_plaintext_call_writes_its_wav_on_teardown() {
+    // The `record_call` profile recording is flushed by the media actor's teardown, and teardown used
+    // to be unreachable: `deregister` sent `Stop` and aborted the task on the next line, so the actor
+    // was killed parked on its mailbox and everything after its loop — including the file write —
+    // never ran. Every recorded call, on every pipeline, produced no file. Pinned on the plaintext
+    // path because that is the simplest shape that shows it is not a secure-call problem.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+
+    let directory =
+        std::env::temp_dir().join(format!("siphon-rtp-plain-record-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("record directory");
+
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "plain-rec".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "plain-rec".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for(addr_b, true),
+                profile: ProfileFlags {
+                    record_call: true,
+                    record_path: Some(directory.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let engine_near = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer")
+        .remote_rtp;
+    for sequence in 0..10u16 {
+        phone_a
+            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), engine_near)
+            .await
+            .expect("caller send");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "plain-rec".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+
+    let recording = directory.join("plain-rec-a.wav");
+    for _ in 0..50 {
+        if recording.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        recording.exists(),
+        "the call asked to be recorded and the recording must exist at {}",
+        recording.display()
+    );
+    let written = std::fs::metadata(&recording).expect("wav metadata").len();
+    assert!(
+        written > 44,
+        "the WAV carries samples, not just a header ({written} bytes)"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recording_a_secure_call_on_a_shared_codec_actually_writes_the_audio() {
+    // A plaintext caller toward a secure callee, both on PCMU, with `record_call`. Nothing about the
+    // codecs forces a decode, so this used to resolve to the plain SRTP crypto bridge — which
+    // registers no media actor, has no recorder, and drops `record_path` on the floor. The `answer`
+    // returned `ok`, the call carried audio, and the recording silently never existed.
+    //
+    // Asserted on the **file**, not on the pipeline kind: a recorder that is wired but never flushed
+    // would pass a kind check and still leave the operator with nothing.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+
+    let directory =
+        std::env::temp_dir().join(format!("siphon-rtp-secure-record-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("record directory");
+
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "secure-rec".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let toward_b = sdp::parse(&ok_sdp_text(&offered)).expect("far offer");
+    let engine_far = toward_b.remote_rtp;
+    assert!(
+        !toward_b.crypto.is_empty(),
+        "precondition: the callee leg really is secure"
+    );
+
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "secure-rec".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                // Same codec as A offered, so nothing but `record_call` can force the decode.
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: ProfileFlags {
+                    record_call: true,
+                    record_path: Some(directory.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let engine_near = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer")
+        .remote_rtp;
+
+    // Drive audio both ways so each direction's recorder has samples to flush.
+    let mut b_out = SrtpContext::from_key_material(&callee_key.key);
+    let mut buffer = [0u8; 2048];
+    for sequence in 0..10u16 {
+        phone_a
+            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), engine_near)
+            .await
+            .expect("caller send");
+        let _ = timeout(Duration::from_millis(200), phone_b.recv_from(&mut buffer)).await;
+
+        let mut sealed = Vec::new();
+        b_out
+            .protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x40), &mut sealed)
+            .expect("B encrypts");
+        phone_b
+            .send_to(&sealed, engine_far)
+            .await
+            .expect("callee send");
+        let _ = timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await;
+    }
+
+    // Teardown flushes the recorders.
+    engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "secure-rec".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    // The actor writes the files as it exits; give it a moment to land.
+    for _ in 0..50 {
+        if directory.join("secure-rec-a.wav").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let caller_side = directory.join("secure-rec-a.wav");
+    assert!(
+        caller_side.exists(),
+        "the call asked to be recorded and the recording must exist at {}",
+        caller_side.display()
+    );
+    let written = std::fs::metadata(&caller_side).expect("wav metadata").len();
+    assert!(
+        written > 44,
+        "the WAV carries samples, not just a header ({written} bytes)"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_secure_offer_with_no_usable_key_is_refused_not_bridged_in_the_clear() {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_phone_a, addr_a) = phone().await;
