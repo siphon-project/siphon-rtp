@@ -26,6 +26,13 @@ use crate::{
 /// leaves headroom without paying for jumbo frames the media plane never sees.
 const MAX_DATAGRAM: usize = 2048;
 
+/// The logical clock's origin. One rather than zero, because `0` is the value
+/// [`StatsAtomic::last_seen`] carries to mean "this endpoint has accepted no packet yet", and a
+/// clock starting at zero would let a packet accepted in the very first tick stamp that same value —
+/// indistinguishable from never having arrived. The origin itself is arbitrary (nothing reads an
+/// absolute tick, only differences), so making it one costs nothing and keeps the sentinel exact.
+const FIRST_TICK: u64 = 1;
+
 /// Lock-free per-endpoint counters, mutated from the endpoint's single receive task and snapshotted
 /// by `stats`.
 struct StatsAtomic {
@@ -172,6 +179,11 @@ enum IceGate {
 struct Inner {
     next_id: AtomicU64,
     /// Logical clock (monotonic ticks) for the media-timeout sweep; advanced via `advance_clock`.
+    ///
+    /// Starts at [`FIRST_TICK`], not at zero, so that the tick an accepted packet stamps can never be
+    /// the `0` that [`StatsAtomic::last_seen`] uses to mean "no packet yet". The origin is arbitrary —
+    /// only differences between ticks are ever read — but the sentinel is not, and the media-timeout
+    /// sweep reasons from it.
     clock: AtomicU64,
     /// Live (reserved) endpoint count, capped at `max_endpoints` to bound port/FD use.
     live: AtomicUsize,
@@ -533,7 +545,7 @@ impl UdpLoopbackDatapath {
         Self {
             inner: Arc::new(Inner {
                 next_id: AtomicU64::new(0),
-                clock: AtomicU64::new(0),
+                clock: AtomicU64::new(FIRST_TICK),
                 live: AtomicUsize::new(0),
                 max_endpoints,
                 bind_ip,
@@ -2390,7 +2402,7 @@ mod tests {
     #[tokio::test]
     async fn clock_and_last_activity_track_endpoints() {
         let datapath = UdpLoopbackDatapath::new();
-        assert_eq!(datapath.now_ticks(), 0);
+        assert_eq!(datapath.now_ticks(), FIRST_TICK);
         assert_eq!(
             datapath.last_activity(EndpointId(0)),
             None,
@@ -2403,7 +2415,22 @@ mod tests {
             "no packets accepted yet"
         );
         datapath.advance_clock(5);
-        assert_eq!(datapath.now_ticks(), 5);
+        assert_eq!(datapath.now_ticks(), FIRST_TICK + 5);
+    }
+
+    #[test]
+    fn the_clock_never_reports_the_no_packet_sentinel() {
+        // `last_activity` says "no packet yet" with the tick `0`, and the media-timeout sweep reads
+        // that to tell a call whose path died from one still in setup. A clock that could itself
+        // report `0` would let a packet accepted in the first tick stamp the sentinel and read back
+        // as one that never arrived, so the origin is one — asserted here rather than left to the
+        // constant's comment.
+        let datapath = UdpLoopbackDatapath::new();
+        assert_ne!(
+            datapath.now_ticks(),
+            0,
+            "a fresh backend must already be past the sentinel"
+        );
     }
 
     #[test]
@@ -2415,10 +2442,10 @@ mod tests {
             datapath.advance_clock(ticks);
         }
         let datapath = UdpLoopbackDatapath::new();
-        assert_eq!(datapath.now_ticks(), 0);
+        assert_eq!(datapath.now_ticks(), FIRST_TICK);
         tick_via_trait(&datapath, 3);
         tick_via_trait(&datapath, 4);
-        assert_eq!(datapath.now_ticks(), 7);
+        assert_eq!(datapath.now_ticks(), FIRST_TICK + 7);
     }
 
     #[test]
@@ -2645,7 +2672,7 @@ mod tests {
 
         assert_eq!(
             datapath.last_activity(leg.id),
-            Some(7),
+            Some(FIRST_TICK + 7),
             "a valid consent check stamps activity at the current tick"
         );
     }
@@ -2857,7 +2884,11 @@ mod tests {
             .expect("the channel stays open");
         assert_eq!(event.endpoint, leg.id);
         assert_eq!(event.source, peer_addr);
-        assert_eq!(event.arrival_tick, 5, "stamped at the current logical tick");
+        assert_eq!(
+            event.arrival_tick,
+            FIRST_TICK + 5,
+            "stamped at the current logical tick"
+        );
         assert_eq!(event.datagram.as_ref(), response.as_slice());
     }
 

@@ -564,6 +564,15 @@ pub trait Datapath: Send + Sync {
     /// The tick of the last **accepted** packet on `endpoint` (`0` if none yet), or `None` if the
     /// endpoint is unknown. Feeds the media-timeout / dead-path sweep (docs/security-and-nat.md §4
     /// layer 6).
+    ///
+    /// `0` is load-bearing, not merely conventional: the sweep distinguishes a call whose media path
+    /// *died* from one that has not carried a packet **yet** (still in setup) by whether any of its
+    /// endpoints reports a non-zero tick, and gives the two different ceilings. A backend must
+    /// therefore never let [`now_ticks`](Self::now_ticks) report `0` while it is running, or a packet
+    /// accepted in that first tick stamps the sentinel and reads back as one that never arrived. The
+    /// loopback backend starts its logical clock at one for exactly this reason; the cost of getting
+    /// it wrong is bounded (one tick of the longer ceiling, self-correcting on the next packet), but
+    /// it makes the sweep's reasoning untrue.
     fn last_activity(&self, endpoint: EndpointId) -> Option<u64>;
 
     /// Stamp `endpoint`'s activity at the current logical tick. The `Forward` fast path stamps
