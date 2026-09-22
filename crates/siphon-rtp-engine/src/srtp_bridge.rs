@@ -25,7 +25,12 @@ use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use crate::dtls_bridge::DtlsBridge;
+use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
+
+/// The SSRC of an RTP media datagram, or `None` for anything else (RTCP, STUN, DTLS). What the
+/// symmetric latch keys a stream on (RFC 3550 §8), shared with the other `Redirect` consumers.
+use siphon_rtp_datapath::rtp_media_ssrc;
 
 /// Which of a call's two parties owns the SRTP/SRTCP contexts one side of a bridge flow reaches for.
 ///
@@ -60,9 +65,17 @@ pub struct BridgeFlowPlan {
     pub egress_leg: Option<BridgeLeg>,
     /// Signalled-source gate — only this source may drive the flow (RTPBleed defence).
     pub accepted_source: SourceFilter,
+    /// Whether this endpoint's accepted ingress may re-point the reply at the source the peer's
+    /// media actually arrives from (symmetric RTP, docs/security-and-nat.md §4 layer 3).
+    ///
+    /// `false` on a leg whose transport an RFC 8445 agent owns: there an authenticated connectivity
+    /// check is the only thing that may move the destination (§4 layer 4), which is the same posture
+    /// the datapath takes by installing `LatchPolicy::Off` on an ICE leg.
+    pub latch: bool,
     /// The endpoint to transmit the transformed datagram from (the peer-facing socket).
     pub out_endpoint: EndpointId,
-    /// Where to transmit it (the peer's negotiated address).
+    /// Where to transmit it: the peer's *negotiated* address, used until its own flow latches and
+    /// learns where its media really comes from.
     pub out_dst: SocketAddr,
 }
 
@@ -91,6 +104,10 @@ struct FlowLeg {
 /// An installed bridge flow: a plan with its leg references resolved to the call's shared handles.
 struct Flow {
     accepted_source: SourceFilter,
+    /// This endpoint's symmetric-RTP latch, shared with [`crate::media_pipeline`] and the WS bridge
+    /// through [`SymmetricLatch`] so the userspace `Redirect` paths cannot drift on what counts as a
+    /// genuine NAT rebind and what counts as a hijack spray. `None` on an ICE-managed leg.
+    latch: Option<Arc<Mutex<SymmetricLatch>>>,
     out_endpoint: EndpointId,
     out_dst: SocketAddr,
     /// Decrypts this endpoint's ingress; `None` when it arrives in the clear.
@@ -118,6 +135,20 @@ struct Flow {
 pub struct SrtpBridge<D: Datapath> {
     datapath: D,
     flows: DashMap<EndpointId, Flow>,
+    /// Where each redirected endpoint's peer actually sends from, learned from that endpoint's
+    /// accepted, authenticated ingress.
+    ///
+    /// Read when forwarding *out of* an endpoint — the same indirection the datapath's `Forward`
+    /// path uses (`udp.rs`: "prefer its latched source (symmetric RTP) over its configured
+    /// destination"), so the bridge honours the contract `docs/cookbook/nat.md` states for every
+    /// leg rather than only for the ones that never reach userspace.
+    ///
+    /// Keeping it here rather than on the `Flow` is what makes the cross-flow read trivial: a
+    /// packet arriving at A is forwarded out of B, and the address wanted is the one *B's* flow
+    /// learned. It is also stronger here than on the plain path: an entry is only written after the
+    /// SRTP `unprotect` above it succeeded, so on a secure leg a source that cannot produce a packet
+    /// authenticating under that party's key can never move it.
+    latched: DashMap<EndpointId, SocketAddr>,
     dtls: Arc<DtlsBridge<D>>,
 }
 
@@ -129,6 +160,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             dtls: Arc::new(DtlsBridge::new(datapath.clone())),
             datapath,
             flows: DashMap::new(),
+            latched: DashMap::new(),
         }
     }
 
@@ -180,6 +212,12 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 endpoint,
                 Flow {
                     accepted_source: flow.accepted_source,
+                    // A fresh latch per registration: a renegotiation re-points the leg, and
+                    // carrying the old latch would keep replying to the pre-renegotiation source
+                    // until the peer's next packet happened to re-latch it.
+                    latch: flow
+                        .latch
+                        .then(|| Arc::new(Mutex::new(SymmetricLatch::default()))),
                     out_endpoint: flow.out_endpoint,
                     out_dst: flow.out_dst,
                     ingress_leg,
@@ -196,8 +234,24 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         let endpoints: Vec<EndpointId> = endpoints.into_iter().collect();
         for endpoint in &endpoints {
             self.flows.remove(endpoint);
+            // The learned source outlives nothing: a re-used endpoint id must start from its own
+            // signalled address, never from what the previous call's peer happened to send from.
+            self.latched.remove(endpoint);
         }
         self.dtls.deregister(endpoints);
+    }
+
+    /// Where `endpoint`'s peer is actually sending from, once its symmetric-RTP latch has adopted a
+    /// source. `None` before the first accepted packet, on an ICE-managed leg, and on a leg whose
+    /// peer sends from exactly the address it signalled — in every one of those the signalled
+    /// address is what the reply used, so a caller falls back to it.
+    ///
+    /// Exists for the call record: a leg reported at its signalled address while its media is
+    /// crossing somewhere else is precisely what made the wrong-destination fault invisible from the
+    /// engine's own output, and took a host capture to see.
+    #[must_use]
+    pub fn latched_source(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+        self.latched.get(&endpoint).map(|latched| *latched)
     }
 
     /// Whether this (or the sibling DTLS) bridge owns `endpoint` — the dispatcher's routing predicate.
@@ -262,6 +316,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     ingress_leg: flow.ingress_leg.as_ref().map(|side| side.party),
                     egress_leg: flow.egress_leg.as_ref().map(|side| side.party),
                     accepted_source: flow.accepted_source,
+                    latch: flow.latch.is_some(),
                     out_endpoint: flow.out_endpoint,
                     out_dst: flow.out_dst,
                 })
@@ -301,10 +356,11 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             return;
         }
         // Snapshot the flow and release the map guard before any crypto or `.await`.
-        let Some((accepted_source, out_endpoint, out_dst, ingress_leg, egress_leg, x3)) =
+        let Some((accepted_source, latch, out_endpoint, out_dst, ingress_leg, egress_leg, x3)) =
             self.flows.get(&packet.endpoint).map(|flow| {
                 (
                     flow.accepted_source,
+                    flow.latch.clone(),
                     flow.out_endpoint,
                     flow.out_dst,
                     flow.ingress_leg.clone(),
@@ -375,6 +431,53 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             plaintext
         };
 
+        // Symmetric RTP: adopt the source this leg's media actually arrives from, so the reply goes
+        // to a NATed peer's binding rather than to the private address in its `c=` line — the
+        // contract `docs/cookbook/nat.md` states and, until this landed, the one path that did not
+        // keep it. Run on the *plaintext*, after the source gate and after the crypto, so a forged
+        // packet cannot steer the reply: on a secure leg that means a source must be able to produce
+        // a packet authenticating under the party's own key before it can move anything, which is a
+        // stronger gate than the plain `Forward` path can apply.
+        //
+        // The adopted address is recorded against **this** endpoint; the peer's flow reads it when
+        // forwarding out of here. Rejections are dropped rather than forwarded, exactly as the
+        // datapath drops them (docs/security-and-nat.md §4 layer 3).
+        if let Some(latch) = &latch {
+            let adopted = {
+                let Ok(mut latch) = latch.lock() else {
+                    tracing::error!(
+                        "bridge latch mutex poisoned; dropping the datagram rather than admitting \
+                         it past a latch that can no longer decide"
+                    );
+                    return;
+                };
+                match latch.admit(packet.source, rtp_media_ssrc(plaintext)) {
+                    ReplyLatch::Reject => {
+                        tracing::debug!(
+                            endpoint = ?packet.endpoint,
+                            source = %packet.source,
+                            "bridge dropped packet from a source its latch will not adopt"
+                        );
+                        return;
+                    }
+                    ReplyLatch::Accept(adopted) => adopted,
+                }
+            };
+            if let Some(adopted) = adopted {
+                // Only on a change, so the steady state does not write the map every packet.
+                let previous = self.latched.insert(packet.endpoint, adopted);
+                if previous != Some(adopted) {
+                    tracing::info!(
+                        target: "siphon_rtp::media",
+                        endpoint = ?packet.endpoint,
+                        ?previous,
+                        %adopted,
+                        "bridge latched its reply to the observed media source"
+                    );
+                }
+            }
+        }
+
         // Accepted: past the source gate and past the crypto. Stamp the endpoint's liveness for the
         // engine's idle sweep (docs/security-and-nat.md §4 layer 6). The `Redirect` arm never touches
         // the datapath's `last_seen`, so a bridged call — whose legs are both `Redirect` and so has no
@@ -392,7 +495,13 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             x3.deliver(packet.source, packet.arrival, plaintext);
         }
 
-        if let Err(error) = self.datapath.send(out_endpoint, out_dst, out).await {
+        // Prefer where the peer's own flow saw its media come from over the address it signalled —
+        // the same precedence the datapath's `Forward` path applies, and for the same reason.
+        let destination = self
+            .latched
+            .get(&out_endpoint)
+            .map_or(out_dst, |latched| *latched);
+        if let Err(error) = self.datapath.send(out_endpoint, destination, out).await {
             tracing::debug!(%error, "bridge forward send failed");
         }
     }
@@ -561,6 +670,7 @@ mod tests {
                     ingress_leg: None,
                     egress_leg: Some(BridgeLeg::Far),
                     accepted_source: SourceFilter::Exact(addr_a.ip()),
+                    latch: true,
                     out_endpoint: secure.id,
                     out_dst: addr_b,
                 },
@@ -569,6 +679,7 @@ mod tests {
                     ingress_leg: Some(BridgeLeg::Far),
                     egress_leg: None,
                     accepted_source: SourceFilter::Exact(addr_b.ip()),
+                    latch: true,
                     out_endpoint: plain.id,
                     out_dst: addr_a,
                 },
@@ -640,6 +751,7 @@ mod tests {
                     ingress_leg: Some(BridgeLeg::Near),
                     egress_leg: Some(BridgeLeg::Far),
                     accepted_source: SourceFilter::Exact(addr_a.ip()),
+                    latch: true,
                     out_endpoint: far.id,
                     out_dst: addr_b,
                 },
@@ -648,6 +760,7 @@ mod tests {
                     ingress_leg: Some(BridgeLeg::Far),
                     egress_leg: Some(BridgeLeg::Near),
                     accepted_source: SourceFilter::Exact(addr_b.ip()),
+                    latch: true,
                     out_endpoint: near.id,
                     out_dst: addr_a,
                 },
@@ -806,6 +919,7 @@ mod tests {
                 ingress_leg: Some(BridgeLeg::Near),
                 egress_leg: Some(BridgeLeg::Far),
                 accepted_source: SourceFilter::Any,
+                latch: true,
                 out_endpoint: endpoint.id,
                 out_dst: endpoint.local_addr,
             }],
@@ -860,6 +974,148 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bridge_replies_to_where_a_natted_peer_actually_sends_from() {
+        // The regression test for one-way audio on every externally bridged NATed call. A phone
+        // behind NAT signals its LAN address in `c=`, so the flow's `out_dst` is unroutable; its
+        // media arrives from its NAT binding instead. `docs/cookbook/nat.md` promises the reply
+        // follows the peer's accepted packets, and the bridge was the one egress path that did not
+        // keep that promise — it sent to the signalled address for the life of the call, while its
+        // own CDR reported the call healthy because a send to nowhere still counts as a send.
+        //
+        // Here the plain leg's `out_dst` is a port nothing listens on, standing in for the address
+        // the phone advertised, while phone A really sends from its own socket.
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        let (phone_a, addr_a) = phone(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let signalled_a = SocketAddr::new(addr_a.ip(), addr_a.port().wrapping_add(1) | 1);
+        assert_ne!(signalled_a, addr_a);
+
+        datapath
+            .install_flow(plain.id, FlowAction::Redirect)
+            .expect("redirect plain");
+        datapath
+            .install_flow(secure.id, FlowAction::Redirect)
+            .expect("redirect secure");
+
+        let local = key(0xAA);
+        let remote = key(0xBB);
+        let bridge = Arc::new(SrtpBridge::new(datapath.clone()));
+        bridge.register(BridgeCallPlan {
+            near_leg: None,
+            far_leg: Some(SecureLeg::new(&local, &remote)),
+            flows: vec![
+                BridgeFlowPlan {
+                    endpoint: plain.id,
+                    ingress_leg: None,
+                    egress_leg: Some(BridgeLeg::Far),
+                    accepted_source: SourceFilter::Exact(addr_a.ip()),
+                    latch: true,
+                    out_endpoint: secure.id,
+                    out_dst: addr_b,
+                },
+                BridgeFlowPlan {
+                    endpoint: secure.id,
+                    ingress_leg: Some(BridgeLeg::Far),
+                    egress_leg: None,
+                    accepted_source: SourceFilter::Exact(addr_b.ip()),
+                    latch: true,
+                    out_endpoint: plain.id,
+                    // What the phone signalled — not where it is.
+                    out_dst: signalled_a,
+                },
+            ],
+        });
+        let rx = datapath.rx();
+        let dispatch = bridge.clone();
+        tokio::spawn(async move {
+            while let Ok(packet) = rx.recv_async().await {
+                dispatch.handle(packet).await;
+            }
+        });
+
+        // A's first packet is what teaches the bridge where A really is.
+        phone_a
+            .send_to(&rtp(1, 0x4444_4444), plain.local_addr)
+            .await
+            .expect("send a");
+        let _ = recv(&phone_b).await;
+        assert_eq!(
+            bridge.latched_source(plain.id),
+            Some(addr_a),
+            "the bridge adopted the source A's media actually arrives from"
+        );
+
+        // B replies. Without the latch this goes to `signalled_a` and A hears nothing for the whole
+        // call — the fault as observed, with a CDR that looks perfect.
+        let plaintext = rtp(2000, 0x5555_5555);
+        let mut encrypt = SrtpContext::from_key_material(&harness_key(&remote));
+        let mut srtp = Vec::new();
+        encrypt
+            .protect(&plaintext, &mut srtp)
+            .expect("peer encrypt");
+        phone_b
+            .send_to(&srtp, secure.local_addr)
+            .await
+            .expect("send b");
+        assert_eq!(
+            recv(&phone_a).await,
+            plaintext,
+            "the reply reaches the phone at its real source, not the address it signalled"
+        );
+    }
+
+    /// The peer's answered key, by value — `SrtpContext::from_key_material` takes a reference and the
+    /// test above holds its own copy.
+    fn harness_key(material: &SrtpKeyMaterial) -> SrtpKeyMaterial {
+        *material
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ice_managed_bridge_leg_is_never_steered_by_media() {
+        // On an ICE leg an authenticated connectivity check is the only thing that may move the
+        // destination (docs/security-and-nat.md §4 layer 4), which is why the plan can switch the
+        // latch off. Media from a source the agent never validated must not re-point the reply.
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        let (phone_a, addr_a) = phone(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (_phone_b, addr_b) = phone(Ipv4Addr::new(127, 0, 0, 3)).await;
+        datapath
+            .install_flow(plain.id, FlowAction::Redirect)
+            .expect("redirect plain");
+        let bridge = SrtpBridge::new(datapath.clone());
+        bridge.register(BridgeCallPlan {
+            near_leg: None,
+            far_leg: Some(SecureLeg::new(&key(0xAA), &key(0xBB))),
+            flows: vec![BridgeFlowPlan {
+                endpoint: plain.id,
+                ingress_leg: None,
+                egress_leg: Some(BridgeLeg::Far),
+                accepted_source: SourceFilter::Exact(addr_a.ip()),
+                latch: false,
+                out_endpoint: secure.id,
+                out_dst: addr_b,
+            }],
+        });
+        bridge
+            .handle(RxPacket {
+                endpoint: plain.id,
+                source: addr_a,
+                arrival: 0,
+                data: bytes::Bytes::from(rtp(1, 0x6666_6666)),
+            })
+            .await;
+        assert_eq!(
+            bridge.latched_source(plain.id),
+            None,
+            "an ICE-managed leg learns nothing from media"
+        );
+        drop(phone_a);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn off_source_packet_is_gated_out() {
         let (harness, _phone_a, (phone_b, _)) = live_bridge().await;
         // An attacker on a different IP sprays the plain endpoint — the bridge's source gate drops
@@ -908,6 +1164,7 @@ mod tests {
                 ingress_leg: Some(BridgeLeg::Far),
                 egress_leg: None,
                 accepted_source: SourceFilter::Any,
+                latch: true,
                 out_endpoint: owned.id,
                 out_dst: owned.local_addr,
             }],
@@ -974,6 +1231,7 @@ mod tests {
                 ingress_leg: Some(BridgeLeg::Far),
                 egress_leg: None,
                 accepted_source: SourceFilter::Any,
+                latch: true,
                 out_endpoint: endpoint.id,
                 out_dst: endpoint.local_addr,
             }],

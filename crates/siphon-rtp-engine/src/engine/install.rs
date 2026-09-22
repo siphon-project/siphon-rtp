@@ -467,6 +467,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near.endpoint_ids().chain(far.endpoint_ids()),
             "install SRTP bridge redirect",
         )?;
+        // A leg whose transport an RFC 8445 agent owns is never steered by media: an authenticated
+        // connectivity check is the only thing that may move it (docs/security-and-nat.md §4 layer
+        // 4), which is what the datapath expresses as `LatchPolicy::Off` on an ICE leg. RTCP keeps
+        // its peer leg's setting: it carries no SSRC, so `SymmetricLatch` never lets it aim a reply
+        // on its own, but the rejection half still drops RTCP from a source that is not the latched
+        // stream.
+        let near_latch = !wiring.near_ice && !wiring.agent_endpoints.contains(&near.rtp.id);
+        let far_latch = !wiring.far_ice && !wiring.agent_endpoints.contains(&far.rtp.id);
         let mut flows = vec![
             // A's ingress → out the far endpoint toward B. Gated to A's effective source (its
             // `received-from` public IP when the offer supplied one).
@@ -475,6 +483,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ingress_leg: near_side,
                 egress_leg: far_side,
                 accepted_source: bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
+                latch: near_latch,
                 out_endpoint: far.rtp.id,
                 out_dst: far_media_dst,
             },
@@ -484,6 +493,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ingress_leg: far_side,
                 egress_leg: near_side,
                 accepted_source: bridge_source_filter(profile, far_gate_rtp),
+                latch: far_latch,
                 out_endpoint: near.rtp.id,
                 out_dst: near_media_dst.unwrap_or(a_rtp),
             },
@@ -494,6 +504,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ingress_leg: near_side,
                 egress_leg: far_side,
                 accepted_source: bridge_source_filter(profile, near_gate_rtcp.unwrap_or(a_rtcp)),
+                latch: near_latch,
                 out_endpoint: far_rtcp.id,
                 out_dst: far_rtcp_dst,
             });
@@ -502,6 +513,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ingress_leg: far_side,
                 egress_leg: near_side,
                 accepted_source: bridge_source_filter(profile, far_gate_rtcp),
+                latch: far_latch,
                 out_endpoint: near_rtcp.id,
                 out_dst: near_rtcp_dst.unwrap_or(a_rtcp),
             });

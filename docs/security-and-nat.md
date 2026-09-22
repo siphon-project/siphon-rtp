@@ -268,8 +268,8 @@ Latch state machine, per direction:
   new trust is introduced. A FIB miss / unresolved neighbour still falls back to `Redirect`.
 - **The `Redirect` consumers drop on reject, as the `Forward` path does.** On the `Forward` path a
   latch rejection is a **drop**: `Inner::update_latch` returns `Reject` and `dispatch` discards the
-  packet. The userspace consumers (`MediaCall::process`, `Conference::ingest` and its text path, the
-  text pipeline, and the WebSocket takeover's `WsEgress`) do the same through
+  packet. The userspace consumers (`SrtpBridge::handle`, `MediaCall::process`, `Conference::ingest`
+  and its text path, the text pipeline, and the WebSocket takeover's `WsEgress`) do the same through
   `SymmetricLatch::admit`: they decide the latch after SRTP authentication and **before** the packet
   is teed, intercepted, relayed, decoded, mixed or forwarded, and a rejected packet is dropped without
   counting as media activity. They used to only decline to move the reply address and still consume

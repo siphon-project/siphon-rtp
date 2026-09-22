@@ -15,7 +15,10 @@ The default posture, per leg:
 - **Source gate.** Ingress is accepted only from the source the SDP signalled (the `c=`/`m=`
   address, RFC 3264). Packets from anywhere else are dropped before they can influence anything.
 - **Latch.** The reply destination follows the peer's *accepted* packets, so a party behind NAT
-  is answered at its NAT binding, not at the address it advertised.
+  is answered at its NAT binding, not at the address it advertised. This holds on every path a
+  call can take — the in-kernel relay, the transcoding pipeline, the conference, the text
+  pipeline, the WebSocket takeover and the SRTP/transcrypt bridge — except a leg whose transport
+  an ICE agent owns, where only an authenticated connectivity check moves it.
 - **No mid-stream re-latch.** Once latched, a new source is followed only if it carries the same
   RTP SSRC (a genuine NAT rebind keeps its SSRC, RFC 3550 §8); a new source with a different
   SSRC is rejected and counted. An off-path spray never steals the stream.
