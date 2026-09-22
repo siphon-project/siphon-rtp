@@ -158,8 +158,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // rejection — a warrant has to be servable on any call.
             // A terminated DTLS offerer taps the same way: each tap sits on its own party's ingress
             // endpoint, and the bridge hands it the plaintext side of that endpoint's transform.
+            // A **transcrypt** belongs here for the same reason and needs it most: both sides of the
+            // wire are ciphertext, so the intermediate plaintext the bridge taps is the only place
+            // the content exists in the clear anywhere in the engine.
+            //
+            // `SrtpTranscryptMedia` is deliberately **not** here: it is a media pipeline, so its
+            // plaintext reaches the actor and it taps with the other media shapes below. Putting it
+            // here would install a tap on a bridge that call does not have, and the warrant would
+            // deliver nothing.
             PipelineKind::Srtp
             | PipelineKind::SrtpOfferer
+            | PipelineKind::SrtpTranscrypt
             | PipelineKind::Dtls
             | PipelineKind::DtlsOfferer => {
                 let Some(b_endpoint) = b_endpoint else {
@@ -181,6 +190,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             PipelineKind::Passthrough
             | PipelineKind::Media
             | PipelineKind::SrtpMedia
+            | PipelineKind::SrtpTranscryptMedia
             | PipelineKind::DtlsMedia => {
                 self.hold_in_userspace(call_id, PromotionReason::X3, PromoteMode::RelayOnly)
                     .await?;

@@ -25,8 +25,59 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   shared engine is still safe by construction. The id is an identity claim rather than a credential
   — where a secret is configured it is honoured only on a connection that presented the matching
   token — and one identity carries one live connection, a second claim closing the first.
+- **Two SDES-SRTP parties are now bridged as a transcrypt.** Two SRTP-only desk phones calling each
+  other is the ordinary internal call, and the engine refused it: bridging them means holding a key
+  pair per party and re-encrypting every datagram from one party's key to the other's, and only
+  one-sided bridges were wired. The refusal also arrived on the `answer`, so both phones rang, the
+  callee picked up, and the call collapsed a fraction of a second later — which pushed controllers
+  toward passing such calls through unanchored, and that only works while both phones can reach each
+  other directly. The engine is now the cryptographic far side of both parties (four SRTP/SRTCP
+  contexts, neither party's key ever shown to the other). It stays a *crypto* bridge: the payload is
+  never decoded, so any codec crosses, including ones the engine has no decoder for, and the cost is
+  one decrypt plus one encrypt — 507 ns per packet against 261/266 ns for a one-sided leg, i.e.
+  exactly the sum. What it cannot do is yield the decoded audio, so recording, prompts, noise
+  suppression, echo cancellation, beep detection and a codec mismatch on a secure pair are still
+  refused, now saying that rather than blaming the transcrypt that carries the same pair without
+  them. `checkpoint` is refused for such a call, because the HA record carries one secure leg and
+  this call has two; the call itself keeps running. Bridging SDES to **DTLS** remains unsupported —
+  two keying mechanisms rather than two keys — and is refused on the `offer`, before either party is
+  rung.
+
+  Internally, a bridge flow now names *which party's* leg sits on each side of its transform instead
+  of deriving it from a one-sided crypto op, because on a transcrypt the direction no longer implies
+  the key. A flow naming a leg its call plan does not carry installs nothing for the whole call and
+  logs an error, rather than running that side unkeyed. Lawful interception taps the plaintext
+  between the two transforms, which on a transcrypt is the only plaintext the call has anywhere.
+
+- **A secure pair that needs the decoded audio is now transcoded rather than refused.** The
+  transcrypt above never decodes the payload, so a recording, a prompt, noise suppression, echo
+  cancellation, beep detection or a callee answering a different codec still had nothing to attach
+  to — and a recorded internal call between two desk phones is an ordinary thing to ask a PBX for.
+  Such a call now resolves to a media pipeline holding **both** parties' SRTP legs instead of the
+  bridge: each direction decrypts under the party it faces and encrypts under the party it forwards
+  to, and the plaintext between them is what the recorder, the prompt mixer and the DSP see. Neither
+  party's key reaches the other, exactly as on the bridge. The controller asks for nothing new — the
+  same offer and answer resolve to whichever form the call needs. Both parties' SRTP rollovers are
+  carried across a renegotiation; seeding only one would restart the other party's ROC on every
+  re-INVITE and its peer could not verify it (RFC 3711 §3.3.1). Lawful interception taps this shape
+  in the pipeline, where its plaintext actually is, not on a bridge the call does not have.
+  `checkpoint` is refused for it for the same reason as the bridge form: two secure legs, one record.
 
 ### Changed
+
+- **A secure-offerer posture the engine can never key is now refused on the `offer`, not the
+  `answer`.** `resolve_pipeline` runs at the answer, so an SRTP caller aimed at a callee the engine
+  could not bridge to got an SDP back, the callee rang, the callee picked up, and only then did the
+  call collapse with `secure-offerer-unsupported` and a 500 to a caller who was already saying
+  hello. Nothing about the decision needed the answer: the far leg's keying is settled from the
+  **offer's** own `transport_protocol` and stored on the call, so the predicate the answer tested
+  was already true one verb earlier. What remains in this class after the transcrypt above is an
+  SDES caller toward a **DTLS** far leg; the `offer` now returns that refusal and creates no call,
+  which also removes the incentive to paper over the symptom by relaying the pair unanchored. The
+  answer keeps the cases only an answer can know — the two legs' codecs differing, a `record_call` /
+  `noise_suppression` / `echo_cancellation` / `beep_detection` flag first named on the answer
+  profile, and a renegotiation that changes the posture. The `secure-offerer-unsupported` token is
+  unchanged, so a controller matching on it needs no edit; only the verb that carries it moves.
 
 - **DTLS-SRTP now runs on a sans-I/O stack, and a lost last flight no longer strands a call.** RFC 6347
   §4.2.4 makes the sender of the last handshake flight responsible for retransmitting it: that side

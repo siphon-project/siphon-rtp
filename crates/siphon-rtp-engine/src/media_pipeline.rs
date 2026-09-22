@@ -2590,6 +2590,33 @@ impl MediaCall {
         self
     }
 
+    /// Install **both** parties' SDES-SRTP legs for a secure↔secure transcoding call
+    /// (`PipelineKind::SrtpTranscryptMedia`).
+    ///
+    /// Each direction decrypts under the party it faces and encrypts under the party it forwards to,
+    /// so the two legs are crossed between the directions: A→B decrypts with A's leg and encrypts
+    /// with B's, B→A the mirror. The engine is the cryptographic far side of both parties and
+    /// neither key is ever presented to the other, exactly as on the transcrypt bridge — what
+    /// differs is that the plaintext between the two transforms reaches the pipeline, which is the
+    /// whole point: it is what a recording, a prompt, the DSP and a codec change attach to.
+    ///
+    /// Distinct from [`MediaCall::with_far_secure_leg`], which puts **one** leg on `a_to_b`'s egress
+    /// and `b_to_a`'s ingress because A is plaintext. Using that here would leave A's ingress
+    /// undecrypted and A's egress in the clear — the pipeline would decode ciphertext as audio and
+    /// answer a secure caller unencrypted.
+    #[must_use]
+    pub fn with_both_secure_legs(
+        mut self,
+        near: Arc<Mutex<SecureLeg>>,
+        far: Arc<Mutex<SecureLeg>>,
+    ) -> Self {
+        self.a_to_b.secure_ingress = Some(near.clone());
+        self.a_to_b.secure_egress = Some(far.clone());
+        self.b_to_a.secure_ingress = Some(far);
+        self.b_to_a.secure_egress = Some(near);
+        self
+    }
+
     /// Mark this call's far (B) leg as **DTLS-keyed-later**: the topology is the same as
     /// [`MediaCall::with_far_secure_leg`], but the [`SecureLeg`] does not exist yet because the DTLS
     /// handshake (RFC 5764) has not completed. Until [`MediaCall::attach_secure_leg`] delivers it,
@@ -2654,14 +2681,32 @@ impl MediaCall {
         }
     }
 
-    /// The call's shared SDES-SRTP leg, when this is a secure-transcode (`SrtpMedia`) call — so the
-    /// registry can retain a handle to it after the actor takes ownership of the `MediaCall`, and read
-    /// the leg's SRTP rollover for an HA checkpoint (RFC 3711 §3.3.1). `None` for a plaintext transcode
-    /// / relay call (no secure leg). The `a_to_b` egress and `b_to_a` ingress share the one `Arc` (set
-    /// together by [`MediaCall::with_far_secure_leg`]), so returning the A→B egress handle is enough.
+    /// The call's **far-facing** SDES-SRTP leg — so the registry can retain a handle to it after the
+    /// actor takes ownership of the `MediaCall`, and read the leg's SRTP rollover for an HA
+    /// checkpoint or a renegotiation (RFC 3711 §3.3.1). `None` for a plaintext transcode / relay
+    /// call (no secure leg).
+    ///
+    /// On a secure-transcode (`SrtpMedia`) call the `a_to_b` egress and `b_to_a` ingress share the
+    /// one `Arc` (set together by [`MediaCall::with_far_secure_leg`]), so the A→B egress handle is
+    /// the whole story. On a secure↔secure (`SrtpTranscryptMedia`) call it is only *half* of it —
+    /// the near party has its own leg, read through [`MediaCall::near_secure_leg`]. A caller that
+    /// needs both (an HA checkpoint) must take both or refuse; taking this one alone would record a
+    /// secure↔secure call as a far-secure one and silently demote the caller to plaintext.
     #[must_use]
     pub fn far_secure_leg(&self) -> Option<Arc<Mutex<SecureLeg>>> {
         self.a_to_b.secure_egress.clone()
+    }
+
+    /// The leg on A's *ingress*: the near party's own [`SecureLeg`] on a secure↔secure
+    /// (`SrtpTranscryptMedia`) call, put there by [`MediaCall::with_both_secure_legs`].
+    ///
+    /// `None` on `SrtpMedia` and on a plaintext call, where A is not a secure party. A single-leg
+    /// (`answer_local`) DTLS call does end up with a leg here too, but only once its handshake
+    /// completes and [`MediaCall::attach_near_secure_leg`] runs — after the registry has read this,
+    /// so what the registry retains is the two-leg case alone.
+    #[must_use]
+    pub fn near_secure_leg(&self) -> Option<Arc<Mutex<SecureLeg>>> {
+        self.a_to_b.secure_ingress.clone()
     }
 
     /// Build a call from its two directions and identity.
@@ -3725,10 +3770,16 @@ struct CallHandle {
     /// `true` for a promoted passthrough relay (no transcode) — distinguishes it from a transcoding
     /// call so the engine's silence/play/DTMF guards stay correct.
     relay_only: bool,
-    /// The call's shared SDES-SRTP leg for a secure-transcode (`SrtpMedia`) call — retained so an HA
-    /// checkpoint can read its live SRTP rollover (RFC 3711 §3.3.1), which the running actor otherwise
-    /// owns exclusively. `None` for a plaintext transcode / relay call.
+    /// The call's far-facing SDES-SRTP leg for a secure-transcode (`SrtpMedia`) or secure↔secure
+    /// (`SrtpTranscryptMedia`) call — retained so an HA checkpoint or a renegotiation can read its
+    /// live SRTP rollover (RFC 3711 §3.3.1), which the running actor otherwise owns exclusively.
+    /// `None` for a plaintext transcode / relay call.
     secure_leg: Option<Arc<Mutex<SecureLeg>>>,
+    /// The near party's own leg, on a secure↔secure call only. A renegotiation has to carry **both**
+    /// parties' rollovers: rebuilding the pipeline restarts whichever counter it does not seed, and
+    /// a restarted ROC makes that party's SRTP unverifiable at the peer (RFC 3711 §3.3.1). The
+    /// transcrypt bridge learned this already; the transcode twin holds two legs for the same reason.
+    near_secure_leg: Option<Arc<Mutex<SecureLeg>>>,
 }
 
 impl MediaRegistry {
@@ -3770,6 +3821,7 @@ impl MediaRegistry {
         // so an HA checkpoint can reach its SRTP rollover (RFC 3711 §3.3.1). The `Arc` is the same
         // instance the actor holds — reads are a brief, uncontended lock.
         let secure_leg = call.far_secure_leg();
+        let near_secure_leg = call.near_secure_leg();
         // Re-registering a call id **replaces** its actor, so retire the displaced one first: a
         // `DashMap::insert` would only drop its `CallHandle`, and dropping a `JoinHandle` *detaches*
         // the task rather than aborting it — the old actor would keep running forever, unreachable but
@@ -3795,6 +3847,7 @@ impl MediaRegistry {
                 task,
                 relay_only,
                 secure_leg,
+                near_secure_leg,
             },
         );
     }
@@ -3826,6 +3879,17 @@ impl MediaRegistry {
     pub fn rollover_snapshot(&self, call_id: &str) -> Option<SecureLegRollover> {
         let handle = self.calls.get(call_id)?;
         let leg = handle.secure_leg.as_ref()?;
+        let guard = leg.lock().ok()?;
+        Some(guard.rollover_snapshot())
+    }
+
+    /// The **near** party's live SRTP rollover on a secure↔secure (`SrtpTranscryptMedia`) call, the
+    /// twin of [`MediaRegistry::rollover_snapshot`]. `None` on every shape where A is not itself a
+    /// secure party, so a caller can ask unconditionally and seed whatever comes back.
+    #[must_use]
+    pub fn near_rollover_snapshot(&self, call_id: &str) -> Option<SecureLegRollover> {
+        let handle = self.calls.get(call_id)?;
+        let leg = handle.near_secure_leg.as_ref()?;
         let guard = leg.lock().ok()?;
         Some(guard.rollover_snapshot())
     }

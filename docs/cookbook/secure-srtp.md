@@ -51,7 +51,7 @@ fails SRTP authentication is dropped, never forwarded (see
 [Security & NAT](../security-and-nat.md)).
 
 **Terminating SRTP the *offerer* signals** — a secure caller, rather than a secure
-callee — is now wired in three places:
+callee — is wired in four places:
 
 - **conference legs** (`conference_join` answers `RTP/SAVP` + `a=crypto`);
 - **`answer_local`** — an SDES-SRTP caller reaches an IVR, an announcement, an
@@ -61,18 +61,77 @@ callee — is now wired in three places:
 - the **two-party offer/answer relay** — the engine mints its own SDES key for the
   caller, answers with it, decrypts the caller's SRTP and relays plaintext to the
   callee (and back again, encrypted). See
-  [A secure caller toward a plain callee](#a-secure-caller-toward-a-plain-callee).
+  [A secure caller toward a plain callee](#a-secure-caller-toward-a-plain-callee);
+- **both parties secure** — the engine holds a key pair per party and re-encrypts
+  each datagram from one to the other. See
+  [Two secure parties](#two-secure-parties-the-transcrypt-bridge).
 
 Three shapes are refused rather than half-carried, each because the media path
-behind it is not built:
+behind it is not built. **Which verb refuses matters**, so each says:
 
-- **both parties secure** — a transcrypt between two different keys;
+- an **SDES caller toward a DTLS far leg** — two keying *mechanisms*, not two
+  keys. Refused on the **`offer`**: the far leg's keying comes from the offer's
+  own `transport_protocol`, so the engine knows this before it hands back an SDP
+  and declines there rather than after the callee has rung and answered;
 - **a codec mismatch** on a secure caller — its `SecureLeg` would have to be
-  threaded into the transcoding pipeline;
+  threaded into the transcoding pipeline. Refused on the **`answer`**, because
+  only the answer names the callee's codec. Likewise a `record_call`,
+  `noise_suppression`, `echo_cancellation` or `beep_detection` flag that first
+  appears on the answer profile: a crypto bridge relays the payload without
+  decoding it, so a secure pair that asks for the decoded audio is refused even
+  though the same pair without it is carried;
 - a **DTLS-SRTP (WebRTC) offerer** on `answer_local` — it needs a full ICE agent
   on the promoted leg. It is answered `secure-offerer-unsupported`, naming DTLS.
   On the two-party relay a DTLS caller toward a plain callee *is* terminated; see
   [WebRTC legs](webrtc.md#a-webrtc-caller-toward-a-plain-callee).
+
+Every one of them carries the stable `secure-offerer-unsupported` token, so a
+controller can match on it without parsing the sentence that follows.
+
+## Two secure parties: the transcrypt bridge
+
+Two SRTP-only desk phones calling each other. Both legs are `RTP/SAVP` with their
+own `a=crypto`, and the two keys have nothing to do with each other. Anchor it by
+naming a secure far leg on the offer:
+
+```json
+{
+  "id": 70,
+  "command": "offer",
+  "call_id": "3c81ff02@198.51.100.20",
+  "from_tag": "b41d9e",
+  "sdp": "<the caller's RTP/SAVP offer with its a=crypto>",
+  "profile": { "transport_protocol": "RTP/SAVP" }
+}
+```
+
+The callee answers `RTP/SAVP` with *its* key, and the call is up. The engine is
+the cryptographic far side of both: it advertised its own key to each party, so
+the caller's key never reaches the callee and the callee's never reaches the
+caller. Every datagram is decrypted under the sender's key and re-encrypted under
+the receiver's.
+
+This is a crypto bridge, not a transcode. The payload is never decoded, so any
+codec crosses — including ones the engine has no decoder for — and the cost is
+one decrypt plus one encrypt, around half a microsecond per packet.
+
+Ask for anything that needs the *samples* — `record_call`, a prompt,
+`noise_suppression`, `echo_cancellation`, `beep_detection`, or simply a callee
+answering a different codec — and the call resolves to the transcode form
+instead, with no change to the request. The engine then holds the same two keys
+in the media pipeline rather than in the bridge: each direction decrypts under
+the party it faces and re-encrypts under the party it forwards to, and the
+plaintext in between is what the recorder, the prompt mixer and the DSP attach
+to. Neither party's key reaches the other either way. It costs what any
+transcoding leg costs — a decode and an encode per frame on top of the two
+crypto operations — so it is taken only when something actually needs it.
+
+`checkpoint` is refused for a secure pair in both forms: the HA snapshot record
+holds one secure leg and this call has two. The call itself is unaffected.
+
+Until this landed, the pair was refused outright, and the refusal arrived on the
+**answer**: both phones rang, the callee picked up, and the call collapsed a
+fraction of a second later.
 
 ## Native JSON exchange
 

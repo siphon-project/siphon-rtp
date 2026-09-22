@@ -239,15 +239,28 @@ pub(super) fn settle_secure_offerer(
     info: &sdp::MediaInfo,
     (reversed, profile, engine_fingerprint): (bool, &ProfileFlags, Option<sdp::Fingerprint>),
 ) -> Result<Option<NearDtlsAnswer>, Box<siphon_rtp_proto::CmdResult>> {
-    if (near_sdes && pipeline != super::PipelineKind::SrtpOfferer)
+    let near_sdes_carried = matches!(
+        pipeline,
+        super::PipelineKind::SrtpOfferer
+            | super::PipelineKind::SrtpTranscrypt
+            | super::PipelineKind::SrtpTranscryptMedia
+    );
+    if (near_sdes && !near_sdes_carried)
         || (near_dtls.is_some() && pipeline != super::PipelineKind::DtlsOfferer)
     {
         let codecs_differ = matches!(
             (near_codec, info.primary_codec()),
             (Some(near), Some(far)) if !same_codec(near, &far)
         );
-        let why = if far_secure {
-            "both parties are secure, which needs a transcrypt between two different keys"
+        // Naming the *actual* obstacle matters here, because neither "both parties are secure" nor
+        // "the call needs the audio decoded" is one any more: an SDES↔SDES pair is carried by
+        // `SrtpTranscrypt` when it can be relayed and by `SrtpTranscryptMedia` when it must be
+        // decoded, and neither reaches this refusal. What is left is a DTLS offerer facing a secure
+        // callee — two keying mechanisms rather than two keys — and a *DTLS* offerer whose call
+        // needs the audio decoded, which `DtlsOfferer` has no transcode twin for.
+        let why = if near_dtls.is_some() && far_secure {
+            "both parties are secure and one is keyed by DTLS, which needs a transcrypt between two \
+             keying mechanisms rather than between two keys"
         } else if codecs_differ {
             "the two legs' codecs differ, which needs the secure offerer's leg threaded into the \
              transcoding pipeline"
@@ -255,11 +268,14 @@ pub(super) fn settle_secure_offerer(
             "the call needs the decoded audio (recording, noise suppression, echo cancellation or \
              beep detection), which needs the secure offerer's leg threaded into the media pipeline"
         };
+        let supported = if far_secure {
+            "two SDES parties are bridged as a transcrypt, and transcoded as one where the call \
+             needs the decoded audio"
+        } else {
+            "a secure caller toward a plain callee on a shared codec is supported"
+        };
         return Err(Box::new(siphon_rtp_proto::CmdResult::Error {
-            reason: format!(
-                "answer: secure-offerer-unsupported: {why}; a secure caller toward a plain callee \
-                 on a shared codec is supported"
-            ),
+            reason: format!("answer: secure-offerer-unsupported: {why}; {supported}"),
         }));
     }
     near_dtls
@@ -708,6 +724,12 @@ pub(super) fn build_transcode_pair(
 pub(super) enum RtcpKeying {
     /// With the SDES leg the call already holds.
     Leg(Arc<Mutex<SecureLeg>>),
+    /// With **both** parties' legs, for a secure↔secure call: each relay decrypts under the party it
+    /// faces and re-encrypts under the party it forwards to, which is what the RTP directions do.
+    BothLegs {
+        near: Arc<Mutex<SecureLeg>>,
+        far: Arc<Mutex<SecureLeg>>,
+    },
     /// Pending until the DTLS handshake delivers a leg; the relays drop until then (RFC 5764).
     Pending,
 }
@@ -731,6 +753,17 @@ pub(super) fn secure_rtcp_relays(
         RtcpKeying::Leg(leg) => vec![
             toward_far.with_secure_egress(leg.clone()),
             toward_near.with_secure_ingress(leg.clone()),
+        ],
+        // A→B: A's SRTCP in under A's key, out under B's. B→A: the mirror. `RtcpRelay::relay`
+        // already runs unprotect→protect, so a transcrypt needs no new relay logic — only both
+        // sides named.
+        RtcpKeying::BothLegs { near, far } => vec![
+            toward_far
+                .with_secure_ingress(near.clone())
+                .with_secure_egress(far.clone()),
+            toward_near
+                .with_secure_ingress(far.clone())
+                .with_secure_egress(near.clone()),
         ],
         RtcpKeying::Pending => vec![
             toward_far.with_pending_secure(SecureSide::Egress),

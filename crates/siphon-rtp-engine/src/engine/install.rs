@@ -8,7 +8,7 @@ use siphon_rtp_datapath::{
 };
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_proto::{CmdResult, Event, ProfileFlags};
-use siphon_rtp_srtp::leg::SecureLeg;
+use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use crate::dtls_bridge::DtlsCallPlan;
 use crate::ice::IceCredentials;
 use crate::media_pipeline::{DirectionConfig, EchoProfile, MediaCall, RtcpRelay};
 use crate::sdp;
-use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp};
+use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeLeg};
 use crate::text_pipeline::{TextCall, TextDirectionConfig};
 
 use super::answer::{ingress_rule, with_ptime_override};
@@ -26,6 +26,17 @@ use super::negotiate::{
     ice_tie_breaker, peer_ice_credentials, secure_rtcp_relays, RtcpKeying, TranscodePair,
 };
 use super::{boxed_error_result, Engine, Leg, PipelineKind};
+
+/// Which of a bridged call's two parties are secure, and the key pair that keys each: the engine's
+/// own key toward that party (what it advertised in the SDP that party received) and that party's
+/// own answered key. At least one side is `Some` — a bridge with neither belongs on the datapath's
+/// plain `Forward` path, not on the `Redirect` slow path.
+struct BridgeKeying {
+    /// The near (A, offerer) party's `(engine key toward A, A's own key)`.
+    near: Option<(CryptoAttribute, CryptoAttribute)>,
+    /// The far (B, answerer) party's `(engine key toward B, B's own key)`.
+    far: Option<(CryptoAttribute, CryptoAttribute)>,
+}
 
 /// What every media-pipeline arm of [`Engine::answer`] wires from, resolved once so the arms cannot
 /// drift on which address gates or aims a leg: both legs, each peer's effective ingress gate and
@@ -316,7 +327,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         &"missing a=crypto in the answer",
                     ));
                 };
-                self.install_srtp_bridge(wiring, far_local, far_remote, BridgeOp::Encrypt)?;
+                self.install_srtp_bridge(
+                    wiring,
+                    BridgeKeying {
+                        near: None,
+                        far: Some((far_local, far_remote)),
+                    },
+                )?;
             }
             PipelineKind::SrtpOfferer => {
                 // A secure **offerer** toward a plain callee: the exact mirror of the arm above, with
@@ -333,13 +350,69 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         &"secure offerer has no engine key or no peer key (internal)",
                     ));
                 };
-                self.install_srtp_bridge(wiring, near_local, near_remote, BridgeOp::Decrypt)?;
+                self.install_srtp_bridge(
+                    wiring,
+                    BridgeKeying {
+                        near: Some((near_local, near_remote)),
+                        far: None,
+                    },
+                )?;
+            }
+            PipelineKind::SrtpTranscrypt => {
+                // Both parties negotiated SDES-SRTP, under keys that have nothing to do with each
+                // other — two SRTP-only desk phones calling each other is the ordinary case. The
+                // engine is the cryptographic far side of *both*: it advertised its own key to each,
+                // so it holds four contexts and re-encrypts every datagram from one party's key to
+                // the other's. The payload is never decoded, so any codec crosses, and neither
+                // party's key is ever shown to the other.
+                let (Some(near_local), Some(near_remote), Some(far_local)) =
+                    (near_local_crypto, near_remote_crypto, far_local_crypto)
+                else {
+                    return Err(boxed_error_result(
+                        "SRTP transcrypt",
+                        &"a transcrypt is missing one party's engine key or peer key (internal)",
+                    ));
+                };
+                let Some(far_remote) = wiring.info.crypto.first().copied() else {
+                    return Err(boxed_error_result(
+                        "SAVP answer",
+                        &"missing a=crypto in the answer",
+                    ));
+                };
+                self.install_srtp_bridge(
+                    wiring,
+                    BridgeKeying {
+                        near: Some((near_local, near_remote)),
+                        far: Some((far_local, far_remote)),
+                    },
+                )?;
             }
             PipelineKind::Dtls => self.install_dtls_bridge(wiring)?,
             PipelineKind::DtlsOfferer => self.install_dtls_offerer_bridge(wiring)?,
             PipelineKind::DtlsMedia => self.install_dtls_media(wiring, owner_events)?,
             PipelineKind::SrtpMedia => {
                 self.install_srtp_media(wiring, far_local_crypto, owner_events)?;
+            }
+            PipelineKind::SrtpTranscryptMedia => {
+                // Both parties SDES **and** the call needs the audio decoded — a recorded internal
+                // call between two SRTP desk phones, or a secure pair whose codecs differ. The
+                // transcrypt bridge cannot serve it (it never decodes), so the media actor holds
+                // both parties' legs instead and the plaintext between them reaches the pipeline.
+                let (Some(near_local), Some(near_remote), Some(far_local)) =
+                    (near_local_crypto, near_remote_crypto, far_local_crypto)
+                else {
+                    return Err(boxed_error_result(
+                        "SRTP transcrypt transcode",
+                        &"a secure↔secure transcode is missing one party's engine key or peer key \
+                          (internal)",
+                    ));
+                };
+                self.install_srtp_transcrypt_media(
+                    wiring,
+                    (near_local, near_remote),
+                    far_local,
+                    owner_events,
+                )?;
             }
             PipelineKind::Media => self.install_media(wiring, owner_events)?,
             // Named rather than a wildcard, so a new pipeline kind has to choose its install here
@@ -351,16 +424,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Ok(Vec::new())
     }
 
-    /// The userspace SDES-SRTP bridge between the plain party and the secure one, keyed with the
-    /// engine's own key toward the secure party (`local`) and that party's key (`remote`). `near_op`
-    /// is what A's ingress gets — `Encrypt` when B is the secure party, `Decrypt` when A is — and B's
-    /// ingress gets the other. Every leg endpoint is redirected so the bridge sees both directions.
+    /// The userspace SDES-SRTP bridge, keyed for whichever of the two parties negotiated SRTP.
+    ///
+    /// Each party that is secure contributes a [`SecureLeg`] from the engine's own key toward it
+    /// (`local`) and that party's answered key (`remote`). Every flow then names which party's leg
+    /// decrypts its ingress and which encrypts its egress, so the three shapes are one construction:
+    /// B secure only (`Srtp`), A secure only (`SrtpOfferer`), or **both** under different keys
+    /// (`SrtpTranscrypt`), where A's ingress is decrypted with A's key and re-encrypted with B's, and
+    /// the reverse. Every leg endpoint is redirected so the bridge sees both directions.
     fn install_srtp_bridge(
         &self,
         wiring: &AnswerWiring<'_>,
-        local: CryptoAttribute,
-        remote: CryptoAttribute,
-        near_op: BridgeOp,
+        keying: BridgeKeying,
     ) -> Result<(), Box<CmdResult>> {
         let AnswerWiring {
             profile,
@@ -376,10 +451,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_rtcp_dst,
             ..
         } = *wiring;
-        let far_op = match near_op {
-            BridgeOp::Encrypt => BridgeOp::Decrypt,
-            BridgeOp::Decrypt => BridgeOp::Encrypt,
-        };
+        // Which party sits on each side of a flow's transform. A flow whose ingress faces A decrypts
+        // with A's leg (if A is secure) and encrypts with B's (if B is); one facing B is the mirror.
+        // A party that is plaintext contributes `None` on both sides, which is what collapses this
+        // back to the one-sided bridge.
+        let near_side = keying.near.is_some().then_some(BridgeLeg::Near);
+        let far_side = keying.far.is_some().then_some(BridgeLeg::Far);
         let (Some(a_rtp), Some(a_rtcp)) = (near.remote_rtp, near.remote_rtcp) else {
             return Err(boxed_error_result(
                 "SRTP bridge",
@@ -395,7 +472,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // `received-from` public IP when the offer supplied one).
             BridgeFlowPlan {
                 endpoint: near.rtp.id,
-                op: near_op,
+                ingress_leg: near_side,
+                egress_leg: far_side,
                 accepted_source: bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                 out_endpoint: far.rtp.id,
                 out_dst: far_media_dst,
@@ -403,7 +481,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // B's ingress → out the near endpoint toward A.
             BridgeFlowPlan {
                 endpoint: far.rtp.id,
-                op: far_op,
+                ingress_leg: far_side,
+                egress_leg: near_side,
                 accepted_source: bridge_source_filter(profile, far_gate_rtp),
                 out_endpoint: near.rtp.id,
                 out_dst: near_media_dst.unwrap_or(a_rtp),
@@ -412,14 +491,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
             flows.push(BridgeFlowPlan {
                 endpoint: near_rtcp.id,
-                op: near_op,
+                ingress_leg: near_side,
+                egress_leg: far_side,
                 accepted_source: bridge_source_filter(profile, near_gate_rtcp.unwrap_or(a_rtcp)),
                 out_endpoint: far_rtcp.id,
                 out_dst: far_rtcp_dst,
             });
             flows.push(BridgeFlowPlan {
                 endpoint: far_rtcp.id,
-                op: far_op,
+                ingress_leg: far_side,
+                egress_leg: near_side,
                 accepted_source: bridge_source_filter(profile, far_gate_rtcp),
                 out_endpoint: near_rtcp.id,
                 out_dst: near_rtcp_dst.unwrap_or(a_rtcp),
@@ -429,15 +510,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // estimate it from the sequence numbers they have seen. This runs again on every renegotiation
         // of a live call, so a leg rebuilt from the keys alone would restart both counters at 0 while
         // the peer's keep counting, and every packet past the first sequence wrap would then
-        // authenticate against the wrong index. Carry the live leg's rollover into the rebuilt one,
+        // authenticate against the wrong index. Carry the live legs' rollover into the rebuilt ones,
         // exactly as an HA restore does — including across a re-key, since a new master key does not
         // restart the stream's packet index.
-        let previous_rollover = self.bridge.rollover_snapshot(near.rtp.id);
-        let mut leg = SecureLeg::new(&local.key, &remote.key);
-        if let Some(rollover) = previous_rollover.as_ref() {
-            leg.seed_rollover(rollover);
-        }
-        self.bridge.register(BridgeCallPlan { leg, flows });
+        //
+        // Both are read from A's RTP endpoint, whose one flow faces A on ingress and B on egress and
+        // so names both parties. Seeding a transcrypt from a single leg would cross-seed one party's
+        // counters into the other's, which is worse than not seeding at all.
+        let (previous_near, previous_far) = self.bridge.rollover_snapshots(near.rtp.id);
+        let build = |keys: Option<(CryptoAttribute, CryptoAttribute)>,
+                     previous: Option<SecureLegRollover>| {
+            let (local, remote) = keys?;
+            let mut leg = SecureLeg::new(&local.key, &remote.key);
+            if let Some(rollover) = previous.as_ref() {
+                leg.seed_rollover(rollover);
+            }
+            Some(leg)
+        };
+        self.bridge.register(BridgeCallPlan {
+            near_leg: build(keying.near, previous_near),
+            far_leg: build(keying.far, previous_far),
+            flows,
+        });
         Ok(())
     }
 
@@ -674,6 +768,83 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let call = wiring
             .media_call(directions, inputs.record_path)
             .with_far_secure_leg(leg)
+            .with_rtcp_relays(rtcp_relays);
+        self.media
+            .register(call, self.datapath.clone(), owner_events);
+        Ok(())
+    }
+
+    /// The secure↔secure transcode: both parties on SDES-SRTP, and the call needs the decoded audio.
+    ///
+    /// The twin of [`Engine::install_srtp_media`] with a second [`SecureLeg`] on the near side. Each
+    /// direction decrypts under the party it faces and encrypts under the party it forwards to, so
+    /// the engine is the cryptographic far side of both and neither key ever reaches the other —
+    /// the same posture as the transcrypt bridge, but with the plaintext delivered to the pipeline
+    /// so a recording, a prompt, the DSP and a codec change have something to attach to.
+    ///
+    /// Both parties' SRTP rollovers are carried across a renegotiation (RFC 3711 §3.3.1). Seeding
+    /// only one would leave the other party's ROC restarting at 0 on every re-INVITE, which its
+    /// peer cannot verify — the same defect the bridge's two-leg rollover read exists to avoid.
+    fn install_srtp_transcrypt_media(
+        &self,
+        wiring: &AnswerWiring<'_>,
+        near_keys: (CryptoAttribute, CryptoAttribute),
+        far_local: CryptoAttribute,
+        owner_events: Option<flume::Sender<Event>>,
+    ) -> Result<(), Box<CmdResult>> {
+        let AnswerWiring { near, far, .. } = *wiring;
+        let (near_local, near_remote) = near_keys;
+        let Some(far_remote) = wiring.info.crypto.first().copied() else {
+            return Err(boxed_error_result(
+                "SAVP answer",
+                &"missing a=crypto in the answer",
+            ));
+        };
+        let inputs = wiring.transcode_inputs("secure↔secure media pipeline")?;
+        let directions = build_transcode_pair(&wiring.transcode_pair(&inputs)).map_err(
+            |(direction, reason)| {
+                boxed_error_result(
+                    &format!("secure↔secure media pipeline ({direction})"),
+                    &reason,
+                )
+            },
+        )?;
+        self.redirect_endpoints(
+            [near.rtp.id, far.rtp.id],
+            "install secure↔secure media redirect",
+        )?;
+        let mut near_leg = SecureLeg::new(&near_local.key, &near_remote.key);
+        if let Some(rollover) = self.media.near_rollover_snapshot(wiring.call_id) {
+            near_leg.seed_rollover(&rollover);
+        }
+        let mut far_leg = SecureLeg::new(&far_local.key, &far_remote.key);
+        if let Some(rollover) = self.media.rollover_snapshot(wiring.call_id) {
+            far_leg.seed_rollover(&rollover);
+        }
+        let near_leg = Arc::new(Mutex::new(near_leg));
+        let far_leg = Arc::new(Mutex::new(far_leg));
+        // Non-muxed companion RTCP, keyed on both sides for the same reason the RTP directions are.
+        let mut rtcp_relays = Vec::new();
+        if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp)) =
+            (near.rtcp, far.rtcp, near.remote_rtcp)
+        {
+            self.redirect_endpoints(
+                [near_rtcp.id, far_rtcp.id],
+                "install secure↔secure media RTCP redirect",
+            )?;
+            rtcp_relays = wiring.rtcp_relays(
+                near_rtcp.id,
+                far_rtcp.id,
+                a_rtcp,
+                &RtcpKeying::BothLegs {
+                    near: near_leg.clone(),
+                    far: far_leg.clone(),
+                },
+            );
+        }
+        let call = wiring
+            .media_call(directions, inputs.record_path)
+            .with_both_secure_legs(near_leg, far_leg)
             .with_rtcp_relays(rtcp_relays);
         self.media
             .register(call, self.datapath.clone(), owner_events);

@@ -242,6 +242,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"secure-offerer-unkeyable: the RTP/SAVP offer carries no usable a=crypto",
             )));
         }
+        // An SDES-SRTP offerer toward a **DTLS** far leg, refused here rather than at the answer
+        // because it is already knowable: `far_dtls` is settled from *this* offer's profile and
+        // stored on the `Call`, and `answer` only reads it back. Deciding it at the answer meant
+        // both parties were mid-call before the refusal landed — the callee had been rung, had
+        // picked up, and the caller then got a 500 for a shape the engine could have declined
+        // before the INVITE was ever sent.
+        //
+        // An SDES offerer toward an **SDES** far leg is *not* refused: that is the transcrypt
+        // (`PipelineKind::SrtpTranscrypt`), which re-encrypts from one party's key to the other's.
+        // Bridging SDES to DTLS is a different problem — two keying mechanisms rather than two keys
+        // — and stays unsupported. The answer keeps the checks for what only it knows: a codec
+        // mismatch, a decode-forcing flag first named on the answer profile, and a renegotiation
+        // that changes the posture.
+        if near_sdes && far_dtls {
+            return Err(Box::new(error_result(
+                "offer",
+                &"secure-offerer-unsupported: an SDES-SRTP offerer toward a DTLS-SRTP far leg needs \
+                  a transcrypt between two keying mechanisms; an SDES callee (RTP/SAVP) or a plain \
+                  callee is supported",
+            )));
+        }
         // A **DTLS-SRTP** offerer (`UDP/TLS/RTP/SAVP[F]`, RFC 5764). With no far-leg transport and no
         // DTLS directive its keying passes through to B untouched, as before: two DTLS peers may run
         // their association end to end through the relay. Asking for a plaintext far leg (`dtls: off`,
