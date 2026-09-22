@@ -239,15 +239,25 @@ pub(super) fn settle_secure_offerer(
     info: &sdp::MediaInfo,
     (reversed, profile, engine_fingerprint): (bool, &ProfileFlags, Option<sdp::Fingerprint>),
 ) -> Result<Option<NearDtlsAnswer>, Box<siphon_rtp_proto::CmdResult>> {
-    if (near_sdes && pipeline != super::PipelineKind::SrtpOfferer)
+    let near_sdes_carried = matches!(
+        pipeline,
+        super::PipelineKind::SrtpOfferer | super::PipelineKind::SrtpTranscrypt
+    );
+    if (near_sdes && !near_sdes_carried)
         || (near_dtls.is_some() && pipeline != super::PipelineKind::DtlsOfferer)
     {
         let codecs_differ = matches!(
             (near_codec, info.primary_codec()),
             (Some(near), Some(far)) if !same_codec(near, &far)
         );
-        let why = if far_secure {
-            "both parties are secure, which needs a transcrypt between two different keys"
+        // Naming the *actual* obstacle matters here, because "both parties are secure" stopped being
+        // one: a same-codec SDES↔SDES pair is carried by `PipelineKind::SrtpTranscrypt` and never
+        // reaches this refusal. What is left is a DTLS offerer facing a secure callee (two keying
+        // mechanisms, not two keys), and any secure offerer whose call needs the audio *decoded* —
+        // which no crypto bridge can give it, whether one leg is secure or both.
+        let why = if near_dtls.is_some() && far_secure {
+            "both parties are secure and one is keyed by DTLS, which needs a transcrypt between two \
+             keying mechanisms rather than between two keys"
         } else if codecs_differ {
             "the two legs' codecs differ, which needs the secure offerer's leg threaded into the \
              transcoding pipeline"
@@ -255,11 +265,13 @@ pub(super) fn settle_secure_offerer(
             "the call needs the decoded audio (recording, noise suppression, echo cancellation or \
              beep detection), which needs the secure offerer's leg threaded into the media pipeline"
         };
+        let supported = if far_secure {
+            "two SDES parties on a shared codec are bridged as a transcrypt"
+        } else {
+            "a secure caller toward a plain callee on a shared codec is supported"
+        };
         return Err(Box::new(siphon_rtp_proto::CmdResult::Error {
-            reason: format!(
-                "answer: secure-offerer-unsupported: {why}; a secure caller toward a plain callee \
-                 on a shared codec is supported"
-            ),
+            reason: format!("answer: secure-offerer-unsupported: {why}; {supported}"),
         }));
     }
     near_dtls

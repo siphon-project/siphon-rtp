@@ -158,8 +158,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // rejection — a warrant has to be servable on any call.
             // A terminated DTLS offerer taps the same way: each tap sits on its own party's ingress
             // endpoint, and the bridge hands it the plaintext side of that endpoint's transform.
+            // A **transcrypt** belongs here for the same reason and needs it most: both sides of the
+            // wire are ciphertext, so the intermediate plaintext the bridge taps is the only place
+            // the content exists in the clear anywhere in the engine.
             PipelineKind::Srtp
             | PipelineKind::SrtpOfferer
+            | PipelineKind::SrtpTranscrypt
             | PipelineKind::Dtls
             | PipelineKind::DtlsOfferer => {
                 let Some(b_endpoint) = b_endpoint else {

@@ -193,6 +193,50 @@ fn bench_secure_leg(criterion: &mut Criterion) {
     });
 }
 
+/// The per-packet cost a **transcrypt** bridge pays: one `unprotect` under the sending party's leg
+/// followed by one `protect` under the receiving party's, which is what a call between two SDES
+/// parties runs for every datagram in each direction. Benched as the pair rather than inferred from
+/// the two one-sided numbers, so the intermediate buffer handling is inside the measurement.
+fn bench_transcrypt(criterion: &mut Criterion) {
+    let (a_local, a_remote) = (
+        SrtpKeyMaterial::from_inline_bytes(&[0xA1; 30]).expect("30 bytes"),
+        SrtpKeyMaterial::from_inline_bytes(&[0xA2; 30]).expect("30 bytes"),
+    );
+    let (b_local, b_remote) = (
+        SrtpKeyMaterial::from_inline_bytes(&[0xB1; 30]).expect("30 bytes"),
+        SrtpKeyMaterial::from_inline_bytes(&[0xB2; 30]).expect("30 bytes"),
+    );
+
+    criterion.bench_function("secure_leg_transcrypt_rtp", |bencher| {
+        // Party A seals into the same replay-safe monotone ring the unprotect benches use; the
+        // engine then decrypts with A's leg and re-encrypts with B's.
+        let mut peer = SrtpContext::from_key_material(&a_remote);
+        let ring: Vec<Vec<u8>> = (0..RING_LEN)
+            .map(|seq| {
+                let mut sealed = Vec::with_capacity(256);
+                peer.protect(&rtp_packet(seq as u16, 0x1111_1111), &mut sealed)
+                    .expect("seed protect");
+                sealed
+            })
+            .collect();
+        let mut near = SecureLeg::new(&a_local, &a_remote);
+        let mut far = SecureLeg::new(&b_local, &b_remote);
+        let mut plain = Vec::with_capacity(256);
+        let mut sealed = Vec::with_capacity(256);
+        let mut index = 0usize;
+        bencher.iter(|| {
+            if index == 0 {
+                near = SecureLeg::new(&a_local, &a_remote); // fresh replay window so the ring repeats
+            }
+            near.unprotect(black_box(&ring[index]), &mut plain)
+                .expect("ingress decrypt");
+            let kind = far.protect(&plain, &mut sealed).expect("egress encrypt");
+            index = if index + 1 == RING_LEN { 0 } else { index + 1 };
+            black_box(kind)
+        });
+    });
+}
+
 fn bench_setup(criterion: &mut Criterion) {
     criterion.bench_function("srtp_context_new", |bencher| {
         bencher.iter(|| {
@@ -207,6 +251,7 @@ criterion_group!(
     bench_srtp,
     bench_srtcp,
     bench_secure_leg,
+    bench_transcrypt,
     bench_setup
 );
 criterion_main!(benches);

@@ -1385,6 +1385,22 @@ fn resolve_pipeline(
             PipelineKind::Dtls
         };
     }
+    // Both parties on SDES-SRTP, under different keys: the transcrypt bridge. It must be tested
+    // before both arms below, which each assume the *other* party is plaintext — `SrtpOfferer`
+    // requires `far_local_crypto.is_none()` and `Srtp` would otherwise claim this call and encrypt
+    // A's still-encrypted datagrams a second time under B's key.
+    //
+    // Like the two one-sided bridges it relays the payload verbatim, so it is available exactly when
+    // nothing needs the decoded audio. Anything that does falls through to a media pipeline with no
+    // A-facing `SecureLeg` threaded into it, which the caller then refuses.
+    if near_local_crypto.is_some()
+        && far_local_crypto.is_some()
+        && !far_dtls
+        && !near_dtls
+        && !needs_decoded_audio
+    {
+        return PipelineKind::SrtpTranscrypt;
+    }
     // A secure **offerer** toward a plain callee: the mirror of the secure-far-leg bridge below. Only
     // the crypto-bridge shape is wired, so this yields `SrtpOfferer` exactly when nothing needs the
     // decoded audio. Anything that does — a codec mismatch, recording, NS, AEC, beep detection —
