@@ -2385,13 +2385,13 @@ async fn a_secure_bridge_carrying_media_is_not_reaped_but_a_silent_one_still_is(
     assert_eq!(recovered, from_a);
 
     assert!(
-        engine.reap_idle(5, 0).await.is_empty(),
+        engine.reap_idle(5, 0, 0).await.is_empty(),
         "a secure bridge carrying audio is not idle"
     );
 
     engine.datapath().advance_clock(10);
     assert_eq!(
-        engine.reap_idle(5, 0).await,
+        engine.reap_idle(5, 0, 0).await,
         vec!["savp-idle".to_string()],
         "and one that has genuinely gone quiet is still reaped"
     );
@@ -5430,7 +5430,10 @@ async fn answer_local_ws_stream_ends_when_the_call_is_reaped_as_idle() {
 
     // The caller never sends a packet, so the leg is idle from creation and the sweeper takes it.
     engine.datapath().advance_clock(10);
-    assert_eq!(engine.reap_idle(5, 0).await, vec!["al-ws-reap".to_string()]);
+    assert_eq!(
+        engine.reap_idle(5, 0, 0).await,
+        vec!["al-ws-reap".to_string()]
+    );
     assert!(
         !engine.ws().is_ws_call("al-ws-reap"),
         "the reaped call's WS bridge is deregistered"
@@ -5729,7 +5732,7 @@ async fn a_takeover_carrying_ingress_is_not_reaped_but_a_silent_one_still_is() {
     );
 
     assert!(
-        engine.reap_idle(5, 0).await.is_empty(),
+        engine.reap_idle(5, 0, 0).await.is_empty(),
         "a takeover call being talked into is not idle"
     );
     assert!(
@@ -5740,7 +5743,7 @@ async fn a_takeover_carrying_ingress_is_not_reaped_but_a_silent_one_still_is() {
     // Now the caller goes quiet: the sweep must still do its job.
     engine.datapath().advance_clock(10);
     assert_eq!(
-        engine.reap_idle(5, 0).await,
+        engine.reap_idle(5, 0, 0).await,
         vec!["ws-idle".to_string()],
         "a takeover call whose caller has stopped sending is still reaped"
     );
@@ -9897,7 +9900,10 @@ async fn a_recording_is_finalized_when_the_media_timeout_reaps_the_call() {
 
     // The caller goes quiet for longer than the media timeout.
     engine.datapath().advance_clock(10);
-    assert_eq!(engine.reap_idle(5, 0).await, vec!["vm-reaped".to_string()]);
+    assert_eq!(
+        engine.reap_idle(5, 0, 0).await,
+        vec!["vm-reaped".to_string()]
+    );
 
     assert!(
         engine.recordings.is_empty(),
@@ -11055,7 +11061,7 @@ async fn echo_single_leg_active_call_survives_timeout_but_silent_is_reaped() {
     // Tick 14: only 4 ticks since the stamp (< 5) → recent media keeps the active call alive.
     engine.datapath().advance_clock(4);
     assert!(
-        engine.reap_idle(5, 0).await.is_empty(),
+        engine.reap_idle(5, 0, 0).await.is_empty(),
         "an actively-echoing call is not reaped"
     );
     assert!(
@@ -11066,7 +11072,7 @@ async fn echo_single_leg_active_call_survives_timeout_but_silent_is_reaped() {
     // Tick 20: 10 ticks of silence (>= 5) → the now-silent call times out and is reaped.
     engine.datapath().advance_clock(6);
     assert_eq!(
-        engine.reap_idle(5, 0).await,
+        engine.reap_idle(5, 0, 0).await,
         vec!["echo-idle".to_string()],
         "a silent single-leg echo call is reaped"
     );
@@ -14763,14 +14769,14 @@ async fn idle_calls_are_reaped_and_active_ones_survive() {
     // Tick 8: idle since the packet (tick 4) is 4 < 5 → recent media keeps the call alive.
     engine.datapath().advance_clock(4);
     assert!(
-        engine.reap_idle(5, 0).await.is_empty(),
+        engine.reap_idle(5, 0, 0).await.is_empty(),
         "recent media defers reaping"
     );
     assert_eq!(engine.session_count(), 1);
 
     // Tick 13: idle since tick 4 is 9 >= 5 → the silent call is reaped and its ports freed.
     engine.datapath().advance_clock(5);
-    assert_eq!(engine.reap_idle(5, 0).await, vec!["c".to_string()]);
+    assert_eq!(engine.reap_idle(5, 0, 0).await, vec!["c".to_string()]);
     assert_eq!(engine.session_count(), 0);
 }
 
@@ -14830,17 +14836,19 @@ async fn a_held_call_outlives_the_media_timeout_and_reaps_on_its_own_ceiling() {
     )
     .await;
 
-    // Far past the media timeout, and not one packet has been sent by either party.
+    // Far past the media timeout *and* the setup ceiling, and not one packet has been sent by either
+    // party. Held is the first rule tried, so a call the signalling has suspended keeps the long
+    // ceiling whether or not it has carried media yet.
     engine.datapath().advance_clock(100);
     assert!(
-        engine.reap_idle(5, 1000).await.is_empty(),
+        engine.reap_idle(5, 1000, 5).await.is_empty(),
         "neither party is expected to send, so their silence is not a dead path"
     );
     assert_eq!(engine.session_count(), 1);
 
     // Past the held ceiling, it does end — a call abandoned on hold is still freed eventually.
     engine.datapath().advance_clock(1000);
-    assert_eq!(engine.reap_idle(5, 1000).await, vec!["held".to_string()]);
+    assert_eq!(engine.reap_idle(5, 1000, 5).await, vec!["held".to_string()]);
     assert_eq!(engine.session_count(), 0);
 }
 
@@ -14871,8 +14879,10 @@ async fn every_shape_of_hold_is_recognised_and_an_active_call_is_not() {
         )
         .await;
 
+        // None of these calls ever carried a packet, so the `sendrecv` row is judged by the setup
+        // ceiling (5) and the held rows by the held one, which is disabled here.
         engine.datapath().advance_clock(100);
-        let reaped = engine.reap_idle(5, 0).await;
+        let reaped = engine.reap_idle(5, 0, 5).await;
         assert_eq!(
             reaped.is_empty(),
             held,
@@ -14894,7 +14904,7 @@ async fn a_held_call_never_ages_out_when_the_held_ceiling_is_disabled() {
 
     engine.datapath().advance_clock(1_000_000);
     assert!(
-        engine.reap_idle(5, 0).await.is_empty(),
+        engine.reap_idle(5, 0, 5).await.is_empty(),
         "`0` disables the held ceiling — such a call is freed by `delete` alone"
     );
 }
@@ -14906,14 +14916,29 @@ async fn taking_a_call_off_hold_re_arms_the_dead_path_timer() {
     // for the rest of its life and a genuinely dead path after an unhold would never be reaped.
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let client = ClientId(14);
-    let (_phone_a, addr_a) = phone().await;
+    let (phone_a, addr_a) = phone().await;
     let (_phone_b, addr_b) = phone().await;
     held_call(
         &engine, client, "unhold", addr_a, addr_b, "sendonly", "recvonly",
     )
     .await;
+
+    // One packet of hold music, so this call has genuinely carried media: what is under test is the
+    // *dead-path* ceiling re-arming, and a path can only die once it has lived. It also lets the
+    // setup ceiling be disabled below, so nothing but the media ceiling can end this call.
+    let near_rtp = engine
+        .calls
+        .get("unhold")
+        .map(|call| call.near.rtp.local_addr)
+        .expect("the call has a near leg");
+    phone_a
+        .send_to(&rtp(0x7777_0000), near_rtp)
+        .await
+        .expect("send");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
     engine.datapath().advance_clock(100);
-    assert!(engine.reap_idle(5, 1000).await.is_empty(), "still held");
+    assert!(engine.reap_idle(5, 1000, 0).await.is_empty(), "still held");
 
     // A re-offers with `sendrecv` — the unhold. It carries no direction attribute at all, which is
     // exactly what RFC 4566 §6 says `sendrecv` means, so the absence has to re-arm too.
@@ -14947,7 +14972,7 @@ async fn taking_a_call_off_hold_re_arms_the_dead_path_timer() {
 
     engine.datapath().advance_clock(100);
     assert_eq!(
-        engine.reap_idle(5, 1000).await,
+        engine.reap_idle(5, 1000, 0).await,
         vec!["unhold".to_string()],
         "off hold and silent is a dead path again"
     );
@@ -14975,12 +15000,12 @@ async fn a_single_leg_call_is_held_by_its_only_partys_own_direction() {
 
     engine.datapath().advance_clock(100);
     assert!(
-        engine.reap_idle(5, 1000).await.is_empty(),
+        engine.reap_idle(5, 1000, 0).await.is_empty(),
         "the caller told us it would send nothing"
     );
     engine.datapath().advance_clock(1000);
     assert_eq!(
-        engine.reap_idle(5, 1000).await,
+        engine.reap_idle(5, 1000, 0).await,
         vec!["ivr-held".to_string()],
         "and the held ceiling still ends it"
     );
@@ -15015,13 +15040,13 @@ async fn music_on_hold_refreshes_a_held_calls_own_ceiling() {
     // Tick 16: 8 since the music, under the 10-tick held ceiling.
     engine.datapath().advance_clock(8);
     assert!(
-        engine.reap_idle(5, 10).await.is_empty(),
+        engine.reap_idle(5, 10, 0).await.is_empty(),
         "the hold music refreshed the ceiling"
     );
 
     engine.datapath().advance_clock(20);
     assert_eq!(
-        engine.reap_idle(5, 10).await,
+        engine.reap_idle(5, 10, 0).await,
         vec!["moh".to_string()],
         "and once even the music stops, the held ceiling still ends it"
     );
@@ -15039,18 +15064,12 @@ async fn the_reaped_event_names_which_rule_fired() {
     )
     .await;
 
+    // The setup ceiling is armed and shorter than the held one, and still loses to it: held is the
+    // first rule tried, so the reason below is the hold, not the absent media.
     engine.datapath().advance_clock(20);
-    assert_eq!(engine.reap_idle(5, 10).await, vec!["held".to_string()]);
+    assert_eq!(engine.reap_idle(5, 10, 5).await, vec!["held".to_string()]);
 
-    let mut reason = None;
-    let mut cdr_reason = None;
-    while let Ok(event) = events.try_recv() {
-        match event {
-            Event::MediaTimeout { reason: seen, .. } => reason = Some(seen),
-            Event::CallSummary { reason: seen, .. } => cdr_reason = Some(seen),
-            _ => {}
-        }
-    }
+    let (reason, cdr_reason) = reaped_reasons(&events);
     assert_eq!(
         reason,
         Some(MediaTimeoutReason::HeldTooLong),
@@ -15060,6 +15079,228 @@ async fn the_reaped_event_names_which_rule_fired() {
         cdr_reason.as_deref(),
         Some("held_timeout"),
         "and the CDR records the same distinction"
+    );
+}
+
+/// Drain the owner's event channel for the reaped call's two reasons: the `MediaTimeout` rule and
+/// the CDR's `reason` string, which must agree on which ceiling fired.
+fn reaped_reasons(events: &flume::Receiver<Event>) -> (Option<MediaTimeoutReason>, Option<String>) {
+    let mut reason = None;
+    let mut cdr_reason = None;
+    while let Ok(event) = events.try_recv() {
+        match event {
+            Event::MediaTimeout { reason: seen, .. } => reason = Some(seen),
+            Event::CallSummary { reason: seen, .. } => cdr_reason = Some(seen),
+            _ => {}
+        }
+    }
+    (reason, cdr_reason)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_that_is_still_ringing_is_not_reaped_as_a_dead_path() {
+    // The defect this closes: a controller anchors media when it *builds the offer*, before it dials,
+    // so a call that is still ringing has no media by definition. Judged by "nothing since creation"
+    // the anchor's budget races the controller's own ring budget and wins it — the anchor was created
+    // a fraction of a second before the ring deadline was armed — so a call that simply rang out was
+    // torn down as a media fault, and the ring-timeout path that would have recorded the far end's
+    // failure response never ran.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let client = ClientId(18);
+    let events = engine.register_client(client);
+    let (_phone, addr) = phone().await;
+    engine
+        .handle(
+            client,
+            Command::Offer {
+                call_id: "ringing".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr, false),
+                profile: Default::default(),
+            },
+        )
+        .await;
+
+    // Well past the media ceiling — and past the held one too, since neither is the rule that
+    // applies to a call nobody has answered yet.
+    engine.datapath().advance_clock(60);
+    assert!(
+        engine.reap_idle(30, 30, 300).await.is_empty(),
+        "no media was ever due, so its absence is not a dead path"
+    );
+    assert_eq!(engine.session_count(), 1);
+
+    // Past its own ceiling it does end: an anchor whose controller never came back is still freed.
+    engine.datapath().advance_clock(300);
+    assert_eq!(
+        engine.reap_idle(30, 30, 300).await,
+        vec!["ringing".to_string()]
+    );
+    assert_eq!(engine.session_count(), 0);
+
+    let (reason, cdr_reason) = reaped_reasons(&events);
+    assert_eq!(
+        reason,
+        Some(MediaTimeoutReason::SetupTimeout),
+        "and it is reported as a call that never connected, not one whose path died"
+    );
+    assert_eq!(
+        cdr_reason.as_deref(),
+        Some("setup_timeout"),
+        "the CDR records the same distinction"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_packet_moves_a_call_from_the_setup_ceiling_to_the_dead_path_one() {
+    // The setup ceiling is the strictly narrower claim: it covers a call that has *never* carried
+    // media. The first accepted packet moves the call onto the dead-path rule for the rest of its
+    // life, which is what keeps a mid-call failure at `--media-timeout-secs`, where it has always
+    // been. Proven by disabling the setup ceiling outright: only the media one can end this call.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let client = ClientId(19);
+    let events = engine.register_client(client);
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    held_call(
+        &engine, client, "answered", addr_a, addr_b, "sendrecv", "sendrecv",
+    )
+    .await;
+    let near_rtp = engine
+        .calls
+        .get("answered")
+        .map(|call| call.near.rtp.local_addr)
+        .expect("the call has a near leg");
+
+    phone_a
+        .send_to(&rtp(0x2222_0000), near_rtp)
+        .await
+        .expect("send");
+    // B receiving it is the synchronisation point: the datagram cleared the gate, which is strictly
+    // after the liveness stamp.
+    let _ = recv(&phone_b).await;
+
+    engine.datapath().advance_clock(10);
+    assert_eq!(
+        engine.reap_idle(5, 0, 0).await,
+        vec!["answered".to_string()],
+        "a path that carried media and then stopped is still reaped on the media ceiling"
+    );
+
+    let (reason, cdr_reason) = reaped_reasons(&events);
+    assert_eq!(
+        reason,
+        Some(MediaTimeoutReason::NoMedia),
+        "and it is a dead path, not a call that never connected"
+    );
+    assert_eq!(cdr_reason.as_deref(), Some("media_timeout"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zero_setup_ceiling_never_ages_out_an_unanswered_call() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let client = ClientId(20);
+    let (_phone, addr) = phone().await;
+    engine
+        .handle(
+            client,
+            Command::Offer {
+                call_id: "forever".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr, false),
+                profile: Default::default(),
+            },
+        )
+        .await;
+
+    engine.datapath().advance_clock(1_000_000);
+    assert!(
+        engine.reap_idle(5, 5, 0).await.is_empty(),
+        "`0` disables the setup ceiling — such an anchor is freed by `delete` alone"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_locally_answered_call_has_no_setup_phase() {
+    // `answer_local` *is* the answer — the caller is already in a live dialog and starts sending one
+    // round trip later — so there is no ring to wait through and no setup ceiling to earn. With that
+    // ceiling disabled the call is still reaped, which is only possible on the dead-path rule.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let client = ClientId(21);
+    let events = engine.register_client(client);
+    let (_phone, addr) = phone().await;
+    engine
+        .handle(
+            client,
+            Command::AnswerLocal {
+                call_id: "ivr".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr, false),
+                profile: Default::default(),
+            },
+        )
+        .await;
+
+    engine.datapath().advance_clock(10);
+    assert_eq!(engine.reap_idle(5, 0, 0).await, vec!["ivr".to_string()]);
+    let (reason, _) = reaped_reasons(&events);
+    assert_eq!(reason, Some(MediaTimeoutReason::NoMedia));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_call_keeps_the_dead_path_ceiling_it_was_checkpointed_under() {
+    // A checkpoint is only ever taken of a call that is already up, so a standby adopts a live media
+    // path. It has never seen a packet on that path, but that is the standby's own ignorance rather
+    // than a call still in setup — giving it the setup ceiling would hold a genuinely dead call open
+    // long past the media timeout. Proven the same way: the setup ceiling is disabled and the
+    // restored call is still reaped.
+    let (min, max) = (46_200u16, 46_240u16);
+    let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    held_call(
+        &engine_a, CLIENT, "ha-idle", addr_a, addr_b, "sendrecv", "sendrecv",
+    )
+    .await;
+    let CmdResult::Checkpoint { snapshot } = engine_a
+        .handle(
+            CLIENT,
+            Command::Checkpoint {
+                call_id: "ha-idle".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await
+    else {
+        panic!("expected a checkpoint result");
+    };
+    engine_a
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "ha-idle".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    drop(engine_a);
+
+    let engine_b = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+    assert!(
+        matches!(
+            engine_b.handle(CLIENT, Command::Restore { snapshot }).await,
+            CmdResult::Ok { .. }
+        ),
+        "restore succeeds on the standby"
+    );
+
+    engine_b.datapath().advance_clock(10);
+    assert_eq!(
+        engine_b.reap_idle(5, 0, 0).await,
+        vec!["ha-idle".to_string()],
+        "the standby judges an adopted call by the dead-path ceiling from its first tick"
     );
 }
 
@@ -15082,8 +15323,9 @@ async fn reaping_pushes_a_media_timeout_event_to_the_owner() {
         )
         .await;
 
+    // Anchored and never spoken to, so it is the setup ceiling that ends it.
     engine.datapath().advance_clock(10);
-    assert_eq!(engine.reap_idle(5, 0).await, vec!["gone".to_string()]);
+    assert_eq!(engine.reap_idle(5, 0, 5).await, vec!["gone".to_string()]);
 
     // Reaping pushes two events to the owner: the end-of-call `CallSummary` (CDR) and the
     // `MediaTimeout` dead-path signal SIPhon already relies on. Both must fire (additive).
@@ -15095,7 +15337,7 @@ async fn reaping_pushes_a_media_timeout_event_to_the_owner() {
                 call_id, reason, ..
             } => {
                 assert_eq!(call_id, "gone");
-                assert_eq!(reason, "media_timeout");
+                assert_eq!(reason, "setup_timeout");
                 got_summary = true;
             }
             Event::MediaTimeout {
@@ -15107,8 +15349,8 @@ async fn reaping_pushes_a_media_timeout_event_to_the_owner() {
                 assert_eq!(from_tag, "ft");
                 assert_eq!(
                     reason,
-                    MediaTimeoutReason::NoMedia,
-                    "a sendrecv call that went quiet is a dead path, not a hold"
+                    MediaTimeoutReason::SetupTimeout,
+                    "a call that never carried a packet never connected, it did not die"
                 );
                 got_timeout = true;
             }

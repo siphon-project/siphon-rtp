@@ -66,6 +66,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Call {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
+                // This command *is* the answer: the caller is already in a live dialog and starts
+                // sending one round trip later, so there is no setup phase to spare it from the
+                // dead-path ceiling.
+                anchored_before_answer: false,
                 started_at_unix_ms: super::unix_time_ms(),
                 ice: None,
                 // A single-leg local answer mints no ICE of its own, so there is no pair to keep

@@ -87,8 +87,11 @@ The engine pushes these asynchronously to the controlling client (no request id)
   ```
 
 - `dtmf`: one event per completed RFC 4733 key press, with digit, duration, and volume.
-- `media_timeout`: a call went silent past `--media-timeout-secs` (default 30) and the engine
-  reaped it; release your own per-call state on this.
+- `media_timeout`: a call went silent past one of its idle ceilings and the engine reaped it;
+  release your own per-call state on this. Branch on `reason`: `no_media` is a path that died
+  (`--media-timeout-secs`, default 30), `held_too_long` a call nobody took off hold
+  (`--held-media-timeout-secs`), and `setup_timeout` a call that never carried a packet at all
+  (`--setup-timeout-secs`, default 300) — one that never connected rather than one that failed.
 - `active_speaker`: the dominant speaker in a conference changed (`from_tag` absent when the
   floor went silent).
 

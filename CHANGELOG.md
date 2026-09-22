@@ -9,6 +9,25 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **A call that is still ringing is no longer reaped as a dead media path.** Media is anchored when a
+  controller *builds the offer*, before it dials, so a call nobody has answered yet has no media by
+  definition — its silence is not a path that failed, it is a path that has not been asked for. The
+  reaper knew only "held" and "not held", so it judged that silence against `--media-timeout-secs`,
+  and with both at 30 seconds the anchor beat the controller's own ring budget by the fraction of a
+  second between anchoring and arming the ring deadline. A call that merely rang out therefore ended
+  as a media fault, and the ring-timeout path that records the far end's failure response and fires
+  the route-failure hook never ran. A call anchored by `offer` that has carried **no** accepted packet
+  on any leg is now measured against its own `--setup-timeout-secs` (default 300, `0` disables it) and
+  reported with a new `media_timeout` reason, `setup_timeout`, so a controller can tell "the far end
+  went silent" from "nothing ever arrived" and route the second to the same place as its own ring
+  timeout. The first accepted packet on any leg moves the call onto the dead-path rule for the rest of
+  its life, so a mid-call failure is still reaped at `--media-timeout-secs` unchanged, and a held call
+  is still judged by `--held-media-timeout-secs`. `answer_local` gets no setup phase — that command
+  *is* the answer, so media is due one round trip later — nor does a call restored from an HA
+  checkpoint, whose media path the standby adopts already live. Conference seats keep the two
+  ceilings they had: a controller only seats a leg it has already answered. This is the split
+  rtpengine makes between its `timeout` and its `silent-timeout`.
+
 - **A control client can present a stable identity that survives a reconnect.** `authenticate` now
   carries an optional `controller_id`, and the engine resolves it to the same internal client
   identity on every connection, so a reconnect re-attaches to the calls that identity owns, to its

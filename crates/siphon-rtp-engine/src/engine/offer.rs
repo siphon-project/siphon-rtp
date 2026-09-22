@@ -748,6 +748,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Call {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
+                // Anchored before the controller dials, so no media is due until the call is
+                // answered — the setup ceiling applies until the first packet, not the media one.
+                anchored_before_answer: true,
                 started_at_unix_ms: super::unix_time_ms(),
                 ice: ice_creds,
                 // A's own credentials, from the offer — needed to *address* checks to A later

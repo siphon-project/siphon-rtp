@@ -305,6 +305,23 @@ struct Call {
     owner: ClientId,
     /// Logical-clock tick at creation (offer), the media-timeout baseline before any media arrives.
     created_tick: u64,
+    /// Whether this call was anchored **before anyone answered it**, so it may still be in setup and
+    /// owes no media yet ([`super::Engine::reap_idle`] measures it against `--setup-timeout-secs`
+    /// until its first packet arrives, rather than against `--media-timeout-secs`).
+    ///
+    /// `true` for `offer`: a controller builds the offer before it dials, so an unanswered call has no
+    /// media by definition and a call that is still ringing must not be read as a dead path. `false`
+    /// for `answer_local`, where the command *is* the answer — the caller is already in a live dialog
+    /// and starts sending one round trip later, so media is due at once — and `false` for a call
+    /// restored from an HA checkpoint, which was answered on the node that checkpointed it, so the
+    /// standby adopts a live path whose silence is a dead path from the first tick.
+    ///
+    /// It records how the call arrived, so it is latched at construction and never written back:
+    /// what actually ends the setup phase is the first accepted packet, which the sweep reads from the
+    /// datapath (`Datapath::last_activity`, sticky once a packet lands). It deliberately does **not**
+    /// clear on `answer`: an SDP answer arrives on a `183` as readily as on a `200`, so it says the
+    /// far end has a media address, not that anyone picked up.
+    anchored_before_answer: bool,
     /// Wall-clock creation time in milliseconds since the Unix epoch, for the `Timestamps` an RFC 6035
     /// report correlates with other records (§4.6.2.2). `None` on a call restored from an HA
     /// checkpoint, which does not carry the original.

@@ -1716,7 +1716,8 @@ pub enum PlayEndReason {
 /// The engine judges a leg idle only while its peer is **expected to send**: a party that signalled
 /// `a=recvonly` or `a=inactive` has told us it will send nothing (RFC 3264 §8.4), so its silence is
 /// the session state the signalling asked for. A call where no leg is expected to send is *held*, and
-/// held calls are measured against their own, much longer ceiling.
+/// held calls are measured against their own, much longer ceiling. A call that has not carried media
+/// *yet* is in setup, and gets a third ceiling of its own.
 ///
 /// `#[non_exhaustive]`: engine-emitted and purely informational. A consumer that does not recognise a
 /// reason still knows the call is gone, which is the part it must act on.
@@ -1724,13 +1725,19 @@ pub enum PlayEndReason {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MediaTimeoutReason {
-    /// A leg that was expected to be sending sent nothing for `--media-timeout-secs` — the media path
-    /// died (or was never established). The historical, and still the default, reason.
+    /// A leg that was expected to be sending stopped for `--media-timeout-secs` — the media path
+    /// carried packets and then died. The historical, and still the default, reason.
     NoMedia,
     /// Every leg is held (`a=recvonly` / `a=inactive` / a `sendonly`+`recvonly` pair), so no silence
     /// was unexpected, but the call stayed that way past `--held-media-timeout-secs`. Nobody came back
     /// to it.
     HeldTooLong,
+    /// The call was anchored but **never** carried a packet on any leg, and stayed that way past
+    /// `--setup-timeout-secs`. Nothing ever arrived, so nothing died: a controller anchors media when
+    /// it builds the offer, before it dials, so a call that is still ringing has no media by
+    /// definition and its silence is not a fault. A controller should treat this as a call that never
+    /// connected — the same class as its own ring timeout — not as a dead path on a live call.
+    SetupTimeout,
 }
 
 /// An asynchronous event pushed from the engine to SIPhon (no request correlation).
@@ -1775,9 +1782,11 @@ pub enum Event {
         direction: Option<String>,
     },
     /// A call's media went silent past a timeout and the engine tore it down. Lets SIPhon release its
-    /// own per-call state. `reason` says **which** rule fired, because the two mean opposite things
+    /// own per-call state. `reason` says **which** rule fired, because they mean different things
     /// operationally: [`MediaTimeoutReason::NoMedia`] is a path that died while a party was expected
-    /// to be sending, and [`MediaTimeoutReason::HeldTooLong`] is a call nobody ever took off hold.
+    /// to be sending, [`MediaTimeoutReason::HeldTooLong`] is a call nobody ever took off hold, and
+    /// [`MediaTimeoutReason::SetupTimeout`] is a call that never carried media at all — one that
+    /// never connected, not one that failed.
     MediaTimeout {
         call_id: String,
         from_tag: String,
@@ -3951,7 +3960,11 @@ mod tests {
 
     #[test]
     fn media_timeout_event_roundtrip_for_each_reason() {
-        for reason in [MediaTimeoutReason::NoMedia, MediaTimeoutReason::HeldTooLong] {
+        for reason in [
+            MediaTimeoutReason::NoMedia,
+            MediaTimeoutReason::HeldTooLong,
+            MediaTimeoutReason::SetupTimeout,
+        ] {
             roundtrip(&Event::MediaTimeout {
                 call_id: "c".into(),
                 from_tag: "f".into(),
@@ -3971,6 +3984,14 @@ mod tests {
         .expect("serialize");
         assert_eq!(json["event"], "media_timeout");
         assert_eq!(json["reason"], "held_too_long");
+
+        let json = serde_json::to_value(Event::MediaTimeout {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            reason: MediaTimeoutReason::SetupTimeout,
+        })
+        .expect("serialize");
+        assert_eq!(json["reason"], "setup_timeout");
     }
 
     #[test]

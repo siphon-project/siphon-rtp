@@ -470,6 +470,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Call {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
+                // A checkpoint is only taken of an answered call, so the standby adopts a live media
+                // path rather than one still being set up: its silence is a dead path from the first
+                // tick, and the setup ceiling must not hold it open past the media one.
+                anchored_before_answer: false,
                 // The checkpoint does not carry when the call started, and the restore time is not
                 // it, so a restored call has no start for a voice-quality report to claim.
                 started_at_unix_ms: None,
