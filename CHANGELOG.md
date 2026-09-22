@@ -5,7 +5,7 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.8.0] — 2026-09-22
 
 ### Added
 
@@ -44,6 +44,15 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   shared engine is still safe by construction. The id is an identity claim rather than a credential
   — where a secret is configured it is honoured only on a connection that presented the matching
   token — and one identity carries one live connection, a second claim closing the first.
+
+  **Breaking (Rust API).** `Command::Authenticate` is an existing struct variant and gained a field,
+  which `#[non_exhaustive]` at the enum level does not make additive (see VERSIONING.md), so code
+  constructing it by struct literal must now name `controller_id` — `None` reproduces the old
+  behaviour exactly. The JSON wire is **not** affected: the field is `#[serde(default,
+  skip_serializing_if)]`, so an older client's frame is accepted unchanged and a newer client's
+  frame is byte-identical to the old one when it presents no id. This is why the release is 0.8.0
+  rather than a patch: a caret-compatible 0.7.3 would have reached embedders through
+  `cargo update`.
 - **Two SDES-SRTP parties are now bridged as a transcrypt.** Two SRTP-only desk phones calling each
   other is the ordinary internal call, and the engine refused it: bridging them means holding a key
   pair per party and re-encrypting every datagram from one party's key to the other's, and only
