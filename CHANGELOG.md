@@ -49,6 +49,20 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   logs an error, rather than running that side unkeyed. Lawful interception taps the plaintext
   between the two transforms, which on a transcrypt is the only plaintext the call has anywhere.
 
+- **A secure pair that needs the decoded audio is now transcoded rather than refused.** The
+  transcrypt above never decodes the payload, so a recording, a prompt, noise suppression, echo
+  cancellation, beep detection or a callee answering a different codec still had nothing to attach
+  to — and a recorded internal call between two desk phones is an ordinary thing to ask a PBX for.
+  Such a call now resolves to a media pipeline holding **both** parties' SRTP legs instead of the
+  bridge: each direction decrypts under the party it faces and encrypts under the party it forwards
+  to, and the plaintext between them is what the recorder, the prompt mixer and the DSP see. Neither
+  party's key reaches the other, exactly as on the bridge. The controller asks for nothing new — the
+  same offer and answer resolve to whichever form the call needs. Both parties' SRTP rollovers are
+  carried across a renegotiation; seeding only one would restart the other party's ROC on every
+  re-INVITE and its peer could not verify it (RFC 3711 §3.3.1). Lawful interception taps this shape
+  in the pipeline, where its plaintext actually is, not on a bridge the call does not have.
+  `checkpoint` is refused for it for the same reason as the bridge form: two secure legs, one record.
+
 ### Changed
 
 - **A secure-offerer posture the engine can never key is now refused on the `offer`, not the

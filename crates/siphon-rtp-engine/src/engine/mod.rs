@@ -822,6 +822,16 @@ enum PipelineKind {
     /// leg's, so the [`MediaCall`] actor decrypts the secure ingress, transcodes, and encrypts the
     /// secure egress — one shared SRTP leg threaded into both directions (BGCF/SBC PSTN breakout).
     SrtpMedia,
+    /// **Both** parties on SDES-SRTP *and* the call needs the decoded audio: the transcode twin of
+    /// [`PipelineKind::SrtpTranscrypt`]. The crypto bridge relays the payload without ever decoding
+    /// it, so a recording, a prompt, noise suppression, echo cancellation, beep detection or a codec
+    /// mismatch has nothing to attach to — and two SRTP desk phones calling each other is exactly
+    /// the call an operator wants to record. The [`MediaCall`] actor therefore holds **two**
+    /// [`SecureLeg`](siphon_rtp_srtp::leg::SecureLeg)s, one per party, and each direction decrypts
+    /// under the sending party's and encrypts under the receiving party's. Neither party's key is
+    /// ever presented to the other, exactly as on the bridge; what differs is that the plaintext
+    /// reaches the pipeline instead of living only in a stack buffer.
+    SrtpTranscryptMedia,
     /// WebSocket bridge: leg A's audio is attached to an external WS media server (mod_audio_stream /
     /// voice-AI). The A↔B relay/transcode path is not wired — the WS server is A's far side.
     Ws,

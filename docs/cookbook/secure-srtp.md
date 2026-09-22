@@ -113,12 +113,21 @@ the receiver's.
 
 This is a crypto bridge, not a transcode. The payload is never decoded, so any
 codec crosses — including ones the engine has no decoder for — and the cost is
-one decrypt plus one encrypt, around half a microsecond per packet. What it
-cannot do is give you the audio: recording, prompts, noise suppression, echo
-cancellation and beep detection all need the decoded samples, and asking for any
-of them on a secure pair is refused (`secure-offerer-unsupported`, naming the
-decode). `checkpoint` is refused too — the HA snapshot record holds one secure
-leg and this call has two — though the call itself is unaffected.
+one decrypt plus one encrypt, around half a microsecond per packet.
+
+Ask for anything that needs the *samples* — `record_call`, a prompt,
+`noise_suppression`, `echo_cancellation`, `beep_detection`, or simply a callee
+answering a different codec — and the call resolves to the transcode form
+instead, with no change to the request. The engine then holds the same two keys
+in the media pipeline rather than in the bridge: each direction decrypts under
+the party it faces and re-encrypts under the party it forwards to, and the
+plaintext in between is what the recorder, the prompt mixer and the DSP attach
+to. Neither party's key reaches the other either way. It costs what any
+transcoding leg costs — a decode and an encode per frame on top of the two
+crypto operations — so it is taken only when something actually needs it.
+
+`checkpoint` is refused for a secure pair in both forms: the HA snapshot record
+holds one secure leg and this call has two. The call itself is unaffected.
 
 Until this landed, the pair was refused outright, and the refusal arrived on the
 **answer**: both phones rang, the callee picked up, and the call collapsed a

@@ -124,6 +124,10 @@ pub enum PipelineSnapshot {
     /// honest rather than filing a transcrypt under [`PipelineSnapshot::Srtp`], which would restore
     /// it as a half-keyed far-secure bridge.
     SrtpTranscrypt,
+    /// A secure↔secure **transcoding** call. Like [`PipelineSnapshot::SrtpTranscrypt`] it has two
+    /// legs where the secure record carries one, so `checkpoint` refuses it and this never reaches a
+    /// blob; it exists so the mapping cannot quietly file a two-legged call as a one-legged one.
+    SrtpTranscryptMedia,
 }
 
 /// ICE-lite credentials (engine side).

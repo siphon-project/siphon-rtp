@@ -1390,16 +1390,15 @@ fn resolve_pipeline(
     // requires `far_local_crypto.is_none()` and `Srtp` would otherwise claim this call and encrypt
     // A's still-encrypted datagrams a second time under B's key.
     //
-    // Like the two one-sided bridges it relays the payload verbatim, so it is available exactly when
-    // nothing needs the decoded audio. Anything that does falls through to a media pipeline with no
-    // A-facing `SecureLeg` threaded into it, which the caller then refuses.
-    if near_local_crypto.is_some()
-        && far_local_crypto.is_some()
-        && !far_dtls
-        && !near_dtls
-        && !needs_decoded_audio
-    {
-        return PipelineKind::SrtpTranscrypt;
+    // Like the two one-sided bridges it relays the payload verbatim, so the bridge shape is taken
+    // exactly when nothing needs the decoded audio; anything that does takes the transcode twin
+    // below, which threads both parties' legs into the media actor instead.
+    if near_local_crypto.is_some() && far_local_crypto.is_some() && !far_dtls && !near_dtls {
+        return if needs_decoded_audio {
+            PipelineKind::SrtpTranscryptMedia
+        } else {
+            PipelineKind::SrtpTranscrypt
+        };
     }
     // A secure **offerer** toward a plain callee: the mirror of the secure-far-leg bridge below. Only
     // the crypto-bridge shape is wired, so this yields `SrtpOfferer` exactly when nothing needs the

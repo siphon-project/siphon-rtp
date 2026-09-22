@@ -157,6 +157,62 @@ fn bench_secure_pipeline(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// The per-packet cost of a **secure↔secure** transcoding call — both parties on SDES-SRTP with the
+/// pipeline decoding between them, which is what a recorded internal call between two SRTP desk
+/// phones runs. Against the `secure` arm above (one leg, plaintext caller) the delta is the second
+/// party's crypto: one extra `unprotect` on ingress and one extra `protect` on egress per packet.
+///
+/// Benched on its own rather than as another arm of the group above, because its ingress is
+/// ciphertext: the packets are pre-sealed under A's key into a replay-safe ring, and the leg is
+/// rebuilt when the ring wraps so the SRTP replay window never rejects a repeat. Sealing inside the
+/// loop would measure a `protect` the real ingress path never performs.
+fn bench_secure_transcrypt_pipeline(criterion: &mut Criterion) {
+    const RING: usize = 256;
+    criterion.bench_function("media_pipeline_process_8k_20ms/both_secure", |bencher| {
+        let a_key = SrtpKeyMaterial::from_inline_bytes(&[0xA7u8; 30]).expect("30 bytes");
+        let b_key = SrtpKeyMaterial::from_inline_bytes(&[0xB7u8; 30]).expect("30 bytes");
+        // A's own sender context, standing in for the caller's phone.
+        let mut peer = siphon_rtp_srtp::SrtpContext::from_key_material(&a_key);
+        let ring: Vec<Vec<u8>> = (0..RING)
+            .map(|sequence| {
+                let mut sealed = Vec::with_capacity(256);
+                peer.protect(&ulaw_packet(sequence as u16), &mut sealed)
+                    .expect("seed protect");
+                sealed
+            })
+            .collect();
+
+        let build = || {
+            let near = Arc::new(Mutex::new(SecureLeg::new(&a_key, &a_key)));
+            let far = Arc::new(Mutex::new(SecureLeg::new(&b_key, &b_key)));
+            call(Secure::None).with_both_secure_legs(near, far)
+        };
+        let mut media_call = build();
+        let mut index = 0usize;
+        let mut out = Vec::with_capacity(4);
+        let mut events = Vec::with_capacity(4);
+        bencher.iter(|| {
+            if index == 0 {
+                media_call = build(); // fresh replay window so the ring repeats
+            }
+            out.clear();
+            events.clear();
+            let accepted = media_call.process(
+                &RxPacket {
+                    endpoint: EndpointId(1),
+                    source: addr(A_ADDR),
+                    arrival: index as u64 * 20_000,
+                    data: bytes::Bytes::copy_from_slice(&ring[index]),
+                },
+                &mut out,
+                &mut events,
+            );
+            index = if index + 1 == RING { 0 } else { index + 1 };
+            black_box(accepted)
+        });
+    });
+}
+
 /// The per-packet crypto a **WebSocket-takeover** leg pays once its offerer is secure. The takeover
 /// datapath has exactly two crypto sites — the registry's ingress `unprotect` on the way to the
 /// bridge, and the drain task's egress `protect` on the way out — so benching the two calls measures
@@ -222,5 +278,10 @@ fn bench_ws_secure_leg(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_secure_pipeline, bench_ws_secure_leg);
+criterion_group!(
+    benches,
+    bench_secure_pipeline,
+    bench_secure_transcrypt_pipeline,
+    bench_ws_secure_leg
+);
 criterion_main!(benches);

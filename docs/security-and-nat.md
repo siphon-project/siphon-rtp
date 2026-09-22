@@ -599,10 +599,25 @@ is wrong, and encryption defeats A2 eavesdrop.
 > into passing the media through unanchored to make the symptom go away. The answer's
 > `settle_secure_offerer` keeps the cases only the answer can know: the two legs' codecs differing, a
 > decode-forcing flag (`record_call`, `noise_suppression`, `echo_cancellation`, `beep_detection`)
-> first named on the answer profile, and a renegotiation that changes the posture. A secure pair that
-> asks for any of those is still refused — no crypto bridge yields decoded audio, whether one leg is
-> secure or both — and the refusal says so rather than blaming the transcrypt that carries the same
-> pair without them.
+> first named on the answer profile, and a renegotiation that changes the posture.
+>
+> **A secure pair that asks for any of those is transcoded, not refused** (`PipelineKind::
+> SrtpTranscryptMedia`). No crypto *bridge* yields decoded audio, but the media pipeline does, and it
+> can hold the same two legs: `MediaCall::with_both_secure_legs` puts A's leg on the A→B ingress and
+> the B→A egress and B's leg on the mirror image, so each direction decrypts under the party it faces
+> and encrypts under the party it forwards to. The security posture is identical to the bridge's —
+> the engine is the cryptographic far side of both parties and neither key is ever presented to the
+> other — and what changes is only where the intermediate plaintext goes: to the pipeline, which is
+> the point, since that is what a recording, a prompt, the DSP and a codec change attach to.
+> Consequently **interception taps this shape in the pipeline, not on the bridge** (a tap installed on
+> a bridge the call does not have would deliver nothing), and **`checkpoint` refuses it** for the same
+> reason it refuses the bridge form: two secure legs, one snapshot record. A renegotiation reads both
+> parties' rollovers (`MediaRegistry::rollover_snapshot` and `::near_rollover_snapshot`) for the same
+> reason the bridge does — seeding one and restarting the other leaves that party's ROC at 0 on every
+> re-INVITE, which its peer cannot verify (RFC 3711 §3.3.1).
+>
+> What is still refused at the answer is a **DTLS** offerer whose call needs the decoded audio:
+> `DtlsOfferer` has no transcode twin, and the refusal says that rather than blaming the transcrypt.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The
