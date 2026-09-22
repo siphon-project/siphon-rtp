@@ -19,13 +19,23 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   contexts, neither party's key ever shown to the other). It stays a *crypto* bridge: the payload is
   never decoded, so any codec crosses, including ones the engine has no decoder for, and the cost is
   one decrypt plus one encrypt — 507 ns per packet against 261/266 ns for a one-sided leg, i.e.
-  exactly the sum. What it cannot do is yield the decoded audio, so recording, prompts, noise
-  suppression, echo cancellation, beep detection and a codec mismatch on a secure pair are still
-  refused, now saying that rather than blaming the transcrypt that carries the same pair without
-  them. `checkpoint` is refused for such a call, because the HA record carries one secure leg and
-  this call has two; the call itself keeps running. Bridging SDES to **DTLS** remains unsupported —
-  two keying mechanisms rather than two keys — and is refused on the `offer`, before either party is
-  rung.
+  exactly the sum. `checkpoint` is refused for such a call, because the HA record carries one secure
+  leg and this call has two; the call itself keeps running. Bridging SDES to **DTLS** remains
+  unsupported — two keying mechanisms rather than two keys — and is refused on the `offer`, before
+  either party is rung.
+
+- **A secure pair that needs the audio decoded is carried too.** The crypto bridge above relays the
+  payload without decoding it, which is what makes it cheap and codec-agnostic, and also what makes
+  it useless for recording an internal call, playing a prompt into one, suppressing noise,
+  cancelling echo, detecting a record tone, or bridging two phones that answered different codecs.
+  Those now route the same secure pair through the media actor with *both* parties' legs threaded
+  in: A's key decrypts A's ingress, the transcoder works on plaintext PCM, B's key encrypts what B
+  receives, and companion SRTCP is re-encrypted the same way. Nothing in the control API changes —
+  name the flag or let the codecs differ and the engine picks the shape. It costs ~887 ns per packet
+  against ~589 ns for a far-secure transcode, the difference being the added ingress decrypt, so
+  prefer the bridge when the samples are not needed. What remains refused is the *asymmetric* case:
+  a secure caller toward a **plaintext** callee that needs the decode, where one secure leg would
+  have to be threaded in alongside a plaintext far side.
 
   Internally, a bridge flow now names *which party's* leg sits on each side of its transform instead
   of deriving it from a one-sided crypto op, because on a transcrypt the direction no longer implies

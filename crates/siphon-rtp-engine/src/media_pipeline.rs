@@ -2590,6 +2590,32 @@ impl MediaCall {
         self
     }
 
+    /// Install the call's SDES-SRTP leg for the **near** (A, offerer) party: A's ingress is decrypted
+    /// on the way into the transcoder and A's egress encrypted on the way out, against A's own
+    /// [`SecureLeg`].
+    ///
+    /// The mirror of [`MediaCall::with_far_secure_leg`]; a `Direction` keys its two sides
+    /// independently, so composing both gives a **transcrypt that also decodes** — what a secure↔secure
+    /// call becomes when the codecs differ or something needs the audio in the clear.
+    ///
+    /// Not [`MediaCall::attach_near_secure_leg`], which is the **single-leg** (`answer_local`) shape
+    /// and puts one leg on all four sides; here the parties differ, and that method would encrypt B's
+    /// stream under A's key.
+    #[must_use]
+    pub fn with_near_secure_leg(mut self, leg: Arc<Mutex<SecureLeg>>) -> Self {
+        self.a_to_b.secure_ingress = Some(leg.clone());
+        self.b_to_a.secure_egress = Some(leg);
+        self
+    }
+
+    /// The call's **near** (A) party SDES-SRTP leg, when A is secure — the counterpart of
+    /// [`MediaCall::far_secure_leg`]. The `a_to_b` ingress and `b_to_a` egress share the one `Arc`
+    /// (set together by [`MediaCall::with_near_secure_leg`]), so the A→B ingress handle is enough.
+    #[must_use]
+    pub fn near_secure_leg(&self) -> Option<Arc<Mutex<SecureLeg>>> {
+        self.a_to_b.secure_ingress.clone()
+    }
+
     /// Mark this call's far (B) leg as **DTLS-keyed-later**: the topology is the same as
     /// [`MediaCall::with_far_secure_leg`], but the [`SecureLeg`] does not exist yet because the DTLS
     /// handshake (RFC 5764) has not completed. Until [`MediaCall::attach_secure_leg`] delivers it,
@@ -3725,10 +3751,14 @@ struct CallHandle {
     /// `true` for a promoted passthrough relay (no transcode) — distinguishes it from a transcoding
     /// call so the engine's silence/play/DTMF guards stay correct.
     relay_only: bool,
-    /// The call's shared SDES-SRTP leg for a secure-transcode (`SrtpMedia`) call — retained so an HA
-    /// checkpoint can read its live SRTP rollover (RFC 3711 §3.3.1), which the running actor otherwise
-    /// owns exclusively. `None` for a plaintext transcode / relay call.
+    /// The call's far (B) party SDES-SRTP leg for a secure-transcode (`SrtpMedia`) call — retained so
+    /// an HA checkpoint can read its live SRTP rollover (RFC 3711 §3.3.1), which the running actor
+    /// otherwise owns exclusively. `None` for a plaintext transcode / relay call.
     secure_leg: Option<Arc<Mutex<SecureLeg>>>,
+    /// The call's **near** (A) party leg, set only on a secure↔secure transcode
+    /// (`SrtpMediaTranscrypt`). Kept beside the far one for the same reason — a renegotiation rebuilds
+    /// both actors' legs and must seed each from its own party's rollover, never from the other's.
+    near_secure_leg: Option<Arc<Mutex<SecureLeg>>>,
 }
 
 impl MediaRegistry {
@@ -3770,6 +3800,7 @@ impl MediaRegistry {
         // so an HA checkpoint can reach its SRTP rollover (RFC 3711 §3.3.1). The `Arc` is the same
         // instance the actor holds — reads are a brief, uncontended lock.
         let secure_leg = call.far_secure_leg();
+        let near_secure_leg = call.near_secure_leg();
         // Re-registering a call id **replaces** its actor, so retire the displaced one first: a
         // `DashMap::insert` would only drop its `CallHandle`, and dropping a `JoinHandle` *detaches*
         // the task rather than aborting it — the old actor would keep running forever, unreachable but
@@ -3795,6 +3826,7 @@ impl MediaRegistry {
                 task,
                 relay_only,
                 secure_leg,
+                near_secure_leg,
             },
         );
     }
@@ -3828,6 +3860,27 @@ impl MediaRegistry {
         let leg = handle.secure_leg.as_ref()?;
         let guard = leg.lock().ok()?;
         Some(guard.rollover_snapshot())
+    }
+
+    /// Both parties' live SRTP rollovers as `(near, far)` — what a renegotiation seeds the rebuilt
+    /// legs with on a secure↔secure transcode, so neither restarts its counter at 0 while its peer's
+    /// keeps counting, and neither is seeded from the *other* party's (RFC 3711 §3.3.1). Either
+    /// element is `None` for a party that is not secure, or for an unknown call. Kept separate from
+    /// [`MediaRegistry::rollover_snapshot`], which answers the HA checkpoint's narrower question.
+    #[must_use]
+    pub fn rollover_snapshots(
+        &self,
+        call_id: &str,
+    ) -> (Option<SecureLegRollover>, Option<SecureLegRollover>) {
+        let Some(handle) = self.calls.get(call_id) else {
+            return (None, None);
+        };
+        let snapshot =
+            |leg: Option<&Arc<Mutex<SecureLeg>>>| Some(leg?.lock().ok()?.rollover_snapshot());
+        (
+            snapshot(handle.near_secure_leg.as_ref()),
+            snapshot(handle.secure_leg.as_ref()),
+        )
     }
 
     /// Whether `call_id` is a **transcoding** media call (decode/re-encode), i.e. registered and not
@@ -6642,6 +6695,36 @@ mod tests {
         assert!(
             Arc::ptr_eq(&exposed, &leg),
             "the exact shared leg instance is returned"
+        );
+        assert!(
+            secure.near_secure_leg().is_none(),
+            "a far-secure call has no near leg, so a renegotiation seeds only the far one"
+        );
+
+        // A secure↔secure transcode exposes **both**, and they must stay distinguishable: a
+        // renegotiation rebuilds each leg and seeds it from its own party's rollover, so handing back
+        // one leg for both — or the same leg twice — would cross-seed the two parties' SRTP counters.
+        let near_local = SrtpKeyMaterial::from_inline_bytes(&[5u8; 30]).expect("near local");
+        let near_remote = SrtpKeyMaterial::from_inline_bytes(&[6u8; 30]).expect("near remote");
+        let near_leg = Arc::new(Mutex::new(SecureLeg::new(&near_local, &near_remote)));
+        let transcrypt = MediaCall::new(
+            "transcrypt",
+            "tag-a",
+            Some("tag-b".into()),
+            g711(1, A_ADDR, 2, B_ADDR),
+            g711(2, B_ADDR, 1, A_ADDR),
+            true,
+            None,
+        )
+        .with_far_secure_leg(leg.clone())
+        .with_near_secure_leg(near_leg.clone());
+        let exposed_far = transcrypt.far_secure_leg().expect("far leg exposed");
+        let exposed_near = transcrypt.near_secure_leg().expect("near leg exposed");
+        assert!(Arc::ptr_eq(&exposed_far, &leg), "far leg is B's");
+        assert!(Arc::ptr_eq(&exposed_near, &near_leg), "near leg is A's");
+        assert!(
+            !Arc::ptr_eq(&exposed_far, &exposed_near),
+            "the two parties' legs are distinct instances, never one leg reported twice"
         );
     }
 

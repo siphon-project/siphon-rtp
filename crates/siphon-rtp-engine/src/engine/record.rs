@@ -117,7 +117,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Every crypto bridge carries ciphertext on the wire (the SDES and DTLS bridges, facing either
         // party), as does a secure transcode, and a WS-bridged call carries no two-party media at all.
         if pipeline.is_crypto_bridge()
-            || matches!(pipeline, PipelineKind::SrtpMedia | PipelineKind::Ws)
+            || matches!(
+                pipeline,
+                PipelineKind::SrtpMedia | PipelineKind::SrtpMediaTranscrypt | PipelineKind::Ws
+            )
         {
             return error_result(
                 "start_recording",

@@ -122,7 +122,11 @@ pub(super) fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSn
         // Deliberately *not* folded into `Srtp`: a transcrypt has two legs and the secure snapshot
         // holds one. `checkpoint` refuses it outright, so this never reaches a blob — it is here so
         // the mapping cannot quietly mis-file a two-legged call as a one-legged one.
-        PipelineKind::SrtpTranscrypt => PipelineSnapshot::SrtpTranscrypt,
+        // Both transcrypt shapes carry two secure legs, which the one-legged secure snapshot cannot
+        // represent; `checkpoint` refuses them, so neither reaches a blob.
+        PipelineKind::SrtpTranscrypt | PipelineKind::SrtpMediaTranscrypt => {
+            PipelineSnapshot::SrtpTranscrypt
+        }
         PipelineKind::Media => PipelineSnapshot::Media,
         PipelineKind::SrtpMedia => PipelineSnapshot::SrtpMedia,
         PipelineKind::Ws => PipelineSnapshot::Ws,
@@ -239,7 +243,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // (the peer's SDES key, plus the endpoint roles the bridge query maps its flow ids through).
         let Some((snapshot, secure_ctx, transcrypt)) = self.owned_call(client, call_id, |call| {
             let snapshot = call.to_snapshot();
-            let transcrypt = call.pipeline == PipelineKind::SrtpTranscrypt;
+            let transcrypt = matches!(
+                call.pipeline,
+                PipelineKind::SrtpTranscrypt | PipelineKind::SrtpMediaTranscrypt
+            );
             let secure_ctx = call
                 .far_remote_crypto
                 .as_ref()

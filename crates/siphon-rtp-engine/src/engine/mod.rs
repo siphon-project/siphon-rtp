@@ -733,6 +733,15 @@ enum PipelineKind {
     /// for — and neither party's key is ever presented to the other. Two SRTP-only desk phones
     /// calling each other resolve here, which used to be refused outright.
     SrtpTranscrypt,
+    /// Secure↔secure **and** media-processing: the transcoding counterpart of
+    /// [`PipelineKind::SrtpTranscrypt`], and the secure-offerer counterpart of
+    /// [`PipelineKind::SrtpMedia`]. Both parties negotiated SDES under different keys *and* the call
+    /// needs the audio decoded — the two legs' codecs differ, or it is being recorded, prompted into,
+    /// noise-suppressed, echo-cancelled or watched for a record tone. Each party's
+    /// [`SecureLeg`](siphon_rtp_srtp::leg::SecureLeg) is threaded onto its own side of both
+    /// directions, so the actor decrypts with the sender's key, works on plaintext PCM, and
+    /// re-encrypts with the receiver's.
+    SrtpMediaTranscrypt,
     /// Userspace media slow path: transcode / record / DTMF-extraction via a [`MediaCall`] actor.
     Media,
     /// Secure **and** transcoding: the far (`RTP/SAVP`) leg's codec differs from the near (plaintext)
@@ -762,6 +771,20 @@ impl PipelineKind {
     /// Whether the call's media runs through a crypto bridge, which relays SRTP without decoding it.
     /// Nothing that needs the decoded audio (a recording, a tee, a SIPREC fork, a DTMF block) has
     /// anything to attach to on such a call.
+    /// Whether the call re-encodes the payload rather than forwarding it as it arrived — every shape
+    /// that runs a [`MediaCall`] transcode actor over the two legs, secure or not.
+    ///
+    /// Drives the SDP each party is shown: on a transcoding call each side is presented only its own
+    /// codec (RFC 3264 §6), because it never receives the other's. One definition, because `answer`,
+    /// a reversed answer and `reoffer` each need it and three copies of the list is how one of them
+    /// comes to miss a newly added kind and quietly present a codec the party will never be sent.
+    fn is_transcoding(self) -> bool {
+        matches!(
+            self,
+            Self::Media | Self::SrtpMedia | Self::SrtpMediaTranscrypt | Self::DtlsMedia
+        )
+    }
+
     fn is_crypto_bridge(self) -> bool {
         matches!(
             self,

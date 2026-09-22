@@ -241,7 +241,9 @@ pub(super) fn settle_secure_offerer(
 ) -> Result<Option<NearDtlsAnswer>, Box<siphon_rtp_proto::CmdResult>> {
     let near_sdes_carried = matches!(
         pipeline,
-        super::PipelineKind::SrtpOfferer | super::PipelineKind::SrtpTranscrypt
+        super::PipelineKind::SrtpOfferer
+            | super::PipelineKind::SrtpTranscrypt
+            | super::PipelineKind::SrtpMediaTranscrypt
     );
     if (near_sdes && !near_sdes_carried)
         || (near_dtls.is_some() && pipeline != super::PipelineKind::DtlsOfferer)
@@ -716,17 +718,25 @@ pub(super) fn build_transcode_pair(
     Ok((a_to_b, b_to_a))
 }
 
-/// How the companion RTCP relays of a transcoding call with a secure far (B) party are keyed.
+/// How the companion RTCP relays of a transcoding call with at least one secure party are keyed.
 pub(super) enum RtcpKeying {
-    /// With the SDES leg the call already holds.
+    /// With the SDES leg the call already holds for the far (B) party; A is plaintext.
     Leg(Arc<Mutex<SecureLeg>>),
+    /// With **both** parties' SDES legs — a secure↔secure transcode. Each relay decrypts under the
+    /// sending party's key and re-encrypts under the receiving party's, exactly as the RTP directions
+    /// do, so SRTCP crosses a transcrypt as well (RFC 3711 §3.4).
+    Transcrypt {
+        near: Arc<Mutex<SecureLeg>>,
+        far: Arc<Mutex<SecureLeg>>,
+    },
     /// Pending until the DTLS handshake delivers a leg; the relays drop until then (RFC 5764).
     Pending,
 }
 
-/// The two companion (non-muxed) RTCP relays of a transcoding call whose far (B) party is secure:
-/// A's RTCP encrypted toward B, B's SRTCP decrypted toward A (RFC 3711; RFC 5761 keeps RTCP on its
-/// own port). The caller redirects both endpoints to the actor.
+/// The two companion (non-muxed) RTCP relays of a transcoding call with a secure party: A's RTCP
+/// encrypted toward B, B's SRTCP decrypted toward A (RFC 3711; RFC 5761 keeps RTCP on its own port),
+/// or both re-encrypted when each party has its own key. The caller redirects both endpoints to the
+/// actor.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn secure_rtcp_relays(
     near_rtcp: EndpointId,
@@ -743,6 +753,14 @@ pub(super) fn secure_rtcp_relays(
         RtcpKeying::Leg(leg) => vec![
             toward_far.with_secure_egress(leg.clone()),
             toward_near.with_secure_ingress(leg.clone()),
+        ],
+        RtcpKeying::Transcrypt { near, far } => vec![
+            toward_far
+                .with_secure_ingress(near.clone())
+                .with_secure_egress(far.clone()),
+            toward_near
+                .with_secure_ingress(far.clone())
+                .with_secure_egress(near.clone()),
         ],
         RtcpKeying::Pending => vec![
             toward_far.with_pending_secure(SecureSide::Egress),

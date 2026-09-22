@@ -206,10 +206,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // only its own codec, so B's is the one B already had. Leading B's list with it lets
                 // the codec machinery below read it as B's primary, so the pipeline decision does not
                 // move on a renegotiation that changes no codec.
-                let transcoding = matches!(
-                    call.pipeline,
-                    PipelineKind::Media | PipelineKind::SrtpMedia | PipelineKind::DtlsMedia
-                );
+                let transcoding = call.pipeline.is_transcoding();
                 let far_codec = match answered.primary_codec() {
                     Some(selected)
                         if !transcoding
@@ -1014,11 +1011,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // A WS-bridged call has no B leg to relay to (the WS server is A's far side); it never
         // transcodes A↔B, so its answer is never codec-rewritten.
         let becoming_ws = offer_pipeline == PipelineKind::Ws || profile.ws_uri.is_some();
-        let transcoding = !becoming_ws
-            && matches!(
-                pipeline,
-                PipelineKind::Media | PipelineKind::SrtpMedia | PipelineKind::DtlsMedia
-            );
+        let transcoding = !becoming_ws && pipeline.is_transcoding();
 
         // A call that becomes a takeover here keeps the takeover meaning of `ice: remove`: no ICE agent
         // runs for a takeover leg on offer/answer (see `offer_takeover_refusal`), so a `ws_uri` named
@@ -1390,16 +1383,16 @@ fn resolve_pipeline(
     // requires `far_local_crypto.is_none()` and `Srtp` would otherwise claim this call and encrypt
     // A's still-encrypted datagrams a second time under B's key.
     //
-    // Like the two one-sided bridges it relays the payload verbatim, so it is available exactly when
-    // nothing needs the decoded audio. Anything that does falls through to a media pipeline with no
-    // A-facing `SecureLeg` threaded into it, which the caller then refuses.
-    if near_local_crypto.is_some()
-        && far_local_crypto.is_some()
-        && !far_dtls
-        && !near_dtls
-        && !needs_decoded_audio
-    {
-        return PipelineKind::SrtpTranscrypt;
+    // Like the two one-sided bridges it relays the payload verbatim, so it is the shape whenever
+    // nothing needs the decoded audio. When something does — the two legs' codecs differ, or the
+    // call is recorded, prompted into, noise-suppressed, echo-cancelled or watched for a record tone
+    // — the same pair goes through the media actor instead, with *both* parties' legs threaded in.
+    if near_local_crypto.is_some() && far_local_crypto.is_some() && !far_dtls && !near_dtls {
+        return if needs_decoded_audio {
+            PipelineKind::SrtpMediaTranscrypt
+        } else {
+            PipelineKind::SrtpTranscrypt
+        };
     }
     // A secure **offerer** toward a plain callee: the mirror of the secure-far-leg bridge below. Only
     // the crypto-bridge shape is wired, so this yields `SrtpOfferer` exactly when nothing needs the

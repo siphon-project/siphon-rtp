@@ -16,7 +16,7 @@ use super::negotiate::{
     peer_ice_credentials, present_leg, same_codec, CodecPresentation, IceDirective,
     LegPresentation,
 };
-use super::{error_result, ok_sdp, unknown_call, Call, ClientId, Engine, Leg, Party, PipelineKind};
+use super::{error_result, ok_sdp, unknown_call, Call, ClientId, Engine, Leg, Party};
 
 /// What a re-offer needs from its call, copied out from under the registry guard: which party is
 /// re-offering, both legs, and everything either leg has already been presented with — a re-offer
@@ -83,10 +83,7 @@ impl ReofferState {
             text_relayed: call.far.is_some_and(|far| far.text_remote_rtp.is_some()),
             near_codec: call.near_codec.clone(),
             near_telephone_event: call.near_telephone_event,
-            transcoding: matches!(
-                call.pipeline,
-                PipelineKind::Media | PipelineKind::SrtpMedia | PipelineKind::DtlsMedia
-            ),
+            transcoding: call.pipeline.is_transcoding(),
         }
     }
 }

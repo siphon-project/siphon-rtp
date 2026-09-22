@@ -566,8 +566,8 @@ is wrong, and encryption defeats A2 eavesdrop.
 > which is the same property the one-sided bridge has and the reason passing the offerer's `a=crypto`
 > through was a defect rather than a shortcut.
 >
-> It is a *crypto* bridge, not a transcode: the payload is never decoded, so any codec crosses,
-> including ones the engine has no decoder for, and the cost is one decrypt plus one encrypt
+> By default it is a *crypto* bridge, not a transcode: the payload is never decoded, so any codec
+> crosses, including ones the engine has no decoder for, and the cost is one decrypt plus one encrypt
 > (~507 ns per packet on the reference box, against ~261/~266 ns for a one-sided leg — exactly the
 > sum, the intermediate never being copied anywhere else). Each flow names *which party's* leg sits
 > on each side (`BridgeFlowPlan::ingress_leg` / `egress_leg`) rather than deriving it from a crypto
@@ -575,6 +575,18 @@ is wrong, and encryption defeats A2 eavesdrop.
 > plan does not carry installs **nothing** for the whole call and logs an `error!`: an unkeyed side
 > would either relay one party's ciphertext onward verbatim or put the other's plaintext on a wire
 > that negotiated encryption, and a partially installed bridge is worse than an absent one.
+>
+> **When the call needs the audio decoded, the same pair takes the media path instead**
+> (`PipelineKind::SrtpMediaTranscrypt`) — the two legs' codecs differ, or it is recorded, prompted
+> into, noise-suppressed, echo-cancelled or watched for a record tone. `Direction` already keys its
+> ingress and egress independently, so this is composition rather than new crypto: `with_near_secure_leg`
+> puts A's leg on the A-facing sides (`a_to_b` ingress, `b_to_a` egress) and the existing
+> `with_far_secure_leg` puts B's on the B-facing ones, and the transcoder in between sees plaintext
+> PCM. Companion (non-muxed) SRTCP is keyed the same way on both sides (`RtcpKeying::Transcrypt`).
+> ~887 ns per packet against ~589 ns for the far-secure transcode, the difference being the added
+> ingress decrypt. Note this is **not** `attach_near_secure_leg`, which is the single-leg
+> (`answer_local`) shape and puts one leg on all four sides — using it here would encrypt B's stream
+> under A's key.
 >
 > Two consequences worth stating. **Interception** (Layer 5g / `engine/src/engine/intercept.rs`) taps
 > the plaintext *between* the two transforms, which on a transcrypt is the only plaintext the call
@@ -599,10 +611,10 @@ is wrong, and encryption defeats A2 eavesdrop.
 > into passing the media through unanchored to make the symptom go away. The answer's
 > `settle_secure_offerer` keeps the cases only the answer can know: the two legs' codecs differing, a
 > decode-forcing flag (`record_call`, `noise_suppression`, `echo_cancellation`, `beep_detection`)
-> first named on the answer profile, and a renegotiation that changes the posture. A secure pair that
-> asks for any of those is still refused — no crypto bridge yields decoded audio, whether one leg is
-> secure or both — and the refusal says so rather than blaming the transcrypt that carries the same
-> pair without them.
+> first named on the answer profile, and a renegotiation that changes the posture. Those now refuse
+> only when the *other* party is plaintext, where threading one secure leg into the transcoder
+> alongside a plaintext far side is still unwired; a secure **pair** asking for the same thing is
+> carried by `SrtpMediaTranscrypt` above.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The

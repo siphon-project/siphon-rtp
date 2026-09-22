@@ -14,6 +14,9 @@
 //!   dropped. This exists to keep the security gate honest about its cost: it has to be a branch on
 //!   the way in, not work that gets thrown away, so an unkeyed leg must be cheaper than a keyed one
 //!   rather than more expensive (a peer that floods before the handshake must not cost more than one).
+//! - `transcrypt` — both parties secure under different keys (`SrtpMediaTranscrypt`): the `secure`
+//!   row plus an ingress decrypt under the *other* party's key. The delta against `secure` is what a
+//!   secure↔secure call pays over a secure↔plaintext one for the same transcode.
 //!
 //! `cargo bench -p siphon-rtp --bench secure_pipeline_bench`.
 
@@ -32,6 +35,7 @@ use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::media_pipeline::{DirectionConfig, MediaCall};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
+use siphon_rtp_srtp::SrtpContext;
 
 const A_ADDR: &str = "127.0.0.2:5000";
 const B_ADDR: &str = "127.0.0.3:6000";
@@ -98,15 +102,31 @@ fn call(secure: Secure) -> MediaCall {
             let key = SrtpKeyMaterial::from_inline_bytes(&[7u8; 30]).expect("30 bytes");
             call.with_far_secure_leg(Arc::new(Mutex::new(SecureLeg::new(&key, &key))))
         }
+        // Both parties secure under different keys: A's leg decrypts the ingress, the transcoder
+        // works on plaintext PCM, B's leg encrypts the egress.
+        Secure::Transcrypt => {
+            let far = SrtpKeyMaterial::from_inline_bytes(&[7u8; 30]).expect("30 bytes");
+            call.with_far_secure_leg(Arc::new(Mutex::new(SecureLeg::new(&far, &far))))
+                .with_near_secure_leg(Arc::new(Mutex::new(SecureLeg::new(
+                    &near_key(),
+                    &near_key(),
+                ))))
+        }
         // The DTLS shape before its handshake lands: keyed later, dropping until then.
         Secure::Pending => call.with_far_secure_pending(),
     }
+}
+
+/// A's key on the transcrypt row — distinct from B's, which is the whole point of the shape.
+fn near_key() -> SrtpKeyMaterial {
+    SrtpKeyMaterial::from_inline_bytes(&[9u8; 30]).expect("30 bytes")
 }
 
 #[derive(Clone, Copy)]
 enum Secure {
     None,
     Keyed,
+    Transcrypt,
     Pending,
 }
 
@@ -119,6 +139,12 @@ fn ulaw_packet(sequence: u16) -> Vec<u8> {
     packet.extend_from_slice(&[0xFFu8; FRAME_SAMPLES]);
     packet
 }
+
+/// How many pre-sealed packets the transcrypt row cycles through before rebuilding its call. RFC 3711
+/// §3.3.2 anti-replay forbids re-`unprotect`ing one packet, so the ingress cannot be a single buffer
+/// with its sequence bumped, as the plaintext rows use. Big enough that the rebuild — two G.711
+/// codecs and two `SecureLeg`s, a few microseconds — amortises to well under a percent per iteration.
+const SEALED_RING: usize = 4096;
 
 fn bench_secure_pipeline(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("media_pipeline_process_8k_20ms");
@@ -154,6 +180,49 @@ fn bench_secure_pipeline(criterion: &mut Criterion) {
             });
         });
     }
+
+    // The secure↔secure transcode: the `secure` row's transcode-plus-egress-encrypt, with an ingress
+    // decrypt under the *other* party's key in front of it. Its ingress must really be SRTP, so the
+    // stream is pre-sealed outside the timed body and the call rebuilt once per cycle to reset the
+    // replay window — the same idiom `srtp_bench`'s unprotect rows use, for the same reason.
+    group.bench_function("transcrypt", |bencher| {
+        let mut peer = SrtpContext::from_key_material(&near_key());
+        let ring: Vec<bytes::Bytes> = (0..SEALED_RING)
+            .map(|sequence| {
+                let mut sealed = Vec::with_capacity(256);
+                peer.protect(&ulaw_packet(sequence as u16), &mut sealed)
+                    .expect("seed protect");
+                bytes::Bytes::from(sealed)
+            })
+            .collect();
+        let mut call = call(Secure::Transcrypt);
+        let mut index = 0usize;
+        let mut out = Vec::with_capacity(4);
+        let mut events = Vec::with_capacity(4);
+        bencher.iter(|| {
+            if index == 0 {
+                call = self::call(Secure::Transcrypt); // fresh replay window so the ring repeats
+            }
+            out.clear();
+            events.clear();
+            let accepted = call.process(
+                &RxPacket {
+                    endpoint: EndpointId(1),
+                    source: addr(A_ADDR),
+                    arrival: index as u64 * 20_000,
+                    data: ring[index].clone(),
+                },
+                &mut out,
+                &mut events,
+            );
+            index = if index + 1 == SEALED_RING {
+                0
+            } else {
+                index + 1
+            };
+            black_box(accepted)
+        });
+    });
     group.finish();
 }
 

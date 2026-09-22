@@ -73,13 +73,13 @@ behind it is not built. **Which verb refuses matters**, so each says:
   keys. Refused on the **`offer`**: the far leg's keying comes from the offer's
   own `transport_protocol`, so the engine knows this before it hands back an SDP
   and declines there rather than after the callee has rung and answered;
-- **a codec mismatch** on a secure caller — its `SecureLeg` would have to be
-  threaded into the transcoding pipeline. Refused on the **`answer`**, because
-  only the answer names the callee's codec. Likewise a `record_call`,
-  `noise_suppression`, `echo_cancellation` or `beep_detection` flag that first
-  appears on the answer profile: a crypto bridge relays the payload without
-  decoding it, so a secure pair that asks for the decoded audio is refused even
-  though the same pair without it is carried;
+- **a codec mismatch** on a secure caller toward a **plain** callee — the
+  caller's `SecureLeg` would have to be threaded into the transcoding pipeline
+  alongside a plaintext far side, which is not wired. Refused on the **`answer`**,
+  because only the answer names the callee's codec. Likewise a `record_call`,
+  `noise_suppression`, `echo_cancellation` or `beep_detection` flag on such a
+  call. (When the callee is *also* secure, both legs are threaded in and the call
+  is carried — see [Two secure parties](#two-secure-parties-the-transcrypt-bridge).)
 - a **DTLS-SRTP (WebRTC) offerer** on `answer_local` — it needs a full ICE agent
   on the promoted leg. It is answered `secure-offerer-unsupported`, naming DTLS.
   On the two-party relay a DTLS caller toward a plain callee *is* terminated; see
@@ -111,14 +111,39 @@ the caller's key never reaches the callee and the callee's never reaches the
 caller. Every datagram is decrypted under the sender's key and re-encrypted under
 the receiver's.
 
-This is a crypto bridge, not a transcode. The payload is never decoded, so any
-codec crosses — including ones the engine has no decoder for — and the cost is
-one decrypt plus one encrypt, around half a microsecond per packet. What it
-cannot do is give you the audio: recording, prompts, noise suppression, echo
-cancellation and beep detection all need the decoded samples, and asking for any
-of them on a secure pair is refused (`secure-offerer-unsupported`, naming the
-decode). `checkpoint` is refused too — the HA snapshot record holds one secure
-leg and this call has two — though the call itself is unaffected.
+By default this is a crypto bridge, not a transcode: the payload is never
+decoded, so any codec crosses — including ones the engine has no decoder for —
+and the cost is one decrypt plus one encrypt, around half a microsecond per
+packet.
+
+**Ask for the audio and the same pair decodes instead.** If the two phones answer
+different codecs, or the profile names `record_call`, `noise_suppression`,
+`echo_cancellation` or `beep_detection`, the call goes through the media actor
+with *both* legs threaded in: A's key decrypts A's ingress, the transcoder works
+on plaintext PCM, and B's key encrypts what B receives. Nothing in the control
+API changes — add the flag and the engine picks the shape:
+
+```json
+{
+  "id": 71,
+  "command": "answer",
+  "call_id": "3c81ff02@198.51.100.20",
+  "from_tag": "b41d9e",
+  "to_tag": "9a02c7",
+  "sdp": "<the callee's RTP/SAVP answer with its a=crypto>",
+  "profile": { "record_call": true, "record_path": "/var/spool/rec/3c81ff02.wav" }
+}
+```
+
+That costs roughly 890 ns per packet against 510 ns for the bridge, the
+difference being the decode, re-encode and the second crypto pass. Prefer the
+bridge when you do not need the samples.
+
+Two limits remain. `checkpoint` is refused for either shape — the HA snapshot
+record holds one secure leg and these calls have two — though the call itself is
+unaffected. And `start_recording` (the raw-pcap verb, as opposed to the
+`record_call` profile flag) still refuses a secure call, because what it would
+capture is ciphertext.
 
 Until this landed, the pair was refused outright, and the refusal arrived on the
 **answer**: both phones rang, the callee picked up, and the call collapsed a
