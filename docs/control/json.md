@@ -180,15 +180,24 @@ per-leg media interface (below).
 
 | Verb | Fields | Result |
 |---|---|---|
-| `checkpoint` | `call_id`, `from_tag` | `{"result": "checkpoint", "snapshot": "..."}`. An opaque blob; store it verbatim, keyed by call. Ownership-gated. |
+| `checkpoint` | `call_id`, `from_tag` | `{"result": "checkpoint", "snapshot": "..."}`. An opaque blob; store it verbatim, keyed by call. Ownership-gated. A call whose media path the snapshot cannot describe is **refused here**, naming what is missing, rather than returning a blob that fails at failover. |
 | `restore` | `snapshot` | Rebuilds the call on this (standby) node at the snapshot's exact ports, so a floating-IP failover needs no re-INVITE. |
 
-`restore` currently rebuilds four call shapes: a plain passthrough relay, an SDES-SRTP
-bridge, a plaintext transcode call, and a secure transcode call (`SrtpMedia`). A
-WebSocket-bridged or DTLS-SRTP call keeps live state that a snapshot cannot recover (a running
-WS actor, or handshake-derived DTLS keys) and is rejected with
-`restore of a ... call is not yet supported`. Restoring a `call_id` that already exists
-on the node is also rejected.
+`restore` rebuilds four call shapes: a plain passthrough relay, an SDES-SRTP bridge, a
+plaintext transcode call, and a secure transcode call (`SrtpMedia`). Everything else is
+refused by `checkpoint` in the first place, because the snapshot record describes exactly
+one topology — a two-party call whose *far* side may be secure — and the rest have state
+it has nowhere to put:
+
+- a **secure caller** (its own keying is not in the record, so a standby would resume the
+  call with the caller demoted to plaintext);
+- a **secure↔secure** call, bridged or transcoding (two secure legs, one record);
+- a **DTLS-SRTP** call (keys come from the handshake, not the SDP);
+- a **WebSocket-bridged** call (no far leg to replicate at all).
+
+`restore` keeps its own checks as defence in depth, so a hand-crafted blob is still
+rejected with `restore of a ... call is not yet supported`. Restoring a `call_id` that
+already exists on the node is also rejected.
 
 ### Media control
 

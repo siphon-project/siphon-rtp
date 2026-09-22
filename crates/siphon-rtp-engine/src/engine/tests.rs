@@ -7053,6 +7053,74 @@ async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secure_offerer_call_refuses_a_checkpoint_instead_of_failing_at_failover() {
+    // The HA record describes one topology: a two-party call whose *far* side may be secure. A
+    // secure **offerer** has keying it has nowhere to put, and it used to be recorded as a plain
+    // `Srtp` bridge — so `checkpoint` returned a blob that looked usable, and the failure surfaced
+    // at `restore`, under a kind the call never was ("restore of a Srtp call is not yet supported").
+    // Refuse at checkpoint, while the operator can still act on it, and name the real obstacle.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "offerer-ha".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "offerer-ha".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for(addr_b, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_eq!(
+        engine.calls.get("offerer-ha").expect("call").pipeline,
+        PipelineKind::SrtpOfferer,
+        "precondition: a secure caller toward a plain callee"
+    );
+    match engine
+        .handle(
+            CLIENT,
+            Command::Checkpoint {
+                call_id: "offerer-ha".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await
+    {
+        CmdResult::Error { reason } => {
+            assert!(
+                reason.contains("secure caller's own keying"),
+                "the refusal names the missing state, got: {reason}"
+            );
+            assert!(
+                !reason.contains("Srtp call"),
+                "and never blames a kind this call is not, got: {reason}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        engine.calls.contains_key("offerer-ha"),
+        "refusing to replicate the call does not end it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_recorded_plaintext_call_writes_its_wav_on_teardown() {
     // The `record_call` profile recording is flushed by the media actor's teardown, and teardown used
     // to be unreachable: `deregister` sent `Stop` and aborted the task on the next line, so the actor
