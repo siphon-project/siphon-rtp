@@ -771,6 +771,38 @@ impl PipelineKind {
     /// Whether the call's media runs through a crypto bridge, which relays SRTP without decoding it.
     /// Nothing that needs the decoded audio (a recording, a tee, a SIPREC fork, a DTMF block) has
     /// anything to attach to on such a call.
+    /// Why this call's media path cannot be replicated to a standby, or `None` when it can.
+    ///
+    /// The HA snapshot record describes exactly one topology: a two-party call whose **far** (B) side
+    /// may be secure. Everything else has state it has nowhere to put — the caller's own keying, a
+    /// second secure leg, keys that came from a handshake rather than from SDP. `restore` has always
+    /// rejected those, but it rejected them *at failover*, having accepted a `checkpoint` that looked
+    /// like it worked; and because a secure **offerer** is recorded as a plain `Srtp` bridge, the
+    /// rejection it eventually produced named a kind the call never was. Refusing here instead means
+    /// the operator learns at checkpoint time, while they can still act on it, and the reason names
+    /// the real obstacle. `restore`'s own checks stay as defence in depth.
+    fn checkpoint_refusal(self) -> Option<&'static str> {
+        match self {
+            Self::Passthrough | Self::Srtp | Self::Media | Self::SrtpMedia => None,
+            Self::SrtpOfferer => Some(
+                "a secure caller's own keying is not carried in the snapshot record, so a standby \
+                 would resume the call with the caller demoted to plaintext",
+            ),
+            Self::SrtpTranscrypt | Self::SrtpMediaTranscrypt => Some(
+                "a secure↔secure (transcrypt) call has two secure legs and the snapshot record \
+                 carries one",
+            ),
+            Self::Dtls | Self::DtlsMedia | Self::DtlsOfferer => Some(
+                "a DTLS-SRTP call's keys come from the handshake rather than the SDP, so an \
+                 established association cannot move to a standby",
+            ),
+            // Deliberately `None`: a WebSocket takeover has no far leg at all, so `to_snapshot`
+            // yields nothing and the single-leg refusal just below `checkpoint`'s call to this
+            // already declines it — with a more specific reason than this function could give.
+            Self::Ws => None,
+        }
+    }
+
     /// Whether the call re-encodes the payload rather than forwarding it as it arrived — every shape
     /// that runs a [`MediaCall`] transcode actor over the two legs, secure or not.
     ///

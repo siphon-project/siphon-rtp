@@ -6762,6 +6762,74 @@ async fn two_secure_parties_on_different_codecs_transcode_between_their_own_keys
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secure_offerer_call_refuses_a_checkpoint_instead_of_failing_at_failover() {
+    // The HA record describes one topology: a two-party call whose *far* side may be secure. A
+    // secure **offerer** has keying it has nowhere to put, and it used to be recorded as a plain
+    // `Srtp` bridge — so `checkpoint` returned a blob that looked usable, and the failure surfaced
+    // at `restore`, under a kind the call never was ("restore of a Srtp call is not yet supported").
+    // Refuse at checkpoint, while the operator can still act on it, and name the real obstacle.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "offerer-ha".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "offerer-ha".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for(addr_b, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_eq!(
+        engine.calls.get("offerer-ha").expect("call").pipeline,
+        PipelineKind::SrtpOfferer,
+        "precondition: a secure caller toward a plain callee"
+    );
+    match engine
+        .handle(
+            CLIENT,
+            Command::Checkpoint {
+                call_id: "offerer-ha".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await
+    {
+        CmdResult::Error { reason } => {
+            assert!(
+                reason.contains("secure caller's own keying"),
+                "the refusal names the missing state, got: {reason}"
+            );
+            assert!(
+                !reason.contains("Srtp call"),
+                "and never blames a kind this call is not, got: {reason}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        engine.calls.contains_key("offerer-ha"),
+        "refusing to replicate the call does not end it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transcrypt_call_refuses_a_checkpoint_rather_than_replicating_half_of_it() {
     // Two secure legs, and the HA record carries one of everything. Rather than checkpoint half the
     // call — which restores as a far-secure bridge with the caller silently demoted to plaintext —

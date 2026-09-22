@@ -241,12 +241,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // component — the SRTP bridge for a plain secure leg (`Srtp`), the media actor for a secure
         // *transcode* leg (`SrtpMedia`) — so the closure also hands back what that later query needs
         // (the peer's SDES key, plus the endpoint roles the bridge query maps its flow ids through).
-        let Some((snapshot, secure_ctx, transcrypt)) = self.owned_call(client, call_id, |call| {
+        let Some((snapshot, secure_ctx, refusal)) = self.owned_call(client, call_id, |call| {
             let snapshot = call.to_snapshot();
-            let transcrypt = matches!(
-                call.pipeline,
-                PipelineKind::SrtpTranscrypt | PipelineKind::SrtpMediaTranscrypt
-            );
+            let refusal = call.pipeline.checkpoint_refusal();
             let secure_ctx = call
                 .far_remote_crypto
                 .as_ref()
@@ -259,19 +256,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     PipelineKind::SrtpMedia => Some(SecureCheckpoint::Media { far_remote_crypto }),
                     _ => None,
                 });
-            (snapshot, secure_ctx, transcrypt)
+            (snapshot, secure_ctx, refusal)
         }) else {
             return unknown_call(call_id);
         };
-        // A transcrypt holds two independent `SecureLeg`s, and the secure snapshot record holds one
-        // of everything: one peer key, one rollover, one crypto op per flow. Rather than checkpoint
-        // half of it — which would restore as a far-secure bridge with the caller silently demoted
-        // to plaintext — say so. The call keeps running; only replication is unavailable.
-        if transcrypt {
+        // A media path the snapshot record cannot describe is refused **here**, not discovered at
+        // failover: `restore` would have rejected the blob anyway, and for a secure offerer it would
+        // have rejected it under the wrong kind (recorded as a plain `Srtp` bridge). The call keeps
+        // running; only replication is unavailable, and the reason says which part is missing.
+        if let Some(reason) = refusal {
             return CmdResult::Error {
-                reason: "checkpoint is unsupported for a secure↔secure (transcrypt) call \
-                         (two secure legs, and the snapshot record carries one)"
-                    .to_string(),
+                reason: format!("checkpoint is unsupported for this call: {reason}"),
             };
         }
         // A single-leg call has no far leg to put in the two-leg snapshot record, and nothing a standby

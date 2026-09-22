@@ -43,6 +43,20 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   logs an error, rather than running that side unkeyed. Lawful interception taps the plaintext
   between the two transforms, which on a transcrypt is the only plaintext the call has anywhere.
 
+### Fixed
+
+- **`checkpoint` now refuses a call it cannot replicate, instead of handing back a blob that fails
+  at failover.** The HA snapshot record describes one topology — a two-party call whose *far* side
+  may be secure — and `restore` has always rejected anything else. It rejected it at the worst
+  possible moment, though: during the failover, having accepted a `checkpoint` that looked like it
+  worked. A **secure caller** was the sharp edge, because it was recorded as a plain `Srtp` bridge,
+  so the eventual rejection named a kind the call never was (`restore of a Srtp call is not yet
+  supported`) and a standby that did accept it would have resumed the call with the caller demoted
+  to plaintext. `checkpoint` now declines a secure-offerer, secure↔secure or DTLS-SRTP call up
+  front and says which part of its state the record cannot hold, while an operator can still act on
+  it. `restore` keeps its own checks as defence in depth. A WebSocket-bridged call was already
+  declined for having no far leg at all, and keeps that more specific reason.
+
 ### Changed
 
 - **A secure-offerer posture the engine can never key is now refused on the `offer`, not the
