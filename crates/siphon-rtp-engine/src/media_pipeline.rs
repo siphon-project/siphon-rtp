@@ -3936,12 +3936,25 @@ impl MediaRegistry {
         tokio::time::timeout(timeout, reply_rx).await.ok()?.ok()
     }
 
-    /// Tear a call's actor down: stop it (flushing recordings), drop its routes, and abort the task.
+    /// Tear a call's actor down: stop it, drop its routes, and let it run its teardown before the
+    /// task is aborted.
+    ///
+    /// The grace period is the whole point. This used to send `Stop` and call `abort()` on the next
+    /// line, which is a race the abort essentially always wins: the actor is parked on its mailbox,
+    /// the abort drops that future, and **everything after the actor's loop never runs**. That
+    /// teardown is where a `record_call` profile recording is written to disk, so `record_call` +
+    /// `record_path` answered `ok`, carried the audio, and produced no file — on every pipeline, not
+    /// just a secure one. (`start_recording` is a different mechanism and was unaffected: the engine
+    /// stops those from its own registry before getting here.)
+    ///
+    /// The wait runs on a detached task so this stays synchronous for its callers, and falls back to
+    /// an immediate abort when there is no runtime to spawn on.
     pub fn deregister(&self, call_id: &str) {
         if let Some((_, handle)) = self.calls.remove(call_id) {
             let _ = handle
                 .mailbox
                 .try_send(MediaInput::Control(MediaControl::Stop));
+            // Dropped first, so the stopping actor receives nothing more while it drains.
             for endpoint in handle
                 .endpoints
                 .iter()
@@ -3950,10 +3963,29 @@ impl MediaRegistry {
             {
                 self.routes.remove(&endpoint);
             }
-            handle.task.abort();
+            let mut task = handle.task;
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(async move {
+                        if tokio::time::timeout(ACTOR_TEARDOWN_GRACE, &mut task)
+                            .await
+                            .is_err()
+                        {
+                            // A wedged actor must not outlive its call, recording or not.
+                            task.abort();
+                        }
+                    });
+                }
+                Err(_) => task.abort(),
+            }
         }
     }
 }
+
+/// How long a stopped media actor is given to run its teardown — flush a `record_call` recording,
+/// report any prompt still in flight — before it is aborted. The work is a couple of buffered file
+/// writes, so this is an upper bound on a wedged actor, not an expected wait.
+const ACTOR_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The async actor for one media-processing call: drain its mailbox, run [`MediaCall::process`], and
 /// perform the datapath I/O + event emission. Exits on `Stop`, mailbox close, or task abort.

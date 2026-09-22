@@ -45,6 +45,24 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **A `record_call` recording is now actually written.** Two independent defects, either of which
+  was enough to lose the file, and both silent: the call answered `ok` and carried audio throughout.
+
+  The media actor writes the WAV in the code that runs *after* its mailbox loop ends, and that code
+  was unreachable. Tearing a call down sent the actor a `Stop` and then aborted its task on the very
+  next line; the actor was parked on its mailbox, so the abort dropped that future and the teardown
+  never ran. This lost the recording on **every** pipeline, plaintext included. A stopped actor now
+  gets a bounded grace period to finish before it is aborted. (`start_recording`, the pcap verb, is
+  a different mechanism and was never affected — the engine stops those from its own registry.)
+
+  Separately, a call only reaches a media actor at all when something needs the decoded audio, and
+  the secure-far-leg arm of that decision tested a shorter list than every other arm: a codec
+  mismatch and beep detection, but not `record_call`, `noise_suppression` or `echo_cancellation`. An
+  `RTP/AVP` ↔ `RTP/SAVP` call on a shared codec therefore resolved to the crypto bridge, which has
+  no media actor, no recorder and no use for `record_path`; noise suppression and echo cancellation
+  were inert on those calls for the same reason. All four arms now read one definition, so a new
+  flag is added in one place.
+
 - **`checkpoint` now refuses a call it cannot replicate, instead of handing back a blob that fails
   at failover.** The HA snapshot record describes one topology — a two-party call whose *far* side
   may be secure — and `restore` has always rejected anything else. It rejected it at the worst

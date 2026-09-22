@@ -48,7 +48,7 @@ jobs:
           threshold=1500
           # path  max production lines  # why
           allowlist='
-          crates/siphon-rtp-engine/src/media_pipeline.rs 4190 # large, no function over 250 lines; +53 for the near-party secure leg (secure↔secure transcode)
+          crates/siphon-rtp-engine/src/media_pipeline.rs 4222 # large, no function over 250 lines; +53 for the near-party secure leg (secure↔secure transcode); +32 for the actor teardown grace that flushes a recording
           crates/siphon-rtp-engine/src/conference.rs 2712 # large, no function over 250 lines
           crates/siphon-rtp-engine/src/sdp.rs 2171 # large, no function over 250 lines; +27 for RFC 8842 a=tls-id
           crates/siphon-rtp-dsp/src/aec.rs 2554 # one algorithm

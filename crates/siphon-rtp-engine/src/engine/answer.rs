@@ -1351,6 +1351,14 @@ fn resolve_pipeline(
         (Some(near), Some(far)) => !same_codec(near, &far),
         _ => false,
     };
+    // Everything that cannot be done to a payload the engine only forwards. **Every** arm below tests
+    // exactly this, and that is the point: each used to spell the list out for itself, and one of them
+    // — the secure far leg — spelled a shorter one, checking only `transcode || beep_detection`. A
+    // recorded `RTP/AVP` ↔ `RTP/SAVP` call on a shared codec therefore resolved to the crypto bridge,
+    // which registers no media actor, holds no `WavRecorder` and drops `record_path`: the answer said
+    // `ok`, the audio crossed, and the recording never existed. Noise suppression and echo
+    // cancellation were inert on the same calls for the same reason. A new flag must be added here and
+    // nowhere else.
     let needs_decoded_audio = transcode
         || profile.record_call
         || profile.noise_suppression
@@ -1367,12 +1375,7 @@ fn resolve_pipeline(
         // decoded audio — a codec mismatch, recording, noise suppression, echo cancellation or
         // record-tone (beep) detection — and through the plain crypto bridge otherwise, which stays
         // cheaper (no decode/re-encode) and is all a same-codec WebRTC↔SIP call needs.
-        return if transcode
-            || profile.record_call
-            || profile.noise_suppression
-            || profile.echo_cancellation
-            || profile.beep_detection
-        {
+        return if needs_decoded_audio {
             PipelineKind::DtlsMedia
         } else {
             PipelineKind::Dtls
@@ -1402,11 +1405,7 @@ fn resolve_pipeline(
     if near_local_crypto.is_some()
         && far_local_crypto.is_none()
         && !far_dtls
-        && !transcode
-        && !profile.record_call
-        && !profile.noise_suppression
-        && !profile.echo_cancellation
-        && !profile.beep_detection
+        && !needs_decoded_audio
     {
         return PipelineKind::SrtpOfferer;
     }
@@ -1414,19 +1413,14 @@ fn resolve_pipeline(
         // Secure far leg: the plain SRTP bridge when both legs share a codec and nothing needs the
         // decoded audio (crypto only), or the secure transcoding media slow path otherwise —
         // decrypt → transcode → encrypt (BGCF/SBC: a secure AMR-WB access leg ↔ a plaintext G.711
-        // PSTN leg). Record-tone detection needs the PCM, so it takes the same slow path.
-        return if transcode || profile.beep_detection {
+        // PSTN leg).
+        return if needs_decoded_audio {
             PipelineKind::SrtpMedia
         } else {
             PipelineKind::Srtp
         };
     }
-    if profile.record_call
-        || profile.noise_suppression
-        || profile.echo_cancellation
-        || profile.beep_detection
-        || transcode
-    {
+    if needs_decoded_audio {
         // Recording, noise suppression, echo cancellation, record-tone (beep) detection, or a codec
         // mismatch all need the decoded audio, so force the userspace media slow path instead of the
         // in-kernel passthrough.
