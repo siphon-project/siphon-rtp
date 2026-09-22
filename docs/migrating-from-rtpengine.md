@@ -164,6 +164,13 @@ concept, and rtpengine's `tos` is `--media-dscp` — which defaults to `EF`/184 
 marking, so a node that set `tos = 184` needs no equivalent line), but the schema is its own. See
 [Deployment & operations](deployment.md#the-config-file); do not copy `rtpengine.conf` across.
 
+**The idle timers split the same way, with a third case.** rtpengine's `timeout` is
+`--media-timeout-secs` (default 30 rather than 60) and its `silent-timeout` — the ceiling for a call
+that has never received media at all — is `--setup-timeout-secs` (default 300 rather than 3600).
+siphon-rtp adds a third, `--held-media-timeout-secs`, for a call the signalling has put on hold,
+which rtpengine does not distinguish. The `media_timeout` event's `reason` says which of the three
+fired; see [Media-timeout reaping](deployment.md#media-timeout-reaping).
+
 ## What to validate after cutover
 
 Work through these with test traffic before moving production:

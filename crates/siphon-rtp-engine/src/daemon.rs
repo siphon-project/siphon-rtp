@@ -172,7 +172,8 @@ pub struct EngineArgs {
     /// Only legs whose party signalled that it *would* send are measured: a party on hold
     /// (`a=recvonly` / `a=inactive`, RFC 3264 §8.4) may legitimately send nothing, so its silence is
     /// not a dead path. A call where neither party is expected to send is judged by
-    /// `--held-media-timeout-secs` instead.
+    /// `--held-media-timeout-secs` instead, and one that has not carried a packet *yet* by
+    /// `--setup-timeout-secs`.
     #[arg(long, default_value_t = DEFAULT_MEDIA_TIMEOUT_SECS)]
     pub media_timeout_secs: u64,
 
@@ -183,6 +184,16 @@ pub struct EngineArgs {
     /// ages out and is freed by `delete` alone).
     #[arg(long, default_value_t = DEFAULT_HELD_MEDIA_TIMEOUT_SECS)]
     pub held_media_timeout_secs: u64,
+
+    /// Reap a call that has **never** carried a packet after this many seconds — one still in setup.
+    /// A controller anchors media when it builds the offer, before it dials, so a call that is still
+    /// ringing has no media by definition; measuring that against `--media-timeout-secs` races the
+    /// controller's own ring timeout and reports a call that rang out as a media fault. This ceiling
+    /// is therefore set well above any sane ring timeout, and exists only so an anchor whose
+    /// controller never came back is still freed. `0` disables it (such a call is then freed by
+    /// `delete` alone). rtpengine calls the same split `silent-timeout`.
+    #[arg(long, default_value_t = DEFAULT_SETUP_TIMEOUT_SECS)]
+    pub setup_timeout_secs: u64,
 
     /// Bounded grace period (seconds) to drain live calls on SIGTERM/SIGINT before exiting. The
     /// daemon stops accepting new control connections immediately, then waits up to this long for
@@ -309,7 +320,6 @@ pub struct RunConfig {
     pub max_control_rps: u64,
     /// Bytes of decoded prompt audio to cache; `0` disables caching.
     pub prompt_cache_bytes: u64,
-    /// Reap a call after this many seconds with no accepted media.
     /// File holding the control-plane shared secret; `None` ⇒ the environment variable, or no
     /// authentication at all.
     pub control_secret_file: Option<PathBuf>,
@@ -319,6 +329,9 @@ pub struct RunConfig {
     /// Reap a **held** call — one where no party is expected to send — after this many seconds;
     /// `0` disables it.
     pub held_media_timeout_secs: u64,
+    /// Reap a call that has never carried a packet — one still in setup — after this many seconds;
+    /// `0` disables it.
+    pub setup_timeout_secs: u64,
     /// Bounded SIGTERM/SIGINT drain grace period (seconds).
     pub shutdown_grace_secs: u64,
     /// STUN servers asked for a server-reflexive candidate when gathering; empty ⇒ host-only.
@@ -418,6 +431,12 @@ impl RunConfig {
                 explicit("held_media_timeout_secs"),
                 file.held_media_timeout_secs,
                 DEFAULT_HELD_MEDIA_TIMEOUT_SECS,
+            ),
+            setup_timeout_secs: resolve_defaulted(
+                args.setup_timeout_secs,
+                explicit("setup_timeout_secs"),
+                file.setup_timeout_secs,
+                DEFAULT_SETUP_TIMEOUT_SECS,
             ),
             shutdown_grace_secs: resolve_defaulted(
                 args.shutdown_grace_secs,
@@ -671,6 +690,15 @@ const DEFAULT_MEDIA_TIMEOUT_SECS: u64 = 30;
 /// (a park slot nobody retrieves, a queue whose caller hung up without the proxy noticing), and two
 /// hours is comfortably past any hold, park or queue wait a PBX has a legitimate reason to hold.
 const DEFAULT_HELD_MEDIA_TIMEOUT_SECS: u64 = 7200;
+/// Built-in default for `--setup-timeout-secs` (mirrors the clap `default_value_t`): five minutes.
+///
+/// A call that has never carried a packet is not a dead path — it is one whose media was anchored
+/// before it was dialled, and whose far end may simply still be ringing. So this ceiling has to clear
+/// any ring timeout a controller could reasonably run: RFC 3261 sets no limit on how long a call may
+/// alert, the INVITE transaction's own bound (Timer B / Timer F, §17.1.1.1) is 32 s, and the longest
+/// no-answer timers in the field sit around three minutes. Five is past all of them, while still
+/// bounding how long an anchor whose controller never came back can hold its ports.
+const DEFAULT_SETUP_TIMEOUT_SECS: u64 = 300;
 /// Built-in default for `--shutdown-grace-secs` (mirrors the clap `default_value_t`).
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 25;
 /// How often the full-ICE driver polls its agents. Below the RFC 8445 §14.2 `Ta` of 50 ms, so pacing
@@ -911,10 +939,12 @@ where
     let turn_sweeper = turn.clone();
     let timeout_ticks = config.media_timeout_secs;
     let held_timeout_ticks = config.held_media_timeout_secs;
+    let setup_timeout_ticks = config.setup_timeout_secs;
     tracing::info!(
         target: "siphon_rtp::media",
         media_timeout_secs = timeout_ticks,
         held_media_timeout_secs = held_timeout_ticks,
+        setup_timeout_secs = setup_timeout_ticks,
         "media-timeout sweeper enabled"
     );
     tokio::spawn(async move {
@@ -930,9 +960,14 @@ where
             // whose peer stopped answering. A no-op unless `--ice-consent` is set. Runs *before* the
             // idle reap so a call the peer just refreshed is not also evaluated as idle this tick.
             sweeper.drive_consent().await;
-            for call_id in sweeper.reap_idle(timeout_ticks, held_timeout_ticks).await {
-                tracing::warn!(target: "siphon_rtp::media", %call_id, idle_secs = timeout_ticks, held_idle_secs = held_timeout_ticks, "media timeout — call reaped");
+            for call_id in sweeper
+                .reap_idle(timeout_ticks, held_timeout_ticks, setup_timeout_ticks)
+                .await
+            {
+                tracing::warn!(target: "siphon_rtp::media", %call_id, idle_secs = timeout_ticks, held_idle_secs = held_timeout_ticks, setup_idle_secs = setup_timeout_ticks, "media timeout — call reaped");
             }
+            // Conference seats keep the two-ceiling rule: a controller only seats a leg it has already
+            // answered, so a seat is never in setup and has no third ceiling to pick from.
             let reaped = sweeper
                 .reap_idle_conferences(timeout_ticks, held_timeout_ticks)
                 .await;
@@ -1372,6 +1407,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_setup_ceiling_defaults_clear_of_any_ring_timeout_and_is_configurable_both_ways() {
+        // The default is the load-bearing part: this ceiling exists so a call that is merely still
+        // ringing is not read as a dead media path, which it can only do by clearing any ring
+        // timeout a controller might run — so it must be well clear of the media ceiling, not a
+        // near neighbour of it.
+        let default = resolve_from(&["siphon-rtp"], FileConfig::default());
+        assert_eq!(
+            default.setup_timeout_secs,
+            super::DEFAULT_SETUP_TIMEOUT_SECS
+        );
+        assert!(
+            default.setup_timeout_secs >= 5 * default.media_timeout_secs,
+            "a setup ceiling near the media one would race a ring timeout, which is the defect"
+        );
+
+        let file = FileConfig {
+            setup_timeout_secs: Some(600),
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            resolve_from(&["siphon-rtp"], file.clone()).setup_timeout_secs,
+            600,
+            "the file value applies when the flag is absent"
+        );
+        assert_eq!(
+            resolve_from(&["siphon-rtp", "--setup-timeout-secs", "0"], file).setup_timeout_secs,
+            0,
+            "an explicit flag beats the file, including the `0` that disables the ceiling"
+        );
+    }
+
     /// A `FileConfig` naming all three lawful-interception PEM paths.
     fn provisioned_file() -> FileConfig {
         FileConfig {
@@ -1456,6 +1523,7 @@ mod tests {
             control_secret_file: None,
             media_timeout_secs: 30,
             held_media_timeout_secs: super::DEFAULT_HELD_MEDIA_TIMEOUT_SECS,
+            setup_timeout_secs: super::DEFAULT_SETUP_TIMEOUT_SECS,
             shutdown_grace_secs: 25,
             stun_servers: Vec::new(),
             ice_full: false,

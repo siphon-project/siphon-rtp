@@ -83,10 +83,10 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 | `--metrics-addr <ADDR>` | off | Prometheus + health HTTP: `GET /metrics`, `GET /healthz`, `GET /readyz`. |
 | `--max-control-rps <N>` | `200` | Per-connection control request cap (requests/second). `0` disables the limit. |
 | `--prompt-cache-bytes <N>` | `67108864` (64 MiB) | Decoded prompt audio to cache, so a bed played to many callers is decoded once. Keyed by path + mtime + size, so re-recording a prompt takes effect on the next play. `0` disables caching. |
-| `--media-timeout-secs <N>` | `30` | Reap a call after N seconds with no accepted media (dead-path detection). |
 | `--control-secret-file <PATH>` | none | File holding the control-plane shared secret, read once at start. Surrounding whitespace (including the trailing newline) is trimmed. Mutually exclusive with `SIPHON_RTP_CONTROL_SECRET`. |
-| `--media-timeout-secs <N>` | `30` | Reap a call after N seconds with no accepted media (dead-path detection). Applies only while the call is on two-way media; a held call uses the setting below. |
+| `--media-timeout-secs <N>` | `30` | Reap a call after N seconds with no accepted media (dead-path detection). Applies only while the call is on two-way media *and* has carried at least one packet; a held call uses the setting below, one still in setup the one after that. |
 | `--held-media-timeout-secs <N>` | `7200` | Reap a **held** call (one party signalled `sendonly` / `recvonly` / `inactive`) after N seconds. `0` never reaps one. |
+| `--setup-timeout-secs <N>` | `300` | Reap a call that has **never** carried a packet after N seconds — one anchored but not yet answered, which is still ringing rather than dead. `0` never reaps one. rtpengine's `silent-timeout`. |
 | `--shutdown-grace-secs <N>` | `25` | Bounded drain of live calls on SIGTERM/SIGINT before exiting. |
 | `--node-id <STRING>` | `$HOSTNAME`, else `siphon-rtp` | Stable cluster node id reported by `load` / `node_info`. |
 | `--max-sessions <N>` | `0` (unlimited) | Advertised session capacity for cluster load scoring. Does not itself cap admission. |
@@ -285,11 +285,12 @@ Served on `--metrics-addr`:
 
 A call that stops receiving media is dead signalling-wise sooner or later, but the engine does not
 wait for the proxy to notice: after `--media-timeout-secs` (default 30) with no *accepted* media,
-the call is reaped and the owning controller receives a `media_timeout` event on the control
-channel. "Accepted" is measured after the source gate, so an attacker spraying packets at a media
-port cannot keep a dead call alive (see
+a call that was carrying media is reaped and the owning controller receives a `media_timeout` event
+on the control channel. "Accepted" is measured after the source gate, so an attacker spraying packets
+at a media port cannot keep a dead call alive (see
 [Security & NAT design](security-and-nat.md), layer 6). Conference participants are reaped on the
-same sweep and empty rooms are torn down.
+same sweep and empty rooms are torn down. Two other states get ceilings of their own — a **held**
+call and one still in **setup** — because their silence means something different; both are below.
 
 **A held call is not a dead one.** Hold, park and queue are exactly the states in which both parties
 legitimately stop sending, and RFC 3264 §8.4 says so explicitly — the party placing a call on hold
@@ -299,15 +300,34 @@ the SDP tells them apart. So the engine reads the direction attribute (RFC 4566 
 `a=sendonly` / `a=recvonly` / `a=inactive`, media-level winning over session-level) on every offer,
 answer and `reoffer`, and a call where either party has taken the stream off `sendrecv` is measured
 against `--held-media-timeout-secs` (default 7200) instead. Taking the call off hold re-arms the
-short timer. The `media_timeout` event's `reason` says which rule fired — `no_media` or
-`held_too_long` — so a controller can tell "the path died" from "nobody came back to it". A held
-call that *does* carry music-on-hold refreshes its own ceiling like any other media.
+short timer. The `media_timeout` event's `reason` says which rule fired — `no_media`,
+`held_too_long` or `setup_timeout` — so a controller can tell "the path died" from "nobody came back
+to it" from "nothing ever arrived". A held call that *does* carry music-on-hold refreshes its own
+ceiling like any other media.
 
 A conference seat that joined `recvonly` or `inactive` (a listen-only webinar attendee) is treated
 the same way on the same sweep.
 
-Raising `--media-timeout-secs` globally is **not** the way to support hold: it would stop the engine
-cleaning up a genuinely dead path in reasonable time, which is the whole reason the reaper exists.
+**A call that is still ringing is not a dead one either.** A controller anchors media when it builds
+the offer, *before* it dials, so a call nobody has answered yet has no media by definition — its
+silence is not a path that failed, it is a path that has not been asked for. Judged by
+`--media-timeout-secs` the anchor's budget races the controller's own ring budget and, with both at
+their defaults, wins it: the anchor was created a fraction of a second before the ring deadline was
+armed, so a call that merely rang out ends as a media fault and the controller's ring-timeout path —
+which is where the failure response and the route-failure hook live — never runs.
+
+So a call anchored by `offer` that has carried **no** accepted packet at all is measured against
+`--setup-timeout-secs` (default 300, `0` = never) and reported as `reason: setup_timeout`: a call
+that never connected, not one that died. The first accepted packet on any leg moves it onto the
+dead-path rule for the rest of its life, so a mid-call failure is still reaped at
+`--media-timeout-secs` exactly as before. `answer_local` gets no setup phase — that command *is* the
+answer, so media is due one round trip later — and neither does a call restored from an HA
+checkpoint, which was answered on the node that checkpointed it. This is the same split rtpengine
+makes between its `timeout` and its `silent-timeout`.
+
+Raising `--media-timeout-secs` globally is **not** the way to support hold or ringing: it would stop
+the engine cleaning up a genuinely dead path in reasonable time, which is the whole reason the reaper
+exists.
 
 ### Control-plane protection
 

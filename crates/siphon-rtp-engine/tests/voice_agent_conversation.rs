@@ -352,7 +352,7 @@ async fn a_takeover_leg_stamps_liveness_so_the_sweep_spares_a_live_call() {
         .expect("agent uplink channel open");
 
     assert!(
-        engine.reap_idle(5, 0).await.is_empty(),
+        engine.reap_idle(5, 0, 0).await.is_empty(),
         "a takeover leg carrying media must not be reaped: the caller's audio arrived after the \
          clock advanced, so the sweep has fresh liveness to read and the call is plainly alive"
     );
@@ -362,7 +362,7 @@ async fn a_takeover_leg_stamps_liveness_so_the_sweep_spares_a_live_call() {
     // media stopped and the clock advanced again, the same call is reaped.
     engine.datapath().advance_clock(50);
     assert_eq!(
-        engine.reap_idle(5, 0).await,
+        engine.reap_idle(5, 0, 0).await,
         vec!["live".to_string()],
         "a takeover leg that genuinely went quiet is still reaped"
     );

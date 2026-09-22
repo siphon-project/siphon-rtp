@@ -28,32 +28,76 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// hold still ends eventually, with `0` disabling it so such a call never ages out. Everything else
     /// keeps the dead-path rule unchanged, down to reading the same endpoint set. The
     /// [`MediaTimeoutReason`] on the event says which rule fired.
-    pub async fn reap_idle(&self, idle_ticks: u64, held_idle_ticks: u64) -> Vec<String> {
+    ///
+    /// **And silence that was never due is not a dead path either.** A controller anchors a call when
+    /// it *builds the offer*, before it dials, so a call that is still ringing has no media by
+    /// definition: its activity sits at `created_tick` because nothing has been sent yet, not because
+    /// something stopped. Judging that against `idle_ticks` puts the media budget in a race with the
+    /// controller's ring budget, and the anchor wins it, having been created a fraction of a second
+    /// before the ring deadline was armed — so a call that rings out is reported as a media fault and
+    /// the controller's own ring-timeout path never runs. A call that was anchored before anyone
+    /// answered it (`Call::anchored_before_answer` — `offer`, not `answer_local`, whose command *is*
+    /// the answer) and has carried **no** accepted packet on any endpoint is therefore measured
+    /// against `setup_ticks` (`--setup-timeout-secs`, `0` disables it) and reported as
+    /// [`MediaTimeoutReason::SetupTimeout`], so a controller can tell "the far end went silent" from
+    /// "nothing ever arrived". It is the same split rtpengine makes between its `timeout` and its
+    /// `silent-timeout`, for the same reason.
+    ///
+    /// The three ceilings are tried in that order — held, then setup, then dead path — because a call
+    /// the signalling has explicitly suspended is the one whose silence is *most* expected, whether or
+    /// not it has carried media yet. The setup rule is the strictly narrower claim: it applies only
+    /// while nothing has **ever** arrived, and the first accepted packet on any leg moves the call onto
+    /// the dead-path rule for good (`last_activity` is sticky — it is never reset). A caller that sends
+    /// a burst of early media and then stops while the far end is still ringing therefore lands on the
+    /// dead-path rule from that burst onwards: a packet did arrive, so it is judged as one that
+    /// stopped.
+    pub async fn reap_idle(
+        &self,
+        idle_ticks: u64,
+        held_idle_ticks: u64,
+        setup_ticks: u64,
+    ) -> Vec<String> {
         let now = self.datapath.now_ticks();
         // First pass (no `.await`, so holding the shard guards is fine): find the idle calls.
         let mut stale = Vec::new();
         for entry in self.calls.iter() {
             let call = entry.value();
-            let (budget, reason) = if call.is_held() {
-                (held_idle_ticks, MediaTimeoutReason::HeldTooLong)
-            } else {
-                (idle_ticks, MediaTimeoutReason::NoMedia)
-            };
-            // `0` disables the held ceiling. It is never a valid *media* timeout, so this only ever
-            // spares a held call.
-            if budget == 0 {
+            // A held call with its ceiling disabled can never be reaped whatever the endpoints say,
+            // so it skips the scan below entirely — that scan is the only per-call cost this sweep
+            // pays, and a parked-call-heavy node is exactly where it would otherwise add up.
+            let held = call.is_held();
+            if held && held_idle_ticks == 0 {
                 continue;
             }
             // Measured exactly as before — the latest accepted packet across every endpoint, text
-            // included (RFC 4103 text is media too, and a text-only exchange is not a dead path),
-            // falling back to the call's creation. A held call that *does* carry music-on-hold refreshes
-            // its own ceiling, which is right: it is demonstrably alive.
-            let mut last_activity = call.created_tick;
+            // included (RFC 4103 text is media too, and a text-only exchange is not a dead path). `0`
+            // is the datapath's documented "no accepted packet yet" sentinel ([`Datapath::
+            // last_activity`]), so a zero maximum across every endpoint is a call that has never
+            // carried media, which is what picks the setup ceiling below. The sentinel is exact
+            // because a backend's clock never reports `0` while it is running (the loopback backend
+            // starts at one), so no accepted packet can ever stamp it.
+            let mut last_media = 0;
             for endpoint in call.all_endpoint_ids() {
                 if let Some(seen) = self.datapath.last_activity(endpoint) {
-                    last_activity = last_activity.max(seen);
+                    last_media = last_media.max(seen);
                 }
             }
+            let (budget, reason) = if held {
+                (held_idle_ticks, MediaTimeoutReason::HeldTooLong)
+            } else if call.anchored_before_answer && last_media == 0 {
+                (setup_ticks, MediaTimeoutReason::SetupTimeout)
+            } else {
+                (idle_ticks, MediaTimeoutReason::NoMedia)
+            };
+            // `0` disables the setup ceiling (the held one is handled above). It is never a valid
+            // *media* timeout, so this only ever spares a call still in setup.
+            if budget == 0 {
+                continue;
+            }
+            // Fall back to the call's creation, which is the baseline until the first packet lands. A
+            // held call that *does* carry music-on-hold refreshes its own ceiling, which is right: it
+            // is demonstrably alive.
+            let last_activity = last_media.max(call.created_tick);
             if now.saturating_sub(last_activity) >= budget {
                 stale.push((entry.key().clone(), reason));
             }
@@ -64,6 +108,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         for (call_id, reason) in stale {
             let cdr_reason = match reason {
                 MediaTimeoutReason::HeldTooLong => "held_timeout",
+                MediaTimeoutReason::SetupTimeout => "setup_timeout",
                 _ => "media_timeout",
             };
             if self.reap_call(&call_id, cdr_reason, reason).await {

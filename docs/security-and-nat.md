@@ -1183,7 +1183,7 @@ copy of Layers 1–4.
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.
 
 > **Status (landed):** the **reaper + event delivery** — `Engine::reap_idle(idle_ticks,
-> held_idle_ticks)` frees calls whose media has been idle (returning their ports/FDs and
+> held_idle_ticks, setup_ticks)` frees calls whose media has been idle (returning their ports/FDs and
 > registry/quota slots) and pushes `Event::MediaTimeout` to the owning control connection over the
 > server's per-connection event channel (`Engine::register_client` + the connection `select!`-loop;
 > bounded, drop-on-backpressure). Activity is stamped on every accepted packet against the datapath's
@@ -1216,9 +1216,37 @@ A flow that has received no *accepted* packet for `T` ticks is torn down and rep
   gate and, where there is crypto, SRTP authentication, so an attacker cannot extend a call's life by
   spraying it — and cannot shorten one either, since the attribute comes from the signalling path the
   controller already owns, not from the media path.
+- **Silence that was never due is not evidence at all.** A controller anchors media when it *builds
+  the offer*, before it dials, so a call that is still ringing has no media by definition — its
+  activity sits at `Call::created_tick` because nothing was ever asked for, not because something
+  stopped. Measured against `--media-timeout-secs` the anchor's budget races the controller's own ring
+  budget and wins it (the anchor was created a fraction of a second before the ring deadline was
+  armed), so a call that merely rang out is reported as a media fault and the controller's ring-timeout
+  path — where its failure response and route-failure hook live — never runs.
+
+  A call anchored by `offer` (`Call::anchored_before_answer`) that has carried **no** accepted packet
+  on any endpoint is therefore measured against `--setup-timeout-secs` (default 300, `0` = never) and
+  reported as `setup_timeout`. `answer_local` is excluded — that command *is* the answer, so media is
+  due one round trip later — as is a call restored from an HA checkpoint, which was answered on the
+  node that checkpointed it and whose media path the standby adopts live. The three ceilings are tried
+  held → setup → dead path: the setup rule is the narrower claim, and the first accepted packet on any
+  leg moves the call onto the dead-path rule for the rest of its life (`last_activity` is sticky), so a
+  mid-call failure is still reaped at `--media-timeout-secs` unchanged. This is the split rtpengine
+  makes between its `timeout` and its `silent-timeout`.
+
+  **This does not weaken the gate either.** The ceiling is selected from how the call was *signalled*
+  and from whether a packet has ever cleared the gate — never from the contents of an unaccepted one.
+  An off-path attacker spraying a ringing call's port therefore moves nothing: its packets are dropped
+  before they are stamped, and a dropped packet is neither liveness nor a first packet. A source that
+  *does* pass the gate would move the call onto the shorter dead-path ceiling — but a source that
+  passes the gate is, by construction, indistinguishable from the signalled peer, and it can already
+  inject media, which is the larger problem the earlier layers exist to prevent. Note the direction:
+  the setup ceiling is the longer one, so the only thing a gate-passing source can do here is shorten
+  a budget, never extend one.
 - **Conference seats follow the same rule** (`ConferenceRegistry::reap_idle`): a participant that
   joined `recvonly` or `inactive` — a listen-only webinar attendee — owes the room no media, so it is
-  measured against the held ceiling instead of the media timeout.
+  measured against the held ceiling instead of the media timeout. Seats have no *setup* ceiling: a
+  controller only seats a leg it has already answered, so a seat is never in setup.
 
 ### 4.7 Data-model changes implied
 > **Landed in M-S1:** `SourceFilter` (`Exact`/`Subnet`/`Any`) and `LatchPolicy`

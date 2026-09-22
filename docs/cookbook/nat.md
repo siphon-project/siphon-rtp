@@ -151,9 +151,12 @@ Work through these in order; each one names its check.
    packets never reach the engine at all: routing or firewall, not the gate.
 3. **Silence one way only, gate fine?** Check the *other* leg the same way. One-way audio is
    almost always the quiet direction's ingress being dropped or misrouted, not the loud one.
-4. **Did the call get reaped?** No accepted media for `--media-timeout-secs` (default 30)
-   tears the call down and pushes a `media_timeout` event to the controller. If calls die after
-   exactly that interval, the gate was dropping everything from the start.
+4. **Did the call get reaped, and under which rule?** A call that was carrying media and stopped is
+   reaped after `--media-timeout-secs` (default 30) with `reason: no_media`. A call where the gate
+   was dropping *everything* from the start never carried a packet at all, so the engine cannot tell
+   it from one still ringing: it lives until `--setup-timeout-secs` (default 300) and is reported as
+   `reason: setup_timeout`. That reason on a call you know was answered is itself the finding — it
+   says the gate accepted nothing for the whole call.
 5. **Carrier splits RTP across addresses?** RTP arrives from one IP, RTCP (or a re-INVITEd
    stream) from a neighbour. That is what `subnet-source` is for.
 6. **Still stuck?** Capture both engine ports and both directions
