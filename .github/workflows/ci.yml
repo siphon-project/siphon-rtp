@@ -179,25 +179,55 @@ jobs:
   # regression net over the saved corpus + new mutation); deep runs belong on a scheduled/OSS-Fuzz
   # harness. Covers the RTP/RTCP parser, the SDP + NG/bencode + native-JSON control parsers, the
   # STUN/TURN framing, and the AMR-NB/WB RFC 4867 payload decoders.
-  fuzz:
-    name: fuzz (parsers + codec decoders, 30s each)
+  # The target list is read from `fuzz/Cargo.toml` rather than written out here, because a
+  # hand-maintained copy silently drifts: it had lost `ice_agent_fuzz`, `ice_candidate_fuzz`,
+  # `red_parse` and `li_pdu_fuzz`, so four parsers of untrusted bytes were fuzzed by nobody while
+  # this job reported green. Adding a `[[bin]]` is now the only step needed to get it fuzzed.
+  fuzz-targets:
+    name: enumerate fuzz targets
     runs-on: ubuntu-latest
-    needs: test
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        name: Read every [[bin]] from fuzz/Cargo.toml
+        run: |
+          set -euo pipefail
+          targets=$(awk '/^\[\[bin\]\]/ {want=1; next} want && /^name = / {gsub(/^name = "|"$/, ""); print; want=0}' fuzz/Cargo.toml | jq -R . | jq -sc .)
+          count=$(printf '%s' "$targets" | jq 'length')
+          # An empty or unparsed list would make the matrix below vacuous, and a job that fuzzes
+          # nothing still reports success — the exact failure this job exists to prevent.
+          if [ "$count" -lt 1 ]; then
+            echo "::error::no fuzz targets parsed from fuzz/Cargo.toml"
+            exit 1
+          fi
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          echo "fuzzing $count targets: $targets"
+
+  fuzz:
+    name: fuzz (${{ matrix.target }}, 30s)
+    runs-on: ubuntu-latest
+    needs: [test, fuzz-targets]
+    strategy:
+      # One target's crash must not cancel the others: the whole point is to learn which parsers
+      # are broken in a single run, not the first one alphabetically.
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.fuzz-targets.outputs.targets) }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
-      - name: Fuzz each target (30s smoke each)
-        run: |
-          for target in \
-            rtp_parser_fuzz sdp_fuzz bencode_fuzz proto_frame_fuzz stun_fuzz \
-            amr_wb_decode_fuzz amr_nb_decode_fuzz opus_decode_fuzz tone_spec_fuzz; do
-            echo "::group::fuzz $target"
-            cargo +nightly fuzz run "$target" -- -max_total_time=30
-            echo "::endgroup::"
-          done
+        with:
+          # One cache across the matrix instead of one per leg: the legs share a dependency graph
+          # and a cargo-fuzz binary, and per-leg caches would multiply the repo's cache budget by
+          # the number of targets.
+          shared-key: fuzz
+      - name: Install cargo-fuzz (pinned)
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz ${{ matrix.target }} (30s smoke)
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30
 
   # ── Docker image builds (musl/distroless runtime target — no push, no privileged run) ────
   # GitHub runners can't grant the NET_ADMIN/BPF caps the compose profiles need, so we only prove
@@ -393,7 +423,7 @@ jobs:
   ci:
     name: CI passed
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, benches, deny, sbom, fuzz, docker-build, perf-gate, xdp-integration]
+    needs: [fmt, clippy, test, msrv, docs, benches, deny, sbom, fuzz-targets, fuzz, docker-build, perf-gate, xdp-integration]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job failed or was cancelled
