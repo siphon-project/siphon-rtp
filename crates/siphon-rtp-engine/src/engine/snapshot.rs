@@ -687,6 +687,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ingress_leg,
                 egress_leg,
                 accepted_source: restore_source_filter(plan.accepted_source),
+                // Derived rather than replicated: the HA record carries no per-flow latch flag, and
+                // adding one would change the blob format for a bit that is a function of state the
+                // record already holds. A restored call latches unless it carries ICE, whose agent
+                // owns the transport (docs/security-and-nat.md §4 layer 4) — the same rule the live
+                // install applies. Defaulting the other way would leave a restored NATed leg
+                // replying to the address in its `c=` for the rest of the call.
+                latch: snapshot.ice.is_none(),
                 out_endpoint: out.id,
                 out_dst: plan.out_dst,
             });

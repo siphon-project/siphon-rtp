@@ -82,6 +82,28 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   in the pipeline, where its plaintext actually is, not on a bridge the call does not have.
   `checkpoint` is refused for it for the same reason as the bridge form: two secure legs, one record.
 
+### Fixed
+
+- **A bridged leg now replies where its peer's media actually comes from.** `symmetric` (and the
+  default signalled gate) admitted a NATed phone's packets from its NAT binding, and the SRTP bridge
+  then kept answering the private address in the phone's `c=` line for the rest of the call — so
+  every externally bridged call to a phone behind NAT was one-way, and the engine's own record
+  reported it healthy, because a send to an unreachable address still counts as a send. The reply
+  destination is documented to follow the peer's accepted packets and every other egress path did
+  so; the bridge was the exception. It now keeps its own symmetric-RTP latch, through the same
+  `SymmetricLatch` the pipeline and the WebSocket takeover use so they cannot drift on what counts
+  as a NAT rebind and what counts as a hijack. The latch runs on the *plaintext*, after the source
+  gate and after SRTP authentication, so on a secure leg a source that cannot produce a packet
+  authenticating under that party's key can never steer the reply — a stronger gate than the plain
+  relay path can apply. A leg whose transport an ICE agent owns does not latch at all.
+
+- **The call record reports the address a leg actually replied to.** `Event::CallSummary` read only
+  the datapath's latch, which is never written for a `Redirect` leg, so every bridged, transcoded,
+  secure or recorded call reported the party's *signalled* address however far its media had moved.
+  The bridge and the media pipeline now publish what their latches adopted and the record reads all
+  three in turn. This is what made the one-way-audio fault above invisible from the engine's output:
+  finding it took a host capture.
+
 ### Changed
 
 - **A secure-offerer posture the engine can never key is now refused on the `offer`, not the

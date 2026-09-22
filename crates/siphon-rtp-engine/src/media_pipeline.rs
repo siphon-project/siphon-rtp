@@ -2541,6 +2541,10 @@ struct LegMeta<'a> {
 /// `process` is pure and synchronous — feed it a redirected datagram, collect the datagrams to send
 /// and DTMF events to emit. The async actor (`run_media_call`) wraps it with the datapath I/O.
 pub struct MediaCall {
+    /// Where each party is observed to send from, shared with [`MediaRegistry`] so the call record
+    /// can report the address the pipeline actually replies to rather than the signalled one.
+    /// `None` outside the registry (unit tests build a bare `MediaCall`).
+    observed: Option<Arc<DashMap<EndpointId, SocketAddr>>>,
     call_id: String,
     from_tag: String,
     to_tag: Option<String>,
@@ -2588,6 +2592,31 @@ impl MediaCall {
         self.a_to_b.secure_egress = Some(leg.clone());
         self.b_to_a.secure_ingress = Some(leg);
         self
+    }
+
+    /// Publish this call's latched sources into `observed`, keyed by the *ingress* endpoint of the
+    /// party they belong to.
+    ///
+    /// The pipeline has always steered its own egress correctly; what it could not do was say so.
+    /// `Engine::observed_remote` reads the datapath's latch, which is never written for a `Redirect`
+    /// leg, so every transcoded call reported the party's **signalled** address in its CDR however
+    /// far the media had moved. A leg whose audio is crossing somewhere the record does not mention
+    /// is how a wrong-destination fault stays invisible until someone takes a host capture.
+    #[must_use]
+    pub fn observing(mut self, observed: Arc<DashMap<EndpointId, SocketAddr>>) -> Self {
+        self.observed = Some(observed);
+        self
+    }
+
+    /// Record where a party is observed to send from, for the call record. A no-op when the call was
+    /// built outside the registry, and written only on a change so the per-packet path does not
+    /// touch the shared map in the steady state.
+    fn note_observed(&self, endpoint: EndpointId, source: SocketAddr) {
+        if let Some(observed) = &self.observed {
+            if observed.get(&endpoint).map(|seen| *seen) != Some(source) {
+                observed.insert(endpoint, source);
+            }
+        }
     }
 
     /// Install **both** parties' SDES-SRTP legs for a secure↔secure transcoding call
@@ -2724,6 +2753,7 @@ impl MediaCall {
             call_id: call_id.into(),
             from_tag: from_tag.into(),
             to_tag,
+            observed: None,
             a_to_b: Direction::new(a_to_b),
             b_to_a: Direction::new(b_to_a),
             latch,
@@ -2772,6 +2802,7 @@ impl MediaCall {
             call_id: call_id.into(),
             from_tag: from_tag.into(),
             to_tag,
+            observed: None,
             a_to_b: Direction::new_relay(a_to_b),
             b_to_a: Direction::new_relay(b_to_a),
             latch,
@@ -2879,7 +2910,10 @@ impl MediaCall {
             // activity; an accepted stream aims the B→A reply at A's latched source.
             match admitted {
                 ReplyLatch::Reject => return false,
-                ReplyLatch::Accept(Some(dst)) => self.b_to_a.egress_dst = dst,
+                ReplyLatch::Accept(Some(dst)) => {
+                    self.b_to_a.egress_dst = dst;
+                    self.note_observed(self.a_to_b.ingress_endpoint, dst);
+                }
                 ReplyLatch::Accept(None) => {}
             }
             // Passive per-leg RTT (RFC 3550 §6.4.1) from the plaintext RTCP this leg relays: the
@@ -2936,7 +2970,10 @@ impl MediaCall {
             // latched source (docs/security-and-nat.md §4 layer 3; RFC 3550 §8).
             match admitted {
                 ReplyLatch::Reject => return false,
-                ReplyLatch::Accept(Some(dst)) => self.a_to_b.egress_dst = dst,
+                ReplyLatch::Accept(Some(dst)) => {
+                    self.a_to_b.egress_dst = dst;
+                    self.note_observed(self.b_to_a.ingress_endpoint, dst);
+                }
                 ReplyLatch::Accept(None) => {}
             }
             // Passive per-leg RTT, mirrored for the B leg (engine↔B round trip).
@@ -3758,6 +3795,11 @@ pub struct MediaRegistry {
     routes: DashMap<EndpointId, flume::Sender<MediaInput>>,
     /// Call-id → control handle (mailbox + endpoints), for control verbs and teardown.
     calls: DashMap<String, CallHandle>,
+    /// Endpoint → where that party's media is observed to come from, published by each running call
+    /// as its symmetric-RTP latch adopts a source. Shared with the actors (an `Arc` per call) because
+    /// the actor owns its `MediaCall` and the control path cannot read into it; the call record needs
+    /// the address the pipeline actually replies to, not the one that was signalled.
+    observed: Arc<DashMap<EndpointId, SocketAddr>>,
 }
 
 /// A handle to a running media-call actor.
@@ -3837,6 +3879,7 @@ impl MediaRegistry {
         {
             self.routes.insert(endpoint, mailbox.clone());
         }
+        let call = call.observing(self.observed.clone());
         let task = tokio::spawn(run_media_call(call, inbox, datapath, events));
         self.calls.insert(
             call_id,
@@ -3868,6 +3911,15 @@ impl MediaRegistry {
     #[must_use]
     pub fn is_media_call(&self, call_id: &str) -> bool {
         self.calls.contains_key(call_id)
+    }
+
+    /// Where a redirected endpoint's party is observed to send from, once this call's symmetric-RTP
+    /// latch has adopted a source. `None` before the first accepted packet and on a party that sends
+    /// from exactly the address it signalled — in both, the signalled address is what the pipeline
+    /// replies to, so a caller falls back to it.
+    #[must_use]
+    pub fn latched_source(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+        self.observed.get(&endpoint).map(|latched| *latched)
     }
 
     /// Snapshot the live SRTP rollover of a secure-transcode (`SrtpMedia`) call's shared [`SecureLeg`]
@@ -3960,6 +4012,9 @@ impl MediaRegistry {
                 .chain(handle.rtcp_endpoints.iter().copied())
             {
                 self.routes.remove(&endpoint);
+                // What this call learned dies with it: a re-used endpoint id must start from its own
+                // signalled address, never from the previous call's peer.
+                self.observed.remove(&endpoint);
             }
             handle.task.abort();
         }

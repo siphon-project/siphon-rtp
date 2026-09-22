@@ -328,11 +328,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         total
     }
 
-    /// Where a leg's party actually sent from: the source the datapath latched, else its signalled
-    /// address. A `Redirect` leg's media actor keeps its own latch, so there the signalled address
-    /// stands.
+    /// Where a leg's party actually sent from, falling back to the address it signalled.
+    ///
+    /// Asked of each latch in turn because a leg lives on exactly one of them and none of them can
+    /// answer for another: the datapath's, for an in-kernel `Forward` relay; the SRTP bridge's, for
+    /// a crypto-bridged or transcrypted leg; the media registry's, for a transcoded one. Only the
+    /// first of those existed here, and it is never written for a `Redirect` leg — so every bridged,
+    /// transcoded, secure or recorded call reported the party's *signalled* address however far its
+    /// media had actually moved. A record that cannot show a leg replying to the wrong place is how
+    /// that class of fault stays invisible until someone takes a host capture.
     fn observed_remote(&self, leg: &Leg) -> Option<std::net::SocketAddr> {
-        self.datapath.latched_source(leg.rtp.id).or(leg.remote_rtp)
+        self.datapath
+            .latched_source(leg.rtp.id)
+            .or_else(|| self.bridge.latched_source(leg.rtp.id))
+            .or_else(|| self.media.latched_source(leg.rtp.id))
+            .or(leg.remote_rtp)
     }
 
     /// Render one CDR leg line (target `siphon_rtp::cdr`): the datapath byte/packet counters, plus —
