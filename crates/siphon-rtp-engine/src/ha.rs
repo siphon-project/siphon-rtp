@@ -117,6 +117,13 @@ pub enum PipelineSnapshot {
     /// Userspace DTLS-SRTP bridge — not HA-restorable (the handshake-derived keys cannot be recovered
     /// from the snapshot), so `restore` rejects it and `checkpoint` refuses to produce one.
     Dtls,
+    /// Userspace SRTP **transcrypt** bridge (both parties SDES, under different keys) — not
+    /// HA-restorable: [`SecureSnapshot`] carries one peer key, one rollover and a one-sided crypto op
+    /// per flow, all of which a two-legged call has two of. `checkpoint` refuses such a call, so this
+    /// is never written to a blob; it exists so the mapping from the engine's pipeline kind stays
+    /// honest rather than filing a transcrypt under [`PipelineSnapshot::Srtp`], which would restore
+    /// it as a half-keyed far-secure bridge.
+    SrtpTranscrypt,
 }
 
 /// ICE-lite credentials (engine side).

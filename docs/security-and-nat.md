@@ -558,20 +558,51 @@ is wrong, and encryption defeats A2 eavesdrop.
 > the caller without a fingerprint is refused. Neither the offer, the answer nor either direction of a
 > renegotiation ever presents the caller's keying to the callee.
 >
-> **An SDES-SRTP offerer toward a secure far leg is refused on the `offer`, not the `answer`**
-> (`engine/src/engine/offer.rs`, `offer_security`). It is the SDES mirror of the DTLS refusal above,
-> and where it is decided is part of the security posture rather than an ergonomic detail. The far
-> leg's security (`Call.far_local_crypto` / `Call.far_dtls`) is settled from the **offer's** own
-> `transport_protocol` and merely read back at the answer, so the predicate an answer would test is
-> already true when the offer is handled. Deciding it at the answer meant the engine handed out an
-> SDP, the callee rang and picked up, and only then was the call torn down — a refusal that arrives
-> after both parties are in conversation is worse than the same refusal before either is disturbed,
-> and it tempts a controller into passing the media through unanchored to make the symptom go away.
-> The answer's `settle_secure_offerer` keeps the cases only the answer can know: the two legs'
-> codecs differing, a decode-forcing flag (`record_call`, `noise_suppression`, `echo_cancellation`,
-> `beep_detection`) first named on the answer profile, and a renegotiation that changes the posture.
-> An SDES caller aimed at a **DTLS** far leg is refused the same way and stays refused: that needs
-> two keying mechanisms bridged, not two keys.
+> **Both parties on SDES is a transcrypt bridge** (`PipelineKind::SrtpTranscrypt`), which is what two
+> SRTP-only desk phones calling each other negotiate. The engine is the cryptographic far side of
+> *each*: it minted its own key toward A and its own toward B, so it holds two `SecureLeg`s — four
+> SRTP/SRTCP contexts — and every datagram is `unprotect`ed under the sending party's key and
+> `protect`ed under the receiving party's. **Neither party's key is ever presented to the other**,
+> which is the same property the one-sided bridge has and the reason passing the offerer's `a=crypto`
+> through was a defect rather than a shortcut.
+>
+> It is a *crypto* bridge, not a transcode: the payload is never decoded, so any codec crosses,
+> including ones the engine has no decoder for, and the cost is one decrypt plus one encrypt
+> (~507 ns per packet on the reference box, against ~261/~266 ns for a one-sided leg — exactly the
+> sum, the intermediate never being copied anywhere else). Each flow names *which party's* leg sits
+> on each side (`BridgeFlowPlan::ingress_leg` / `egress_leg`) rather than deriving it from a crypto
+> op, because on a transcrypt the direction no longer implies the key. A flow naming a leg its call
+> plan does not carry installs **nothing** for the whole call and logs an `error!`: an unkeyed side
+> would either relay one party's ciphertext onward verbatim or put the other's plaintext on a wire
+> that negotiated encryption, and a partially installed bridge is worse than an absent one.
+>
+> Two consequences worth stating. **Interception** (Layer 5g / `engine/src/engine/intercept.rs`) taps
+> the plaintext *between* the two transforms, which on a transcrypt is the only plaintext the call
+> ever has — both sides of the wire are ciphertext under different keys, so without that tap a
+> secure-to-secure call would be uninterceptable. And **HA `checkpoint` refuses a transcrypt call**:
+> `SecureSnapshot` carries one peer key, one rollover and a one-sided crypto op per flow, all of
+> which a two-legged call has two of, so replicating it would restore a far-secure bridge with the
+> caller silently demoted to plaintext. The call keeps running; only replication is unavailable.
+> A renegotiation reads **both** rollovers (RFC 3711 §3.3.1) from A's RTP endpoint, whose one flow
+> faces A on ingress and B on egress and so names both parties — seeding two legs from one snapshot
+> would cross-seed one party's counters into the other's, which authenticates for a while and then
+> stops.
+>
+> **An SDES-SRTP offerer toward a *DTLS* far leg is refused on the `offer`, not the `answer`**
+> (`engine/src/engine/offer.rs`, `offer_security`), and stays refused: bridging SDES to DTLS is two
+> keying *mechanisms* rather than two keys. Where it is decided is part of the posture rather than an
+> ergonomic detail. `Call.far_dtls` is settled from the **offer's** own `transport_protocol` and
+> merely read back at the answer, so the predicate an answer would test is already true when the
+> offer is handled. Deciding it at the answer meant the engine handed out an SDP, the callee rang and
+> picked up, and only then was the call torn down — a refusal that arrives after both parties are in
+> conversation is worse than the same refusal before either is disturbed, and it tempts a controller
+> into passing the media through unanchored to make the symptom go away. The answer's
+> `settle_secure_offerer` keeps the cases only the answer can know: the two legs' codecs differing, a
+> decode-forcing flag (`record_call`, `noise_suppression`, `echo_cancellation`, `beep_detection`)
+> first named on the answer profile, and a renegotiation that changes the posture. A secure pair that
+> asks for any of those is still refused — no crypto bridge yields decoded audio, whether one leg is
+> secure or both — and the refusal says so rather than blaming the transcrypt that carries the same
+> pair without them.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The

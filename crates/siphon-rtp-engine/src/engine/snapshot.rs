@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use crate::ice::IceCredentials;
 use crate::media_pipeline::{EchoProfile, MediaCall};
 use crate::sdp;
-use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp};
+use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeLeg};
 
 use super::negotiate::{build_transcode_pair, secure_rtcp_relays, RtcpKeying, TranscodePair};
 use super::{
@@ -119,6 +119,10 @@ pub(super) fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSn
         // far-secure one from the keys it does carry, and the offerer's own keying is not in the
         // snapshot at all (a restored call treats A as plaintext — see `Call::near_local_crypto`).
         PipelineKind::Srtp | PipelineKind::SrtpOfferer => PipelineSnapshot::Srtp,
+        // Deliberately *not* folded into `Srtp`: a transcrypt has two legs and the secure snapshot
+        // holds one. `checkpoint` refuses it outright, so this never reaches a blob — it is here so
+        // the mapping cannot quietly mis-file a two-legged call as a one-legged one.
+        PipelineKind::SrtpTranscrypt => PipelineSnapshot::SrtpTranscrypt,
         PipelineKind::Media => PipelineSnapshot::Media,
         PipelineKind::SrtpMedia => PipelineSnapshot::SrtpMedia,
         PipelineKind::Ws => PipelineSnapshot::Ws,
@@ -233,8 +237,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // component — the SRTP bridge for a plain secure leg (`Srtp`), the media actor for a secure
         // *transcode* leg (`SrtpMedia`) — so the closure also hands back what that later query needs
         // (the peer's SDES key, plus the endpoint roles the bridge query maps its flow ids through).
-        let Some((snapshot, secure_ctx)) = self.owned_call(client, call_id, |call| {
+        let Some((snapshot, secure_ctx, transcrypt)) = self.owned_call(client, call_id, |call| {
             let snapshot = call.to_snapshot();
+            let transcrypt = call.pipeline == PipelineKind::SrtpTranscrypt;
             let secure_ctx = call
                 .far_remote_crypto
                 .as_ref()
@@ -247,10 +252,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     PipelineKind::SrtpMedia => Some(SecureCheckpoint::Media { far_remote_crypto }),
                     _ => None,
                 });
-            (snapshot, secure_ctx)
+            (snapshot, secure_ctx, transcrypt)
         }) else {
             return unknown_call(call_id);
         };
+        // A transcrypt holds two independent `SecureLeg`s, and the secure snapshot record holds one
+        // of everything: one peer key, one rollover, one crypto op per flow. Rather than checkpoint
+        // half of it — which would restore as a far-secure bridge with the caller silently demoted
+        // to plaintext — say so. The call keeps running; only replication is unavailable.
+        if transcrypt {
+            return CmdResult::Error {
+                reason: "checkpoint is unsupported for a secure↔secure (transcrypt) call \
+                         (two secure legs, and the snapshot record carries one)"
+                    .to_string(),
+            };
+        }
         // A single-leg call has no far leg to put in the two-leg snapshot record, and nothing a standby
         // could resume: the far side of an IVR / echo / voice-AI call is this engine's own pipeline, not
         // replicable state. Say so rather than handing back a blob that would restore as a two-party
@@ -300,9 +316,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .filter_map(|plan| {
                 Some(crate::ha::BridgeFlowSnapshot {
                     endpoint: role_of(plan.endpoint)?,
-                    op: match plan.op {
-                        BridgeOp::Encrypt => crate::ha::BridgeOpSnapshot::Encrypt,
-                        BridgeOp::Decrypt => crate::ha::BridgeOpSnapshot::Decrypt,
+                    // The HA record carries a one-sided crypto op, which is all it has ever needed:
+                    // `checkpoint` admits only `PipelineKind::Srtp`, where exactly one side of each
+                    // flow is keyed. A transcrypt flow has both sides keyed and no single-op mirror,
+                    // and `checkpoint` refuses such a call before reaching here.
+                    op: match (plan.ingress_leg, plan.egress_leg) {
+                        (None, Some(_)) => crate::ha::BridgeOpSnapshot::Encrypt,
+                        (Some(_), None) => crate::ha::BridgeOpSnapshot::Decrypt,
+                        _ => return None,
                     },
                     accepted_source: source_filter_snapshot(plan.accepted_source),
                     out: role_of(plan.out_endpoint)?,
@@ -645,12 +666,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     reason: "restore: a secure bridge flow references an unknown role".to_string(),
                 }));
             };
+            // A restored bridge is always the far-secure shape: `restore_srtp_bridge` keys from
+            // `far_local`/`far_remote` and rebuilds the call with A plaintext (`near_secure: false`
+            // below), so every keyed side is the far party's leg.
+            let (ingress_leg, egress_leg) = match plan.op {
+                crate::ha::BridgeOpSnapshot::Encrypt => (None, Some(BridgeLeg::Far)),
+                crate::ha::BridgeOpSnapshot::Decrypt => (Some(BridgeLeg::Far), None),
+            };
             bridge_flows.push(BridgeFlowPlan {
                 endpoint: endpoint.id,
-                op: match plan.op {
-                    crate::ha::BridgeOpSnapshot::Encrypt => BridgeOp::Encrypt,
-                    crate::ha::BridgeOpSnapshot::Decrypt => BridgeOp::Decrypt,
-                },
+                ingress_leg,
+                egress_leg,
                 accepted_source: restore_source_filter(plan.accepted_source),
                 out_endpoint: out.id,
                 out_dst: plan.out_dst,
@@ -663,7 +689,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let mut leg = SecureLeg::new(&far_local.key, &far_remote.key);
         leg.seed_rollover(&restore_rollover(&secure.rollover));
         self.bridge.register(BridgeCallPlan {
-            leg,
+            near_leg: None,
+            far_leg: Some(leg),
             flows: bridge_flows,
         });
         Ok(RestoredMedia {

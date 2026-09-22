@@ -808,6 +808,14 @@ enum PipelineKind {
     /// toward a plain callee. The mirror of [`PipelineKind::Srtp`] — the same flows with the
     /// endpoints and crypto ops swapped — over the engine's own key toward A.
     SrtpOfferer,
+    /// Userspace SRTP **transcrypt** bridge: *both* parties negotiated SDES-SRTP (RFC 4568), under
+    /// keys that have nothing to do with each other. The engine is the cryptographic far side of
+    /// each, holding one [`SecureLeg`](siphon_rtp_srtp::leg::SecureLeg) per party, and re-encrypts
+    /// every datagram from one party's key to the other's. It is a crypto bridge, not a transcode:
+    /// the payload is never decoded, so any codec crosses — including ones the engine has no decoder
+    /// for — and neither party's key is ever presented to the other. Two SRTP-only desk phones
+    /// calling each other resolve here, which used to be refused outright.
+    SrtpTranscrypt,
     /// Userspace media slow path: transcode / record / DTMF-extraction via a [`MediaCall`] actor.
     Media,
     /// Secure **and** transcoding: the far (`RTP/SAVP`) leg's codec differs from the near (plaintext)
@@ -840,7 +848,7 @@ impl PipelineKind {
     fn is_crypto_bridge(self) -> bool {
         matches!(
             self,
-            Self::Srtp | Self::SrtpOfferer | Self::Dtls | Self::DtlsOfferer
+            Self::Srtp | Self::SrtpOfferer | Self::SrtpTranscrypt | Self::Dtls | Self::DtlsOfferer
         )
     }
 }

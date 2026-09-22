@@ -6524,24 +6524,36 @@ async fn a_secure_caller_reaches_a_plain_callee_through_the_bridge() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
-    // The shapes that are *not* wired refuse rather than answering `ok` and relaying the caller's
-    // audio somewhere it should not go. **Which verb refuses is itself the assertion.** A secure
-    // far leg is settled from the offer's own profile and only read back at the answer, so that
-    // refusal belongs on the `offer`, before either party has been rung. A codec mismatch is not
-    // known until B has answered, so that one can only be refused there.
+async fn two_secure_parties_are_bridged_under_their_own_keys() {
+    // The internal call between two SRTP-only desk phones: both legs SDES, under key pairs that have
+    // nothing to do with each other. This used to be refused on the answer — after the callee had
+    // rung and picked up — because the engine could not transcrypt. Now it is a crypto bridge: each
+    // datagram is decrypted with the sender's key and re-encrypted with the receiver's, the payload
+    // is never decoded, and neither party's key is ever shown to the other.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
     let caller_key =
         CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
 
-    // (a) both parties secure — a transcrypt between two different keys. Refused on the OFFER: the
-    // callee is never rung for a call the engine already knows it cannot carry.
-    let engine = Engine::new(UdpLoopbackDatapath::new());
-    let (_phone_a, addr_a) = phone().await;
-    let result = engine
+    let offered = engine
         .handle(
             CLIENT,
             Command::Offer {
-                call_id: "both-secure".into(),
+                call_id: "both-sdes".into(),
                 from_tag: "tag-a".into(),
                 sdp: sdes_offerer_sdp(addr_a, &caller_key),
                 profile: ProfileFlags {
@@ -6551,18 +6563,165 @@ async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
             },
         )
         .await;
-    match result {
-        CmdResult::Error { reason } => {
-            assert!(reason.contains("secure-offerer-unsupported"), "{reason}");
-            assert!(reason.contains("transcrypt"), "{reason}");
-        }
-        other => panic!("expected a refusal for secure↔secure, got {other:?}"),
-    }
-    assert!(!engine.calls.contains_key("both-secure"));
-    assert_eq!(engine.client_call_count(CLIENT), 0, "no quota slot leaked");
+    let toward_b = sdp::parse(&ok_sdp_text(&offered)).expect("far offer");
+    let engine_far = toward_b.remote_rtp;
+    let key_toward_b = *toward_b.crypto.first().expect("the engine's key toward B");
+    assert_ne!(
+        key_toward_b.key.master_key, caller_key.key.master_key,
+        "the callee is never shown the caller's key"
+    );
 
-    // (a2) an SDES caller toward a **DTLS** far leg: two keying mechanisms, not two keys. Also the
-    // offer, and this one stays refused even once the SDES↔SDES transcrypt lands.
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "both-sdes".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let toward_a = sdp::parse(&ok_sdp_text(&answered)).expect("answer");
+    let engine_near = toward_a.remote_rtp;
+    let key_toward_a = *toward_a.crypto.first().expect("the engine's key toward A");
+    assert_ne!(
+        key_toward_a.key.master_key, callee_key.key.master_key,
+        "the caller is never shown the callee's key"
+    );
+    assert_eq!(
+        engine.calls.get("both-sdes").expect("call").pipeline,
+        PipelineKind::SrtpTranscrypt,
+        "a same-codec secure pair is a crypto bridge, not a transcode"
+    );
+
+    // A → B: sealed under A's own key, and B opens it with the key the engine advertised to B.
+    let plain = g711_rtp(0, 7, 0x0A0A_0A0A, 0x20);
+    let mut a_out = SrtpContext::from_key_material(&caller_key.key);
+    let mut from_a = Vec::new();
+    a_out.protect(&plain, &mut from_a).expect("A encrypts");
+    phone_a
+        .send_to(&from_a, engine_near)
+        .await
+        .expect("caller send");
+    let mut buffer = [0u8; 2048];
+    let (len, _) = timeout(Duration::from_millis(500), phone_b.recv_from(&mut buffer))
+        .await
+        .expect("the callee receives")
+        .expect("recv");
+    assert_ne!(
+        &buffer[..len],
+        plain.as_slice(),
+        "the callee is never handed plaintext"
+    );
+    assert_ne!(
+        &buffer[..len],
+        from_a.as_slice(),
+        "nor the caller's own ciphertext relayed verbatim, which it could not open"
+    );
+    let mut b_in = SrtpContext::from_key_material(&key_toward_b.key);
+    let mut recovered = Vec::new();
+    b_in.unprotect(&buffer[..len], &mut recovered)
+        .expect("the callee authenticates under the key the engine advertised to it");
+    assert_eq!(recovered, plain, "and reads exactly what the caller sent");
+
+    // B → A: the mirror, under the other pair of keys.
+    let reply = g711_rtp(0, 11, 0x0B0B_0B0B, 0x40);
+    let mut b_out = SrtpContext::from_key_material(&callee_key.key);
+    let mut from_b = Vec::new();
+    b_out.protect(&reply, &mut from_b).expect("B encrypts");
+    phone_b
+        .send_to(&from_b, engine_far)
+        .await
+        .expect("callee send");
+    let (len, _) = timeout(Duration::from_millis(500), phone_a.recv_from(&mut buffer))
+        .await
+        .expect("the caller receives")
+        .expect("recv");
+    assert_ne!(&buffer[..len], reply.as_slice());
+    assert_ne!(&buffer[..len], from_b.as_slice());
+    let mut a_in = SrtpContext::from_key_material(&key_toward_a.key);
+    let mut recovered = Vec::new();
+    a_in.unprotect(&buffer[..len], &mut recovered)
+        .expect("the caller authenticates under the engine's own advertised key");
+    assert_eq!(recovered, reply);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transcrypt_call_refuses_a_checkpoint_rather_than_replicating_half_of_it() {
+    // Two secure legs, and the HA record carries one of everything. Rather than checkpoint half the
+    // call — which restores as a far-secure bridge with the caller silently demoted to plaintext —
+    // say so. The call itself keeps running.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "transcrypt-ha".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "transcrypt-ha".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    match engine
+        .handle(
+            CLIENT,
+            Command::Checkpoint {
+                call_id: "transcrypt-ha".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await
+    {
+        CmdResult::Error { reason } => assert!(
+            reason.contains("transcrypt"),
+            "the refusal names why, got: {reason}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        engine.calls.contains_key("transcrypt-ha"),
+        "refusing to replicate the call does not end it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
+    // What is left unsupported now that the SDES↔SDES transcrypt carries the ordinary secure pair,
+    // and **which verb refuses each one**, which is itself the assertion. The far leg's keying is
+    // settled from the offer's own profile and only read back at the answer, so a posture the engine
+    // can never key belongs on the `offer`, before either party has been rung. Anything that depends
+    // on the *answer* — the callee's codec, a flag on the answer profile — can only be refused there.
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+
+    // (a) an SDES caller toward a **DTLS** far leg: two keying mechanisms, not two keys, which the
+    // transcrypt does not address. Refused on the OFFER.
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_phone_a, addr_a) = phone().await;
     let result = engine
@@ -6627,6 +6786,59 @@ async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
             assert!(reason.contains("codecs differ"), "{reason}");
         }
         other => panic!("expected a refusal for a transcoding secure offerer, got {other:?}"),
+    }
+
+    // (c) both parties secure **and** the call wants the audio decoded. The transcrypt bridge relays
+    // the payload without decoding it, so there is nothing for a recorder to attach to, and no
+    // crypto bridge of any shape can help. It can only be refused on the ANSWER — `record_call` here
+    // is named on the *answer* profile, which the offer never saw — and the reason must say that
+    // rather than blaming the transcrypt, which is exactly what carries the same pair without it.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "secure-record".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "secure-record".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: ProfileFlags {
+                    record_call: true,
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    match result {
+        CmdResult::Error { reason } => {
+            assert!(reason.contains("secure-offerer-unsupported"), "{reason}");
+            assert!(
+                reason.contains("decoded audio"),
+                "the refusal blames the decode, not the transcrypt that carries this pair \
+                 without it, got: {reason}"
+            );
+            assert!(
+                reason.contains("transcrypt"),
+                "and points at what *is* supported for two SDES parties, got: {reason}"
+            );
+        }
+        other => panic!("expected a refusal for a recorded secure↔secure call, got {other:?}"),
     }
 }
 
@@ -17739,6 +17951,140 @@ async fn an_sdes_bridge_keeps_its_srtp_rollover_across_a_renegotiation() {
         relayed, from_b,
         "the engine still decrypts B's stream after the renegotiation"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transcrypt_keeps_both_legs_srtp_rollover_across_a_renegotiation() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+
+    // The one-sided bridge's rollover problem (RFC 3711 §3.3.1), doubled. A transcrypt holds *two*
+    // independent legs, and the renegotiation rebuilds both. Seeding them from a single snapshot —
+    // which is what a per-endpoint lookup returns — would cross-seed one party's counters into the
+    // other's, and that is strictly worse than not seeding: it authenticates for a while and then
+    // stops. Both legs are therefore read from A's RTP endpoint, whose one flow faces A on ingress
+    // and B on egress and so names both parties.
+    //
+    // Four contexts here, two per phone, because each party is its own cryptographic endpoint.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let a_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("A's key");
+    let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("B's key");
+    let profile = ProfileFlags {
+        transport_protocol: Some("RTP/SAVP".into()),
+        ..Default::default()
+    };
+    let offered = offer_from_a(
+        &engine,
+        "transcrypt-roc",
+        sdes_offerer_sdp(addr_a, &a_key),
+        profile.clone(),
+    )
+    .await;
+    let key_toward_b = offered.crypto[0];
+    let answered = answer_from_b(
+        &engine,
+        "transcrypt-roc",
+        savp_answer_sdp(addr_b, &b_key),
+        ProfileFlags::default(),
+    )
+    .await;
+    let key_toward_a = answered.crypto[0];
+    let engine_near = answered.remote_rtp;
+    let engine_far = offered.remote_rtp;
+
+    // Each phone decrypts the engine's stream with the key the engine advertised to it, and encrypts
+    // with its own — the mapping `SecureLeg::new(local, remote)` pins, once per party.
+    let mut a_inbound = SrtpContext::from_key_material(&key_toward_a.key);
+    let mut a_outbound = SrtpContext::from_key_material(&a_key.key);
+    let mut b_inbound = SrtpContext::from_key_material(&key_toward_b.key);
+    let mut b_outbound = SrtpContext::from_key_material(&b_key.key);
+
+    // Run both directions across a sequence wrap, so every one of the four counters is at 1.
+    for sequence in [65_534u16, 65_535, 0, 1] {
+        let from_a = rtp_packet(sequence, 0x0A0A_0A0A);
+        let mut sealed_a = Vec::new();
+        a_outbound.protect(&from_a, &mut sealed_a).expect("A seals");
+        phone_a
+            .send_to(&sealed_a, engine_near)
+            .await
+            .expect("A sends");
+        let (at_b, _) = recv(&phone_b).await;
+        let mut plain = Vec::new();
+        b_inbound
+            .unprotect(&at_b, &mut plain)
+            .expect("B decrypts the engine's stream");
+        assert_eq!(plain, from_a);
+
+        let from_b = rtp_packet(sequence, 0x0B0B_0B0B);
+        let mut sealed_b = Vec::new();
+        b_outbound.protect(&from_b, &mut sealed_b).expect("B seals");
+        phone_b
+            .send_to(&sealed_b, engine_far)
+            .await
+            .expect("B sends");
+        let (at_a, _) = recv(&phone_a).await;
+        let mut plain = Vec::new();
+        a_inbound
+            .unprotect(&at_a, &mut plain)
+            .expect("A decrypts the engine's stream");
+        assert_eq!(plain, from_b);
+    }
+
+    // The renegotiation: A re-offers with the key it already had, B answers with its own.
+    reoffer_from(
+        &engine,
+        "transcrypt-roc",
+        "a",
+        sdes_offerer_sdp(addr_a, &a_key),
+        profile,
+    )
+    .await;
+    answer_from_b(
+        &engine,
+        "transcrypt-roc",
+        savp_answer_sdp(addr_b, &b_key),
+        ProfileFlags::default(),
+    )
+    .await;
+
+    // Both legs continued their own rollover rather than restarting — or being handed the other's.
+    let from_a = rtp_packet(2, 0x0A0A_0A0A);
+    let mut sealed_a = Vec::new();
+    a_outbound.protect(&from_a, &mut sealed_a).expect("A seals");
+    phone_a
+        .send_to(&sealed_a, engine_near)
+        .await
+        .expect("A sends");
+    let (at_b, _) = recv(&phone_b).await;
+    let mut plain = Vec::new();
+    b_inbound
+        .unprotect(&at_b, &mut plain)
+        .expect("B still decrypts after the renegotiation");
+    assert_eq!(plain, from_a);
+
+    let from_b = rtp_packet(2, 0x0B0B_0B0B);
+    let mut sealed_b = Vec::new();
+    b_outbound.protect(&from_b, &mut sealed_b).expect("B seals");
+    phone_b
+        .send_to(&sealed_b, engine_far)
+        .await
+        .expect("B sends");
+    let (at_a, _) = recv(&phone_a).await;
+    let mut plain = Vec::new();
+    a_inbound
+        .unprotect(&at_a, &mut plain)
+        .expect("A still decrypts after the renegotiation");
+    assert_eq!(plain, from_b);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
