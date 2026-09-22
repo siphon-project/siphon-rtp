@@ -5,6 +5,27 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **Four fuzz targets existed and were never run.** The CI fuzz job iterated a hand-written list of
+  nine targets while `fuzz/Cargo.toml` declared thirteen, so `ice_agent_fuzz`, `ice_candidate_fuzz`,
+  `red_parse` and `li_pdu_fuzz` — all of them parsers of untrusted bytes, which the house rule says
+  must decode-or-error rather than panic — were fuzzed by nobody, and the job reported green the
+  whole time. The list is now read from `fuzz/Cargo.toml` at job start, so declaring a `[[bin]]` is
+  the only step needed to get it fuzzed and the list cannot drift again; enumerating nothing fails
+  the job rather than passing vacuously. (All four were run locally before being added: no crashes.)
+
+### Changed
+
+- **The fuzz job runs its targets in parallel and pins `cargo-fuzz`.** It was a serial loop that
+  also rebuilt `cargo-fuzz` from source on every run, unpinned — the only `cargo install` in CI
+  without a `--version`/`--locked`, directly below two jobs that pin `cargo-deny` exactly. It now
+  installs `cargo-fuzz 0.13.2 --locked` and fans the targets out over a matrix sharing one cache
+  key, so wall-clock time is roughly one build plus the 30 s smoke rather than the sum of all of
+  them, and the toolchain is no longer resolved fresh on each run.
+
 ## [0.8.0] — 2026-09-22
 
 ### Added
