@@ -6,7 +6,8 @@ use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 use std::collections::HashSet;
 
 use crate::ice;
-use crate::sdp::{self, SecurityAdvertisement, TextRewrite};
+use crate::sdp::{self, ImageRewrite, SecurityAdvertisement, TextRewrite};
+use std::net::IpAddr;
 
 use super::negotiate::{
     bridge_source_filter, dtls_directive, far_security, ice_directive, offer_ice_rewrite,
@@ -346,6 +347,37 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 }
 
+/// What anchoring an offer's T.38 fax stream leaves for the call.
+struct OfferImage {
+    /// The offer carried an `m=image` section the engine can relay (UDPTL, addressable).
+    anchor_image: bool,
+    /// The offer carried an `m=image` section on a transport the engine cannot relay — T.38 over TCP
+    /// or over DTLS. Declined rather than passed through: an untouched section advertises the UE's
+    /// own address, so passing it through is a silent topology change, not a no-op.
+    decline_image: bool,
+    near_image_endpoint: Option<siphon_rtp_datapath::Endpoint>,
+    far_image_endpoint: Option<siphon_rtp_datapath::Endpoint>,
+}
+
+impl OfferImage {
+    /// The directive for the far (B-facing) presentation.
+    fn far_rewrite(
+        &self,
+        far: Option<siphon_rtp_datapath::Endpoint>,
+        advertised: IpAddr,
+    ) -> ImageRewrite {
+        match (self.anchor_image, far) {
+            (true, Some(endpoint)) => ImageRewrite::Anchor(sdp::EngineMedia {
+                rtp: endpoint.local_addr,
+                rtcp: None,
+                advertised_ip: advertised,
+            }),
+            _ if self.decline_image => ImageRewrite::Decline,
+            _ => ImageRewrite::None,
+        }
+    }
+}
+
 /// What anchoring an offer's RFC 4103 text stream leaves for the call.
 struct OfferText {
     /// The offer's text stream is secure (`RTP/SAVP`).
@@ -483,6 +515,101 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_text_local_crypto,
         })
     }
+
+    /// Anchor an offer's **second streams** — the RFC 4103 text stream and the T.38 fax stream — in
+    /// one step. Each is independent of the other and of the audio; this exists so `offer` takes one
+    /// fallible step for both rather than two identical ones with the same seven arguments.
+    #[allow(clippy::too_many_arguments)]
+    async fn anchor_offer_streams(
+        &self,
+        profile: &ProfileFlags,
+        info: &sdp::MediaInfo,
+        near_family: AddressFamily,
+        near_bind: Option<std::net::IpAddr>,
+        far_family: AddressFamily,
+        far_bind: Option<std::net::IpAddr>,
+        endpoints: &mut Vec<siphon_rtp_datapath::Endpoint>,
+    ) -> Result<(OfferText, OfferImage), Box<CmdResult>> {
+        let text = self
+            .anchor_offer_text(
+                profile,
+                info,
+                near_family,
+                near_bind,
+                far_family,
+                far_bind,
+                endpoints,
+            )
+            .await?;
+        let image = self
+            .anchor_offer_image(
+                profile,
+                info,
+                near_family,
+                near_bind,
+                far_family,
+                far_bind,
+                endpoints,
+            )
+            .await?;
+        Ok((text, image))
+    }
+
+    /// Anchor an offer's T.38 fax stream: one UDPTL endpoint per leg, sharing each leg's family and
+    /// interface, exactly as the text stream gets one.
+    ///
+    /// There is no keying to mint and no RTCP companion to pair — UDPTL has neither. The only
+    /// decision is whether the engine can relay the transport at all: `udptl` it anchors, `TCP` and
+    /// `UDP/TLS/UDPTL` it declines (RFC 3264 §6, port 0). A WS-bridged call has no B leg to relay
+    /// to, so it anchors nothing, the same exclusion the text stream takes.
+    async fn anchor_offer_image(
+        &self,
+        profile: &ProfileFlags,
+        info: &sdp::MediaInfo,
+        near_family: AddressFamily,
+        near_bind: Option<std::net::IpAddr>,
+        far_family: AddressFamily,
+        far_bind: Option<std::net::IpAddr>,
+        endpoints: &mut Vec<siphon_rtp_datapath::Endpoint>,
+    ) -> Result<OfferImage, Box<CmdResult>> {
+        let relayable = info
+            .image
+            .as_ref()
+            .is_some_and(|image| image.transport.is_relayable());
+        let anchor_image = relayable && profile.ws_uri.is_none();
+        let decline_image = info.image.is_some() && !anchor_image;
+        if !anchor_image {
+            return Ok(OfferImage {
+                anchor_image,
+                decline_image,
+                near_image_endpoint: None,
+                far_image_endpoint: None,
+            });
+        }
+        let near_image = match self.alloc_endpoints(1, near_family, near_bind).await {
+            Ok(mut allocated) => allocated.remove(0),
+            Err(reason) => {
+                self.free(endpoints).await;
+                return Err(Box::new(CmdResult::Error { reason }));
+            }
+        };
+        let far_image = match self.alloc_endpoints(1, far_family, far_bind).await {
+            Ok(mut allocated) => allocated.remove(0),
+            Err(reason) => {
+                self.datapath.remove_endpoint(near_image.id).await;
+                self.free(endpoints).await;
+                return Err(Box::new(CmdResult::Error { reason }));
+            }
+        };
+        endpoints.push(near_image);
+        endpoints.push(far_image);
+        Ok(OfferImage {
+            anchor_image,
+            decline_image,
+            near_image_endpoint: Some(near_image),
+            far_image_endpoint: Some(far_image),
+        })
+    }
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -597,16 +724,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .copied()
             .collect();
 
-        let OfferText {
-            text_offered_secure,
-            near_text_remote_crypto,
-            anchor_text,
-            anchor_secure_text,
-            near_text_endpoint,
-            far_text_endpoint,
-            far_text_local_crypto,
-        } = match self
-            .anchor_offer_text(
+        let (
+            OfferText {
+                text_offered_secure,
+                near_text_remote_crypto,
+                anchor_text,
+                anchor_secure_text,
+                near_text_endpoint,
+                far_text_endpoint,
+                far_text_local_crypto,
+            },
+            offer_image,
+        ) = match self
+            .anchor_offer_streams(
                 profile,
                 &info,
                 near_family,
@@ -617,7 +747,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             )
             .await
         {
-            Ok(text) => text,
+            Ok(streams) => streams,
             Err(result) => return *result,
         };
 
@@ -632,6 +762,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text: far_text_endpoint,
             // The far side's text address is unknown until its answer.
             text_remote_rtp: None,
+            image: offer_image.far_image_endpoint,
+            // As with text, the far side's fax address arrives with its answer.
+            image_remote: None,
         };
         let text_rewrite = match far_leg.text_anchor(far_text_local_crypto) {
             Some(anchor) => anchor,
@@ -639,6 +772,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None if text_offered_secure => TextRewrite::Decline,
             None => TextRewrite::None,
         };
+        let image_rewrite = offer_image.far_rewrite(offer_image.far_image_endpoint, far_advertised);
         // ICE rewrite mode (RFC 8839 §5): re-originate ICE-lite when we minted creds; when `ice: remove`
         // took ICE off the far leg, strip the peer's ICE without advertising our own; otherwise pass it
         // through. `IceAdvertisement` borrows `ice_creds`, so it is built here and kept alive to rewrite.
@@ -672,6 +806,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ),
                 mux_override: far_mux_override,
                 text: text_rewrite,
+                image: image_rewrite,
                 codec: CodecPresentation::Policy(&codec_policy),
             },
             &profile.replace,
@@ -796,6 +931,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     advertised_ip: near_advertised,
                     text: near_text_endpoint,
                     text_remote_rtp: near_text_remote,
+                    image: offer_image.near_image_endpoint,
+                    image_remote: info.image.as_ref().map(|image| image.remote),
                 },
                 // An offer always allocates a B-facing leg: a B side may still answer, and the offer
                 // being rewritten right here is what would be delivered to it.

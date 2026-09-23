@@ -93,6 +93,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // A single-leg local answer relays no text stream.
                     text: None,
                     text_remote_rtp: None,
+                    // Neither a single-leg local answer nor a conference seat relays fax.
+                    image: None,
+                    image_remote: None,
                 },
                 // No B-facing leg, and never will be: this verb *is* the answer (see the allocation
                 // comment above). `answer` refuses to run on such a call rather than inventing one.
@@ -643,6 +646,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     advertised_ip: near_advertised,
                     text: None,
                     text_remote_rtp: None,
+                    // Neither a single-leg local answer nor a conference seat relays fax.
+                    image: None,
+                    image_remote: None,
                 };
                 let candidates = self.gather_leg_candidates(&leg, &config).await;
                 (candidates, Some(config))

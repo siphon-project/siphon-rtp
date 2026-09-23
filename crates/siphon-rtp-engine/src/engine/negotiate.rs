@@ -32,6 +32,8 @@ pub(super) struct LegPresentation<'a> {
     pub(super) mux_override: Option<bool>,
     /// The leg's RFC 4103 text stream.
     pub(super) text: TextRewrite,
+    /// The leg's T.38 fax stream.
+    pub(super) image: ImageRewrite,
     /// Which audio codecs the party is shown.
     pub(super) codec: CodecPresentation<'a>,
 }
@@ -69,7 +71,7 @@ pub(super) fn present_leg(
         presentation.security,
         presentation.mux_override,
         presentation.text,
-        ImageRewrite::None,
+        presentation.image,
     )?
     .sdp;
     match presentation.codec {

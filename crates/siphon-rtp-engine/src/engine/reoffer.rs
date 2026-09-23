@@ -149,6 +149,16 @@ fn reoffer_security_refusal(state: &ReofferState, info: &sdp::MediaInfo) -> Opti
     }
 }
 
+/// Whether a re-offer presents the leg's bound RTCP-mux state explicitly (RFC 5761).
+///
+/// Presented when a `rtcp-mux` directive asks for it, or when the re-offering party's SDP disagrees
+/// with it — exactly as `answer` does. The presented SDP is rewritten from the *other* party's,
+/// whose `a=rtcp-mux` line says nothing about this leg, so mirroring the input would be wrong.
+fn reoffer_mux_override(leg: &Leg, info: &sdp::MediaInfo, profile: &ProfileFlags) -> Option<bool> {
+    let muxed = leg.rtcp.is_none();
+    (!profile.rtcp_mux.is_empty() || info.rtcp_mux != muxed).then_some(muxed)
+}
+
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// A re-offer's ICE candidates: the offering leg's, for its rebuilt agent, and the presented
     /// leg's, for the SDP. Both are the ones already advertised when stored — the ports are unchanged,
@@ -489,12 +499,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
         let presented_media = presented_leg.engine_media();
-        // RFC 5761: present the leg's bound mux state when a `rtcp-mux` directive asks for it, or when
-        // the re-offering party's SDP disagrees with it, exactly as `answer` does. The presented SDP is
-        // rewritten from the other party's, whose `a=rtcp-mux` line says nothing about this leg.
-        let presented_muxed = presented_leg.rtcp.is_none();
-        let mux_override = (!profile.rtcp_mux.is_empty() || info.rtcp_mux != presented_muxed)
-            .then_some(presented_muxed);
+        let mux_override = reoffer_mux_override(&presented_leg, &info, profile);
         let codec_policy = parse_codec_flags(&profile.flags);
         let presentation = match presented_party {
             // Delivered to B: the far leg, presented as the original offer presented it.
@@ -524,6 +529,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 };
                 LegPresentation {
                     engine: presented_media,
+                    image: presented_leg.image_rewrite(info.image.is_some()),
                     ice: offer_ice_rewrite(
                         ice_creds.as_ref(),
                         &presented_candidates,
@@ -568,6 +574,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 };
                 LegPresentation {
                     engine: presented_media,
+                    image: presented_leg.image_rewrite(info.image.is_some()),
                     ice: answer_ice_rewrite(ice_creds.as_ref(), &presented_candidates),
                     security: near_security(
                         state.near_local_crypto,

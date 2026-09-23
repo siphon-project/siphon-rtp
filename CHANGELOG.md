@@ -9,6 +9,28 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **T.38 fax is relayed over UDPTL.** With the SDP layer able to anchor an `m=image` section, the
+  engine now allocates a UDPTL endpoint per leg and relays the fax stream between them, gated and
+  latched as its own inbound surface — RTPBleed is per-stream, so a fax stream gets its own copy of
+  the source gate and latch rather than riding the audio's.
+  **It deliberately does not ride the datapath's `Forward` fast path.** A UDPTL datagram is not RTP:
+  its first two octets are a sequence number, so its leading byte walks the whole 0–255 range as the
+  fax progresses and aliases every RFC 7983 demux class. As a `Forward` flow a fax would be dropped
+  in the datapath for roughly three datagrams in four, and the quarter landing in the media range
+  would be worse than dropped — the SSRC reader returns garbage rather than nothing for a datagram
+  that merely looks like RTP, pinning the latch to a value that changes every packet. The stream is
+  therefore `Redirect`ed and relayed in userspace, which is the arm the design already sanctions for
+  non-RTP, and leaves the `Forward` path's RTP-only rule untouched.
+  The latch is address-only and learns exactly once, because a UDPTL stream carries nothing that
+  could prove a new source is the same stream. The existing symmetric latch could not be reused: it
+  deliberately does not store an SSRC-less learn, so on a stream that never has an SSRC it accepts
+  every source forever — which under the opt-in `symmetric` posture is no gate at all. One
+  consequence is deliberate: a mid-call NAT rebind stops a fax rather than following it. A fax that
+  stops is retried; a fax that follows an attacker is not a fax.
+  The stream is never parsed — the bytes that arrive are the bytes that leave — so this adds no
+  parser for untrusted input. Relaying a datagram costs ~24 ns and dropping one ~4 ns, so refusing a
+  flood is cheaper than carrying the fax.
+
 - **The SDP layer parses and re-originates a T.38 fax section (`m=image` / UDPTL).** Until now an
   `m=image` section was `MediaKind::Other` and passed through byte for byte, so the fax media
   advertised the UE's own address and went around the engine — correct on a flat network, broken

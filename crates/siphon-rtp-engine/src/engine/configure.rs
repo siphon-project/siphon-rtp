@@ -16,6 +16,7 @@ use crate::media_pipeline::MediaRegistry;
 use crate::metrics::Metrics;
 use crate::srtp_bridge::SrtpBridge;
 use crate::text_pipeline::TextRegistry;
+use crate::udptl_pipeline::UdptlRegistry;
 use crate::ws_bridge::WsRegistry;
 use crate::x3::X3Config;
 
@@ -61,6 +62,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             conference: Arc::new(ConferenceRegistry::default()),
             seat_ice_followers: DashMap::new(),
             text: Arc::new(TextRegistry::default()),
+            udptl: Arc::new(UdptlRegistry::default()),
             subscriptions: DashMap::new(),
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(ClusterState::new("siphon-rtp".to_string(), 0, Vec::new())),
@@ -291,6 +293,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// text-owned endpoints' datagrams to the per-call text observers (see [`crate::text_pipeline`]).
     pub fn text(&self) -> Arc<TextRegistry> {
         self.text.clone()
+    }
+
+    /// The shared T.38 fax relay — handed to the redirect dispatcher so it can route image-owned
+    /// endpoints' UDPTL datagrams to the per-call relays (see [`crate::udptl_pipeline`]).
+    pub fn udptl(&self) -> Arc<UdptlRegistry> {
+        self.udptl.clone()
     }
 
     /// Number of live calls in the session registry.

@@ -1025,6 +1025,57 @@ copy of Layers 1–3.
   captures pre-decrypt). The one difference from the plaintext path: a secure text stream is never
   demoted back to the kernel (it holds a permanent `Secure` promotion reason).
 
+### Layer 5g — The T.38 fax (UDPTL) relay path
+A call may switch to fax: an `m=image <port> udptl t38` section (ITU-T T.38 Annex D, RFC 3362),
+either alongside the audio or — the usual T.30 switchover — replacing it, in a re-INVITE that carries
+no `m=audio` line at all. The engine anchors it to a **separate** endpoint per leg and relays it.
+**RTPBleed is per-stream**, so the fax stream is a full inbound surface in its own right and gets its
+own copy of Layers 2–3. Layer 1 is where it differs, and that difference is the whole design.
+
+- **It is not RTP, so it does not ride the `Forward` path — at all.** A UDPTL datagram has no RTP
+  header: its first two octets are a 16-bit sequence number, so its leading byte walks the whole
+  `0..=255` range as the fax progresses and *aliases every RFC 7983 demux class* (Layer 1). Installed
+  as a `FlowAction::Forward` flow it would be dropped in the datapath for roughly three datagrams in
+  four, and the quarter landing in `128..=191` would be worse than dropped: `rtp_media_ssrc` reads
+  bytes 8..12 and returns `Some(garbage)` rather than `None` for a datagram that merely looks like
+  RTP, so the Layer-3 latch would pin a value that changes every packet. The stream is therefore
+  installed as `FlowAction::Redirect` on both endpoints and relayed by `udptl_pipeline`. This is the
+  arm Layer 1 already sanctions for non-RTP ("a redirected endpoint is entitled to non-RTP") and it
+  leaves the `Forward` path's RTP-only rule — the RTPBleed fix — exactly as it was. No eBPF ABI
+  change, and the XDP backend's own `Redirect` arm gates Layer 2 in-kernel before handing the
+  datagram up.
+- **The consumer re-enforces Layer 2 itself,** because on a non-ICE `Redirect` endpoint the UDP
+  backend applies no source gate of its own (see the Layer 4 `Redirect` bullet). Each direction is
+  gated to its peer's signalled address, tightened to the `received-from` public IP when the proxy
+  supplied one, through the same `bridge_source_filter` the audio and text relays use — so the
+  `symmetric` and `subnet-source` postures mean the same thing on a fax leg as anywhere else.
+- **The latch is address-only and learns exactly once.** There is no SSRC to key a re-latch on, so
+  there is no evidence a new source could ever offer that it is the same stream. `OpaqueLatch` runs
+  the same `source_latch_verdict` state machine with `ssrc: None`, which already yields precisely
+  this: learn the first accepted source, reject every later one. It is the posture Layer 3 already
+  describes for an SSRC-less latch — *confirmed by its own source but never moved*. The consequence
+  is deliberate and worth stating plainly: a genuine mid-call NAT rebind **kills** a fax rather than
+  following it. A fax that stops is retried; a fax that follows an attacker is not a fax.
+  - `SymmetricLatch` could **not** be reused. It deliberately does not store an SSRC-less learn (the
+    carve-out that stops RTCP-before-RTP from aiming the reply), so on a stream that never carries an
+    SSRC it accepts every source forever. Under the opt-in `symmetric` flag, where `SourceFilter::Any`
+    makes the latch the only constraint left, that is no gate at all — the same hole Layer 3 records
+    as already fixed once for RTP. The two latches share one state machine so they cannot drift.
+- **The stream is never parsed.** A relay does not need the sequence number, the primary IFP packet
+  or the redundancy — those are a contract between the two fax endpoints. The bytes that arrive are
+  the bytes that leave, so this path adds no parser for untrusted input, and therefore no new attack
+  surface and no new fuzz target.
+- **Never forward into the void.** A direction with no resolved destination drops the datagram rather
+  than guessing, exactly as the `Forward` path does.
+- **A transport the engine cannot relay is declined, not passed through.** T.38 over TCP (Annex E)
+  and over DTLS are legal and unsupported here; both are answered with `m=image 0` (RFC 3264 §6). An
+  untouched section would advertise the UE's own address, so passing one through is not a no-op — it
+  is a silent topology change that takes the media off the engine.
+- **Idle reap + teardown.** The image endpoints are part of the call's endpoint set
+  (`all_endpoint_ids`) for the media-timeout sweep and teardown, and the relay stamps datapath
+  activity only for a datagram that cleared both gates — so a spoofed spray cannot extend a call's
+  life, and a fax-only call (which by then carries no audio at all) is not reaped mid-transmission.
+
 ### Layer 5e — The WebSocket-takeover Redirect path
 A **takeover** call (`ProfileFlags.ws_uri`, `PipelineKind::Ws`) points leg A's RTP endpoint at
 `FlowAction::Redirect` and makes an external WebSocket media server A's far side; the A↔B

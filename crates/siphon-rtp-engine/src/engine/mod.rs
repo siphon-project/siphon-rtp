@@ -21,6 +21,7 @@ mod answer;
 mod answer_local;
 mod configure;
 mod dispatch;
+mod fax;
 mod fork;
 mod gather;
 mod inject;
@@ -58,9 +59,10 @@ use crate::interface::{Interface, InterfaceTable};
 use crate::media_fetch::MediaFetchLimits;
 use crate::media_pipeline::MediaRegistry;
 use crate::metrics::Metrics;
-use crate::sdp::{self, EngineMedia, TextRewrite};
+use crate::sdp::{self, EngineMedia, ImageRewrite, TextRewrite};
 use crate::srtp_bridge::SrtpBridge;
 use crate::text_pipeline::TextRegistry;
+use crate::udptl_pipeline::UdptlRegistry;
 use crate::ws_bridge::WsRegistry;
 use crate::x3::X3Config;
 
@@ -212,6 +214,14 @@ struct Leg {
     /// the forward destination and source-gate anchor for the sibling leg's text relay (mirrors
     /// `remote_rtp`). `None` until known (the far leg's is filled at answer, like `remote_rtp`).
     text_remote_rtp: Option<std::net::SocketAddr>,
+    /// The engine's UDPTL endpoint for this leg's T.38 fax stream, when the call negotiated an
+    /// `m=image` section. `None` on a call carrying no fax. One port per leg: UDPTL has no RTCP
+    /// companion, so there is nothing to pair it with.
+    image: Option<Endpoint>,
+    /// This side's signalled UDPTL address (the `m=image`/`c=` transport), when a fax stream was
+    /// negotiated — the forward destination and source-gate anchor for the sibling leg's fax relay
+    /// (mirrors `remote_rtp`). `None` until known.
+    image_remote: Option<std::net::SocketAddr>,
 }
 
 impl Leg {
@@ -228,6 +238,7 @@ impl Leg {
     fn all_endpoint_ids(&self) -> impl Iterator<Item = EndpointId> {
         self.endpoint_ids()
             .chain(self.text.map(|endpoint| endpoint.id))
+            .chain(self.image.map(|endpoint| endpoint.id))
     }
 
     /// The engine endpoints this leg presents in SDP: its RTP port, its RTCP port unless muxed, and
@@ -253,6 +264,25 @@ impl Leg {
             Some(crypto) => TextRewrite::AnchorSecure { engine, crypto },
             None => TextRewrite::Anchor(engine),
         })
+    }
+
+    /// How this leg's T.38 fax stream is presented: anchored at the leg's own UDPTL endpoint when it
+    /// has one, else declined if the SDP being rewritten carries an `m=image` section at all, else
+    /// nothing to do. `rtcp: None` because UDPTL has none.
+    ///
+    /// The decline is the load-bearing case. Leaving an unanchored section alone would present the
+    /// party a fax address belonging to the *other* party — its own, often private, one — so the fax
+    /// would either bypass the engine or go nowhere. Saying no is honest; saying nothing is not.
+    fn image_rewrite(&self, offered: bool) -> ImageRewrite {
+        match self.image {
+            Some(endpoint) => ImageRewrite::Anchor(EngineMedia {
+                rtp: endpoint.local_addr,
+                rtcp: None,
+                advertised_ip: self.advertised_ip,
+            }),
+            None if offered => ImageRewrite::Decline,
+            None => ImageRewrite::None,
+        }
     }
 }
 
@@ -984,6 +1014,11 @@ pub struct Engine<D: Datapath> {
     /// [`crate::text_pipeline`]). Only the low-rate text stream is ever promoted here — audio is never
     /// promoted for text observability.
     text: Arc<TextRegistry>,
+    /// The T.38 fax relay: per-call UDPTL forwarders for a negotiated `m=image` stream. Shared with
+    /// the redirect dispatcher, which routes image-owned endpoints' datagrams here. Unlike the text
+    /// stream this is never a `Forward` flow — UDPTL is not RTP, so it cannot ride the datapath's
+    /// RTP-only fast path at all (see [`crate::udptl_pipeline`]).
+    udptl: Arc<UdptlRegistry>,
     /// SIPREC / monitor media subscriptions, keyed by call-id (RFC 7866). Each entry's source leg is
     /// forked to a send-only subscriber endpoint; freed alongside the parent call on delete/reap.
     subscriptions: DashMap<String, Vec<Subscription>>,
