@@ -10,27 +10,27 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use siphon_rtp_dsp::{NeuralVad, NeuralVadStream, VoiceDetector, NEURAL_VAD_WINDOW_SAMPLES};
 
 /// A pass-through allocator that counts allocations, so a test can assert a hot loop made none.
 struct CountingAllocator;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
 thread_local! {
-    // Only the measuring thread arms counting; a global counter would also catch the libtest
-    // harness's background-thread allocations. `const`-initialised so reading it never allocates.
+    // Only the measuring thread arms counting, and the count is per thread too: libtest runs tests
+    // in parallel, and a global counter picks up another test's armed allocations (the constructor
+    // test below arms around code that allocates) between this thread's before/after reads.
+    // `const`-initialised so reading either never allocates.
     static ARMED: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
-// SAFETY: every call delegates straight to the system allocator; we only bump a relaxed counter,
+// SAFETY: every call delegates straight to the system allocator; we only bump a thread-local counter,
 // and only when the current thread has armed counting.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if ARMED.with(Cell::get) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            ALLOCATIONS.with(|count| count.set(count.get() + 1));
         }
         System.alloc(layout)
     }
@@ -55,9 +55,9 @@ fn deterministic_pcm(length: usize, seed: u32) -> Vec<i16> {
 
 fn measure(mut body: impl FnMut()) -> usize {
     ARMED.with(|armed| armed.set(true));
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = ALLOCATIONS.with(Cell::get);
     body();
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let after = ALLOCATIONS.with(Cell::get);
     ARMED.with(|armed| armed.set(false));
     after - before
 }
