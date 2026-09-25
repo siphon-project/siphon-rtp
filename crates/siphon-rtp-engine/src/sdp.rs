@@ -54,10 +54,7 @@ pub struct MediaInfo {
     /// The direction this party declared for the audio stream (RFC 4566 §6 / RFC 8866 §6.7),
     /// media-level winning over session-level. [`MediaDirection::SendRecv`] when absent.
     pub direction: MediaDirection,
-    /// The `a=crypto` lines offered (RFC 4568 SDES) that the engine can key, in order and under their
-    /// offered tags — the peer's SRTP key candidates. Lines in a suite the SRTP context does not run
-    /// are dropped at parse, so `first()` is the line an answer accepts and must echo the tag of
-    /// (RFC 4568 §5.1.2, §7.1.1).
+    /// The keyable `a=crypto` lines offered, in order; `first()` is the accepted one (RFC 4568 §5.1.2).
     pub crypto: Vec<CryptoAttribute>,
     /// The peer's DTLS certificate fingerprint (`a=fingerprint`, RFC 8122), present on a DTLS-SRTP
     /// (`UDP/TLS/RTP/SAVP[F]`) offer/answer — it binds the handshake identity to the SDP (RFC 5763 §5).
@@ -139,9 +136,8 @@ pub struct TextMediaInfo {
     /// per-leg `SecureLeg` that decrypts ingress / encrypts egress, exactly as the audio SDES bridge does.
     pub secure: bool,
     /// The `a=crypto` lines offered in the text section (RFC 4568 SDES), in order — the peer's SRTP key
-    /// candidates for the text stream, filtered exactly as the audio `crypto` is. Present only on a
-    /// secure (`RTP/SAVP`) text section; empty for a plaintext one. The engine takes the first one to
-    /// key the text leg's inbound context and answers under its tag.
+    /// candidates for the text stream, filtered as the audio `crypto` is. Empty for a plaintext text
+    /// section. The first one keys the text leg's inbound context and names the answer's tag.
     pub crypto: Vec<CryptoAttribute>,
     /// The negotiated T.140 payload type (`a=rtpmap:<pt> t140/1000`, RFC 4103 §5), if the section
     /// carried one. Case-insensitive on the encoding name; the 1000 Hz clock is the RFC 4103 T.140 rate.
@@ -738,15 +734,6 @@ fn parse_media_line(value: &str) -> (MediaKind, Option<u16>) {
 }
 
 /// Parse the port from an `a=rtcp:<port> [...]` attribute body (`rtcp:<port> ...`).
-/// An `a=crypto` value the engine can key, or `None` for a line it cannot parse or whose suite the SRTP
-/// context does not run. Selecting such a line would answer a suite the engine never applies, so it is
-/// skipped as RFC 4568 §7.1.1 lets an answerer skip any line it does not support.
-fn keyable_crypto(value: &str) -> Option<CryptoAttribute> {
-    CryptoAttribute::parse(value)
-        .ok()
-        .filter(CryptoAttribute::is_keyable)
-}
-
 fn parse_rtcp_attr(value: &str) -> Option<u16> {
     value
         .strip_prefix("rtcp:")?
@@ -954,9 +941,8 @@ fn scan(sdp: &str) -> AudioScan {
                     } else if value.starts_with("crypto:") {
                         // RFC 4568 SDES key for a secure (`RTP/SAVP`) text stream — parsed here (scoped to
                         // the text section) so the engine can key the text `SecureLeg`. Ignore lines we
-                        // cannot parse or key (unknown suite, `_32`, bad key), exactly as the audio
-                        // section does.
-                        if let Some(crypto) = keyable_crypto(value) {
+                        // cannot parse or key (unknown suite, bad key), exactly as the audio section does.
+                        if let Some(crypto) = CryptoAttribute::parse_keyable(value) {
                             scan.text_crypto.push(crypto);
                         }
                     }
@@ -966,9 +952,8 @@ fn scan(sdp: &str) -> AudioScan {
                     } else if let Some(port) = parse_rtcp_attr(value) {
                         scan.audio_rtcp = Some((index, port));
                     } else if value.starts_with("crypto:") {
-                        // RFC 4568 SDES key; ignore lines we cannot parse or key (unknown suite,
-                        // `_32`, bad key).
-                        if let Some(crypto) = keyable_crypto(value) {
+                        // RFC 4568 SDES key; ignore lines we cannot parse or key (unknown suite, bad key).
+                        if let Some(crypto) = CryptoAttribute::parse_keyable(value) {
                             scan.crypto.push(crypto);
                         }
                     } else if value.starts_with("rtpmap:") {

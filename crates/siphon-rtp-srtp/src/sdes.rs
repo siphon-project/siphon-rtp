@@ -196,6 +196,14 @@ impl CryptoAttribute {
         Ok(Self { tag, suite, key })
     }
 
+    /// [`Self::parse`], keeping only a line [`Self::is_keyable`]: `None` for one the engine cannot
+    /// parse or whose suite the SRTP context does not run. An answerer skips any line it does not
+    /// support (RFC 4568 §7.1.1), so selecting such a line would answer a suite never applied.
+    #[must_use]
+    pub fn parse_keyable(attribute_value: &str) -> Option<Self> {
+        Self::parse(attribute_value).ok().filter(Self::is_keyable)
+    }
+
     /// Render the SDP attribute value (`crypto:<tag> <suite> inline:<base64>`), without the `a=`.
     #[must_use]
     pub fn to_attribute_value(&self) -> String {
@@ -280,6 +288,9 @@ mod tests {
             CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_32).expect("gen");
         assert!(eighty.is_keyable());
         assert!(!thirty_two.is_keyable());
+        assert!(CryptoAttribute::parse_keyable(&eighty.to_attribute_value()).is_some());
+        assert!(CryptoAttribute::parse_keyable(&thirty_two.to_attribute_value()).is_none());
+        assert!(CryptoAttribute::parse_keyable("crypto:1 AEAD_AES_128_GCM inline:AAAA").is_none());
     }
 
     #[test]
