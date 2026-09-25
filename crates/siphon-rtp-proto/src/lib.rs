@@ -1355,6 +1355,32 @@ pub struct ProfileFlags {
     /// cadence robustness for latency. Inert without `beep_detection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub beep_cadence_guard_ms: Option<u32>,
+    /// Pin this call to opaque relay: the engine forwards the payload it receives, byte for byte, and
+    /// refuses anything that would decode the audio. Set it on a call carrying T.30 fax — either as
+    /// G.711 passthrough or alongside a relayed T.38 stream.
+    ///
+    /// A fax is a modem signal, not speech. Every stage of the media pipeline that helps a voice call
+    /// destroys it: noise suppression and echo cancellation subtract from the waveform, packet loss
+    /// concealment invents samples the far modem's demodulator reads as data, and a codec cycle
+    /// requantizes it. **A µ-law ↔ A-law transcode is enough**, which is the trap this flag exists to
+    /// close: `transcode` is never asked for explicitly, it is derived from the two legs' primary
+    /// codecs, so a G.711µ caller and a G.711A callee silently take the userspace media path.
+    ///
+    /// It is an assertion, so it fails loudly rather than quietly downgrading. Combined with
+    /// `noise_suppression`, `echo_cancellation`, `beep_detection`, `record_call` or `ws_uri` — all of
+    /// which need the decoded audio — the offer/answer is **refused**. So is an answer whose codec
+    /// does not match the offer's, and a `codec-transcode-…` / `codec-mask-…` directive in `flags`.
+    /// Mid-call, a verb that would pull the call into the processing pipeline (`play_media`, `echo`,
+    /// WAV `start_recording`, a WebSocket tee, a local answer) is refused for as long as the pin
+    /// holds; the verbs that promote for verbatim relay only — pcap `start recording`, `block DTMF`
+    /// and X3 interception — are unaffected, because they never decode.
+    ///
+    /// Inert in the sense that it adds no processing of its own: a same-codec relay call already
+    /// forwards opaquely and constructs no codec, so on a correctly configured fax call this flag
+    /// changes nothing except what the engine will agree to do next. A native siphon-rtp extension —
+    /// the NG/bencode front-end does not set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fax_passthrough: bool,
     /// Attach this call's offerer (leg A) audio to an external WebSocket media server (the
     /// mod_audio_stream / voice-AI integration). When set on `offer`/`answer`, the engine dials this
     /// URI as a WebSocket client and bridges leg A's RTP to it (decode → L16 uplink, L16 downlink →

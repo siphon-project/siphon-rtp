@@ -460,6 +460,12 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         // rtpengine's NG dictionary has no equivalent directive, so it is never armed from here.
         beep_detection: false,
         beep_cadence_guard_ms: None,
+        // The opaque-relay pin is a native siphon-rtp (JSON control) extension; rtpengine's NG
+        // dictionary has no equivalent, and inventing a flag string for it would put a siphon-rtp
+        // word in a vocabulary that is meant to be rtpengine's. An NG-controlled fax call still
+        // relays correctly — an NG offer cannot reach a decoding pipeline except through
+        // `record call` or a codec directive — it just cannot assert that it will.
+        fax_passthrough: false,
         // The WS bridge and its voice-AI turn-taking knobs are native siphon-rtp (JSON control)
         // extensions; the NG/bencode front-end never sets them.
         ws_uri: None,

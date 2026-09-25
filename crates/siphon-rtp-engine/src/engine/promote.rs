@@ -379,9 +379,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         reason: PromotionReason,
         mode: PromoteMode,
     ) -> Result<(), String> {
-        let pipeline = self
-            .owned_call_internal(call_id, |call| call.pipeline)
+        let (pipeline, fax_passthrough) = self
+            .owned_call_internal(call_id, |call| (call.pipeline, call.fax_passthrough))
             .ok_or_else(|| "call no longer exists".to_string())?;
+        // A call pinned to opaque relay (`fax_passthrough`) cannot host a feature that decodes it.
+        // The offer/answer refused the profile-driven ones; this is the mid-call half of the same
+        // rule, and it has to live here rather than in each verb because every one of them funnels
+        // through this function. `PromoteMode::RelayOnly` — pcap recording, `block DTMF`, X3 — stays
+        // allowed: it forwards the payload verbatim, which is exactly what the pin asserts.
+        if fax_passthrough && mode == PromoteMode::Processing {
+            return Err(
+                "fax-passthrough-needs-decoded-audio: this call is pinned to opaque relay \
+                 (fax_passthrough), so it cannot be promoted to the processing pipeline — a fax \
+                 does not survive a decode/re-encode cycle"
+                    .to_string(),
+            );
+        }
         // Mirror `subscribe_request`'s guard: promote only a plain relay not already in the pipeline.
         // After promotion the call's pipeline is `Media`, so a second hold skips this and just records.
         if pipeline == PipelineKind::Passthrough && !self.media.is_media_call(call_id) {

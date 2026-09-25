@@ -501,7 +501,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 reason: "per-client call quota exceeded".to_string(),
             };
         }
-        if let Err(reason) = crate::media_pipeline::validate_echo_delay_search_ms(profile) {
+        if let Err(reason) = crate::media_pipeline::validate_profile(profile) {
             return CmdResult::Error {
                 reason: format!("offer: {reason}"),
             };
@@ -826,6 +826,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event: info.telephone_event_payload_type(),
                 far_telephone_event: None,
                 pipeline,
+                fax_passthrough: profile.fax_passthrough,
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
                 offer_received_from: profile.received_from,

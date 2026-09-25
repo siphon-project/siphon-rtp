@@ -7,6 +7,25 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [0.8.1] — 2026-09-25
 
+### Added
+
+- **`fax_passthrough`: a call can be pinned to opaque relay.** A fax is a modem signal, not speech, and
+  every stage of the media pipeline that helps a voice call destroys it — noise suppression and echo
+  cancellation subtract from the waveform, loss concealment invents samples the far modem's demodulator
+  reads as data, and a codec cycle requantizes it. Nothing stopped that happening: a transcode is never
+  asked for, it is *derived* from the two legs' primary codecs, so a G.711µ caller and a G.711A callee
+  silently took the userspace media path and the fax failed with every counter reading healthy. The new
+  profile flag makes the intent explicit and the engine refuses to violate it: an offer/answer that also
+  asks for noise suppression, echo cancellation, beep detection, recording or a WebSocket bridge is
+  rejected, as is a codec-manipulation directive or an answer whose codec does not match the offer's,
+  and mid-call the verbs that would promote the relay into the decoding pipeline are refused for the
+  call's life. The verbs that promote for verbatim relay only — pcap recording, DTMF block, X3
+  interception — are deliberately unaffected, which is why the gate is on the promotion *mode* rather
+  than on the call. It is an assertion rather than a feature: a same-codec relay already forwards
+  opaquely, so on a correctly configured fax call the flag changes nothing except what the engine will
+  agree to do next. Carried in the HA checkpoint, because losing a safety assertion across a failover
+  would let a later verb undo it.
+
 ### Fixed
 
 - **An SDES answer named the wrong offer line, so a multi-suite SRTP caller was one-way.** The

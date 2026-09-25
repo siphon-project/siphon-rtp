@@ -122,6 +122,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event: info.telephone_event_payload_type(),
                 far_telephone_event: None,
                 pipeline: PipelineKind::Passthrough,
+                // Refused above: a locally answered call synthesizes its own audio, so it can never
+                // be a fax relay.
+                fax_passthrough: false,
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
                 offer_received_from: profile.received_from,
@@ -451,9 +454,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 reason: "per-client call quota exceeded".to_string(),
             };
         }
-        if let Err(reason) = crate::media_pipeline::validate_echo_delay_search_ms(profile) {
+        if let Err(reason) = crate::media_pipeline::validate_profile(profile) {
             return CmdResult::Error {
                 reason: format!("answer_local: {reason}"),
+            };
+        }
+        // `answer_local` terminates the call on the engine and synthesizes its audio, which is the
+        // opposite of forwarding the payload untouched. There is nothing to relay a fax to.
+        if profile.fax_passthrough {
+            return CmdResult::Error {
+                reason: "answer_local: fax-passthrough-needs-a-peer-leg: fax_passthrough forwards \
+                         the payload verbatim, and answer_local terminates the call on the engine \
+                         with synthesized audio, so there is no peer to forward to"
+                    .to_string(),
             };
         }
         let info = match sdp::parse(sdp) {

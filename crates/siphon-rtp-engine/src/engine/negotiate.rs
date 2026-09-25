@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 use crate::ice::IceCredentials;
 use crate::media_pipeline::{DirectionConfig, RtcpRelay, SecureSide};
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
+use std::net::SocketAddr;
+
+use super::{Leg, PipelineKind};
 
 /// What the engine shows one party about the leg that faces it. Every SDP the engine hands a party is
 /// built from one of these and [`present_leg`]: `offer` presents the far leg to B, `answer` the near
@@ -869,5 +872,226 @@ pub(super) fn bridge_source_filter(
         SourceFilter::Subnet(addr.ip(), prefix)
     } else {
         SourceFilter::Exact(addr.ip())
+    }
+}
+
+// ---- How an answer is wired: the effective addresses, and the pipeline that carries it ----
+
+/// Both legs' effective source-gate addresses, and the destinations each direction transmits to
+/// until that peer's own first accepted packet moves the latch.
+///
+/// The gate and the destination are the same `(hint IP, signalled port)` pair, deliberately — see
+/// [`answer_gate_addresses`] — but they are separate fields because they answer separate questions
+/// and only one of them is a security boundary.
+pub(super) struct AnswerAddresses {
+    pub(super) near_gate_rtp: Option<SocketAddr>,
+    pub(super) near_gate_rtcp: Option<SocketAddr>,
+    pub(super) far_gate_rtp: SocketAddr,
+    pub(super) far_gate_rtcp: SocketAddr,
+    pub(super) near_media_dst: Option<SocketAddr>,
+    pub(super) near_rtcp_dst: Option<SocketAddr>,
+    pub(super) far_media_dst: SocketAddr,
+    pub(super) far_rtcp_dst: SocketAddr,
+}
+
+/// Which `received-from` hint gates the **far** (B) leg.
+///
+/// B's hint is this answer's when B is answering and it carries one, and otherwise the one stored
+/// from B's earlier answer or re-offer — so a renegotiation that omits it keeps gating a NATed B on
+/// its public address instead of falling back to the private `c=` it signalled. On a reversed
+/// answer (A answering B's re-offer) the profile belongs to A, so only the stored hint applies.
+pub(super) fn far_received_from_hint(
+    reversed: bool,
+    profile: &ProfileFlags,
+    stored: Option<std::net::IpAddr>,
+) -> Option<std::net::IpAddr> {
+    if reversed {
+        stored
+    } else {
+        profile.received_from.or(stored)
+    }
+}
+
+/// Fold each leg's rtpengine `received-from` hint — the real post-NAT source the SIP proxy saw the
+/// request come from — into the addresses the answer's wiring is built on.
+///
+/// Both keep the signalled **port** and only override the gated source IP, so the source gate is
+/// uniform across every path below (docs/security-and-nat.md §4 layer 2). `None` ⇒ the signalled
+/// address is used unchanged.
+///
+/// The destinations are the same pair, and that is the point. A `received-from` hint is the proxy
+/// telling us the peer's signalling really arrived from that public address, so its media almost
+/// certainly will too, while the private `c=` it advertised is unroutable: aiming there put the
+/// answering party's audio into the void for the whole pre-latch window (~400 ms of a NATed call at
+/// 20 ms ptime) and leaked RFC 1918 datagrams off the node.
+///
+/// It is a better opening guess, not a guarantee — behind a symmetric NAT the public media port need
+/// not be the signalled one, and that port on the NAT may even belong to another device. That is
+/// precisely why it stays confined to the pre-latch window and never becomes a latch substitute: the
+/// latch still governs from the first *accepted* packet onward, and the gate is unchanged, so
+/// nothing here widens what the engine will accept.
+pub(super) fn answer_gate_addresses(
+    near: &Leg,
+    info: &sdp::MediaInfo,
+    offer_received_from: Option<std::net::IpAddr>,
+    far_received_from: Option<std::net::IpAddr>,
+) -> AnswerAddresses {
+    let near_gate_rtp = apply_received_from(near.remote_rtp, offer_received_from);
+    let near_gate_rtcp = apply_received_from(near.remote_rtcp, offer_received_from);
+    let far_gate_rtp =
+        apply_received_from(Some(info.remote_rtp), far_received_from).unwrap_or(info.remote_rtp);
+    let far_gate_rtcp =
+        apply_received_from(Some(info.remote_rtcp), far_received_from).unwrap_or(info.remote_rtcp);
+    AnswerAddresses {
+        near_gate_rtp,
+        near_gate_rtcp,
+        far_gate_rtp,
+        far_gate_rtcp,
+        near_media_dst: near_gate_rtp,
+        near_rtcp_dst: near_gate_rtcp,
+        far_media_dst: far_gate_rtp,
+        far_rtcp_dst: far_gate_rtcp,
+    }
+}
+
+/// Resolve how this call's media is carried, or refuse the answer.
+///
+/// The only refusal is a call pinned to opaque relay (`fax_passthrough`) that resolved to a pipeline
+/// which decodes. It belongs here rather than at the call site because `transcode` is *derived*
+/// here — nothing asks for it — so this is the only place that knows both codecs and can say which
+/// two disagreed.
+///
+/// # Errors
+/// The reason string, ready to return as a `CmdResult::Error`.
+pub(super) fn resolve_pipeline(
+    near_codec: Option<&CodecSpec>,
+    info: &sdp::MediaInfo,
+    profile: &ProfileFlags,
+    far_local_crypto: Option<CryptoAttribute>,
+    near_local_crypto: Option<CryptoAttribute>,
+    far_dtls: bool,
+    near_dtls: bool,
+) -> Result<PipelineKind, String> {
+    let pipeline = resolve_pipeline_kind(
+        near_codec,
+        info,
+        profile,
+        far_local_crypto,
+        near_local_crypto,
+        far_dtls,
+        near_dtls,
+    );
+    if profile.fax_passthrough && pipeline.decodes_audio() {
+        let describe = |spec: Option<&CodecSpec>| {
+            spec.map_or_else(
+                || "an unknown codec".to_string(),
+                |spec| format!("{}/{}", spec.encoding_name, spec.clock_rate_hz),
+            )
+        };
+        return Err(format!(
+            "fax-passthrough-would-transcode: this answer selects {} while the other leg is on \
+             {}, which the engine can only bridge by decoding and re-encoding — a fax does not \
+             survive that. Answer the offered codec, or drop fax_passthrough.",
+            describe(info.primary_codec().as_ref()),
+            describe(near_codec),
+        ));
+    }
+    Ok(pipeline)
+}
+
+pub(super) fn resolve_pipeline_kind(
+    near_codec: Option<&CodecSpec>,
+    info: &sdp::MediaInfo,
+    profile: &ProfileFlags,
+    far_local_crypto: Option<CryptoAttribute>,
+    near_local_crypto: Option<CryptoAttribute>,
+    far_dtls: bool,
+    near_dtls: bool,
+) -> PipelineKind {
+    // Transcode when the two legs' primary codecs differ in encoding or clock rate.
+    let transcode = match (near_codec, info.primary_codec()) {
+        (Some(near), Some(far)) => !same_codec(near, &far),
+        _ => false,
+    };
+    // Everything that cannot be done to a payload the engine only forwards. **Every** arm below
+    // tests exactly this, and that is the point: each used to spell the list out for itself, and one
+    // of them — the secure far leg — spelled a shorter one, checking only `transcode ||
+    // beep_detection`. A recorded `RTP/AVP` ↔ `RTP/SAVP` call on a shared codec therefore resolved to
+    // the crypto bridge, which registers no media actor, holds no `WavRecorder` and drops
+    // `record_path`: the answer said `ok`, the audio crossed, and the recording never existed. Noise
+    // suppression and echo cancellation were inert on the same calls for the same reason. A new flag
+    // is added here and nowhere else.
+    let needs_decoded_audio = transcode
+        || profile.record_call
+        || profile.noise_suppression
+        || profile.echo_cancellation
+        || profile.beep_detection;
+    // A terminated DTLS-SRTP **offerer** toward a plain callee: the mirror of the DTLS far leg below,
+    // and like `SrtpOfferer` only in its crypto-bridge shape. Anything that needs the decoded audio
+    // falls through to a pipeline with no A-facing DTLS leg, which the caller then refuses.
+    if near_dtls && far_local_crypto.is_none() && !far_dtls && !needs_decoded_audio {
+        return PipelineKind::DtlsOfferer;
+    }
+    if far_dtls {
+        // DTLS-SRTP far leg. Route it through the media pipeline when something actually needs the
+        // decoded audio — a codec mismatch, recording, noise suppression, echo cancellation or
+        // record-tone (beep) detection — and through the plain crypto bridge otherwise, which stays
+        // cheaper (no decode/re-encode) and is all a same-codec WebRTC↔SIP call needs.
+        return if transcode
+            || profile.record_call
+            || profile.noise_suppression
+            || profile.echo_cancellation
+            || profile.beep_detection
+        {
+            PipelineKind::DtlsMedia
+        } else {
+            PipelineKind::Dtls
+        };
+    }
+    // Both parties on SDES-SRTP, under different keys: the transcrypt bridge. It must be tested
+    // before both arms below, which each assume the *other* party is plaintext — `SrtpOfferer`
+    // requires `far_local_crypto.is_none()` and `Srtp` would otherwise claim this call and encrypt
+    // A's still-encrypted datagrams a second time under B's key.
+    //
+    // Like the two one-sided bridges it relays the payload verbatim, so the bridge shape is taken
+    // exactly when nothing needs the decoded audio; anything that does takes the transcode twin
+    // below, which threads both parties' legs into the media actor instead.
+    if near_local_crypto.is_some() && far_local_crypto.is_some() && !far_dtls && !near_dtls {
+        return if needs_decoded_audio {
+            PipelineKind::SrtpTranscryptMedia
+        } else {
+            PipelineKind::SrtpTranscrypt
+        };
+    }
+    // A secure **offerer** toward a plain callee: the mirror of the secure-far-leg bridge below. Only
+    // the crypto-bridge shape is wired, so this yields `SrtpOfferer` exactly when nothing needs the
+    // decoded audio. Anything that does — a codec mismatch, recording, NS, AEC, beep detection —
+    // falls through to a media pipeline that has no A-facing `SecureLeg` threaded into it, which the
+    // caller then refuses rather than silently relaying the caller's audio undecrypted or unencrypted.
+    if near_local_crypto.is_some()
+        && far_local_crypto.is_none()
+        && !far_dtls
+        && !needs_decoded_audio
+    {
+        return PipelineKind::SrtpOfferer;
+    }
+    if far_local_crypto.is_some() {
+        // Secure far leg: the plain SRTP bridge when both legs share a codec and nothing needs the
+        // decoded audio (crypto only), or the secure transcoding media slow path otherwise —
+        // decrypt → transcode → encrypt (BGCF/SBC: a secure AMR-WB access leg ↔ a plaintext G.711
+        // PSTN leg).
+        return if needs_decoded_audio {
+            PipelineKind::SrtpMedia
+        } else {
+            PipelineKind::Srtp
+        };
+    }
+    if needs_decoded_audio {
+        // Recording, noise suppression, echo cancellation, record-tone (beep) detection, or a codec
+        // mismatch all need the decoded audio, so force the userspace media slow path instead of the
+        // in-kernel passthrough.
+        PipelineKind::Media
+    } else {
+        PipelineKind::Passthrough
     }
 }
