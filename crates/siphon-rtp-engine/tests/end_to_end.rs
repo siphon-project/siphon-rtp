@@ -510,6 +510,174 @@ async fn offer_answer_relay_delete_over_tcp_control() {
     assert!(matches!(requery, CmdResult::Error { .. }));
 }
 
+/// A control server whose engine also runs the redirect dispatcher — needed by any stream that is
+/// relayed in userspace rather than in the datapath, which for T.38 is every one of them.
+async fn spawn_control_server_with_dispatcher() -> SocketAddr {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    tokio::spawn(run_redirect_dispatcher_with_text(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.text(),
+        engine.udptl(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    tokio::spawn(async move {
+        let _ = server::serve(engine, listener).await;
+    });
+    control_addr
+}
+
+/// An `m=audio` (PCMU) + `m=image` (T.38 over UDPTL) SDP, each on its own port, sharing the loopback
+/// connection address. The `a=T38*` attributes are the T.38 Annex D set a real offer carries.
+fn audio_image_sdp(audio: SocketAddr, image: SocketAddr) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {aport} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+         m=image {iport} udptl t38\r\n\
+         a=T38FaxVersion:0\r\na=T38MaxBitRate:14400\r\n\
+         a=T38FaxRateManagement:transferredTCF\r\na=T38FaxUdpEC:t38UDPRedundancy\r\n",
+        ip = audio.ip(),
+        aport = audio.port(),
+        iport = image.port(),
+    )
+}
+
+/// The engine's advertised UDPTL address, parsed back out of a rewritten SDP's `m=image` section.
+fn image_engine_addr(result: &CmdResult) -> SocketAddr {
+    match result {
+        CmdResult::Ok {
+            sdp: Some(text), ..
+        } => {
+            sdp::parse(text)
+                .expect("parse engine image addr")
+                .image
+                .expect("fax stream anchored")
+                .remote
+        }
+        other => panic!("expected Ok with sdp, got {other:?}"),
+    }
+}
+
+/// A UDPTL datagram (ITU-T T.38 Annex D): the 16-bit sequence number, then a primary IFP packet,
+/// then the error-recovery field.
+///
+/// The payload is a real, well-formed one — `01 00` is a one-octet IFP carrying the T.30 indicator
+/// `no-signal`, and `00 00` is an empty `secondary-ifp-packets` list. Verified against Wireshark's
+/// T.38 dissector, which reads it with no malformed or undecoded field; a made-up payload would
+/// still exercise the relay, but nobody reading a capture of these tests could tell whether the
+/// engine or the fixture was at fault.
+///
+/// The sequence number is the part that matters here. A fax starts at 0, so its first datagram leads
+/// with `0x00` — which the RFC 7983 demux on the datapath's `Forward` path reads as **STUN** and
+/// drops. Relaying this datagram at all is the proof that the fax stream does not ride that path.
+fn udptl(sequence: u16) -> Vec<u8> {
+    let mut datagram = Vec::from(sequence.to_be_bytes());
+    datagram.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+    datagram
+}
+
+/// A plaintext `m=audio` + `m=image` call relays BOTH streams end-to-end over the UDP-loopback
+/// datapath: a UDPTL datagram into one fax port comes out the other, byte for byte, while the audio
+/// relay is unaffected. Proves the section-aware SDP anchor plus the per-stream UDPTL relay, source
+/// gate and opaque latch. NIC-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offer_answer_relays_audio_and_t38_udptl_end_to_end() {
+    let control_addr = spawn_control_server_with_dispatcher().await;
+    let mut control = Control::connect(control_addr).await;
+
+    let (phone_a_audio, addr_a_audio) = phone().await;
+    let (phone_a_image, addr_a_image) = phone().await;
+    let (phone_b_audio, addr_b_audio) = phone().await;
+    let (phone_b_image, addr_b_image) = phone().await;
+
+    let offer = control
+        .request(Command::Offer {
+            call_id: "fax".into(),
+            from_tag: "tag-a".into(),
+            sdp: audio_image_sdp(addr_a_audio, addr_a_image),
+            profile: Default::default(),
+        })
+        .await;
+    let far_audio = engine_addr(&offer);
+    let far_image = image_engine_addr(&offer);
+    assert_ne!(
+        far_audio.port(),
+        far_image.port(),
+        "audio + fax anchored on distinct engine ports"
+    );
+    // The T.38 attributes are the two fax endpoints' contract, not the relay's.
+    assert!(sdp_text(&offer).contains("a=T38FaxUdpEC:t38UDPRedundancy"));
+
+    let answer = control
+        .request(Command::Answer {
+            call_id: "fax".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: audio_image_sdp(addr_b_audio, addr_b_image),
+            profile: Default::default(),
+        })
+        .await;
+    let near_audio = engine_addr(&answer);
+    let near_image = image_engine_addr(&answer);
+
+    // Audio still relays: anchoring a fax stream must not disturb the audio path.
+    phone_a_audio
+        .send_to(&rtp(1), near_audio)
+        .await
+        .expect("send audio");
+    let (relayed, from) = recv(&phone_b_audio).await;
+    assert_eq!(relayed, rtp(1));
+    assert_eq!(from, far_audio);
+
+    // A→B, on a datagram whose first byte the RFC 7983 demux calls STUN.
+    let first = udptl(0);
+    assert_eq!(first[0], 0x00, "sequence 0 leads with a STUN-class byte");
+    phone_a_image
+        .send_to(&first, near_image)
+        .await
+        .expect("send udptl");
+    let (relayed, from) = recv(&phone_b_image).await;
+    assert_eq!(relayed, first, "the fax payload is relayed byte for byte");
+    assert_eq!(from, far_image, "out of the engine's own fax port");
+
+    // B→A, exercising the reverse direction's own gate and latch.
+    let reply = udptl(1);
+    phone_b_image
+        .send_to(&reply, far_image)
+        .await
+        .expect("send udptl reply");
+    let (relayed, from) = recv(&phone_a_image).await;
+    assert_eq!(relayed, reply);
+    assert_eq!(from, near_image);
+
+    // Sequence numbers that land in every other demux class relay just the same.
+    for sequence in [0x1400_u16, 0x8000, 0xffff] {
+        let datagram = udptl(sequence);
+        phone_a_image
+            .send_to(&datagram, near_image)
+            .await
+            .expect("send udptl");
+        let (relayed, _) = recv(&phone_b_image).await;
+        assert_eq!(relayed, datagram, "sequence {sequence:#06x}");
+    }
+
+    let deleted = control
+        .request(Command::Delete {
+            call_id: "fax".into(),
+            from_tag: "tag-a".into(),
+            to_tag: None,
+        })
+        .await;
+    assert!(matches!(deleted, CmdResult::Ok { .. }), "{deleted:?}");
+}
+
 /// An `m=audio` (PCMU) + RFC 4103 `m=text` (RED pt 98 wrapping T.140 pt 99) SDP, each on its own port
 /// but sharing the loopback connection address.
 fn audio_text_sdp(audio: SocketAddr, text: SocketAddr) -> String {
@@ -662,6 +830,7 @@ async fn text_events_promotes_only_text_emits_events_and_carries_cdr_counters() 
         engine.bridge(),
         engine.media(),
         engine.text(),
+        engine.udptl(),
         engine.ws(),
         engine.conference(),
         None,
@@ -811,6 +980,7 @@ async fn finish_call_exports_rfc4103_text_qos_to_the_hep_collector() {
         engine.bridge(),
         engine.media(),
         engine.text(),
+        engine.udptl(),
         engine.ws(),
         engine.conference(),
         None,
@@ -1037,6 +1207,7 @@ async fn secure_sdes_text_bridge_rekeys_end_to_end_with_audio_unaffected() {
         engine.bridge(),
         engine.media(),
         engine.text(),
+        engine.udptl(),
         engine.ws(),
         engine.conference(),
         None,
@@ -1241,6 +1412,7 @@ async fn without_observability_text_stays_in_kernel_and_still_relays() {
         engine.bridge(),
         engine.media(),
         engine.text(),
+        engine.udptl(),
         engine.ws(),
         engine.conference(),
         None,
@@ -1324,6 +1496,7 @@ async fn conference_distributes_multiparty_text_with_per_source_csrc() {
         engine.bridge(),
         engine.media(),
         engine.text(),
+        engine.udptl(),
         engine.ws(),
         engine.conference(),
         None,
@@ -1443,6 +1616,7 @@ async fn conference_secures_multiparty_text_per_participant() {
         engine.bridge(),
         engine.media(),
         engine.text(),
+        engine.udptl(),
         engine.ws(),
         engine.conference(),
         None,
@@ -1825,6 +1999,7 @@ async fn a_teed_call_reports_the_negotiated_wire_sample_rate_on_the_control_plan
         engine.bridge(),
         engine.media(),
         engine.text(),
+        engine.udptl(),
         engine.ws(),
         engine.conference(),
         None,

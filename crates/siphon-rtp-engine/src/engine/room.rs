@@ -354,6 +354,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // phase — so there is no text component to gather candidates for.
                     text: None,
                     text_remote_rtp: None,
+                    // Neither a single-leg local answer nor a conference seat relays fax.
+                    image: None,
+                    image_remote: None,
                 };
                 let candidates = self.gather_leg_candidates(&leg, &config).await;
                 (candidates, Some(config))

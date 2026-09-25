@@ -160,6 +160,15 @@ per-leg media interface (below).
 | `ws_tee_channels` | int | Wire channel count for `ws_tee`: `2` = stereo caller/callee, `1` = mixed mono. Unset ⇒ 2 when both legs are teed, 1 for a single leg. Inert without `ws_tee`. |
 | `ws_tee_sample_rate` | int | L16 wire sample rate in Hz for `ws_tee`, independent of either leg's codec rate: each tapped leg is resampled into it before framing. Must be a multiple of 1000 within 8000–48000, else the answer is rejected (never clamped). Unset ⇒ the tapped leg's own codec PCM rate. Inert without `ws_tee`. |
 
+**T.38 fax needs no control surface.** An `m=image <port> udptl t38` section in the offer or answer
+is anchored to a UDPTL endpoint of the engine's own on each leg and relayed transparently, with its
+own source gate and latch — there is no flag to set and nothing reported back, exactly as the RFC
+4103 text stream needs nothing beyond `text_events`. The T.30 switchover shape that carries **no**
+`m=audio` line at all is handled too. A transport the engine cannot relay (T.38 over TCP or over
+DTLS) is declined with `m=image 0` rather than passed through. For a fax that stays on G.711 instead
+of switching to T.38, see `fax_passthrough` above. There is no T.38 **gateway**: the engine will not
+bridge a T.38 leg to a G.711 one.
+
 ### Liveness and census
 
 | Verb | Fields | Result |

@@ -164,6 +164,50 @@ latch need (RFC 3550 header fields). Two consequences worth naming:
 - **Passive monitoring keeps working.** Because SSRC and sequence numbers survive the relay, a
   passive capture (VoIPmonitor-style) can still correlate the two legs.
 
+## Fax: T.38 and G.711 passthrough
+
+A call carrying T.30 fax comes in one of two shapes, and they need different things from you.
+
+**T.38.** When a gateway switches the call to T.38 it re-INVITEs with an `m=image <port> udptl t38`
+section — usually *replacing* the audio stream, so the re-INVITE has no `m=audio` line at all. The
+engine anchors that section to a UDPTL endpoint of its own on each leg and relays the stream between
+them, byte for byte. Nothing to configure: it happens on any relay call that offers one, the same
+way the audio stream is anchored.
+
+The fax stream is its own inbound surface, with its own source gate and its own latch, so a spoofed
+source on the fax port cannot touch the audio and vice versa. One property to plan around: the fax
+latch **learns once and never moves**. UDPTL carries no SSRC, so nothing could prove a new source is
+the same stream, and a mid-call NAT rebind stops the fax rather than following it. Faxes are retried;
+a stream that follows whoever shouts loudest is worse.
+
+T.38 over TCP or over DTLS is declined (`m=image 0`, RFC 3264 §6) rather than passed through. There
+is no T.38 **gateway** — the engine will not bridge a T.38 leg to a G.711 one.
+
+**G.711 passthrough.** A fax that never switches to T.38 is just audio, and a plain relay already
+carries it: no codec runs, nothing touches the payload. The danger is a call that is *not* a plain
+relay. A fax is a modem signal, and every stage that helps a voice call destroys it — noise
+suppression and echo cancellation subtract from the waveform, loss concealment invents samples the
+far modem reads as data, and a codec cycle requantizes it. A µ-law ↔ A-law transcode is enough, and
+nobody asks for that one: it is derived from the two legs' codecs, so a G.711µ caller and a G.711A
+callee take the media slow path silently.
+
+Set `fax_passthrough` on the offer and answer to pin the call:
+
+```json
+{"command": "offer", "call_id": "fax-1", "from_tag": "a",
+ "sdp": "...", "profile": {"fax_passthrough": true}}
+```
+
+The engine then refuses anything that would decode the call rather than doing it quietly: a profile
+that also asks for noise suppression, echo cancellation, beep detection, recording or a WebSocket
+bridge, a codec-manipulation directive, an answer whose codec differs from the offer's, and mid-call
+any verb that would pull the relay into the processing pipeline. The verbs that promote for verbatim
+relay only — pcap recording, DTMF block, lawful intercept — keep working, because they never decode.
+
+It is an assertion, not a feature: on a correctly configured fax call it changes nothing except what
+the engine will agree to do next. It is native-JSON only; an NG-controlled call still relays a fax
+correctly, it just cannot assert that it will.
+
 ## NAT: symmetric RTP, safely
 
 Each leg's ingress is gated to the source the SDP signalled, and the reply destination latches to

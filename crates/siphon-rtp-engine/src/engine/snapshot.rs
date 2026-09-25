@@ -450,6 +450,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // with the deferred SrtpMedia/Ws restore) — a restored call carries audio only.
             text: None,
             text_remote_rtp: None,
+            // T.38 fax stream: likewise not checkpointed. A fax mid-transmission does not survive a
+            // failover in any case — its T.30 session is stateful and the peers will retrain or
+            // abandon — so restoring an anchored image endpoint would preserve a port and nothing
+            // that uses it.
+            image: None,
+            image_remote: None,
         };
         let far = Leg {
             rtp: far_rtp,
@@ -460,9 +466,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .far
                 .advertised_ip
                 .unwrap_or_else(|| far_rtp.local_addr.ip()),
-            // RTT text stream: HA checkpoint/restore deferred (see the near leg).
+            // RTT text and T.38 fax streams: HA checkpoint/restore deferred (see the near leg).
             text: None,
             text_remote_rtp: None,
+            image: None,
+            image_remote: None,
         };
 
         // Install the datapath flows and resolve the crypto per pipeline.

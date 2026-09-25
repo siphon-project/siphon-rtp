@@ -127,6 +127,24 @@ and never links the XDP toolchain — and even that userspace rewrite costs only
 way. There is no `/proc/rtpengine` interface (siphon-rtp is not a kernel module); stats come from
 `query`/`statistics` and [Prometheus](observability.md).
 
+**T.38 fax is relayed, not gatewayed.** Like rtpengine, siphon-rtp anchors an `m=image ... udptl
+t38` section and relays the UDPTL stream between the two legs, so a T.30 switchover re-INVITE works
+through the engine and the fax media never bypasses it. Unlike an rtpengine built with spandsp,
+there is **no T.38 gateway**: siphon-rtp will not bridge a T.38 leg to a G.711 audio leg, because
+that needs a full V.17/V.29/V.27ter/V.21 modem stack and siphon-rtp is pure Rust with no C library
+dependencies. A call that needs T.38↔G.711 conversion needs a gateway in front of the engine.
+
+Two behaviours to know before cutover. T.38 over **TCP** (Annex E) or over DTLS is declined with
+`m=image 0` (RFC 3264 §6) rather than passed through — passing an unanchored section through would
+advertise the UE's own address and take the media off the engine, which is a silent topology change
+rather than a no-op. And the fax stream's latch **learns once and never moves**: there is no SSRC to
+key a re-latch on, so a mid-call NAT rebind stops the fax instead of following it.
+
+For a fax call that stays on G.711 rather than switching to T.38, set `fax_passthrough` on the
+native JSON control plane to pin the call to opaque relay. It is not settable over NG (rtpengine has
+no equivalent flag), but an NG-controlled call still relays a fax correctly as long as the routing
+script does not ask for transcoding or recording.
+
 **NG is UDP-only and unauthenticated.** Like rtpengine, the NG protocol has no authentication;
 unlike recent rtpengine, siphon-rtp listens for NG on UDP only (no NG-over-TCP). Keep `--ng` on a
 trusted control network. The native JSON front-end supports a shared secret

@@ -144,6 +144,10 @@ harness = false
 name = "control_identity_bench"
 harness = false
 
+[[bench]]
+name = "udptl_relay_bench"
+harness = false
+
 [lints]
 workspace = true
 

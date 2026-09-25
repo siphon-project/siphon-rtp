@@ -369,6 +369,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     far_local_crypto.is_some() || far_dtls,
                 ),
                 mux_override: near_mux_override,
+                image: near.image_rewrite(info.image.is_some()),
                 text: if near.text.is_none() {
                     TextRewrite::None
                 } else if secure_text_accepted {
@@ -414,6 +415,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 });
                 LegPresentation {
                     engine: far.engine_media(),
+                    image: far.image_rewrite(info.image.is_some()),
                     // B's leg as the original offer presented it: without ICE when `ice: remove` took
                     // it off, whatever credentials the call holds for A's leg (RFC 8839 §4.2.5).
                     ice: if far_ice_removed {
@@ -609,6 +611,8 @@ struct AnswerRecord<'a> {
     to_tag: &'a str,
     info: &'a sdp::MediaInfo,
     far_text_remote: Option<std::net::SocketAddr>,
+    /// B's signalled UDPTL address, when a T.38 stream was relayed. `None` otherwise.
+    far_image_remote: Option<std::net::SocketAddr>,
     near_codec: Option<&'a CodecSpec>,
     ptime_override: Option<u8>,
     pipeline: PipelineKind,
@@ -781,6 +785,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             to_tag,
             info,
             far_text_remote,
+            far_image_remote,
             near_codec,
             ptime_override,
             pipeline,
@@ -803,6 +808,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // The far side's signalled text address (its answer's `m=text`/`c=`), for the text
                 // relay's reverse forward destination + gate anchor. `None` when no text was relayed.
                 far.text_remote_rtp = far_text_remote;
+                // Likewise B's fax address, for a later re-offer and for teardown bookkeeping.
+                far.image_remote = far_image_remote;
             }
             // Store the *effective* (ptime-overridden) codecs so an HA checkpoint captures the override
             // and a restore rebuilds the transcode at the same packetization (inert for a plain relay).
@@ -1198,12 +1205,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Err(result) => return *result,
         };
 
+        // The T.38 fax relay, if both legs anchored one and B accepted it. It is installed after the
+        // audio/text wiring and independently of it: a fax stream is its own inbound surface with its
+        // own gate and latch, and a failure to bring it up must not fail the call's audio.
+        let far_image_remote =
+            self.install_answer_image(call_id, profile, &info, &near, &far, offer_received_from);
+
         self.record_answer(
             call_id,
             AnswerRecord {
                 to_tag: &to_tag,
                 info: &info,
                 far_text_remote,
+                far_image_remote,
                 near_codec: near_codec.as_ref(),
                 ptime_override,
                 pipeline,

@@ -279,6 +279,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.bridge.deregister(endpoints.iter().copied());
         self.media.deregister(call_id);
         self.text.deregister(call_id);
+        self.udptl.deregister(call_id);
         // The WS takeover bridge closes with the call, so its controller gets a final
         // `ws_bridge_ended` rather than a stream that simply stops.
         self.stop_ws_bridge(call_id, WsBridgeEndReason::CallEnded)

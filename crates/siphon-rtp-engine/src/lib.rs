@@ -35,6 +35,7 @@ pub mod server;
 pub mod shutdown;
 pub mod srtp_bridge;
 pub mod text_pipeline;
+pub mod udptl_pipeline;
 pub mod ws_bridge;
 pub mod x3;
 
