@@ -54,7 +54,10 @@ pub struct MediaInfo {
     /// The direction this party declared for the audio stream (RFC 4566 §6 / RFC 8866 §6.7),
     /// media-level winning over session-level. [`MediaDirection::SendRecv`] when absent.
     pub direction: MediaDirection,
-    /// The `a=crypto` lines offered (RFC 4568 SDES), in order — the peer's SRTP key candidates.
+    /// The `a=crypto` lines offered (RFC 4568 SDES) that the engine can key, in order and under their
+    /// offered tags — the peer's SRTP key candidates. Lines in a suite the SRTP context does not run
+    /// are dropped at parse, so `first()` is the line an answer accepts and must echo the tag of
+    /// (RFC 4568 §5.1.2, §7.1.1).
     pub crypto: Vec<CryptoAttribute>,
     /// The peer's DTLS certificate fingerprint (`a=fingerprint`, RFC 8122), present on a DTLS-SRTP
     /// (`UDP/TLS/RTP/SAVP[F]`) offer/answer — it binds the handshake identity to the SDP (RFC 5763 §5).
@@ -136,8 +139,9 @@ pub struct TextMediaInfo {
     /// per-leg `SecureLeg` that decrypts ingress / encrypts egress, exactly as the audio SDES bridge does.
     pub secure: bool,
     /// The `a=crypto` lines offered in the text section (RFC 4568 SDES), in order — the peer's SRTP key
-    /// candidates for the text stream. Present only on a secure (`RTP/SAVP`) text section; empty for a
-    /// plaintext one. The engine takes the first usable one to key the text leg's inbound context.
+    /// candidates for the text stream, filtered exactly as the audio `crypto` is. Present only on a
+    /// secure (`RTP/SAVP`) text section; empty for a plaintext one. The engine takes the first one to
+    /// key the text leg's inbound context and answers under its tag.
     pub crypto: Vec<CryptoAttribute>,
     /// The negotiated T.140 payload type (`a=rtpmap:<pt> t140/1000`, RFC 4103 §5), if the section
     /// carried one. Case-insensitive on the encoding name; the 1000 Hz clock is the RFC 4103 T.140 rate.
@@ -734,6 +738,15 @@ fn parse_media_line(value: &str) -> (MediaKind, Option<u16>) {
 }
 
 /// Parse the port from an `a=rtcp:<port> [...]` attribute body (`rtcp:<port> ...`).
+/// An `a=crypto` value the engine can key, or `None` for a line it cannot parse or whose suite the SRTP
+/// context does not run. Selecting such a line would answer a suite the engine never applies, so it is
+/// skipped as RFC 4568 §7.1.1 lets an answerer skip any line it does not support.
+fn keyable_crypto(value: &str) -> Option<CryptoAttribute> {
+    CryptoAttribute::parse(value)
+        .ok()
+        .filter(CryptoAttribute::is_keyable)
+}
+
 fn parse_rtcp_attr(value: &str) -> Option<u16> {
     value
         .strip_prefix("rtcp:")?
@@ -941,8 +954,9 @@ fn scan(sdp: &str) -> AudioScan {
                     } else if value.starts_with("crypto:") {
                         // RFC 4568 SDES key for a secure (`RTP/SAVP`) text stream — parsed here (scoped to
                         // the text section) so the engine can key the text `SecureLeg`. Ignore lines we
-                        // cannot parse (unknown suite, bad key), exactly as the audio section does.
-                        if let Ok(crypto) = CryptoAttribute::parse(value) {
+                        // cannot parse or key (unknown suite, `_32`, bad key), exactly as the audio
+                        // section does.
+                        if let Some(crypto) = keyable_crypto(value) {
                             scan.text_crypto.push(crypto);
                         }
                     }
@@ -952,8 +966,9 @@ fn scan(sdp: &str) -> AudioScan {
                     } else if let Some(port) = parse_rtcp_attr(value) {
                         scan.audio_rtcp = Some((index, port));
                     } else if value.starts_with("crypto:") {
-                        // RFC 4568 SDES key; ignore lines we cannot parse (unknown suite, bad key).
-                        if let Ok(crypto) = CryptoAttribute::parse(value) {
+                        // RFC 4568 SDES key; ignore lines we cannot parse or key (unknown suite,
+                        // `_32`, bad key).
+                        if let Some(crypto) = keyable_crypto(value) {
                             scan.crypto.push(crypto);
                         }
                     } else if value.starts_with("rtpmap:") {
@@ -3335,6 +3350,30 @@ mod tests {
         let plain = parse(&offer("203.0.113.7", 49170)).expect("parse");
         assert!(!plain.secure);
         assert!(plain.crypto.is_empty());
+    }
+
+    #[test]
+    fn parse_keeps_only_crypto_lines_the_engine_can_key_with_their_offered_tags() {
+        // A desk phone listing GCM first and a `_32` line ahead of the 80-bit one: only the line the
+        // SRTP context runs survives, under the tag the offer gave it (RFC 4568 §5.1.2), in both the
+        // audio and the text section. `crypto.first()` is therefore the line an answer accepts.
+        let sdp = concat!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n",
+            "m=audio 49170 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+            "a=crypto:1 AEAD_AES_128_GCM inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n",
+            "a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n",
+            "a=crypto:3 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n",
+            "a=crypto:4 AES_256_CM_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n",
+            "m=text 49172 RTP/SAVP 98\r\na=rtpmap:98 t140/1000\r\n",
+            "a=crypto:5 AES_CM_128_HMAC_SHA1_32 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n",
+            "a=crypto:6 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n",
+        );
+        let info = parse(sdp).expect("parse");
+        let audio: Vec<_> = info.crypto.iter().map(|crypto| crypto.tag).collect();
+        assert_eq!(audio, vec![3]);
+        let text = info.text.expect("text section");
+        let text: Vec<_> = text.crypto.iter().map(|crypto| crypto.tag).collect();
+        assert_eq!(text, vec![6]);
     }
 
     /// A WebRTC-style DTLS-SRTP (`UDP/TLS/RTP/SAVPF`) offer: fingerprint + setup + ICE, no `a=crypto`.

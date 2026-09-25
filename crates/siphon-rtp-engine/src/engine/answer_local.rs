@@ -5,7 +5,7 @@ use siphon_rtp_datapath::{AddressFamily, Datapath, IceAgentMode, IceConfig, Sour
 use siphon_rtp_dtls::{DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_proto::{CmdResult, ProfileFlags};
 use siphon_rtp_srtp::leg::SecureLeg;
-use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+use siphon_rtp_srtp::sdes::CryptoAttribute;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -564,15 +564,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // told the peer to decrypt with.
         let (security, near_local_crypto) = match &offerer_security {
             WsTakeoverSecurity::Plain => (None, None),
-            WsTakeoverSecurity::Sdes { .. } => {
-                match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
-                    Ok(local) => (Some(SecurityAdvertisement::Secure(local)), Some(local)),
-                    Err(error) => {
-                        self.free(&endpoints).await;
-                        return error_result("answer_local: generate SDES key", &error);
-                    }
+            // Under the tag and suite of the offer line accepted (RFC 4568 §5.1.2).
+            WsTakeoverSecurity::Sdes { peer_key } => match CryptoAttribute::answer_to(peer_key) {
+                Ok(local) => (Some(SecurityAdvertisement::Secure(local)), Some(local)),
+                Err(error) => {
+                    self.free(&endpoints).await;
+                    return error_result("answer_local: generate SDES key", &error);
                 }
-            }
+            },
             WsTakeoverSecurity::Dtls { peer_setup, .. } => {
                 let Some(certificate) = self.dtls_certificate.as_ref() else {
                     self.free(&endpoints).await;

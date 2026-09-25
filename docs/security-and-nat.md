@@ -670,6 +670,15 @@ is wrong, and encryption defeats A2 eavesdrop.
   engine's *own* offered key (the `a=crypto` it advertised); inbound (peer→engine) decrypts with the
   *peer's* answered key. The peer's `a=crypto` is always re-originated (dropped and replaced), like
   ICE — a secure leg's key never leaks onto the plaintext leg's rewritten SDP.
+- **Which offered line is accepted, and how the answer names it.** An offerer may list several
+  `a=crypto` lines. The engine accepts the first one it can key: lines in a suite the SRTP context does
+  not run (AEAD, 256-bit, and `_32`, since the context authenticates with the 80-bit tag only) are
+  dropped at SDP parse (RFC 4568 §7.1.1), so the inbound context is always keyed from the accepted line.
+  The engine's own key is then answered under **that line's tag and suite** (RFC 4568 §5.1.2), at every
+  answerer: the offer/answer bridge (audio and text), `answer_local`, and a conference seat (audio and
+  text). Numbering the answer from one is a silent one-way-audio bug: an offerer whose first line is a
+  suite the engine skipped reads tag 1 as "my first line was accepted", encrypts under that context,
+  and every one of its packets fails authentication without appearing as a drop anywhere.
 - **A renegotiation keeps the crypto, and keeps it continuous.** Completing an offer/answer on a live
   call re-runs the answer path, which rebuilds the leg's wiring; two things have to survive that, and
   both are enforced rather than left to chance. A **DTLS association** is kept and re-pointed (each

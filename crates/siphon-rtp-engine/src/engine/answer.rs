@@ -5,7 +5,7 @@ use siphon_rtp_codec::factory::{CodecSpec, OPUS_MAX_PTIME_MS};
 use siphon_rtp_datapath::{Datapath, EndpointId, ForwardRule, LatchPolicy, SourceFilter};
 use siphon_rtp_dtls::DtlsRole;
 use siphon_rtp_proto::{CmdResult, ProfileFlags};
-use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+use siphon_rtp_srtp::sdes::CryptoAttribute;
 
 use crate::ice::IceCredentials;
 use crate::sdp::{self, IceRewrite, SecurityAdvertisement, TextRewrite};
@@ -521,6 +521,8 @@ fn accept_answer_text(
     // that one is kept — failing closed rather than keying a stream A cannot decrypt.
     let near_text_local_crypto = match (reversed, secure_text_accepted) {
         (_, false) => None,
+        // Answering A's secure text offer: the engine's key goes under the tag and suite of the line
+        // it accepted from A (RFC 4568 §5.1.2), exactly as the audio key does.
         (Some(reversed), true) => match reversed.near_text_local_crypto {
             Some(crypto) => Some(crypto),
             None => {
@@ -530,15 +532,23 @@ fn accept_answer_text(
                 )))
             }
         },
-        (None, true) => match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
-            Ok(crypto) => Some(crypto),
-            Err(error) => {
+        (None, true) => {
+            let Some(accepted) = near_text_remote_crypto else {
                 return Err(Box::new(error_result(
-                    "answer: generate text SDES key",
-                    &error,
-                )))
+                    "answer secure text",
+                    &"A's secure text offer carried no keyable a=crypto",
+                )));
+            };
+            match CryptoAttribute::answer_to(&accepted) {
+                Ok(crypto) => Some(crypto),
+                Err(error) => {
+                    return Err(Box::new(error_result(
+                        "answer: generate text SDES key",
+                        &error,
+                    )))
+                }
             }
-        },
+        }
     };
     Ok(AnswerTextAcceptance {
         secure_text_accepted,

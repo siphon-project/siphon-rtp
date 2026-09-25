@@ -14,7 +14,7 @@ use siphon_rtp_proto::{
     RecordingEndReason,
 };
 use siphon_rtp_srtp::leg::SecureLeg;
-use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+use siphon_rtp_srtp::sdes::CryptoAttribute;
 use std::sync::Arc;
 
 use crate::conference::{ConferenceControl, ParticipantConfig, ParticipantTextConfig, Routing};
@@ -179,10 +179,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         // plainly.
                         let (text_secure, text_rewrite) = match text_remote_crypto {
                             Some(remote) if text.secure => {
-                                let local = match CryptoAttribute::generate(
-                                    1,
-                                    CryptoSuite::AesCm128HmacSha1_80,
-                                ) {
+                                // Under the accepted line's tag and suite (RFC 4568 §5.1.2).
+                                let local = match CryptoAttribute::answer_to(&remote) {
                                     Ok(local) => local,
                                     Err(error) => {
                                         self.free(&[endpoint, text_endpoint]).await;
@@ -422,7 +420,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &"RTP/SAVP offer without a usable a=crypto",
                 );
             };
-            let local = match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+            // Under the accepted line's tag and suite (RFC 4568 §5.1.2).
+            let local = match CryptoAttribute::answer_to(&remote) {
                 Ok(local) => local,
                 Err(error) => {
                     self.free(&[endpoint]).await;

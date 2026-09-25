@@ -153,6 +153,22 @@ impl CryptoAttribute {
         })
     }
 
+    /// The answerer's attribute for an accepted offer line: fresh key material under the offered
+    /// line's tag and suite. RFC 4568 §5.1.2 makes the answer's tag the identifier of the offer line
+    /// it accepted and requires the same crypto-suite, so neither is the answerer's to renumber.
+    pub fn answer_to(offered: &Self) -> Result<Self, SdesError> {
+        Self::generate(offered.tag, offered.suite)
+    }
+
+    /// Whether [`crate::SrtpContext`] can run this line's suite. The context authenticates with the
+    /// 80-bit tag only ([`crate::AUTH_TAG_LEN`]), so a `_32` line is recognised but cannot be keyed;
+    /// an answerer must skip it and select a later line (RFC 4568 §7.1.1) rather than answer a suite
+    /// it does not run.
+    #[must_use]
+    pub fn is_keyable(&self) -> bool {
+        self.suite.auth_tag_len() == crate::AUTH_TAG_LEN
+    }
+
     /// Parse the value of an `a=crypto` line (the text after `a=`, i.e. `crypto:<tag> <suite>
     /// inline:<base64>[|...][ session-params]`). The first inline key-param is used; lifetime/MKI
     /// suffixes and session parameters are ignored.
@@ -235,6 +251,35 @@ mod tests {
         assert_eq!(attribute.tag, 7);
         assert_eq!(attribute.suite, CryptoSuite::AesCm128HmacSha1_32);
         assert_eq!(attribute.suite.auth_tag_len(), 4);
+    }
+
+    #[test]
+    fn an_answer_keeps_the_accepted_lines_tag_and_suite_under_a_fresh_key() {
+        // RFC 4568 §5.1.2: the answer's tag names the offer line it accepted and its suite is that
+        // line's suite. A caller whose first offered line the engine cannot key accepts tag 2, so
+        // an answer numbered from 1 would claim a line that was never accepted.
+        let offered = CryptoAttribute::parse(
+            "crypto:2 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR",
+        )
+        .expect("parse");
+        let answer = CryptoAttribute::answer_to(&offered).expect("answer");
+        assert_eq!(answer.tag, 2);
+        assert_eq!(answer.suite, CryptoSuite::AesCm128HmacSha1_80);
+        assert_ne!(answer.key, offered.key, "the answerer's key is its own");
+        assert!(answer
+            .to_attribute_value()
+            .starts_with("crypto:2 AES_CM_128_HMAC_SHA1_80 inline:"));
+    }
+
+    #[test]
+    fn only_a_suite_the_srtp_context_implements_is_keyable() {
+        // The context authenticates with the 80-bit tag only (`AUTH_TAG_LEN`), so a `_32` line
+        // parses but cannot be keyed: accepting it would answer a suite the engine does not run.
+        let eighty = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let thirty_two =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_32).expect("gen");
+        assert!(eighty.is_keyable());
+        assert!(!thirty_two.is_keyable());
     }
 
     #[test]
