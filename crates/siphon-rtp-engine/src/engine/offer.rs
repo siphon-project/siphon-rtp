@@ -223,16 +223,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // SDES only here. A DTLS-SRTP offerer is keyed by a handshake, not by a key in the SDP, and is
         // decided below.
         let near_sdes = info.secure && !info.dtls;
+        // The first keyable line is the one accepted (the parse drops the rest), and the answer A
+        // receives echoes its tag and suite (RFC 4568 §5.1.2): a key numbered from one names a line
+        // A may have offered in another suite, and A then encrypts under a context we never hold.
         let near_remote_crypto = info.crypto.first().copied();
-        let near_local_crypto = if near_sdes {
-            match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+        let near_local_crypto = match near_remote_crypto.filter(|_| near_sdes) {
+            Some(accepted) => match CryptoAttribute::answer_to(&accepted) {
                 Ok(crypto) => Some(crypto),
                 Err(error) => {
                     return Err(Box::new(error_result("generate SDES key", &error)));
                 }
-            }
-        } else {
-            None
+            },
+            None => None,
         };
         // A secure offerer with no key to decrypt is refused, never bridged in the clear: answering a
         // `RTP/SAVP` offer that carries no usable `a=crypto` would advertise keying against nothing.

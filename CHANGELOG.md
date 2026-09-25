@@ -9,6 +9,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **An SDES answer named the wrong offer line, so a multi-suite SRTP caller was one-way.** The
+  engine answered every secure offerer with its own key under tag 1, whatever line it had actually
+  accepted. A phone offering an AEAD suite first and `AES_CM_128_HMAC_SHA1_80` second read the
+  answer as accepting its first line (RFC 4568 §5.1.2 makes the tag the identifier), encrypted under
+  that context, and the engine could decrypt none of it: the caller was heard by no one while the
+  call looked healthy in both SDPs and the drop counters. The answer now echoes the accepted line's
+  tag and suite at every answerer: offer/answer (audio and text), `answer_local`, and conference
+  seats. Relatedly, a `_32` line listed ahead of an `_80` one was accepted and keyed although the
+  SRTP context only runs the 80-bit tag; such lines are now skipped like any other unsupported suite.
+
 - **Four fuzz targets existed and were never run.** The CI fuzz job iterated a hand-written list of
   nine targets while `fuzz/Cargo.toml` declared thirteen, so `ice_agent_fuzz`, `ice_candidate_fuzz`,
   `red_parse` and `li_pdu_fuzz` — all of them parsers of untrusted bytes, which the house rule says

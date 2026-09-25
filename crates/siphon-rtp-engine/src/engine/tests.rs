@@ -25141,3 +25141,222 @@ async fn a_controller_identity_claim_is_range_checked_and_refused_over_live_call
         "a connection that already owns calls cannot be re-keyed"
     );
 }
+
+// ----------------------------------------------------------------------------------------
+// RFC 4568 §5.1.2: an SDES answer names the offer line it accepted. A phone that lists a suite the
+// engine does not run ahead of the one it does is answered under the accepted line's tag, never a tag
+// numbered from one, and keyed from that line, never from the first line it happened to parse.
+// ----------------------------------------------------------------------------------------
+
+/// Put two offer lines the engine cannot key — an AEAD suite and the 32-bit tag — ahead of every
+/// `a=crypto` in `sdp`, each carrying key material of its own so keying from either is detectable.
+/// The real line is expected to carry tag 3.
+fn lead_with_unkeyable_crypto(sdp: &str) -> String {
+    sdp.replace(
+        "a=crypto:",
+        "a=crypto:1 AEAD_AES_128_GCM inline:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd\r\n\
+         a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:HRwbGhkYFxYVFBMSERAPDg0MCwoJCAcGBQQDAgEA\r\n\
+         a=crypto:",
+    )
+}
+
+/// The `a=crypto` lines of one section (`m=audio` or `m=text`) of a rendered SDP.
+fn section_crypto_lines(sdp: &str, media: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut lines = Vec::new();
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            in_section = line.starts_with(&format!("m={media} "));
+        } else if in_section && line.starts_with("a=crypto:") {
+            lines.push(line.to_string());
+        }
+    }
+    lines
+}
+
+/// Assert a section answers exactly one `a=crypto`, under tag 3 and the 80-bit suite.
+fn assert_answers_accepted_line(sdp: &str, media: &str) {
+    let lines = section_crypto_lines(sdp, media);
+    assert_eq!(lines.len(), 1, "one accepted line in m={media}: {sdp}");
+    assert!(
+        lines[0].starts_with("a=crypto:3 AES_CM_128_HMAC_SHA1_80 inline:"),
+        "the answer names the accepted offer line (tag 3), not the first one: {sdp}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_sdes_callers_answer_names_the_offer_line_the_engine_accepted() {
+    // The outbound-call shape: the caller offers several suites, the engine terminates its SRTP and
+    // answers with its own key. Tag 1 in that answer would say "I accepted your AEAD line" while the
+    // suite says otherwise, and the phone encrypts under a context the engine cannot decrypt.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(3, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "sdes-tag".into(),
+                from_tag: "tag-a".into(),
+                sdp: lead_with_unkeyable_crypto(&sdes_offerer_sdp(addr_a, &caller_key)),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "sdes-tag".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for(addr_b, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&answered);
+    assert_answers_accepted_line(&answer, "audio");
+
+    // And the engine keyed its inbound context from that same line: the caller's SRTP under the
+    // tag-3 key reaches the callee in the clear.
+    let engine_near = sdp::parse(&answer).expect("answer").remote_rtp;
+    let _ = ok_sdp_text(&offered);
+    let mut protect = SrtpContext::from_key_material(&caller_key.key);
+    let plain = g711_rtp(0, 7, 0x0A0A_0A0A, 0x20);
+    let mut encrypted = Vec::new();
+    protect.protect(&plain, &mut encrypted).expect("protect");
+    phone_a
+        .send_to(&encrypted, engine_near)
+        .await
+        .expect("caller send");
+    let mut buffer = [0u8; 2048];
+    let (len, _) = timeout(Duration::from_millis(500), phone_b.recv_from(&mut buffer))
+        .await
+        .expect("the callee receives the caller's audio")
+        .expect("recv");
+    assert_eq!(&buffer[..len], plain.as_slice());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_sdes_callers_secure_text_answer_names_the_offer_line_the_engine_accepted() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a_audio, addr_a_audio) = phone().await;
+    let (_phone_a_text, addr_a_text) = phone().await;
+    let (_phone_b_audio, addr_b_audio) = phone().await;
+    let (_phone_b_text, addr_b_text) = phone().await;
+    let a_text_key = CryptoAttribute::generate(3, CryptoSuite::AesCm128HmacSha1_80).expect("gen a");
+    let b_text_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen b");
+
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "sdes-text-tag".into(),
+                from_tag: "a".into(),
+                sdp: lead_with_unkeyable_crypto(&audio_secure_text_sdp(
+                    addr_a_audio,
+                    addr_a_text,
+                    &a_text_key,
+                )),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let _ = ok_sdp_text(&offered);
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "sdes-text-tag".into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp: audio_secure_text_sdp(addr_b_audio, addr_b_text, &b_text_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_answers_accepted_line(&ok_sdp_text(&answered), "text");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_local_on_an_sdes_offerer_names_the_offer_line_it_accepted() {
+    let (ws_uri, _frames, _downlink) = takeover_ws_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let peer_key =
+        CryptoAttribute::generate(3, CryptoSuite::AesCm128HmacSha1_80).expect("peer key");
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "al-sdes-tag".into(),
+                from_tag: "tag-a".into(),
+                sdp: lead_with_unkeyable_crypto(&sdes_offerer_sdp(addr_a, &peer_key)),
+                profile: ProfileFlags {
+                    ws_uri: Some(ws_uri),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    assert_answers_accepted_line(&ok_sdp_text(&result), "audio");
+}
+
+#[tokio::test]
+async fn conference_join_names_the_offer_line_it_accepted() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+    let peer_crypto = CryptoAttribute::generate(3, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "sdes-tag-room".into(),
+                from_tag: "alice".into(),
+                sdp: lead_with_unkeyable_crypto(&savp_answer_sdp(addr, &peer_crypto)),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    assert_answers_accepted_line(&ok_sdp_text(&joined), "audio");
+}
+
+#[tokio::test]
+async fn conference_join_secure_text_names_the_offer_line_it_accepted() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_audio, audio_addr) = phone().await;
+    let (_phone_text, text_addr) = phone().await;
+    let text_key =
+        CryptoAttribute::generate(3, CryptoSuite::AesCm128HmacSha1_80).expect("gen text key");
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "sdes-text-tag-room".into(),
+                from_tag: "alice".into(),
+                sdp: lead_with_unkeyable_crypto(&audio_secure_text_sdp(
+                    audio_addr, text_addr, &text_key,
+                )),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    assert_answers_accepted_line(&ok_sdp_text(&joined), "text");
+}
