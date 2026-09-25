@@ -5,7 +5,7 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [0.8.1] — 2026-09-25
+## [0.9.0] — 2026-09-25
 
 ### Added
 
@@ -62,6 +62,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   opaquely, so on a correctly configured fax call the flag changes nothing except what the engine will
   agree to do next. Carried in the HA checkpoint, because losing a safety assertion across a failover
   would let a later verb undo it.
+
+## [0.8.1] — 2026-09-25
 
 ### Fixed
 

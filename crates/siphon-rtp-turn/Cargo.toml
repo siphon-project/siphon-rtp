@@ -16,8 +16,8 @@ keywords = ["turn", "stun", "ice", "webrtc", "nat"]
 categories = ["network-programming"]
 
 [dependencies]
-siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.8.1" }
-siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.8.1" }
+siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.9.0" }
+siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.9.0" }
 tokio = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
