@@ -50,7 +50,7 @@ jobs:
           allowlist='
           crates/siphon-rtp-engine/src/media_pipeline.rs 4379 # large, no function over 250 lines; +64 for the secure-to-secure transcode wiring, +55 for publishing the latched source, +32 for the actor teardown grace that flushes a recording, +91 for the fax-passthrough profile validation
           crates/siphon-rtp-engine/src/conference.rs 2712 # large, no function over 250 lines
-          crates/siphon-rtp-engine/src/sdp.rs 2171 # large, no function over 250 lines; +27 for RFC 8842 a=tls-id
+          crates/siphon-rtp-engine/src/sdp.rs 2461 # large, no function over 250 lines; +27 for RFC 8842 a=tls-id; +290 for the T.38 m=image section (parse, anchor/decline directive, and the audio-less switchover entry points)
           crates/siphon-rtp-dsp/src/aec.rs 2554 # one algorithm
           crates/siphon-rtp-proto/src/lib.rs 2156 # the control contract, type definitions; +27 for the authenticate controller id; +9 for the setup_timeout media-timeout reason; +26 for the fax_passthrough profile flag
           crates/siphon-rtp-codec/src/opus/celt/encoder.rs 1996 # reference port

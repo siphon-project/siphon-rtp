@@ -7,7 +7,7 @@
 //! [`rewrite`](siphon_rtp_engine::sdp::rewrite) against a fixed engine endpoint (RFC 4566 / 3264).
 
 use libfuzzer_sys::fuzz_target;
-use siphon_rtp_engine::sdp::{self, EngineMedia, IceRewrite, TextRewrite};
+use siphon_rtp_engine::sdp::{self, EngineMedia, ImageRewrite, IceRewrite, TextRewrite};
 
 fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
@@ -23,5 +23,16 @@ fuzz_target!(|data: &[u8]| {
     );
     // Rewrite against arbitrary input passing the peer's ICE through (no re-origination) with no
     // security advertisement / mux override and no text-stream directive: must never panic.
-    let _ = sdp::rewrite(&text, engine, IceRewrite::Keep, None, None, TextRewrite::None);
+    let _ = sdp::rewrite(
+        &text,
+        engine,
+        IceRewrite::Keep,
+        None,
+        None,
+        TextRewrite::None,
+        ImageRewrite::None,
+    );
+    // A fax-only switchover takes its own entry points, so drive those over the same bytes.
+    let _ = sdp::parse_session(&text);
+    let _ = sdp::rewrite_image_only(&text, engine, ImageRewrite::Anchor(engine));
 });

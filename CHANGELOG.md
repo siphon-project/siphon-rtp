@@ -9,6 +9,21 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **The SDP layer parses and re-originates a T.38 fax section (`m=image` / UDPTL).** Until now an
+  `m=image` section was `MediaKind::Other` and passed through byte for byte, so the fax media
+  advertised the UE's own address and went around the engine — correct on a flat network, broken
+  behind NAT, and in neither case what an SBC was asked to do. Worse, a T.30 switchover usually
+  *replaces* the audio stream rather than sitting beside it, and that re-INVITE has no `m=audio` line
+  at all: `parse` and `rewrite` both failed it outright, so every fax call that tried to switch to
+  T.38 failed the re-INVITE. The section is now parsed (`MediaInfo::image`), anchored or declined
+  through a directive of its own (`ImageRewrite`), and the audio-less case has its own entry points
+  (`parse_session`, `rewrite_image_only`) rather than making the audio transport optional in the ~25
+  places that read it. A transport the engine cannot relay — T.38 over TCP or over DTLS — is
+  **declined** with port 0 (RFC 3264 §6) rather than passed through, because passing it through is a
+  silent topology change. The T.38 attributes themselves are copied untouched: they are a contract
+  between the two fax endpoints, not with the relay. This is the SDP half only; the UDPTL datapath
+  follows.
+
 - **`fax_passthrough`: a call can be pinned to opaque relay.** A fax is a modem signal, not speech, and
   every stage of the media pipeline that helps a voice call destroys it — noise suppression and echo
   cancellation subtract from the waveform, loss concealment invents samples the far modem's demodulator

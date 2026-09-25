@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ice::IceCredentials;
 use crate::media_pipeline::{DirectionConfig, RtcpRelay, SecureSide};
-use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
+use crate::sdp::{self, EngineMedia, IceRewrite, ImageRewrite, SecurityAdvertisement, TextRewrite};
 use std::net::SocketAddr;
 
 use super::{Leg, PipelineKind};
@@ -69,6 +69,7 @@ pub(super) fn present_leg(
         presentation.security,
         presentation.mux_override,
         presentation.text,
+        ImageRewrite::None,
     )?
     .sdp;
     match presentation.codec {

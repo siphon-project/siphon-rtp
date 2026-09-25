@@ -21,7 +21,7 @@ use crate::conference::{ConferenceControl, ParticipantConfig, ParticipantTextCon
 use crate::dtls_bridge::DtlsCallPlan;
 use crate::ice;
 use crate::media_pipeline::PlayRequest;
-use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
+use crate::sdp::{self, EngineMedia, IceRewrite, ImageRewrite, SecurityAdvertisement, TextRewrite};
 
 use super::negotiate::{
     filter_component, ice_directive, ice_tie_breaker, peer_ice_credentials, random_ssrc,
@@ -580,7 +580,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
             (None, _) => IceRewrite::Keep,
         };
-        match sdp::rewrite(sdp, engine, ice_rewrite, security, None, text_rewrite) {
+        match sdp::rewrite(
+            sdp,
+            engine,
+            ice_rewrite,
+            security,
+            None,
+            text_rewrite,
+            ImageRewrite::None,
+        ) {
             Ok(rewritten) => ok_sdp(rewritten.sdp, Some(from_tag)),
             Err(error) => {
                 let _ = self.conference.leave(conference_id, &from_tag);

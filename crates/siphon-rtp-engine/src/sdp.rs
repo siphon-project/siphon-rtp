@@ -26,6 +26,10 @@ pub enum SdpError {
     /// No `m=audio` media line was present.
     #[error("no audio media line in SDP")]
     NoAudioMedia,
+    /// No addressable `m=image` (T.38) media line was present, on a path that needs one — a fax-only
+    /// re-originate reached with something that is not a fax SDP.
+    #[error("no image media line in SDP")]
+    NoImageMedia,
     /// The `m=audio` line's port field was missing or not a number.
     #[error("malformed m=audio port")]
     MediaPort,
@@ -115,6 +119,65 @@ pub struct MediaInfo {
     /// offer/answer carried one alongside the audio. `None` for an audio-only SDP. Parsed but relayed
     /// transparently (PR 1 does not decode RED/T.140 — RFC 2198 / RFC 4103 payload parsing lands later).
     pub text: Option<TextMediaInfo>,
+    /// The first T.38 fax stream (`m=image ... udptl t38`), if the offer/answer carried one alongside
+    /// the audio. `None` when it carried none. A T.30 switchover usually replaces the audio instead of
+    /// sitting beside it, and that SDP has no `m=audio` at all, so it never produces a [`MediaInfo`] —
+    /// see [`parse_session`] and [`ParsedSdp::ImageOnly`].
+    pub image: Option<ImageMediaInfo>,
+}
+
+/// The transport of an `m=image` section — the `<proto>` field of the media line (RFC 4566 §5.14),
+/// as ITU-T T.38 Annex D spells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageTransport {
+    /// `udptl` — T.38 over UDPTL (T.38 Annex D), the transport deployed fax actually uses and the
+    /// only one the engine relays.
+    Udptl,
+    /// A legal T.38 transport the engine does not relay: `TCP` (T.38 Annex E) or `UDP/TLS/UDPTL`.
+    /// Also covers an unrecognised token — the engine declines what it cannot anchor rather than
+    /// guessing at it.
+    Unsupported(String),
+}
+
+impl ImageTransport {
+    /// Classify a media line's `<proto>` token. Matched case-insensitively: T.38 Annex D writes
+    /// `udptl` in lower case while RFC 4566 leaves the token's case unconstrained, and endpoints
+    /// differ in practice.
+    fn classify(token: &str) -> Self {
+        if token.eq_ignore_ascii_case("udptl") {
+            Self::Udptl
+        } else {
+            Self::Unsupported(token.to_string())
+        }
+    }
+
+    /// Whether the engine can anchor and relay this transport.
+    #[must_use]
+    pub fn is_relayable(&self) -> bool {
+        matches!(self, Self::Udptl)
+    }
+}
+
+/// The remote T.38 fax transport advertised by an SDP `m=image` section (ITU-T T.38 Annex D,
+/// RFC 3362).
+///
+/// UDPTL is **not** RTP: there is no RTP header, no payload type, no SSRC, and no RTCP — so this
+/// carries a single address and nothing else the audio path would recognise. The engine relays the
+/// datagrams opaquely and never parses them, which is why the T.38 attributes that configure the
+/// far ends' fax behaviour (`a=T38FaxVersion`, `a=T38MaxBitRate`, `a=T38FaxRateManagement`,
+/// `a=T38FaxUdpEC`, …) are passed through untouched rather than captured here — they are a contract
+/// between the two fax endpoints, not with the relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageMediaInfo {
+    /// Where the peer receives the fax stream: its media-level `c=` (else the session `c=`) with the
+    /// `m=image` port.
+    pub remote: SocketAddr,
+    /// The section's transport. Only [`ImageTransport::Udptl`] is relayed.
+    pub transport: ImageTransport,
+    /// The `m=image` format list (the fields after the transport), in offered order — `t38` on a
+    /// T.38 offer. Kept so a declined section can be re-emitted with its formats intact, which
+    /// RFC 3264 §6 requires of a rejected stream.
+    pub formats: Vec<String>,
 }
 
 /// The remote RFC 4103 text (T.140-over-RTP) transport advertised by an SDP `m=text` section, parsed
@@ -311,6 +374,9 @@ enum MediaKind {
     Audio,
     /// `m=text` — an RFC 4103 Real-Time Text stream.
     Text,
+    /// `m=image` — a T.38 fax stream (ITU-T T.38 Annex D / RFC 3362). Not RTP: the media type is
+    /// `image` and the transport is UDPTL, so nothing about the audio path applies to it.
+    Image,
     /// Any other media (`m=video`, `m=application`, …) — passed through verbatim.
     Other,
 }
@@ -482,6 +548,15 @@ pub struct Rewritten {
     pub media: MediaInfo,
 }
 
+/// The result of re-originating a fax-only SDP ([`rewrite_image_only`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewrittenImage {
+    /// The rewritten SDP advertising the engine's image endpoint.
+    pub sdp: String,
+    /// The remote fax transport parsed from the input SDP.
+    pub image: ImageMediaInfo,
+}
+
 /// Indices and values located in one scan of an SDP's audio stream.
 struct AudioScan {
     session_conn: Option<(usize, IpAddr)>,
@@ -550,6 +625,16 @@ struct AudioScan {
     /// secure (`RTP/SAVP`) text stream. Empty for a plaintext text section. Scoped to the text section
     /// exactly as `crypto` is to the audio section (the same section scoping that fixes the multi-`m=` bug).
     text_crypto: Vec<CryptoAttribute>,
+    /// The FIRST `m=image` (T.38) section: (line index, port). `None` when the SDP carries no fax
+    /// stream.
+    image_media: Option<(usize, u16)>,
+    /// The `m=image` transport (3rd field) and format list — `udptl t38` on a deployed T.38 offer.
+    image_transport: Option<String>,
+    /// The `m=image` format list (the fields after the transport), in offered order.
+    image_formats: Vec<String>,
+    /// The image section's media-level `c=` connection: (line index, address). Falls back to the
+    /// session `c=` when absent.
+    image_conn: Option<(usize, IpAddr)>,
 }
 
 /// Parse an `a=rtpmap` attribute body (`rtpmap:<pt> <encoding>/<clock>[/<channels>]`).
@@ -727,6 +812,7 @@ fn parse_media_line(value: &str) -> (MediaKind, Option<u16>) {
     let kind = match parts.next() {
         Some("audio") => MediaKind::Audio,
         Some("text") => MediaKind::Text,
+        Some("image") => MediaKind::Image,
         _ => MediaKind::Other,
     };
     let port = parts.next().and_then(|port| port.parse::<u16>().ok());
@@ -778,10 +864,15 @@ fn scan(sdp: &str) -> AudioScan {
         text_rtcp_mux: false,
         text_rtpmaps: Vec::new(),
         text_crypto: Vec::new(),
+        image_media: None,
+        image_transport: None,
+        image_formats: Vec::new(),
+        image_conn: None,
     };
     let mut seen_media = false;
     let mut in_audio = false;
     let mut in_text = false;
+    let mut in_image = false;
 
     for (index, raw_line) in sdp.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -794,10 +885,11 @@ fn scan(sdp: &str) -> AudioScan {
                 let (kind, port) = parse_media_line(value);
                 // Record every section (index + kind) so `rewrite` can scope its edits per section.
                 scan.sections.push((index, kind));
-                // Leaving one section always resets both "in-section" flags; the arms below re-set the
-                // one that applies when this m-line opens the audio or text section we capture.
+                // Leaving one section always resets every "in-section" flag; the arms below re-set
+                // the one that applies when this m-line opens a section we capture.
                 in_audio = false;
                 in_text = false;
+                in_image = false;
                 match kind {
                     MediaKind::Audio if scan.audio_media.is_none() => {
                         if let Some(port) = port {
@@ -822,6 +914,18 @@ fn scan(sdp: &str) -> AudioScan {
                             in_text = true;
                         }
                     }
+                    MediaKind::Image if scan.image_media.is_none() => {
+                        if let Some(port) = port {
+                            scan.image_media = Some((index, port));
+                            // `image <port> <proto> <format> …` (T.38 Annex D): the transport is
+                            // field 2 (`udptl`) and the format list is `t38`. There are no payload
+                            // types — UDPTL is not RTP — so nothing here parses as a number.
+                            let mut fields = value.split_whitespace();
+                            scan.image_transport = fields.nth(2).map(str::to_string);
+                            scan.image_formats = fields.map(str::to_string).collect();
+                            in_image = true;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -833,6 +937,8 @@ fn scan(sdp: &str) -> AudioScan {
                         scan.audio_conn = Some((index, addr));
                     } else if in_text && scan.text_conn.is_none() {
                         scan.text_conn = Some((index, addr));
+                    } else if in_image && scan.image_conn.is_none() {
+                        scan.image_conn = Some((index, addr));
                     }
                 }
             }
@@ -1040,6 +1146,33 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         ptime_ms: scan.ptime_ms.unwrap_or(DEFAULT_PTIME_MS),
         maxptime_ms: scan.maxptime_ms,
         text: text_media_info(scan),
+        image: image_media_info(scan),
+    })
+}
+
+/// Resolve the [`ImageMediaInfo`] for the first `m=image` section, if the SDP carried one with a
+/// usable connection address (its own media-level `c=`, else the session `c=`).
+///
+/// An image section without any connection address is treated as absent, exactly as
+/// [`text_media_info`] treats a text one: a stream we cannot address is not relayable, and failing
+/// the whole parse over it would take the audio down with it.
+///
+/// A **port-0** section is still reported. RFC 3264 §6 makes `m=image 0 …` the answer's way of
+/// saying "I do not want this stream", and the caller needs to see the refusal to tear the fax
+/// stream down; treating it as absent would leave the engine's endpoint anchored to nothing.
+fn image_media_info(scan: &AudioScan) -> Option<ImageMediaInfo> {
+    let (_, image_port) = scan.image_media?;
+    let ip = scan
+        .image_conn
+        .map(|(_, addr)| addr)
+        .or_else(|| scan.session_conn.map(|(_, addr)| addr))?;
+    Some(ImageMediaInfo {
+        remote: SocketAddr::new(ip, image_port),
+        transport: scan.image_transport.as_deref().map_or_else(
+            || ImageTransport::Unsupported(String::new()),
+            ImageTransport::classify,
+        ),
+        formats: scan.image_formats.clone(),
     })
 }
 
@@ -1094,8 +1227,105 @@ fn text_payload_type(rtpmaps: &[RtpMap], encoding_name: &str) -> Option<u8> {
 }
 
 /// Parse the remote audio transport info from an SDP without rewriting it.
+///
+/// Fails with [`SdpError::NoAudioMedia`] on an SDP that carries no `m=audio` — which a T.30 fax
+/// switchover legitimately does. A caller that must handle one uses [`parse_session`] instead.
 pub fn parse(sdp: &str) -> Result<MediaInfo, SdpError> {
     media_info(&scan(sdp))
+}
+
+/// What an SDP offered, when it may legitimately have offered no audio at all.
+///
+/// Almost every SDP the engine sees is an audio session, possibly with a second stream beside it,
+/// and [`parse`] is the right entry point for those. The exception is a **T.30 fax switchover**: a
+/// gateway that moves a call to T.38 usually re-INVITEs with `m=image <port> udptl t38` and no
+/// `m=audio` line at all, replacing the audio stream rather than sitting beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedSdp {
+    /// An audio session. Its `image` field carries a fax stream offered *alongside* the audio (the
+    /// `m=audio 0` + `m=image <port>` shape some gateways send).
+    Audio(Box<MediaInfo>),
+    /// A fax-only session: an `m=image` stream and no usable `m=audio`. There is no audio transport
+    /// to report, which is exactly why it cannot be a [`MediaInfo`].
+    ImageOnly(ImageMediaInfo),
+}
+
+/// Parse an SDP that may be an audio session or a fax-only one.
+///
+/// The audio-bearing case is [`parse`] verbatim, so nothing that already calls `parse` changes
+/// behaviour or shape. Only the fax-only case is new, and it is kept as a separate variant rather
+/// than by making [`MediaInfo::remote_rtp`] optional: that field is read unconditionally in ~25
+/// places that are all genuinely about audio, and making every one of them handle an absence that
+/// only a fax switchover can produce would trade one narrow case for twenty-five wide ones.
+///
+/// # Errors
+/// [`SdpError::NoAudioMedia`] when the SDP has neither a usable `m=audio` nor an addressable
+/// `m=image`, and whatever [`parse`] would have returned otherwise.
+pub fn parse_session(sdp: &str) -> Result<ParsedSdp, SdpError> {
+    let scan = scan(sdp);
+    match media_info(&scan) {
+        Ok(media) => Ok(ParsedSdp::Audio(Box::new(media))),
+        // Only the missing-audio error falls through to the fax reading. A malformed port or an
+        // unusable connection address is a broken SDP, not a fax one, and must still fail.
+        Err(SdpError::NoAudioMedia) => image_media_info(&scan)
+            .map(ParsedSdp::ImageOnly)
+            .ok_or(SdpError::NoAudioMedia),
+        Err(error) => Err(error),
+    }
+}
+
+/// Re-originate a **fax-only** SDP — one whose only media is `m=image` (a T.30 switchover
+/// re-INVITE). Anchors the image section's port and connection address to `engine`, or declines the
+/// stream, and leaves every other line alone.
+///
+/// Deliberately narrow, and it can be: a UDPTL section has no ICE, no crypto, no payload types, no
+/// codec policy, no direction handling and no RTCP. Everything [`rewrite`] does beyond moving a port
+/// and a connection address is about a stream this SDP does not have, so sharing that function would
+/// mean threading "there is no audio" through all of it for no benefit.
+///
+/// # Errors
+/// [`SdpError::NoImageMedia`] when the SDP has no addressable `m=image` section — the caller reached
+/// here with something that is not a fax SDP. [`SdpError::ConnectionAddress`] when the image stream
+/// has no usable `c=`.
+pub fn rewrite_image_only(
+    sdp: &str,
+    engine: EngineMedia,
+    image: ImageRewrite,
+) -> Result<RewrittenImage, SdpError> {
+    let scan = scan(sdp);
+    let media = image_media_info(&scan).ok_or(SdpError::NoImageMedia)?;
+    let (image_media_index, _) = scan.image_media.ok_or(SdpError::NoImageMedia)?;
+    let (conn_index, _) = scan
+        .image_conn
+        .or(scan.session_conn)
+        .ok_or(SdpError::ConnectionAddress)?;
+
+    let mut writer = SdpWriter::default();
+    for (index, raw_line) in sdp.split('\n').enumerate() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if index == image_media_index {
+            // The section is re-originated, so hold it in RFC 4566 §5 order.
+            if !matches!(image, ImageRewrite::None) {
+                writer.open_section();
+            }
+            match image {
+                ImageRewrite::Anchor(engine) => {
+                    writer.push(rewrite_media_line(line, engine.rtp.port(), Option::None));
+                }
+                ImageRewrite::Decline => writer.push(rewrite_media_line(line, 0, Option::None)),
+                ImageRewrite::None => writer.push(line.to_string()),
+            }
+        } else if index == conn_index && matches!(image, ImageRewrite::Anchor(_)) {
+            let ip = engine.advertised_ip;
+            writer.push(format!("c=IN {} {ip}", addrtype(ip)));
+        } else {
+            writer.emit(line.to_string());
+        }
+    }
+    Ok(RewrittenImage {
+        sdp: writer.finish().join(CRLF),
+        image: media,
+    })
 }
 
 /// The engine's ICE identity to advertise in a rewritten SDP: `a=ice-lite` (session-level) plus
@@ -1208,6 +1438,32 @@ impl TextRewrite {
             TextRewrite::None | TextRewrite::Decline => Option::None,
         }
     }
+}
+
+/// How [`rewrite`] treats the SDP's first `m=image` (T.38) section — the fax stream, anchored
+/// independently of the audio exactly as the text stream is (RFC 3264 §5/§6).
+///
+/// There is no secure variant. UDPTL carries no SRTP: T.38 over DTLS (`UDP/TLS/UDPTL`) exists on
+/// paper and is declined, not bridged.
+#[derive(Debug, Clone, Copy)]
+pub enum ImageRewrite {
+    /// No image section to act on — leave any `m=image` section's lines untouched. Used when the SDP
+    /// carried no fax stream.
+    None,
+    /// Anchor the fax stream to the engine: rewrite its `m=image` port and connection to the engine's
+    /// image endpoint so the relay owns the media path and never leaks the UE's (often private)
+    /// address (RFC 3264 §5). The T.38 attributes are passed through untouched — they configure the
+    /// two fax endpoints, not the relay between them.
+    Anchor(EngineMedia),
+    /// Reject the fax stream: set its `m=image` port to `0` (RFC 3264 §6). Used for a section the
+    /// engine will not relay — a transport it cannot anchor (`TCP`, `UDP/TLS/UDPTL`), or a peer that
+    /// declined the stream.
+    ///
+    /// Declining is deliberately not the same as leaving the section alone. An untouched section
+    /// advertises the UE's own address, so the fax would bypass the engine entirely: correct on a
+    /// flat network, broken behind NAT, and in both cases not what an SBC was asked to do. Saying
+    /// "no" is honest; saying nothing is a silent topology change.
+    Decline,
 }
 
 /// Host-candidate priority (RFC 8445 §5.1.2): type-pref 126, local-pref 65535, component 1 (RTP).
@@ -1369,6 +1625,7 @@ pub fn rewrite(
     security: Option<SecurityAdvertisement>,
     mux_override: Option<bool>,
     text: TextRewrite,
+    image: ImageRewrite,
 ) -> Result<Rewritten, SdpError> {
     let scan = scan(sdp);
     let media = media_info(&scan)?;
@@ -1388,6 +1645,8 @@ pub fn rewrite(
     // Text section line indices (all `None` for an audio-only SDP or `TextRewrite::None`).
     let text_media_index = scan.text_media.map(|(index, _)| index);
     let text_rtcp_index = scan.text_rtcp.map(|(index, _)| index);
+    // Image (T.38) section line index (`None` for an SDP with no fax stream).
+    let image_media_index = scan.image_media.map(|(index, _)| index);
     // Connection lines to rewrite to an engine advertised IP, and to which IP. The audio stream's `c=`
     // (its media-level, else the session `c=`) always maps to the audio engine IP. When anchoring text,
     // its own media-level `c=` (else the session `c=` it falls back to) maps to the text engine IP —
@@ -1404,6 +1663,15 @@ pub fn rewrite(
             .or_else(|| scan.session_conn.map(|(index, _)| index));
         if let Some(index) = text_conn_index {
             conn_rewrites.insert(index, text_engine.advertised_ip);
+        }
+    }
+    if let ImageRewrite::Anchor(image_engine) = image {
+        let image_conn_index = scan
+            .image_conn
+            .map(|(index, _)| index)
+            .or_else(|| scan.session_conn.map(|(index, _)| index));
+        if let Some(index) = image_conn_index {
+            conn_rewrites.insert(index, image_engine.advertised_ip);
         }
     }
 
@@ -1498,6 +1766,28 @@ pub fn rewrite(
                     writer.push(rewrite_media_line(line, 0, Option::None));
                 }
                 TextRewrite::None => writer.push(line.to_string()),
+            }
+        } else if Some(index) == image_media_index {
+            // The `m=image` line: anchor its port to the engine's image endpoint, or decline the
+            // stream (port 0). Only the port moves — the transport (`udptl`) and format list (`t38`)
+            // are the two fax endpoints' business, and so are the `a=T38*` attributes that follow,
+            // which the loop copies through untouched because nothing below claims them.
+            if !matches!(image, ImageRewrite::None) {
+                writer.open_section();
+            }
+            match image {
+                ImageRewrite::Anchor(image_engine) => {
+                    writer.push(rewrite_media_line(
+                        line,
+                        image_engine.rtp.port(),
+                        Option::None,
+                    ));
+                }
+                ImageRewrite::Decline => {
+                    // RFC 3264 §6: a rejected stream keeps its formats but advertises port 0.
+                    writer.push(rewrite_media_line(line, 0, Option::None));
+                }
+                ImageRewrite::None => writer.push(line.to_string()),
             }
         } else if Some(index) == text_rtcp_index {
             // Text RTCP is not separately anchored: drop an anchored text section's `a=rtcp:` (single
@@ -2294,6 +2584,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -2782,6 +3073,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert_eq!(
@@ -2818,6 +3110,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(result.sdp.contains("a=rtcp:40001"));
@@ -2842,6 +3135,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -2863,6 +3157,7 @@ mod tests {
             None,
             Some(true),
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert_eq!(
@@ -2887,6 +3182,7 @@ mod tests {
             None,
             Some(true),
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert_eq!(
@@ -2914,6 +3210,7 @@ mod tests {
             None,
             Some(false),
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -2938,7 +3235,8 @@ mod tests {
             IceRewrite::Keep,
             None,
             None,
-            TextRewrite::None
+            TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite")
         .sdp
@@ -2955,7 +3253,8 @@ mod tests {
             IceRewrite::Keep,
             None,
             None,
-            TextRewrite::None
+            TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite")
         .sdp
@@ -2966,8 +3265,16 @@ mod tests {
     fn media_level_connection_overrides_session_level() {
         let sdp = "v=0\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\nc=IN IP4 198.51.100.9\r\n";
         let engine = EngineMedia::new("127.0.0.1:41000".parse::<SocketAddr>().unwrap(), None);
-        let result =
-            rewrite(sdp, engine, IceRewrite::Keep, None, None, TextRewrite::None).expect("rewrite");
+        let result = rewrite(
+            sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+            ImageRewrite::None,
+        )
+        .expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
             "198.51.100.9:5000".parse::<SocketAddr>().unwrap()
@@ -3045,6 +3352,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite v6");
         assert_eq!(
@@ -3095,6 +3403,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite v6 ice");
         assert!(result.sdp.contains("c=IN IP6 ::1"));
@@ -3130,6 +3439,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite v4");
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
@@ -3160,7 +3470,7 @@ mod tests {
         fn parsers_never_panic(text in "(?s).{0,400}") {
             let _ = parse(&text);
             let engine = EngineMedia::new("192.0.2.1:10000".parse::<SocketAddr>().expect("addr"), None);
-            let _ = rewrite(&text, engine, IceRewrite::Keep, None, None, TextRewrite::None);
+            let _ = rewrite(&text, engine, IceRewrite::Keep, None, None, TextRewrite::None, ImageRewrite::None);
             let _ = force_answer_codec(&text, &CodecSpec::new(0, "PCMU", 8000, 1, 20), Some(96));
         }
     }
@@ -3216,6 +3526,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
 
@@ -3260,6 +3571,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(!result.sdp.contains("a=ice-lite"));
@@ -3279,6 +3591,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(result.sdp.contains("a=ice-ufrag:PEERUF"));
@@ -3303,6 +3616,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         // The peer's ICE attributes are gone.
@@ -3485,6 +3799,7 @@ mod tests {
             }),
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -3564,6 +3879,7 @@ mod tests {
                 }),
                 None,
                 TextRewrite::None,
+                ImageRewrite::None,
             )
             .expect("rewrite");
             let presented: Vec<&str> = result
@@ -3589,6 +3905,7 @@ mod tests {
             Some(SecurityAdvertisement::Secure(ours)),
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -3613,6 +3930,7 @@ mod tests {
             Some(SecurityAdvertisement::Plain),
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -4110,6 +4428,302 @@ mod tests {
         assert_eq!(rewrite_origin(sdp, "203.0.113.5".parse().unwrap()), sdp);
     }
 
+    // ---- ITU-T T.38 fax (`m=image` / UDPTL) section-aware parse + rewrite ----
+
+    /// An audio + T.38 offer: the shape a gateway sends when it keeps the audio stream alongside the
+    /// fax one. `transport` selects the `m=image` `<proto>` field. The `a=T38*` attributes are the
+    /// T.38 Annex D set a real offer carries; the engine must pass every one through untouched.
+    fn audio_image_offer(transport: &str) -> String {
+        format!(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 198.51.100.1\r\n\
+             s=-\r\n\
+             c=IN IP4 198.51.100.1\r\n\
+             t=0 0\r\n\
+             m=audio 5000 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             m=image 5004 {transport} t38\r\n\
+             a=T38FaxVersion:0\r\n\
+             a=T38MaxBitRate:14400\r\n\
+             a=T38FaxRateManagement:transferredTCF\r\n\
+             a=T38FaxMaxBuffer:2000\r\n\
+             a=T38FaxMaxDatagram:200\r\n\
+             a=T38FaxUdpEC:t38UDPRedundancy\r\n"
+        )
+    }
+
+    /// The T.30 switchover shape that actually breaks today: the re-INVITE replaces the audio
+    /// stream, so there is no `m=audio` line at all.
+    fn image_only_offer() -> String {
+        concat!(
+            "v=0\r\n",
+            "o=- 1 2 IN IP4 198.51.100.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 198.51.100.1\r\n",
+            "t=0 0\r\n",
+            "m=image 5004 udptl t38\r\n",
+            "a=T38FaxVersion:0\r\n",
+            "a=T38MaxBitRate:14400\r\n",
+            "a=T38FaxRateManagement:transferredTCF\r\n",
+        )
+        .to_string()
+    }
+
+    fn image_engine() -> EngineMedia {
+        EngineMedia::new("127.0.0.1:40004".parse::<SocketAddr>().unwrap(), None)
+    }
+
+    #[test]
+    fn parses_a_t38_stream_offered_alongside_audio() {
+        let info = parse(&audio_image_offer("udptl")).expect("parse");
+        assert_eq!(
+            info.remote_rtp,
+            "198.51.100.1:5000".parse::<SocketAddr>().unwrap()
+        );
+        let image = info.image.expect("image stream parsed");
+        assert_eq!(
+            image.remote,
+            "198.51.100.1:5004".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(image.transport, ImageTransport::Udptl);
+        assert!(image.transport.is_relayable());
+        assert_eq!(image.formats, vec!["t38".to_string()]);
+        // An audio-only offer has no fax stream.
+        assert!(parse(&offer("203.0.113.7", 49170))
+            .expect("parse")
+            .image
+            .is_none());
+    }
+
+    #[test]
+    fn a_t38_transport_the_engine_cannot_relay_is_reported_as_unsupported() {
+        // T.38 Annex E (TCP) and T.38 over DTLS are legal and not relayable here. They are reported
+        // distinctly so the caller declines the section rather than passing it through — an
+        // untouched section advertises the UE's own address.
+        for transport in ["TCP", "UDP/TLS/UDPTL", "something-else"] {
+            let image = parse(&audio_image_offer(transport))
+                .expect("parse")
+                .image
+                .expect("image stream parsed");
+            assert_eq!(
+                image.transport,
+                ImageTransport::Unsupported(transport.to_string()),
+                "{transport}"
+            );
+            assert!(!image.transport.is_relayable(), "{transport}");
+        }
+        // The token's case is not load-bearing: T.38 Annex D writes `udptl`, RFC 4566 does not
+        // constrain the case, and endpoints differ.
+        for spelling in ["udptl", "UDPTL", "UdpTl"] {
+            let image = parse(&audio_image_offer(spelling))
+                .expect("parse")
+                .image
+                .expect("image stream parsed");
+            assert_eq!(image.transport, ImageTransport::Udptl, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn anchoring_a_t38_stream_moves_its_port_and_leaves_the_fax_attributes_alone() {
+        let sdp = audio_image_offer("udptl");
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
+        let result = rewrite(
+            &sdp,
+            audio_engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+            ImageRewrite::Anchor(image_engine()),
+        )
+        .expect("rewrite");
+
+        assert!(
+            result.sdp.contains("m=image 40004 udptl t38"),
+            "the image port is anchored to the engine: {}",
+            result.sdp
+        );
+        assert!(
+            result.sdp.contains("m=audio 40000 RTP/AVP 0"),
+            "the audio section is anchored independently: {}",
+            result.sdp
+        );
+        // Every T.38 attribute is a contract between the two fax endpoints, not with the relay.
+        for attribute in [
+            "a=T38FaxVersion:0",
+            "a=T38MaxBitRate:14400",
+            "a=T38FaxRateManagement:transferredTCF",
+            "a=T38FaxMaxBuffer:2000",
+            "a=T38FaxMaxDatagram:200",
+            "a=T38FaxUdpEC:t38UDPRedundancy",
+        ] {
+            assert!(result.sdp.contains(attribute), "{attribute} was dropped");
+        }
+        // Re-parsing what we emit is what a peer will do, so assert on that rather than on strings.
+        let reparsed = parse(&result.sdp).expect("reparse");
+        assert_eq!(
+            reparsed.image.expect("image").remote,
+            "127.0.0.1:40004".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn declining_a_t38_stream_zeroes_its_port_and_keeps_its_formats() {
+        // RFC 3264 §6: a rejected stream advertises port 0 and keeps its format list.
+        let sdp = audio_image_offer("TCP");
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
+        let result = rewrite(
+            &sdp,
+            audio_engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+            ImageRewrite::Decline,
+        )
+        .expect("rewrite");
+        assert!(
+            result.sdp.contains("m=image 0 TCP t38"),
+            "declined with formats intact: {}",
+            result.sdp
+        );
+        assert!(
+            result.sdp.contains("m=audio 40000 RTP/AVP 0"),
+            "declining the fax stream leaves audio anchored: {}",
+            result.sdp
+        );
+    }
+
+    #[test]
+    fn image_rewrite_none_leaves_the_section_byte_identical() {
+        let sdp = audio_image_offer("udptl");
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
+        let result = rewrite(
+            &sdp,
+            audio_engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+            ImageRewrite::None,
+        )
+        .expect("rewrite");
+        assert!(
+            result.sdp.contains("m=image 5004 udptl t38"),
+            "an untouched section keeps the peer's own port: {}",
+            result.sdp
+        );
+    }
+
+    #[test]
+    fn a_fax_switchover_with_no_audio_section_parses_and_re_originates() {
+        // The case that fails outright today: `parse` has no audio to report, and every caller turns
+        // that into an error, so the re-INVITE fails the call.
+        let sdp = image_only_offer();
+        assert_eq!(parse(&sdp), Err(SdpError::NoAudioMedia));
+
+        let ParsedSdp::ImageOnly(image) = parse_session(&sdp).expect("parse_session") else {
+            panic!("a fax-only SDP has no audio transport to report");
+        };
+        assert_eq!(
+            image.remote,
+            "198.51.100.1:5004".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(image.transport, ImageTransport::Udptl);
+
+        let engine = image_engine();
+        let result = rewrite_image_only(&sdp, engine, ImageRewrite::Anchor(engine))
+            .expect("rewrite_image_only");
+        assert!(
+            result.sdp.contains("m=image 40004 udptl t38"),
+            "the fax stream is anchored: {}",
+            result.sdp
+        );
+        assert!(
+            result.sdp.contains("c=IN IP4 127.0.0.1"),
+            "the connection address is the engine's, never the UE's: {}",
+            result.sdp
+        );
+        // The **transport** address is what must not leak, and it does not: no `c=`/`m=` line still
+        // names the peer. The session origin is left alone on purpose, exactly as the audio path
+        // leaves it — `o=` is topology hiding, driven by rtpengine's `replace: [origin]` through
+        // `rewrite_origin`, not by anchoring a stream.
+        assert!(
+            !result
+                .sdp
+                .lines()
+                .any(|line| (line.starts_with("c=") || line.starts_with("m="))
+                    && line.contains("198.51.100.1")),
+            "the peer's address survives on a transport line: {}",
+            result.sdp
+        );
+        assert!(result.sdp.contains("a=T38FaxVersion:0"));
+
+        // An audio-bearing SDP still parses as audio through the same entry point.
+        let audio = parse_session(&audio_image_offer("udptl")).expect("parse_session");
+        let ParsedSdp::Audio(media) = audio else {
+            panic!("an SDP with an m=audio line is an audio session");
+        };
+        assert!(media.image.is_some(), "with the fax stream beside it");
+
+        // Neither audio nor an addressable fax stream is still an error, not a fax reading.
+        assert_eq!(
+            parse_session("v=0\r\no=- 1 1 IN IP4 198.51.100.1\r\ns=-\r\nt=0 0\r\n").err(),
+            Some(SdpError::NoAudioMedia)
+        );
+    }
+
+    #[test]
+    fn an_anchored_image_section_is_emitted_in_rfc4566_section_order() {
+        // The §5 ordering class of bug: a section carrying its own media-level `c=` must keep that
+        // line ahead of the attribute region after the engine re-originates the section.
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 198.51.100.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 5000 RTP/AVP 0\r\n",
+            "c=IN IP4 198.51.100.1\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "m=image 5004 udptl t38\r\n",
+            "c=IN IP4 198.51.100.2\r\n",
+            "a=T38FaxVersion:0\r\n",
+        );
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
+        let result = rewrite(
+            sdp,
+            audio_engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+            ImageRewrite::Anchor(image_engine()),
+        )
+        .expect("rewrite");
+
+        let lines: Vec<&str> = result.sdp.split(CRLF).collect();
+        let image_line = position_of(&lines, "m=image 40004 udptl t38");
+        let connection = lines[image_line..]
+            .iter()
+            .position(|line| line.starts_with("c="))
+            .expect("the image section keeps its own connection line");
+        let attribute = lines[image_line..]
+            .iter()
+            .position(|line| line.starts_with("a=T38"))
+            .expect("the fax attributes survive");
+        assert!(
+            connection < attribute,
+            "RFC 4566 §5: c= precedes the attribute region — {:?}",
+            &lines[image_line..]
+        );
+        // The image section's own `c=` is anchored to the engine, not left pointing at the UE.
+        assert!(
+            !result.sdp.contains("198.51.100.2"),
+            "the image section's own c= is rewritten: {}",
+            result.sdp
+        );
+    }
+
     // ---- RFC 4103 Real-Time Text (`m=text`) section-aware parse + rewrite ----
 
     /// An audio (`m=audio` PCMU) + RFC 4103 text (`m=text`, RED pt 98 wrapping T.140 pt 99) offer at
@@ -4220,6 +4834,7 @@ mod tests {
                 engine: text_engine,
                 crypto: our_text_key,
             },
+            ImageRewrite::None,
         )
         .expect("rewrite");
         // The text `m=` line is anchored to the engine port AND forced to `RTP/SAVP`.
@@ -4272,6 +4887,7 @@ mod tests {
             None,
             None,
             TextRewrite::Anchor(text_engine),
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -4319,6 +4935,7 @@ mod tests {
             None,
             None,
             TextRewrite::Decline,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -4346,6 +4963,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0"));
@@ -4394,6 +5012,7 @@ mod tests {
             Some(SecurityAdvertisement::Secure(ours)),
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         // The text section's OWN crypto + ICE + rtpmaps survive (they belong to a different m= section).
@@ -4475,6 +5094,7 @@ mod tests {
             Some(SecurityAdvertisement::Secure(ours)),
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -4590,6 +5210,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         let section = media_section(&result.sdp, "audio");
@@ -4620,6 +5241,7 @@ mod tests {
             None,
             Some(true),
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         let section = media_section(&result.sdp, "audio");
@@ -4641,6 +5263,7 @@ mod tests {
             Some(SecurityAdvertisement::Secure(ours)),
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         let section = media_section(&result.sdp, "audio");
@@ -4670,6 +5293,7 @@ mod tests {
             }),
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         let section = media_section(&result.sdp, "audio");
@@ -4697,6 +5321,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         let section = media_section(&result.sdp, "audio");
@@ -4741,6 +5366,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         let options: Vec<&str> = result
@@ -4765,6 +5391,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         let section = media_section(&result.sdp, "audio");
@@ -4806,6 +5433,7 @@ mod tests {
                 engine: text_engine,
                 crypto: our_text_key,
             },
+            ImageRewrite::None,
         )
         .expect("rewrite");
         let text = media_section(&result.sdp, "text");
@@ -4855,6 +5483,7 @@ mod tests {
             None,
             Some(true),
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         let section = media_section(&result.sdp, "audio");
@@ -4892,8 +5521,16 @@ mod tests {
             "127.0.0.1:30168".parse::<SocketAddr>().unwrap(),
             Some("127.0.0.1:41001".parse::<SocketAddr>().unwrap()),
         );
-        let result =
-            rewrite(sdp, engine, IceRewrite::Keep, None, None, TextRewrite::None).expect("rewrite");
+        let result = rewrite(
+            sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+            ImageRewrite::None,
+        )
+        .expect("rewrite");
         let section = media_section(&result.sdp, "audio");
         assert_rfc4566_line_order(&section, "offerer-misordered c=");
         assert_eq!(
@@ -4926,8 +5563,16 @@ mod tests {
             "b=AS:512\r\n",
         );
         let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
-        let result =
-            rewrite(sdp, engine, IceRewrite::Keep, None, None, TextRewrite::None).expect("rewrite");
+        let result = rewrite(
+            sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+            ImageRewrite::None,
+        )
+        .expect("rewrite");
         assert_eq!(
             media_section(&result.sdp, "video"),
             vec![
@@ -4959,6 +5604,7 @@ mod tests {
             None,
             Some(true),
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert_eq!(
@@ -4991,6 +5637,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(result.sdp.ends_with("a=sendrecv\r\n"), "{:?}", result.sdp);
@@ -5018,6 +5665,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -5052,6 +5700,7 @@ mod tests {
             None,
             None,
             TextRewrite::None,
+            ImageRewrite::None,
         )
         .expect("rewrite");
         assert!(result.sdp.contains("a=rtcp:40001"), "{}", result.sdp);
