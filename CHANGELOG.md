@@ -5,7 +5,7 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.8.1] — 2026-09-25
 
 ### Fixed
 
