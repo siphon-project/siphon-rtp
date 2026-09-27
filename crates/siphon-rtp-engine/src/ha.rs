@@ -157,6 +157,20 @@ pub struct CryptoSnapshot {
     pub master_key_hex: String,
     /// 14-byte master salt, hex.
     pub master_salt_hex: String,
+    /// The key's MKI (RFC 3711 §3.1), when its key-param signalled one. Every packet under the key
+    /// carries it, so a standby restored without it could not authenticate the peer's stream.
+    /// Absent from checkpoints written before it existed, which is exactly `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mki: Option<MkiSnapshot>,
+}
+
+/// A master key identifier: the integer and the field length it is carried in, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MkiSnapshot {
+    /// The MKI value.
+    pub value: u64,
+    /// The MKI field length on the wire, in bytes (1..=128).
+    pub length: usize,
 }
 
 /// A negotiated codec (mirror of `siphon_rtp_codec::factory::CodecSpec`'s wire-relevant fields).
@@ -437,6 +451,7 @@ mod tests {
                 suite: "AES_CM_128_HMAC_SHA1_80".into(),
                 master_key_hex: to_hex(&[0x11; 16]),
                 master_salt_hex: to_hex(&[0x22; 14]),
+                mki: None,
             }),
             near_codec: Some(CodecSnapshot {
                 payload_type: 0,
@@ -479,6 +494,10 @@ mod tests {
                     suite: "AES_CM_128_HMAC_SHA1_80".into(),
                     master_key_hex: to_hex(&[0x33; 16]),
                     master_salt_hex: to_hex(&[0x44; 14]),
+                    mki: Some(MkiSnapshot {
+                        value: 1,
+                        length: 1,
+                    }),
                 },
                 rollover: SecureLegRolloverSnapshot {
                     inbound_rtp: vec![StreamRolloverSnapshot {
@@ -561,5 +580,17 @@ mod tests {
         assert_eq!(from_hex(&to_hex(&bytes)), Some(bytes.to_vec()));
         assert_eq!(from_hex("abc"), None, "odd length");
         assert_eq!(from_hex("zz"), None, "non-hex digit");
+    }
+
+    #[test]
+    fn a_crypto_snapshot_written_before_the_mki_existed_restores_without_one() {
+        let older = r#"{"tag":2,"suite":"AES_CM_128_HMAC_SHA1_80","master_key_hex":"00","master_salt_hex":"00"}"#;
+        let crypto: CryptoSnapshot = serde_json::from_str(older).expect("an older checkpoint");
+        assert_eq!(crypto.mki, None);
+        let rendered = serde_json::to_string(&crypto).expect("serialise");
+        assert!(
+            !rendered.contains("mki"),
+            "and a key without one writes nothing new: {rendered}"
+        );
     }
 }

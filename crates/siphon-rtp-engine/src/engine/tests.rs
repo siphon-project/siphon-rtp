@@ -651,6 +651,10 @@ impl Datapath for LatchLearningDatapath {
         self.inner.note_activity(endpoint);
     }
 
+    fn note_dropped(&self, endpoint: EndpointId) {
+        self.inner.note_dropped(endpoint);
+    }
+
     // The override under test: expose the injected kernel-learned source.
     fn learned_source(&self, endpoint: EndpointId) -> Option<SocketAddr> {
         self.learned.get(&endpoint).map(|entry| *entry.value())
@@ -25692,4 +25696,121 @@ async fn conference_join_secure_text_names_the_offer_line_it_accepted() {
         )
         .await;
     assert_answers_accepted_line(&ok_sdp_text(&joined), "text");
+}
+
+/// A desk phone's SDES offer in the shape phones actually send: `RTP/SAVP` without `a=rtcp-mux`,
+/// PCMA plus telephone-event, and four `a=crypto` lines of which only `keyable` (tag 2) is one the
+/// SRTP context runs — the GCM and 256-bit lines ahead of and behind it are skipped (RFC 4568 §7.1.1).
+fn desk_phone_sdes_offer_sdp(rtp: SocketAddr, keyable: &CryptoAttribute) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/SAVP 8 101\r\na=rtpmap:8 PCMA/8000\r\n\
+         a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\n\
+         a=crypto:1 AEAD_AES_128_GCM inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n\
+         a={keyable}|2^31|1:1\r\n\
+         a=crypto:3 AEAD_AES_256_GCM inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBRPS1uQCVeeCFCanVmcjk\r\n\
+         a=crypto:4 AES_256_CM_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBRPS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n\
+         a=sendrecv\r\n",
+        ip = rtp.ip(),
+        port = rtp.port(),
+        keyable = keyable.to_attribute_value(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_desk_phone_offering_sdes_without_rtcp_mux_is_heard_by_a_plain_callee() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(2, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "desk-phone-out".into(),
+                from_tag: "tag-a".into(),
+                sdp: desk_phone_sdes_offer_sdp(addr_a, &caller_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let engine_far = sdp::parse(&ok_sdp_text(&offered))
+        .expect("far offer")
+        .remote_rtp;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "desk-phone-out".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_single_codec_nomux(addr_b, 8, "PCMA"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let near = sdp::parse(&ok_sdp_text(&answered)).expect("answer");
+    let engine_near = near.remote_rtp;
+    let engine_key = *near.crypto.first().expect("the engine's key");
+    assert_eq!(engine_key.tag, 2, "the answer names the accepted line");
+
+    let mut protect = SrtpContext::from_key_material(&caller_key.key);
+    let mut buffer = [0u8; 2048];
+    for sequence in 0..5u16 {
+        let plain = g711_rtp(8, 100 + sequence, 0x0A0A_0A0A, 0x20);
+        let mut encrypted = Vec::new();
+        protect.protect(&plain, &mut encrypted).expect("protect");
+        // RFC 3711 §3.1: the one-byte MKI the offer signalled (`1:1`) sits between the encrypted
+        // payload and the authentication tag, outside the authenticated portion.
+        let tag_at = encrypted.len() - 10;
+        encrypted.insert(tag_at, 1);
+        phone_a
+            .send_to(&encrypted, engine_near)
+            .await
+            .expect("caller send");
+        let (len, _) = timeout(Duration::from_millis(500), phone_b.recv_from(&mut buffer))
+            .await
+            .expect("the callee hears the caller")
+            .expect("recv");
+        assert_eq!(&buffer[..len], plain.as_slice());
+    }
+
+    let reply = g711_rtp(8, 11, 0x0B0B_0B0B, 0x40);
+    phone_b
+        .send_to(&reply, engine_far)
+        .await
+        .expect("callee send");
+    let (len, _) = timeout(Duration::from_millis(500), phone_a.recv_from(&mut buffer))
+        .await
+        .expect("the caller hears the callee")
+        .expect("recv");
+    let mut unprotect = SrtpContext::from_key_material(&engine_key.key);
+    let mut decrypted = Vec::new();
+    unprotect
+        .unprotect(&buffer[..len], &mut decrypted)
+        .expect("under the engine's key");
+    assert_eq!(decrypted, reply);
+}
+
+fn sdp_single_codec_nomux(rtp: SocketAddr, payload_type: u8, name: &str) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP {payload_type} 101\r\na=rtpmap:{payload_type} {name}/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n",
+        ip = rtp.ip(),
+        port = rtp.port(),
+    )
 }

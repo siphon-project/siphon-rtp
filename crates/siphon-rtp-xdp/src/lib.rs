@@ -429,6 +429,8 @@ struct Inner {
     /// media-timeout sweep and be reaped. The loopback backend gets this for free (its responder
     /// stamps the same counter media does); this is what keeps the two backends agreeing.
     ice_last_check: Arc<DashMap<EndpointId, u64>>,
+    /// Redirected datagrams userspace refused ([`Datapath::note_dropped`]), added to the kernel's count.
+    userspace_dropped: DashMap<EndpointId, u64>,
     /// Per-endpoint publisher of the adopted source, created when a consumer subscribes through
     /// [`Datapath::watch_ice_validated`]. Shared with the datapath thread, which publishes when the
     /// ice-lite responder adopts a source; [`Datapath::adopt_source`] publishes on the control plane.
@@ -540,6 +542,7 @@ impl XdpDatapath {
             ice_agents: ice_agents.clone(),
             ice_adopted: ice_adopted.clone(),
             ice_last_check: ice_last_check.clone(),
+            userspace_dropped: DashMap::new(),
             ice_validated: ice_validated.clone(),
             next_id: AtomicU64::new(0),
             next_port: AtomicU64::new(0),
@@ -1298,6 +1301,7 @@ impl Datapath for XdpDatapath {
         }
         self.inner.ice.remove(&endpoint);
         self.inner.ice_agents.remove(&endpoint);
+        self.inner.userspace_dropped.remove(&endpoint);
         self.inner.ice_adopted.remove(&endpoint);
         self.inner.ice_last_check.remove(&endpoint);
         self.inner.ice_validated.remove(&endpoint);
@@ -1340,14 +1344,25 @@ impl Datapath for XdpDatapath {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let totals = loader.flow_stats(key).ok()?.unwrap_or_default();
+        let userspace_dropped = self
+            .inner
+            .userspace_dropped
+            .get(&endpoint)
+            .map_or(0, |count| *count);
         Some(EndpointStats {
             packets_in: totals.packets_in,
             packets_out: totals.packets_out,
             bytes_in: totals.bytes_in,
             bytes_out: totals.bytes_out,
-            packets_dropped: totals.packets_dropped,
+            packets_dropped: totals.packets_dropped + userspace_dropped,
             packets_lost: totals.packets_lost,
         })
+    }
+
+    fn note_dropped(&self, endpoint: EndpointId) {
+        if self.inner.endpoints.contains_key(&endpoint) {
+            *self.inner.userspace_dropped.entry(endpoint).or_insert(0) += 1;
+        }
     }
 
     fn now_ticks(&self) -> u64 {

@@ -6,7 +6,7 @@ use siphon_rtp_datapath::{
 };
 use siphon_rtp_proto::CmdResult;
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
-use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
+use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, Mki, SrtpKeyMaterial};
 use siphon_rtp_srtp::StreamRollover;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -93,6 +93,10 @@ pub(super) fn crypto_snapshot(crypto: &CryptoAttribute) -> crate::ha::CryptoSnap
         suite: crypto.suite.name().to_string(),
         master_key_hex: crate::ha::to_hex(&crypto.key.master_key),
         master_salt_hex: crate::ha::to_hex(&crypto.key.master_salt),
+        mki: crypto.key.mki.map(|mki| crate::ha::MkiSnapshot {
+            value: mki.value(),
+            length: mki.len(),
+        }),
     }
 }
 
@@ -187,12 +191,18 @@ fn restore_crypto(snapshot: &crate::ha::CryptoSnapshot) -> Result<CryptoAttribut
     let master_salt: [u8; 14] = crate::ha::from_hex(&snapshot.master_salt_hex)
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or("invalid master salt hex (want 14 bytes)")?;
+    let mki = snapshot
+        .mki
+        .map(|mki| Mki::new(mki.value, mki.length))
+        .transpose()
+        .map_err(|error| format!("invalid MKI: {error}"))?;
     Ok(CryptoAttribute {
         tag: snapshot.tag,
         suite,
         key: SrtpKeyMaterial {
             master_key,
             master_salt,
+            mki,
         },
     })
 }

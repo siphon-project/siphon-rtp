@@ -5,6 +5,30 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **A secure offerer whose `a=crypto` carries an MKI is heard again.** RFC 4568 §6.1 lets a key-param
+  name a master key identifier (`inline:<key>|<lifetime>|<value>:<length>`), and RFC 3711 §3.1 / §3.4
+  then put that MKI in every SRTP and SRTCP packet under the key, between the encrypted portion and
+  the authentication tag. The `a=crypto` parser dropped it, so the receiving context authenticated
+  over the wrong bytes and refused every packet from such a peer. On a bridged call the result was
+  one-way audio: the peer's media arrived, none of it was forwarded, and the reverse direction, under
+  the engine's own MKI-less key, worked. It showed up when the SRTP party was the *offerer*, because
+  that is the side whose own key the engine decrypts with. The MKI is now carried on the key material,
+  written on protect and checked on unprotect (a packet naming another MKI is refused before
+  authentication), and replicated in the HA checkpoint. A checkpoint written by an older version
+  restores without one. Only the first key-param is keyed, as before.
+- **Datagrams the SRTP bridge refuses are counted in `packets_dropped`.** A failed decrypt, a source
+  the gate does not admit, and a latch rejection were each dropped at `debug` with no counter, so a
+  whole direction could disappear with the CDR showing packets in, none out and none dropped. New
+  `Datapath::note_dropped` adds them to the endpoint's count on both backends, and the first
+  authentication failure per flow is logged at `warn`.
+- **`call created` logs the offerer's own security.** `secure` only ever described the far leg, so a
+  secure offerer toward a plain callee logged `secure=false`. The line now also carries
+  `offerer_secure`.
+
 ## [0.9.0] — 2026-09-25
 
 ### Added

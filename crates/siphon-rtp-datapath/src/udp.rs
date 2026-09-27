@@ -1126,6 +1126,12 @@ impl Datapath for UdpLoopbackDatapath {
             .map(|entry| entry.stats.last_seen.load(Ordering::Relaxed))
     }
 
+    fn note_dropped(&self, endpoint: EndpointId) {
+        if let Some(entry) = self.inner.endpoints.get(&endpoint) {
+            entry.stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn note_activity(&self, endpoint: EndpointId) {
         if let Some(entry) = self.inner.endpoints.get(&endpoint) {
             entry
@@ -3104,5 +3110,21 @@ mod tests {
         assert_eq!(observed.destination, callee_addr);
         assert_eq!(&observed.payload[..], &report[..]);
         assert!(observations.try_recv().is_err(), "the RTP was not observed");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_consumers_refusal_is_counted_on_the_endpoint() {
+        let datapath = UdpLoopbackDatapath::new();
+        let endpoint = datapath.alloc_endpoint().await.expect("alloc");
+        datapath.note_dropped(endpoint.id);
+        datapath.note_dropped(endpoint.id);
+        assert_eq!(
+            datapath.stats(endpoint.id).expect("stats").packets_dropped,
+            2
+        );
+        // An endpoint already released counts nothing and does not panic.
+        datapath.remove_endpoint(endpoint.id).await;
+        datapath.note_dropped(endpoint.id);
+        assert!(datapath.stats(endpoint.id).is_none());
     }
 }

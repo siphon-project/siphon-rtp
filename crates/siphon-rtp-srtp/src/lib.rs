@@ -22,7 +22,7 @@ pub mod sdes;
 pub mod srtcp;
 
 use kdf::MASTER_SALT_LEN;
-use sdes::SrtpKeyMaterial;
+use sdes::{Mki, SrtpKeyMaterial};
 
 type AesCm = ctr::Ctr128BE<Aes128>;
 type HmacSha1 = Hmac<Sha1>;
@@ -49,6 +49,31 @@ pub enum SrtpError {
     /// replay); either way the caller drops it and never forwards it.
     #[error("replayed packet")]
     Replayed,
+    /// The packet's MKI field names a master key this context does not hold (RFC 3711 §3.3 step 1:
+    /// the MKI selects the key, so there is nothing to authenticate against).
+    #[error("unknown MKI")]
+    UnknownMki,
+}
+
+/// Split the optional MKI field (RFC 3711 §3.1 / §3.4) off the end of `protected` — a packet with
+/// its authentication tag already removed — and check it names `mki`. Returns the authenticated
+/// portion, which the MKI is not part of.
+pub(crate) fn strip_mki<'packet>(
+    protected: &'packet [u8],
+    mki: Option<&Mki>,
+) -> Result<&'packet [u8], SrtpError> {
+    let Some(mki) = mki else {
+        return Ok(protected);
+    };
+    let at = protected
+        .len()
+        .checked_sub(mki.len())
+        .ok_or(SrtpError::TooShort)?;
+    let (authenticated, field) = protected.split_at(at);
+    if !mki.matches(field) {
+        return Err(SrtpError::UnknownMki);
+    }
+    Ok(authenticated)
 }
 
 /// The RFC 3711 §3.3.2 replay-window width, in packets. The RFC mandates a receiver window of at
@@ -178,6 +203,8 @@ pub struct SrtpContext {
     session_salt: [u8; MASTER_SALT_LEN],
     session_auth: [u8; 20],
     streams: HashMap<u32, StreamState>,
+    /// The MKI every packet under this key carries (RFC 3711 §3.1), when the key signalled one.
+    mki: Option<Mki>,
 }
 
 impl SrtpContext {
@@ -211,13 +238,18 @@ impl SrtpContext {
             session_salt,
             session_auth,
             streams: HashMap::new(),
+            mki: None,
         }
     }
 
-    /// Build a context from SDES [`SrtpKeyMaterial`] (a parsed/generated `a=crypto` inline key).
+    /// Build a context from SDES [`SrtpKeyMaterial`] (a parsed/generated `a=crypto` inline key),
+    /// including the MKI its key-param signalled, which every packet then carries.
     #[must_use]
     pub fn from_key_material(material: &SrtpKeyMaterial) -> Self {
-        Self::new(&material.master_key, &material.master_salt)
+        Self {
+            mki: material.mki,
+            ..Self::new(&material.master_key, &material.master_salt)
+        }
     }
 
     /// Export the per-SSRC rollover state for an HA checkpoint (order unspecified). This is the only
@@ -257,7 +289,7 @@ impl SrtpContext {
     }
 
     /// Encrypt + authenticate an RTP packet into `out` (cleared first): `header || AES-CM(payload) ||
-    /// HMAC-SHA1-80`.
+    /// [MKI] || HMAC-SHA1-80`. The MKI sits outside the authenticated portion (RFC 3711 §3.1).
     pub fn protect(&mut self, rtp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
         let (header_len, ssrc, seq) = parse_rtp_header(rtp)?;
         let (index, roc) = self.streams.entry(ssrc).or_default().index_for(seq);
@@ -268,18 +300,25 @@ impl SrtpContext {
         AesCm::new(&self.session_key.into(), &iv.into()).apply_keystream(&mut out[header_len..]);
 
         let tag = auth_tag(&self.session_auth, out, roc)?;
+        if let Some(mki) = &self.mki {
+            mki.write_to(out);
+        }
         out.extend_from_slice(&tag);
         Ok(())
     }
 
     /// Reject replays, verify the tag, and decrypt an SRTP packet into `out` (cleared first), yielding
     /// the plain RTP. Returns [`SrtpError::Replayed`] for a duplicated/too-old index (RFC 3711 §3.3.2)
-    /// and [`SrtpError::AuthFailed`] for a forged/corrupt tag; neither advances the stream state.
+    /// and [`SrtpError::AuthFailed`] for a forged/corrupt tag; neither advances the stream state. A
+    /// key that signalled an MKI expects it in every packet, and a packet naming another is
+    /// [`SrtpError::UnknownMki`].
     pub fn unprotect(&mut self, srtp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
-        if srtp.len() < 12 + AUTH_TAG_LEN {
+        let mki_len = self.mki.as_ref().map_or(0, Mki::len);
+        if srtp.len() < 12 + mki_len + AUTH_TAG_LEN {
             return Err(SrtpError::TooShort);
         }
-        let (authenticated, tag) = srtp.split_at(srtp.len() - AUTH_TAG_LEN);
+        let (protected, tag) = srtp.split_at(srtp.len() - AUTH_TAG_LEN);
+        let authenticated = strip_mki(protected, self.mki.as_ref())?;
         let (header_len, ssrc, seq) = parse_rtp_header(authenticated)?;
 
         // Estimate the index on a *copy* of the stream state so a failed auth never advances it.
@@ -744,6 +783,83 @@ mod tests {
         assert!(
             !window.is_replay(12 + REPLAY_WINDOW + 101),
             "a newer index is fresh"
+        );
+    }
+
+    fn keyed(mki: Option<Mki>) -> SrtpContext {
+        SrtpContext::from_key_material(&SrtpKeyMaterial {
+            master_key: [0x11; 16],
+            master_salt: [0x22; MASTER_SALT_LEN],
+            mki,
+        })
+    }
+
+    /// The packet RFC 3711 §3.1 describes for a key with an MKI, built from the same key's packet
+    /// *without* one: the MKI is neither encrypted nor authenticated, so inserting it ahead of the
+    /// tag is the whole difference. Independent of the MKI code under test.
+    fn with_mki_field(protected: &[u8], field: &[u8]) -> Vec<u8> {
+        let tag_at = protected.len() - AUTH_TAG_LEN;
+        [&protected[..tag_at], field, &protected[tag_at..]].concat()
+    }
+
+    #[test]
+    fn a_key_with_an_mki_carries_it_between_the_payload_and_the_tag() {
+        let mki = Mki::new(0x0102, 4).expect("mki");
+        let plain = rtp(1, 0xCAFE_F00D, 0x55);
+        let mut without = Vec::new();
+        keyed(None).protect(&plain, &mut without).expect("protect");
+        let mut with = Vec::new();
+        keyed(Some(mki))
+            .protect(&plain, &mut with)
+            .expect("protect");
+        assert_eq!(with, with_mki_field(&without, &[0, 0, 1, 2]));
+    }
+
+    #[test]
+    fn a_peers_packet_carrying_its_signalled_mki_authenticates() {
+        // The one-way-audio case: a peer whose key-param said `|1:1` puts a one-byte MKI in every
+        // packet. Without the MKI on the context the tag is checked over the wrong bytes and every
+        // packet fails authentication.
+        let plain = rtp(9, 0x0A0A_0A0A, 0x20);
+        let mut sealed = Vec::new();
+        keyed(None).protect(&plain, &mut sealed).expect("protect");
+        let on_wire = with_mki_field(&sealed, &[1]);
+
+        let mut out = Vec::new();
+        assert_eq!(
+            keyed(None).unprotect(&on_wire, &mut out),
+            Err(SrtpError::AuthFailed),
+            "a context that does not know the MKI cannot hear this peer"
+        );
+        keyed(Some(Mki::new(1, 1).expect("mki")))
+            .unprotect(&on_wire, &mut out)
+            .expect("the MKI-aware context does");
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn a_packet_naming_another_mki_is_refused_before_authentication() {
+        let plain = rtp(9, 0x0A0A_0A0A, 0x20);
+        let mut sealed = Vec::new();
+        keyed(None).protect(&plain, &mut sealed).expect("protect");
+        let mut receiver = keyed(Some(Mki::new(1, 1).expect("mki")));
+        let mut out = Vec::new();
+        assert_eq!(
+            receiver.unprotect(&with_mki_field(&sealed, &[2]), &mut out),
+            Err(SrtpError::UnknownMki)
+        );
+        receiver
+            .unprotect(&with_mki_field(&sealed, &[1]), &mut out)
+            .expect("the refusal advanced no replay state");
+    }
+
+    #[test]
+    fn a_packet_too_short_for_its_mki_is_too_short() {
+        let mut receiver = keyed(Some(Mki::new(1, 4).expect("mki")));
+        let mut out = Vec::new();
+        assert_eq!(
+            receiver.unprotect(&[0x80; 12 + AUTH_TAG_LEN + 3], &mut out),
+            Err(SrtpError::TooShort)
         );
     }
 }

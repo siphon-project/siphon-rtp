@@ -638,11 +638,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         let info = match sdp::parse(sdp) {
             Ok(info) => info,
-            Err(error) => {
-                return CmdResult::Error {
-                    reason: format!("offer SDP parse failed: {error}"),
-                }
-            }
+            Err(error) => return error_result("offer SDP parse failed", &error),
         };
 
         if let Some(refusal) = offer_takeover_refusal(profile, &info) {
@@ -864,7 +860,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Media-plane lifecycle (target `siphon_rtp::media`): the offer allocated ports and is about to
         // record the call — the first line of a call's story, correlated by the same `call_id` the SBC
-        // logs. `secure` flags a leg the far side offered as SRTP (SDES) or DTLS-SRTP.
+        // logs. `secure` flags the far leg as SRTP/DTLS-SRTP; `offerer_secure` the offerer's own leg.
         tracing::info!(
             target: "siphon_rtp::media",
             call_id = %call_id,
@@ -873,6 +869,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_local = %near_rtp.local_addr,
             codec = near_codec.as_ref().map(|codec| codec.encoding_name.as_str()).unwrap_or("-"),
             secure = far_local_crypto.is_some() || far_dtls,
+            offerer_secure = info.secure,
             text = anchor_text,
             text_secure = anchor_secure_text,
             "call created"

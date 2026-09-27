@@ -582,6 +582,14 @@ pub trait Datapath: Send + Sync {
     /// do not track activity.
     fn note_activity(&self, _endpoint: EndpointId) {}
 
+    /// Count one datagram a `Redirect`-path consumer refused (source gate, failed authentication,
+    /// latch rejection) in `endpoint`'s `packets_dropped`. The `Forward` fast path counts its own
+    /// drops; a redirected packet was counted as received and is otherwise never counted again, so a
+    /// userspace path refusing every packet reads as `packets_in` climbing with nothing dropped and
+    /// nothing sent — which is what made a whole direction of a call silently disappear. Default no-op
+    /// for a backend with no userspace counters.
+    fn note_dropped(&self, _endpoint: EndpointId) {}
+
     /// The peer source a backend has learned in-kernel for `endpoint` via symmetric-RTP latching
     /// (RFC 3550 §8), if any. The engine propagates it to the sibling leg's forward destination so a
     /// NATed peer's real source drives the in-kernel relay (docs/security-and-nat.md §4 layer 3).
