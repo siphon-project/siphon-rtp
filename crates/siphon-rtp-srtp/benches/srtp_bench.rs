@@ -8,6 +8,8 @@
 //! Benched paths:
 //!   - `srtp_protect_160` / `srtp_unprotect_160` — one G.711 frame (12-byte header + 160-byte
 //!     payload, 20 ms @ 8 kHz): the dominant cost, run at 50 packets/s per stream per direction.
+//!   - `srtp_unprotect_160_mki` — the same frame from a peer whose key signalled a 4-byte MKI
+//!     (RFC 3711 §3.1): the extra cost is locating and comparing the field ahead of the tag.
 //!   - `srtcp_protect` / `srtcp_unprotect` — a compound RTCP SR (RFC 3711 §3.4): explicit index,
 //!     8-byte header in the clear; runs at RTCP rate, not media rate, but on the same datapath.
 //!   - `secure_leg_protect_rtp` / `secure_leg_unprotect_rtp` — the full leg path incl. the RFC 5761
@@ -23,7 +25,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_srtp::leg::SecureLeg;
-use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
+use siphon_rtp_srtp::sdes::{Mki, SrtpKeyMaterial};
 use siphon_rtp_srtp::srtcp::SrtcpContext;
 use siphon_rtp_srtp::{kdf::MASTER_SALT_LEN, SrtpContext, MASTER_KEY_LEN};
 
@@ -100,6 +102,37 @@ fn bench_srtp(criterion: &mut Criterion) {
         bencher.iter(|| {
             if index == 0 {
                 receiver = srtp_context(); // fresh replay window so the ring repeats
+            }
+            receiver
+                .unprotect(black_box(&ring[index]), &mut out)
+                .expect("unprotect");
+            index = if index + 1 == RING_LEN { 0 } else { index + 1 };
+            black_box(out.len())
+        });
+    });
+
+    criterion.bench_function("srtp_unprotect_160_mki", |bencher| {
+        let key = SrtpKeyMaterial {
+            master_key: MASTER_KEY,
+            master_salt: MASTER_SALT,
+            mki: Some(Mki::new(1, 4).expect("mki")),
+        };
+        let mut sender = SrtpContext::from_key_material(&key);
+        let ring: Vec<Vec<u8>> = (0..RING_LEN)
+            .map(|seq| {
+                let mut sealed = Vec::with_capacity(256);
+                sender
+                    .protect(&rtp_packet(seq as u16, 0x0102_0304), &mut sealed)
+                    .expect("seed protect");
+                sealed
+            })
+            .collect();
+        let mut receiver = SrtpContext::from_key_material(&key);
+        let mut out = Vec::with_capacity(256);
+        let mut index = 0usize;
+        bencher.iter(|| {
+            if index == 0 {
+                receiver = SrtpContext::from_key_material(&key);
             }
             receiver
                 .unprotect(black_box(&ring[index]), &mut out)

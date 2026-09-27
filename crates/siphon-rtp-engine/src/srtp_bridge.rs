@@ -18,6 +18,7 @@
 //! the engine cannot decode. The plaintext in between is a stack buffer that never reaches a socket.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
@@ -123,6 +124,10 @@ struct Flow {
     /// that intermediate is the *only* plaintext there is, so the tap is what keeps a
     /// secure-to-secure call interceptable at all.
     x3: Option<X3Tap>,
+    /// Set once this flow has logged a peer whose SRTP does not authenticate, so the operator hears
+    /// about it once per negotiation rather than 50 times a second. Every such datagram is still
+    /// counted in the endpoint's `packets_dropped`.
+    auth_failure_reported: AtomicBool,
 }
 
 /// The bridge registry: redirected endpoint → its `Flow`. Shared (`Arc`) between the control path
@@ -223,6 +228,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     ingress_leg,
                     egress_leg,
                     x3: None,
+                    auth_failure_reported: AtomicBool::new(false),
                 },
             );
         }
@@ -347,6 +353,39 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         self.dtls.clear_x3_tap(endpoint);
     }
 
+    /// Log a secure peer's datagram that failed to decrypt. A replay is routine and stays at `debug`;
+    /// anything else (a wrong key, an MKI the key does not carry, a truncated packet) means this
+    /// direction of the call is inaudible, so the first one per flow is a `warn`, once.
+    fn report_ingress_failure(
+        &self,
+        packet: &RxPacket,
+        party: BridgeLeg,
+        error: &siphon_rtp_srtp::SrtpError,
+    ) {
+        let first = !matches!(error, siphon_rtp_srtp::SrtpError::Replayed)
+            && self
+                .flows
+                .get(&packet.endpoint)
+                .is_some_and(|flow| !flow.auth_failure_reported.swap(true, Ordering::Relaxed));
+        if first {
+            tracing::warn!(
+                target: "siphon_rtp::media",
+                endpoint = ?packet.endpoint,
+                source = %packet.source,
+                ?party,
+                %error,
+                "bridge cannot decrypt the secure peer's media; this direction is dropped \
+                 (counted in packets_dropped, logged once per negotiation)"
+            );
+        } else {
+            tracing::debug!(
+                %error,
+                ?party,
+                "bridge ingress decrypt failed; dropping packet"
+            );
+        }
+    }
+
     /// Handle one redirected datagram: gate the source, apply the flow's crypto, and forward it.
     /// Anything that fails to gate or transform is dropped (never forwarded into the void).
     pub async fn handle(&self, packet: RxPacket) {
@@ -379,6 +418,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 source = %packet.source,
                 "bridge dropped packet from unsignalled source"
             );
+            self.datapath.note_dropped(packet.endpoint);
             return;
         }
 
@@ -397,11 +437,8 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 leg.unprotect(&packet.data, &mut decrypted)
             };
             if let Err(error) = transformed {
-                tracing::debug!(
-                    ?error,
-                    party = ?side.party,
-                    "bridge ingress decrypt failed; dropping packet"
-                );
+                self.report_ingress_failure(&packet, side.party, &error);
+                self.datapath.note_dropped(packet.endpoint);
                 return;
             }
             &decrypted
@@ -424,6 +461,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     party = ?side.party,
                     "bridge egress encrypt failed; dropping packet"
                 );
+                self.datapath.note_dropped(packet.endpoint);
                 return;
             }
             &sealed
@@ -458,6 +496,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                             source = %packet.source,
                             "bridge dropped packet from a source its latch will not adopt"
                         );
+                        self.datapath.note_dropped(packet.endpoint);
                         return;
                     }
                     ReplyLatch::Accept(adopted) => adopted,
@@ -955,6 +994,70 @@ mod tests {
             .unprotect(&srtp, &mut recovered)
             .expect("peer decrypt");
         assert_eq!(recovered, plaintext);
+    }
+
+    /// Wait for `endpoint`'s `packets_dropped` to reach `expected`: the bridge counts on the
+    /// dispatcher's task, after the datagram the test sent has crossed the loopback socket.
+    async fn wait_for_dropped(
+        datapath: &UdpLoopbackDatapath,
+        endpoint: EndpointId,
+        expected: u64,
+    ) -> u64 {
+        let counted = || {
+            datapath
+                .stats(endpoint)
+                .map_or(0, |stats| stats.packets_dropped)
+        };
+        let _ = timeout(SHORT, async {
+            while counted() < expected {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        counted()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_datagram_the_bridge_refuses_is_counted_as_dropped() {
+        // The one-way-audio fault: a secure peer's packets arrived (`packets_in` climbed) and none
+        // left, with `packets_dropped` at zero, because the bridge refused them in userspace and
+        // counted nothing. Each refusal is now a drop on the endpoint it arrived at.
+        let (harness, (phone_a, _), (phone_b, _)) = live_bridge().await;
+        let mut wrong_key = SrtpContext::from_key_material(&key(0xCC));
+        for sequence in 0..3u16 {
+            let mut sealed = Vec::new();
+            wrong_key
+                .protect(&rtp(3000 + sequence, 0x3333_3333), &mut sealed)
+                .expect("protect");
+            phone_b
+                .send_to(&sealed, harness.secure_addr)
+                .await
+                .expect("send b");
+        }
+        assert_eq!(
+            wait_for_dropped(&harness._datapath, harness.secure_endpoint, 3).await,
+            3,
+            "every packet that fails authentication is a drop"
+        );
+        let mut buffer = [0u8; 2048];
+        assert!(
+            timeout(NEGATIVE, phone_a.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "and none of them was forwarded"
+        );
+
+        let (stranger, _) = phone(Ipv4Addr::new(127, 0, 0, 9)).await;
+        stranger
+            .send_to(&rtp(1, 0x5555_5555), harness.plain_addr)
+            .await
+            .expect("send stranger");
+        assert_eq!(
+            wait_for_dropped(&harness._datapath, harness.plain_endpoint, 1).await,
+            1,
+            "a source the gate refuses is a drop too"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

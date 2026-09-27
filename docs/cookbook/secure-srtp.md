@@ -16,9 +16,19 @@ RTP core. For DTLS-keyed SRTP (WebRTC), see [WebRTC legs](webrtc.md).
   peer's SDP are skipped and the first supported one keys the leg.
 - **Key material**: the RFC 4568 §9.1 30-byte inline value, `master_key(16) ||
   master_salt(14)`, base64. The engine mints its own keys from the OS CSPRNG and
-  never emits MKI or lifetime parameters (both optional); it tolerates
-  `|lifetime|MKI` suffixes and session parameters on the peer's line and uses the
-  first inline key-param.
+  never emits MKI or lifetime parameters on them (both optional). On the peer's
+  line it uses the first inline key-param, ignores the lifetime and session
+  parameters, and **honours the MKI** (`|<value>:<length>`, RFC 4568 §6.1): every
+  SRTP and SRTCP packet under that key carries the MKI before its auth tag
+  (RFC 3711 §3.1 / §3.4), so the engine expects it there and refuses a packet
+  naming another. A peer that rolls to a second key-param under a new MKI is not
+  followed.
+- **Refused packets are counted.** A secure datagram that fails to authenticate,
+  arrives from an unsignalled source, or is refused by the latch is counted in
+  its endpoint's `packets_dropped`, and the first authentication failure on a
+  flow is logged at `warn` (target `siphon_rtp::media`). A direction whose
+  `packets_in` climbs while the other leg's `packets_out` stays at zero is now
+  also visible as `packets_dropped` climbing.
 - **RTP/RTCP**: both directions get independent SRTP and SRTCP contexts, derived
   from the same master key under the RFC 3711 §4.3 labels. `a=rtcp-mux`
   (RFC 5761) and non-muxed RTCP both work; on a non-muxed leg the companion RTCP

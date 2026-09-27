@@ -7,8 +7,10 @@
 //! datapath.
 //!
 //! Scope: `AES_CM_128_HMAC_SHA1_80` (the SIP/VoLTE default) and `_32` are recognised; key material
-//! is the 30-byte `master_key(16) || master_salt(14)` base64 inline value (RFC 4568 §9.1, no MKI /
-//! no lifetime emitted — both optional and widely accepted absent).
+//! is the 30-byte `master_key(16) || master_salt(14)` base64 inline value (RFC 4568 §9.1). The engine
+//! emits no MKI and no lifetime on its own keys (both optional), but a peer's MKI is parsed and kept
+//! on its [`SrtpKeyMaterial`]: RFC 3711 §3.1 puts the MKI in *every* packet under that key, so a
+//! context that ignored it would authenticate over the wrong bytes and drop the whole stream.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -40,6 +42,99 @@ pub enum SdesError {
     /// The OS CSPRNG failed (key generation).
     #[error("randomness unavailable")]
     Random,
+    /// The `|<value>:<length>` MKI of a key-param was malformed, zero or over 128 bytes long, or
+    /// named a value that does not fit its length (RFC 4568 §6.1).
+    #[error("malformed MKI")]
+    BadMki,
+}
+
+/// A master key identifier (RFC 3711 §3.1), signalled on a key-param as `|<value>:<length>`
+/// (RFC 4568 §6.1): `length` bytes carrying `value` big-endian, present in every SRTP and SRTCP
+/// packet under that key, after the encrypted portion and before the authentication tag. It is
+/// neither encrypted nor authenticated.
+///
+/// The value is held as a `u64`. RFC 4568 allows up to 128 bytes of length, and a longer field is
+/// represented with leading zero bytes; a *value* past 64 bits is refused as [`SdesError::BadMki`],
+/// which makes the line unkeyable rather than keyed wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mki {
+    value: u64,
+    length: u8,
+}
+
+impl Mki {
+    /// The longest MKI RFC 4568 §6.1 admits, in bytes.
+    pub const MAX_LENGTH: usize = 128;
+
+    /// An MKI of `length` bytes carrying `value`. Refuses a zero or over-long length and a value
+    /// that does not fit in `length` bytes.
+    pub fn new(value: u64, length: usize) -> Result<Self, SdesError> {
+        let length_fits = (1..=Self::MAX_LENGTH).contains(&length);
+        let value_fits = length >= 8 || value >> (8 * length) == 0;
+        if !length_fits || !value_fits {
+            return Err(SdesError::BadMki);
+        }
+        let length = u8::try_from(length).map_err(|_| SdesError::BadMki)?;
+        Ok(Self { value, length })
+    }
+
+    /// The integer the MKI field carries.
+    #[must_use]
+    pub fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// The MKI field's length on the wire, in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        usize::from(self.length)
+    }
+
+    /// Always `false`: an MKI is at least one byte (RFC 4568 §6.1). Present for the `len` pairing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// The field's byte at `position` (0 = first on the wire), big-endian and zero-padded.
+    fn byte(&self, position: usize) -> u8 {
+        let from_right = self.len() - 1 - position;
+        if from_right < 8 {
+            self.value.to_be_bytes()[7 - from_right]
+        } else {
+            0
+        }
+    }
+
+    /// Whether `field` is exactly this MKI as it appears on the wire.
+    #[must_use]
+    pub fn matches(&self, field: &[u8]) -> bool {
+        field.len() == self.len()
+            && field
+                .iter()
+                .enumerate()
+                .all(|(position, byte)| *byte == self.byte(position))
+    }
+
+    /// Append the MKI field to `out`.
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend((0..self.len()).map(|position| self.byte(position)));
+    }
+
+    /// Parse the `<value>:<length>` text of a key-param's MKI (both decimal, RFC 4568 §6.1).
+    fn parse(text: &str) -> Result<Self, SdesError> {
+        let (value, length) = text.split_once(':').ok_or(SdesError::BadMki)?;
+        let decimal = |digits: &str| {
+            digits
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then(|| digits.parse::<u64>().ok())
+                .flatten()
+                .ok_or(SdesError::BadMki)
+        };
+        let length = usize::try_from(decimal(length)?).map_err(|_| SdesError::BadMki)?;
+        Self::new(decimal(value)?, length)
+    }
 }
 
 /// An SRTP crypto-suite as named on the `a=crypto` line.
@@ -88,6 +183,9 @@ pub struct SrtpKeyMaterial {
     pub master_key: [u8; MASTER_KEY_LEN],
     /// 14-byte master salt.
     pub master_salt: [u8; MASTER_SALT_LEN],
+    /// The master key identifier every packet under this key carries, when its key-param signalled
+    /// one (RFC 3711 §3.1). `None` for the engine's own keys and for DTLS-exported ones.
+    pub mki: Option<Mki>,
 }
 
 impl SrtpKeyMaterial {
@@ -112,6 +210,7 @@ impl SrtpKeyMaterial {
         Ok(Self {
             master_key,
             master_salt,
+            mki: None,
         })
     }
 
@@ -170,8 +269,12 @@ impl CryptoAttribute {
     }
 
     /// Parse the value of an `a=crypto` line (the text after `a=`, i.e. `crypto:<tag> <suite>
-    /// inline:<base64>[|...][ session-params]`). The first inline key-param is used; lifetime/MKI
-    /// suffixes and session parameters are ignored.
+    /// inline:<base64>[|lifetime][|MKI:length][ session-params]`). The first inline key-param is
+    /// used, with its MKI; the lifetime and any session parameters are ignored.
+    ///
+    /// Only the first key-param is keyed. A peer listing several keys under different MKIs to roll
+    /// between them (RFC 4568 §6.1) is therefore heard until it switches, after which its packets
+    /// name an MKI this key does not carry and fail as [`crate::SrtpError::UnknownMki`].
     pub fn parse(attribute_value: &str) -> Result<Self, SdesError> {
         let body = attribute_value
             .strip_prefix("crypto:")
@@ -187,12 +290,22 @@ impl CryptoAttribute {
             .ok_or_else(|| SdesError::UnsupportedSuite(suite_name.to_string()))?;
         let key_params = fields.next().ok_or(SdesError::Malformed("key-params"))?;
 
-        // First key-param only; strip the `inline:` prefix and any `|lifetime|MKI` suffix.
+        // First key-param only: `inline:<key>[|<lifetime>][|<MKI>:<length>]` (RFC 4568 §6.1). The
+        // lifetime and the MKI are told apart by the colon only the MKI has.
         let first = key_params.split(';').next().unwrap_or(key_params);
         let inline = first.strip_prefix("inline:").ok_or(SdesError::BadKey)?;
-        let encoded = inline.split('|').next().unwrap_or(inline);
+        let mut parts = inline.split('|');
+        let encoded = parts.next().unwrap_or(inline);
         let raw = STANDARD.decode(encoded).map_err(|_| SdesError::BadKey)?;
-        let key = SrtpKeyMaterial::from_inline_bytes(&raw)?;
+        let mut key = SrtpKeyMaterial::from_inline_bytes(&raw)?;
+        for part in parts {
+            if part.contains(':') {
+                if key.mki.is_some() {
+                    return Err(SdesError::BadMki);
+                }
+                key.mki = Some(Mki::parse(part)?);
+            }
+        }
         Ok(Self { tag, suite, key })
     }
 
@@ -204,11 +317,17 @@ impl CryptoAttribute {
         Self::parse(attribute_value).ok().filter(Self::is_keyable)
     }
 
-    /// Render the SDP attribute value (`crypto:<tag> <suite> inline:<base64>`), without the `a=`.
+    /// Render the SDP attribute value (`crypto:<tag> <suite> inline:<base64>[|<MKI>:<length>]`),
+    /// without the `a=`.
     #[must_use]
     pub fn to_attribute_value(&self) -> String {
+        let mki = self
+            .key
+            .mki
+            .map(|mki| format!("|{}:{}", mki.value(), mki.len()))
+            .unwrap_or_default();
         format!(
-            "crypto:{} {} inline:{}",
+            "crypto:{} {} inline:{}{mki}",
             self.tag,
             self.suite.name(),
             STANDARD.encode(self.key.to_inline_bytes())
@@ -230,6 +349,66 @@ mod tests {
         assert_eq!(attribute.suite, CryptoSuite::AesCm128HmacSha1_80);
         // The inline value is exactly 30 bytes once decoded.
         assert_eq!(attribute.key.to_inline_bytes().len(), INLINE_KEY_LEN);
+        // `1:4` is MKI value 1 in a 4-byte field, which every packet under this key carries.
+        assert_eq!(attribute.key.mki, Some(Mki::new(1, 4).expect("mki")));
+    }
+
+    #[test]
+    fn an_mki_is_kept_with_or_without_a_lifetime_ahead_of_it() {
+        // RFC 4568 §6.1: both `|lifetime` and `|MKI:length` are optional and independent.
+        let key = "inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR";
+        let with = |suffix: &str| {
+            CryptoAttribute::parse(&format!("crypto:2 AES_CM_128_HMAC_SHA1_80 {key}{suffix}"))
+                .expect("parse")
+                .key
+                .mki
+        };
+        assert_eq!(with("|2^31|1:1"), Some(Mki::new(1, 1).expect("mki")));
+        assert_eq!(with("|7:2"), Some(Mki::new(7, 2).expect("mki")));
+        assert_eq!(with("|2^31"), None);
+        assert_eq!(with(""), None);
+    }
+
+    #[test]
+    fn a_malformed_mki_makes_the_line_unparseable_rather_than_keyed_without_it() {
+        let key = "inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR";
+        for suffix in ["|1:0", "|1:129", "|256:1", "|x:1", "|1:", "|:1", "|1:1|2:1"] {
+            assert_eq!(
+                CryptoAttribute::parse(&format!("crypto:1 AES_CM_128_HMAC_SHA1_80 {key}{suffix}")),
+                Err(SdesError::BadMki),
+                "{suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_mki_is_its_value_big_endian_in_its_signalled_length() {
+        let mut field = Vec::new();
+        Mki::new(0x0102, 4).expect("mki").write_to(&mut field);
+        assert_eq!(field, [0, 0, 1, 2]);
+        let wide = Mki::new(u64::MAX, 10).expect("a field wider than the value");
+        let mut field = Vec::new();
+        wide.write_to(&mut field);
+        assert_eq!(
+            field,
+            [0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert!(wide.matches(&field));
+        assert!(
+            !wide.matches(&field[1..]),
+            "the length is part of the identity"
+        );
+        assert!(!Mki::new(1, 1).expect("mki").matches(&[2]));
+    }
+
+    #[test]
+    fn an_mki_round_trips_through_the_attribute_line() {
+        let mut attribute =
+            CryptoAttribute::generate(3, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        attribute.key.mki = Some(Mki::new(5, 2).expect("mki"));
+        let line = attribute.to_attribute_value();
+        assert!(line.ends_with("|5:2"), "{line}");
+        assert_eq!(CryptoAttribute::parse(&line).expect("parse"), attribute);
     }
 
     #[test]

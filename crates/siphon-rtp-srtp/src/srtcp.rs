@@ -12,9 +12,10 @@
 use subtle::ConstantTimeEq;
 
 use crate::kdf::{self, MASTER_SALT_LEN};
-use crate::sdes::SrtpKeyMaterial;
+use crate::sdes::{Mki, SrtpKeyMaterial};
 use crate::{
-    apply_aes_cm, cipher_iv, hmac_sha1_80, ReplayWindow, SrtpError, AUTH_TAG_LEN, MASTER_KEY_LEN,
+    apply_aes_cm, cipher_iv, hmac_sha1_80, strip_mki, ReplayWindow, SrtpError, AUTH_TAG_LEN,
+    MASTER_KEY_LEN,
 };
 
 /// The `E|SRTCP-index` trailer length (RFC 3711 §3.4): 1 encrypt-flag bit + 31-bit index.
@@ -36,6 +37,8 @@ pub struct SrtcpContext {
     /// Receive-side replay filter over the peer's explicit SRTCP index (RFC 3711 §3.3.2). Only used
     /// on the inbound (unprotect) direction; unused on an outbound-only context.
     recv_replay: ReplayWindow,
+    /// The MKI every packet under this key carries (RFC 3711 §3.4), when the key signalled one.
+    mki: Option<Mki>,
 }
 
 impl SrtcpContext {
@@ -69,13 +72,18 @@ impl SrtcpContext {
             session_auth,
             send_index: 0,
             recv_replay: ReplayWindow::default(),
+            mki: None,
         }
     }
 
-    /// Build an SRTCP context from SDES [`SrtpKeyMaterial`] (the same inline key as the SRTP leg).
+    /// Build an SRTCP context from SDES [`SrtpKeyMaterial`] (the same inline key as the SRTP leg),
+    /// including its MKI: the key's MKI appears in SRTCP exactly as in SRTP (RFC 3711 §3.4).
     #[must_use]
     pub fn from_key_material(material: &SrtpKeyMaterial) -> Self {
-        Self::new(&material.master_key, &material.master_salt)
+        Self {
+            mki: material.mki,
+            ..Self::new(&material.master_key, &material.master_salt)
+        }
     }
 
     /// The current outgoing SRTCP index (RFC 3711 §3.4). Carried across an HA failover so a standby
@@ -93,7 +101,7 @@ impl SrtcpContext {
     }
 
     /// Encrypt + authenticate a compound RTCP packet into `out`: `header(8) || AES-CM(rest) ||
-    /// E|index || HMAC-SHA1-80`.
+    /// E|index || [MKI] || HMAC-SHA1-80`. The MKI is not authenticated (RFC 3711 §3.4).
     pub fn protect(&mut self, rtcp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
         if rtcp.len() < CLEAR_HEADER_LEN {
             return Err(SrtpError::TooShort);
@@ -112,6 +120,9 @@ impl SrtcpContext {
 
         out.extend_from_slice(&(ENCRYPT_FLAG | index).to_be_bytes());
         let tag = hmac_sha1_80(&self.session_auth, out)?;
+        if let Some(mki) = &self.mki {
+            mki.write_to(out);
+        }
         out.extend_from_slice(&tag);
         Ok(())
     }
@@ -120,13 +131,15 @@ impl SrtcpContext {
     /// compound RTCP. Returns [`SrtpError::Replayed`] for a duplicated/too-old SRTCP index (RFC 3711
     /// §3.3.2) and [`SrtpError::AuthFailed`] for a forged/corrupt tag.
     pub fn unprotect(&mut self, srtcp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
-        if srtcp.len() < CLEAR_HEADER_LEN + INDEX_TRAILER_LEN + AUTH_TAG_LEN {
+        let mki_len = self.mki.as_ref().map_or(0, Mki::len);
+        if srtcp.len() < CLEAR_HEADER_LEN + INDEX_TRAILER_LEN + mki_len + AUTH_TAG_LEN {
             return Err(SrtpError::TooShort);
         }
         if srtcp[0] >> 6 != 2 {
             return Err(SrtpError::BadVersion);
         }
-        let (authenticated, tag) = srtcp.split_at(srtcp.len() - AUTH_TAG_LEN);
+        let (protected, tag) = srtcp.split_at(srtcp.len() - AUTH_TAG_LEN);
+        let authenticated = strip_mki(protected, self.mki.as_ref())?;
 
         let trailer_at = authenticated.len() - INDEX_TRAILER_LEN;
         let index_field = u32::from_be_bytes([
@@ -443,5 +456,42 @@ mod tests {
             .unprotect(&genuine, &mut out)
             .expect("the genuine packet is still accepted after the forgery");
         assert_eq!(out, rtcp(0x0101, &[0x5A; 20]));
+    }
+
+    fn keyed(mki: Option<crate::sdes::Mki>) -> SrtcpContext {
+        SrtcpContext::from_key_material(&SrtpKeyMaterial {
+            master_key: [0x11; 16],
+            master_salt: [0x22; MASTER_SALT_LEN],
+            mki,
+        })
+    }
+
+    #[test]
+    fn srtcp_carries_the_mki_after_the_index_and_before_the_tag() {
+        // RFC 3711 §3.4: `... || E|SRTCP index || [MKI] || auth tag`, the MKI outside the
+        // authenticated portion — so the MKI packet is the plain one with the field spliced in.
+        let mki = crate::sdes::Mki::new(1, 1).expect("mki");
+        let plain = rtcp(0xDEAD_BEEF, &[0xAA; 20]);
+        let mut without = Vec::new();
+        keyed(None).protect(&plain, &mut without).expect("protect");
+        let tag_at = without.len() - AUTH_TAG_LEN;
+        let spliced = [&without[..tag_at], &[1u8][..], &without[tag_at..]].concat();
+
+        let mut with = Vec::new();
+        keyed(Some(mki))
+            .protect(&plain, &mut with)
+            .expect("protect");
+        assert_eq!(with, spliced);
+
+        let mut out = Vec::new();
+        keyed(Some(mki))
+            .unprotect(&spliced, &mut out)
+            .expect("authenticates");
+        assert_eq!(out, plain);
+        let wrong = [&without[..tag_at], &[2u8][..], &without[tag_at..]].concat();
+        assert_eq!(
+            keyed(Some(mki)).unprotect(&wrong, &mut out),
+            Err(SrtpError::UnknownMki)
+        );
     }
 }
