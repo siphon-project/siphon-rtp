@@ -486,6 +486,9 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         text_events: false,
         // rtpengine spells it `received from`; accept the hyphenated form too.
         received_from: parse_received_from(request),
+        // rtpengine's `call-id` is the SIP Call-ID of the dialog, and it becomes the engine call id,
+        // so a leg's HEP captures already correlate by it without naming it twice.
+        sip_call_id: None,
         // rtpengine `rtcp-mux` directive list; accept the dotted `rtcp.mux` spelling too.
         rtcp_mux: {
             let mut mux = string_list(request, "rtcp-mux");

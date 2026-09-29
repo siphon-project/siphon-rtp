@@ -48,21 +48,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // single-leg call has no far leg — and never relays text, which is a 2-leg concern — so only
         // the near entry can ever carry stats there.
         let legs = [
-            (Some(&call.near), near, call.from_tag.as_str(), "a_to_b"),
+            (
+                Some(&call.near),
+                near,
+                call.from_tag.as_str(),
+                "a_to_b",
+                call.near_sip_call_id.as_deref(),
+            ),
             (
                 call.far.as_ref(),
                 far,
                 call.to_tag.as_deref().unwrap_or("-"),
                 "b_to_a",
+                call.far_sip_call_id.as_deref(),
             ),
         ];
-        for (leg, stats, tag, direction) in legs {
+        for (leg, stats, tag, direction, sip_call_id) in legs {
             let (Some(leg), Some(stats)) = (leg, stats) else {
                 continue;
             };
             let (src, dst) = text_stream_addresses(leg);
             let report = TextQosReport {
-                correlation_id: call_id.to_string(),
+                correlation_id: sip_call_id.unwrap_or(call_id).to_string(),
                 tag: tag.to_string(),
                 direction,
                 packets: stats.packets,
@@ -120,11 +127,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let Some(call_id) = self.call_for_endpoint(observed.endpoint) else {
                 continue;
             };
+            // The leg's SIP Call-ID, so a collector files the RTCP under the dialog it belongs to.
+            let correlation_id = self
+                .sip_call_id_for_endpoint(observed.endpoint)
+                .unwrap_or_else(|| call_id.clone());
             let (timestamp_secs, timestamp_micros) = wall_clock_now();
             // Raw RTCP passthrough (unchanged) — a passive collector still gets the bytes verbatim.
             let raw = rtcp_capture(
                 &observed,
-                call_id.clone(),
+                correlation_id.clone(),
                 capture_agent_id,
                 timestamp_secs,
                 timestamp_micros,
@@ -136,7 +147,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let (codec, clock_rate_hz) = self.qos_codec_for_endpoint(observed.endpoint);
             for report in qos_captures(
                 &observed,
-                &call_id,
+                &correlation_id,
                 capture_agent_id,
                 timestamp_secs,
                 timestamp_micros,
@@ -157,6 +168,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     self.push_event(owner, event);
                 }
             }
+        }
+    }
+
+    /// The SIP `Call-ID` of the leg `endpoint` belongs to (`ProfileFlags::sip_call_id`), if the
+    /// controller named one. A single-leg call has only the caller's dialog, whichever socket the
+    /// caller reaches.
+    fn sip_call_id_for_endpoint(&self, endpoint: EndpointId) -> Option<String> {
+        use crate::ha::EndpointRole;
+        let call_id = self.call_for_endpoint(endpoint)?;
+        let call = self.calls.get(&call_id)?;
+        match call.endpoint_role(endpoint) {
+            Some(EndpointRole::FarRtp | EndpointRole::FarRtcp) if !call.is_single_leg() => {
+                call.far_sip_call_id.clone()
+            }
+            _ => call.near_sip_call_id.clone(),
         }
     }
 
@@ -334,4 +360,27 @@ fn wall_clock_now() -> (u32, u32) {
         Ok(elapsed) => (elapsed.as_secs() as u32, elapsed.subsec_micros()),
         Err(_) => (0, 0),
     }
+}
+
+/// Check a controller-supplied [`ProfileFlags::sip_call_id`](siphon_rtp_proto::ProfileFlags): it is
+/// kept for the life of the call and written into every HEP capture for the leg, so it must be
+/// bounded and printable. RFC 3261 §25.1 builds a `callid` from `word` characters, all visible ASCII.
+///
+/// # Errors
+/// The reason string, ready to return as a `CmdResult::Error`.
+pub(crate) fn validate_sip_call_id(profile: &siphon_rtp_proto::ProfileFlags) -> Result<(), String> {
+    let Some(sip_call_id) = profile.sip_call_id.as_deref() else {
+        return Ok(());
+    };
+    let max = siphon_rtp_proto::MAX_SIP_CALL_ID_LEN;
+    if sip_call_id.is_empty() || sip_call_id.len() > max {
+        return Err(format!(
+            "sip_call_id must be 1 to {max} bytes, got {}",
+            sip_call_id.len()
+        ));
+    }
+    if !sip_call_id.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err("sip_call_id must be visible ASCII (RFC 3261 §25.1)".to_string());
+    }
+    Ok(())
 }

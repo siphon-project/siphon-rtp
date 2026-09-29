@@ -51,6 +51,13 @@ pub struct CallSnapshot {
     /// snapshot written before this field restores as unpinned — the behaviour it was written with.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fax_passthrough: bool,
+    /// Each leg's SIP `Call-ID`, the correlation id of its HEP captures — carried so a restored call
+    /// keeps filing its media under the call's signalling. Defaulted: an older snapshot restores
+    /// correlated by the engine `call_id`, as it was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_sip_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far_sip_call_id: Option<String>,
     /// The engine's ICE-lite credentials, if the call negotiated ICE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ice: Option<IceSnapshot>,
@@ -445,6 +452,8 @@ mod tests {
             to_tag: Some("bob-tag".into()),
             pipeline: PipelineSnapshot::Passthrough,
             fax_passthrough: false,
+            near_sip_call_id: Some("a84b4c76e66710@pc33.example.com".into()),
+            far_sip_call_id: None,
             ice: Some(IceSnapshot {
                 ufrag: "ufrag".into(),
                 pwd: "password".into(),

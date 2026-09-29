@@ -751,10 +751,21 @@ pub trait Datapath: Send + Sync {
     /// telemetry export (e.g. HEP to a VoIPmonitor / Homer collector). Bounded — observations are
     /// dropped under backpressure, never blocking the relay. Idempotent; all callers share one stream.
     fn observe_rtcp(&self) -> flume::Receiver<ObservedRtcp>;
+
+    /// A sender into the [`Self::observe_rtcp`] stream for a `Redirect`-path consumer. The datapath
+    /// only hands a redirected datagram on, so the RTCP of a leg carried in userspace — an SRTP or
+    /// DTLS bridge, a transcoded or locally answered call — is seen only by the consumer, after it
+    /// decrypts it. The consumer publishes that plaintext here so the leg's reports reach telemetry
+    /// the same way a relayed leg's do. `None` while nothing observes, so no consumer copies RTCP
+    /// nobody reads. Default `None`, for a backend with no observation stream.
+    fn rtcp_tap(&self) -> Option<flume::Sender<ObservedRtcp>> {
+        None
+    }
 }
 
-/// A relayed RTCP datagram observed on the datapath, for telemetry export. `source` sent it; the
-/// relay forwarded it to `destination`.
+/// An RTCP datagram observed for telemetry export: relayed by the datapath, or published by a
+/// `Redirect`-path consumer through [`Datapath::rtcp_tap`]. `source` sent it; it was forwarded to
+/// `destination`. Always plaintext — a consumer publishes what it decrypted.
 #[derive(Clone, Debug)]
 pub struct ObservedRtcp {
     /// The endpoint the RTCP arrived on (maps back to a call leg).
@@ -765,6 +776,27 @@ pub struct ObservedRtcp {
     pub destination: SocketAddr,
     /// The RTCP datagram bytes.
     pub payload: Bytes,
+}
+
+impl ObservedRtcp {
+    /// Offer one RTCP datagram to a [`Datapath::rtcp_tap`] sender without blocking: dropped when the
+    /// stream is full, because telemetry must never delay media. A no-op without a tap.
+    pub fn offer(
+        tap: Option<&flume::Sender<ObservedRtcp>>,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        destination: SocketAddr,
+        payload: &[u8],
+    ) {
+        if let Some(tap) = tap {
+            let _ = tap.try_send(Self {
+                endpoint,
+                source,
+                destination,
+                payload: Bytes::copy_from_slice(payload),
+            });
+        }
+    }
 }
 
 #[cfg(test)]

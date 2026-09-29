@@ -150,9 +150,19 @@ legs (keyed by `call_id`); exactly one identifier is present, matching the
   by `conference_id`): the transcode path on a ~5 s tick, the plain-relay path from each endpoint's
   RTCP reception reports.
 - **HEP3 / Homer** RTCP export ships (enabled by `SIPHON_RTP_HEP_COLLECTOR`, with
-  `SIPHON_RTP_HEP_AGENT_ID`), tapping relayed RTCP on the plain-relay path and sending it as HEP3
-  captures. The G.107 MOS now rides BOTH the `call_quality` control events AND the exported HEP
-  type-35 QoS report (alongside the raw RTCP capture).
+  `SIPHON_RTP_HEP_AGENT_ID`), sending each leg's received RTCP as HEP3 captures. The G.107 MOS now
+  rides BOTH the `call_quality` control events AND the exported HEP type-35 QoS report (alongside the
+  raw RTCP capture).
+  - **Which legs.** The datapath taps the plain relay (in userspace, and in-kernel on XDP). A leg the
+    engine carries in userspace publishes its own RTCP after decrypting it: the SDES and DTLS-SRTP
+    bridges, and the media pipeline (transcoded calls, secure transcodes, locally answered legs).
+    The captured payload is always plaintext. Conference seats and WebSocket takeover legs terminate
+    RTCP rather than relay it and are not exported; their quality is on `call_quality`.
+  - **Correlation.** Each capture's correlation id is the SIP `Call-ID` of the leg's dialog, which
+    the controller names as `sip_call_id` on the offer (offerer's leg) and the answer (answerer's
+    leg). A B2BUA's two legs are two dialogs, so each is filed under its own. Unset, a leg is
+    correlated by the engine `call_id` — correct over NG, where that is the Call-ID, and nowhere
+    else, since a controller's media id is not a SIP identifier a collector can join on.
 
 ## 4. End-of-call CDR (`call_summary` / the `siphon_rtp::cdr` log block)
 

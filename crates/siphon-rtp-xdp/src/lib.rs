@@ -73,7 +73,7 @@
 //! workspace's dependency graph).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -458,6 +458,11 @@ struct Inner {
     /// the datapath thread, which drains the in-kernel `RTCP_TAP` ring into it — so the channel stays
     /// open for the datapath's whole life (the thread is joined on teardown) and closes when it exits.
     observe_rx: flume::Receiver<ObservedRtcp>,
+    /// A weak handle on the observe stream's sender, for [`Datapath::rtcp_tap`]. Weak so the stream
+    /// still closes when the datapath thread — the owner of the strong sender — exits.
+    observe_tap: flume::WeakSender<ObservedRtcp>,
+    /// Set once something observes ([`XdpDatapath::observe_rtcp`]); until then consumers get no tap.
+    observe_enabled: AtomicBool,
     /// TX command channel to the datapath thread (the single owner of the AF_XDP socket).
     tx_commands: flume::Sender<TxRequest>,
     /// Handle to the AF_XDP busy-poll thread, joined on teardown (see [`Inner::drop`]).
@@ -515,6 +520,7 @@ impl XdpDatapath {
 
         let (redirect_tx, redirect_rx) = flume::unbounded();
         let (observe_tx, observe_rx) = flume::bounded(256);
+        let observe_tap = observe_tx.downgrade();
         let (tx_commands, tx_rx) = flume::unbounded::<TxRequest>();
         let endpoints: Arc<DashMap<EndpointId, EndpointRecord>> = Arc::new(DashMap::new());
         let ice: Arc<DashMap<EndpointId, IceConfig>> = Arc::new(DashMap::new());
@@ -551,6 +557,8 @@ impl XdpDatapath {
             local_ip,
             redirect_rx,
             observe_rx,
+            observe_tap,
+            observe_enabled: AtomicBool::new(false),
             tx_commands,
             datapath_thread: Mutex::new(None),
         });
@@ -1499,7 +1507,15 @@ impl Datapath for XdpDatapath {
         // forwarded RTCP datagram into the `RTCP_TAP` ring, and the datapath thread drains it into this
         // bounded stream (`observed_rtcp_from_record`), so a kernelized relay's RTCP reaches the HEP QoS
         // export exactly like the userspace-redirected path.
+        self.inner.observe_enabled.store(true, Ordering::Relaxed);
         self.inner.observe_rx.clone()
+    }
+
+    fn rtcp_tap(&self) -> Option<flume::Sender<ObservedRtcp>> {
+        if !self.inner.observe_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.inner.observe_tap.upgrade()
     }
 }
 

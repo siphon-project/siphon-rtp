@@ -1243,6 +1243,13 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner.observe_rx.clone()
     }
 
+    fn rtcp_tap(&self) -> Option<flume::Sender<ObservedRtcp>> {
+        self.inner
+            .observe_enabled
+            .load(Ordering::Relaxed)
+            .then(|| self.inner.observe_tx.clone())
+    }
+
     /// A clone of the shared Redirect stream; all redirected endpoints feed this one MPMC receiver.
     fn rx(&self) -> flume::Receiver<RxPacket> {
         self.inner.redirect_rx.clone()

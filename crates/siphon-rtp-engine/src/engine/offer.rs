@@ -961,6 +961,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_telephone_event: None,
                 pipeline,
                 fax_passthrough: profile.fax_passthrough,
+                near_sip_call_id: profile.sip_call_id.clone(),
+                far_sip_call_id: None,
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
                 offer_received_from: profile.received_from,

@@ -107,6 +107,11 @@ pub const MAX_PLAY_BLOB_LEN: usize = (MAX_FRAME_LEN - 4096) / 4 * 3;
 /// peer choose how much the engine remembers.
 pub const MAX_CONTROLLER_ID_LEN: usize = 128;
 
+/// Longest [`ProfileFlags::sip_call_id`] the engine accepts, in bytes. RFC 3261 §8.1.1.4 sets no
+/// bound; this one is far beyond any a UA generates, and exists because the engine keeps the value
+/// for the life of the call.
+pub const MAX_SIP_CALL_ID_LEN: usize = 256;
+
 /// Smallest [`ProfileFlags::echo_delay_search_ms`] the engine accepts as a **search window**, in
 /// milliseconds. The floor keeps a request from rounding to a degenerate range.
 ///
@@ -1466,6 +1471,15 @@ pub struct ProfileFlags {
     /// from the signalling port, so the port is never gated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub received_from: Option<std::net::IpAddr>,
+    /// The SIP `Call-ID` of the dialog this leg belongs to, at most [`MAX_SIP_CALL_ID_LEN`] bytes.
+    /// Named on the `offer` (or `answer_local`) for the offerer's leg and on the `answer` for the
+    /// answerer's. It is the correlation id of every HEP capture exported for that leg — the raw
+    /// RTCP, its QoS report, the text QoS report — which is what lets a collector file the media
+    /// under the call's signalling. A B2BUA's two legs are two dialogs, so each leg carries its own.
+    /// Absent, the leg is correlated by the engine's `call_id`, which is the `Call-ID` itself only
+    /// when the controller used it as one (the NG front-end does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sip_call_id: Option<String>,
     /// Attach a **WebSocket tee** to this call at offer/answer time — the declarative twin of
     /// [`Command::AttachWsTee`], so a controller does not need a second round-trip. Unlike `ws_uri`
     /// (takeover), a tee is send-only and leaves the A↔B relay/transcode path wired: the call relays
