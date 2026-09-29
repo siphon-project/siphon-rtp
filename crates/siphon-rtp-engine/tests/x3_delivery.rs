@@ -473,8 +473,9 @@ async fn a_full_buffer_reports_loss_and_keeps_a_contiguous_prefix() {
         "the delivered stream is a contiguous prefix, not the most recent packets"
     );
 
-    // …and the loss is reported to the controller, which owes a destination-level report.
-    let (dropped, _delivered) = timeout(SHORT, loss_rx.recv_async())
+    // …and the loss is reported to the controller, which owes a destination-level report — as the
+    // connection that ends the outage comes up, not a report interval later.
+    let (dropped, _delivered) = timeout(Duration::from_secs(1), loss_rx.recv_async())
         .await
         .expect("a loss report must be raised")
         .expect("loss report");

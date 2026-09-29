@@ -494,6 +494,10 @@ where
             address = %task.address,
             "X3 delivery connected"
         );
+        // Loss that built up while there was no connection is owed now: the controller's
+        // destination-level report should not wait out a report interval on the connection that
+        // ends the outage.
+        report_loss(&task, &mut reported_drops, &mut on_loss);
 
         match serve_connection(
             &task,

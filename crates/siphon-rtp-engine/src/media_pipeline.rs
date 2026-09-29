@@ -4514,12 +4514,25 @@ async fn run_media_call<D>(
     emit_events(&mut emitted, &events);
     // Flush recordings on teardown (one-shot; tokio::fs keeps the runtime non-blocking).
     for (path, bytes) in call.take_recordings() {
-        if let Err(error) = tokio::fs::write(&path, &bytes).await {
+        if let Err(error) = write_whole_file(&path, &bytes).await {
             tracing::warn!(%error, path, "media-pipeline failed to write recording");
         } else {
             tracing::info!(path, "media-pipeline wrote recording");
         }
     }
+}
+
+/// Write `bytes` to `path` so the file never exists half-written: into a sibling temporary name,
+/// then renamed over `path`, which is atomic within one filesystem. A `record_call` recording has no
+/// completion event, so whatever collects it watches for the file — and a plain write creates the
+/// file before it fills it, which such a reader can observe as an empty or truncated WAV.
+async fn write_whole_file(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let partial = format!("{path}.partial");
+    if let Err(error) = tokio::fs::write(&partial, bytes).await {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(error);
+    }
+    tokio::fs::rename(&partial, path).await
 }
 
 /// RFC 5761 demux: a datagram whose second byte's payload-type field is in `64..=95` is RTCP (never a
@@ -4557,6 +4570,27 @@ async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_teardown_recording_appears_whole_or_not_at_all() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("call-a.wav");
+        let path = path.to_string_lossy().into_owned();
+        let bytes = vec![0x5A_u8; 4096];
+        write_whole_file(&path, &bytes).await.expect("write");
+        assert_eq!(std::fs::read(&path).expect("read"), bytes);
+        assert!(
+            !std::path::Path::new(&format!("{path}.partial")).exists(),
+            "the temporary is renamed away, never left beside the recording"
+        );
+
+        // A write that cannot happen leaves nothing behind under either name.
+        let missing = directory.path().join("no-such-dir").join("call-b.wav");
+        let missing = missing.to_string_lossy().into_owned();
+        assert!(write_whole_file(&missing, &bytes).await.is_err());
+        assert!(!std::path::Path::new(&missing).exists());
+        assert!(!std::path::Path::new(&format!("{missing}.partial")).exists());
+    }
     use siphon_rtp_codec::g711::G711;
     use siphon_rtp_codec::g722::G722;
     use siphon_rtp_codec::l16::L16;
