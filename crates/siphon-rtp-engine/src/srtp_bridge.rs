@@ -18,7 +18,6 @@
 //! the engine cannot decode. The plaintext in between is a stack buffer that never reaches a socket.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
@@ -26,6 +25,7 @@ use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use crate::dtls_bridge::DtlsBridge;
+use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
 
@@ -124,10 +124,10 @@ struct Flow {
     /// that intermediate is the *only* plaintext there is, so the tap is what keeps a
     /// secure-to-secure call interceptable at all.
     x3: Option<X3Tap>,
-    /// Set once this flow has logged a peer whose SRTP does not authenticate, so the operator hears
-    /// about it once per negotiation rather than 50 times a second. Every such datagram is still
-    /// counted in the endpoint's `packets_dropped`.
-    auth_failure_reported: AtomicBool,
+    /// Which refusals this flow has already logged at `warn`, so the operator hears about each once
+    /// per negotiation rather than 50 times a second. Every refused datagram is still counted in the
+    /// endpoint's `packets_dropped`.
+    refusals: Arc<RefusalLog>,
     /// A WebSocket tee's tap on this endpoint's plaintext RTP ([`SrtpBridge::set_plain_tap`]). The
     /// bridge never decodes, so a tee on a bridged call decodes this copy in its own task.
     plain_tap: Option<flume::Sender<bytes::Bytes>>,
@@ -231,8 +231,8 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     ingress_leg,
                     egress_leg,
                     x3: None,
+                    refusals: Arc::new(RefusalLog::default()),
                     plain_tap: None,
-                    auth_failure_reported: AtomicBool::new(false),
                 },
             );
         }
@@ -385,7 +385,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             && self
                 .flows
                 .get(&packet.endpoint)
-                .is_some_and(|flow| !flow.auth_failure_reported.swap(true, Ordering::Relaxed));
+                .is_some_and(|flow| flow.refusals.first(Refusal::NotAuthenticated));
         if first {
             tracing::warn!(
                 target: "siphon_rtp::media",
@@ -422,6 +422,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             ingress_leg,
             egress_leg,
             x3,
+            refusals,
             plain_tap,
         )) = self.flows.get(&packet.endpoint).map(|flow| {
             (
@@ -432,20 +433,25 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 flow.ingress_leg.clone(),
                 flow.egress_leg.clone(),
                 flow.x3.clone(),
+                flow.refusals.clone(),
                 flow.plain_tap.clone(),
             )
         })
         else {
             return; // not a bridge endpoint (dispatcher should have routed it elsewhere)
         };
+        // The bridge keys flows by endpoint and holds no call id; the endpoint identifies the flow.
+        let context = RefusalContext {
+            component: "srtp-bridge",
+            call_id: "",
+            endpoint: packet.endpoint,
+            source: packet.source,
+            expected: accepted_source,
+        };
 
         // RTPBleed gate: Redirect skips the datapath's source check, so re-enforce it here.
         if !accepted_source.accepts(packet.source.ip()) {
-            tracing::debug!(
-                endpoint = ?packet.endpoint,
-                source = %packet.source,
-                "bridge dropped packet from unsignalled source"
-            );
+            refusals.log(Refusal::UnsignalledSource, context);
             self.datapath.note_dropped(packet.endpoint);
             return;
         }
@@ -519,11 +525,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 };
                 match latch.admit(packet.source, rtp_media_ssrc(plaintext)) {
                     ReplyLatch::Reject => {
-                        tracing::debug!(
-                            endpoint = ?packet.endpoint,
-                            source = %packet.source,
-                            "bridge dropped packet from a source its latch will not adopt"
-                        );
+                        refusals.log(Refusal::NewSource, context);
                         self.datapath.note_dropped(packet.endpoint);
                         return;
                     }

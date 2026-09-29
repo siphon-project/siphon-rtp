@@ -25,6 +25,7 @@ use siphon_rtp_srtp::leg::{is_rtcp, PacketKind, SecureLeg};
 use tokio::task::JoinHandle;
 
 use crate::dtls_session::{spawn_session, DriverPlan, SessionOutcome};
+use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::x3::X3Tap;
 
 /// How many inbound DTLS records a leg's driver will queue. Bounded so a stalled association cannot
@@ -211,6 +212,8 @@ struct Flow {
     /// A WebSocket tee's tap on this endpoint's plaintext RTP ([`DtlsBridge::set_plain_tap`]). The
     /// bridge never decodes, so a tee on a bridged call decodes this copy in its own task.
     plain_tap: Option<flume::Sender<bytes::Bytes>>,
+    /// Which refusals of this flow's ingress have already been logged at `warn`.
+    refusals: Arc<RefusalLog>,
 }
 
 /// Copy an ICE-gated leg's validated source into its DTLS destination for as long as the association
@@ -411,6 +414,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             x3: None,
             plain_tap: None,
             rtcp_only: true,
+            refusals: Arc::new(RefusalLog::default()),
             rtcp_out: None,
         }
     }
@@ -590,6 +594,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 x3: None,
                 plain_tap: None,
                 rtcp_only: false,
+                refusals: Arc::new(RefusalLog::default()),
                 rtcp_out: None,
             },
         );
@@ -618,6 +623,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 x3: None,
                 plain_tap: None,
                 rtcp_only: false,
+                refusals: Arc::new(RefusalLog::default()),
                 // Decrypted RTCP goes to the plain peer's own RTCP port when it has one.
                 rtcp_out: plan.plain_rtcp.map(|rtcp| (rtcp.endpoint, rtcp.dst)),
             },
@@ -695,6 +701,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 plain_tap: None,
                 // The per-call actor relays RTCP itself (`plan.plain_rtcp` is not used here).
                 rtcp_only: false,
+                refusals: Arc::new(RefusalLog::default()),
                 rtcp_out: None,
             },
         );
@@ -797,6 +804,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             plain_tap,
             rtcp_only,
             rtcp_out,
+            refusals,
         )) = self.flows.get(&packet.endpoint).map(|flow| {
             (
                 flow.direction.clone(),
@@ -811,6 +819,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 flow.plain_tap.clone(),
                 flow.rtcp_only,
                 flow.rtcp_out,
+                flow.refusals.clone(),
             )
         })
         else {
@@ -821,12 +830,22 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         // the leg is unkeyed anyway (docs/security-and-nat.md §4 layer 4).
         let pipeline_mode = matches!(direction, Direction::Pipeline { .. });
         if out_dst.is_none() && !pipeline_mode {
+            self.datapath.note_dropped(packet.endpoint);
             return;
         }
+        // The plan carries no call id; the endpoint identifies the flow.
+        let context = RefusalContext {
+            component: "dtls-bridge",
+            call_id: "",
+            endpoint: packet.endpoint,
+            source: packet.source,
+            expected: accepted_source,
+        };
 
         // RTPBleed gate: Redirect skips the datapath's source check, so re-enforce it here.
         if !accepted_source.accepts(packet.source.ip()) {
-            tracing::debug!(source = %packet.source, "DTLS bridge dropped unsignalled source");
+            refusals.log(Refusal::UnsignalledSource, context);
+            self.datapath.note_dropped(packet.endpoint);
             return;
         }
 
@@ -850,6 +869,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         // A plain peer's separate RTCP port relays RTCP only (RFC 5761 §4 packet-type demux), so it
         // cannot be used to inject RTP toward the DTLS peer.
         if rtcp_only && !is_rtcp(&packet.data) {
+            self.datapath.note_dropped(packet.endpoint);
             return;
         }
 
@@ -859,7 +879,9 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         // and its own `secure_pending` gate would drop it a second time).
         if let Direction::Pipeline { target, keyed, .. } = &direction {
             if !keyed.load(std::sync::atomic::Ordering::SeqCst) {
-                return; // handshake not complete — no key, drop the media
+                // Handshake not complete — no key, drop the media.
+                self.datapath.note_dropped(packet.endpoint);
+                return;
             }
             target.dispatch(packet);
             return;
@@ -872,7 +894,10 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 return;
             };
             let Some(leg) = guard.as_mut() else {
-                return; // handshake not complete yet — no key, drop the media
+                // Handshake not complete yet — no key, drop the media.
+                drop(guard);
+                self.datapath.note_dropped(packet.endpoint);
+                return;
             };
             match direction {
                 Direction::Encrypt => leg.protect(&packet.data, &mut out),
@@ -886,6 +911,10 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             Ok(kind) => kind,
             Err(error) => {
                 tracing::debug!(?error, "DTLS bridge crypto failed; dropping packet");
+                if matches!(direction, Direction::Decrypt { .. }) {
+                    refusals.log(Refusal::NotAuthenticated, context);
+                }
+                self.datapath.note_dropped(packet.endpoint);
                 return;
             }
         };

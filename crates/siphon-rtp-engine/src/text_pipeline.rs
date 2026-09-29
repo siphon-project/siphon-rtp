@@ -43,6 +43,7 @@ use siphon_rtp_media::t140::T140Reassembler;
 use siphon_rtp_proto::{Event, TextStreamStats};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
+use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::media_pipeline::{Outbound, PcapCapture};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 
@@ -58,6 +59,8 @@ struct TextDirection {
     /// SSRC-consistent symmetric latch for this ingress stream; an accepted, SSRC-consistent packet
     /// re-points the *reverse* direction's `egress_dst` to the observed source (RFC 3550 §8, layer 3).
     source_latch: SymmetricLatch,
+    /// Which refusals of this direction's ingress have already been logged at `warn`.
+    refusals: RefusalLog,
     /// The endpoint to transmit from (the receiving party's engine socket).
     egress_endpoint: EndpointId,
     /// Where to transmit (the receiving party's text address; latched to its observed source).
@@ -209,6 +212,7 @@ impl TextCall {
                 ingress_endpoint: a_to_b.ingress_endpoint,
                 accepted_source: a_to_b.accepted_source,
                 source_latch: SymmetricLatch::default(),
+                refusals: RefusalLog::default(),
                 egress_endpoint: a_to_b.egress_endpoint,
                 egress_dst: a_to_b.egress_dst,
                 reassembler: T140Reassembler::new(),
@@ -225,6 +229,7 @@ impl TextCall {
                 ingress_endpoint: b_to_a.ingress_endpoint,
                 accepted_source: b_to_a.accepted_source,
                 source_latch: SymmetricLatch::default(),
+                refusals: RefusalLog::default(),
                 egress_endpoint: b_to_a.egress_endpoint,
                 egress_dst: b_to_a.egress_dst,
                 reassembler: T140Reassembler::new(),
@@ -278,20 +283,20 @@ impl TextCall {
 
     /// Process one redirected text datagram: enforce the source gate, forward it verbatim to the peer,
     /// observe it (Event::Text + QoS), capture it (recording), and drive the symmetric latch. Returns
-    /// `true` when the packet was accepted (so the actor stamps datapath activity for the timeout
-    /// sweep), `false` when the source gate or the latch dropped it or it was for an unowned endpoint.
+    /// what became of it, which the actor reports to the datapath: activity for the timeout sweep
+    /// unless it was refused, and a drop unless it was forwarded.
     pub fn process(
         &mut self,
         packet: &RxPacket,
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
-    ) -> bool {
+    ) -> Ingress {
         let from_a = if packet.endpoint == self.a_to_b.ingress_endpoint {
             true
         } else if packet.endpoint == self.b_to_a.ingress_endpoint {
             false
         } else {
-            return false;
+            return Ingress::Refused;
         };
 
         // Disjoint field borrows: the sending direction, the reverse (for the latch), and the capture
@@ -308,17 +313,20 @@ impl TextCall {
         } else {
             (b_to_a, a_to_b)
         };
+        let context = RefusalContext {
+            component: "text-pipeline",
+            call_id,
+            endpoint: packet.endpoint,
+            source: packet.source,
+            expected: direction.accepted_source,
+        };
 
         // RTPBleed source gate (docs/security-and-nat.md §4 layer 2): drop a packet from a source the
         // SDP never signalled — the `Redirect` path bypasses the datapath's Forward-path gate, so the
         // exact same gate is re-enforced here, per-stream.
         if !direction.accepted_source.accepts(packet.source.ip()) {
-            tracing::debug!(
-                target: "siphon_rtp::text",
-                source = %packet.source,
-                "text-pipeline dropped packet from unsignalled source"
-            );
-            return false;
+            direction.refusals.log(Refusal::UnsignalledSource, context);
+            return Ingress::Refused;
         }
 
         // Recording: copy the accepted text RTP byte-for-byte to the shared pcap sink (RFC 7866-style
@@ -360,16 +368,12 @@ impl TextCall {
                     target: "siphon_rtp::text",
                     "secure text ingress leg mutex poisoned; dropping packet"
                 );
-                return true;
+                return Ingress::DroppedFromPeer;
             };
             if guard.unprotect(&packet.data, &mut decrypted).is_err() {
                 drop(guard);
-                tracing::debug!(
-                    target: "siphon_rtp::text",
-                    source = %packet.source,
-                    "secure text ingress failed SRTP auth/replay; dropped (never forwarded)"
-                );
-                return true;
+                direction.refusals.log(Refusal::NotAuthenticated, context);
+                return Ingress::DroppedFromPeer;
             }
             drop(guard);
             &decrypted
@@ -388,13 +392,8 @@ impl TextCall {
                 .admit(packet.source, rtp_media_ssrc(plaintext))
             {
                 ReplyLatch::Reject => {
-                    tracing::debug!(
-                        target: "siphon_rtp::text",
-                        source = %packet.source,
-                        "text-pipeline dropped a packet from a new source that could not prove it is \
-                         the latched stream"
-                    );
-                    return false;
+                    direction.refusals.log(Refusal::NewSource, context);
+                    return Ingress::Refused;
                 }
                 ReplyLatch::Accept(Some(new_dst)) => reverse.egress_dst = new_dst,
                 ReplyLatch::Accept(None) => {}
@@ -415,7 +414,7 @@ impl TextCall {
                     target: "siphon_rtp::text",
                     "secure text egress leg mutex poisoned; dropping packet"
                 );
-                return true;
+                return Ingress::DroppedFromPeer;
             };
             if guard.protect(plaintext, &mut encrypted).is_err() {
                 drop(guard);
@@ -423,7 +422,7 @@ impl TextCall {
                     target: "siphon_rtp::text",
                     "secure text egress SRTP protect failed; dropped"
                 );
-                return true;
+                return Ingress::DroppedFromPeer;
             }
             drop(guard);
             &encrypted
@@ -440,7 +439,7 @@ impl TextCall {
         // (Event::Text, the CDR counters, and the recording all see cleartext text — observe after
         // decrypt, before encrypt.)
         direction.observe(plaintext, call_id, events);
-        true
+        Ingress::Accepted
     }
 }
 
@@ -620,9 +619,8 @@ async fn run_text_call<D>(
                 // Stamp media activity only when the packet passed the source gate (a spoofed spray
                 // must not keep an idle path alive) — the `Redirect` arm never touches the datapath's
                 // `last_seen`, so without this a live text-only call could be reaped mid-conversation.
-                if call.process(&packet, &mut outbound, &mut emitted) {
-                    datapath.note_activity(packet.endpoint);
-                }
+                call.process(&packet, &mut outbound, &mut emitted)
+                    .record(&datapath, packet.endpoint);
                 for out in outbound.drain(..) {
                     if let Err(error) = datapath.send(out.endpoint, out.dst, &out.data).await {
                         tracing::debug!(
@@ -763,11 +761,13 @@ mod tests {
         let mut out = Vec::new();
         let mut events = Vec::new();
         let packet = red_rtp(1, 1000, b"Hi", &[]);
-        assert!(call.process(
-            &rx(NEAR_TEXT, A_ADDR, packet.clone()),
-            &mut out,
-            &mut events
-        ));
+        assert!(call
+            .process(
+                &rx(NEAR_TEXT, A_ADDR, packet.clone()),
+                &mut out,
+                &mut events
+            )
+            .is_live());
 
         // Event::Text carries the recovered increment, the sender (A) tag, and the a_to_b direction.
         assert_eq!(events.len(), 1);
@@ -838,11 +838,13 @@ mod tests {
         let mut out = Vec::new();
         let mut events = Vec::new();
         // An attacker racing A's text stream from a different source IP (RTPBleed) — gate drops it.
-        let accepted = call.process(
-            &rx(NEAR_TEXT, "127.0.0.9:6000", red_rtp(1, 1000, b"steal", &[])),
-            &mut out,
-            &mut events,
-        );
+        let accepted = call
+            .process(
+                &rx(NEAR_TEXT, "127.0.0.9:6000", red_rtp(1, 1000, b"steal", &[])),
+                &mut out,
+                &mut events,
+            )
+            .is_live();
         assert!(!accepted, "off-source packet rejected");
         assert!(out.is_empty(), "nothing forwarded to the peer");
         assert!(events.is_empty(), "no Event::Text for a gated-out packet");
@@ -941,11 +943,13 @@ mod tests {
         assert!(events.is_empty(), "an idle keepalive emits no Event::Text");
 
         // A datagram for an endpoint this call does not own is a no-op (defensive).
-        assert!(!call.process(
-            &rx(999, A_ADDR, red_rtp(3, 1200, b"z", &[])),
-            &mut out,
-            &mut events
-        ));
+        assert!(!call
+            .process(
+                &rx(999, A_ADDR, red_rtp(3, 1200, b"z", &[])),
+                &mut out,
+                &mut events
+            )
+            .is_live());
     }
 
     #[test]
@@ -1026,7 +1030,8 @@ mod tests {
                 &rx(NEAR_TEXT, A_ADDR, red_rtp(1, 1000, b"Hi", &[])),
                 &mut out,
                 &mut events
-            ),
+            )
+            .is_live(),
             "A's stream latches"
         );
         out.clear();
@@ -1036,11 +1041,13 @@ mod tests {
         let mut spray = red_rtp(2, 2000, b"Xx", &[]);
         spray[8..12].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
         assert!(
-            !call.process(
-                &rx(NEAR_TEXT, "127.0.0.9:7000", spray),
-                &mut out,
-                &mut events
-            ),
+            !call
+                .process(
+                    &rx(NEAR_TEXT, "127.0.0.9:7000", spray),
+                    &mut out,
+                    &mut events
+                )
+                .is_live(),
             "a rejected source is not activity"
         );
         assert!(out.is_empty(), "nothing is forwarded to B");
@@ -1060,11 +1067,13 @@ mod tests {
             1000,
             &[0x80 | T140_PT, 0x00, 0x03, 0xFF, T140_PT],
         );
-        assert!(call.process(
-            &rx(NEAR_TEXT, A_ADDR, malformed.clone()),
-            &mut out,
-            &mut events
-        ));
+        assert!(call
+            .process(
+                &rx(NEAR_TEXT, A_ADDR, malformed.clone()),
+                &mut out,
+                &mut events
+            )
+            .is_live());
         assert_eq!(&out[0].data[..], &malformed[..], "still relayed verbatim");
         assert!(
             events.is_empty(),
@@ -1145,11 +1154,13 @@ mod tests {
             .protect(&plaintext, &mut srtp_in)
             .expect("A encrypt");
 
-        assert!(call.process(
-            &rx(NEAR_TEXT, A_ADDR, srtp_in.clone()),
-            &mut out,
-            &mut events
-        ));
+        assert!(call
+            .process(
+                &rx(NEAR_TEXT, A_ADDR, srtp_in.clone()),
+                &mut out,
+                &mut events
+            )
+            .is_live());
 
         // Event::Text carries the DECRYPTED increment (observe after decrypt).
         assert_eq!(events.len(), 1);
@@ -1233,11 +1244,13 @@ mod tests {
         let mut a_encrypt = SrtpContext::from_key_material(&near_remote);
         let mut srtp = Vec::new();
         a_encrypt.protect(&plaintext, &mut srtp).expect("encrypt");
-        let accepted = call.process(
-            &rx(NEAR_TEXT, "127.0.0.9:6000", srtp),
-            &mut out,
-            &mut events,
-        );
+        let accepted = call
+            .process(
+                &rx(NEAR_TEXT, "127.0.0.9:6000", srtp),
+                &mut out,
+                &mut events,
+            )
+            .is_live();
         assert!(!accepted, "off-source secure packet rejected at the gate");
         assert!(out.is_empty());
         assert!(events.is_empty());
