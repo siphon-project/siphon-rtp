@@ -895,6 +895,10 @@ pub(super) enum SourcePosture {
     /// Any source, the latch then following the first stream: `symmetric`, for a peer whose signalled
     /// address is unusable (a NATed UA advertising its private one).
     Any,
+    /// An RFC 8445 agent owns the transport: the datapath's layer-4 gate admits only the pair a
+    /// connectivity check validated, which legitimately need not be the signalled address (§7.3.1.3),
+    /// so the pipeline's own gate opens and the selection narrows it. Egress waits for that selection.
+    Ice,
 }
 
 impl SourcePosture {
@@ -912,7 +916,7 @@ impl SourcePosture {
     /// The gate around `addr`.
     pub(super) fn gate(self, addr: std::net::SocketAddr) -> SourceFilter {
         match self {
-            Self::Any => SourceFilter::Any,
+            Self::Any | Self::Ice => SourceFilter::Any,
             Self::Subnet => {
                 let prefix = if addr.is_ipv4() { 24 } else { 64 };
                 SourceFilter::Subnet(addr.ip(), prefix)

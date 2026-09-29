@@ -870,6 +870,12 @@ pub struct Direction {
     /// Cleared by [`MediaCall::attach_secure_leg`] when the handshake delivers the key; always `false`
     /// on a plaintext or SDES leg, whose key is known at answer time.
     secure_pending: bool,
+    /// This direction sends from an endpoint whose RFC 8445 agent has not selected a pair yet, so it
+    /// has nowhere it may send: the signalled address is only a candidate, and media MUST follow the
+    /// selected pair (RFC 8445 §12). Egress is withheld (a prompt held, not burned down) until
+    /// [`MediaCall::ice_selected`] clears it. Ingress is not affected: the datapath's own ICE gate
+    /// (docs/security-and-nat.md §4 layer 4) admits nothing before a check validates the source.
+    awaiting_ice: bool,
     /// Receiver-side reception statistics for this direction's inbound stream (RFC 3550 §6.4.1): the
     /// loss / jitter (and RTT, when measured) feeding the periodic [`Event::CallQuality`] a 2-party
     /// transcode call reports on the control channel — the transcode counterpart to the conference
@@ -1536,6 +1542,7 @@ impl Direction {
             secure_ingress: None,
             secure_egress: None,
             secure_pending: false,
+            awaiting_ice: false,
             // The ingress interarrival jitter is measured at the ingress codec's RTP clock (RFC 3550
             // §6.4.1), which the decoder exposes — 8 kHz for G.711, 16 kHz for AMR-WB, etc.
             ingress: IngressStats::new(ingress_rtp_clock_rate_hz),
@@ -1616,6 +1623,7 @@ impl Direction {
             secure_ingress: None,
             secure_egress: None,
             secure_pending: false,
+            awaiting_ice: false,
             // A relay-only direction never builds a quality report (a promoted passthrough is spawned
             // with no control-event sink, and its quality is reported off the in-kernel relay's RTCP
             // via `Engine::run_rtcp_export`), so its reception estimator stays inert — never fed.
@@ -1837,7 +1845,7 @@ impl Direction {
         // Read and reset the packet-driven emit counter every tick, whether or not it is used, so a
         // direction that starts an overlay later does not inherit a stale count.
         let transcode_frames = std::mem::take(&mut self.transcode_frames_since_tick);
-        if self.secure_pending {
+        if self.secure_pending || self.awaiting_ice {
             return None;
         }
         if self.injection.is_some() {
@@ -2484,7 +2492,7 @@ impl Direction {
         // Unkeyed secure peer: emit nothing rather than send it cleartext. This is the one choke point
         // every egress datagram passes through — transcode, injected prompt, comfort noise, relayed
         // telephone-event and echo reflect alike — so the guard cannot be bypassed by a new caller.
-        if self.secure_pending {
+        if self.secure_pending || self.awaiting_ice {
             return;
         }
         let data = if let Some(leg) = self.secure_egress.as_ref() {
@@ -2852,6 +2860,41 @@ impl MediaCall {
     #[must_use]
     pub fn with_near_secure_pending(mut self) -> Self {
         self.mark_near_secure_pending();
+        self
+    }
+
+    /// Follow an RFC 8445 selection on `endpoint` (§8.1.1): every direction receiving on it now
+    /// accepts only the selected remote's address, and every direction sending from it sends there.
+    /// The datapath's own ICE gate already admits only that source; narrowing the pipeline's gate
+    /// to match keeps the two in step when the selection moves (an ICE restart, RFC 8445 §9).
+    pub fn ice_selected(&mut self, endpoint: EndpointId, remote: SocketAddr) {
+        for direction in [&mut self.a_to_b, &mut self.b_to_a] {
+            if direction.ingress_endpoint == endpoint {
+                direction.accepted_source = SourceFilter::Exact(remote.ip());
+            }
+            if direction.egress_endpoint == endpoint {
+                direction.egress_dst = remote;
+                direction.awaiting_ice = false;
+            }
+        }
+        for relay in &mut self.rtcp {
+            if relay.ingress_endpoint == endpoint {
+                relay.accepted_source = SourceFilter::Exact(remote.ip());
+            }
+        }
+        self.note_observed(endpoint, remote);
+    }
+
+    /// Hold every direction sending from `endpoint` until [`MediaCall::ice_selected`] names a pair.
+    /// Applied before the actor is registered, for the same reason as
+    /// [`MediaCall::with_near_secure_pending`]: a control message would race the first tick.
+    #[must_use]
+    pub fn with_egress_awaiting_ice(mut self, endpoint: EndpointId) -> Self {
+        for direction in [&mut self.a_to_b, &mut self.b_to_a] {
+            if direction.egress_endpoint == endpoint {
+                direction.awaiting_ice = true;
+            }
+        }
         self
     }
 
@@ -4017,6 +4060,12 @@ pub enum MediaControl {
     /// Mark a **single-leg** call's party as DTLS-keyed-later: both directions drop rather than treat
     /// SRTP as plaintext until [`MediaControl::AttachNearSecureLeg`] delivers the leg.
     MarkNearSecurePending,
+    /// An RFC 8445 agent selected a candidate pair for `endpoint` (§8.1.1): the pipeline's gate on
+    /// that endpoint narrows to the selected remote and its egress toward that party follows it.
+    IceSelected {
+        endpoint: EndpointId,
+        remote: SocketAddr,
+    },
     /// Tear the call down: flush recordings and exit the actor loop.
     Stop,
 }
@@ -4080,6 +4129,19 @@ impl MediaRegistry {
     #[cfg(test)]
     pub(crate) fn call_endpoints(&self, call_id: &str) -> Option<[EndpointId; 2]> {
         self.calls.get(call_id).map(|handle| handle.endpoints)
+    }
+
+    /// Tell the call that owns `endpoint` that ICE selected `remote` for it
+    /// ([`MediaControl::IceSelected`]). Returns whether a call owns the endpoint.
+    pub fn ice_selected(&self, endpoint: EndpointId, remote: SocketAddr) -> bool {
+        self.routes.get(&endpoint).is_some_and(|mailbox| {
+            mailbox
+                .try_send(MediaInput::Control(MediaControl::IceSelected {
+                    endpoint,
+                    remote,
+                }))
+                .is_ok()
+        })
     }
 
     /// Route a redirected datagram to its owning call actor (drop on a full or closed mailbox —
@@ -4469,6 +4531,9 @@ async fn run_media_call<D>(
                     MediaInput::Control(MediaControl::MarkNearSecurePending) => {
                         call.mark_near_secure_pending();
                     }
+                    MediaInput::Control(MediaControl::IceSelected { endpoint, remote }) => {
+                        call.ice_selected(endpoint, remote);
+                    }
                     MediaInput::Control(MediaControl::AttachSecureLeg { leg }) => {
                         call.attach_secure_leg(leg);
                         tracing::debug!(target: "siphon_rtp::media", "DTLS-SRTP key installed on the media pipeline");
@@ -4725,6 +4790,48 @@ mod tests {
         assert!(
             !out.is_empty(),
             "after the key is attached the comfort-idle egress must resume"
+        );
+    }
+
+    #[test]
+    fn an_ice_leg_sends_nothing_until_its_agent_selects_and_then_sends_to_the_pair() {
+        // RFC 8445 §12: the signalled address is only a candidate, so a single-leg pipeline whose
+        // caller runs ICE holds its comfort-idle egress until the agent selects, then aims it at the
+        // selected pair rather than at the `c=` it was built with.
+        let (a_endpoint, b_endpoint) = (1, 2);
+        let mut call = ulaw_alaw_call_on(a_endpoint, b_endpoint)
+            .with_comfort_idle(None)
+            .with_egress_awaiting_ice(endpoint(a_endpoint))
+            .with_egress_awaiting_ice(endpoint(b_endpoint));
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for _ in 0..50 {
+            call.tick(&mut out, &mut events);
+        }
+        assert!(
+            out.is_empty(),
+            "{} datagram(s) left before selection",
+            out.len()
+        );
+
+        let selected = addr("198.51.100.7:40000");
+        call.ice_selected(endpoint(a_endpoint), selected);
+        call.ice_selected(endpoint(b_endpoint), selected);
+        for _ in 0..5 {
+            call.tick(&mut out, &mut events);
+        }
+        assert!(
+            !out.is_empty(),
+            "the egress resumes once a pair is selected"
+        );
+        assert!(
+            out.iter().all(|datagram| datagram.dst == selected),
+            "every datagram goes to the selected pair"
+        );
+        assert_eq!(
+            call.a_to_b.accepted_source,
+            SourceFilter::Exact(selected.ip()),
+            "the pipeline's gate narrows to the selected remote"
         );
     }
 

@@ -9,6 +9,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **The engine answers WebRTC callers itself.** `answer_local` without `ws_uri` refused a DTLS-SRTP
+  caller (`secure-offerer-unsupported`) and echoed an ICE caller's own credentials back with no agent
+  behind them, so a browser could not reach an IVR, announcement or voicemail box directly. The
+  handshake now keys the local pipeline, and with `--ice-full` the agent runs on the leg: the
+  pipeline sends nothing until a pair is selected and then sends only to that pair, never to the
+  signalled `c=`. Without an agent the answer declines ICE instead.
+
 - **An SDES-SRTP caller toward a plain callee can be transcoded.** The only pipeline for that shape
   was the offerer bridge, which never decodes, so a codec mismatch was refused on the answer
   (`secure-offerer-unsupported`), and so were recording, noise suppression, echo cancellation, beep

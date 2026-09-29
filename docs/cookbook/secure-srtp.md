@@ -76,7 +76,7 @@ callee — is wired in four places:
   each datagram from one to the other. See
   [Two secure parties](#two-secure-parties-the-transcrypt-bridge).
 
-Three shapes are refused rather than half-carried, each because the media path
+Two shapes are refused rather than half-carried, each because the media path
 behind it is not built. **Which verb refuses matters**, so each says:
 
 - an **SDES caller toward a DTLS far leg** — two keying *mechanisms*, not two
@@ -90,10 +90,6 @@ behind it is not built. **Which verb refuses matters**, so each says:
   An **SDES** caller in the same position is transcoded instead
   (`SrtpOffererMedia`): the media actor holds the caller's `SecureLeg`, decrypting
   what it sends and encrypting what goes back, and the callee's side stays plain;
-- a **DTLS-SRTP (WebRTC) offerer** on `answer_local` — it needs a full ICE agent
-  on the promoted leg. It is answered `secure-offerer-unsupported`, naming DTLS.
-  On the two-party relay a DTLS caller toward a plain callee *is* terminated; see
-  [WebRTC legs](webrtc.md#a-webrtc-caller-toward-a-plain-callee).
 
 Every one of them carries the stable `secure-offerer-unsupported` token, so a
 controller can match on it without parsing the sentence that follows.
@@ -347,5 +343,8 @@ nothing in the media path handles the caller's audio in the clear on the wire.
 This used to be refused outright (`secure-offerer-unsupported`), which meant a
 TLS/SRTP phone could not reach an IVR or a voicemail box at all.
 
-A **DTLS-SRTP** caller (a browser softphone) still needs a WebSocket takeover;
-see the note above.
+A **DTLS-SRTP** caller (a browser softphone) is answered the same way, with the
+engine's own `a=fingerprint`: the handshake keys the pipeline, which sends the
+caller nothing until it has. Browsers offer ICE, so run the engine with
+`--ice-full`; the pipeline then sends only to the pair the agent selects. See
+[WebRTC legs](webrtc.md).

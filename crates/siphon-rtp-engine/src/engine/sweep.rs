@@ -175,6 +175,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // without this the downlink would keep going to the signalled `c=` while the
                     // registry's pending gate kept dropping ingress. A no-op for any other leg.
                     self.ws.ice_selected(endpoint, remote);
+                    // And for a leg the engine's own pipeline carries — a locally answered call, or a
+                    // transcoded one — whose egress the actor owns just as a takeover bridge owns its.
+                    self.media.ice_selected(endpoint, remote);
                     // A DTLS-SRTP leg keys the path ICE chose: this releases a gated handshake and
                     // re-points its records and media at the selected pair (RFC 8445 §12). A no-op
                     // for a leg with no DTLS bridge.
