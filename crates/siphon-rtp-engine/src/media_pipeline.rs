@@ -2853,6 +2853,29 @@ impl MediaCall {
         self
     }
 
+    /// Mark this call's **caller** (A) as DTLS-keyed-later (`PipelineKind::DtlsOffererMedia`): the
+    /// topology of [`MediaCall::with_near_secure_leg`], but the handshake (RFC 5764) has not produced
+    /// the leg yet. Both directions stay inert until [`MediaCall::attach_caller_secure_leg`] delivers
+    /// it, for the reason [`MediaCall::with_far_secure_pending`] gives: A's ingress would otherwise be
+    /// decoded as plaintext, and B's audio would reach A in the clear.
+    #[must_use]
+    pub fn with_caller_secure_pending(mut self) -> Self {
+        self.a_to_b.secure_pending = true;
+        self.b_to_a.secure_pending = true;
+        self
+    }
+
+    /// Install the caller's DTLS-derived [`SecureLeg`] on a two-party call whose callee is plaintext,
+    /// on the directions [`MediaCall::with_near_secure_leg`] names — A→B decrypts, B→A encrypts —
+    /// and open both. A's RTCP rides its muxed RTP port (a DTLS offerer is refused without
+    /// `a=rtcp-mux`), so there is no companion relay to key.
+    pub fn attach_caller_secure_leg(&mut self, leg: Arc<Mutex<SecureLeg>>) {
+        self.a_to_b.secure_ingress = Some(leg.clone());
+        self.b_to_a.secure_egress = Some(leg);
+        self.a_to_b.secure_pending = false;
+        self.b_to_a.secure_pending = false;
+    }
+
     /// Mark a **single-leg** call's one party as secure, keyed later by the DTLS handshake.
     ///
     /// The single-leg twin of [`MediaCall::with_far_secure_pending`], and it gates the same way:
@@ -4057,6 +4080,9 @@ pub enum MediaControl {
     /// Install the [`SecureLeg`] for a **single-leg** call, where the one party is the secure side
     /// and each direction both decrypts and encrypts against it.
     AttachNearSecureLeg { leg: Arc<Mutex<SecureLeg>> },
+    /// Install the **caller's** DTLS-derived [`SecureLeg`] on a two-party call toward a plaintext
+    /// callee: A→B decrypts, B→A encrypts.
+    AttachCallerSecureLeg { leg: Arc<Mutex<SecureLeg>> },
     /// Mark a **single-leg** call's party as DTLS-keyed-later: both directions drop rather than treat
     /// SRTP as plaintext until [`MediaControl::AttachNearSecureLeg`] delivers the leg.
     MarkNearSecurePending,
@@ -4528,6 +4554,10 @@ async fn run_media_call<D>(
                     MediaInput::Control(MediaControl::AttachNearSecureLeg { leg }) => {
                         call.attach_near_secure_leg(leg);
                     }
+                    MediaInput::Control(MediaControl::AttachCallerSecureLeg { leg }) => {
+                        call.attach_caller_secure_leg(leg);
+                        tracing::debug!(target: "siphon_rtp::media", "caller's DTLS-SRTP key installed on the media pipeline");
+                    }
                     MediaInput::Control(MediaControl::MarkNearSecurePending) => {
                         call.mark_near_secure_pending();
                     }
@@ -4833,6 +4863,32 @@ mod tests {
             SourceFilter::Exact(selected.ip()),
             "the pipeline's gate narrows to the selected remote"
         );
+    }
+
+    #[test]
+    fn a_dtls_caller_is_keyed_on_the_directions_that_face_it() {
+        // `DtlsOffererMedia`: pending on both directions until the handshake, then A's leg decrypts
+        // A→B ingress and encrypts B→A egress, and B's side stays in the clear. Keying it with the
+        // callee topology would encrypt toward the plaintext callee and hand A B's audio in the clear.
+        let mut call = ulaw_alaw_call().with_caller_secure_pending();
+        assert!(call.a_to_b.secure_pending && call.b_to_a.secure_pending);
+        let key = siphon_rtp_srtp::sdes::SrtpKeyMaterial::from_inline_bytes(&[9u8; 30])
+            .expect("30 bytes");
+        let leg = Arc::new(Mutex::new(SecureLeg::new(&key, &key)));
+        call.attach_caller_secure_leg(leg.clone());
+        assert!(!call.a_to_b.secure_pending && !call.b_to_a.secure_pending);
+        assert!(call
+            .a_to_b
+            .secure_ingress
+            .as_ref()
+            .is_some_and(|ingress| Arc::ptr_eq(ingress, &leg)));
+        assert!(call
+            .b_to_a
+            .secure_egress
+            .as_ref()
+            .is_some_and(|egress| Arc::ptr_eq(egress, &leg)));
+        assert!(call.a_to_b.secure_egress.is_none(), "B is plaintext");
+        assert!(call.b_to_a.secure_ingress.is_none(), "B is plaintext");
     }
 
     #[test]

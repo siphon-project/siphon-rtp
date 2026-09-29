@@ -21,7 +21,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   (`secure-offerer-unsupported`), and so were recording, noise suppression, echo cancellation, beep
   detection and a tee. An SRTP phone calling out to a plain trunk on another codec could not be
   connected at all. The new `SrtpOffererMedia` pipeline holds the caller's `SecureLeg` in the media
-  actor. A DTLS-SRTP caller in the same position is still refused.
+  actor. A DTLS-SRTP caller in the same position is transcoded as well (`DtlsOffererMedia`): the
+  handshake keys the caller's directions of the media actor, and nothing crosses before it does.
 - **A bot can join a call the engine answered.** `attach_ws_bridge` refused every `answer_local`
   call (`ws-takeover-not-answered`), which is every call a controller answers, so a bot could only be
   named at answer time. It now takes the leg from the engine's own pipeline, and a detach gives it

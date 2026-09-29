@@ -137,9 +137,10 @@ pub(super) fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSn
         PipelineKind::Ws => PipelineSnapshot::Ws,
         // A terminated DTLS offerer is a DTLS call too, and restore refuses the DTLS kind: an
         // established DTLS association cannot move to a standby.
-        PipelineKind::Dtls | PipelineKind::DtlsMedia | PipelineKind::DtlsOfferer => {
-            PipelineSnapshot::Dtls
-        }
+        PipelineKind::Dtls
+        | PipelineKind::DtlsMedia
+        | PipelineKind::DtlsOfferer
+        | PipelineKind::DtlsOffererMedia => PipelineSnapshot::Dtls,
     }
 }
 

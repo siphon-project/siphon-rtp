@@ -78,7 +78,7 @@ enum Direction {
     },
 }
 
-/// Which party of a media-pipeline call a DTLS leg keys — the three topologies
+/// Which party of a media-pipeline call a DTLS leg keys — the topologies
 /// [`crate::media_pipeline::MediaCall`] threads a `SecureLeg` into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyedParty {
@@ -86,6 +86,8 @@ pub enum KeyedParty {
     Callee,
     /// The one party of a single-leg call the engine answered itself: both directions face it.
     SoleParty,
+    /// The caller of a two-party call (`PipelineKind::DtlsOffererMedia`): A keyed, B plaintext.
+    Caller,
 }
 
 /// Which slow-path owner a keyed DTLS leg's media belongs to. Both own the `SecureLeg` themselves and
@@ -120,6 +122,7 @@ impl KeyedParty {
         match self {
             Self::Callee => crate::media_pipeline::MediaControl::AttachSecureLeg { leg },
             Self::SoleParty => crate::media_pipeline::MediaControl::AttachNearSecureLeg { leg },
+            Self::Caller => crate::media_pipeline::MediaControl::AttachCallerSecureLeg { leg },
         }
     }
 }

@@ -946,6 +946,12 @@ enum PipelineKind {
     /// facing A and the engine's own fingerprint in A's answer, as [`PipelineKind::SrtpOfferer`]
     /// mirrors [`PipelineKind::Srtp`].
     DtlsOfferer,
+    /// A DTLS-SRTP **offerer** toward a plain callee *and* the call needs the decoded audio: the
+    /// transcode twin of [`PipelineKind::DtlsOfferer`], as [`PipelineKind::SrtpOffererMedia`] is of
+    /// [`PipelineKind::SrtpOfferer`]. The bridge keeps the RFC 7983 demux and the handshake on A's
+    /// endpoint; the [`MediaCall`] actor holds A's leg once the handshake delivers it, and both of its
+    /// directions stay pending until then.
+    DtlsOffererMedia,
 }
 
 impl PipelineKind {
@@ -970,7 +976,7 @@ impl PipelineKind {
                 "a secure↔secure (transcrypt) call has two secure legs and the snapshot record \
                  carries one",
             ),
-            Self::Dtls | Self::DtlsMedia | Self::DtlsOfferer => Some(
+            Self::Dtls | Self::DtlsMedia | Self::DtlsOfferer | Self::DtlsOffererMedia => Some(
                 "a DTLS-SRTP call's keys come from the handshake rather than the SDP, so an \
                  established association cannot move to a standby",
             ),
@@ -1014,6 +1020,7 @@ impl PipelineKind {
                 | Self::DtlsMedia
                 | Self::SrtpTranscryptMedia
                 | Self::SrtpOffererMedia
+                | Self::DtlsOffererMedia
         )
     }
 }

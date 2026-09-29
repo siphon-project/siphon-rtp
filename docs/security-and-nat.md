@@ -631,8 +631,11 @@ is wrong, and encryption defeats A2 eavesdrop.
 > `MediaCall::with_near_secure_leg` puts the caller's leg on the A→B ingress and the B→A egress, and
 > the callee's side is plaintext — the mirror of `with_far_secure_leg`. The caller never receives a
 > packet in the clear, and its key is never presented to the callee, exactly as on the offerer
-> bridge. A DTLS caller in the same position is still refused: its leg is keyed by a handshake the
-> media pipeline cannot host on that side yet.
+> bridge. **A DTLS caller in the same position is transcoded as well** (`PipelineKind::
+> DtlsOffererMedia`): the bridge keeps A's endpoint for the RFC 7983 demux and the handshake, and
+> keys the actor through `KeyedParty::Caller` (`MediaCall::attach_caller_secure_leg`, the same two
+> directions). Both directions start pending (`with_caller_secure_pending`), so nothing from A is
+> decoded and nothing reaches A in the clear before the handshake completes.
 >
 > **A secure pair that asks for any of those is transcoded, not refused** (`PipelineKind::
 > SrtpTranscryptMedia`). No crypto *bridge* yields decoded audio, but the media pipeline does, and it
@@ -649,8 +652,9 @@ is wrong, and encryption defeats A2 eavesdrop.
 > reason the bridge does — seeding one and restarting the other leaves that party's ROC at 0 on every
 > re-INVITE, which its peer cannot verify (RFC 3711 §3.3.1).
 >
-> What is still refused at the answer is a **DTLS** offerer whose call needs the decoded audio:
-> `DtlsOfferer` has no transcode twin, and the refusal says that rather than blaming the transcrypt.
+> What is still refused is two keying *mechanisms* on one call (a DTLS party facing an SDES or DTLS
+> one), which needs a transcrypt between a handshake and a key; the refusal says that rather than
+> blaming the transcrypt.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The

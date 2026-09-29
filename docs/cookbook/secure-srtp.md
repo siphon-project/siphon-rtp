@@ -76,23 +76,24 @@ callee — is wired in four places:
   each datagram from one to the other. See
   [Two secure parties](#two-secure-parties-the-transcrypt-bridge).
 
-Two shapes are refused rather than half-carried, each because the media path
-behind it is not built. **Which verb refuses matters**, so each says:
+One shape is refused rather than half-carried, because the media path behind it
+is not built: **two keying mechanisms on one call**, an SDES caller toward a DTLS
+far leg or a DTLS caller toward a secure one. That needs a transcrypt between a
+handshake and a key, not between two keys. It is refused on the **`offer`**,
+because the far leg's keying comes from the offer's own `transport_protocol`, so
+the engine knows before it hands back an SDP and declines there rather than after
+the callee has rung and answered. The reason carries the stable
+`secure-offerer-unsupported` token, so a controller can match on it without
+parsing the sentence that follows.
 
-- an **SDES caller toward a DTLS far leg** — two keying *mechanisms*, not two
-  keys. Refused on the **`offer`**: the far leg's keying comes from the offer's
-  own `transport_protocol`, so the engine knows this before it hands back an SDP
-  and declines there rather than after the callee has rung and answered;
-- **a DTLS-SRTP caller whose call needs the decoded audio** — a codec mismatch,
-  or `record_call`, `noise_suppression`, `echo_cancellation`, `beep_detection` or
-  `ws_tee` on the answer. Its leg cannot be threaded into the media pipeline yet.
-  Refused on the **`answer`**, because only the answer names the callee's codec.
-  An **SDES** caller in the same position is transcoded instead
-  (`SrtpOffererMedia`): the media actor holds the caller's `SecureLeg`, decrypting
-  what it sends and encrypting what goes back, and the callee's side stays plain;
-
-Every one of them carries the stable `secure-offerer-unsupported` token, so a
-controller can match on it without parsing the sentence that follows.
+A secure caller toward a plain callee whose call needs the decoded audio (a codec
+mismatch, or `record_call`, `noise_suppression`, `echo_cancellation`,
+`beep_detection` or `ws_tee` on the answer) is transcoded rather than bridged,
+whichever keying it used: `SrtpOffererMedia` for SDES, `DtlsOffererMedia` for
+DTLS. The media actor holds the caller's `SecureLeg`, decrypting what it sends
+and encrypting what goes back, and the callee's side stays plain. A DTLS caller's
+leg starts pending and is keyed when the handshake completes; until then nothing
+crosses in either direction.
 
 ## Two secure parties: the transcrypt bridge
 
