@@ -37,7 +37,9 @@ use super::negotiate::{
 };
 use super::offer::far_address_family;
 use super::snapshot::{codec_snapshot, restore_codec};
-use super::takeover::{WsVadConfig, DEFAULT_WS_VAD_HANGOVER_MS, DEFAULT_WS_VAD_THRESHOLD};
+use super::takeover::{
+    WsBridgeProcessing, WsVadConfig, DEFAULT_WS_VAD_HANGOVER_MS, DEFAULT_WS_VAD_THRESHOLD,
+};
 use super::telemetry::{qos_captures, qos_quality_events, rtcp_capture};
 use super::*;
 
@@ -25110,6 +25112,7 @@ async fn attaching_a_ws_bridge_takes_a_live_relay_over_and_detaching_gives_it_ba
                 call_id: "ws-attach".into(),
                 from_tag: "tag-a".into(),
                 ws_uri: ws_uri.clone(),
+                profile: None,
             },
         )
         .await;
@@ -25272,6 +25275,7 @@ async fn re_pointing_a_ws_bridge_moves_a_live_call_to_a_second_consumer() {
                 call_id: "ws-move".into(),
                 from_tag: "tag-a".into(),
                 ws_uri: second_uri.clone(),
+                profile: None,
             },
         )
         .await;
@@ -25733,6 +25737,7 @@ async fn attaching_a_ws_bridge_is_refused_where_the_media_path_could_not_be_give
                 call_id: "ws-transcode".into(),
                 from_tag: "tag-a".into(),
                 ws_uri: ws_uri.clone(),
+                profile: None,
             },
         )
         .await
@@ -25764,6 +25769,7 @@ async fn attaching_a_ws_bridge_is_refused_where_the_media_path_could_not_be_give
                 call_id: "ws-unanswered".into(),
                 from_tag: "tag-a".into(),
                 ws_uri: ws_uri.clone(),
+                profile: None,
             },
         )
         .await
@@ -25797,6 +25803,7 @@ async fn attaching_a_ws_bridge_is_refused_where_the_media_path_could_not_be_give
                 call_id: "ws-secure".into(),
                 from_tag: "tag-a".into(),
                 ws_uri,
+                profile: None,
             },
         )
         .await
@@ -25841,6 +25848,7 @@ async fn attaching_a_ws_bridge_is_refused_while_a_tee_holds_the_call() {
                 call_id: "ws-vs-tee".into(),
                 from_tag: "tag-a".into(),
                 ws_uri,
+                profile: None,
             },
         )
         .await
@@ -26038,6 +26046,7 @@ async fn a_taken_over_call_can_be_detached_back_to_its_relay_after_the_server_di
                 call_id: "ws-recover".into(),
                 from_tag: "tag-a".into(),
                 ws_uri: closing_ws_server().await,
+                profile: None,
             },
         )
         .await;
@@ -26086,6 +26095,7 @@ async fn deleting_a_bridged_call_reports_the_bridge_ending_with_it() {
                 call_id: "ws-delete".into(),
                 from_tag: "tag-a".into(),
                 ws_uri,
+                profile: None,
             },
         )
         .await;
@@ -26133,6 +26143,7 @@ async fn blocking_a_taken_over_call_is_refused_rather_than_undoing_the_takeover(
                 call_id: "ws-block".into(),
                 from_tag: "tag-a".into(),
                 ws_uri,
+                profile: None,
             },
         )
         .await;
@@ -28078,6 +28089,7 @@ async fn a_dtls_takeover_is_handed_to_the_engine_and_back_without_a_new_handshak
                 call_id: "dtls-handover".into(),
                 from_tag: "tag-a".into(),
                 ws_uri: second_uri,
+                profile: None,
             },
         )
         .await;
@@ -28230,6 +28242,7 @@ async fn an_ice_takeover_is_handed_to_the_engine_and_back_on_the_selected_pair()
                 call_id: "ice-handover".into(),
                 from_tag: "tag-a".into(),
                 ws_uri: second_uri,
+                profile: None,
             },
         )
         .await;
@@ -28288,6 +28301,7 @@ async fn a_bot_can_take_over_a_leg_the_engine_answered_and_hand_it_back() {
                 call_id: "anchor-bot".into(),
                 from_tag: "tag-a".into(),
                 ws_uri,
+                profile: None,
             },
         )
         .await;
@@ -28395,6 +28409,7 @@ async fn a_bot_taking_over_a_secure_anchor_continues_its_srtp_context() {
                 call_id: "secure-anchor-bot".into(),
                 from_tag: "tag-a".into(),
                 ws_uri,
+                profile: None,
             },
         )
         .await;
@@ -28491,6 +28506,7 @@ async fn a_bot_is_refused_while_something_else_runs_on_the_anchor() {
                 call_id: "busy-anchor".into(),
                 from_tag: "tag-a".into(),
                 ws_uri,
+                profile: None,
             },
         )
         .await;
@@ -28538,6 +28554,7 @@ async fn a_bot_that_cannot_be_reached_leaves_the_anchor_untouched() {
                 call_id: "unreachable-bot".into(),
                 from_tag: "tag-a".into(),
                 ws_uri: "ws://127.0.0.1:9/nobody-listens".into(),
+                profile: None,
             },
         )
         .await;
@@ -28895,4 +28912,256 @@ async fn a_secure_takeover_legs_srtcp_is_exported_decrypted() {
         contains_bytes(&capture, b"bot-srtcp"),
         "correlated by the call"
     );
+}
+
+// ---- A runtime ws bridge attach reads a media profile as the answer path does ----
+
+/// The profile a voice-AI controller hands `answer_local` alongside `ws_uri`: a 16 kHz wire, local
+/// turn-taking with barge-in, and both uplink cleaners.
+fn voice_bot_profile() -> ProfileFlags {
+    ProfileFlags {
+        ws_sample_rate: Some(16000),
+        ws_vad: true,
+        ws_barge_in: true,
+        ws_vad_min_speech_ms: Some(60),
+        echo_cancellation: true,
+        noise_suppression: true,
+        ..Default::default()
+    }
+}
+
+/// An `answer_local` call on the engine's own pipeline, with the redirect dispatcher running.
+async fn anchored_call(call_id: &str) -> (Engine<UdpLoopbackDatapath>, UdpSocket, SocketAddr) {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let caller_target = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer sdp")
+        .remote_rtp;
+    assert!(engine.media().is_media_call(call_id));
+    (engine, phone_a, caller_target)
+}
+
+#[test]
+fn a_default_profile_resolves_to_the_same_processing_as_none() {
+    // Absent and empty are one posture: every uplink stage off, the leg's own rate. That is what
+    // keeps an attach without a profile exactly what it was.
+    assert_eq!(
+        WsBridgeProcessing::from_profile(&ProfileFlags::default()),
+        WsBridgeProcessing::default()
+    );
+    let processing = WsBridgeProcessing::default();
+    assert_eq!(processing.wire_sample_rate, None);
+    assert!(!processing.noise_suppression);
+    assert!(!processing.echo.enabled);
+    assert!(processing.vad_config.is_none());
+}
+
+#[test]
+fn a_voice_bot_profile_resolves_every_bridge_knob() {
+    let processing = WsBridgeProcessing::from_profile(&voice_bot_profile());
+    assert_eq!(processing.wire_sample_rate, Some(16000));
+    assert!(processing.noise_suppression);
+    assert!(processing.echo.enabled);
+    let vad = processing.vad_config.expect("turn-taking requested");
+    assert!(vad.barge_in);
+    assert_eq!(vad.minimum_speech_ms, 60);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runtime_attach_to_the_anchor_reads_its_profile_as_answer_does() {
+    let (engine, phone_a, caller_target) = anchored_call("anchor-profile").await;
+    let (ws_uri, frames, _down) = takeover_ws_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "anchor-profile".into(),
+                from_tag: "tag-a".into(),
+                ws_uri,
+                profile: Some(voice_bot_profile()),
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    assert_eq!(
+        engine.ws_bridge_processing("anchor-profile"),
+        Some(WsBridgeProcessing::from_profile(&voice_bot_profile())),
+        "the bridge runs exactly what answer_local would have built from the same profile"
+    );
+    let start = expect_bridge_start(&frames).await;
+    assert_eq!(
+        start.media.sample_rate, 16000,
+        "the start frame reports the profile's wire rate, not the G.711 leg's 8 kHz"
+    );
+    for sequence in 0..12u16 {
+        phone_a
+            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), caller_target)
+            .await
+            .expect("caller send");
+    }
+    assert_eq!(
+        expect_bridge_uplink(&frames).await.len(),
+        640,
+        "16 kHz x 20 ms mono L16 = 320 samples = 640 bytes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runtime_attach_without_a_profile_keeps_processing_off_at_the_leg_rate() {
+    let (engine, _phone_a, _caller_target) = anchored_call("anchor-plain").await;
+    let (ws_uri, frames, _down) = takeover_ws_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "anchor-plain".into(),
+                from_tag: "tag-a".into(),
+                ws_uri,
+                profile: None,
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    assert_eq!(
+        engine.ws_bridge_processing("anchor-plain"),
+        Some(WsBridgeProcessing::default())
+    );
+    assert_eq!(expect_bridge_start(&frames).await.media.sample_rate, 8000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_takeover_reads_its_profile_and_a_repoint_keeps_or_replaces_it() {
+    let (engine, _a, _b) = two_party_relay("relay-profile").await;
+    let (first_uri, first_frames, _first_down) = takeover_ws_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "relay-profile".into(),
+                from_tag: "tag-a".into(),
+                ws_uri: first_uri,
+                profile: Some(voice_bot_profile()),
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    assert_eq!(
+        engine.ws_bridge_processing("relay-profile"),
+        Some(WsBridgeProcessing::from_profile(&voice_bot_profile()))
+    );
+    assert_eq!(
+        expect_bridge_start(&first_frames).await.media.sample_rate,
+        16000
+    );
+
+    // A re-point without a profile moves the destination and nothing else.
+    let (second_uri, second_frames, _second_down) = takeover_ws_server().await;
+    let repointed = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "relay-profile".into(),
+                from_tag: "tag-a".into(),
+                ws_uri: second_uri,
+                profile: None,
+            },
+        )
+        .await;
+    assert!(matches!(repointed, CmdResult::Ok { .. }), "{repointed:?}");
+    assert_eq!(
+        engine.ws_bridge_processing("relay-profile"),
+        Some(WsBridgeProcessing::from_profile(&voice_bot_profile())),
+        "carried across the re-point"
+    );
+    assert_eq!(
+        expect_bridge_start(&second_frames).await.media.sample_rate,
+        16000
+    );
+
+    // One with a profile replaces it.
+    let plain = ProfileFlags {
+        ws_sample_rate: Some(8000),
+        ..Default::default()
+    };
+    let (third_uri, third_frames, _third_down) = takeover_ws_server().await;
+    let replaced = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "relay-profile".into(),
+                from_tag: "tag-a".into(),
+                ws_uri: third_uri,
+                profile: Some(plain.clone()),
+            },
+        )
+        .await;
+    assert!(matches!(replaced, CmdResult::Ok { .. }), "{replaced:?}");
+    assert_eq!(
+        engine.ws_bridge_processing("relay-profile"),
+        Some(WsBridgeProcessing::from_profile(&plain))
+    );
+    assert_eq!(
+        expect_bridge_start(&third_frames).await.media.sample_rate,
+        8000
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runtime_attach_with_an_unserviceable_profile_leaves_the_anchor_untouched() {
+    // Refused before the pipeline stops, as answer_local refuses the same profile before it
+    // allocates anything.
+    let (engine, _phone_a, _caller_target) = anchored_call("anchor-bad").await;
+    for profile in [
+        ProfileFlags {
+            ws_sample_rate: Some(7000),
+            ..Default::default()
+        },
+        ProfileFlags {
+            // Inert without a canceller: answer_local refuses it, so does the attach.
+            echo_long_tail: true,
+            ..Default::default()
+        },
+    ] {
+        let (ws_uri, _frames, _down) = takeover_ws_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: "anchor-bad".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri,
+                    profile: Some(profile.clone()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Error { .. }),
+            "{profile:?} must be refused: {attached:?}"
+        );
+        assert!(
+            engine.media().is_media_call("anchor-bad"),
+            "still on the pipeline"
+        );
+        assert!(!engine.ws().is_ws_call("anchor-bad"));
+    }
 }

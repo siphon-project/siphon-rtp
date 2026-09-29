@@ -14,7 +14,7 @@ use super::negotiate::{
     offered_dtls_setup, parse_codec_flags, peer_ice_credentials, present_leg, resolve_rtcp_mux,
     same_codec, CodecPresentation, DtlsDirective, IceDirective, LegPresentation,
 };
-use super::takeover::{ws_takeover_media_address, WsBridgeSetup, WsVadConfig};
+use super::takeover::{ws_takeover_media_address, WsBridgeProcessing, WsBridgeSetup};
 use super::{
     error_result, ok_sdp, unknown_call, Call, CallerMediaLeg, ClientId, Engine, Leg, PipelineKind,
 };
@@ -995,10 +995,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // top of `offer`), so this arm is always a plaintext, non-ICE leg.
                     ice_pending: false,
                     secure: None,
-                    noise_suppression: profile.noise_suppression,
-                    echo: crate::media_pipeline::EchoProfile::from_profile(profile),
-                    vad_config: WsVadConfig::from_profile(profile),
-                    wire_sample_rate: profile.ws_sample_rate,
+                    processing: WsBridgeProcessing::from_profile(profile),
                     // Negotiation-time: a fresh egress watch, and no relay displaced (there is none
                     // yet) — so there is nothing for a detach to put back either.
                     egress: None,

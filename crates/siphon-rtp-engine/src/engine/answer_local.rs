@@ -18,7 +18,7 @@ use super::negotiate::{
     bridge_source_filter, filter_component, ice_directive, ice_tie_breaker, parse_codec_flags,
     peer_ice_credentials, resolve_rtcp_mux, IceDirective,
 };
-use super::takeover::{ws_takeover_media_address, WsBridgeSetup, WsVadConfig};
+use super::takeover::{ws_takeover_media_address, WsBridgeProcessing, WsBridgeSetup};
 use super::{
     error_result, ok_sdp, unknown_call, Call, CallerMediaLeg, ClientId, Engine, Leg, PipelineKind,
     PromoteMode, PromotionReason,
@@ -326,10 +326,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 accepted_source,
                 ice_pending,
                 secure,
-                noise_suppression: profile.noise_suppression,
-                echo: crate::media_pipeline::EchoProfile::from_profile(profile),
-                vad_config: WsVadConfig::from_profile(profile),
-                wire_sample_rate: profile.ws_sample_rate,
+                processing: WsBridgeProcessing::from_profile(profile),
                 // Negotiation-time: a fresh egress watch, and no relay displaced (there is none
                 // yet) — so there is nothing for a detach to put back either.
                 egress: None,

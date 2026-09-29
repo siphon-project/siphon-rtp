@@ -8,7 +8,7 @@ use siphon_rtp_proto::WsBridgeEndReason;
 use std::sync::Arc;
 
 use super::super::{Engine, PipelineKind, PromoteMode, PromotionReason};
-use super::{ws_takeover_media_address, WsBridgeSetup};
+use super::{ws_takeover_media_address, WsBridgeProcessing, WsBridgeSetup};
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Hand a single-leg call from the engine's own pipeline to a WebSocket takeover: a bot joins a
@@ -29,7 +29,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Refused while anything else lives on the pipeline — a recording, a tee, a SIPREC
     /// subscription, an interception, a DTMF block, echo — since stopping the pipeline would stop it
     /// silently. A prompt still playing is ended with `play_finished{error}`, as on any teardown.
-    pub(super) async fn attach_to_anchor(&self, call_id: &str, ws_uri: &str) -> Result<(), String> {
+    ///
+    /// `processing` is what the attach's profile resolved to — [`WsBridgeProcessing::default`] when
+    /// it named none, which runs the bot at the leg's own rate with every uplink stage off.
+    pub(super) async fn attach_to_anchor(
+        &self,
+        call_id: &str,
+        ws_uri: &str,
+        processing: WsBridgeProcessing,
+    ) -> Result<(), String> {
         let Some((codec, caller, signalled, received_from, posture, secure, others)) = self
             .owned_call_internal(call_id, |call| {
                 (
@@ -147,12 +155,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // below releases it.
                 ice_pending: has_ice,
                 secure: secure.clone(),
-                // A runtime attach carries no profile; the uplink processing stays off, as on a relay
-                // takeover.
-                noise_suppression: false,
-                echo: crate::media_pipeline::EchoProfile::default(),
-                vad_config: None,
-                wire_sample_rate: None,
+                processing,
                 egress: None,
                 // Nothing displaced: a detach returns the leg to the anchor, not to a relay.
                 takeover: None,

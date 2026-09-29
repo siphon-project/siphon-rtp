@@ -7,6 +7,18 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **A runtime `attach_ws_bridge` takes a media profile.** The command carried only `call_id` and
+  `ws_uri`, so a bot attached at runtime always ran at the leg's own codec rate with VAD, barge-in,
+  echo cancellation and noise suppression off: a G.711 leg's `start` frame said 8000 where the same
+  bot answered with `ws_sample_rate: 16000` said 16000. It now takes an optional `profile`, read and
+  validated exactly as the answer path reads the profile carrying `ws_uri` (one shared resolver).
+  Only the wire rate and uplink processing are read; the leg's gate, codec and keying are untouched.
+  Absent, nothing changes: a takeover runs with processing off at the leg's rate, a re-point keeps
+  what it had. The field is omitted from the wire when unset and defaulted when missing, so older
+  controllers and engines interoperate.
+
 ## [0.10.0] — 2026-09-29
 
 ### Added

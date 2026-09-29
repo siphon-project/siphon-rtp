@@ -1244,6 +1244,9 @@ copy of Layers 1–4.
 - **Runtime lifecycle (`attach_ws_bridge` / `detach_ws_bridge`) inherits every layer above, and adds
   no new way in.** A bridge can now be attached to a call already up, moved to a different server, and
   removed again. None of that touches how a packet is accepted:
+  - **An attach's `profile` is read for the wire rate and uplink processing only.** The symmetric /
+    subnet-source flags that shape the gate at negotiation are not read from it, so a runtime attach
+    cannot widen the gate the negotiation installed.
   - **A re-point carries the gate, the keying and the egress across; it never re-derives them.** The
     replacement bridge is handed the *live* `SourceFilter` — already narrowed to the selected pair if
     ICE has chosen one — the same `WsSecureLeg`, and the same egress watch. Rebuilding any of the

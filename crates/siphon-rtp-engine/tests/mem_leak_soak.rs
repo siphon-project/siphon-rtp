@@ -1211,6 +1211,7 @@ async fn ws_bridge_attach_repoint_detach(
                         call_id: call_id.clone(),
                         from_tag: "tag-a".into(),
                         ws_uri: uri.to_string(),
+                        profile: None,
                     },
                 )
                 .await,
@@ -1501,6 +1502,7 @@ async fn anchor_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &str, i
                     call_id: call_id.clone(),
                     from_tag: "tag-a".into(),
                     ws_uri: uri.to_string(),
+                    profile: None,
                 },
             )
             .await,
