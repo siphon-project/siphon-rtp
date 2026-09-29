@@ -18,6 +18,15 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   `unknown call`. Re-answering the client's own single-leg call still works and replaces it through
   the `delete` path, only after the replacement has validated and bound its ports, and is admitted
   at a full quota.
+- **A tee named on the answer decodes a secure call instead of bridging it.** `ws_tee` was not one of
+  the reasons `resolve_pipeline` decodes a call, so an SDES-SRTP callee, two SDES parties, or a
+  DTLS-SRTP callee on a shared codec resolved to a crypto bridge, and the tee was then refused against
+  the bridge that choice produced. A tee now counts like a recording: those calls take `SrtpMedia`,
+  `SrtpTranscryptMedia` and `DtlsMedia`. A plain relay is unchanged; the tee still promotes it for its
+  own lifetime and demotes it on detach. A secure caller toward a plain callee has no decoding pipeline,
+  so a tee on that answer is refused up front as `secure-offerer-unsupported` rather than answering on
+  the bridge and failing the tee. `fax_passthrough` now refuses `ws_tee` in the profile, like every
+  other flag that decodes. A tee attached mid-call to a crypto bridge is still refused.
 
 ## [0.9.1] — 2026-09-27
 

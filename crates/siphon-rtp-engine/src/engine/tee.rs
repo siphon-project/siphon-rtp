@@ -107,9 +107,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // post-decode fan-out to tap. Note this rejects only the bridge kinds: a secure call that
             // runs through the media pipeline (`SrtpMedia` / `DtlsMedia`) decodes like any other and
             // tees fine — for DTLS that is exactly what WP-R4 unlocked.
+            // A bridge cannot be converted to its decoding twin mid-call, so the tee has to be named
+            // on the answer (`ProfileFlags::ws_tee`), where `resolve_pipeline_kind` counts it as a
+            // reason to decode.
             return Err(
                 "teeing a secure crypto-bridge call is not supported — the bridge relays \
-                 ciphertext without decoding; a transcoded secure call can be teed"
+                 ciphertext without decoding; name ws_tee on the answer to have the call decoded \
+                 from the start"
                     .to_string(),
             );
         }

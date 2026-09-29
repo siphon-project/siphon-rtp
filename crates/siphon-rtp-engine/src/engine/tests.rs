@@ -7054,6 +7054,47 @@ async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
         engine.calls.get("secure-record").expect("call").pipeline,
         PipelineKind::SrtpTranscryptMedia,
     );
+
+    // (d) a secure caller toward a plain callee with a tee on the answer. The bridge cannot be teed
+    // and has no decoding twin, so the answer refuses it before anything is installed, rather than
+    // answering on the bridge and then failing to attach the tee.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "secure-offerer-teed".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "secure-offerer-teed".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                profile: ProfileFlags {
+                    ws_tee: Some("ws://127.0.0.1:9/never-dialled".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    match result {
+        CmdResult::Error { reason } => {
+            assert!(reason.contains("secure-offerer-unsupported"), "{reason}");
+            assert!(reason.contains("WebSocket tee"), "{reason}");
+        }
+        other => panic!("expected a refusal for a teed secure offerer, got {other:?}"),
+    }
+    assert_eq!(engine.ws_tee_count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23743,6 +23784,166 @@ async fn the_ws_tee_profile_flag_attaches_at_answer_time() {
         engine.ws_tee_count(),
         0,
         "delete tore the tee down with the call"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ws_tee_on_the_answer_decodes_a_secure_callee_instead_of_bridging_it() {
+    // A plain caller toward an SDES callee on a shared codec is carried by the SRTP bridge, which
+    // relays ciphertext and has nothing a tee can tap. Naming the tee on the answer is a reason to
+    // decode, so the call resolves to the secure transcode pipeline instead, and the callee's SRTP
+    // reaches the tee as decoded audio.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let (uri, frames) = tee_server().await;
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "tee-secure-callee".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let far_addr = sdp::parse(&ok_sdp_text(&offer))
+        .expect("offer reply")
+        .remote_rtp;
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "tee-secure-callee".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: ProfileFlags {
+                    ws_tee: Some(uri),
+                    ws_tee_direction: Some(WsTeeDirection::Callee),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    assert!(matches!(answer, CmdResult::Ok { .. }), "answer: {answer:?}");
+    assert_eq!(
+        engine
+            .calls
+            .get("tee-secure-callee")
+            .expect("call")
+            .pipeline,
+        PipelineKind::SrtpMedia,
+        "a teed secure call is decoded, not bridged"
+    );
+    expect_tee_start(&frames).await;
+
+    let mut seal = SrtpContext::from_key_material(&callee_key.key);
+    for sequence in 0..6u16 {
+        let mut sealed = Vec::new();
+        seal.protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0xFF), &mut sealed)
+            .expect("B encrypts");
+        phone_b.send_to(&sealed, far_addr).await.expect("b send");
+    }
+    assert_eq!(
+        next_tee_audio(&frames).await.len(),
+        320,
+        "the callee's SRTP reached the tee as one decoded 20 ms frame"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ws_tee_on_the_answer_decodes_two_secure_parties_instead_of_transcrypting() {
+    // Two SDES parties on a shared codec are carried by the transcrypt bridge, which re-keys each
+    // datagram without decoding it. A tee on the answer takes the transcode twin instead, which holds
+    // both parties' legs in the media actor, so the caller's SRTP reaches the tee decoded.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let (uri, frames) = tee_server().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "tee-both-sdes".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "tee-both-sdes".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: ProfileFlags {
+                    ws_tee: Some(uri),
+                    ws_tee_direction: Some(WsTeeDirection::Caller),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let near_addr = sdp::parse(&ok_sdp_text(&answer))
+        .expect("the answer still returns SDP")
+        .remote_rtp;
+    assert_eq!(
+        engine.calls.get("tee-both-sdes").expect("call").pipeline,
+        PipelineKind::SrtpTranscryptMedia,
+        "a teed secure pair is decoded, not transcrypted"
+    );
+    expect_tee_start(&frames).await;
+
+    let mut seal = SrtpContext::from_key_material(&caller_key.key);
+    for sequence in 0..6u16 {
+        let mut sealed = Vec::new();
+        seal.protect(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), &mut sealed)
+            .expect("A encrypts");
+        phone_a.send_to(&sealed, near_addr).await.expect("a send");
+    }
+    assert_eq!(
+        next_tee_audio(&frames).await.len(),
+        320,
+        "the caller's SRTP reached the tee as one decoded 20 ms frame"
     );
 }
 

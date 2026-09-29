@@ -1460,6 +1460,11 @@ pub struct ProfileFlags {
     /// normally *and* streams its decoded audio to this URI. Applied once the call's media path exists
     /// (i.e. on `answer` / `answer_local`), and torn down with the call. A native siphon-rtp extension
     /// — the NG/bencode front-end does not set it.
+    ///
+    /// A tee is a reason to decode, like `record_call`: a secure call the engine would otherwise carry
+    /// on a crypto bridge (which relays ciphertext and cannot be teed) is carried by its decoding
+    /// pipeline instead. That choice is made on the answer, so a secure call that must be teed names
+    /// the tee here rather than attaching one later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_tee: Option<String>,
     /// Which leg(s) `ws_tee` streams. `None` ⇒ both. Inert without `ws_tee`.

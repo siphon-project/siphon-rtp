@@ -270,22 +270,17 @@ pub(crate) fn validate_fax_passthrough(profile: &ProfileFlags) -> Result<(), Str
     if !profile.fax_passthrough {
         return Ok(());
     }
-    let mut requested = Vec::new();
-    if profile.noise_suppression {
-        requested.push("noise_suppression");
-    }
-    if profile.echo_cancellation {
-        requested.push("echo_cancellation");
-    }
-    if profile.beep_detection {
-        requested.push("beep_detection");
-    }
-    if profile.record_call {
-        requested.push("record_call");
-    }
-    if profile.ws_uri.is_some() {
-        requested.push("ws_uri");
-    }
+    let requested: Vec<&str> = [
+        ("noise_suppression", profile.noise_suppression),
+        ("echo_cancellation", profile.echo_cancellation),
+        ("beep_detection", profile.beep_detection),
+        ("record_call", profile.record_call),
+        ("ws_uri", profile.ws_uri.is_some()),
+        ("ws_tee", profile.ws_tee.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, set)| set.then_some(flag))
+    .collect();
     if !requested.is_empty() {
         // Name every conflict, not the first one: a controller fixing them one offer at a time
         // learns the rule an error at a time.
@@ -9276,7 +9271,7 @@ mod tests {
         // A bare pin asks for nothing else, so there is nothing to contradict.
         assert!(validate_fax_passthrough(&pinned()).is_ok());
 
-        let conflicts: [ConflictingFlag; 5] = [
+        let conflicts: [ConflictingFlag; 6] = [
             ("noise_suppression", |profile| {
                 profile.noise_suppression = true;
             }),
@@ -9287,6 +9282,9 @@ mod tests {
             ("record_call", |profile| profile.record_call = true),
             ("ws_uri", |profile| {
                 profile.ws_uri = Some("ws://example.invalid/stream".to_string());
+            }),
+            ("ws_tee", |profile| {
+                profile.ws_tee = Some("ws://example.invalid/tee".to_string());
             }),
         ];
 
@@ -9311,7 +9309,7 @@ mod tests {
         for (_, set) in conflicts {
             set(&mut every_conflict);
         }
-        let error = validate_fax_passthrough(&every_conflict).expect_err("all five conflict");
+        let error = validate_fax_passthrough(&every_conflict).expect_err("every one conflicts");
         for (name, _) in conflicts {
             assert!(error.contains(name), "{name} missing from: {error}");
         }
