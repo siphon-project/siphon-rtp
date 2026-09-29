@@ -5560,6 +5560,7 @@ fn takeover_downlink_target(engine: &Engine<UdpLoopbackDatapath>, call_id: &str)
         .expect("the call has a takeover route")
         .egress
         .destination()
+        .expect("a downlink destination")
 }
 
 /// A WS server that republishes every frame it receives on `frames` and forwards anything pushed
@@ -27893,9 +27894,10 @@ async fn a_voicemail_records_an_opus_caller() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn detaching_a_dtls_keyed_takeover_is_refused_before_anything_stops() {
-    // The engine's own pipeline cannot terminate DTLS-SRTP, so handing it this leg would leave the
-    // caller behind a key nothing renews. Refused with the reason, and the bot keeps the call.
+async fn detaching_a_dtls_takeover_mid_handshake_is_refused_before_anything_stops() {
+    // The handshake's session keys the owner it was registered with. Detaching before it completes
+    // would key the WebSocket leg being torn down and leave the pipeline pending forever, so it is
+    // refused with the reason, and the bot keeps the call.
     use crate::srtp_bridge::run_redirect_dispatcher;
     let (ws_uri, frames, _down) = takeover_ws_server().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
@@ -27936,13 +27938,312 @@ async fn detaching_a_dtls_keyed_takeover_is_refused_before_anything_stops() {
         .await;
     match refused {
         CmdResult::Error { reason } => {
-            assert!(reason.contains("ws-bridge-detach-dtls"), "{reason}")
+            assert!(reason.contains("ws-bridge-detach-dtls-pending"), "{reason}")
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
     assert!(
         engine.ws().is_ws_call("dtls-detach"),
         "the bot keeps the call"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dtls_takeover_is_handed_to_the_engine_and_back_without_a_new_handshake() {
+    // A WebRTC caller answered by a bot, handed to the engine's own pipeline, then to a second bot.
+    // The association outlives both hand-overs: the caller handshakes once, and its one key keeps
+    // working with each owner in turn (RFC 8842 §5.5).
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let (first_uri, first_frames, _first_down) = takeover_ws_server().await;
+    let (second_uri, second_frames, _second_down) = takeover_ws_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let phone_a = Arc::new(
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind a"),
+    );
+    let addr_a = phone_a.local_addr().expect("addr a");
+    let caller_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "dtls-handover".into(),
+                from_tag: "tag-a".into(),
+                sdp: dtls_offerer_sdp(addr_a, &caller_cert.fingerprint(), "active"),
+                profile: ProfileFlags {
+                    ws_uri: Some(first_uri),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let answer = sdp::parse(&ok_sdp_text(&result)).expect("answer sdp");
+    let engine_media = answer.remote_rtp;
+    let engine_fingerprint = answer.fingerprint.clone().expect("engine fingerprint");
+    let _ = expect_bridge_start(&first_frames).await;
+    let caller_leg = Arc::new(Mutex::new(
+        peer_dtls_handshake(
+            phone_a.clone(),
+            addr_a,
+            engine_media,
+            &caller_cert,
+            &engine_fingerprint,
+        )
+        .await,
+    ));
+    let speak = |from: u16| {
+        let leg = caller_leg.clone();
+        let socket = phone_a.clone();
+        async move {
+            for sequence in from..from + 10 {
+                let mut sealed = Vec::new();
+                leg.lock()
+                    .expect("leg")
+                    .protect(&ulaw_rtp_packet(sequence, 0x0C0C_0C0C, 0x20), &mut sealed)
+                    .expect("caller SRTP");
+                socket
+                    .send_to(&sealed, engine_media)
+                    .await
+                    .expect("caller send");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
+    speak(0).await;
+    assert!(
+        next_uplink_frame(&first_frames).await.is_some(),
+        "the first bot hears the caller"
+    );
+
+    // Hand the caller to the engine.
+    let detached = engine
+        .handle(
+            CLIENT,
+            Command::DetachWsBridge {
+                call_id: "dtls-handover".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+    assert!(!engine.ws().is_ws_call("dtls-handover"));
+    assert!(engine.media().is_media_call("dtls-handover"));
+
+    // The pipeline speaks SRTP under the same association…
+    let mut buffer = [0u8; 2048];
+    let mut heard = false;
+    for _ in 0..40 {
+        let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(100), phone_a.recv_from(&mut buffer)).await
+        else {
+            continue;
+        };
+        let mut clear = Vec::new();
+        if caller_leg
+            .lock()
+            .expect("leg")
+            .unprotect(&buffer[..len], &mut clear)
+            .is_ok()
+        {
+            heard = true;
+            break;
+        }
+    }
+    assert!(
+        heard,
+        "the caller decrypts the pipeline with the key it already has"
+    );
+    // …and decodes the caller.
+    let samples = record_caller_while(&engine, &events, "dtls-handover", speak(100)).await;
+    assert!(
+        samples.iter().any(|&sample| sample != 0),
+        "the engine hears the caller"
+    );
+
+    // And on to a second bot.
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "dtls-handover".into(),
+                from_tag: "tag-a".into(),
+                ws_uri: second_uri,
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    let _ = expect_bridge_start(&second_frames).await;
+    speak(200).await;
+    assert!(
+        next_uplink_frame(&second_frames).await.is_some(),
+        "the second bot hears the caller under the same key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ice_takeover_is_handed_to_the_engine_and_back_on_the_selected_pair() {
+    // The agent outlives both hand-overs; each new owner starts on the pair it already selected,
+    // which here is deliberately not the signalled `c=`.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let (first_uri, first_frames, _first_down) = takeover_ws_server().await;
+    let (second_uri, second_frames, _second_down) = takeover_ws_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (decoy, addr_decoy) = phone().await;
+    let offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+             m=audio {decoy_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:peer 1 UDP 2130706431 {ip} {port} typ host\r\n\
+             a=candidate:decoy 1 UDP 1694498815 {ip} {decoy_port} typ host\r\n\
+             a=end-of-candidates\r\n",
+        ip = addr_a.ip(),
+        decoy_port = addr_decoy.port(),
+        port = addr_a.port()
+    );
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "ice-handover".into(),
+                from_tag: "tag-a".into(),
+                sdp: offer,
+                profile: ProfileFlags {
+                    ws_uri: Some(first_uri),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let answer = sdp::parse(&ok_sdp_text(&result)).expect("answer sdp");
+    let engine_media = answer.remote_rtp;
+    let near_rtp = engine
+        .calls
+        .get("ice-handover")
+        .map(|call| call.near.rtp.id)
+        .expect("call");
+    let _ = expect_ws_start(&first_frames).await;
+
+    let mut peer = peer_agent(&answer, addr_a);
+    let mut buffer = [0u8; 2048];
+    let mut now = 0u64;
+    while now < 4_000 && engine.datapath().ice_validated_source(near_rtp).is_none() {
+        for action in peer.poll(now) {
+            if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                phone_a.send_to(&datagram, to).await.expect("peer send");
+            }
+        }
+        engine.drive_ice_agents(now).await;
+        while let Ok(Ok((len, from))) =
+            timeout(Duration::from_millis(20), phone_a.recv_from(&mut buffer)).await
+        {
+            for action in peer.on_datagram(addr_a, from, &buffer[..len], now) {
+                if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                    phone_a.send_to(&datagram, to).await.expect("peer send");
+                }
+            }
+            engine.drive_ice_agents(now).await;
+        }
+        now += 20;
+    }
+    assert_eq!(
+        engine.datapath().ice_validated_source(near_rtp),
+        Some(addr_a)
+    );
+    let mut before_detach = 0usize;
+    let mut decoy_scratch = [0u8; 2048];
+    while let Ok(Ok(_)) = timeout(
+        Duration::from_millis(50),
+        decoy.recv_from(&mut decoy_scratch),
+    )
+    .await
+    {
+        if (128..=191).contains(&decoy_scratch[0]) {
+            before_detach += 1;
+        }
+    }
+    assert_eq!(
+        before_detach, 0,
+        "the first bot's downlink waited for the selection instead of going to the signalled c="
+    );
+
+    let detached = engine
+        .handle(
+            CLIENT,
+            Command::DetachWsBridge {
+                call_id: "ice-handover".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+    assert!(engine.media().is_media_call("ice-handover"));
+
+    // The pipeline's egress goes to the selected pair, and nothing goes to the signalled address.
+    let mut heard = false;
+    for _ in 0..40 {
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(50), phone_a.recv_from(&mut buffer)).await
+        {
+            if (128..=191).contains(&buffer[0]) && len > 12 {
+                heard = true;
+                break;
+            }
+        }
+    }
+    assert!(heard, "the engine's pipeline sends to the selected pair");
+    let mut decoy_buffer = [0u8; 2048];
+    while let Ok(Ok((len, _))) = timeout(
+        Duration::from_millis(50),
+        decoy.recv_from(&mut decoy_buffer),
+    )
+    .await
+    {
+        assert!(
+            !(128..=191).contains(&decoy_buffer[0]),
+            "{len} bytes of media reached the signalled address the agent did not select"
+        );
+    }
+
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "ice-handover".into(),
+                from_tag: "tag-a".into(),
+                ws_uri: second_uri,
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    let _ = expect_ws_start(&second_frames).await;
+    for sequence in 0..10u16 {
+        phone_a
+            .send_to(&ulaw_rtp_packet(sequence, 0x0E0E_0E0E, 0xFF), engine_media)
+            .await
+            .expect("media");
+    }
+    assert!(
+        next_uplink_frame(&second_frames).await.is_some(),
+        "the second bot hears the caller on the selected pair"
     );
 }
 

@@ -633,6 +633,13 @@ impl AgentSupervisor {
         self.agents.retain(|_, entry| entry.call_id != call_id);
     }
 
+    /// Whether an agent runs on `endpoint`: its transport is the agent's to decide, whoever owns the
+    /// media on it.
+    #[must_use]
+    pub fn runs(&self, endpoint: EndpointId) -> bool {
+        self.agents.contains_key(&endpoint)
+    }
+
     /// The agent state for `endpoint` (diagnostics and tests).
     #[must_use]
     pub fn state(&self, endpoint: EndpointId) -> Option<IceState> {

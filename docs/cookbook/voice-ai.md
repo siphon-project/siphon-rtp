@@ -550,7 +550,9 @@ taken over, and every refusal carries its own token:
 **Joining a call the engine answered.** A call answered with `answer_local` (and no `ws_uri`) runs
 on the engine's own pipeline, and `attach_ws_bridge` hands that leg to the bot: the pipeline is
 stopped, the bot gets the caller, and a later `detach_ws_bridge` gives the leg back to a fresh
-pipeline. An SDES-SRTP caller keeps its SRTP context through both hand-overs. A prompt still playing
+pipeline. An SDES-SRTP caller keeps its SRTP context through both hand-overs, a DTLS-SRTP caller
+keeps its association (no new handshake), and an ICE caller keeps its agent and selected pair. A
+prompt still playing
 when the bot joins ends with `play_finished` (`error`). Refused while something else runs on the
 pipeline, since stopping it would stop that silently:
 
@@ -570,15 +572,19 @@ answered) displaced nothing, so detaching it hands the caller to the engine's ow
 the same anchor `answer_local` builds without a bot. From there `play_media`, recording, DTMF and a
 fresh `attach_ws_bridge` all work, which is what lets a bot understand the caller, step away, and let
 the controller play an announcement, take a message or route the call. An SDES-SRTP leg keeps its
-SRTP context across the hand-over. Three shapes are still refused, each before anything stops:
+SRTP context across the hand-over and a DTLS-SRTP leg its association, so the caller never
+handshakes again. An ICE leg keeps its agent: the pipeline starts on the pair already selected and
+follows any later one. Two shapes are refused, each before anything stops:
 
 | Shape | Refusal |
 |---|---|
 | A negotiated takeover on a two-leg call (never wired A to B) | `ws-bridge-negotiated-two-leg` |
-| A leg running ICE (the engine's own pipeline has no ICE agent) | `ws-bridge-detach-ice` |
-| A leg keyed by DTLS-SRTP (the engine's own pipeline cannot terminate it) | `ws-bridge-detach-dtls` |
+| A DTLS-SRTP leg whose handshake has not completed yet | `ws-bridge-detach-dtls-pending` |
 
-Re-point those, or `delete` the call.
+Re-point the first, or `delete` the call; retry the second once media flows.
+
+An ICE takeover's downlink waits for the agent's selection and then goes to the selected pair,
+never to the signalled `c=` (RFC 8445 §12).
 
 `block_media` / `unblock_media` are refused on a taken-over call for a related reason: the call is
 still holding the displaced relay's forward rules for its detach, and an unblock walks that list.
