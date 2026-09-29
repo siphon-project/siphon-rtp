@@ -255,7 +255,7 @@ Media-control honesty, in one place:
 | Tag | Fields | What it plays |
 |---|---|---|
 | `file` | `path` | A WAV on the engine host. |
-| `blob` | `data` | WAV bytes carried inline in the control frame. |
+| `blob` | `data_base64` | WAV bytes carried inline in the control frame, as base64 (RFC 4648 §4, padded). At most 783,360 bytes of audio (`MAX_PLAY_BLOB_LEN`), about 49 s of 8 kHz 16-bit mono; play anything longer by `file` or `http`. The earlier `data` array of byte values is still accepted but costs about 3.5 characters per byte, capping a blob near 300 KB. |
 | `tone` | `tone` | A synthesised call-progress tone — see [Tones](#tones). |
 | `http` | `url` | A WAV fetched over `http://` / `https://` by the engine — see [Playback from a URL](#playback-from-a-url). |
 | `db_id` | `id` | Rejected; there is no media database. |

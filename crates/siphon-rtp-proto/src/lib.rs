@@ -89,8 +89,15 @@ use std::str::FromStr;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Hard ceiling on a single control frame (1 MiB). Guards against a corrupt length prefix.
-/// SDP and play-media blobs are the only large payloads and stay well under this.
+/// A `play_media` blob is the only payload that approaches it — see [`MAX_PLAY_BLOB_LEN`].
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
+
+/// The largest [`PlayMediaSource::Blob`] that fits one control frame, in bytes of audio.
+///
+/// The blob travels as base64 (four characters per three bytes), and the rest of the frame — the
+/// request id, the command, the call id and tags — is budgeted at 4 KiB, which a real request never
+/// approaches. Audio longer than this should be played by `file` path or `http` URL.
+pub const MAX_PLAY_BLOB_LEN: usize = (MAX_FRAME_LEN - 4096) / 4 * 3;
 
 /// Longest [`Command::Authenticate::controller_id`] the engine accepts, in bytes.
 ///
@@ -1166,9 +1173,14 @@ impl<'de> Deserialize<'de> for PlayRepeat {
 pub enum PlayMediaSource {
     /// A path on the engine host.
     File { path: String },
-    /// Raw audio bytes carried inline.
+    /// Raw audio bytes carried inline, at most [`MAX_PLAY_BLOB_LEN`].
+    ///
+    /// Sent as a base64 string under `data_base64` (RFC 4648 §4). Received from either that or the
+    /// earlier `data` array of decimal byte values, which took roughly 3.5 characters per byte and
+    /// so capped a blob near 300 KB. The key changed along with the encoding so that an engine which
+    /// only knows `data` refuses the request outright rather than playing the base64 text as audio.
     Blob {
-        #[serde(with = "serde_bytes")]
+        #[serde(rename = "data_base64", alias = "data", with = "base64::blob_data")]
         data: Vec<u8>,
     },
     /// A prompt id in the engine's media database.
@@ -2098,7 +2110,12 @@ pub enum ProtoError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     /// A frame's declared length exceeds [`MAX_FRAME_LEN`].
-    #[error("frame length {len} exceeds maximum {max}")]
+    #[error(
+        "control frame of {len} bytes exceeds the {max}-byte maximum; a play_media blob is the only \
+         payload that large, and must stay under {} bytes of audio — play longer audio by file path \
+         or http url",
+        MAX_PLAY_BLOB_LEN
+    )]
     FrameTooLarge { len: usize, max: usize },
 }
 
@@ -2156,6 +2173,7 @@ pub mod frame {
     }
 }
 
+mod base64;
 pub mod vq_rtcpxr;
 
 #[cfg(test)]
@@ -2832,6 +2850,88 @@ mod tests {
             serde_json::from_str::<OldEvent>(&wire).expect("decode"),
             OldEvent::Unknown
         ));
+    }
+
+    /// A blob as the controller receives it back from the wire, via the play request that carries it.
+    fn blob_request(data: Vec<u8>) -> Request {
+        serde_json::from_value(serde_json::json!({
+            "id": u64::MAX,
+            "command": "play_media",
+            "call_id": "b2b-00000000-0000-0000-0000-000000000000",
+            "from_tag": "0123456789abcdef0123456789abcdef",
+            "source": { "source": "blob", "data_base64": base64::encode(&data) },
+        }))
+        .expect("a blob request parses")
+    }
+
+    #[test]
+    fn a_blob_goes_out_as_base64_under_its_own_key() {
+        let source = PlayMediaSource::Blob {
+            data: b"RIFF\x00\xff".to_vec(),
+        };
+        let value = serde_json::to_value(&source).expect("to_value");
+        assert_eq!(value["source"], "blob");
+        assert_eq!(value["data_base64"], "UklGRgD/");
+        assert!(
+            value.get("data").is_none(),
+            "an engine that only knows `data` must refuse it, not play base64 text as audio"
+        );
+        assert_eq!(
+            serde_json::from_value::<PlayMediaSource>(value).expect("roundtrip"),
+            source
+        );
+    }
+
+    #[test]
+    fn a_blob_in_the_earlier_array_form_is_still_read() {
+        let source: PlayMediaSource =
+            serde_json::from_str(r#"{"source":"blob","data":[82,73,70,70,0,255]}"#)
+                .expect("the earlier form parses");
+        assert_eq!(
+            source,
+            PlayMediaSource::Blob {
+                data: b"RIFF\x00\xff".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn a_corrupt_base64_blob_is_refused_with_the_reason() {
+        let error = serde_json::from_str::<PlayMediaSource>(
+            r#"{"source":"blob","data_base64":"UklG%gD/"}"#,
+        )
+        .expect_err("not base64");
+        assert!(error.to_string().contains("base64"), "{error}");
+    }
+
+    #[test]
+    fn the_largest_blob_fits_one_frame_and_the_next_size_up_names_the_bound() {
+        let fits = blob_request(vec![0xa5; MAX_PLAY_BLOB_LEN]);
+        let encoded = frame::encode(&fits).expect("the documented maximum fits a frame");
+        assert!(encoded.len() <= frame::HEADER_LEN + MAX_FRAME_LEN);
+        let (decoded, _) = frame::decode::<Request>(&encoded)
+            .expect("decode")
+            .expect("a whole frame");
+        assert_eq!(decoded, fits);
+
+        // Well past the budget: the refusal says what is too large and what to do instead.
+        let too_large = blob_request(vec![0xa5; MAX_PLAY_BLOB_LEN + 4096]);
+        let error = frame::encode(&too_large).expect_err("over the frame");
+        let message = error.to_string();
+        assert!(message.contains("play_media blob"), "{message}");
+        assert!(
+            message.contains(&MAX_PLAY_BLOB_LEN.to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_blob_that_did_not_fit_as_an_array_fits_as_base64() {
+        // Half a megabyte of audio — about 31 s of G.711 — was beyond the array encoding.
+        let half_megabyte: Vec<u8> = (0..512 * 1024).map(|index| (index % 251) as u8).collect();
+        let legacy = serde_json::json!({ "source": "blob", "data": half_megabyte });
+        assert!(serde_json::to_vec(&legacy).expect("json").len() > MAX_FRAME_LEN);
+        assert!(frame::encode(&blob_request(half_megabyte)).is_ok());
     }
 
     #[test]
