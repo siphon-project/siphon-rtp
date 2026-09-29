@@ -248,6 +248,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         role: ConferenceRole,
         profile: &ProfileFlags,
     ) -> CmdResult {
+        if let Err(reason) = super::validate_sip_call_id(profile) {
+            return error_result("conference_join", &reason);
+        }
         let info = match sdp::parse(sdp) {
             Ok(info) => info,
             Err(error) => return error_result("conference_join: SDP parse", &error),
@@ -467,6 +470,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             secure,
             text: text_config,
             routing: routing_of(role),
+            telemetry: crate::conference::SeatTelemetry {
+                local: Some(endpoint.local_addr),
+                sip_call_id: profile.sip_call_id.clone(),
+            },
         };
         let events = self.event_sink(client);
         let joined_tick = self.datapath.now_ticks();

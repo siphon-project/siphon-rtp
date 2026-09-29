@@ -442,6 +442,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             rtp_in: rtp_in_tx,
             bridge_task,
             drain_task,
+            // The leg's own engine address is the capture's destination: a takeover leg
+            // terminates the caller's RTCP instead of relaying it anywhere.
+            rtcp_tap: self.datapath.rtcp_tap().zip(
+                self.owned_call_internal(call_id, |call| {
+                    std::iter::once(call.near)
+                        .chain(call.far)
+                        .find(|leg| leg.rtp.id == endpoint_a)
+                        .map(|leg| leg.rtp.local_addr)
+                })
+                .flatten(),
+            ),
         });
         self.ws_bridges.insert(
             call_id.to_string(),

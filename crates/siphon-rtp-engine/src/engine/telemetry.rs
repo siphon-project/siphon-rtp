@@ -177,7 +177,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     fn sip_call_id_for_endpoint(&self, endpoint: EndpointId) -> Option<String> {
         use crate::ha::EndpointRole;
         let call_id = self.call_for_endpoint(endpoint)?;
-        let call = self.calls.get(&call_id)?;
+        // A conference seat is a dialog of its own, named when it joined.
+        let Some(call) = self.calls.get(&call_id) else {
+            return self.conference.seat_telemetry(endpoint)?.0;
+        };
         match call.endpoint_role(endpoint) {
             Some(EndpointRole::FarRtp | EndpointRole::FarRtcp) if !call.is_single_leg() => {
                 call.far_sip_call_id.clone()
@@ -213,7 +216,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return fallback;
         };
         let Some(call) = self.calls.get(&call_id) else {
-            return fallback;
+            return self
+                .conference
+                .seat_telemetry(endpoint)
+                .map_or(fallback, |(_, codec)| codec);
         };
         let codec = match call.endpoint_role(endpoint) {
             Some(EndpointRole::FarRtp | EndpointRole::FarRtcp) => call.far_codec.as_ref(),

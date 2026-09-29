@@ -38,6 +38,10 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **Conference seats and WebSocket takeover legs export their RTCP.** They terminate RTCP rather
+  than relay it, so they never reached the export. Each now publishes the RTCP it receives (a secure
+  takeover leg's SRTCP decrypted), and a seat's captures are filed under the `sip_call_id` it named on
+  `conference_join`, which is now validated like the offer's.
 - **X3 loss is reported when delivery reconnects.** Content dropped while the Mediation Function was
   unreachable was reported only on the first loss-report tick of the connection that ended the
   outage, up to five seconds after it came back. It is now reported as the connection comes up.
