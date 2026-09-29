@@ -192,7 +192,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             | PipelineKind::SrtpMedia
             | PipelineKind::SrtpTranscryptMedia
             | PipelineKind::SrtpOffererMedia
-            | PipelineKind::DtlsMedia => {
+            | PipelineKind::DtlsMedia
+            | PipelineKind::DtlsOffererMedia => {
                 self.hold_in_userspace(call_id, PromotionReason::X3, PromoteMode::RelayOnly)
                     .await?;
                 if !self

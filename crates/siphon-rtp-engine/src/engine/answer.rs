@@ -1003,14 +1003,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
         };
-        // A secure offerer is terminated only in the crypto-bridge shape, and a terminated DTLS
-        // offerer is answered as A's DTLS peer (see `settle_secure_offerer`).
+        // A secure offerer is terminated only where a pipeline carries its keying, and a terminated
+        // DTLS offerer is answered as A's DTLS peer (see `settle_secure_offerer`).
         let near_dtls_settled = match settle_secure_offerer(
             pipeline,
             (near_local_crypto.is_some(), near_dtls.as_ref()),
             far_dtls || far_local_crypto.is_some(),
-            near_codec.as_ref(),
-            &info,
             (reversed.is_some(), profile, self.engine_fingerprint()),
         ) {
             Ok(settled) => settled,

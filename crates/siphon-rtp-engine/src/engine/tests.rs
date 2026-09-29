@@ -13605,9 +13605,10 @@ async fn a_dtls_offerer_toward_a_secure_callee_is_refused() {
 }
 
 #[tokio::test]
-async fn a_dtls_offerer_needing_decoded_audio_is_refused() {
-    // Only the crypto-bridge shape is wired for a DTLS caller. Anything that needs the decoded audio
-    // (recording here, a codec the caller did not offer below) is refused, never relayed in the clear.
+async fn a_dtls_offerer_needing_decoded_audio_is_carried_by_the_media_pipeline() {
+    // Recording a WebRTC caller used to be refused (`secure-offerer-unsupported`): the only shape
+    // wired for a DTLS caller was the crypto bridge, which never decodes. The transcode twin carries
+    // it now, and the call runs through a media actor that owns the recording.
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_phone_a, addr_a) = phone().await;
     let (_phone_b, addr_b) = phone().await;
@@ -13634,18 +13635,47 @@ async fn a_dtls_offerer_needing_decoded_audio_is_refused() {
             },
         )
         .await;
-    match answer {
-        CmdResult::Error { reason } => assert!(
-            reason.contains("secure-offerer-unsupported"),
-            "recording: {reason}"
-        ),
-        other => panic!("recording: expected a refusal, got {other:?}"),
-    }
+    assert!(
+        matches!(answer, CmdResult::Ok { .. }),
+        "recording: {answer:?}"
+    );
+    let answered = sdp::parse(&ok_sdp_text(&answer)).expect("answer sdp");
+    assert!(answered.dtls, "A is still answered as a DTLS peer");
+    assert_eq!(answered.fingerprint, engine.engine_fingerprint());
+    assert!(engine.media().is_media_call("dtls-record"));
+    assert_eq!(
+        engine.calls.get("dtls-record").map(|call| call.pipeline),
+        Some(PipelineKind::DtlsOffererMedia)
+    );
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dtls_offerer_is_transcoded_to_a_plain_callee_on_a_different_codec() {
+    // The mirror of the DTLS-far transcode: a WebRTC caller offering PCMU toward a plain PCMA
+    // callee. Nothing crosses in either direction before the handshake keys the caller's side, and
+    // after it each party hears its own codec — which is what proves a transcode ran.
+    use crate::srtp_bridge::run_redirect_dispatcher;
     let engine = Engine::new(UdpLoopbackDatapath::new());
-    offer_from_a(
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let phone_a = Arc::new(
+        UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a"),
+    );
+    let addr_a = phone_a.local_addr().expect("addr a");
+    let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+
+    let offered = offer_from_a(
         &engine,
-        "dtls-transcode",
+        "dtls-offerer-transcode",
         dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
         ProfileFlags {
             transport_protocol: Some("RTP/AVP".into()),
@@ -13654,11 +13684,12 @@ async fn a_dtls_offerer_needing_decoded_audio_is_refused() {
         },
     )
     .await;
+    let engine_far = offered.remote_rtp;
     let answer = engine
         .handle(
             CLIENT,
             Command::Answer {
-                call_id: "dtls-transcode".into(),
+                call_id: "dtls-offerer-transcode".into(),
                 from_tag: "a".into(),
                 to_tag: "b".into(),
                 sdp: sdp_single_codec(addr_b, 8, "PCMA"),
@@ -13666,13 +13697,99 @@ async fn a_dtls_offerer_needing_decoded_audio_is_refused() {
             },
         )
         .await;
-    match answer {
-        CmdResult::Error { reason } => assert!(
-            reason.contains("secure-offerer-unsupported"),
-            "transcode: {reason}"
-        ),
-        other => panic!("transcode: expected a refusal, got {other:?}"),
+    assert!(matches!(answer, CmdResult::Ok { .. }), "answer: {answer:?}");
+    let answered = sdp::parse(&ok_sdp_text(&answer)).expect("answer sdp");
+    let engine_near = answered.remote_rtp;
+    let engine_fingerprint = answered.fingerprint.clone().expect("engine fingerprint");
+    assert_eq!(answered.setup, Some(sdp::Setup::Active));
+    assert!(engine.media().is_media_call("dtls-offerer-transcode"));
+
+    // Unkeyed: B's audio must not reach A in the clear, and nothing A sends is decoded.
+    let mut buffer = [0u8; 2048];
+    for sequence in 0..5u16 {
+        phone_b
+            .send_to(&g711_rtp(8, sequence, 0x0B0B_0B0B, 0xD5), engine_far)
+            .await
+            .expect("b send");
     }
+    for _ in 0..3 {
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(100), phone_a.recv_from(&mut buffer)).await
+        {
+            assert!(
+                !(128..=191).contains(&buffer[0]),
+                "{len} bytes of RTP reached the unkeyed DTLS caller"
+            );
+        }
+    }
+    for sequence in 0..5u16 {
+        phone_a
+            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), engine_near)
+            .await
+            .expect("a send");
+    }
+    assert!(
+        timeout(Duration::from_millis(300), phone_b.recv_from(&mut buffer))
+            .await
+            .is_err(),
+        "nothing from an unkeyed caller reaches the callee"
+    );
+
+    // The engine answered `active`, so the caller is the DTLS server.
+    let mut caller_leg = peer_dtls_handshake_server(
+        phone_a.clone(),
+        addr_a,
+        engine_near,
+        &caller,
+        &engine_fingerprint,
+    )
+    .await;
+
+    // A → B: SRTP PCMU in, plaintext PCMA out.
+    let mut to_b = None;
+    for sequence in 10..60u16 {
+        let mut sealed = Vec::new();
+        caller_leg
+            .protect(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), &mut sealed)
+            .expect("A protects");
+        phone_a.send_to(&sealed, engine_near).await.expect("a send");
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(150), phone_b.recv_from(&mut buffer)).await
+        {
+            to_b = Some(buffer[..len].to_vec());
+            break;
+        }
+    }
+    let to_b = to_b.expect("B receives A's media, decrypted and transcoded");
+    assert_eq!(
+        to_b[1] & 0x7f,
+        8,
+        "A's PCMU arrives at B as PCMA, in the clear"
+    );
+
+    // B → A: plaintext PCMA in, SRTP PCMU out.
+    let mut to_a = None;
+    for sequence in 100..150u16 {
+        phone_b
+            .send_to(&g711_rtp(8, sequence, 0x0B0B_0B0B, 0xD5), engine_far)
+            .await
+            .expect("b send");
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+        {
+            let mut plain = Vec::new();
+            if caller_leg.unprotect(&buffer[..len], &mut plain).is_ok() {
+                to_a = Some(plain);
+                break;
+            }
+        }
+    }
+    let to_a = to_a.expect("A decrypts B's media");
+    assert_eq!(
+        to_a[1] & 0x7f,
+        0,
+        "B's PCMA arrives at A as PCMU, encrypted"
+    );
 }
 
 #[tokio::test]

@@ -232,17 +232,15 @@ impl NearDtlsAnswer {
 }
 
 /// The secure-offerer checks an answer runs once its pipeline is resolved. A secure offerer (SDES or
-/// DTLS) is terminated only in the crypto-bridge shape. Every other combination would have to thread
-/// A's `SecureLeg` onto the A-facing directions of the media actor, and until that exists the honest
-/// answer is a refusal, not a call that answers `ok` and relays A's audio somewhere it should not go.
-/// `resolve_pipeline` already picked the shape, so this reads its verdict rather than re-deriving the
-/// conditions. A terminated DTLS offerer then has its association settled ([`near_dtls_answer`]).
+/// DTLS) is terminated only by a pipeline that carries its keying: an offerer bridge, a transcrypt,
+/// or the transcode twin of either. Anything else is refused, not answered `ok` with A's audio
+/// relayed somewhere it should not go. `resolve_pipeline` already picked the shape, so this reads its
+/// verdict rather than re-deriving the conditions. A terminated DTLS offerer then has its association
+/// settled ([`near_dtls_answer`]).
 pub(super) fn settle_secure_offerer(
     pipeline: super::PipelineKind,
     (near_sdes, near_dtls): (bool, Option<&super::NearDtls>),
     far_secure: bool,
-    near_codec: Option<&CodecSpec>,
-    info: &sdp::MediaInfo,
     (reversed, profile, engine_fingerprint): (bool, &ProfileFlags, Option<sdp::Fingerprint>),
 ) -> Result<Option<NearDtlsAnswer>, Box<siphon_rtp_proto::CmdResult>> {
     let near_sdes_carried = matches!(
@@ -253,35 +251,26 @@ pub(super) fn settle_secure_offerer(
             | super::PipelineKind::SrtpTranscryptMedia
     );
     if (near_sdes && !near_sdes_carried)
-        || (near_dtls.is_some() && pipeline != super::PipelineKind::DtlsOfferer)
+        || (near_dtls.is_some()
+            && !matches!(
+                pipeline,
+                super::PipelineKind::DtlsOfferer | super::PipelineKind::DtlsOffererMedia
+            ))
     {
-        let codecs_differ = matches!(
-            (near_codec, info.primary_codec()),
-            (Some(near), Some(far)) if !same_codec(near, &far)
-        );
         // Naming the *actual* obstacle matters here, because neither "both parties are secure" nor
         // "the call needs the audio decoded" is one any more: an SDES↔SDES pair is carried by
-        // `SrtpTranscrypt` when it can be relayed and by `SrtpTranscryptMedia` when it must be
-        // decoded, and neither reaches this refusal. What is left is a DTLS offerer facing a secure
-        // callee — two keying mechanisms rather than two keys — and a *DTLS* offerer whose call
-        // needs the audio decoded, which `DtlsOfferer` has no transcode twin for.
-        let why = if near_dtls.is_some() && far_secure {
-            "both parties are secure and one is keyed by DTLS, which needs a transcrypt between two \
-             keying mechanisms rather than between two keys"
-        } else if codecs_differ {
-            "the two legs' codecs differ, and a DTLS-SRTP caller's leg cannot be threaded into the \
-             transcoding pipeline yet"
-        } else {
-            "the call needs the decoded audio (recording, noise suppression, echo cancellation, \
-             beep detection or a WebSocket tee), and a DTLS-SRTP caller's leg cannot be threaded \
-             into the media pipeline yet"
-        };
+        // `SrtpTranscrypt` or its transcode twin, and a secure caller toward a plain callee by an
+        // offerer bridge or its transcode twin, whichever keying it used. What is left is two keying
+        // *mechanisms* on one call — a DTLS party facing an SDES or DTLS one — which needs a
+        // transcrypt between a handshake and a key, and nothing carries that.
+        let why = "both parties are secure and one is keyed by DTLS, which needs a transcrypt \
+                   between two keying mechanisms rather than between two keys";
         let supported = if far_secure {
             "two SDES parties are bridged as a transcrypt, and transcoded as one where the call \
              needs the decoded audio"
         } else {
-            "an SDES-SRTP caller toward a plain callee is bridged, or transcoded where the call \
-             needs the decoded audio; a DTLS-SRTP caller is bridged on a shared codec"
+            "a secure caller toward a plain callee is bridged, or transcoded where the call needs \
+             the decoded audio"
         };
         return Err(Box::new(siphon_rtp_proto::CmdResult::Error {
             reason: format!("answer: secure-offerer-unsupported: {why}; {supported}"),
@@ -1083,11 +1072,15 @@ pub(super) fn resolve_pipeline_kind(
     // and holds no media actor to fan out from), so a bridge chosen here is a tee refused there. The
     // plain arm at the bottom therefore tests `decodes_for_the_whole_call`, every other arm this.
     let needs_decoded_audio = decodes_for_the_whole_call || profile.ws_tee.is_some();
-    // A terminated DTLS-SRTP **offerer** toward a plain callee: the mirror of the DTLS far leg below,
-    // and like `SrtpOfferer` only in its crypto-bridge shape. Anything that needs the decoded audio
-    // falls through to a pipeline with no A-facing DTLS leg, which the caller then refuses.
-    if near_dtls && far_local_crypto.is_none() && !far_dtls && !needs_decoded_audio {
-        return PipelineKind::DtlsOfferer;
+    // A terminated DTLS-SRTP **offerer** toward a plain callee: the mirror of the DTLS far leg below.
+    // The bridge when nothing needs the decoded audio; the transcode twin, which keys the caller's
+    // directions of the media actor from the handshake, when something does.
+    if near_dtls && far_local_crypto.is_none() && !far_dtls {
+        return if needs_decoded_audio {
+            PipelineKind::DtlsOffererMedia
+        } else {
+            PipelineKind::DtlsOfferer
+        };
     }
     if far_dtls {
         // DTLS-SRTP far leg. Route it through the media pipeline when something actually needs the
