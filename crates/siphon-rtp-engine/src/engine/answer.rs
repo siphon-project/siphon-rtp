@@ -630,6 +630,16 @@ struct AnswerRecord<'a> {
     /// A terminated DTLS offerer's settled association: the role the engine answered A with and the
     /// `a=tls-id` it assigned, kept so a renegotiation re-presents both (RFC 8842 §5.3, §5.5).
     near_dtls: Option<(DtlsRole, Option<String>)>,
+    /// The answering party's SIP `Call-ID` and which leg that party is on: the far leg, or the near
+    /// leg when A answers a re-offer from B.
+    answerer_sip_call_id: Option<(super::Party, &'a str)>,
+}
+
+/// The answering party's SIP `Call-ID` and the leg it belongs to: the far leg for B's answer, the
+/// near leg when A answers a re-offer from B (`reversed`).
+fn answerer_sip_call_id(profile: &ProfileFlags, reversed: bool) -> Option<(Party, &str)> {
+    let party = if reversed { Party::Near } else { Party::Far };
+    profile.sip_call_id.as_deref().map(|id| (party, id))
 }
 
 /// Media-plane lifecycle: negotiation is complete — the call now relays or transcodes. The
@@ -795,9 +805,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_dtls,
             dtls_role,
             near_dtls,
+            answerer_sip_call_id,
         } = record;
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.to_tag = Some(to_tag.to_string());
+            match answerer_sip_call_id {
+                Some((Party::Near, id)) => call.near_sip_call_id = Some(id.to_string()),
+                Some((Party::Far, id)) => call.far_sip_call_id = Some(id.to_string()),
+                None => {}
+            }
             // The far leg is present — this path ran only because the guard above unwrapped it.
             if let Some(far) = call.far.as_mut() {
                 far.remote_rtp = Some(info.remote_rtp);
@@ -1223,6 +1239,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_dtls,
                 dtls_role,
                 near_dtls: near_dtls_settled.map(NearDtlsAnswer::recorded),
+                answerer_sip_call_id: answerer_sip_call_id(profile, reversed.is_some()),
             },
         );
 

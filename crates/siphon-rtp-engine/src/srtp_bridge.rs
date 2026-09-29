@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
-use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_datapath::{Datapath, EndpointId, ObservedRtcp, RxPacket, SourceFilter};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use crate::dtls_bridge::DtlsBridge;
@@ -577,6 +577,17 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             .latched
             .get(&out_endpoint)
             .map_or(out_dst, |latched| *latched);
+        // Telemetry: the plaintext RTCP either party sent. A bridged leg never passes the datapath's
+        // relay tap, so this is the only place its reports can be exported from.
+        if siphon_rtp_srtp::leg::is_rtcp(plaintext) {
+            ObservedRtcp::offer(
+                self.datapath.rtcp_tap().as_ref(),
+                packet.endpoint,
+                packet.source,
+                destination,
+                plaintext,
+            );
+        }
         if let Err(error) = self.datapath.send(out_endpoint, destination, out).await {
             tracing::debug!(%error, "bridge forward send failed");
         }

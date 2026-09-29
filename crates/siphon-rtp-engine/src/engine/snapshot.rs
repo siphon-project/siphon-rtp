@@ -591,6 +591,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_telephone_event: None,
                 pipeline: media.pipeline,
                 fax_passthrough: snapshot.fax_passthrough,
+                near_sip_call_id: snapshot.near_sip_call_id.clone(),
+                far_sip_call_id: snapshot.far_sip_call_id.clone(),
                 relay_flows: media.relay_flows,
                 promotion_reasons: HashSet::new(),
                 // The source gate is reconstructed from the snapshot's per-flow `accepted_source`

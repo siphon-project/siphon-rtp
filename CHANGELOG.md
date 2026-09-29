@@ -60,6 +60,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   that an older engine refuses a new controller's blob instead of playing base64 text as audio. An
   oversized frame's error now names the blob bound and the alternatives. The proto crate drops its
   `serde_bytes` dependency.
+- **Exported RTCP is filed under each leg's SIP Call-ID.** HEP captures were correlated by the
+  engine `call_id`, which a controller mints for the media session and which matches neither leg's
+  dialog, so no collector could put a call's RTCP next to its signalling. The new
+  `ProfileFlags::sip_call_id` (on the offer for the offerer's leg, on the answer for the answerer's)
+  is now the correlation id of every capture for that leg, and survives an HA failover. Unset, the
+  engine `call_id` is used as before.
+- **RTCP is exported from every leg the engine carries in userspace.** Only the plain relay was
+  tapped, so SDES and DTLS-SRTP bridges, secure and plain transcodes and locally answered legs
+  exported no RTCP at all. Each now publishes the RTCP it receives, decrypted, through the new
+  `Datapath::rtcp_tap`.
 
 ## [0.9.1] — 2026-09-27
 

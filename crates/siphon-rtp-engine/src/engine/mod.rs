@@ -41,6 +41,8 @@ mod teardown;
 mod tee;
 mod telemetry;
 
+pub(crate) use telemetry::validate_sip_call_id;
+
 use dashmap::DashMap;
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, EndpointId, FlowAction};
@@ -486,6 +488,11 @@ struct Call {
     /// lives. Verbatim-relay promotions (pcap recording, DTMF block, X3) are unaffected — they never
     /// decode.
     fax_passthrough: bool,
+    /// The SIP `Call-ID` of the offerer's dialog (`ProfileFlags::sip_call_id` on the offer), which
+    /// correlates the near leg's HEP captures. `None` falls back to the engine `call_id`.
+    near_sip_call_id: Option<String>,
+    /// The answerer's twin of [`Self::near_sip_call_id`], from the answer.
+    far_sip_call_id: Option<String>,
     /// For a passthrough relay, the forward actions installed at answer — kept so `block`/`unblock`
     /// can flip the endpoints to `Drop` and restore them. Empty for media/SRTP calls.
     relay_flows: Vec<(EndpointId, FlowAction)>,
@@ -831,6 +838,8 @@ impl Call {
             to_tag: self.to_tag.clone(),
             pipeline: pipeline_snapshot(self.pipeline),
             fax_passthrough: self.fax_passthrough,
+            near_sip_call_id: self.near_sip_call_id.clone(),
+            far_sip_call_id: self.far_sip_call_id.clone(),
             ice: self.ice.as_ref().map(|ice| ha::IceSnapshot {
                 ufrag: ice.ufrag.clone(),
                 pwd: ice.pwd.clone(),

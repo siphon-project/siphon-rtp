@@ -26793,3 +26793,241 @@ async fn an_anchored_legs_gate_refusals_reach_the_call_summary() {
         .expect("CallSummary emitted on delete");
     assert_eq!(legs[0].packets_dropped, 5);
 }
+
+/// Read HEP captures off `collector` until one carries `payload`, and return it.
+async fn hep_capture_carrying(collector: &UdpSocket, payload: &[u8]) -> Vec<u8> {
+    let mut buffer = [0u8; 2048];
+    loop {
+        let (len, _) = timeout(Duration::from_secs(2), collector.recv_from(&mut buffer))
+            .await
+            .expect("a HEP capture carrying the RTCP arrives")
+            .expect("recv hep");
+        if contains_bytes(&buffer[..len], payload) {
+            return buffer[..len].to_vec();
+        }
+    }
+}
+
+/// An engine exporting to a loopback collector, with the RTCP export task running and its tap on.
+async fn hep_exporting_engine() -> (Arc<Engine<UdpLoopbackDatapath>>, UdpSocket) {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let collector = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let exporter = HepExporter::connect(collector.local_addr().expect("addr"))
+        .await
+        .expect("connect");
+    engine.set_hep_export(exporter, 7);
+    tokio::spawn(engine.clone().run_rtcp_export());
+    for _ in 0..50 {
+        if engine.datapath().rtcp_tap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    (engine, collector)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_legs_rtcp_is_exported_under_its_own_sip_call_id() {
+    // A B2BUA's two legs are two dialogs with two Call-IDs, and neither is the engine's call id. Each
+    // leg's RTCP is filed under the Call-ID the controller named for it, so a collector can put the
+    // media next to the signalling it belongs to.
+    let (engine, collector) = hep_exporting_engine().await;
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "engine-media-7".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags {
+                    sip_call_id: Some("7f3e0a1c-a-leg".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let far = sdp::parse(&ok_sdp_text(&offer)).expect("far");
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "engine-media-7".into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp: sdp_for(addr_b, true),
+                profile: ProfileFlags {
+                    sip_call_id: Some("91c2b4d0-b-leg".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
+
+    let from_a = rtcp_sr(0x0A0A_0A0A);
+    phone_a
+        .send_to(&from_a, near.remote_rtp)
+        .await
+        .expect("send a");
+    let capture = hep_capture_carrying(&collector, &from_a).await;
+    assert!(contains_bytes(&capture, b"7f3e0a1c-a-leg"), "A's dialog");
+    assert!(
+        !contains_bytes(&capture, b"engine-media-7"),
+        "not the media id"
+    );
+
+    let from_b = rtcp_sr(0x0B0B_0B0B);
+    phone_b
+        .send_to(&from_b, far.remote_rtp)
+        .await
+        .expect("send b");
+    let capture = hep_capture_carrying(&collector, &from_b).await;
+    assert!(contains_bytes(&capture, b"91c2b4d0-b-leg"), "B's dialog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bridged_legs_srtcp_is_exported_decrypted() {
+    // An SDES-SRTP leg is carried by the bridge, which the datapath's relay tap never sees. The
+    // bridge publishes the RTCP it decrypted, so the leg's reports reach the collector as plaintext.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::srtcp::SrtcpContext;
+    let (engine, collector) = hep_exporting_engine().await;
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "bridged-rtcp".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let far_addr = sdp::parse(&ok_sdp_text(&offer)).expect("far").remote_rtp;
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "bridged-rtcp".into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: ProfileFlags {
+                    sip_call_id: Some("91c2b4d0-b-leg".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    assert_eq!(
+        engine.calls.get("bridged-rtcp").expect("call").pipeline,
+        PipelineKind::Srtp
+    );
+
+    let report = rtcp_sr(0x0B0B_0B0B);
+    let mut sealed = Vec::new();
+    SrtcpContext::from_key_material(&callee_key.key)
+        .protect(&report, &mut sealed)
+        .expect("B encrypts SRTCP");
+    phone_b.send_to(&sealed, far_addr).await.expect("send b");
+    let capture = hep_capture_carrying(&collector, &report).await;
+    assert!(contains_bytes(&capture, b"91c2b4d0-b-leg"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_locally_answered_legs_rtcp_is_exported() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let (engine, collector) = hep_exporting_engine().await;
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "anchored-rtcp".into(),
+                from_tag: "a".into(),
+                sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                profile: ProfileFlags {
+                    sip_call_id: Some("7f3e0a1c-a-leg".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let engine_addr = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer SDP")
+        .remote_rtp;
+    let report = rtcp_sr(0x0A0A_0A0A);
+    phone_a.send_to(&report, engine_addr).await.expect("send");
+    let capture = hep_capture_carrying(&collector, &report).await;
+    assert!(contains_bytes(&capture, b"7f3e0a1c-a-leg"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sip_call_id_that_cannot_be_one_is_refused() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    for bad in ["", "has space", "line\r\nbreak"] {
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "bad-sip-call-id".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        sip_call_id: Some(bad.into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        match result {
+            CmdResult::Error { reason } => assert!(reason.contains("sip_call_id"), "{reason}"),
+            other => panic!("{bad:?} accepted: {other:?}"),
+        }
+    }
+    let too_long = "x".repeat(siphon_rtp_proto::MAX_SIP_CALL_ID_LEN + 1);
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "bad-sip-call-id".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags {
+                    sip_call_id: Some(too_long),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    assert!(matches!(result, CmdResult::Error { .. }), "{result:?}");
+    assert!(!engine.calls.contains_key("bad-sip-call-id"));
+}

@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use siphon_rtp_datapath::{classify, Datapath, EndpointId, PacketClass, RxPacket, SourceFilter};
+use siphon_rtp_datapath::{
+    classify, Datapath, EndpointId, ObservedRtcp, PacketClass, RxPacket, SourceFilter,
+};
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint};
 use siphon_rtp_srtp::leg::{is_rtcp, PacketKind, SecureLeg};
 use tokio::task::JoinHandle;
@@ -947,6 +949,17 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             if kind != PacketKind::Rtcp {
                 let _ = tap.try_send(bytes::Bytes::copy_from_slice(plaintext));
             }
+        }
+        // Telemetry: the plaintext RTCP either party sent, which the datapath's relay tap never sees
+        // on a bridged leg.
+        if kind == PacketKind::Rtcp {
+            ObservedRtcp::offer(
+                self.datapath.rtcp_tap().as_ref(),
+                packet.endpoint,
+                packet.source,
+                out_dst,
+                plaintext,
+            );
         }
 
         if let Err(error) = self.datapath.send(out_endpoint, out_dst, &out).await {

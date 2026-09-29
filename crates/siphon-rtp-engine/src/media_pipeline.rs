@@ -28,7 +28,9 @@ use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use siphon_rtp_codec::cn::{Cn, COMFORT_NOISE_LEVEL_DBOV};
 use siphon_rtp_codec::{Decoder, Encoder};
-use siphon_rtp_datapath::{rtp_media_ssrc, Datapath, EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_datapath::{
+    rtp_media_ssrc, Datapath, EndpointId, ObservedRtcp, RxPacket, SourceFilter,
+};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_dsp::{EchoCanceller, NoiseSuppressor, RecordToneDetector, ToneOutcome};
 use siphon_rtp_media::dtmf::{DtmfDetector, DtmfSequence, DtmfStep};
@@ -264,6 +266,7 @@ pub(crate) fn validate_echo_delay_search_ms(profile: &ProfileFlags) -> Result<()
 /// The reason string, ready to return as a `CmdResult::Error`.
 pub(crate) fn validate_profile(profile: &ProfileFlags) -> Result<(), String> {
     validate_echo_delay_search_ms(profile)?;
+    crate::engine::validate_sip_call_id(profile)?;
     validate_fax_passthrough(profile)
 }
 
@@ -686,6 +689,9 @@ pub struct Direction {
     source_latch: SymmetricLatch,
     /// Which refusals of this direction's ingress have already been logged at `warn`.
     refusals: RefusalLog,
+    /// The telemetry tap for this direction's received RTCP ([`Datapath::rtcp_tap`]), set when the
+    /// call is registered. `None` while nothing exports RTCP.
+    rtcp_tap: Option<flume::Sender<ObservedRtcp>>,
     /// The endpoint to transmit from (the receiving party's engine socket).
     egress_endpoint: EndpointId,
     /// Where to transmit (the receiving party's address; latched to its observed source).
@@ -1189,6 +1195,8 @@ pub struct RtcpRelay {
     secure_pending: Option<SecureSide>,
     /// Which refusals of this relay's ingress have already been logged at `warn`.
     refusals: RefusalLog,
+    /// The telemetry tap for the RTCP this relay decrypts, as on [`Direction`].
+    rtcp_tap: Option<flume::Sender<ObservedRtcp>>,
 }
 
 /// Which side of a relay an as-yet-undelivered DTLS key will be installed on.
@@ -1218,6 +1226,7 @@ impl RtcpRelay {
             secure_egress: None,
             secure_pending: None,
             refusals: RefusalLog::default(),
+            rtcp_tap: None,
         }
     }
 
@@ -1295,6 +1304,13 @@ impl RtcpRelay {
         } else {
             data
         };
+        ObservedRtcp::offer(
+            self.rtcp_tap.as_ref(),
+            self.ingress_endpoint,
+            source,
+            self.egress_dst,
+            plaintext,
+        );
         let encrypted;
         let payload: &[u8] = if let Some(leg) = &self.secure_egress {
             let mut buffer = Vec::new();
@@ -1461,6 +1477,7 @@ impl Direction {
             accepted_source: config.accepted_source,
             source_latch: SymmetricLatch::default(),
             refusals: RefusalLog::default(),
+            rtcp_tap: None,
             egress_endpoint: config.egress_endpoint,
             egress_dst: config.egress_dst,
             relay_only: false,
@@ -1537,6 +1554,7 @@ impl Direction {
             accepted_source: config.accepted_source,
             source_latch: SymmetricLatch::default(),
             refusals: RefusalLog::default(),
+            rtcp_tap: None,
             egress_endpoint: config.egress_endpoint,
             egress_dst: config.egress_dst,
             relay_only: true,
@@ -2067,6 +2085,19 @@ impl Direction {
         // declares payload format 8, "RTP packet").
         if let Some(x3) = &self.x3 {
             x3.deliver(source, arrival_micros, data);
+        }
+
+        // Telemetry: the party's RTCP, as plaintext, for the HEP export. A leg carried here never
+        // passes the datapath's own relay tap, so without this a secure, transcoded or locally
+        // answered leg would export no RTCP at all. Accepted packets only, like the relay tap.
+        if (64..=95).contains(&(data[1] & 0x7f)) {
+            ObservedRtcp::offer(
+                self.rtcp_tap.as_ref(),
+                self.ingress_endpoint,
+                source,
+                self.egress_dst,
+                data,
+            );
         }
 
         // Relay-only (promoted passthrough): forward the ingress RTP verbatim to the peer — no
@@ -2977,6 +3008,15 @@ impl MediaCall {
     /// Whether this is a relay-only call (a promoted passthrough leg, no transcode). Lets the engine
     /// keep its media-only guards (silence / play / DTMF require a transcoding call) correct after a
     /// passthrough call is promoted for SIPREC.
+    /// Attach the telemetry tap every ingress of this call publishes its received RTCP to.
+    fn set_rtcp_tap(&mut self, tap: Option<flume::Sender<ObservedRtcp>>) {
+        for relay in &mut self.rtcp {
+            relay.rtcp_tap.clone_from(&tap);
+        }
+        self.a_to_b.rtcp_tap.clone_from(&tap);
+        self.b_to_a.rtcp_tap = tap;
+    }
+
     #[must_use]
     pub fn is_relay_only(&self) -> bool {
         self.a_to_b.relay_only && self.b_to_a.relay_only
@@ -4058,6 +4098,8 @@ impl MediaRegistry {
     where
         D: Datapath + Clone + Send + 'static,
     {
+        let mut call = call;
+        call.set_rtcp_tap(datapath.rtcp_tap());
         let call_id = call.call_id.clone();
         let endpoints = call.endpoints();
         let rtcp_endpoints = call.rtcp_endpoints();

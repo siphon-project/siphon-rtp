@@ -196,6 +196,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // Refused above: a locally answered call synthesizes its own audio, so it can never
                 // be a fax relay.
                 fax_passthrough: false,
+                near_sip_call_id: profile.sip_call_id.clone(),
+                far_sip_call_id: None,
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
                 offer_received_from: profile.received_from,
