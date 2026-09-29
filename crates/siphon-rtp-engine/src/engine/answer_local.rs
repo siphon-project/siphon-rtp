@@ -20,8 +20,8 @@ use super::negotiate::{
 };
 use super::takeover::{ws_takeover_media_address, WsBridgeSetup, WsVadConfig};
 use super::{
-    error_result, ok_sdp, Call, CallerMediaLeg, ClientId, Engine, Leg, PipelineKind, PromoteMode,
-    PromotionReason,
+    error_result, ok_sdp, unknown_call, Call, CallerMediaLeg, ClientId, Engine, Leg, PipelineKind,
+    PromoteMode, PromotionReason,
 };
 
 /// What bridging a single-leg answer to a WebSocket server reads: the negotiated codec and SDP,
@@ -42,6 +42,74 @@ struct LocalTakeover<'a> {
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// What an `answer_local` on `call_id` finds already registered: `Ok(false)` for nothing,
+    /// `Ok(true)` for a single-leg call `client` owns (which the answer replaces), and a refusal for
+    /// anything else.
+    ///
+    /// Ownership first (A3 — docs/security-and-nat.md §5): a call another client owns gets the same
+    /// `unknown call` every cross-client reference does, and is left untouched.
+    ///
+    /// A call with a far leg is refused, never replaced. It is a two-party relay, or an offer whose
+    /// far leg a B side may still answer onto — and this verb writes a single-leg call, so replacing
+    /// it would cut the far party off mid-call. A controller that sends this believes the leg is
+    /// one-legged when it is not; an explicit refusal tells it so, where replacing the relay would
+    /// silently end the far party's audio. `reoffer` renegotiates a live relay on its own ports, and
+    /// `delete` is how a controller starts over.
+    ///
+    /// Re-answering a single-leg call the client owns is the in-dialog re-offer on an IVR /
+    /// announcement / controller-anchored leg (a hold, a resume, an RFC 4028 session refresh), which
+    /// a controller answers with another `answer_local` on the same call-id. That is replacement on
+    /// fresh ports, the same as a repeated `offer` (see `replace_offered_call`).
+    fn local_call_gate(&self, client: ClientId, call_id: &str) -> Result<bool, Box<CmdResult>> {
+        let Some(existing) = self.calls.get(call_id) else {
+            return Ok(false);
+        };
+        if existing.owner != client {
+            return Err(Box::new(unknown_call(call_id)));
+        }
+        if existing.far.is_some() {
+            return Err(Box::new(CmdResult::Error {
+                reason: "answer_local: call-has-a-far-leg: the call-id is a two-party call (a \
+                         relay, or an offer awaiting its answer); answer_local writes a single-leg \
+                         call and will not replace it. Use reoffer to renegotiate the relay, or \
+                         delete it first"
+                    .to_string(),
+            }));
+        }
+        Ok(true)
+    }
+
+    /// Tear down the single-leg call a re-answer replaces — the same end-of-call path as `delete`,
+    /// so the CDR is emitted and its ports, endpoint index entries, datapath flows, pipelines and
+    /// quota slot are all released — and re-check the call-id is now free.
+    ///
+    /// The removal is conditional on the call still being this client's single-leg call, so a
+    /// relay that took the id while the replacement's ports were being bound is refused rather
+    /// than destroyed. `None` means the call-id is free to register.
+    async fn replace_local_call(&self, client: ClientId, call_id: &str) -> Option<CmdResult> {
+        if let Some((_, previous)) = self.calls.remove_if(call_id, |_, call| {
+            call.owner == client && call.far.is_none()
+        }) {
+            tracing::info!(
+                target: "siphon_rtp::control",
+                %call_id,
+                "answer_local replaces the single-leg call with the same id — tearing the old one \
+                 down first"
+            );
+            // No `MediaTimeout` event: the controller caused this, it is not a dead path.
+            self.finish_call(call_id, &previous, "replaced").await;
+        }
+        match self.local_call_gate(client, call_id) {
+            Ok(false) => None,
+            // Another `answer_local` on the same id registered while this one was tearing down.
+            Ok(true) => Some(CmdResult::Error {
+                reason: "answer_local: a concurrent answer_local registered this call-id first"
+                    .to_string(),
+            }),
+            Err(refusal) => Some(*refusal),
+        }
+    }
+
     /// Record the half-built call before selecting the codec, so the reject path exercises the same
     /// teardown as a live call (frees the ports + releases the client quota). `to_tag: None` — there
     /// is no far leg. `near_codec` is set to the chosen codec below, right before promotion.
@@ -451,8 +519,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         sdp: &str,
         profile: &ProfileFlags,
     ) -> CmdResult {
+        // A call-id already registered: refuse what this verb must not replace, before anything
+        // else, so a refused command has no side effect at all.
+        let replacing = match self.local_call_gate(client, call_id) {
+            Ok(replacing) => replacing,
+            Err(refusal) => return *refusal,
+        };
         // Soft per-client call quota — a new session, gated exactly like `offer` (A3 / DoS, docs §5).
-        if self.client_call_count(client) >= self.max_calls_per_client {
+        // Re-answering the client's own single-leg call adds no session (the old one is torn down
+        // below), so it is admitted at a full quota.
+        if !replacing && self.client_call_count(client) >= self.max_calls_per_client {
             return CmdResult::Error {
                 reason: "per-client call quota exceeded".to_string(),
             };
@@ -702,6 +778,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.advertised_ip);
         }
 
+        // Only now, with the replacement's ports bound and every validation passed, is the call it
+        // replaces torn down: a re-answer that fails above leaves the caller's live media alone.
+        if let Some(refusal) = self.replace_local_call(client, call_id).await {
+            self.free(&endpoints).await;
+            return refusal;
+        }
         self.register_local_call(
             client,
             call_id,
