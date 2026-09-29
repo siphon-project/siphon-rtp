@@ -512,6 +512,16 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
   replacement, not re-negotiation: the replacement binds fresh ports, so the peer must be told the new
   address. That in-place re-offer on the existing ports (a SIP re-INVITE, and the trigger an RFC 8445
   §9 ICE restart needs) is the `reoffer` verb (see the ICE-restart bullet above).
+- **A repeated `answer_local` on a live call-id is owner-only, and never replaces a two-party
+  call.** Another client gets `unknown_call` and the call is untouched (A3, §5). A call with a far leg
+  (a relay, or an offer awaiting its answer) is refused with `answer_local: call-has-a-far-leg`: this
+  verb writes a single-leg call, so replacing a relay would cut the far party off mid-call. For the
+  owner's own single-leg call (the in-dialog re-offer on an IVR or controller-anchored leg) the
+  answer replaces it the same way a repeated `offer` does, torn down through the `delete` path, but
+  only after the replacement has validated and bound its ports, so a refused re-answer leaves the live
+  call alone. The replacement is admitted at a full quota, since it adds no session. Previously the
+  registry entry was overwritten whatever it held, orphaning the old call's ports, endpoint index and
+  flows and counting its quota slot twice.
 
 ### Layer 5 — SRTP / DTLS-SRTP
 The cryptographic fix: authenticated media cannot be injected or silently hijacked even if the latch

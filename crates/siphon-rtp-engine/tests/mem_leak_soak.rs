@@ -504,6 +504,117 @@ async fn reoffer_from_either_party_does_not_leak() {
     gate.assert_no_leak();
 }
 
+/// Churn one single-leg call through `answer_local → answer_local (replace) → delete`, plus one relay
+/// through `offer → answer → answer_local (refused) → delete`.
+///
+/// A re-answer on the client's own single-leg call replaces it, and the replaced call's ports,
+/// endpoint index entries and quota slot have to come back. An `answer_local` over a live relay is
+/// refused, and the refusal has to allocate nothing that outlives it.
+async fn answer_local_replace_and_refuse_delete(
+    engine: &Engine<UdpLoopbackDatapath>,
+    index: usize,
+) {
+    let local_id = format!("soak-local-{index}");
+    for what in ["answer_local", "answer_local replace"] {
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: local_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for("198.51.100.1", 40_000),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert_ok(&answer, what);
+    }
+
+    let relay_id = format!("soak-relay-{index}");
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: relay_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for("198.51.100.1", 42_000),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&offer, "offer");
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: relay_id.clone(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for("203.0.113.1", 41_000),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&answer, "answer");
+    let refused = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: relay_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for("198.51.100.1", 42_000),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(refused, CmdResult::Error { .. }),
+        "answer_local over a relay is refused, got {refused:?}"
+    );
+    assert_eq!(
+        engine.session_count(),
+        2,
+        "one single-leg call and one relay"
+    );
+
+    for call_id in [local_id, relay_id] {
+        let delete = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id,
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert_ok(&delete, "delete");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_local_replace_and_refusal_do_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    let mut gate = LeakGate::new("answer_local replace/refuse", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            answer_local_replace_and_refuse_delete(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// Let aborted receive tasks actually drop (freeing their socket + recv buffer) so a measurement
 /// reflects quiesced steady state, not in-flight teardown.
 async fn quiesce() {

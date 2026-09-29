@@ -5,6 +5,20 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **`answer_local` no longer overwrites a live call with the same call-id.** It used to register its
+  single-leg call on top of whatever was there, so an `answer_local` sent for an in-dialog re-offer
+  on what was really a two-party relay cut the far party's audio, orphaned the relay's ports,
+  endpoint index entries and datapath flows, and counted the client's quota slot twice. Now a call
+  with a far leg (a relay, or an offer awaiting its answer) is refused with
+  `answer_local: call-has-a-far-leg` and left untouched, and another client's call-id gets
+  `unknown call`. Re-answering the client's own single-leg call still works and replaces it through
+  the `delete` path, only after the replacement has validated and bound its ports, and is admitted
+  at a full quota.
+
 ## [0.9.1] — 2026-09-27
 
 ### Fixed

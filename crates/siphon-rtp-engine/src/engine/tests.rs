@@ -19669,6 +19669,338 @@ async fn another_client_cannot_replace_a_call_it_does_not_own() {
     assert_eq!(engine.client_calls.get(&intruder).map(|count| *count), None);
 }
 
+// ---- answer_local on a live call-id --------------------------------------------------------
+
+/// `answer_local` from `client` on `call_id`, with the caller at `addr`.
+async fn answer_local_from(
+    engine: &Engine<UdpLoopbackDatapath>,
+    client: ClientId,
+    call_id: &str,
+    addr: SocketAddr,
+) -> CmdResult {
+    engine
+        .handle(
+            client,
+            Command::AnswerLocal {
+                call_id: call_id.into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr, false),
+                profile: Default::default(),
+            },
+        )
+        .await
+}
+
+/// Every endpoint `call_id` holds, as the engine's registry records it.
+fn call_endpoints(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) -> Vec<EndpointId> {
+    engine
+        .calls
+        .get(call_id)
+        .map(|call| call.all_endpoint_ids().collect())
+        .expect("call exists")
+}
+
+/// Delete `call_id` as `client` and assert every per-call store the engine keeps is back to empty.
+async fn delete_and_assert_drained(
+    engine: &Engine<UdpLoopbackDatapath>,
+    client: ClientId,
+    call_id: &str,
+) {
+    let delete = engine
+        .handle(
+            client,
+            Command::Delete {
+                call_id: call_id.into(),
+                from_tag: "a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert!(matches!(delete, CmdResult::Ok { .. }), "delete: {delete:?}");
+    assert_eq!(engine.session_count(), 0, "call registry drained");
+    assert_eq!(engine.endpoint_calls.len(), 0, "endpoint index drained");
+    assert_eq!(
+        engine.client_calls.get(&client).map(|count| *count),
+        None,
+        "quota slot released"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_local_over_a_live_relay_is_refused_and_leaves_the_relay_untouched() {
+    // A controller that believes a leg is one-legged answers its in-dialog re-offer locally, on the
+    // call-id of what is really a two-party relay. That used to overwrite the registry entry with a
+    // single-leg call: B lost audio, the relay's ports, endpoint index entries and datapath flows
+    // were orphaned, and the quota slot was counted twice. The relay must survive, byte for byte.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let offered = offer_from_a(&engine, "relay", sdp_for(addr_a, false), Default::default()).await;
+    let answered =
+        answer_from_b(&engine, "relay", sdp_for(addr_b, false), Default::default()).await;
+    let endpoints = call_endpoints(&engine, "relay");
+    let indexed = engine.endpoint_calls.len();
+
+    let refused = answer_local_from(&engine, CLIENT, "relay", addr_a).await;
+    match &refused {
+        CmdResult::Error { reason } => assert!(
+            reason.contains("answer_local: call-has-a-far-leg"),
+            "refused with the typed reason: {reason}"
+        ),
+        other => panic!("answer_local over a relay must be refused, got {other:?}"),
+    }
+
+    assert_eq!(engine.session_count(), 1);
+    assert_eq!(
+        engine.client_calls.get(&CLIENT).map(|count| *count),
+        Some(1),
+        "the refusal charged no quota"
+    );
+    assert_eq!(
+        engine.endpoint_calls.len(),
+        indexed,
+        "the refusal indexed no endpoint"
+    );
+    {
+        let call = engine
+            .calls
+            .get("relay")
+            .expect("the relay is still registered");
+        assert_eq!(
+            call.to_tag.as_deref(),
+            Some("b"),
+            "still the answered relay"
+        );
+        assert!(call.far.is_some(), "still two legs");
+        assert_eq!(
+            call.all_endpoint_ids().collect::<Vec<_>>(),
+            endpoints,
+            "on the same endpoints"
+        );
+    }
+    for endpoint in &endpoints {
+        assert!(
+            engine.datapath().stats(*endpoint).is_some(),
+            "endpoint {endpoint:?} is still bound"
+        );
+    }
+
+    // And it still relays both ways.
+    phone_a
+        .send_to(&rtp(0x0A0A_0A0A), answered.remote_rtp)
+        .await
+        .expect("send from A");
+    let (data, _) = recv(&phone_b).await;
+    assert_eq!(data, rtp(0x0A0A_0A0A), "B still hears A");
+    phone_b
+        .send_to(&rtp(0x0B0B_0B0B), offered.remote_rtp)
+        .await
+        .expect("send from B");
+    let (data, _) = recv(&phone_a).await;
+    assert_eq!(data, rtp(0x0B0B_0B0B), "A still hears B");
+
+    delete_and_assert_drained(&engine, CLIENT, "relay").await;
+    for endpoint in endpoints {
+        assert_eq!(
+            engine.datapath().stats(endpoint),
+            None,
+            "{endpoint:?} freed"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_local_over_an_unanswered_offer_is_refused() {
+    // An offered call already holds the far leg a B side may still answer onto. Replacing it with a
+    // single-leg answer would tear that leg away under a pending `answer`, so it is refused too —
+    // the controller deletes first if it means to start over.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    offer_from_a(
+        &engine,
+        "offered",
+        sdp_for(addr_a, false),
+        Default::default(),
+    )
+    .await;
+    let endpoints = call_endpoints(&engine, "offered");
+
+    let refused = answer_local_from(&engine, CLIENT, "offered", addr_a).await;
+    assert!(
+        matches!(&refused, CmdResult::Error { reason } if reason.contains("call-has-a-far-leg")),
+        "refused: {refused:?}"
+    );
+    let call = engine.calls.get("offered").expect("still registered");
+    assert!(call.far.is_some());
+    assert_eq!(call.all_endpoint_ids().collect::<Vec<_>>(), endpoints);
+    drop(call);
+    assert_eq!(
+        engine.client_calls.get(&CLIENT).map(|count| *count),
+        Some(1)
+    );
+
+    delete_and_assert_drained(&engine, CLIENT, "offered").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_client_cannot_answer_local_over_a_call_it_does_not_own() {
+    // A3 (docs/security-and-nat.md §5): a call is invisible to every client but its owner, so a
+    // foreign `answer_local` on its id gets the same `unknown call` as any cross-client reference
+    // and the owner's single-leg call is left exactly as it was.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let owner = ClientId(41);
+    let intruder = ClientId(42);
+    let (_phone_a, addr_a) = phone().await;
+    let first = answer_local_from(&engine, owner, "owned-local", addr_a).await;
+    assert!(matches!(first, CmdResult::Ok { .. }), "{first:?}");
+    let endpoints = call_endpoints(&engine, "owned-local");
+
+    let stolen = answer_local_from(&engine, intruder, "owned-local", addr_a).await;
+    assert!(
+        matches!(&stolen, CmdResult::Error { reason } if reason.contains("unknown call")),
+        "the intruder learns nothing: {stolen:?}"
+    );
+    let call = engine.calls.get("owned-local").expect("still there");
+    assert_eq!(call.owner, owner);
+    assert_eq!(call.all_endpoint_ids().collect::<Vec<_>>(), endpoints);
+    drop(call);
+    assert_eq!(engine.client_calls.get(&intruder).map(|count| *count), None);
+    assert_eq!(engine.client_calls.get(&owner).map(|count| *count), Some(1));
+
+    delete_and_assert_drained(&engine, owner, "owned-local").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeated_answer_local_replaces_the_single_leg_call_without_leaking() {
+    // The flow a controller relies on: a one-legged call (IVR, announcement, a controller-anchored
+    // leg) takes an in-dialog re-offer — a hold, a resume, a session refresh — and answers it with
+    // another `answer_local` on the same call-id. That must keep working, and the call it replaces
+    // must be torn down fully, not dropped on the floor.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    let (_phone_a, addr_a) = phone().await;
+
+    let first = answer_local_from(&engine, CLIENT, "one-leg", addr_a).await;
+    let first_port = sdp::parse(&ok_sdp_text(&first))
+        .expect("parse")
+        .remote_rtp
+        .port();
+    let first_endpoints = call_endpoints(&engine, "one-leg");
+
+    let second = answer_local_from(&engine, CLIENT, "one-leg", addr_a).await;
+    let second_port = sdp::parse(&ok_sdp_text(&second))
+        .expect("parse")
+        .remote_rtp
+        .port();
+    let second_endpoints = call_endpoints(&engine, "one-leg");
+
+    assert_eq!(engine.session_count(), 1, "one call, not two");
+    assert_eq!(
+        engine.client_calls.get(&CLIENT).map(|count| *count),
+        Some(1),
+        "the replaced call's quota slot is released, not double counted"
+    );
+    assert_eq!(
+        engine.endpoint_calls.len(),
+        second_endpoints.len(),
+        "only the replacement's endpoints are indexed"
+    );
+    for endpoint in &first_endpoints {
+        assert_eq!(
+            engine.datapath().stats(*endpoint),
+            None,
+            "the replaced call's endpoint {endpoint:?} was freed"
+        );
+        assert!(!engine.endpoint_calls.contains_key(endpoint));
+    }
+    assert_ne!(first_port, second_port, "the replacement bound fresh ports");
+    assert!(engine.calls.get("one-leg").expect("present").far.is_none());
+
+    let mut summary_reason = None;
+    while let Ok(event) = events.try_recv() {
+        match event {
+            Event::CallSummary { reason, .. } => summary_reason = Some(reason),
+            Event::MediaTimeout { .. } => {
+                panic!("a controller-driven replacement is not a media timeout")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(summary_reason.as_deref(), Some("replaced"));
+
+    delete_and_assert_drained(&engine, CLIENT, "one-leg").await;
+    for endpoint in second_endpoints {
+        assert_eq!(
+            engine.datapath().stats(endpoint),
+            None,
+            "{endpoint:?} freed"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeated_answer_local_is_admitted_at_a_full_quota() {
+    // Replacing a call the client already owns does not add a session, so a client at its quota
+    // can still re-answer its own one-legged call. Refusing it would turn every hold on a busy
+    // controller into a 488.
+    let engine = Engine::with_max_calls_per_client(UdpLoopbackDatapath::new(), 1);
+    let (_phone_a, addr_a) = phone().await;
+    let first = answer_local_from(&engine, CLIENT, "at-quota", addr_a).await;
+    assert!(matches!(first, CmdResult::Ok { .. }), "{first:?}");
+
+    let again = answer_local_from(&engine, CLIENT, "at-quota", addr_a).await;
+    assert!(
+        matches!(again, CmdResult::Ok { .. }),
+        "re-answer admitted: {again:?}"
+    );
+    assert_eq!(
+        engine.client_calls.get(&CLIENT).map(|count| *count),
+        Some(1)
+    );
+
+    // A genuinely new session is still refused.
+    let other = answer_local_from(&engine, CLIENT, "second-call", addr_a).await;
+    assert!(
+        matches!(&other, CmdResult::Error { reason } if reason.contains("quota")),
+        "{other:?}"
+    );
+
+    delete_and_assert_drained(&engine, CLIENT, "at-quota").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_re_answer_leaves_the_single_leg_call_in_place() {
+    // A re-answer that fails validation (here, an SDP that does not parse) must not have torn the
+    // live call down first: the caller keeps the media it has, and the controller gets its error.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    answer_local_from(&engine, CLIENT, "keep-me", addr_a).await;
+    let endpoints = call_endpoints(&engine, "keep-me");
+
+    let bad = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "keep-me".into(),
+                from_tag: "a".into(),
+                sdp: "not an sdp".into(),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(matches!(bad, CmdResult::Error { .. }), "{bad:?}");
+    assert_eq!(call_endpoints(&engine, "keep-me"), endpoints);
+    for endpoint in &endpoints {
+        assert!(engine.datapath().stats(*endpoint).is_some());
+    }
+    assert_eq!(
+        engine.client_calls.get(&CLIENT).map(|count| *count),
+        Some(1)
+    );
+
+    delete_and_assert_drained(&engine, CLIENT, "keep-me").await;
+}
+
 // ---- RFC 8839 §5.3 ice-mismatch --------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
