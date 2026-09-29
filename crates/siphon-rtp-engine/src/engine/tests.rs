@@ -26715,3 +26715,81 @@ async fn a_ws_tee_attached_mid_call_hears_both_parties_of_a_transcrypt() {
         "a stereo 20 ms frame: both parties, decoded"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_anchored_legs_gate_refusals_reach_the_call_summary() {
+    // A locally answered leg is carried on a `Redirect` endpoint whose source gate the media
+    // pipeline enforces. Its refusals used to be logged at `debug` and counted nowhere, so a leg
+    // that refused every packet ended with `packets_dropped: 0` — indistinguishable from a silent
+    // caller. Every refused datagram now reaches the endpoint's counter and the summary.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+    let (stranger, _) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
+
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "anchored-drops".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let engine_addr = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer SDP")
+        .remote_rtp;
+    for sequence in 0..5u16 {
+        stranger
+            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), engine_addr)
+            .await
+            .expect("send");
+    }
+    // The datagrams cross a real socket and the actor's mailbox; wait until all five are counted.
+    let mut dropped = 0;
+    for _ in 0..100 {
+        dropped = engine
+            .calls
+            .get("anchored-drops")
+            .map(|call| call.near.rtp.id)
+            .and_then(|endpoint| engine.datapath().stats(endpoint))
+            .map_or(0, |stats| stats.packets_dropped);
+        if dropped == 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        dropped, 5,
+        "every refused datagram is counted on the endpoint"
+    );
+
+    engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "anchored-drops".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    let legs = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            Event::CallSummary { legs, .. } => Some(legs),
+            _ => None,
+        })
+        .expect("CallSummary emitted on delete");
+    assert_eq!(legs[0].packets_dropped, 5);
+}

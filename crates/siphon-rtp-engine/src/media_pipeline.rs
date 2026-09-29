@@ -45,6 +45,7 @@ use siphon_rtp_media::tone::{ToneGenerator, ToneSpec};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{Event, PlayEndReason, ProfileFlags};
 
+use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
 
@@ -683,6 +684,8 @@ pub struct Direction {
     /// re-pointed to the observed source only when it is SSRC-consistent — a forged/auth-failing or
     /// wrong-SSRC packet never moves the reply direction (docs/security-and-nat.md §4 layer 3).
     source_latch: SymmetricLatch,
+    /// Which refusals of this direction's ingress have already been logged at `warn`.
+    refusals: RefusalLog,
     /// The endpoint to transmit from (the receiving party's engine socket).
     egress_endpoint: EndpointId,
     /// Where to transmit (the receiving party's address; latched to its observed source).
@@ -1184,6 +1187,8 @@ pub struct RtcpRelay {
     /// completed. `None` on a plaintext or SDES relay (keyed at answer time). While set, the relay
     /// drops — same reasoning as [`Direction::secure_pending`], applied to SRTCP.
     secure_pending: Option<SecureSide>,
+    /// Which refusals of this relay's ingress have already been logged at `warn`.
+    refusals: RefusalLog,
 }
 
 /// Which side of a relay an as-yet-undelivered DTLS key will be installed on.
@@ -1212,6 +1217,7 @@ impl RtcpRelay {
             secure_ingress: None,
             secure_egress: None,
             secure_pending: None,
+            refusals: RefusalLog::default(),
         }
     }
 
@@ -1250,19 +1256,38 @@ impl RtcpRelay {
 
     /// Relay one RTCP datagram: SRTCP-decrypt (if the ingress is secure) → SRTCP-encrypt (if the
     /// egress is secure — [`SecureLeg`] auto-demuxes RTCP) → transmit toward the peer's RTCP address.
-    /// Drops on any (de)crypt failure — never forward garbage RTCP.
-    fn relay(&self, data: &[u8], out: &mut Vec<Outbound>) {
+    /// Drops on any (de)crypt failure — never forward garbage RTCP — and says so: the source already
+    /// passed the gate, so a drop here is [`Ingress::DroppedFromPeer`].
+    fn relay(
+        &self,
+        data: &[u8],
+        source: SocketAddr,
+        call_id: &str,
+        out: &mut Vec<Outbound>,
+    ) -> Ingress {
         // Awaiting the DTLS handshake: drop rather than relay SRTCP verbatim (to a peer that cannot
         // read it) or RTCP in the clear (to one that must not receive it unencrypted).
         if self.secure_pending.is_some() {
-            return;
+            return Ingress::DroppedFromPeer;
         }
         let decrypted;
         let plaintext: &[u8] = if let Some(leg) = &self.secure_ingress {
             let mut buffer = Vec::new();
-            let Ok(mut guard) = leg.lock() else { return };
+            let Ok(mut guard) = leg.lock() else {
+                return Ingress::DroppedFromPeer;
+            };
             if guard.unprotect(data, &mut buffer).is_err() {
-                return;
+                self.refusals.log(
+                    Refusal::NotAuthenticated,
+                    RefusalContext {
+                        component: "media-pipeline rtcp",
+                        call_id,
+                        endpoint: self.ingress_endpoint,
+                        source,
+                        expected: self.accepted_source,
+                    },
+                );
+                return Ingress::DroppedFromPeer;
             }
             drop(guard);
             decrypted = buffer;
@@ -1273,9 +1298,11 @@ impl RtcpRelay {
         let encrypted;
         let payload: &[u8] = if let Some(leg) = &self.secure_egress {
             let mut buffer = Vec::new();
-            let Ok(mut guard) = leg.lock() else { return };
+            let Ok(mut guard) = leg.lock() else {
+                return Ingress::DroppedFromPeer;
+            };
             if guard.protect(plaintext, &mut buffer).is_err() {
-                return;
+                return Ingress::DroppedFromPeer;
             }
             drop(guard);
             encrypted = buffer;
@@ -1288,10 +1315,47 @@ impl RtcpRelay {
             dst: self.egress_dst,
             data: Bytes::copy_from_slice(payload),
         });
+        Ingress::Accepted
     }
 }
 
+/// A datagram from the signalled peer that [`Direction::handle`] dropped before the reply latch. Each
+/// is counted as dropped ([`Ingress::DroppedFromPeer`]); only the authentication failure is worth a
+/// `warn`, since the other two are a malformed datagram and the handshake window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dropped {
+    /// Too short to be RTP or RTCP.
+    Malformed,
+    /// A DTLS leg the handshake has not keyed yet (or whose key can no longer be read).
+    Unkeyed,
+    /// Failed SRTP authentication or replay protection (RFC 3711 §3.3).
+    NotAuthenticated,
+}
+
 impl Direction {
+    /// Where this direction's refusals are logged from.
+    fn refusal_context<'a>(&self, call_id: &'a str, source: SocketAddr) -> RefusalContext<'a> {
+        RefusalContext {
+            component: "media-pipeline",
+            call_id,
+            endpoint: self.ingress_endpoint,
+            source,
+            expected: self.accepted_source,
+        }
+    }
+
+    /// Account for a datagram [`Direction::handle`] dropped before the latch: logged (only the
+    /// authentication failure is worth a `warn`) and reported as a drop from the signalled peer.
+    fn peer_drop(&self, dropped: Dropped, call_id: &str, source: SocketAddr) -> Ingress {
+        if dropped == Dropped::NotAuthenticated {
+            self.refusals.log(
+                Refusal::NotAuthenticated,
+                self.refusal_context(call_id, source),
+            );
+        }
+        Ingress::DroppedFromPeer
+    }
+
     fn new(config: DirectionConfig) -> Self {
         let ingress_params = config.decoder.params();
         let ingress_rate = ingress_params.sample_rate_hz;
@@ -1396,6 +1460,7 @@ impl Direction {
             ingress_endpoint: config.ingress_endpoint,
             accepted_source: config.accepted_source,
             source_latch: SymmetricLatch::default(),
+            refusals: RefusalLog::default(),
             egress_endpoint: config.egress_endpoint,
             egress_dst: config.egress_dst,
             relay_only: false,
@@ -1471,6 +1536,7 @@ impl Direction {
             ingress_endpoint: config.ingress_endpoint,
             accepted_source: config.accepted_source,
             source_latch: SymmetricLatch::default(),
+            refusals: RefusalLog::default(),
             egress_endpoint: config.egress_endpoint,
             egress_dst: config.egress_dst,
             relay_only: true,
@@ -1927,7 +1993,8 @@ impl Direction {
     /// `arrival_micros` is the datapath's receive-time stamp on the datagram, folded into the ingress
     /// interarrival-jitter estimate (RFC 3550 §6.4.1) that feeds this direction's quality report.
     ///
-    /// Returns [`ReplyLatch::Reject`] when `latch` is set and the packet comes from a new source that
+    /// Returns `Err` for a datagram dropped before the latch — too short, unkeyed, or failing SRTP
+    /// authentication — which the caller counts as dropped. Otherwise the latch's verdict: [`ReplyLatch::Reject`] when `latch` is set and the packet comes from a new source that
     /// cannot prove it is the latched stream: it was dropped before the tee, the interception tap, the
     /// relay and the decode, and the caller must not count it as activity. Otherwise
     /// [`ReplyLatch::Accept`], carrying the address the reverse direction should reply to when the
@@ -1946,28 +2013,28 @@ impl Direction {
         echo_reference: Option<&mut EchoReference>,
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
-    ) -> ReplyLatch {
+    ) -> Result<ReplyLatch, Dropped> {
         if data.len() < 2 {
-            return ReplyLatch::Accept(None);
+            return Err(Dropped::Malformed);
         }
         // A DTLS leg whose handshake has not keyed it yet: drop, never interpret. Decoding SRTP as
         // plaintext would emit noise at the peer, and forwarding it verbatim would leak the encrypted
         // stream to a party that never negotiated it (docs/security-and-nat.md §4).
         if self.secure_pending {
-            return ReplyLatch::Accept(None);
+            return Err(Dropped::Unkeyed);
         }
         // Secure ingress (SDES-SRTP): decrypt before anything else, so the tee / relay / RFC 5761
         // demux / decode all operate on plaintext. SecureLeg auto-demuxes SRTP vs SRTCP. A failed
         // unprotect (bad auth / replay / wrong key) drops the datagram — never forward garbage — and
-        // (crucially) before the reply latch below, so an inauthentic packet never reaches it.
+        // (crucially) before the reply latch, so an inauthentic packet never reaches it.
         let decrypted;
         let data: &[u8] = if let Some(leg) = self.secure_ingress.as_ref() {
             let mut plain = Vec::new();
             let Ok(mut guard) = leg.lock() else {
-                return ReplyLatch::Accept(None);
+                return Err(Dropped::Unkeyed);
             };
             if guard.unprotect(data, &mut plain).is_err() {
-                return ReplyLatch::Accept(None);
+                return Err(Dropped::NotAuthenticated);
             }
             drop(guard);
             decrypted = plain;
@@ -1981,7 +2048,7 @@ impl Direction {
         // merely kept from moving the reply, exactly as the datapath's `Forward` path drops it.
         let admitted = self.admit_to_reply_latch(latch, source, data);
         if admitted == ReplyLatch::Reject {
-            return admitted;
+            return Ok(admitted);
         }
         // SIPREC raw tee (RFC 7866 §6): copy the original ingress RTP/RTCP/DTMF byte-for-byte to each
         // subscriber's SRS before any transcode/relay. The SRS records the leg's *actual* media in its
@@ -2032,7 +2099,7 @@ impl Direction {
                             });
                         }
                     }
-                    return admitted;
+                    return Ok(admitted);
                 }
             }
             if !self.blocked {
@@ -2043,7 +2110,7 @@ impl Direction {
                 });
             }
             // A promoted-passthrough leg latches the reply symmetrically too; `admitted` says where.
-            return admitted;
+            return Ok(admitted);
         }
 
         // RFC 5761 demux: payload-type byte 64..=95 marks RTCP — relay it (re-encrypting toward a
@@ -2077,11 +2144,11 @@ impl Direction {
                 // exactly as it arrived rather than risk a half-edited datagram on the wire.
                 self.push_egress(data, out);
             }
-            return admitted;
+            return Ok(admitted);
         }
 
         let Ok(parsed) = RtpPacket::parse(data) else {
-            return admitted; // malformed RTP — drop (never forward garbage)
+            return Ok(admitted); // malformed RTP — drop (never forward garbage)
         };
         // The authenticated stream's SSRC (RFC 3550 §5.1).
         let stream_ssrc = parsed.ssrc;
@@ -2116,16 +2183,16 @@ impl Direction {
             if !self.dtmf_blocked && self.comfort.is_none() {
                 self.relay_telephone_event(&parsed, out);
             }
-            return admitted;
+            return Ok(admitted);
         }
 
         if self.blocked {
-            return admitted;
+            return Ok(admitted);
         }
         // While a prompt / DTMF burst plays toward this party, suppress the transcoded audio so the
         // injection is heard cleanly (the playout clock drives the egress instead — see `tick_injection`).
         if self.injection.is_some() {
-            return admitted;
+            return Ok(admitted);
         }
 
         // Decode → fold to mono → (noise suppression) → echo cancel → record/fork → (silence) →
@@ -2143,7 +2210,7 @@ impl Direction {
             events,
         );
         self.decode_scratch = scratch;
-        admitted
+        Ok(admitted)
     }
 
     /// Run the record-tone ("voicemail beep") detector over one decoded ingress frame and, on a
@@ -2469,20 +2536,12 @@ impl Direction {
 
     /// Offer one authenticated datagram to this direction's reply latch when the call latches
     /// (docs/security-and-nat.md §4 layer 3); a call that does not latch accepts it and aims nothing.
-    /// Logs a rejection, so both callers drop it with the same trace.
+    /// A rejection is logged by [`MediaCall::process`], which both callers return through.
     fn admit_to_reply_latch(&mut self, latch: bool, source: SocketAddr, data: &[u8]) -> ReplyLatch {
         if !latch {
             return ReplyLatch::Accept(None);
         }
-        let verdict = self.source_latch.admit(source, rtp_media_ssrc(data));
-        if verdict == ReplyLatch::Reject {
-            tracing::debug!(
-                %source,
-                "media-pipeline dropped a datagram from a new source that could not prove it is the \
-                 latched stream"
-            );
-        }
-        verdict
+        self.source_latch.admit(source, rtp_media_ssrc(data))
     }
 
     /// Echo this direction's ingress audio straight back to the party that sent it (the classic echo
@@ -2932,7 +2991,7 @@ impl MediaCall {
         packet: &RxPacket,
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
-    ) -> bool {
+    ) -> Ingress {
         let accepted = self.process_packet(packet, out, events);
         // An overlay that drained inside the egress emit path reports its own completion. Done here
         // rather than at each emit site because the emit path has no event vector in scope.
@@ -2947,7 +3006,7 @@ impl MediaCall {
         packet: &RxPacket,
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
-    ) -> bool {
+    ) -> Ingress {
         // The call identity is the same whichever direction the packet arrived on; the *leg* identity
         // is not, so `near_tag` / `far_tag` are flipped per branch below. A single-leg call (no
         // to-tag) has only the offerer, so both sides fall back to its tag.
@@ -2963,22 +3022,29 @@ impl MediaCall {
             let meta = call_meta;
             // Party A's media: gate A's source; the B→A direction now knows where to reply to A.
             if !self.a_to_b.accepted_source.accepts(packet.source.ip()) {
-                tracing::debug!(source = %packet.source, "media-pipeline dropped packet from unsignalled source");
-                return false;
+                self.a_to_b.refusals.log(
+                    Refusal::UnsignalledSource,
+                    self.a_to_b.refusal_context(&self.call_id, packet.source),
+                );
+                return Ingress::Refused;
             }
             // Raw-RTP pcap capture (accepted A→B ingress, post source-gate, before any transcode).
             self.capture_ingress(true, packet.source, packet.arrival, &packet.data);
             let admitted = if self.echo {
                 // Echo A back to A: decode on a_to_b (faces A), re-encode on b_to_a (egress faces A).
-                self.a_to_b.echo_into(
-                    &mut self.b_to_a,
-                    &packet.data,
-                    packet.source,
-                    self.latch,
-                    meta,
-                    out,
-                    events,
-                )
+                if packet.data.len() < 2 {
+                    Err(Dropped::Malformed)
+                } else {
+                    Ok(self.a_to_b.echo_into(
+                        &mut self.b_to_a,
+                        &packet.data,
+                        packet.source,
+                        self.latch,
+                        meta,
+                        out,
+                        events,
+                    ))
+                }
             } else {
                 // Cancel A's uplink echo against what the engine last sent *toward* A — the `b_to_a`
                 // egress reference ring (§"Reference/near-end plumbing"). Disjoint field borrows
@@ -3004,8 +3070,20 @@ impl MediaCall {
             // the direction after SRTP auth and before the packet was consumed. A new source that
             // could not prove it is A's stream was dropped there, so it reached nobody and is not
             // activity; an accepted stream aims the B→A reply at A's latched source.
+            let admitted = match admitted {
+                Ok(admitted) => admitted,
+                Err(dropped) => {
+                    return self.a_to_b.peer_drop(dropped, &self.call_id, packet.source);
+                }
+            };
             match admitted {
-                ReplyLatch::Reject => return false,
+                ReplyLatch::Reject => {
+                    self.a_to_b.refusals.log(
+                        Refusal::NewSource,
+                        self.a_to_b.refusal_context(&self.call_id, packet.source),
+                    );
+                    return Ingress::Refused;
+                }
                 ReplyLatch::Accept(Some(dst)) => {
                     self.b_to_a.egress_dst = dst;
                     self.note_observed(self.a_to_b.ingress_endpoint, dst);
@@ -3018,7 +3096,7 @@ impl MediaCall {
             if self.a_to_b.secure_ingress.is_none() && is_rtcp_datagram(&packet.data) {
                 self.observe_rtcp_rtt(true, &packet.data, packet.arrival);
             }
-            true
+            Ingress::Accepted
         } else if packet.endpoint == self.b_to_a.ingress_endpoint {
             // B→A decodes party B: the near leg is the answerer (the offerer when there is no to-tag).
             let meta = LegMeta {
@@ -3027,21 +3105,28 @@ impl MediaCall {
                 ..call_meta
             };
             if !self.b_to_a.accepted_source.accepts(packet.source.ip()) {
-                tracing::debug!(source = %packet.source, "media-pipeline dropped packet from unsignalled source");
-                return false;
+                self.b_to_a.refusals.log(
+                    Refusal::UnsignalledSource,
+                    self.b_to_a.refusal_context(&self.call_id, packet.source),
+                );
+                return Ingress::Refused;
             }
             // Raw-RTP pcap capture (accepted B→A ingress, post source-gate, before any transcode).
             self.capture_ingress(false, packet.source, packet.arrival, &packet.data);
             let admitted = if self.echo {
-                self.b_to_a.echo_into(
-                    &mut self.a_to_b,
-                    &packet.data,
-                    packet.source,
-                    self.latch,
-                    meta,
-                    out,
-                    events,
-                )
+                if packet.data.len() < 2 {
+                    Err(Dropped::Malformed)
+                } else {
+                    Ok(self.b_to_a.echo_into(
+                        &mut self.a_to_b,
+                        &packet.data,
+                        packet.source,
+                        self.latch,
+                        meta,
+                        out,
+                        events,
+                    ))
+                }
             } else {
                 // Symmetric: cancel B's uplink echo against the `a_to_b` egress reference (what the
                 // engine last sent toward B).
@@ -3064,8 +3149,20 @@ impl MediaCall {
             // Symmetric-RTP latch for the A→B reply, mirroring the A branch: a rejected B source was
             // dropped inside the direction, and an accepted B stream aims `a_to_b.egress_dst` at B's
             // latched source (docs/security-and-nat.md §4 layer 3; RFC 3550 §8).
+            let admitted = match admitted {
+                Ok(admitted) => admitted,
+                Err(dropped) => {
+                    return self.b_to_a.peer_drop(dropped, &self.call_id, packet.source);
+                }
+            };
             match admitted {
-                ReplyLatch::Reject => return false,
+                ReplyLatch::Reject => {
+                    self.b_to_a.refusals.log(
+                        Refusal::NewSource,
+                        self.b_to_a.refusal_context(&self.call_id, packet.source),
+                    );
+                    return Ingress::Refused;
+                }
                 ReplyLatch::Accept(Some(dst)) => {
                     self.a_to_b.egress_dst = dst;
                     self.note_observed(self.b_to_a.ingress_endpoint, dst);
@@ -3076,7 +3173,7 @@ impl MediaCall {
             if self.b_to_a.secure_ingress.is_none() && is_rtcp_datagram(&packet.data) {
                 self.observe_rtcp_rtt(false, &packet.data, packet.arrival);
             }
-            true
+            Ingress::Accepted
         } else if let Some(relay) = self
             .rtcp
             .iter()
@@ -3085,13 +3182,23 @@ impl MediaCall {
             // Companion (non-muxed) RTCP on a secure-transcode leg: gate the source (RTPBleed) then
             // SRTCP-(de)crypt and relay it untranscoded toward the peer's RTCP port.
             if !relay.accepted_source.accepts(packet.source.ip()) {
-                tracing::debug!(source = %packet.source, "media-pipeline dropped RTCP from unsignalled source");
-                return false;
+                relay.refusals.log(
+                    Refusal::UnsignalledSource,
+                    RefusalContext {
+                        component: "media-pipeline rtcp",
+                        call_id: &self.call_id,
+                        endpoint: relay.ingress_endpoint,
+                        source: packet.source,
+                        expected: relay.accepted_source,
+                    },
+                );
+                return Ingress::Refused;
             }
-            relay.relay(&packet.data, out);
-            true
+            relay.relay(&packet.data, packet.source, &self.call_id, out)
         } else {
-            false
+            // Not one of this call's endpoints: the dispatcher routed it here by mistake, and it goes
+            // nowhere.
+            Ingress::Refused
         }
     }
 
@@ -4187,9 +4294,8 @@ async fn run_media_call<D>(
                         // Redirect arm doesn't, unlike the in-kernel Forward relay), so without this an
                         // actively-transcoding/echoing call would be reaped mid-call — same fix the
                         // conference actor already applies.
-                        if call.process(&packet, &mut outbound, &mut emitted) {
-                            datapath.note_activity(packet.endpoint);
-                        }
+                        call.process(&packet, &mut outbound, &mut emitted)
+                            .record(&datapath, packet.endpoint);
                         send_all(&datapath, &mut outbound).await;
                         emit_events(&mut emitted, &events);
                     }
@@ -5000,11 +5106,13 @@ mod tests {
         // from moving the reply. Nothing reaches B, and it does not count as activity.
         out.clear();
         assert!(
-            !call.process(
-                &rx(1, "127.0.0.9:5000", ulaw_rtp_with_ssrc(2, 0x9999_9999)),
-                &mut out,
-                &mut events,
-            ),
+            !call
+                .process(
+                    &rx(1, "127.0.0.9:5000", ulaw_rtp_with_ssrc(2, 0x9999_9999)),
+                    &mut out,
+                    &mut events,
+                )
+                .is_live(),
             "a rejected source is not activity"
         );
         assert!(
@@ -5082,7 +5190,10 @@ mod tests {
         peer_leg
             .protect(&b_plain, &mut b_srtp)
             .expect("peer encrypt");
-        call.process(&rx(2, "127.0.0.3:7000", b_srtp), &mut out, &mut events);
+        assert_eq!(
+            call.process(&rx(2, "127.0.0.3:7000", b_srtp), &mut out, &mut events),
+            Ingress::Accepted
+        );
         assert_eq!(
             call.a_to_b.egress_dst,
             addr("127.0.0.3:7000"),
@@ -5093,13 +5204,26 @@ mod tests {
         // the reply — it is dropped before the latch (the B2 fix: latch after auth, not before).
         out.clear();
         let forged = ulaw_rtp_with_ssrc(2, 0xB0B0_B0B0); // never SRTP-protected → auth fails
-        call.process(&rx(2, "127.0.0.3:9999", forged), &mut out, &mut events);
+        let verdict = call.process(&rx(2, "127.0.0.3:9999", forged), &mut out, &mut events);
         assert_eq!(
             call.a_to_b.egress_dst,
             addr("127.0.0.3:7000"),
             "a forged, auth-failing packet must not steal the reply direction (B2)"
         );
         assert!(out.is_empty(), "a forged packet is dropped, not forwarded");
+        // Counted as a drop — it used to read as admitted — while still keeping the signalled peer's
+        // path alive, so a rekey glitch cannot get a live call reaped.
+        assert_eq!(verdict, Ingress::DroppedFromPeer);
+
+        // From an address the SDP never signalled: refused outright, and not liveness.
+        out.clear();
+        let spoofed = call.process(
+            &rx(2, "127.0.0.99:7000", ulaw_rtp_with_ssrc(3, 0xB0B0_B0B0)),
+            &mut out,
+            &mut events,
+        );
+        assert_eq!(spoofed, Ingress::Refused);
+        assert!(out.is_empty());
     }
 
     /// A G.722 RTP packet: PT 9, a 160-byte payload (20 ms of codes), timestamp on the 8 kHz RTP

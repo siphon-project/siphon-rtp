@@ -46,6 +46,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   already holds between its two transforms, where the lawful-interception tap sits, and decodes it
   in a task of its own. The bridge keeps relaying, nothing is re-keyed, and detaching the tee takes
   the tap off again.
+- **Every userspace media path counts what it drops.** Only the SDES bridge reported refused
+  datagrams to `packets_dropped`. The media pipeline (which carries every locally answered leg), the
+  DTLS bridge, the conference, the text and fax relays and the WebSocket takeover logged a refusal at
+  `debug` and counted nothing, so a leg refusing every packet ended with `packets_dropped: 0`. All of
+  them now report through one path, and the first refusal of each kind per flow is logged at `warn`
+  with the source it came from and the gate it failed. A failed SRTP authentication on the media and
+  text pipelines is now counted as a drop too; it still keeps the call alive, as before.
 
 ## [0.9.1] — 2026-09-27
 

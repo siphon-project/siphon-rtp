@@ -35,6 +35,7 @@ use dashmap::DashMap;
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use std::net::SocketAddr;
 
+use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::media_pipeline::Outbound;
 use crate::reply_latch::{OpaqueLatch, ReplyLatch};
 
@@ -57,6 +58,8 @@ struct UdptlDirection {
     relayed: u64,
     /// Datagrams dropped by the source gate or the latch.
     dropped: u64,
+    /// Which refusals of this direction's ingress have already been logged at `warn`.
+    refusals: RefusalLog,
 }
 
 /// How to build one direction of the relay.
@@ -81,6 +84,7 @@ impl UdptlDirection {
             egress_dst: config.egress_dst,
             relayed: 0,
             dropped: 0,
+            refusals: RefusalLog::default(),
         }
     }
 }
@@ -115,28 +119,31 @@ impl UdptlCall {
 
     /// Relay one redirected datagram, appending what to transmit to `out`.
     ///
-    /// Returns whether the datagram was **accepted** — the caller stamps datapath activity only
-    /// then, so a spoofed spray can never keep an idle call alive (§4 layer 6).
-    pub fn process(&mut self, packet: &RxPacket, out: &mut Vec<Outbound>) -> bool {
+    /// Returns what became of the datagram, which the caller reports to the datapath: only an
+    /// admitted one stamps activity, so a spoofed spray can never keep an idle call alive (§4 layer
+    /// 6), and every one that was not forwarded is counted as dropped.
+    pub fn process(&mut self, packet: &RxPacket, out: &mut Vec<Outbound>) -> Ingress {
         let (direction, peer) = if packet.endpoint == self.a_to_b.ingress_endpoint {
             (&mut self.a_to_b, DirectionLabel::AtoB)
         } else if packet.endpoint == self.b_to_a.ingress_endpoint {
             (&mut self.b_to_a, DirectionLabel::BtoA)
         } else {
-            return false;
+            return Ingress::Refused;
+        };
+        let context = RefusalContext {
+            component: "fax-relay",
+            call_id: &self.call_id,
+            endpoint: packet.endpoint,
+            source: packet.source,
+            expected: direction.accepted_source,
         };
 
         // Layer 2 — the signalled-source gate. The `Redirect` arm of the UDP backend applies none of
         // its own on a non-ICE endpoint, so this is the only one there is.
         if !direction.accepted_source.accepts(packet.source.ip()) {
             direction.dropped += 1;
-            tracing::trace!(
-                target: "siphon_rtp::fax",
-                call_id = %self.call_id,
-                direction = peer.as_str(),
-                "udptl datagram from an unsignalled source dropped"
-            );
-            return false;
+            direction.refusals.log(Refusal::UnsignalledSource, context);
+            return Ingress::Refused;
         }
 
         // Layer 3 — the latch. Drop on reject, exactly as the `Forward` path drops, and before the
@@ -144,13 +151,8 @@ impl UdptlCall {
         // shape of the bug §4 layer 3 records as fixed once already for RTP.
         if direction.source_latch.admit(packet.source) == ReplyLatch::Reject {
             direction.dropped += 1;
-            tracing::debug!(
-                target: "siphon_rtp::fax",
-                call_id = %self.call_id,
-                direction = peer.as_str(),
-                "udptl datagram from a second source dropped; the fax stream is latched"
-            );
-            return false;
+            direction.refusals.log(Refusal::NewSource, context);
+            return Ingress::Refused;
         }
 
         // The reverse direction now replies to where this one's datagrams actually come from
@@ -169,10 +171,10 @@ impl UdptlCall {
             DirectionLabel::BtoA => &mut self.b_to_a,
         };
         // Never forward into the void: with no destination resolved the datagram is dropped, not
-        // guessed at. It still counts as accepted — it cleared both gates, so it is evidence the
-        // call is alive even though there is nowhere to send it yet.
+        // guessed at. It cleared both gates, so it is still evidence the call is alive even though
+        // there is nowhere to send it yet.
         let Some(dst) = direction.egress_dst else {
-            return true;
+            return Ingress::DroppedFromPeer;
         };
         direction.relayed += 1;
         out.push(Outbound {
@@ -180,7 +182,7 @@ impl UdptlCall {
             dst,
             data: Bytes::clone(&packet.data),
         });
-        true
+        Ingress::Accepted
     }
 
     /// The relay's per-direction counters, `(a→b, b→a)` as `(relayed, dropped)`.
@@ -193,20 +195,11 @@ impl UdptlCall {
     }
 }
 
-/// Which direction a datagram is travelling, for logging and for picking the reverse direction.
+/// Which direction a datagram is travelling, for picking the reverse direction.
 #[derive(Clone, Copy)]
 enum DirectionLabel {
     AtoB,
     BtoA,
-}
-
-impl DirectionLabel {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AtoB => "a->b",
-            Self::BtoA => "b->a",
-        }
-    }
 }
 
 /// What a running fax-relay actor accepts.
@@ -307,9 +300,8 @@ where
                 // Stamp activity only for a datagram that cleared both gates: the `Redirect` arm
                 // never touches the datapath's own `last_seen`, so without this a fax-only call
                 // (which by then carries no audio at all) would be reaped mid-transmission.
-                if call.process(&packet, &mut outbound) {
-                    datapath.note_activity(packet.endpoint);
-                }
+                call.process(&packet, &mut outbound)
+                    .record(&datapath, packet.endpoint);
                 for out in outbound.drain(..) {
                     if let Err(error) = datapath.send(out.endpoint, out.dst, &out.data).await {
                         tracing::debug!(
@@ -376,7 +368,7 @@ mod tests {
         let mut call = relay();
         let mut out = Vec::new();
         let packet = udptl(0);
-        assert!(call.process(&packet, &mut out));
+        assert!(call.process(&packet, &mut out).is_live());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].endpoint, endpoint(2));
         assert_eq!(out[0].dst, address("203.0.113.9:5004"));
@@ -392,7 +384,7 @@ mod tests {
         for sequence in [0x0000_u16, 0x1400, 0x4000, 0x8000, 0xbfff, 0xc000, 0xffff] {
             let mut out = Vec::new();
             assert!(
-                call.process(&udptl(sequence), &mut out),
+                call.process(&udptl(sequence), &mut out).is_live(),
                 "sequence {sequence:#06x} accepted"
             );
             assert_eq!(out.len(), 1, "sequence {sequence:#06x} relayed");
@@ -406,12 +398,12 @@ mod tests {
         let mut out = Vec::new();
         let mut spoofed = udptl(0);
         spoofed.source = address("192.0.2.66:5004");
-        assert!(!call.process(&spoofed, &mut out), "gated out");
+        assert!(!call.process(&spoofed, &mut out).is_live(), "gated out");
         assert!(out.is_empty(), "and never relayed");
 
         // The real peer still latches afterwards: a rejected spray leaves no trace.
         let mut out = Vec::new();
-        assert!(call.process(&udptl(0), &mut out));
+        assert!(call.process(&udptl(0), &mut out).is_live());
         assert_eq!(out.len(), 1);
         assert_eq!(call.counters()[0], (1, 1));
     }
@@ -437,7 +429,7 @@ mod tests {
         );
         let mut out = Vec::new();
         assert!(
-            call.process(&udptl(0), &mut out),
+            call.process(&udptl(0), &mut out).is_live(),
             "the first source latches"
         );
 
@@ -445,7 +437,7 @@ mod tests {
         racer.source = address("192.0.2.66:5004");
         let mut out = Vec::new();
         assert!(
-            !call.process(&racer, &mut out),
+            !call.process(&racer, &mut out).is_live(),
             "a racing second source is dropped even with the gate wide open"
         );
         assert!(out.is_empty());
@@ -471,13 +463,13 @@ mod tests {
             },
         );
         let mut out = Vec::new();
-        assert!(call.process(&udptl(0), &mut out));
+        assert!(call.process(&udptl(0), &mut out).is_live());
 
         let mut from_b = udptl(0);
         from_b.endpoint = endpoint(2);
         from_b.source = address("203.0.113.9:5004");
         let mut out = Vec::new();
-        assert!(call.process(&from_b, &mut out));
+        assert!(call.process(&from_b, &mut out).is_live());
         assert_eq!(out.len(), 1, "B's reply now has somewhere to go");
         assert_eq!(
             out[0].dst,
@@ -505,7 +497,7 @@ mod tests {
         );
         let mut out = Vec::new();
         assert!(
-            call.process(&udptl(0), &mut out),
+            call.process(&udptl(0), &mut out).is_live(),
             "accepted — it cleared both gates, so the call is alive"
         );
         assert!(out.is_empty(), "but there is nowhere to forward it");
@@ -518,7 +510,19 @@ mod tests {
         let mut out = Vec::new();
         let mut stray = udptl(0);
         stray.endpoint = endpoint(99);
-        assert!(!call.process(&stray, &mut out));
+        assert!(!call.process(&stray, &mut out).is_live());
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_datagram_with_nowhere_to_go_is_counted_as_dropped_but_keeps_the_call_alive() {
+        let mut call = relay();
+        call.b_to_a.egress_dst = None;
+        call.a_to_b.egress_dst = None;
+        let mut out = Vec::new();
+        let verdict = call.process(&udptl(0), &mut out);
+        assert_eq!(verdict, Ingress::DroppedFromPeer);
+        assert!(verdict.is_live() && verdict.is_dropped());
+        assert!(out.is_empty(), "never forwarded into the void");
     }
 }

@@ -1537,6 +1537,36 @@ call would be silently uninterceptable.
 The source gate (layer 2) runs before all of them, so no consumer ever sees a packet from an
 unsignalled source. See [Lawful interception](lawful-interception.md).
 
+## 10b. Every refusal is counted, on every path
+
+The `Forward` fast path counts its own drops. A `Redirect` endpoint does not: the datapath counts the
+datagram as received and hands it on, and admission is decided by the consumer. So every consumer —
+the media pipeline and its companion RTCP relays, the SDES and DTLS bridges, the conference (audio
+and text), the text relay, the fax relay and the WebSocket takeover — reports each datagram through
+`ingress::Ingress::record`, and `packets_dropped` means the same thing whichever path a leg is on.
+Before this, only the SDES bridge counted, so a locally answered leg whose peer signalled an address
+it never sent from ended with `packets_in` climbing, nothing sent and `packets_dropped: 0` — a number
+that read as evidence of absence precisely when it was not.
+
+The outcome has three values because two questions are being answered, not one:
+
+| `Ingress` | Liveness (layer 6) | `packets_dropped` | When |
+|---|---|---|---|
+| `Accepted` | yes | no | past every gate |
+| `DroppedFromPeer` | yes | yes | passed the source gate, then dropped: a failed SRTP authentication on the media or text pipeline, an unkeyed DTLS leg on the media pipeline, a fax datagram with no destination yet |
+| `Refused` | no | yes | an unsignalled source, a latch rejection, ICE not yet selected, an unowned endpoint |
+
+`DroppedFromPeer` keeps the liveness the media and text pipelines already gave an authentication
+failure from the signalled source (a rekey or reorder must not reap a live call). Counting it does not
+change what keeps a call alive; it only stops the drop being invisible. The conference and the
+WebSocket takeover never counted an authentication failure as liveness and still do not.
+
+A refusal is also logged once per flow and kind at `warn` (`ingress::RefusalLog`), naming the source
+the datagram came from and the gate it failed — the signal that a NATed peer is signalling its private
+address. Every later refusal of the same kind is `debug`, so a hostile stream cannot flood the log.
+SRTCP on a takeover leg is not counted: it has no consumer there and is discarded by design, and
+counting it would give every healthy secure call a drop every few seconds.
+
 ---
 
 ## 11. Built-in TURN server (RFC 5766) — the open-relay threat model

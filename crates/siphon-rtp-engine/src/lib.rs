@@ -23,6 +23,7 @@ mod dtls_session;
 pub mod engine;
 pub mod ha;
 pub mod ice;
+pub mod ingress;
 pub mod interface;
 pub mod media_fetch;
 pub mod media_pipeline;

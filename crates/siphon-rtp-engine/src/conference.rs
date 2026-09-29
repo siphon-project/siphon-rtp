@@ -46,6 +46,7 @@ use siphon_rtp_media::text_mixer::{
 use siphon_rtp_proto::{Event, PlayEndReason};
 use siphon_rtp_srtp::leg::SecureLeg;
 
+use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::media_pipeline::{Outbound, PlayRequest};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 
@@ -246,6 +247,8 @@ struct ParticipantText {
     latch: bool,
     /// SSRC-consistent symmetric latch for the text stream (its own, per-stream — §4 layer 3).
     reverse_latch: SymmetricLatch,
+    /// Which refusals of this stream's ingress have already been logged at `warn`.
+    refusals: RefusalLog,
     t140_payload_type: u8,
     red_payload_type: Option<u8>,
     /// The text egress SSRC (also this participant's source-identifier CSRC toward others).
@@ -276,6 +279,8 @@ struct Participant {
     /// SSRC-consistent — a forged/auth-failing or wrong-SSRC packet never moves the reply
     /// (docs/security-and-nat.md §4 layer 3; RFC 3550 §8).
     reverse_latch: SymmetricLatch,
+    /// Which refusals of this stream's ingress have already been logged at `warn`.
+    refusals: RefusalLog,
     /// This participant's codec sample rate, kept so its resamplers can be rebuilt if the room rate
     /// flips (e.g. a wideband leg joins an all-narrowband room).
     native_rate: u32,
@@ -660,6 +665,7 @@ impl Conference {
                     accepted_source: text.accepted_source,
                     latch: text.latch,
                     reverse_latch: SymmetricLatch::default(),
+                    refusals: RefusalLog::default(),
                     t140_payload_type: text.t140_payload_type,
                     red_payload_type: text.red_payload_type,
                     egress_ssrc: text.egress_ssrc,
@@ -681,6 +687,7 @@ impl Conference {
             accepted_source: config.accepted_source,
             latch: config.latch,
             reverse_latch: SymmetricLatch::default(),
+            refusals: RefusalLog::default(),
             native_rate,
             native_frame,
             tick_samples,
@@ -786,6 +793,7 @@ impl Conference {
         // The reply address is now ICE's decision. Re-arm the symmetric latch so a stale pre-ICE
         // observation cannot immediately move it back off the selected pair.
         participant.reverse_latch = SymmetricLatch::default();
+        participant.refusals = RefusalLog::default();
         participant.ice_pending = false;
         tracing::info!(
             target: "siphon_rtp::media",
@@ -802,7 +810,7 @@ impl Conference {
     /// authenticated, SSRC-consistent stream can move the reply address (§4 layer 3). Returns `true`
     /// if the packet passed the signalled-source gate (so the caller can stamp media activity for the
     /// timeout sweep) — RTCP and telephone-events count as activity even though they are not mixed.
-    pub fn ingest(&mut self, packet: &RxPacket) -> bool {
+    pub fn ingest(&mut self, packet: &RxPacket) -> Ingress {
         // RFC 4103 text arrives on a separate `m=text` endpoint. Route it to the T.140 path before the
         // audio lookup, so a T.140/RED packet is reassembled — never mis-decoded as an audio frame.
         if let Some(index) = self.participants.iter().position(|participant| {
@@ -819,36 +827,44 @@ impl Conference {
             .iter_mut()
             .find(|participant| participant.ingress_endpoint == packet.endpoint)
         else {
-            return false;
+            return Ingress::Refused;
+        };
+        let context = RefusalContext {
+            component: "conference",
+            call_id: conference_id,
+            endpoint: packet.endpoint,
+            source: packet.source,
+            expected: participant.accepted_source,
         };
         // Layer 2 — signalled-source gate (docs/security-and-nat.md §4): an unsignalled source never
         // enters the mix.
         if !participant.accepted_source.accepts(packet.source.ip()) {
-            tracing::debug!(
-                source = %packet.source,
-                conference = %conference_id,
-                "conference dropped packet from unsignalled source"
-            );
-            return false;
+            participant
+                .refusals
+                .log(Refusal::UnsignalledSource, context);
+            return Ingress::Refused;
         }
         // A DTLS seat whose handshake has not keyed it yet: drop. Decoding SRTP as if it were
-        // plaintext would mix noise into the room for every other participant.
+        // plaintext would mix noise into the room for every other participant. Not activity: the room
+        // has never had usable media from this seat.
         if participant.secure_pending {
-            return false;
+            return Ingress::Refused;
         }
         // A full-ICE seat before its agent has selected a pair: drop. Media must follow ICE's
         // decision, not race it — mixing in whatever arrives first is exactly the blind latch the
         // connectivity check exists to replace (RFC 8445 §7; docs/security-and-nat.md §4 layer 4).
         // Not counted as activity either: an unselected path is not a live one.
         if participant.ice_pending {
-            return false;
+            return Ingress::Refused;
         }
         // SRTP: decrypt a secure participant's packet first (the auth tag also proves authenticity —
         // a forged/replayed packet fails here and is dropped). Plain legs pass through untouched.
         let data: &[u8] = if let Some(secure) = participant.secure.as_mut() {
             self.clear_in.clear();
             if secure.unprotect(&packet.data, &mut self.clear_in).is_err() {
-                return false;
+                // Not activity either, as before: a seat whose media never authenticates is not live.
+                participant.refusals.log(Refusal::NotAuthenticated, context);
+                return Ingress::Refused;
             }
             &self.clear_in
         } else {
@@ -865,20 +881,15 @@ impl Conference {
                 .admit(packet.source, rtp_media_ssrc(data))
             {
                 ReplyLatch::Reject => {
-                    tracing::debug!(
-                        source = %packet.source,
-                        conference = %conference_id,
-                        "conference dropped a packet from a new source that could not prove it is \
-                         the latched stream"
-                    );
-                    return false;
+                    participant.refusals.log(Refusal::NewSource, context);
+                    return Ingress::Refused;
                 }
                 ReplyLatch::Accept(Some(dst)) => participant.egress_dst = dst,
                 ReplyLatch::Accept(None) => {}
             }
         }
         if data.len() < 2 {
-            return true; // gated in; too short to be audio, but the path is alive
+            return Ingress::Accepted; // gated in; too short to be audio, but the path is alive
         }
         // RFC 5761 demux: payload-type byte 64..=95 marks RTCP. We never mix it, but a Sender Report
         // carries the sender's NTP timestamp, which we echo back as LSR (+ DLSR) in our own reception
@@ -912,10 +923,10 @@ impl Conference {
                     }
                 }
             }
-            return true;
+            return Ingress::Accepted;
         }
         let Ok(parsed) = RtpPacket::parse(data) else {
-            return true;
+            return Ingress::Accepted;
         };
         // RFC 4733 telephone-event: never feed DTMF to the audio decoder (it would mangle the mix);
         // detect the key press and surface it on the control channel instead.
@@ -932,14 +943,14 @@ impl Conference {
                     source: None,
                 });
             }
-            return true;
+            return Ingress::Accepted;
         }
         if participant.leg.ingest_rtp(data).is_ok() {
             // Fold the receive-time arrival the datapath stamped into this leg's interarrival-jitter
             // estimate (RFC 3550 §6.4.1) — stamped at receive, so it reflects network, not queue, timing.
             participant.leg.observe_arrival(packet.arrival);
         }
-        true
+        Ingress::Accepted
     }
 
     /// Ingress one datagram for a participant's **text** endpoint (RFC 4103): gate its source, decrypt
@@ -952,24 +963,27 @@ impl Conference {
     /// reassembly/mix/latch runs on plaintext — exactly as the audio SDES leg decrypts before it mixes
     /// (RFC 3711; docs/security-and-nat.md §4). Returns `true` if the packet passed the source gate (so
     /// the actor stamps media activity for the timeout sweep).
-    fn ingest_text(&mut self, index: usize, packet: &RxPacket) -> bool {
+    fn ingest_text(&mut self, index: usize, packet: &RxPacket) -> Ingress {
         let mut recovered = false;
         let mut from_tag = String::new();
         {
             let participant = &mut self.participants[index];
             let Some(text) = participant.text.as_mut() else {
-                return false;
+                return Ingress::Refused;
             };
             // Layer 2 — signalled-source gate (§4): an unsignalled source never enters the room. The
             // gate runs on the wire source before any decrypt (a spoofed source never reaches the
             // crypto), exactly as the audio path gates before `unprotect`.
+            let context = RefusalContext {
+                component: "conference text",
+                call_id: &self.conference_id,
+                endpoint: packet.endpoint,
+                source: packet.source,
+                expected: text.accepted_source,
+            };
             if !text.accepted_source.accepts(packet.source.ip()) {
-                tracing::debug!(
-                    source = %packet.source,
-                    conference = %self.conference_id,
-                    "conference dropped text packet from unsignalled source"
-                );
-                return false;
+                text.refusals.log(Refusal::UnsignalledSource, context);
+                return Ingress::Refused;
             }
             // Secure (SDES-SRTP) text ingress: decrypt the SRTP packet first — the auth tag also proves
             // authenticity, so a forged/replayed packet fails here and is dropped fail-closed (never
@@ -980,12 +994,8 @@ impl Conference {
             let plaintext: &[u8] = if let Some(secure) = text.secure.as_mut() {
                 self.clear_in.clear();
                 if secure.unprotect(&packet.data, &mut self.clear_in).is_err() {
-                    tracing::debug!(
-                        source = %packet.source,
-                        conference = %self.conference_id,
-                        "conference dropped secure text packet failing SRTP auth/replay (fail-closed)"
-                    );
-                    return true;
+                    text.refusals.log(Refusal::NotAuthenticated, context);
+                    return Ingress::DroppedFromPeer;
                 }
                 &self.clear_in
             } else {
@@ -1001,27 +1011,22 @@ impl Conference {
                     .admit(packet.source, rtp_media_ssrc(plaintext))
                 {
                     ReplyLatch::Reject => {
-                        tracing::debug!(
-                            source = %packet.source,
-                            conference = %self.conference_id,
-                            "conference dropped a text packet from a new source that could not prove \
-                             it is the latched stream"
-                        );
-                        return false;
+                        text.refusals.log(Refusal::NewSource, context);
+                        return Ingress::Refused;
                     }
                     ReplyLatch::Accept(Some(dst)) => text.egress_dst = dst,
                     ReplyLatch::Accept(None) => {}
                 }
             }
             let Ok(parsed) = RtpPacket::parse(plaintext) else {
-                return true; // gated in; not a parseable RTP packet
+                return Ingress::Accepted; // gated in; not a parseable RTP packet
             };
             // Classify the payload: RED (RFC 2198) vs bare T.140 (RFC 4103 §4). Anything else on this
             // endpoint is gated-in but not distributed (it is not text).
             let is_red = Some(parsed.payload_type) == text.red_payload_type;
             let is_t140 = parsed.payload_type == text.t140_payload_type;
             if !is_red && !is_t140 {
-                return true;
+                return Ingress::Accepted;
             }
             match text.reassembler.on_packet(
                 parsed.sequence,
@@ -1037,7 +1042,7 @@ impl Conference {
                     from_tag = participant.tag.clone();
                 }
                 Ok(_) => {} // duplicate / reordered / idle keepalive / split char: nothing new
-                Err(_) => return true,
+                Err(_) => return Ingress::Accepted,
             }
         }
         if recovered {
@@ -1053,7 +1058,7 @@ impl Conference {
                 direction: None,
             });
         }
-        true
+        Ingress::Accepted
     }
 
     /// Advance the RFC 9071 text mix one flush (~300 ms — the second, text-only cadence): drain every
@@ -2132,9 +2137,7 @@ async fn run_conference<D>(
                     ConferenceInput::Packet(packet) => {
                         // Stamp media activity for the timeout sweep only when the packet passes the
                         // source gate (a spoofed spray must not keep an idle path alive).
-                        if conference.ingest(&packet) {
-                            datapath.note_activity(packet.endpoint);
-                        }
+                        conference.ingest(&packet).record(&datapath, packet.endpoint);
                         // Forward any detected DTMF (RFC 4733) to the control channel.
                         for event in conference.drain_events() {
                             if let Some(sink) = &events {
@@ -3243,7 +3246,7 @@ mod tests {
             let mut buffer = vec![0u8; 12 + written];
             let length = write_packet(&header, &payload[..written], &mut buffer).expect("write");
             buffer.truncate(length);
-            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", buffer)));
+            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", buffer)).is_live());
         }
 
         // Tick the room and collect what seat 1 (the listener) was sent.
@@ -3433,7 +3436,7 @@ mod tests {
             let mut buffer = vec![0u8; 13];
             let written = write_packet(&header, &[5u8], &mut buffer).expect("write");
             buffer.truncate(written);
-            assert!(room.ingest(&rx(1, "127.0.0.2:5000", buffer)));
+            assert!(room.ingest(&rx(1, "127.0.0.2:5000", buffer)).is_live());
         }
         for _ in 0..4 {
             room.tick(&mut out);
@@ -3587,16 +3590,20 @@ mod tests {
         assert!(conference.add_participant(ulaw_text_config(2, "10.0.0.3", "10.0.0.3:4000")));
 
         // A (source id 0x7000_0000) types "Hi"; B (0x7000_0001) types "Yo". C stays silent.
-        assert!(conference.ingest(&rx(
-            text_endpoint(0),
-            "10.0.0.1:6000",
-            text_red_rtp(0x1111, 1, 1000, b"Hi", &[]),
-        )));
-        assert!(conference.ingest(&rx(
-            text_endpoint(1),
-            "10.0.0.2:6000",
-            text_red_rtp(0x2222, 1, 1000, b"Yo", &[]),
-        )));
+        assert!(conference
+            .ingest(&rx(
+                text_endpoint(0),
+                "10.0.0.1:6000",
+                text_red_rtp(0x1111, 1, 1000, b"Hi", &[]),
+            ))
+            .is_live());
+        assert!(conference
+            .ingest(&rx(
+                text_endpoint(1),
+                "10.0.0.2:6000",
+                text_red_rtp(0x2222, 1, 1000, b"Yo", &[]),
+            ))
+            .is_live());
 
         let mut out = Vec::new();
         conference.text_tick(&mut out);
@@ -3680,11 +3687,13 @@ mod tests {
         assert!(conference.add_participant(ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000")));
         assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
         assert!(
-            !conference.ingest(&rx(
-                text_endpoint(0),
-                "10.9.9.9:6000", // not the signalled 10.0.0.1
-                text_red_rtp(0x1111, 1, 1000, b"attack", &[]),
-            )),
+            !conference
+                .ingest(&rx(
+                    text_endpoint(0),
+                    "10.9.9.9:6000", // not the signalled 10.0.0.1
+                    text_red_rtp(0x1111, 1, 1000, b"attack", &[]),
+                ))
+                .is_live(),
             "unsignalled source is gated out"
         );
         let mut out = Vec::new();
@@ -3796,7 +3805,9 @@ mod tests {
         a_encrypt
             .protect(&plaintext, &mut srtp_in)
             .expect("A encrypt");
-        assert!(conference.ingest(&rx(text_endpoint(0), "10.0.0.1:6000", srtp_in)));
+        assert!(conference
+            .ingest(&rx(text_endpoint(0), "10.0.0.1:6000", srtp_in))
+            .is_live());
 
         // The decrypted increment surfaces on the control channel (observe after decrypt).
         let text_events: Vec<String> = conference
@@ -3884,7 +3895,9 @@ mod tests {
         wrong
             .protect(&plaintext, &mut forged)
             .expect("encrypt wrong");
-        let accepted = conference.ingest(&rx(text_endpoint(0), "10.0.0.1:9999", forged));
+        let accepted = conference
+            .ingest(&rx(text_endpoint(0), "10.0.0.1:9999", forged))
+            .is_live();
         assert!(
             accepted,
             "the source is authentic + gated, so the path stays alive (no reap)"
@@ -3941,12 +3954,16 @@ mod tests {
         let mut a_encrypt = SrtpContext::from_key_material(&a_remote.key);
         let mut a_srtp = Vec::new();
         a_encrypt.protect(&a_plain, &mut a_srtp).expect("A encrypt");
-        assert!(conference.ingest(&rx(text_endpoint(0), "10.0.0.1:6000", a_srtp)));
-        assert!(conference.ingest(&rx(
-            text_endpoint(1),
-            "10.0.0.2:6000",
-            text_red_rtp(0x2222, 1, 2000, b"Yo", &[]),
-        )));
+        assert!(conference
+            .ingest(&rx(text_endpoint(0), "10.0.0.1:6000", a_srtp))
+            .is_live());
+        assert!(conference
+            .ingest(&rx(
+                text_endpoint(1),
+                "10.0.0.2:6000",
+                text_red_rtp(0x2222, 1, 2000, b"Yo", &[]),
+            ))
+            .is_live());
 
         let mut out = Vec::new();
         conference.text_tick(&mut out);
@@ -4142,7 +4159,9 @@ mod tests {
 
         let quiet = [0i16; 160];
         assert!(
-            conference.ingest(&rx(1, "10.0.0.1:7000", ulaw_rtp(0, 0, &quiet))),
+            conference
+                .ingest(&rx(1, "10.0.0.1:7000", ulaw_rtp(0, 0, &quiet)))
+                .is_live(),
             "party 0's own stream latches"
         );
         let loud = [6000i16; 160];
@@ -4150,7 +4169,7 @@ mod tests {
             let mut spray = ulaw_rtp(0, sequence, &loud);
             spray[8..12].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
             assert!(
-                !conference.ingest(&rx(1, "10.0.0.99:5000", spray)),
+                !conference.ingest(&rx(1, "10.0.0.99:5000", spray)).is_live(),
                 "a rejected source is not activity"
             );
         }
@@ -4513,7 +4532,9 @@ mod tests {
 
         // Only seat 0 sends; seat 1 stays silent, so it hears exactly seat 0's frame.
         for sequence in 0..10 {
-            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 1))));
+            assert!(conference
+                .ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 1)))
+                .is_live());
         }
         let mut out = Vec::new();
         for _ in 0..3 {
@@ -4571,7 +4592,9 @@ mod tests {
 
         // Drive the full-band talker (payload byte 60 → a constant 6000, loud enough for the VAD).
         for sequence in 0..10 {
-            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 60))));
+            assert!(conference
+                .ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 60)))
+                .is_live());
         }
         let mut out = Vec::new();
         for _ in 0..3 {
@@ -4654,7 +4677,9 @@ mod tests {
 
         // Only seat 0 speaks (level 6000, above the VAD threshold); seat 1 listens.
         for sequence in 0..30 {
-            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", probe_rtp(0, sequence, 60, 960))));
+            assert!(conference
+                .ingest(&rx(1, "10.0.0.1:5000", probe_rtp(0, sequence, 60, 960)))
+                .is_live());
         }
         let mut emitted = Vec::new();
         for _ in 0..12 {
@@ -4716,7 +4741,9 @@ mod tests {
         assert!(conference.add_participant(short_ptime));
 
         for sequence in 0..30 {
-            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", probe_rtp(0, sequence, 60, 960))));
+            assert!(conference
+                .ingest(&rx(1, "10.0.0.1:5000", probe_rtp(0, sequence, 60, 960)))
+                .is_live());
         }
         let mut emitted = 0usize;
         for _ in 0..6 {
@@ -4758,7 +4785,9 @@ mod tests {
 
         // Exactly four 60 ms packets = 240 ms of audio = 12 room ticks' worth.
         for sequence in 0..4 {
-            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", probe_rtp(0, sequence, 60, 2880))));
+            assert!(conference
+                .ingest(&rx(1, "10.0.0.1:5000", probe_rtp(0, sequence, 60, 2880)))
+                .is_live());
         }
         for _ in 0..12 {
             let mut out = Vec::new();
@@ -4807,7 +4836,9 @@ mod tests {
         let mut out = Vec::new();
         // Warm up past the jitter prime, then record every scratch capacity.
         for sequence in 0..60 {
-            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 60))));
+            assert!(conference
+                .ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 60)))
+                .is_live());
             out.clear();
             conference.tick(&mut out);
         }
@@ -4825,7 +4856,9 @@ mod tests {
         let payload = conference.payload.capacity();
 
         for sequence in 60..200 {
-            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 60))));
+            assert!(conference
+                .ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 60)))
+                .is_live());
             out.clear();
             conference.tick(&mut out);
         }
@@ -4870,11 +4903,13 @@ mod tests {
         // Levels 1000 / 2000 / 3000 (payload byte × 100), all above the VAD threshold.
         for sequence in 0..10 {
             for index in 0..3u8 {
-                assert!(conference.ingest(&rx(
-                    u64::from(index) + 1,
-                    &format!("10.0.0.{}:5000", index + 1),
-                    full_band_rtp(index as usize, sequence, (index + 1) * 10),
-                )));
+                assert!(conference
+                    .ingest(&rx(
+                        u64::from(index) + 1,
+                        &format!("10.0.0.{}:5000", index + 1),
+                        full_band_rtp(index as usize, sequence, (index + 1) * 10),
+                    ))
+                    .is_live());
             }
         }
         let mut out = Vec::new();
@@ -5065,7 +5100,7 @@ mod tests {
         let len = write_packet(&header, &event_payload, &mut buffer).expect("write");
         buffer.truncate(len);
 
-        assert!(conference.ingest(&rx(1, "10.0.0.1:5000", buffer)));
+        assert!(conference.ingest(&rx(1, "10.0.0.1:5000", buffer)).is_live());
         let events: Vec<Event> = conference.drain_events().collect();
         assert_eq!(events.len(), 1, "one DTMF event extracted");
         match &events[0] {
@@ -5492,7 +5527,9 @@ mod tests {
         assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
         assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
 
-        let gated_in = conference.ingest(&rx(1, "10.0.0.1:5000", ulaw_rtp(0, 1, &loud_frame())));
+        let gated_in = conference
+            .ingest(&rx(1, "10.0.0.1:5000", ulaw_rtp(0, 1, &loud_frame())))
+            .is_live();
         assert!(
             !gated_in,
             "a pending ICE seat's media is neither mixed nor counted as activity"
@@ -5540,7 +5577,9 @@ mod tests {
         );
 
         // And media now flows in.
-        assert!(conference.ingest(&rx(1, "203.0.113.9:60000", ulaw_rtp(0, 1, &loud_frame()))));
+        assert!(conference
+            .ingest(&rx(1, "203.0.113.9:60000", ulaw_rtp(0, 1, &loud_frame())))
+            .is_live());
     }
 
     #[test]
@@ -5552,7 +5591,9 @@ mod tests {
         conference.ice_selected("party-0", addr("203.0.113.9:60000"));
 
         assert!(
-            !conference.ingest(&rx(1, "198.51.100.7:5000", ulaw_rtp(0, 1, &loud_frame()))),
+            !conference
+                .ingest(&rx(1, "198.51.100.7:5000", ulaw_rtp(0, 1, &loud_frame())))
+                .is_live(),
             "a source ICE did not select must not reach the mix once a pair is chosen"
         );
     }

@@ -47,6 +47,7 @@ use dashmap::DashMap;
 use siphon_rtp_datapath::{rtp_media_ssrc, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_srtp::leg::{is_rtcp, SecureLeg};
 
+use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 
 /// The SRTP (RFC 3711) crypto of one secure WebSocket-takeover leg: the engine's own key material
@@ -166,11 +167,19 @@ impl WsSecureLeg {
 pub trait MediaActivity: Send + Sync {
     /// Stamp `endpoint` as having just received accepted media.
     fn stamp(&self, endpoint: EndpointId);
+
+    /// Count one datagram this leg dropped in `endpoint`'s `packets_dropped`
+    /// ([`Datapath::note_dropped`](siphon_rtp_datapath::Datapath::note_dropped)).
+    fn dropped(&self, endpoint: EndpointId);
 }
 
 impl<D: siphon_rtp_datapath::Datapath> MediaActivity for D {
     fn stamp(&self, endpoint: EndpointId) {
         siphon_rtp_datapath::Datapath::note_activity(self, endpoint);
+    }
+
+    fn dropped(&self, endpoint: EndpointId) {
+        siphon_rtp_datapath::Datapath::note_dropped(self, endpoint);
     }
 }
 
@@ -306,8 +315,13 @@ struct WsRoute {
     /// Where the bridge's rendered downlink is sent, and the latch that steers it — moved by this
     /// leg's own accepted media (symmetric RTP) or, on an ICE leg, by the agent's selection.
     egress: Arc<WsEgress>,
-    /// Stamps the endpoint's liveness for the engine's idle sweep on each accepted packet.
+    /// Stamps the endpoint's liveness for the engine's idle sweep on each accepted packet, and counts
+    /// each refused one.
     activity: Arc<dyn MediaActivity>,
+    /// The call this leg belongs to, for the refusal log.
+    call_id: String,
+    /// Which refusals of this leg's ingress have already been logged at `warn`.
+    refusals: RefusalLog,
 }
 
 /// The per-leg state a **re-point** ([`Command::AttachWsBridge`](siphon_rtp_proto::Command) on a
@@ -400,6 +414,8 @@ impl WsRegistry {
                 secure: plan.secure,
                 egress: plan.egress,
                 activity: plan.activity,
+                call_id: plan.call_id.clone(),
+                refusals: RefusalLog::default(),
             },
         );
         self.calls.insert(
@@ -476,20 +492,25 @@ impl WsRegistry {
         let Some(route) = self.routes.get(&packet.endpoint) else {
             return; // not a WS endpoint (the dispatcher should have routed it elsewhere)
         };
+        let context = RefusalContext {
+            component: "ws-bridge",
+            call_id: &route.call_id,
+            endpoint: packet.endpoint,
+            source: packet.source,
+            expected: route.accepted_source,
+        };
         if route.ice_pending {
             // RFC 8445 §12: nothing crosses the leg until the agent has chosen a pair.
             tracing::trace!(
                 endpoint = ?packet.endpoint,
                 "ws-bridge dropped media on a leg whose ICE agent has not selected a pair yet"
             );
+            route.activity.dropped(packet.endpoint);
             return;
         }
         if !route.accepted_source.accepts(packet.source.ip()) {
-            tracing::debug!(
-                endpoint = ?packet.endpoint,
-                source = %packet.source,
-                "ws-bridge dropped packet from unsignalled source"
-            );
+            route.refusals.log(Refusal::UnsignalledSource, context);
+            route.activity.dropped(packet.endpoint);
             return;
         }
         // A secure takeover leg terminates SRTP here (RFC 3711): the bridge below speaks clear RTP,
@@ -498,7 +519,19 @@ impl WsRegistry {
             None => packet.data,
             Some(secure) => match secure.unprotect_ingress(&packet.data) {
                 Some(plain) => plain,
-                None => return,
+                None => {
+                    // SRTCP has no consumer on a takeover leg and is dropped by design, so it is
+                    // neither a refusal nor a drop worth counting — a healthy call would otherwise
+                    // show one every few seconds. Anything else was unkeyed (a DTLS leg mid-handshake)
+                    // or failed authentication: not liveness, as before, and counted.
+                    if !is_rtcp(&packet.data) {
+                        if secure.is_keyed() {
+                            route.refusals.log(Refusal::NotAuthenticated, context);
+                        }
+                        route.activity.dropped(packet.endpoint);
+                    }
+                    return;
+                }
             },
         };
         // Symmetric-RTP latch (docs/security-and-nat.md §4 layer 3): aim the downlink at the source
@@ -512,12 +545,8 @@ impl WsRegistry {
         // no reverse relay direction and no forward rule, so a destination the signalling got wrong
         // stays wrong for the life of the call unless it is fixed here.
         if !route.egress.admit_ingress(packet.source, &payload) {
-            tracing::debug!(
-                endpoint = ?packet.endpoint,
-                source = %packet.source,
-                "ws-bridge dropped a datagram from a new source that could not prove it is the \
-                 latched stream"
-            );
+            route.refusals.log(Refusal::NewSource, context);
+            route.activity.dropped(packet.endpoint);
             return;
         }
         // The packet is accepted: it cleared the source gate, SRTP authentication on a secure leg,
@@ -537,6 +566,7 @@ impl WsRegistry {
             tracing::trace!(
                 "ws-bridge rtp-in mailbox full or closed; dropping redirected datagram"
             );
+            route.activity.dropped(packet.endpoint);
         }
     }
 
@@ -609,17 +639,26 @@ mod tests {
     #[derive(Default)]
     struct CountingActivity {
         stamps: std::sync::atomic::AtomicUsize,
+        drops: std::sync::atomic::AtomicUsize,
     }
 
     impl CountingActivity {
         fn count(&self) -> usize {
             self.stamps.load(Ordering::SeqCst)
         }
+
+        fn dropped_count(&self) -> usize {
+            self.drops.load(Ordering::SeqCst)
+        }
     }
 
     impl MediaActivity for CountingActivity {
         fn stamp(&self, _endpoint: EndpointId) {
             self.stamps.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn dropped(&self, _endpoint: EndpointId) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -973,6 +1012,7 @@ mod tests {
 
         registry.dispatch(rx(1, "127.0.0.2:41000", &rtp_packet(1, 0x0A0A_0A0A)));
         assert_eq!(activity.count(), 1, "an accepted packet marks the leg live");
+        assert_eq!(activity.dropped_count(), 0, "and is not a drop");
         assert!(rtp_in_rx.try_recv().is_ok(), "and still reaches the bridge");
 
         let _ = registry.deregister("live");
@@ -996,6 +1036,7 @@ mod tests {
         registry.register(registration);
         registry.dispatch(rx(1, "198.51.100.7:41000", &rtp_packet(1, 0x0A0A_0A0A)));
         assert_eq!(gated.count(), 0, "an off-source packet is not liveness");
+        assert_eq!(gated.dropped_count(), 1, "but it is counted as dropped");
 
         // Before an ICE agent has selected a pair, nothing crosses the leg — including this.
         let (rtp_in_tx, _rtp_in_rx2) = flume::unbounded::<Bytes>();
@@ -1005,6 +1046,7 @@ mod tests {
         registry.register(registration);
         registry.dispatch(rx(2, "127.0.0.2:41000", &rtp_packet(1, 0x0A0A_0A0A)));
         assert_eq!(pending.count(), 0, "nothing crosses an unselected ICE leg");
+        assert_eq!(pending.dropped_count(), 1);
 
         // A forged packet on a secure leg fails RFC 3711 §3.3 and must not count either.
         let (engine_leg, _peer) = secure_pair();
@@ -1019,6 +1061,15 @@ mod tests {
             0,
             "a packet that fails SRTP authentication is not liveness"
         );
+        assert_eq!(secure.dropped_count(), 1, "and is counted as dropped");
+        // SRTCP has no consumer on a takeover leg and is discarded by design; counting it would give
+        // every healthy secure call a drop every few seconds.
+        registry.dispatch(rx(
+            3,
+            "127.0.0.3:41000",
+            &[0x80, 200, 0x00, 0x06, 0, 0, 0, 1],
+        ));
+        assert_eq!(secure.dropped_count(), 1, "RTCP is not counted as a drop");
 
         for call_id in ["gated", "ice", "secure"] {
             let _ = registry.deregister(call_id);
