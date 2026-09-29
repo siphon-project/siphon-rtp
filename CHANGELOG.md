@@ -40,7 +40,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   own lifetime and demotes it on detach. A secure caller toward a plain callee has no decoding pipeline,
   so a tee on that answer is refused up front as `secure-offerer-unsupported` rather than answering on
   the bridge and failing the tee. `fax_passthrough` now refuses `ws_tee` in the profile, like every
-  other flag that decodes. A tee attached mid-call to a crypto bridge is still refused.
+  other flag that decodes.
+- **A tee can be attached mid-call to a crypto bridge.** `attach_ws_tee` refused an SDES or DTLS-SRTP
+  bridge because the bridge relays without decoding. The tee now takes the plaintext the bridge
+  already holds between its two transforms, where the lawful-interception tap sits, and decodes it
+  in a task of its own. The bridge keeps relaying, nothing is re-keyed, and detaching the tee takes
+  the tap off again.
 
 ## [0.9.1] — 2026-09-27
 

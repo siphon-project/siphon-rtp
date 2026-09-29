@@ -208,6 +208,9 @@ struct Flow {
     /// Where RTCP decrypted on this flow goes when the plain peer has a separate RTCP port: that
     /// endpoint and the peer's RTCP address. `None` sends RTCP wherever RTP goes.
     rtcp_out: Option<(EndpointId, SocketAddr)>,
+    /// A WebSocket tee's tap on this endpoint's plaintext RTP ([`DtlsBridge::set_plain_tap`]). The
+    /// bridge never decodes, so a tee on a bridged call decodes this copy in its own task.
+    plain_tap: Option<flume::Sender<bytes::Bytes>>,
 }
 
 /// Copy an ICE-gated leg's validated source into its DTLS destination for as long as the association
@@ -406,6 +409,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             secure,
             // X3 content is the call's media, tapped on the RTP endpoints; RTCP is not content.
             x3: None,
+            plain_tap: None,
             rtcp_only: true,
             rtcp_out: None,
         }
@@ -584,6 +588,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure_dst: Some(destination.clone()),
                 secure: secure.clone(),
                 x3: None,
+                plain_tap: None,
                 rtcp_only: false,
                 rtcp_out: None,
             },
@@ -611,6 +616,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure_dst: None,
                 secure,
                 x3: None,
+                plain_tap: None,
                 rtcp_only: false,
                 // Decrypted RTCP goes to the plain peer's own RTCP port when it has one.
                 rtcp_out: plan.plain_rtcp.map(|rtcp| (rtcp.endpoint, rtcp.dst)),
@@ -686,6 +692,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure_dst: Some(destination.clone()),
                 secure: Arc::new(Mutex::new(None)),
                 x3: None,
+                plain_tap: None,
                 // The per-call actor relays RTCP itself (`plan.plain_rtcp` is not used here).
                 rtcp_only: false,
                 rtcp_out: None,
@@ -752,6 +759,24 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         true
     }
 
+    /// Install or remove a WebSocket tee's plaintext tap on one relaying flow (see
+    /// `SrtpBridge::set_plain_tap`). A pipeline flow hands its media to an actor that decodes it
+    /// anyway, so it takes none. Returns whether the flow took it.
+    pub fn set_plain_tap(
+        &self,
+        endpoint: EndpointId,
+        tap: Option<flume::Sender<bytes::Bytes>>,
+    ) -> bool {
+        let Some(mut flow) = self.flows.get_mut(&endpoint) else {
+            return false;
+        };
+        if matches!(flow.direction, Direction::Pipeline { .. }) {
+            return false;
+        }
+        flow.plain_tap = tap;
+        true
+    }
+
     /// Remove the lawful-interception tap from one bridged endpoint. Idempotent.
     pub fn clear_x3_tap(&self, endpoint: EndpointId) {
         if let Some(mut flow) = self.flows.get_mut(&endpoint) {
@@ -769,6 +794,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             out_dst,
             secure,
             x3,
+            plain_tap,
             rtcp_only,
             rtcp_out,
         )) = self.flows.get(&packet.endpoint).map(|flow| {
@@ -782,6 +808,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                     .or_else(|| flow.secure_dst.as_ref().and_then(|dst| *dst.borrow())),
                 flow.secure.clone(),
                 flow.x3.clone(),
+                flow.plain_tap.clone(),
                 flow.rtcp_only,
                 flow.rtcp_out,
             )
@@ -879,12 +906,18 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         // transform is plaintext — the same placement as the SDES bridge. Reached only after the
         // source gate, after the leg is keyed, and after the crypto succeeded, so an unkeyed,
         // forged or replayed packet is never delivered.
+        let plaintext = match direction {
+            Direction::Encrypt => packet.data.as_ref(),
+            Direction::Decrypt { .. } | Direction::Pipeline { .. } => out.as_slice(),
+        };
         if let Some(x3) = &x3 {
-            let plaintext = match direction {
-                Direction::Encrypt => packet.data.as_ref(),
-                Direction::Decrypt { .. } | Direction::Pipeline { .. } => out.as_slice(),
-            };
             x3.deliver(packet.source, packet.arrival, plaintext);
+        }
+        // A WebSocket tee's copy of the same plaintext (the SDES bridge taps identically).
+        if let Some(tap) = &plain_tap {
+            if kind != PacketKind::Rtcp {
+                let _ = tap.try_send(bytes::Bytes::copy_from_slice(plaintext));
+            }
         }
 
         if let Err(error) = self.datapath.send(out_endpoint, out_dst, &out).await {

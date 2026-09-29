@@ -1524,7 +1524,7 @@ incidental — they are the security property of each consumer:
 |---|---|---|
 | pcap recording (`start recording`) | before `Direction::handle` | the **verbatim wire bytes**, so on a secure leg it records ciphertext — correct for debugging, since the point is to capture what was on the wire |
 | SIPREC raw tee (`subscribe_*`) | in `handle`, after decrypt | plaintext, pre-transcode |
-| WebSocket tee (`attach_ws_tee`) | post-decode fan-out | decoded PCM |
+| WebSocket tee (`attach_ws_tee`) | post-decode fan-out; on a crypto bridge, between the bridge's transforms | decoded PCM — on a bridge, decoded by the tee's own task from the plaintext RTP the engine **accepted** (after the gate, the latch and the crypto), exactly where the X3 tap sits |
 | **Lawful interception (`attach_x3`)** | in `handle` after decrypt **and** after the authentication decision; plus both crypto bridges | plaintext RTP the engine **accepted** |
 
 The X3 tap is the strictest, and deliberately so. It must never deliver ciphertext (the agency has

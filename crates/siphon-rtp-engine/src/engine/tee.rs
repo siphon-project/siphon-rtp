@@ -32,6 +32,10 @@ pub(super) struct WsTee {
     /// Set once an end event has been emitted for this tee, so the controller sees exactly one
     /// `ws_tee_ended` whether the server or the detach won the race.
     ended: Arc<std::sync::atomic::AtomicBool>,
+    /// On a crypto-bridged call: each tapped endpoint and the task decoding its plaintext for the
+    /// tee (see [`run_bridge_tee_decoder`]). Empty on a pipeline call, whose sinks sit on the actor's
+    /// own post-decode fan-out.
+    bridge_taps: Vec<(siphon_rtp_datapath::EndpointId, tokio::task::JoinHandle<()>)>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -85,9 +89,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         sample_rate: Option<u32>,
     ) -> Result<(), String> {
         use siphon_rtp_media::bridge::protocol::{Encoding, Endianness};
-        use siphon_rtp_media::bridge::tee::{
-            plan_ws_tee, tee_start_message, TeeChannel, WsTeeSink,
-        };
+        use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
         use siphon_rtp_media::bridge::wire_rate::{validate_wire_sample_rate, wire_resampler};
 
         // A WS-takeover call's media is bridged to its own server and never reaches the pipeline, and a
@@ -102,21 +104,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .to_string(),
             );
         }
-        if pipeline.is_crypto_bridge() {
-            // The crypto *bridges* relay ciphertext without ever decoding it, so there is no
-            // post-decode fan-out to tap. Note this rejects only the bridge kinds: a secure call that
-            // runs through the media pipeline (`SrtpMedia` / `DtlsMedia`) decodes like any other and
-            // tees fine — for DTLS that is exactly what WP-R4 unlocked.
-            // A bridge cannot be converted to its decoding twin mid-call, so the tee has to be named
-            // on the answer (`ProfileFlags::ws_tee`), where `resolve_pipeline_kind` counts it as a
-            // reason to decode.
-            return Err(
-                "teeing a secure crypto-bridge call is not supported — the bridge relays \
-                 ciphertext without decoding; name ws_tee on the answer to have the call decoded \
-                 from the start"
-                    .to_string(),
-            );
-        }
+        // A crypto *bridge* relays without decoding, so it has no post-decode fan-out to tap. It
+        // does hold each party's plaintext between its two transforms — where lawful interception
+        // taps too — so the tee takes a copy of that and decodes it in a task of its own. The bridge
+        // keeps relaying untouched: nothing is re-keyed and the call is not rebuilt.
+        let bridged = pipeline.is_crypto_bridge();
 
         // Which legs feed the tee. A single-leg (offer-only / local-answer) call has no callee, so a
         // `both` request degrades to the caller's monologue rather than stalling on a channel that
@@ -125,7 +117,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // (the media registry's equal-endpoints test only exists once an actor is up), and it covers
         // both single-leg shapes: `answer_local` has no far leg at all, an unanswered offer has one
         // with no peer.
-        let (near_codec, far_codec, two_leg) = self
+        let (near_codec, far_codec, two_leg, near_endpoint, far_endpoint) = self
             .owned_call_internal(call_id, |call| {
                 (
                     call.near_codec.clone(),
@@ -133,6 +125,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.far
                         .as_ref()
                         .is_some_and(|far| far.remote_rtp.is_some()),
+                    call.near.rtp.id,
+                    call.far.as_ref().map(|far| far.rtp.id),
                 )
             })
             .ok_or_else(|| "call no longer exists".to_string())?;
@@ -205,6 +199,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             tap_plan.push((source_a, channel, resampler));
         }
 
+        // On a bridge, each tapped leg is decoded here, so its decoder has to exist before anything
+        // is dialled — a codec this build cannot decode is a clean refusal on an untouched call.
+        let mut bridge_decoders = Vec::new();
+        if bridged {
+            for (source_a, _, _) in &tap_plan {
+                let (codec, endpoint) = if *source_a {
+                    (near_codec.as_ref(), Some(near_endpoint))
+                } else {
+                    (far_codec.as_ref(), far_endpoint)
+                };
+                let (Some(codec), Some(endpoint)) = (codec, endpoint) else {
+                    return Err("a tapped leg has no negotiated codec".to_string());
+                };
+                let decoder = siphon_rtp_codec::factory::decoder_for(codec)
+                    .map_err(|error| format!("decode {}: {error}", codec.encoding_name))?;
+                bridge_decoders.push((endpoint, decoder, codec.payload_type));
+            }
+        }
+
         let plan = plan_ws_tee(format, stereo_source, !tap_caller);
         let stream_id = format!("tee-{call_id}");
 
@@ -220,6 +233,68 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // post-decode fan-out a tee taps would stay dry. Rebuild it as a processing actor first. The
         // raw SIPREC tee is copied in `Direction::handle` *before* the relay/transcode split, so it is
         // unaffected by the decode; the subscriptions' tees are re-attached to the new actor.
+        let mut bridge_taps = Vec::new();
+        let mut tapped_legs = Vec::new();
+        if bridged {
+            for ((source_a, channel, resampler), (endpoint, decoder, payload_type)) in
+                tap_plan.into_iter().zip(bridge_decoders)
+            {
+                let sink =
+                    WsTeeSink::new(channel, plan.mixer.clone(), stream_id.clone(), resampler);
+                let (packets, received) = flume::bounded(BRIDGE_TEE_QUEUE);
+                if !self.bridge.set_plain_tap(endpoint, Some(packets)) {
+                    for (attached, task) in bridge_taps.drain(..) {
+                        self.bridge.set_plain_tap(attached, None);
+                        let _ = task.await;
+                    }
+                    return Err("the call's crypto bridge is no longer installed".to_string());
+                }
+                let task = tokio::spawn(run_bridge_tee_decoder(
+                    received,
+                    decoder,
+                    payload_type,
+                    sink,
+                ));
+                bridge_taps.push((endpoint, task));
+                tapped_legs.push(source_a);
+            }
+        } else {
+            self.attach_pipeline_tee(call_id, &stream_id, &plan, tap_plan, &mut tapped_legs)
+                .await?;
+        }
+
+        // Replacing an existing tee: detach the old one first so its sinks and task go away.
+        if self.ws_tees.contains_key(call_id) {
+            self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+        }
+        self.announce_ws_tee(
+            call_id,
+            ws_uri,
+            TeeShape {
+                direction,
+                channels: wire_channels,
+                sample_rate: wire_rate,
+            },
+            (socket, plan, stream_id),
+            (tapped_legs, bridge_taps),
+        )
+    }
+
+    /// Attach a tee's sinks to the call's media actor, holding the call in a processing pipeline for
+    /// the tee's lifetime.
+    async fn attach_pipeline_tee(
+        &self,
+        call_id: &str,
+        stream_id: &str,
+        plan: &siphon_rtp_media::bridge::tee::WsTeePlan,
+        tap_plan: Vec<(
+            bool,
+            siphon_rtp_media::bridge::tee::TeeChannel,
+            Option<siphon_rtp_dsp::resample::Resampler>,
+        )>,
+        tapped_legs: &mut Vec<bool>,
+    ) -> Result<(), String> {
+        use siphon_rtp_media::bridge::tee::WsTeeSink;
         if self.media.is_relay_call(call_id) {
             self.upgrade_relay_to_processing(call_id).await?;
         }
@@ -228,9 +303,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .await?;
 
         // Attach one sink per tapped leg, carrying the conversion into the wire rate built above.
-        let mut tapped_legs = Vec::new();
         for (source_a, channel, resampler) in tap_plan {
-            let sink = WsTeeSink::new(channel, plan.mixer.clone(), stream_id.clone(), resampler);
+            let sink = WsTeeSink::new(
+                channel,
+                plan.mixer.clone(),
+                stream_id.to_string(),
+                resampler,
+            );
             if !self.media.control(
                 call_id,
                 MediaControl::AddFork {
@@ -239,12 +318,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 },
             ) {
                 // Unwind: drop whatever we already attached and release the hold.
-                for attached in &tapped_legs {
+                for attached in tapped_legs.iter() {
                     self.media.control(
                         call_id,
                         MediaControl::RemoveForkTagged {
                             source_a: *attached,
-                            tag: stream_id.clone(),
+                            tag: stream_id.to_string(),
                         },
                     );
                 }
@@ -255,11 +334,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             tapped_legs.push(source_a);
         }
 
-        // Replacing an existing tee: detach the old one first so its sinks and task go away.
-        if self.ws_tees.contains_key(call_id) {
-            self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
-        }
+        Ok(())
+    }
 
+    /// Announce a tee whose sinks are attached, start its transport, and register it: shared by the
+    /// pipeline and the bridge paths, which differ only in where the audio comes from.
+    fn announce_ws_tee(
+        &self,
+        call_id: &str,
+        ws_uri: &str,
+        shape: TeeShape,
+        (socket, plan, stream_id): (TeeSocket, siphon_rtp_media::bridge::tee::WsTeePlan, String),
+        (tapped_legs, bridge_taps): (
+            Vec<bool>,
+            Vec<(siphon_rtp_datapath::EndpointId, tokio::task::JoinHandle<()>)>,
+        ),
+    ) -> Result<(), String> {
+        use siphon_rtp_media::bridge::tee::tee_start_message;
+        let TeeShape {
+            direction,
+            channels: wire_channels,
+            sample_rate: wire_rate,
+        } = shape;
         let (owner, from_tag) = self
             .owned_call_internal(call_id, |call| (call.owner, call.from_tag.clone()))
             .ok_or_else(|| "call no longer exists".to_string())?;
@@ -331,6 +427,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 tapped_legs,
                 transport,
                 ended,
+                bridge_taps,
             },
         );
         tracing::info!(
@@ -465,6 +562,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some((_, tee)) = self.ws_tees.remove(call_id) else {
             return;
         };
+        // A bridged call's tee: take the taps off the bridge, which drops each decoder's feed, and
+        // wait for the decoders to drain and finish. No hold was taken, so none is released below.
+        let bridged = !tee.bridge_taps.is_empty();
+        for (endpoint, task) in tee.bridge_taps {
+            self.bridge.set_plain_tap(endpoint, None);
+            let _ = task.await;
+        }
         for source_a in &tee.tapped_legs {
             self.media.control(
                 call_id,
@@ -494,9 +598,60 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             reason,
             &tee.mixer,
         );
-        self.release_userspace_hold(call_id, PromotionReason::WsTee)
-            .await;
+        if !bridged {
+            self.release_userspace_hold(call_id, PromotionReason::WsTee)
+                .await;
+        }
     }
+}
+
+/// The dialled tee connection, named so the dial and the transport task can be split.
+type TeeSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The negotiated shape a tee announces in `ws_tee_started`.
+struct TeeShape {
+    direction: WsTeeDirection,
+    channels: u8,
+    sample_rate: u32,
+}
+
+/// How many plaintext datagrams a bridged tee's decoder may fall behind by before the bridge drops
+/// them for it: about a second of 20 ms packets. The bridge never waits on the tee.
+const BRIDGE_TEE_QUEUE: usize = 64;
+
+/// Decode a crypto bridge's plaintext RTP for a tee. The bridge relays without decoding, so this is
+/// the leg's one decode — the "never a second decode" rule the pipeline tee keeps is kept here too.
+/// Each packet is decoded as it arrives, as the pipeline's fan-out does; a lost packet is a gap. Only
+/// the leg's audio payload type is decoded: telephone-events and comfort noise are not audio to tee.
+async fn run_bridge_tee_decoder(
+    packets: flume::Receiver<bytes::Bytes>,
+    mut decoder: Box<dyn siphon_rtp_codec::Decoder>,
+    payload_type: u8,
+    mut sink: siphon_rtp_media::bridge::tee::WsTeeSink,
+) {
+    use siphon_rtp_media::fanout::MediaSink;
+    let channels = decoder.params().channels.max(1);
+    // Interleaved 48 kHz × 120 ms stereo — the largest frame any supported decoder produces.
+    let mut decoded = vec![0i16; 48 * 120 * 2];
+    while let Ok(packet) = packets.recv_async().await {
+        let Ok(parsed) = siphon_rtp_media::rtp::RtpPacket::parse(&packet) else {
+            continue;
+        };
+        if parsed.payload_type != payload_type {
+            continue;
+        }
+        match decoder.decode(parsed.payload, &mut decoded) {
+            Ok(samples) => {
+                let mono = siphon_rtp_codec::downmix_to_mono(&mut decoded[..samples], channels);
+                sink.write_pcm(&decoded[..mono]);
+            }
+            Err(error) => {
+                tracing::debug!(%error, "bridged tee dropped an undecodable frame");
+            }
+        }
+    }
+    sink.finish();
 }
 
 /// Emit a tee's [`Event::WsTeeEnded`] **exactly once**, whichever of the transport task or a detach

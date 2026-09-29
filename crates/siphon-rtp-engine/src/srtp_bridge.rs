@@ -128,6 +128,9 @@ struct Flow {
     /// about it once per negotiation rather than 50 times a second. Every such datagram is still
     /// counted in the endpoint's `packets_dropped`.
     auth_failure_reported: AtomicBool,
+    /// A WebSocket tee's tap on this endpoint's plaintext RTP ([`SrtpBridge::set_plain_tap`]). The
+    /// bridge never decodes, so a tee on a bridged call decodes this copy in its own task.
+    plain_tap: Option<flume::Sender<bytes::Bytes>>,
 }
 
 /// The bridge registry: redirected endpoint → its `Flow`. Shared (`Arc`) between the control path
@@ -228,6 +231,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     ingress_leg,
                     egress_leg,
                     x3: None,
+                    plain_tap: None,
                     auth_failure_reported: AtomicBool::new(false),
                 },
             );
@@ -353,6 +357,21 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         self.dtls.clear_x3_tap(endpoint);
     }
 
+    /// Install (`Some`) or remove (`None`) a WebSocket tee's tap on one bridged endpoint: every
+    /// plaintext RTP datagram the endpoint's peer sends, after its crypto, is offered to it. Whichever
+    /// bridge — SDES or DTLS — owns the endpoint takes it. Returns whether one did.
+    pub fn set_plain_tap(
+        &self,
+        endpoint: EndpointId,
+        tap: Option<flume::Sender<bytes::Bytes>>,
+    ) -> bool {
+        if let Some(mut flow) = self.flows.get_mut(&endpoint) {
+            flow.plain_tap = tap;
+            return true;
+        }
+        self.dtls.set_plain_tap(endpoint, tap)
+    }
+
     /// Log a secure peer's datagram that failed to decrypt. A replay is routine and stays at `debug`;
     /// anything else (a wrong key, an MKI the key does not carry, a truncated packet) means this
     /// direction of the call is inaudible, so the first one per flow is a `warn`, once.
@@ -395,18 +414,27 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             return;
         }
         // Snapshot the flow and release the map guard before any crypto or `.await`.
-        let Some((accepted_source, latch, out_endpoint, out_dst, ingress_leg, egress_leg, x3)) =
-            self.flows.get(&packet.endpoint).map(|flow| {
-                (
-                    flow.accepted_source,
-                    flow.latch.clone(),
-                    flow.out_endpoint,
-                    flow.out_dst,
-                    flow.ingress_leg.clone(),
-                    flow.egress_leg.clone(),
-                    flow.x3.clone(),
-                )
-            })
+        let Some((
+            accepted_source,
+            latch,
+            out_endpoint,
+            out_dst,
+            ingress_leg,
+            egress_leg,
+            x3,
+            plain_tap,
+        )) = self.flows.get(&packet.endpoint).map(|flow| {
+            (
+                flow.accepted_source,
+                flow.latch.clone(),
+                flow.out_endpoint,
+                flow.out_dst,
+                flow.ingress_leg.clone(),
+                flow.egress_leg.clone(),
+                flow.x3.clone(),
+                flow.plain_tap.clone(),
+            )
+        })
         else {
             return; // not a bridge endpoint (dispatcher should have routed it elsewhere)
         };
@@ -532,6 +560,13 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         // replayed packet — which returns above — is never delivered.
         if let Some(x3) = &x3 {
             x3.deliver(packet.source, packet.arrival, plaintext);
+        }
+        // A WebSocket tee's copy, from the same place and for the same reason: the only plaintext.
+        // Dropped rather than queued when the tee falls behind — late audio is worthless.
+        if let Some(tap) = &plain_tap {
+            if !siphon_rtp_srtp::leg::is_rtcp(plaintext) {
+                let _ = tap.try_send(bytes::Bytes::copy_from_slice(plaintext));
+            }
         }
 
         // Prefer where the peer's own flow saw its media come from over the address it signalled —
