@@ -27546,3 +27546,340 @@ async fn detaching_a_dtls_keyed_takeover_is_refused_before_anything_stops() {
         "the bot keeps the call"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bot_can_take_over_a_leg_the_engine_answered_and_hand_it_back() {
+    // The engine answers first (a menu, a queue, a supervisor's prompt), a bot joins the live call,
+    // and later hands it back. Every call a controller answers locally is this shape, so a bot that
+    // could only be named at answer time could never join a call already up.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "anchor-bot".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let caller_target = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer sdp")
+        .remote_rtp;
+    assert!(engine.media().is_media_call("anchor-bot"));
+
+    let (ws_uri, frames, _down) = takeover_ws_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "anchor-bot".into(),
+                from_tag: "tag-a".into(),
+                ws_uri,
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    assert!(engine.ws().is_ws_call("anchor-bot"));
+    assert!(
+        !engine.media().is_media_call("anchor-bot"),
+        "the pipeline is stopped, not left running alongside the bot"
+    );
+    let _ = expect_bridge_start(&frames).await;
+    for sequence in 0..12u16 {
+        phone_a
+            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), caller_target)
+            .await
+            .expect("caller send");
+    }
+    assert_eq!(
+        expect_bridge_uplink(&frames).await.len(),
+        320,
+        "the bot hears the caller"
+    );
+
+    let detached = engine
+        .handle(
+            CLIENT,
+            Command::DetachWsBridge {
+                call_id: "anchor-bot".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+    assert!(
+        engine.media().is_media_call("anchor-bot"),
+        "back on the pipeline"
+    );
+    let samples = record_caller_while(&engine, &events, "anchor-bot", async {
+        for sequence in 12..22u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), caller_target)
+                .await
+                .expect("caller send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        samples.iter().any(|&sample| sample != 0),
+        "and the engine hears the caller again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bot_taking_over_a_secure_anchor_continues_its_srtp_context() {
+    // The SDES context moves from the pipeline to the bot's leg rather than being re-derived, so the
+    // caller's continuing SRTP still authenticates and the bot's downlink still decrypts under the
+    // key the answer advertised.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_media::bridge::pcm_to_l16_le;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let peer_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("peer key");
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "secure-anchor-bot".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &peer_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = sdp::parse(&ok_sdp_text(&answered)).expect("answer sdp");
+    let engine_key = answer.crypto.first().copied().expect("engine a=crypto");
+    let caller_target = answer.remote_rtp;
+    let mut caller_leg = SecureLeg::new(&peer_key.key, &engine_key.key);
+    // The anchor has been carrying the caller for a while.
+    for sequence in 0..5u16 {
+        let mut sealed = Vec::new();
+        caller_leg
+            .protect(&ulaw_rtp_packet(sequence, 0x0A0A_0A0A, 0xFF), &mut sealed)
+            .expect("caller SRTP");
+        phone_a
+            .send_to(&sealed, caller_target)
+            .await
+            .expect("caller send");
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (ws_uri, frames, downlink) = takeover_ws_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "secure-anchor-bot".into(),
+                from_tag: "tag-a".into(),
+                ws_uri,
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    assert_eq!(engine.ws().secure_state("secure-anchor-bot"), Some(true));
+    let _ = expect_bridge_start(&frames).await;
+    for sequence in 5..10u16 {
+        let mut sealed = Vec::new();
+        caller_leg
+            .protect(&ulaw_rtp_packet(sequence, 0x0A0A_0A0A, 0xFF), &mut sealed)
+            .expect("caller SRTP");
+        phone_a
+            .send_to(&sealed, caller_target)
+            .await
+            .expect("caller send");
+    }
+    assert!(
+        next_uplink_frame(&frames).await.is_some(),
+        "the bot hears the caller's continuing SRTP"
+    );
+
+    let mut l16 = [0u8; 320];
+    pcm_to_l16_le(&[2000i16; 160], &mut l16);
+    downlink.send(l16.to_vec()).expect("queue downlink");
+    let mut buffer = [0u8; 2048];
+    let mut decrypted = false;
+    for _ in 0..40 {
+        let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+        else {
+            continue;
+        };
+        let mut clear = Vec::new();
+        if caller_leg.unprotect(&buffer[..len], &mut clear).is_ok() {
+            decrypted = true;
+            break;
+        }
+    }
+    assert!(
+        decrypted,
+        "the bot's downlink decrypts under the advertised key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bot_is_refused_while_something_else_runs_on_the_anchor() {
+    // Stopping the pipeline would stop a running recording without a word. Refused, and the
+    // recording carries on.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone().await;
+    engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "busy-anchor".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let started = engine
+        .handle(
+            CLIENT,
+            Command::StartRecording {
+                call_id: "busy-anchor".into(),
+                from_tag: "tag-a".into(),
+                recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                direction: None,
+                channels: None,
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
+            },
+        )
+        .await;
+    assert!(matches!(started, CmdResult::Ok { .. }), "{started:?}");
+    let (ws_uri, _frames, _down) = takeover_ws_server().await;
+    let refused = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "busy-anchor".into(),
+                from_tag: "tag-a".into(),
+                ws_uri,
+            },
+        )
+        .await;
+    match refused {
+        CmdResult::Error { reason } => {
+            assert!(reason.contains("ws-takeover-anchor-busy"), "{reason}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        engine.media().is_media_call("busy-anchor"),
+        "the pipeline keeps running"
+    );
+    assert!(!engine.ws().is_ws_call("busy-anchor"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bot_that_cannot_be_reached_leaves_the_anchor_untouched() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone().await;
+    engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "unreachable-bot".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let refused = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "unreachable-bot".into(),
+                from_tag: "tag-a".into(),
+                ws_uri: "ws://127.0.0.1:9/nobody-listens".into(),
+            },
+        )
+        .await;
+    assert!(matches!(refused, CmdResult::Error { .. }), "{refused:?}");
+    assert!(
+        engine.media().is_media_call("unreachable-bot"),
+        "the dial failed before the pipeline was touched"
+    );
+    assert_eq!(
+        engine.calls.get("unreachable-bot").expect("call").pipeline,
+        PipelineKind::Media
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_that_fails_after_the_pipeline_stopped_puts_the_call_back() {
+    // The recovery path: the pipeline has already been stopped for the bot when something goes
+    // wrong. The call must end up on the pipeline again, not with no media path.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "reanchored".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    engine.media().stop("reanchored").await;
+    assert!(!engine.media().is_media_call("reanchored"));
+
+    let result = engine.reanchor("reanchored", None, "a test failure").await;
+    match result {
+        Err(reason) => assert!(reason.contains("back on the engine's pipeline"), "{reason}"),
+        Ok(()) => panic!("a failed takeover still reports the failure"),
+    }
+    assert!(engine.media().is_media_call("reanchored"));
+    assert_eq!(
+        engine.calls.get("reanchored").expect("call").pipeline,
+        PipelineKind::Media
+    );
+}

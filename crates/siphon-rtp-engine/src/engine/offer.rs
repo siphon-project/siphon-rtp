@@ -882,22 +882,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let text_t140_payload_type = anchored_text.and_then(|text| text.t140_payload_type);
         let text_red_payload_type = anchored_text.and_then(|text| text.red_payload_type);
 
-        *self.client_calls.entry(client).or_insert(0) += 1;
-        // Index this call's endpoints (including the text stream) so observed RTCP can be correlated
-        // back to the call-id and every port is released at teardown.
-        for endpoint in [
-            Some(near_rtp),
-            near_rtcp,
-            Some(far_rtp),
-            far_rtcp,
-            near_text_endpoint,
-            far_text_endpoint,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            self.endpoint_calls.insert(endpoint.id, call_id.clone());
-        }
         self.calls.insert(
             call_id.clone(),
             Call {
@@ -964,6 +948,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_sip_call_id: profile.sip_call_id.clone(),
                 far_sip_call_id: None,
                 caller_source_posture: super::negotiate::SourcePosture::from_profile(profile),
+                near_secure_key: None,
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
                 offer_received_from: profile.received_from,
@@ -988,6 +973,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_text_local_crypto: None,
             },
         );
+        self.index_new_call(&call_id, client);
 
         // Stand the WS bridge up now that the call is recorded (so a dispatch can find its route). On
         // any failure (no codec, redirect install, or dial), tear the half-built call back down.

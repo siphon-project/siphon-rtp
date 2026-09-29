@@ -499,12 +499,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             _ => unreachable!("pipeline validated above"),
         };
 
-        // Register the reconstructed call under the requesting (standby) client.
-        *self.client_calls.entry(client).or_insert(0) += 1;
-        for (_, endpoint) in bound {
-            self.endpoint_calls
-                .insert(endpoint.id, snapshot.call_id.clone());
-        }
         // Read before the snapshot's credentials are moved into the call below.
         let restored_ice = snapshot.ice.is_some();
         self.calls.insert(
@@ -595,6 +589,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_sip_call_id: snapshot.far_sip_call_id.clone(),
                 // Only read by the single-leg anchor, and a single-leg call is never checkpointed.
                 caller_source_posture: super::negotiate::SourcePosture::default(),
+                near_secure_key: None,
                 relay_flows: media.relay_flows,
                 promotion_reasons: HashSet::new(),
                 // The source gate is reconstructed from the snapshot's per-flow `accepted_source`
@@ -622,6 +617,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_text_local_crypto: None,
             },
         );
+        // Register the reconstructed call under the requesting (standby) client.
+        self.index_new_call(&snapshot.call_id, client);
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
         // Be loud about the gap rather than let a restored ICE call look fully covered: consent
         // freshness needs the peer's credentials, which the snapshot does not carry.

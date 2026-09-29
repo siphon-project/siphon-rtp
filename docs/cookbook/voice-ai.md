@@ -545,7 +545,18 @@ taken over, and every refusal carries its own token:
 | ICE leg | `ws-takeover-ice-offerer` |
 | Recording, SIPREC subscription, WS tee, DTMF block or X3 interception attached | `ws-takeover-call-is-held` |
 | Transcoding, secure-bridge or already-promoted call | `ws-takeover-not-a-plain-relay` |
-| Unanswered offer, or a single-leg `answer_local` call | `ws-takeover-not-answered` |
+| Unanswered offer | `ws-takeover-not-answered` |
+
+**Joining a call the engine answered.** A call answered with `answer_local` (and no `ws_uri`) runs
+on the engine's own pipeline, and `attach_ws_bridge` hands that leg to the bot: the pipeline is
+stopped, the bot gets the caller, and a later `detach_ws_bridge` gives the leg back to a fresh
+pipeline. An SDES-SRTP caller keeps its SRTP context through both hand-overs. A prompt still playing
+when the bot joins ends with `play_finished` (`error`). Refused while something else runs on the
+pipeline, since stopping it would stop that silently:
+
+| Shape | Reason token |
+|---|---|
+| Recording, WS tee, SIPREC subscription, DTMF block, echo or X3 interception on the leg | `ws-takeover-anchor-busy` |
 
 The first two are the same structural refusals `offer` and `answer` make for `ws_uri`, for the same
 reasons: on a two-leg call the engine is not the offerer's cryptographic far side, and no ICE agent
