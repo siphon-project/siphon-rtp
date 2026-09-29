@@ -361,6 +361,15 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     handshake is held until ICE selects, then released and pointed at the chosen pair; records and
     media follow it. Gated only when a full agent is actually running on that leg — otherwise no
     selection is coming and waiting would hang a working leg.
+  - **The engine's own pipeline follows the selection too.** A call `answer_local` terminates itself
+    (IVR, announcement, echo, voicemail) runs the agent on its one leg when the engine runs agents.
+    Its pipeline starts with the layer-2 gate open (the datapath's layer-4 gate admits only the
+    validated pair) and its egress **held**: comfort noise, prompts and echo go nowhere until the
+    agent selects, then to the selected pair, never to the signalled `c=` (§12). The selection
+    narrows the pipeline's own gate to the pair as well. Without `--ice-full` the answer strips ICE
+    (RFC 8839 §5.1) instead of echoing the caller's credentials back with no agent behind them.
+    Enforcement: `MediaCall::{with_egress_awaiting_ice, ice_selected}`, `SourcePosture::Ice`,
+    `MediaRegistry::ice_selected` from the sweep's `Selected` arm.
   - **A failed checklist tears the call down** (§8.1.2, CDR reason `ice_failed`): if no pair works,
     there is no path, and holding the call open would only wait for a timeout.
   - **Enforcement:** `siphon-rtp-ice/src/{checklist,agent}.rs` (the pure state machine),
@@ -1219,7 +1228,7 @@ copy of Layers 1–4.
   | Secure (SDES or DTLS) offerer + `ws_uri` | `offer` / `answer` | `ws-takeover-secure-offerer` |
   | ICE offerer + `ws_uri` | `offer` / `answer` | `ws-takeover-ice-offerer` |
   | **SDES** offerer, no `ws_uri` (single-leg IVR/echo/voicemail) | `answer_local` | terminated on the single-leg media pipeline — the engine answers its own `a=crypto` and holds the `SecureLeg` |
-| **DTLS** offerer, **no** `ws_uri` (single-leg IVR/echo) | `answer_local` | `secure-offerer-unsupported` — needs the full ICE agent on the promoted leg to gate the handshake on the selected pair (RFC 8445 §12) |
+  | **DTLS** offerer, no `ws_uri` (single-leg IVR/echo/voicemail) | `answer_local` | terminated on the single-leg media pipeline — the handshake runs in front of the endpoint (held for the ICE selection when an agent runs) and keys both directions, which send nothing until then |
   | `RTP/SAVP` with no usable `a=crypto`; `UDP/TLS/RTP/SAVPF` with no `a=fingerprint`; no engine certificate | `answer_local` | `ws-takeover-unkeyable` |
   | ICE offerer with no full agent available | `answer_local` | `ws-takeover-ice-unsupported` |
 

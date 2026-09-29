@@ -317,8 +317,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         //
         // Gating here rather than with a control message is what closes it completely — a message
         // would race the very tick it is meant to beat.
-        let mut call = if near_secure {
+        let call = if near_secure {
             call.with_near_secure_pending()
+        } else {
+            call
+        };
+        // An ICE caller has no address the pipeline may send to until its agent selects a pair
+        // (RFC 8445 §12): gated from the start for the same reason, lifted by `IceSelected`.
+        let mut call = if caller_source_posture == super::negotiate::SourcePosture::Ice {
+            call.with_egress_awaiting_ice(caller_facing_endpoint)
         } else {
             call
         };

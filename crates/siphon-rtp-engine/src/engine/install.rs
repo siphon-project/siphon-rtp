@@ -730,6 +730,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 crate::dtls_bridge::PipelineTarget::Call {
                     media: self.media.clone(),
                     call_id: wiring.call_id.to_string(),
+                    party: crate::dtls_bridge::KeyedParty::Callee,
                 },
             );
         }

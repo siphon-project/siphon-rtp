@@ -78,6 +78,16 @@ enum Direction {
     },
 }
 
+/// Which party of a media-pipeline call a DTLS leg keys — the three topologies
+/// [`crate::media_pipeline::MediaCall`] threads a `SecureLeg` into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyedParty {
+    /// The callee of a two-party call (`PipelineKind::DtlsMedia`): A plaintext, B keyed.
+    Callee,
+    /// The one party of a single-leg call the engine answered itself: both directions face it.
+    SoleParty,
+}
+
 /// Which slow-path owner a keyed DTLS leg's media belongs to. Both own the `SecureLeg` themselves and
 /// decrypt on their own ingress, so the bridge forwards the datagram untouched either way — the only
 /// difference is which mailbox it lands in and which control message keys it.
@@ -87,6 +97,7 @@ pub enum PipelineTarget {
     Call {
         media: Arc<crate::media_pipeline::MediaRegistry>,
         call_id: String,
+        party: KeyedParty,
     },
     /// A conference seat — the room actor mixes this participant once its handshake keys the seat.
     Conference {
@@ -101,6 +112,16 @@ pub enum PipelineTarget {
         ws: Arc<crate::ws_bridge::WsRegistry>,
         call_id: String,
     },
+}
+
+impl KeyedParty {
+    /// The control that threads `leg` into a media actor for this party.
+    fn attach(self, leg: Arc<Mutex<SecureLeg>>) -> crate::media_pipeline::MediaControl {
+        match self {
+            Self::Callee => crate::media_pipeline::MediaControl::AttachSecureLeg { leg },
+            Self::SoleParty => crate::media_pipeline::MediaControl::AttachNearSecureLeg { leg },
+        }
+    }
 }
 
 impl PipelineTarget {
@@ -127,13 +148,14 @@ impl PipelineTarget {
         secure_endpoint: EndpointId,
     ) -> bool {
         match self {
-            Self::Call { media, call_id } => {
+            Self::Call {
+                media,
+                call_id,
+                party,
+            } => {
                 let leg = Arc::new(Mutex::new(leg));
                 retained.insert(secure_endpoint, leg.clone());
-                media.control(
-                    call_id,
-                    crate::media_pipeline::MediaControl::AttachSecureLeg { leg },
-                )
+                media.control(call_id, party.attach(leg))
             }
             Self::Conference {
                 conference,
@@ -159,10 +181,11 @@ impl PipelineTarget {
     /// handshake afresh), so the others report `false` and keep whatever key they hold.
     fn reattach(&self, leg: Arc<Mutex<SecureLeg>>) -> bool {
         match self {
-            Self::Call { media, call_id } => media.control(
+            Self::Call {
+                media,
                 call_id,
-                crate::media_pipeline::MediaControl::AttachSecureLeg { leg },
-            ),
+                party,
+            } => media.control(call_id, party.attach(leg)),
             Self::Conference { .. } | Self::Ws { .. } => false,
         }
     }

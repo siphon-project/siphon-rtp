@@ -32,6 +32,11 @@ Rust, at different levels of maturity. This page says exactly which level.
   `answer_local` only, with the full ICE agent when the caller offers ICE; the
   two-leg `offer`/`answer` refuses it rather than answering a call it cannot
   bridge. See [Voice-AI](voice-ai.md#which-callers-a-takeover-supports).
+- A DTLS-SRTP caller answered by the **engine itself** (`answer_local` with no
+  `ws_uri`: IVR, announcement, echo, voicemail). The handshake keys the local
+  pipeline, and with `--ice-full` the agent runs on the leg and the pipeline
+  sends only to the selected pair. Without `--ice-full` the answer carries no
+  ICE, which a browser will not accept, so run the agent for browser callers.
 - A DTLS-SRTP caller bridged to a **plain callee** on the two-party
   `offer`/`answer` relay. Ask for a plaintext far leg and the engine terminates
   the caller's DTLS, answers it with its own fingerprint, and relays plaintext

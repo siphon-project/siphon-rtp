@@ -86,9 +86,9 @@ that negotiated encryption. Two further consequences on a secure takeover:
 - An **SDES-SRTP** caller with no `ws_uri` is terminated by `answer_local` on the single-leg media
   pipeline: the engine answers its own `a=crypto` and holds the `SecureLeg`, so an IVR, announcement,
   echo test or voicemail box works for a secure caller directly.
-- A **DTLS-SRTP** caller with no `ws_uri` is still refused (`secure-offerer-unsupported`): it needs
-  the full ICE agent on the promoted leg to gate the handshake on the selected pair, so a browser
-  softphone still reaches the engine through a takeover.
+- A **DTLS-SRTP** caller with no `ws_uri` is terminated the same way: the handshake runs in front of
+  the single-leg pipeline and keys it, and nothing is sent toward the caller until it has. With
+  `--ice-full` the leg runs the agent too, and the pipeline sends only to the selected pair.
 
 ## The WebSocket wire
 

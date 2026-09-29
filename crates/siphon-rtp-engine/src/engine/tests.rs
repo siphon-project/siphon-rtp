@@ -7492,41 +7492,297 @@ async fn a_secure_ivr_decrypts_the_caller_and_answers_it_encrypted() {
     assert!(heard, "the secure caller hears the IVR");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn answer_local_still_refuses_a_dtls_offerer_without_a_takeover() {
-    // Deliberately still refused, and it names why: DTLS on the local pipeline needs the full ICE
-    // agent on the promoted (`Redirect`) leg so the handshake can be gated on the selected pair,
-    // which this change does not build. Answering a fingerprint with no media path behind it is
-    // exactly the failure the SDES half just stopped having.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answer_local_terminates_a_dtls_offerer_on_the_local_pipeline() {
+    // A WebRTC caller reaching an IVR or a mailbox directly, with no bot in between. The handshake
+    // runs in front of the endpoint and keys the engine's own pipeline, which says nothing toward
+    // the caller until then and speaks SRTP after.
+    use crate::srtp_bridge::run_redirect_dispatcher;
     let engine = Engine::new(UdpLoopbackDatapath::new());
-    let (_phone_a, addr_a) = phone().await;
-    let certificate = siphon_rtp_dtls::DtlsCertificate::generate().expect("cert");
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let phone_a = Arc::new(
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind a"),
+    );
+    let addr_a = phone_a.local_addr().expect("addr a");
+    let caller_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
     let result = engine
         .handle(
             CLIENT,
             Command::AnswerLocal {
-                call_id: "al-dtls-ivr".into(),
+                call_id: "dtls-local".into(),
                 from_tag: "tag-a".into(),
-                sdp: dtls_offerer_sdp(addr_a, &certificate.fingerprint(), "actpass"),
-                profile: ProfileFlags::default(),
+                sdp: dtls_offerer_sdp(addr_a, &caller_cert.fingerprint(), "active"),
+                profile: Default::default(),
             },
         )
         .await;
-    match result {
-        CmdResult::Error { reason } => {
-            assert!(
-                reason.contains("secure-offerer-unsupported"),
-                "the refusal keeps its stable token, got: {reason}"
-            );
-            assert!(
-                reason.contains("DTLS"),
-                "and names which posture is unsupported, got: {reason}"
-            );
+    let answer = sdp::parse(&ok_sdp_text(&result)).expect("answer sdp");
+    let engine_fingerprint = answer
+        .fingerprint
+        .clone()
+        .expect("the engine's fingerprint");
+    let caller_target = answer.remote_rtp;
+    assert!(engine.media().is_media_call("dtls-local"));
+
+    // Unkeyed: the comfort-noise ticker is running, and nothing may leave in the clear.
+    let mut buffer = [0u8; 2048];
+    for _ in 0..4 {
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(100), phone_a.recv_from(&mut buffer)).await
+        {
+            panic!("an unkeyed DTLS leg sent {len} bytes toward the caller");
         }
-        other => panic!("expected a refusal, got {other:?}"),
     }
-    assert!(!engine.calls.contains_key("al-dtls-ivr"));
-    assert_eq!(engine.client_call_count(CLIENT), 0, "no quota slot leaked");
+
+    let mut caller_leg = peer_dtls_handshake(
+        phone_a.clone(),
+        addr_a,
+        caller_target,
+        &caller_cert,
+        &engine_fingerprint,
+    )
+    .await;
+
+    // Keyed: the pipeline's egress decrypts under the DTLS-derived key…
+    let mut heard = false;
+    for _ in 0..40 {
+        let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(100), phone_a.recv_from(&mut buffer)).await
+        else {
+            continue;
+        };
+        let mut clear = Vec::new();
+        if caller_leg.unprotect(&buffer[..len], &mut clear).is_ok() {
+            heard = true;
+            break;
+        }
+    }
+    assert!(heard, "the caller decrypts the pipeline's egress");
+
+    // …and the caller's SRTP is decrypted and decoded on the way in.
+    let speaker = Arc::new(Mutex::new(caller_leg));
+    let sender = phone_a.clone();
+    let samples = record_caller_while(&engine, &events, "dtls-local", async move {
+        for sequence in 20..30u16 {
+            let mut sealed = Vec::new();
+            speaker
+                .lock()
+                .expect("leg")
+                .protect(&ulaw_rtp_packet(sequence, 0x0C0C_0C0C, 0x20), &mut sealed)
+                .expect("caller SRTP");
+            sender
+                .send_to(&sealed, caller_target)
+                .await
+                .expect("caller send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        samples.iter().any(|&sample| sample != 0),
+        "the caller is heard"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answer_local_runs_ice_on_the_local_pipeline() {
+    // A WebRTC-style caller answered by the engine itself: the agent decides the transport, the
+    // pipeline sends nothing until it has (RFC 8445 §12), and then sends to the selected pair —
+    // which here is deliberately not the signalled `c=`, so following the SDP would be visible.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let phone_a = Arc::new(phone_a);
+    let (decoy, addr_decoy) = phone().await;
+    let offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+             m=audio {decoy_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:peer 1 UDP 2130706431 {ip} {port} typ host\r\n\
+             a=candidate:decoy 1 UDP 1694498815 {ip} {decoy_port} typ host\r\n\
+             a=end-of-candidates\r\n",
+        ip = addr_a.ip(),
+        decoy_port = addr_decoy.port(),
+        port = addr_a.port()
+    );
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "ice-local".into(),
+                from_tag: "tag-a".into(),
+                sdp: offer,
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = sdp::parse(&ok_sdp_text(&result)).expect("answer sdp");
+    assert!(engine.media().is_media_call("ice-local"));
+    assert!(
+        answer.ice_ufrag.is_some(),
+        "the answer carries the engine's ICE credentials"
+    );
+    assert!(!answer.candidates.is_empty(), "and its gathered candidates");
+    let engine_media = answer.remote_rtp;
+    let near_rtp = engine
+        .calls
+        .get("ice-local")
+        .map(|call| call.near.rtp.id)
+        .expect("call");
+
+    // Before the agent decides, the comfort-noise ticker has nowhere it may send. The decoy is a
+    // candidate too (the `c=` must name one, RFC 8839 §5.3), so the agent's checks reach it; it never
+    // answers them, and media must not follow them there.
+    let is_rtp = |bytes: &[u8]| {
+        bytes
+            .first()
+            .is_some_and(|first| (128..=191).contains(first))
+    };
+    let decoy_rtp = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let decoy_counter = decoy_rtp.clone();
+    let decoy_task = tokio::spawn(async move {
+        let mut buffer = [0u8; 2048];
+        while let Ok((len, _)) = decoy.recv_from(&mut buffer).await {
+            if buffer[..len]
+                .first()
+                .is_some_and(|first| (128..=191).contains(first))
+            {
+                decoy_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+    let mut buffer = [0u8; 2048];
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        decoy_rtp.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "media reached the signalled address before ICE selected a pair"
+    );
+
+    let mut peer = peer_agent(&answer, addr_a);
+    let mut now = 0u64;
+    let mut early_rtp = 0usize;
+    while now < 4_000 && engine.datapath().ice_validated_source(near_rtp).is_none() {
+        for action in peer.poll(now) {
+            if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                phone_a.send_to(&datagram, to).await.expect("peer send");
+            }
+        }
+        engine.drive_ice_agents(now).await;
+        while let Ok(Ok((len, from))) =
+            timeout(Duration::from_millis(20), phone_a.recv_from(&mut buffer)).await
+        {
+            if is_rtp(&buffer[..len]) {
+                if engine.datapath().ice_validated_source(near_rtp).is_none() {
+                    early_rtp += 1;
+                }
+                continue;
+            }
+            for action in peer.on_datagram(addr_a, from, &buffer[..len], now) {
+                if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                    phone_a.send_to(&datagram, to).await.expect("peer send");
+                }
+            }
+            engine.drive_ice_agents(now).await;
+        }
+        now += 20;
+    }
+    assert_eq!(
+        engine.datapath().ice_validated_source(near_rtp),
+        Some(addr_a),
+        "the agent selected the peer's transport address"
+    );
+    assert_eq!(early_rtp, 0, "no media left before the selection");
+
+    // Selected: the pipeline's egress goes to the pair, never to the signalled `c=`.
+    let mut heard = false;
+    for _ in 0..40 {
+        if let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(50), phone_a.recv_from(&mut buffer)).await
+        {
+            if is_rtp(&buffer[..len]) {
+                heard = true;
+                break;
+            }
+        }
+    }
+    assert!(heard, "the pipeline's egress reaches the selected pair");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        decoy_rtp.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no media is sent to the signalled address the agent did not select"
+    );
+    decoy_task.abort();
+
+    // …and the caller's media on the selected pair is decoded.
+    let sender = phone_a.clone();
+    let samples = record_caller_while(&engine, &events, "ice-local", async move {
+        for sequence in 0..10u16 {
+            sender
+                .send_to(&ulaw_rtp_packet(sequence, 0x0D0D_0D0D, 0x20), engine_media)
+                .await
+                .expect("caller send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        samples.iter().any(|&sample| sample != 0),
+        "the caller is heard"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_local_strips_ice_when_the_engine_runs_no_agent() {
+    // Without `--ice-full` there is nothing to answer ICE with. Echoing the caller's candidates back,
+    // or inventing credentials no agent will answer checks for, would leave a WebRTC caller waiting
+    // for a pair that never completes; stripping ICE falls back to plain RTP on the `c=` address
+    // (RFC 8839 §5.1), which the source gate then anchors as usual.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "ice-none".into(),
+                from_tag: "tag-a".into(),
+                sdp: ice_offer_with_candidate(addr_a),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let text = ok_sdp_text(&result);
+    let answer = sdp::parse(&text).expect("answer sdp");
+    assert!(
+        answer.ice_ufrag.is_none(),
+        "no credentials without an agent: {text}"
+    );
+    assert!(answer.candidates.is_empty(), "no candidates either: {text}");
+    assert!(
+        !text.contains(A_UFRAG),
+        "the caller's own credentials are not echoed: {text}"
+    );
+    assert!(engine.media().is_media_call("ice-none"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
