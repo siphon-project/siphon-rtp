@@ -1280,9 +1280,16 @@ copy of Layers 1–4.
     own pipeline, whose source gate is drawn from the call's stored posture and `received-from` hint —
     the same inputs the bridge's gate was drawn from, so the gate does not widen across the
     hand-over. An SDES leg's `SecureLeg` is moved, not re-derived, so the peer's rollover counter and
-    replay window carry over (RFC 3711 §3.3.1). A two-leg negotiated takeover, and a leg running ICE
-    or keyed by DTLS, are refused before anything stops: the engine's own pipeline could not carry
-    them.
+    replay window carry over (RFC 3711 §3.3.1). A DTLS leg keeps its association: the bridge's flow
+    is retargeted from one owner to the other (`DtlsBridge::retarget`) and the key moves with it,
+    so the peer sees no new handshake (RFC 8842 §5.5); a flow whose handshake is still running is
+    not moved, since its session would key the owner being torn down. An ICE leg keeps its agent:
+    each new owner starts on the pair already selected, and a selection that landed while neither
+    owner had a route is read again once the new one exists. A two-leg negotiated takeover is
+    refused before anything stops.
+  - **An ICE takeover leg's downlink has no destination until its agent selects.** `WsEgress` holds
+    `None` rather than the signalled address, so the drain sends nothing before the selection (RFC
+    8445 §12), as a conference seat and the engine's own pipeline already did.
   - **`block_media` / `unblock_media` are refused on a takeover call.** A taken-over call still holds
     the displaced relay's `Forward` rules so its detach can reinstall them, and `unblock` walks exactly
     that list — it would have pulled leg A back off the bridge silently. This joins the existing

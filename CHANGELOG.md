@@ -33,8 +33,9 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   negotiated with `ws_uri`, so once a bot held a leg it held it until the call ended, and nothing
   could be played, recorded or routed afterwards. On a single-leg call the caller is now handed to
   the engine's own pipeline, the same anchor `answer_local` builds without a bot. An SDES-SRTP leg's
-  key material moves with it, so the SRTP context carries on. A two-leg negotiated takeover, and a
-  leg running ICE or keyed by DTLS-SRTP, are still refused, each with its own reason.
+  key material moves with it, so the SRTP context carries on. A DTLS-SRTP leg keeps its association
+  and an ICE leg its agent and selected pair, both ways. A two-leg negotiated takeover is still
+  refused.
 - **`media_started` event.** Raised once per leg when its first packet clears the source gate,
   naming the leg, the address the packet came from (when latched) and the signalled one, so a
   controller can wait on media rather than on a fixed delay, and see a NAT when the two differ.
@@ -46,6 +47,11 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **An ICE takeover sent its downlink to the signalled address before the agent selected a pair.**
+  The bridge's downlink was seeded with the `c=` and only re-pointed by the selection, so the bot
+  audio rendered before it went to a candidate the agent may never choose (RFC 8445 §12).
+  It now has no destination until the selection. Detaching such a leg also missed that it ran ICE
+  (the check read state `answer_local` never sets), so the pipeline it landed on sent to the `c=` too.
 - **Conference seats and WebSocket takeover legs export their RTCP.** They terminate RTCP rather
   than relay it, so they never reached the export. Each now publishes the RTCP it receives (a secure
   takeover leg's SRTCP decrypted), and a seat's captures are filed under the `sip_call_id` it named on

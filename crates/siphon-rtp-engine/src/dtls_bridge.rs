@@ -776,6 +776,72 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         self.flows.contains_key(&endpoint)
     }
 
+    /// Whether `endpoint` is a pipeline flow whose handshake has keyed its owner.
+    #[must_use]
+    pub fn is_keyed(&self, endpoint: EndpointId) -> bool {
+        self.flows.get(&endpoint).is_some_and(|flow| {
+            matches!(&flow.direction, Direction::Pipeline { keyed, .. }
+                if keyed.load(std::sync::atomic::Ordering::Acquire))
+        })
+    }
+
+    /// Take back the leg retained for a media-pipeline owner of `endpoint` (see
+    /// `PipelineTarget::key`), so a caller about to hand the leg to another owner holds the only
+    /// reference to it once that pipeline has stopped.
+    pub fn take_retained(&self, endpoint: EndpointId) -> Option<Arc<Mutex<SecureLeg>>> {
+        self.pipeline_keys.remove(&endpoint).map(|(_, leg)| leg)
+    }
+
+    /// Hand a **keyed** pipeline flow to another owner: its media goes to `target` from now on, and
+    /// `leg` — the association's key, moved out of the previous owner — keys it. The association
+    /// itself is untouched, so the peer sees nothing (no new handshake, RFC 8842 §5.5); only the
+    /// single owner of the crypto changes. Used when a WebSocket takeover leg is handed to the
+    /// engine's own pipeline and back.
+    ///
+    /// Refused while the handshake is still running: its session keys the owner it was registered
+    /// with, so moving the flow then would key an owner that no longer receives the media and leave
+    /// the new one pending forever. A [`PipelineTarget::Call`] owner is retained for renegotiation as
+    /// `PipelineTarget::key` does; any other drops that copy, so the new owner's is the only one.
+    pub fn retarget(
+        &self,
+        endpoint: EndpointId,
+        target: PipelineTarget,
+        leg: Option<Arc<Mutex<SecureLeg>>>,
+    ) -> Result<(), &'static str> {
+        {
+            let Some(mut flow) = self.flows.get_mut(&endpoint) else {
+                return Err("no DTLS flow on the endpoint");
+            };
+            let Direction::Pipeline {
+                target: current,
+                keyed,
+                ..
+            } = &mut flow.direction
+            else {
+                return Err("the DTLS flow does not feed a media owner");
+            };
+            if !keyed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("the DTLS handshake has not completed");
+            }
+            *current = target.clone();
+        }
+        match (&target, leg) {
+            (PipelineTarget::Call { .. }, Some(leg)) => {
+                self.pipeline_keys.insert(endpoint, leg.clone());
+                if target.reattach(leg) {
+                    Ok(())
+                } else {
+                    Err("the media pipeline is gone")
+                }
+            }
+            (PipelineTarget::Call { .. }, None) => Err("no key to hand the media pipeline"),
+            _ => {
+                self.pipeline_keys.remove(&endpoint);
+                Ok(())
+            }
+        }
+    }
+
     /// Install a lawful-interception content tap on one bridged endpoint's ingress, replacing any
     /// tap already there. Returns whether this bridge owns the endpoint.
     ///
@@ -1450,6 +1516,56 @@ mod tests {
         assert!(bridge.owns(secure.id) && bridge.owns(plain.id));
         bridge.deregister([plain.id, secure.id]);
         assert!(!bridge.owns(secure.id) && !bridge.owns(plain.id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pipeline_flow_is_retargeted_only_once_its_handshake_has_keyed_it() {
+        // The session keys the owner it was registered with, so moving an unkeyed flow would key an
+        // owner that no longer receives the media. Refused until then, and refused outright for a
+        // flow that feeds a peer socket rather than a media owner.
+        let datapath = UdpLoopbackDatapath::new();
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let bridge = DtlsBridge::new(datapath.clone());
+        let media = Arc::new(crate::media_pipeline::MediaRegistry::default());
+        let target = |call_id: &str| PipelineTarget::Call {
+            media: media.clone(),
+            call_id: call_id.to_string(),
+            party: KeyedParty::SoleParty,
+        };
+        let peer = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), 40000));
+        bridge.register_for_pipeline(
+            DtlsCallPlan {
+                plain_endpoint: plain.id,
+                plain_source: SourceFilter::Any,
+                plain_dst: peer,
+                secure_endpoint: secure.id,
+                secure_source: SourceFilter::Exact(peer.ip()),
+                secure_dst: peer,
+                secure_local: secure.local_addr,
+                certificate: DtlsCertificate::generate().expect("cert"),
+                role: DtlsRole::Server,
+                peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
+                gate_on_ice: false,
+                ice_validated: None,
+                plain_rtcp: None,
+            },
+            target("first"),
+        );
+        assert!(!bridge.is_keyed(secure.id));
+        assert_eq!(
+            bridge.retarget(secure.id, target("second"), None),
+            Err("the DTLS handshake has not completed")
+        );
+        assert_eq!(
+            bridge.retarget(plain.id, target("second"), None),
+            Err("no DTLS flow on the endpoint"),
+            "a pipeline flow owns only the secure endpoint"
+        );
+        assert!(
+            bridge.take_retained(secure.id).is_none(),
+            "nothing keyed, nothing retained"
+        );
     }
 
     /// An empty RTCP receiver report (RFC 3550 §6.4.2): V=2, RC=0, PT=201, length 1, sender SSRC.

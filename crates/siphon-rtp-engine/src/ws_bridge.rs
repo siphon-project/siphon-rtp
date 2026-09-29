@@ -225,7 +225,11 @@ impl<D: siphon_rtp_datapath::Datapath> MediaActivity for D {
 pub struct WsEgress {
     /// The live downlink destination, read by the drain task per packet. A [`tokio::sync::watch`]
     /// because both the latch below and an ICE selection re-point it mid-call.
-    destination: tokio::sync::watch::Sender<SocketAddr>,
+    ///
+    /// `None` while an RFC 8445 agent owns the leg and has not selected a pair: the signalled address
+    /// is only a candidate then, and media MUST follow the selected pair (RFC 8445 §12), so the
+    /// downlink has nowhere it may go yet.
+    destination: tokio::sync::watch::Sender<Option<SocketAddr>>,
     /// The SSRC-consistent symmetric-RTP latch (docs/security-and-nat.md §4 layer 3; RFC 3550 §8),
     /// shared with [`crate::media_pipeline`] so the two userspace `Redirect` paths cannot drift on
     /// what counts as a genuine NAT rebind and what counts as a hijack spray.
@@ -245,7 +249,7 @@ impl WsEgress {
     #[must_use]
     pub fn new(destination: SocketAddr, ice_managed: bool) -> Self {
         Self {
-            destination: tokio::sync::watch::Sender::new(destination),
+            destination: tokio::sync::watch::Sender::new((!ice_managed).then_some(destination)),
             latch: Mutex::new(SymmetricLatch::default()),
             ice_managed,
         }
@@ -253,13 +257,14 @@ impl WsEgress {
 
     /// A receiver for the bridge's drain task, which reads the destination once per downlink packet.
     #[must_use]
-    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<SocketAddr> {
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<SocketAddr>> {
         self.destination.subscribe()
     }
 
-    /// The address the downlink is currently aimed at (observability + tests).
+    /// The address the downlink is currently aimed at (observability + tests); `None` on an ICE leg
+    /// whose agent has not selected yet.
     #[must_use]
-    pub fn destination(&self) -> SocketAddr {
+    pub fn destination(&self) -> Option<SocketAddr> {
         *self.destination.borrow()
     }
 
@@ -270,7 +275,7 @@ impl WsEgress {
         // is gone, which happens the moment a bridge's drain task exits. The watch outlives that task
         // — a re-point reuses it — so a selection landing on a leg whose bridge has died must still be
         // recorded, or the replacement bridge would start out aimed at the pre-ICE address.
-        let _ = self.destination.send_replace(remote);
+        let _ = self.destination.send_replace(Some(remote));
     }
 
     /// Admit one **authenticated** ingress datagram through the symmetric-RTP latch, re-pointing the
@@ -309,13 +314,13 @@ impl WsEgress {
         };
         // Steady state — the latch is already where this packet came from. Skip the watch write so
         // the per-packet path does not mark it changed on every single frame.
-        if self.destination.borrow().eq(&adopted) {
+        if self.destination.borrow().eq(&Some(adopted)) {
             return true;
         }
-        let previous = self.destination.send_replace(adopted);
+        let previous = self.destination.send_replace(Some(adopted));
         tracing::info!(
             target: "siphon_rtp::media",
-            %previous,
+            ?previous,
             %adopted,
             "ws bridge latched its downlink to the observed media source"
         );
@@ -783,6 +788,7 @@ mod tests {
             .expect("the call has a route")
             .egress
             .destination()
+            .expect("a downlink destination")
     }
 
     /// A minimal 12-byte RTP header + payload (PT 0, µ-law), enough for SRTP to protect.
@@ -950,7 +956,7 @@ mod tests {
         );
         assert_eq!(
             state.egress.destination(),
-            address("203.0.113.9:40000"),
+            Some(address("203.0.113.9:40000")),
             "the selected pair, carried on the same egress"
         );
         assert!(
@@ -1341,7 +1347,7 @@ mod tests {
         registry.dispatch(rx(1, "127.0.0.2:41000", &rtp_packet(1, 0x0A0A_0A0A)));
 
         let carried = registry.route_state("repoint").expect("route state").egress;
-        assert_eq!(carried.destination(), address("127.0.0.2:41000"));
+        assert_eq!(carried.destination(), Some(address("127.0.0.2:41000")));
         let _ = registry.deregister("repoint");
 
         // Stand the replacement up on the carried state, exactly as `start_ws_bridge` does.
@@ -1410,6 +1416,11 @@ mod tests {
         let (rtp_in_tx, rtp_in_rx) = flume::unbounded::<Bytes>();
         let egress = Arc::new(WsEgress::new(address("192.0.2.7:30000"), true));
         let mut watcher = egress.subscribe();
+        assert_eq!(
+            *watcher.borrow_and_update(),
+            None,
+            "no downlink destination before the agent selects, not the signalled c="
+        );
         let mut registration = plan("ice", endpoint(1), SourceFilter::Any, rtp_in_tx);
         registration.ice_pending = true;
         registration.egress = egress;
@@ -1425,7 +1436,7 @@ mod tests {
         assert!(registry.ice_selected(endpoint(1), selected));
         assert_eq!(
             *watcher.borrow_and_update(),
-            selected,
+            Some(selected),
             "the downlink follows the selected pair, not the signalled c="
         );
 
@@ -1437,7 +1448,7 @@ mod tests {
         );
         assert_eq!(
             *watcher.borrow_and_update(),
-            selected,
+            Some(selected),
             "and it does not move the downlink — on an ICE leg only the agent may (§4 layer 4)"
         );
         registry.dispatch(rx(1, "198.51.100.4:5000", b"other"));
