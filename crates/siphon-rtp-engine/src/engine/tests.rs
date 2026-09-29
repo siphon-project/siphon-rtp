@@ -9,7 +9,7 @@ use siphon_rtp_datapath::{
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_hep::protocol_type;
 use siphon_rtp_proto::{
-    BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event,
+    BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSide,
     MediaTimeoutReason, PlayMediaSource, PlayRepeat, ProfileFlags, RecordingFormat, SessionStats,
     WsBridgeEndReason, WsTeeDirection, WsVadEngine,
 };
@@ -27882,4 +27882,185 @@ async fn a_takeover_that_fails_after_the_pipeline_stopped_puts_the_call_back() {
         engine.calls.get("reanchored").expect("call").pipeline,
         PipelineKind::Media
     );
+}
+
+/// Poll [`Engine::detect_media_started`] until it has emitted `want` events in total, the way the
+/// daemon's 20 ms ticker does, and return every `MediaStarted` the client received.
+async fn poll_media_started(
+    engine: &Engine<UdpLoopbackDatapath>,
+    events: &flume::Receiver<Event>,
+    want: usize,
+) -> Vec<Event> {
+    let mut emitted = 0;
+    for _ in 0..200 {
+        emitted += engine.detect_media_started();
+        if emitted >= want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| matches!(event, Event::MediaStarted { .. }))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_leg_reports_its_first_packet_once() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    let (_signalled_a, addr_a) = phone().await;
+    // Party A sends from another port than the one its SDP names — what a NAT does to it.
+    let (natted_a, natted_addr) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "first-media".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let far_addr = sdp::parse(&ok_sdp_text(&offer)).expect("offer").remote_rtp;
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "first-media".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let near_addr = sdp::parse(&ok_sdp_text(&answer))
+        .expect("answer")
+        .remote_rtp;
+
+    assert_eq!(engine.detect_media_started(), 0, "nothing has arrived yet");
+
+    natted_a
+        .send_to(&g711_rtp(0, 1, 0x0A0A_0A0A, 0xFF), near_addr)
+        .await
+        .expect("a send");
+    let started = poll_media_started(&engine, &events, 1).await;
+    assert_eq!(
+        started,
+        vec![Event::MediaStarted {
+            call_id: "first-media".into(),
+            from_tag: "tag-a".into(),
+            to_tag: Some("tag-b".into()),
+            leg: LegSide::Near,
+            source: Some(natted_addr),
+            signalled: Some(addr_a),
+        }],
+        "the source is where the packet came from, the signalled address where the SDP said"
+    );
+
+    phone_b
+        .send_to(&g711_rtp(0, 1, 0x0B0B_0B0B, 0xFF), far_addr)
+        .await
+        .expect("b send");
+    let started = poll_media_started(&engine, &events, 1).await;
+    assert!(
+        matches!(
+            started.as_slice(),
+            [Event::MediaStarted { leg: LegSide::Far, signalled: Some(signalled), .. }]
+                if *signalled == addr_b
+        ),
+        "{started:?}"
+    );
+
+    // More media on both legs: nothing further.
+    natted_a
+        .send_to(&g711_rtp(0, 2, 0x0A0A_0A0A, 0xFF), near_addr)
+        .await
+        .expect("a send");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(engine.detect_media_started(), 0, "once per leg");
+
+    engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "first-media".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    let legs = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            Event::CallSummary { legs, .. } => Some(legs),
+            _ => None,
+        })
+        .expect("CallSummary emitted on delete");
+    assert!(legs
+        .iter()
+        .all(|leg| leg.media_started_at_unix_ms.is_some()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_source_does_not_start_media() {
+    // A packet the gate refuses has not arrived in any useful sense: no event, and the summary says
+    // the leg never carried media — which is what tells an empty recording from a silent caller.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+    let (stranger, _) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "refused-media".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let engine_addr = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer SDP")
+        .remote_rtp;
+    for sequence in 0..5u16 {
+        stranger
+            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), engine_addr)
+            .await
+            .expect("send");
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(engine.detect_media_started(), 0);
+
+    engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "refused-media".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    let legs = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            Event::CallSummary { legs, .. } => Some(legs),
+            _ => None,
+        })
+        .expect("CallSummary emitted on delete");
+    assert_eq!(legs[0].media_started_at_unix_ms, None);
+
+    // Teardown drains the watch list itself — no poll has run since the delete.
+    assert!(engine.awaiting_media.is_empty());
 }

@@ -153,6 +153,12 @@ harness = false
 name = "play_blob_bench"
 harness = false
 
+# The per-tick cost of the first-media poll behind `media_started`, against the number of legs still
+# waiting for their first packet.
+[[bench]]
+name = "media_started_bench"
+harness = false
+
 [lints]
 workspace = true
 

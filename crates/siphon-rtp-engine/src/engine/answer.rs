@@ -780,6 +780,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         if let Some(endpoint) = released {
             self.endpoint_calls.remove(&endpoint.id);
+            self.awaiting_media.remove(&endpoint.id);
             self.free(&[endpoint]).await;
         }
         far

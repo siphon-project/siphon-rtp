@@ -1726,6 +1726,24 @@ pub struct LegSummary {
     /// The RTP payload type of the leg's negotiated audio codec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_type: Option<u8>,
+    /// When this party's first packet cleared the engine's source gate ([`Event::MediaStarted`]), as
+    /// Unix milliseconds. `None` when none ever did: a leg that never carried media, told apart from
+    /// one that carried silence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_started_at_unix_ms: Option<u64>,
+}
+
+/// Which of a call's two engine legs something happened on. `near` faces the offerer (the
+/// `from_tag` side), `far` faces the answerer.
+///
+/// Deliberately **not** `#[non_exhaustive]`: a call has exactly two engine legs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegSide {
+    /// The leg facing the offerer.
+    Near,
+    /// The leg facing the answerer.
+    Far,
 }
 
 /// RFC 4103 Real-Time Text reception counters for one leg's inbound T.140 stream, measured by the
@@ -1847,6 +1865,27 @@ pub enum Event {
         call_id: String,
         from_tag: String,
         reason: MediaTimeoutReason,
+    },
+    /// The first packet arrived on one of a call's legs and cleared the source gate — media is
+    /// flowing toward the engine on that leg. Emitted once per leg, so a two-party call raises two.
+    ///
+    /// `leg` names the engine leg rather than a party because on a call nobody has answered yet the
+    /// engine cannot always tell who is sending: the far leg carries the callee's early media on a
+    /// relayed call and the caller's own media on an offer-only one. `source` is where the packet
+    /// came from when the engine latched it; set against `signalled`, a difference is a NAT between
+    /// the party and the engine. Detected within one packetization interval (20 ms) of arrival.
+    MediaStarted {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_tag: Option<String>,
+        leg: LegSide,
+        /// The address the first packet came from, when the engine latched one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<std::net::SocketAddr>,
+        /// The address the SDP signalled for this leg's party.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signalled: Option<std::net::SocketAddr>,
     },
     /// A [`Command::PlayMedia`] playback ended. Carries the `play_id` the play's accept returned, so a
     /// controller awaiting a specific prompt matches the completion to the accept it holds — the
@@ -2264,6 +2303,7 @@ mod tests {
                     remote_address: Some("198.51.100.7:4000".parse().expect("address")),
                     egress_ssrc: Some(0x1f2e_3d4c),
                     payload_type: Some(8),
+                    media_started_at_unix_ms: None,
                 },
                 // A counters-only leg (no media actor) omits every quality field.
                 LegSummary {
@@ -2287,6 +2327,7 @@ mod tests {
                     remote_address: None,
                     egress_ssrc: None,
                     payload_type: None,
+                    media_started_at_unix_ms: None,
                     text: Some(TextStreamStats {
                         packets: 5,
                         characters: 11,
@@ -2946,6 +2987,57 @@ mod tests {
         let legacy = serde_json::json!({ "source": "blob", "data": half_megabyte });
         assert!(serde_json::to_vec(&legacy).expect("json").len() > MAX_FRAME_LEN);
         assert!(frame::encode(&blob_request(half_megabyte)).is_ok());
+    }
+
+    #[test]
+    fn media_started_event_wire_shape() {
+        let started = Event::MediaStarted {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            to_tag: Some("t".into()),
+            leg: LegSide::Far,
+            source: Some("203.0.113.7:40000".parse().expect("addr")),
+            signalled: Some("192.0.2.10:4000".parse().expect("addr")),
+        };
+        let value = serde_json::to_value(&started).expect("to_value");
+        assert_eq!(value["event"], "media_started");
+        assert_eq!(value["leg"], "far");
+        assert_eq!(value["source"], "203.0.113.7:40000");
+        assert_eq!(value["signalled"], "192.0.2.10:4000");
+        assert_eq!(
+            serde_json::from_value::<Event>(value).expect("roundtrip"),
+            started
+        );
+
+        // Nothing latched and nothing signalled: both fields are omitted, not null.
+        let bare = Event::MediaStarted {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            to_tag: None,
+            leg: LegSide::Near,
+            source: None,
+            signalled: None,
+        };
+        let value = serde_json::to_value(&bare).expect("to_value");
+        assert!(value.get("source").is_none());
+        assert!(value.get("signalled").is_none());
+        assert!(value.get("to_tag").is_none());
+    }
+
+    #[test]
+    fn a_leg_summary_without_a_media_start_omits_it() {
+        let summary: LegSummary = serde_json::from_value(serde_json::json!({
+            "tag": "a",
+            "packets_in": 0,
+            "bytes_in": 0,
+            "packets_out": 0,
+            "bytes_out": 0,
+            "packets_dropped": 0
+        }))
+        .expect("an older summary still parses");
+        assert_eq!(summary.media_started_at_unix_ms, None);
+        let value = serde_json::to_value(&summary).expect("to_value");
+        assert!(value.get("media_started_at_unix_ms").is_none());
     }
 
     #[test]

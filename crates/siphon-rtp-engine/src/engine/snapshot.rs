@@ -513,6 +513,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // The checkpoint does not carry when the call started, and the restore time is not
                 // it, so a restored call has no start for a voice-quality report to claim.
                 started_at_unix_ms: None,
+                near_media_started_at_unix_ms: None,
+                far_media_started_at_unix_ms: None,
                 ice: snapshot.ice.map(|ice| IceCredentials {
                     ufrag: ice.ufrag,
                     pwd: ice.pwd,

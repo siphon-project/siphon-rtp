@@ -54,6 +54,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             for endpoint in endpoints {
                 self.datapath.remove_endpoint(endpoint).await;
                 self.endpoint_calls.remove(&endpoint);
+                self.awaiting_media.remove(&endpoint);
             }
             self.release_client_call(call.owner);
         }
@@ -170,11 +171,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     local_address: advertised_address(&call.near),
                     remote_address: self.observed_remote(&call.near),
                     egress_ssrc: b_to_a.and_then(|quality| quality.egress_ssrc),
+                    media_started_at_unix_ms: call.near_media_started_at_unix_ms,
                 };
                 let far_media = LegMedia {
                     local_address: advertised_address(far),
                     remote_address: self.observed_remote(far),
                     egress_ssrc: a_to_b.and_then(|quality| quality.egress_ssrc),
+                    media_started_at_unix_ms: call.far_media_started_at_unix_ms,
                 };
                 vec![
                     leg_summary(
@@ -222,6 +225,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         .latched_source(caller.rtp.id)
                         .or(call.near.remote_rtp),
                     egress_ssrc: b_to_a.and_then(|quality| quality.egress_ssrc),
+                    // Either socket may be the caller's, so its media started with whichever did.
+                    media_started_at_unix_ms: [
+                        call.near_media_started_at_unix_ms,
+                        call.far_media_started_at_unix_ms,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min(),
                 };
                 vec![leg_summary(
                     &call.from_tag,
@@ -295,6 +306,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         for endpoint in endpoints {
             self.datapath.remove_endpoint(endpoint).await;
             self.endpoint_calls.remove(&endpoint);
+            self.awaiting_media.remove(&endpoint);
         }
         self.release_client_call(call.owner);
     }
@@ -339,11 +351,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// media had actually moved. A record that cannot show a leg replying to the wrong place is how
     /// that class of fault stays invisible until someone takes a host capture.
     fn observed_remote(&self, leg: &Leg) -> Option<std::net::SocketAddr> {
+        self.latched_remote(leg).or(leg.remote_rtp)
+    }
+
+    /// The source the engine latched for `leg`'s party, on whichever path carries it — never the
+    /// signalled address, so a caller comparing the two learns something.
+    pub(super) fn latched_remote(&self, leg: &Leg) -> Option<std::net::SocketAddr> {
         self.datapath
             .latched_source(leg.rtp.id)
             .or_else(|| self.bridge.latched_source(leg.rtp.id))
             .or_else(|| self.media.latched_source(leg.rtp.id))
-            .or(leg.remote_rtp)
     }
 
     /// Render one CDR leg line (target `siphon_rtp::cdr`): the datapath byte/packet counters, plus —
@@ -459,6 +476,8 @@ struct LegMedia {
     remote_address: Option<std::net::SocketAddr>,
     /// The SSRC of the stream the engine sent the party, when a media actor originated it.
     egress_ssrc: Option<u32>,
+    /// When the party's first packet cleared the source gate, Unix ms.
+    media_started_at_unix_ms: Option<u64>,
 }
 
 /// A leg's media address as its party sees it: the advertised IP (a named interface's, which need
@@ -486,6 +505,7 @@ fn leg_summary(
         local_address: Some(media.local_address),
         remote_address: media.remote_address,
         egress_ssrc: media.egress_ssrc,
+        media_started_at_unix_ms: media.media_started_at_unix_ms,
         packets_in: counters.packets_in,
         bytes_in: counters.bytes_in,
         packets_out: counters.packets_out,

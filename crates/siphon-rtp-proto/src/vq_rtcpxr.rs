@@ -1291,6 +1291,7 @@ mod tests {
             remote_address: Some("198.51.100.7:4000".parse().expect("address")),
             egress_ssrc: Some(0x1f2e_3d4c),
             payload_type: Some(8),
+            media_started_at_unix_ms: None,
         }
     }
 

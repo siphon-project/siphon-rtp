@@ -27,7 +27,10 @@ mod gather;
 mod inject;
 mod install;
 mod intercept;
+mod media_started;
 mod negotiate;
+
+pub(crate) use media_started::MEDIA_STARTED_POLL_MS;
 mod offer;
 mod play;
 mod promote;
@@ -369,6 +372,11 @@ struct Call {
     /// report correlates with other records (§4.6.2.2). `None` on a call restored from an HA
     /// checkpoint, which does not carry the original.
     started_at_unix_ms: Option<u64>,
+    /// When the near leg's first packet cleared the source gate ([`Event::MediaStarted`]), Unix ms.
+    /// `None` until it does — which the call summary reports as a leg that never carried media.
+    near_media_started_at_unix_ms: Option<u64>,
+    /// The far leg's twin of [`Self::near_media_started_at_unix_ms`].
+    far_media_started_at_unix_ms: Option<u64>,
     /// The engine's own ICE-lite credentials for this call (its identity as the ICE server), or
     /// `None` for a non-ICE call.
     ice: Option<IceCredentials>,
@@ -1037,6 +1045,10 @@ pub struct Engine<D: Datapath> {
     controller_ids: DashMap<ClientId, Arc<str>>,
     /// Reverse index endpoint → call-id, correlating observed RTCP back to its call (HEP telemetry).
     endpoint_calls: DashMap<EndpointId, String>,
+    /// The RTP endpoints whose first accepted packet has not been seen yet — what
+    /// [`Engine::detect_media_started`] polls. Drained at teardown with `endpoint_calls`; the poll
+    /// also drops any entry whose call is gone, as a backstop.
+    awaiting_media: DashMap<EndpointId, ()>,
     /// The userspace SRTP bridge: the `Redirect`-path crypto for secure (`RTP/SAVP`) legs. Shared
     /// with the redirect dispatcher (see [`crate::srtp_bridge`]).
     bridge: Arc<SrtpBridge<D>>,
@@ -1171,19 +1183,24 @@ pub struct Engine<D: Datapath> {
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
-    /// Account for a call just inserted into the registry: count it against its client's quota, and
-    /// map every endpoint it owns back to it (RTCP correlation, and the release at teardown, which
-    /// removes exactly `Call::all_endpoint_ids` again). Shared by every verb that creates a call.
+    /// Account for a call just inserted into the registry: count it against its client's quota, map
+    /// every endpoint it owns back to it (RTCP correlation, and the release at teardown, which
+    /// removes exactly `Call::all_endpoint_ids` again), and watch each leg's RTP endpoint for its
+    /// first packet ([`Engine::detect_media_started`]). Shared by every verb that creates a call.
     fn index_new_call(&self, call_id: &str, client: ClientId) {
         *self.client_calls.entry(client).or_insert(0) += 1;
-        let endpoints: Vec<EndpointId> = self
-            .calls
-            .get(call_id)
-            .map(|call| call.all_endpoint_ids().collect())
-            .unwrap_or_default();
+        let Some((endpoints, rtp)) = self.calls.get(call_id).map(|call| {
+            let rtp: Vec<EndpointId> = std::iter::once(call.near.rtp.id)
+                .chain(call.far.map(|far| far.rtp.id))
+                .collect();
+            (call.all_endpoint_ids().collect::<Vec<_>>(), rtp)
+        }) else {
+            return;
+        };
         for endpoint in endpoints {
             self.endpoint_calls.insert(endpoint, call_id.to_string());
         }
+        self.watch_for_media(rtp);
     }
 
     /// The engine's DTLS certificate fingerprint as advertised in `a=fingerprint` (RFC 8122), or `None`
