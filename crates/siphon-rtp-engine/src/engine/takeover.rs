@@ -553,8 +553,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ///   recording, a SIPREC subscription, a WS tee or an X3 interception. Each of those owns per-
     ///   packet state built on the media path the takeover would remove; silently stopping an
     ///   interception or a recording is worse than refusing to start.
-    /// * A **single-leg** call (`answer_local`, or an offer nobody answered). There is no relay to
-    ///   displace and no second party a detach could ever hand it back to.
+    /// * A **single-leg** call that is not on the engine's own pipeline (an offer nobody answered
+    ///   and nothing promoted). There is no relay to displace and no anchor to return to.
+    ///
+    /// **Anchor** (a single-leg call on the engine's own pipeline — `answer_local` without `ws_uri`,
+    /// or one a detach handed back). The bot takes the leg from the pipeline and a detach hands it
+    /// back; see [`Self::attach_to_anchor`].
     async fn start_ws_bridge(&self, call_id: &str, ws_uri: &str) -> Result<(), String> {
         // --- re-point ------------------------------------------------------------------------
         if let Some(state) = self.ws.route_state(call_id) {
@@ -627,6 +631,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return result;
         }
 
+        // --- takeover of the engine's own anchor --------------------------------------------
+        let anchored = self
+            .owned_call_internal(call_id, |call| {
+                call.is_single_leg() && call.pipeline == PipelineKind::Media
+            })
+            .unwrap_or(false)
+            && self.media.is_media_call(call_id);
+        if anchored {
+            return self.attach_to_anchor(call_id, ws_uri).await;
+        }
+
         // --- takeover of a live relay ----------------------------------------------------------
         let Some((pipeline, near, near_codec, relay_flows, near_secure, has_ice, received_from)) =
             self.owned_call_internal(call_id, |call| {
@@ -687,9 +702,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         if relay_flows.is_empty() {
             return Err(
-                "ws-takeover-not-answered: the call has no two-party relay to take over (it is \
-                 unanswered, or was answered locally, so there is no second party a detach could \
-                 hand it back to); negotiate the takeover with ws_uri instead"
+                "ws-takeover-not-answered: the call has no two-party relay to take over and is not \
+                 on the engine's own pipeline (it is unanswered), so there is nothing a detach could \
+                 hand it back to; negotiate the takeover with ws_uri instead"
                     .to_string(),
             );
         }
@@ -764,6 +779,207 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.pipeline = PipelineKind::Ws;
         }
         Ok(())
+    }
+
+    /// Hand a single-leg call from the engine's own pipeline to a WebSocket takeover: a bot joins a
+    /// call the engine answered itself, and a later detach gives the leg back
+    /// ([`Self::return_takeover_to_anchor`]).
+    ///
+    /// Everything that can fail cleanly does so first, with the pipeline still carrying the call:
+    /// the refusals, then the dial. Only then is the pipeline stopped — and **awaited**, because the
+    /// bridge must never run alongside it: two senders on one endpoint interleave two RTP sequence
+    /// series toward one peer (RFC 3550 §5.1), and on a secure leg two owners of one SDES context
+    /// would encrypt under the same index (RFC 3711 §9.1). The context itself moves to the bridge
+    /// once the actor has let go of it, so the rollover counter and replay window carry on. The
+    /// gate is drawn exactly as the pipeline's was — the call's stored posture around its
+    /// `received-from`-seeded address — and the downlink starts where the pipeline's latch last saw
+    /// the caller. If the bridge cannot be installed after all, the call is put back on the pipeline
+    /// rather than left with no media path.
+    ///
+    /// Refused while anything else lives on the pipeline — a recording, a tee, a SIPREC
+    /// subscription, an interception, a DTMF block, echo — since stopping the pipeline would stop it
+    /// silently. A prompt still playing is ended with `play_finished{error}`, as on any teardown.
+    async fn attach_to_anchor(&self, call_id: &str, ws_uri: &str) -> Result<(), String> {
+        let Some((codec, caller, signalled, received_from, posture, near_secure, keyed, others)) =
+            self.owned_call_internal(call_id, |call| {
+                (
+                    call.near_codec.clone(),
+                    call.caller_leg().rtp.id,
+                    call.near.remote_rtp,
+                    call.offer_received_from,
+                    call.caller_source_posture,
+                    call.near_secure,
+                    call.near_secure_key.is_some(),
+                    call.promotion_reasons
+                        .iter()
+                        .any(|reason| *reason != PromotionReason::MediaOp),
+                )
+            })
+        else {
+            return Err("call no longer exists".to_string());
+        };
+        if others
+            || self.ws_tees.contains_key(call_id)
+            || self.x3_sessions.contains_key(call_id)
+            || self
+                .subscriptions
+                .get(call_id)
+                .is_some_and(|list| !list.is_empty())
+        {
+            return Err(
+                "ws-takeover-anchor-busy: a recording, WebSocket tee, SIPREC subscription, DTMF \
+                 block, echo or lawful-interception delivery runs on the engine's pipeline for this \
+                 call, and handing the leg to a bot would stop it; stop it first"
+                    .to_string(),
+            );
+        }
+        let Some(codec) = codec else {
+            return Err("the call has no negotiated codec".to_string());
+        };
+        let Some(signalled) = signalled else {
+            return Err("the caller's leg has no signalled address".to_string());
+        };
+        if near_secure && !keyed {
+            return Err(
+                "ws-takeover-unkeyable: the caller's leg is secure but its key material is not \
+                 held by the engine's pipeline"
+                    .to_string(),
+            );
+        }
+        let expected = ws_takeover_media_address(signalled, received_from);
+        let accepted_source = posture.gate(expected);
+        let a_rtp = self.media.latched_source(caller).unwrap_or(expected);
+
+        // Nothing has changed yet, so a dial failure is a clean refusal on a call still anchored.
+        let socket = self.dial_ws_bridge(ws_uri).await?;
+
+        self.media.stop(call_id).await;
+        // Taken, not cloned, and only now: with the actor gone the call's handle is the last one, so
+        // the leg can be unwrapped rather than shared between two owners.
+        let key = self
+            .calls
+            .get_mut(call_id)
+            .and_then(|mut call| call.near_secure_key.take());
+        let secure = match key {
+            None => None,
+            Some(super::NearSecureKey(shared)) => match Arc::try_unwrap(shared) {
+                Ok(mutex) => match mutex.into_inner() {
+                    Ok(leg) => Some(Arc::new(crate::ws_bridge::WsSecureLeg::keyed(leg))),
+                    Err(_) => {
+                        return self
+                            .reanchor(call_id, None, "the secure leg's mutex is poisoned")
+                            .await;
+                    }
+                },
+                Err(still_shared) => {
+                    return self
+                        .reanchor(
+                            call_id,
+                            Some(still_shared),
+                            "the secure leg is still held elsewhere",
+                        )
+                        .await;
+                }
+            },
+        };
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.near_secure_key = None;
+            call.promotion_reasons.remove(&PromotionReason::MediaOp);
+        }
+        let installed = self
+            .setup_ws_bridge(WsBridgeSetup {
+                call_id,
+                ws_uri,
+                endpoint_a: caller,
+                a_rtp,
+                codec: Some(&codec),
+                accepted_source,
+                ice_pending: false,
+                secure: secure.clone(),
+                // A runtime attach carries no profile; the uplink processing stays off, as on a relay
+                // takeover.
+                noise_suppression: false,
+                echo: crate::media_pipeline::EchoProfile::default(),
+                vad_config: None,
+                wire_sample_rate: None,
+                egress: None,
+                // Nothing displaced: a detach returns the leg to the anchor, not to a relay.
+                takeover: None,
+                socket: Some(socket),
+            })
+            .await;
+        if let Err(reason) = installed {
+            let key = secure
+                .and_then(|secure| secure.take_leg())
+                .map(|leg| Arc::new(std::sync::Mutex::new(leg)));
+            return self.reanchor(call_id, key, &reason).await;
+        }
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            // The WS server is the far side now, as on a negotiated takeover.
+            call.far_codec = None;
+            call.pipeline = PipelineKind::Ws;
+        }
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id,
+            ws_uri,
+            "ws bridge attached to the engine's own leg"
+        );
+        Ok(())
+    }
+
+    /// Put a call whose pipeline was stopped for a takeover back on it, keyed with `key` when the
+    /// leg is secure, and report why the takeover did not happen. A failure here leaves the call with
+    /// no media path, so it is logged at ERROR and named in the error.
+    pub(super) async fn reanchor(
+        &self,
+        call_id: &str,
+        key: Option<Arc<std::sync::Mutex<siphon_rtp_srtp::leg::SecureLeg>>>,
+        reason: &str,
+    ) -> Result<(), String> {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            // The state `promote_to_processing` builds a single-leg anchor from: no far codec (a
+            // far codec selects its two-leg branch) and a passthrough pipeline to promote.
+            call.pipeline = PipelineKind::Passthrough;
+            call.far_codec = None;
+        }
+        let restored = self
+            .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
+            .await
+            .and_then(|()| {
+                if let Some(mut call) = self.calls.get_mut(call_id) {
+                    call.far_codec = call.near_codec.clone();
+                    call.pipeline = PipelineKind::Media;
+                    call.near_secure_key = key.clone().map(super::NearSecureKey);
+                }
+                let Some(leg) = key else { return Ok(()) };
+                if self.media.control(
+                    call_id,
+                    crate::media_pipeline::MediaControl::AttachNearSecureLeg { leg },
+                ) {
+                    Ok(())
+                } else {
+                    Err("media actor unavailable".to_string())
+                }
+            });
+        match restored {
+            Ok(()) => Err(format!(
+                "ws-takeover-anchor: {reason}; the call is back on the engine's pipeline"
+            )),
+            Err(error) => {
+                tracing::error!(
+                    target: "siphon_rtp::media",
+                    call_id,
+                    %reason,
+                    %error,
+                    "a takeover of the engine's own leg failed and the leg could not be re-anchored; \
+                     it has no media path"
+                );
+                Err(format!(
+                    "ws-takeover-anchor: {reason}; re-anchoring failed too ({error})"
+                ))
+            }
+        }
     }
 
     /// Detach a call's WebSocket takeover bridge ([`Command::DetachWsBridge`]) and put the media
@@ -896,6 +1112,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         if let Some(key) = key {
             let leg = Arc::new(std::sync::Mutex::new(key));
+            if let Some(mut call) = self.calls.get_mut(call_id) {
+                call.near_secure_key = Some(super::NearSecureKey(leg.clone()));
+            }
             if !self.media.control(
                 call_id,
                 crate::media_pipeline::MediaControl::AttachNearSecureLeg { leg },

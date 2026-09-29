@@ -125,10 +125,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         info: &sdp::MediaInfo,
         profile: &ProfileFlags,
     ) {
-        *self.client_calls.entry(client).or_insert(0) += 1;
-        for endpoint in [Some(near_rtp), near_rtcp].into_iter().flatten() {
-            self.endpoint_calls.insert(endpoint.id, call_id.to_string());
-        }
         self.calls.insert(
             call_id.to_string(),
             Call {
@@ -199,6 +195,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_sip_call_id: profile.sip_call_id.clone(),
                 far_sip_call_id: None,
                 caller_source_posture: super::negotiate::SourcePosture::from_profile(profile),
+                near_secure_key: None,
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
                 offer_received_from: profile.received_from,
@@ -220,6 +217,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_text_local_crypto: None,
             },
         );
+        self.index_new_call(call_id, client);
     }
 
     /// WebSocket bridge (mod_audio_stream / voice-AI) on a single-leg answer — the same
@@ -454,6 +452,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &local.key,
                     &peer_key.key,
                 )));
+                if let Some(mut call) = self.calls.get_mut(call_id) {
+                    call.near_secure_key = Some(super::NearSecureKey(leg.clone()));
+                }
                 if !self
                     .media
                     .control(call_id, MediaControl::AttachNearSecureLeg { leg })

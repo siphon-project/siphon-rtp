@@ -1475,6 +1475,92 @@ async fn ws_takeover_detach_to_anchor_does_not_leak() {
     gate.assert_no_leak();
 }
 
+/// One anchor round trip: `answer_local` (the engine's own pipeline), `attach_ws_bridge` (the
+/// pipeline stops and a bot takes the leg), `detach_ws_bridge` (back to a pipeline), `delete`.
+async fn anchor_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &str, index: usize) {
+    let call_id = format!("anchor-bot-soak-{index}");
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for("198.51.100.1", 40_000),
+                    profile: siphon_rtp_proto::ProfileFlags::default(),
+                },
+            )
+            .await,
+        "answer_local",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri.to_string(),
+                },
+            )
+            .await,
+        "attach a bot to the anchor",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::DetachWsBridge {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await,
+        "detach back to the anchor",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id,
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchor_attach_detach_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let (uri, live) = tee_sink_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let mut gate = LeakGate::new("anchor attach/detach", 100, 40).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            anchor_attach_detach(&engine, &uri, index).await;
+            index += 1;
+        }
+        drain_tee_server(&live).await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(
+            engine.ws_bridge_count(),
+            0,
+            "no bridge record outlives its detach"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// A DTLS-SRTP offerer's SDP (RFC 5764 / RFC 5763 §5). Documentation-range address (RFC 5737).
 fn dtls_offerer_sdp(host: &str, port: u16, fingerprint: &siphon_rtp_dtls::Fingerprint) -> String {
     let hex = fingerprint

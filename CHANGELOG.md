@@ -15,6 +15,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   detection and a tee. An SRTP phone calling out to a plain trunk on another codec could not be
   connected at all. The new `SrtpOffererMedia` pipeline holds the caller's `SecureLeg` in the media
   actor. A DTLS-SRTP caller in the same position is still refused.
+- **A bot can join a call the engine answered.** `attach_ws_bridge` refused every `answer_local`
+  call (`ws-takeover-not-answered`), which is every call a controller answers, so a bot could only be
+  named at answer time. It now takes the leg from the engine's own pipeline, and a detach gives it
+  back. The pipeline is stopped and awaited first, and an SDES-SRTP leg's context moves to the bot's
+  leg intact. Refused (`ws-takeover-anchor-busy`) while a recording, tee, SIPREC subscription, DTMF
+  block, echo or interception runs on the pipeline.
 - **A negotiated WebSocket takeover can be detached.** `detach_ws_bridge` refused a bridge
   negotiated with `ws_uri`, so once a bot held a leg it held it until the call ended, and nothing
   could be played, recorded or routed afterwards. On a single-leg call the caller is now handed to

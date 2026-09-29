@@ -4258,38 +4258,62 @@ impl MediaRegistry {
     /// The wait runs on a detached task so this stays synchronous for its callers, and falls back to
     /// an immediate abort when there is no runtime to spawn on.
     pub fn deregister(&self, call_id: &str) {
-        if let Some((_, handle)) = self.calls.remove(call_id) {
-            let _ = handle
-                .mailbox
-                .try_send(MediaInput::Control(MediaControl::Stop));
-            // Dropped first, so the stopping actor receives nothing more while it drains.
-            for endpoint in handle
-                .endpoints
-                .iter()
-                .copied()
-                .chain(handle.rtcp_endpoints.iter().copied())
-            {
-                self.routes.remove(&endpoint);
-                // What this call learned dies with it: a re-used endpoint id must start from its own
-                // signalled address, never from the previous call's peer.
-                self.observed.remove(&endpoint);
+        let Some(mut task) = self.detach_actor(call_id) else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if tokio::time::timeout(ACTOR_TEARDOWN_GRACE, &mut task)
+                        .await
+                        .is_err()
+                    {
+                        // A wedged actor must not outlive its call, recording or not.
+                        task.abort();
+                    }
+                });
             }
-            let mut task = handle.task;
-            match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => {
-                    runtime.spawn(async move {
-                        if tokio::time::timeout(ACTOR_TEARDOWN_GRACE, &mut task)
-                            .await
-                            .is_err()
-                        {
-                            // A wedged actor must not outlive its call, recording or not.
-                            task.abort();
-                        }
-                    });
-                }
-                Err(_) => task.abort(),
-            }
+            Err(_) => task.abort(),
         }
+    }
+
+    /// [`Self::deregister`], but returning only once the actor has exited — for handing the leg to
+    /// something else that must never run alongside it. Two owners of one secure leg would encrypt
+    /// under the same SRTP index (RFC 3711 §9.1), and two senders on one endpoint would interleave two
+    /// RTP sequence series toward one peer (RFC 3550 §5.1).
+    pub async fn stop(&self, call_id: &str) {
+        let Some(mut task) = self.detach_actor(call_id) else {
+            return;
+        };
+        if tokio::time::timeout(ACTOR_TEARDOWN_GRACE, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// Remove `call_id`'s actor from the registry and its routes, and tell it to stop; the caller
+    /// decides whether to wait for it.
+    fn detach_actor(&self, call_id: &str) -> Option<tokio::task::JoinHandle<()>> {
+        let (_, handle) = self.calls.remove(call_id)?;
+        let _ = handle
+            .mailbox
+            .try_send(MediaInput::Control(MediaControl::Stop));
+        // Dropped first, so the stopping actor receives nothing more while it drains.
+        for endpoint in handle
+            .endpoints
+            .iter()
+            .copied()
+            .chain(handle.rtcp_endpoints.iter().copied())
+        {
+            self.routes.remove(&endpoint);
+            // What this call learned dies with it: a re-used endpoint id must start from its own
+            // signalled address, never from the previous call's peer.
+            self.observed.remove(&endpoint);
+        }
+        Some(handle.task)
     }
 }
 

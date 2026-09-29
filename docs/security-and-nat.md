@@ -1252,6 +1252,14 @@ copy of Layers 1–4.
     is not A's cryptographic far side, and no agent is armed to re-point a takeover leg's egress.
     Re-pointing an *existing* bridge is unaffected — that leg was keyed and armed when it was
     negotiated, and the state is carried, not rebuilt.
+  - **A bot can take over the engine's own leg.** On a single-leg call running on the engine's pipeline
+    the attach stops the pipeline and **awaits** its exit before the bridge is installed, so the two
+    never send on one endpoint together (RFC 3550 §5.1) and never share one SDES context (RFC 3711
+    §9.1: one index, two senders, is a two-time pad). The context then *moves* to the bridge — the
+    call's handle is the last one left, so it is unwrapped rather than cloned — and the gate is drawn
+    from the call's stored posture exactly as the pipeline's was. Everything that can refuse does so
+    before the pipeline stops; anything that fails after it puts the call back on a pipeline rather
+    than leaving it with no media path.
   - **A detach restores exactly what the attach displaced.** The stored `Forward` rules are reinstalled
     verbatim, gate and latch policy included; the datapath keeps the latch in separate state, so a flow
     install does not disturb it and a NATed leg keeps the path it had. A bridge that was *negotiated*

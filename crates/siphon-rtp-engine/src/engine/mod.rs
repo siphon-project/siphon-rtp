@@ -330,6 +330,17 @@ enum CallerMediaLeg {
     Far,
 }
 
+/// A single-leg anchor's SDES key material ([`Call::near_secure_key`]). A newtype so the call can stay
+/// `Debug` without the key material ever being formatted.
+#[derive(Clone)]
+struct NearSecureKey(Arc<std::sync::Mutex<siphon_rtp_srtp::leg::SecureLeg>>);
+
+impl std::fmt::Debug for NearSecureKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NearSecureKey(..)")
+    }
+}
+
 /// A negotiated (or half-negotiated) call: its owner and its leg(s).
 #[derive(Debug)]
 struct Call {
@@ -514,6 +525,11 @@ struct Call {
     /// for the single-leg anchor, which is built later from the call and would otherwise gate on the
     /// exact signalled IP whatever the controller asked for.
     caller_source_posture: negotiate::SourcePosture,
+    /// The SDES key material behind a single-leg anchor's secure caller, kept so the leg can be
+    /// handed to a WebSocket takeover with its SRTP state intact (see `Engine::attach_to_anchor`).
+    /// `None` on any other call. Shared with the media actor while it runs; unwrapped only after the
+    /// actor has exited, so two owners never encrypt under one index.
+    near_secure_key: Option<NearSecureKey>,
     /// The **far** (B) leg's `received-from`, from B's answer — the far-side twin of
     /// [`Self::offer_received_from`]. Stored so a later renegotiation can keep or refresh it: an answer
     /// or a re-offer from B that carries one replaces it, one that carries none keeps it. Without it an
@@ -1155,6 +1171,21 @@ pub struct Engine<D: Datapath> {
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Account for a call just inserted into the registry: count it against its client's quota, and
+    /// map every endpoint it owns back to it (RTCP correlation, and the release at teardown, which
+    /// removes exactly `Call::all_endpoint_ids` again). Shared by every verb that creates a call.
+    fn index_new_call(&self, call_id: &str, client: ClientId) {
+        *self.client_calls.entry(client).or_insert(0) += 1;
+        let endpoints: Vec<EndpointId> = self
+            .calls
+            .get(call_id)
+            .map(|call| call.all_endpoint_ids().collect())
+            .unwrap_or_default();
+        for endpoint in endpoints {
+            self.endpoint_calls.insert(endpoint, call_id.to_string());
+        }
+    }
+
     /// The engine's DTLS certificate fingerprint as advertised in `a=fingerprint` (RFC 8122), or `None`
     /// when the engine has no certificate. The same certificate backs every DTLS leg, so every SDP
     /// presenting one — offer, re-offer or answer — carries the same value (RFC 8842 §5.5: an unchanged
