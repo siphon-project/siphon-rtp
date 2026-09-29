@@ -1255,8 +1255,13 @@ copy of Layers 1–4.
   - **A detach restores exactly what the attach displaced.** The stored `Forward` rules are reinstalled
     verbatim, gate and latch policy included; the datapath keeps the latch in separate state, so a flow
     install does not disturb it and a NATed leg keeps the path it had. A bridge that was *negotiated*
-    (`ws_uri`) displaced nothing and is refused (`ws-bridge-negotiated`) rather than detached into a
-    call with no media path at all.
+    (`ws_uri`) on a single-leg call displaced nothing; its detach promotes the leg onto the engine's
+    own pipeline, whose source gate is drawn from the call's stored posture and `received-from` hint —
+    the same inputs the bridge's gate was drawn from, so the gate does not widen across the
+    hand-over. An SDES leg's `SecureLeg` is moved, not re-derived, so the peer's rollover counter and
+    replay window carry over (RFC 3711 §3.3.1). A two-leg negotiated takeover, and a leg running ICE
+    or keyed by DTLS, are refused before anything stops: the engine's own pipeline could not carry
+    them.
   - **`block_media` / `unblock_media` are refused on a takeover call.** A taken-over call still holds
     the displaced relay's `Forward` rules so its detach can reinstall them, and `unblock` walks exactly
     that list — it would have pulled leg A back off the bridge silently. This joins the existing

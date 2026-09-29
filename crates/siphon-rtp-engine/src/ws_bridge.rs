@@ -91,6 +91,19 @@ impl WsSecureLeg {
         self.keyed.load(Ordering::SeqCst)
     }
 
+    /// Take the key material out, leaving the leg unkeyed — for handing a detached takeover leg to
+    /// the engine's own pipeline with its SRTP state intact. The rollover counter and replay window
+    /// go with it (RFC 3711 §3.3.1): a fresh context would restart the peer's index at zero and fail
+    /// authentication on any call long enough to have wrapped its sequence numbers.
+    pub fn take_leg(&self) -> Option<SecureLeg> {
+        let Ok(mut guard) = self.leg.lock() else {
+            tracing::error!("ws secure-leg mutex poisoned; the key material cannot be handed on");
+            return None;
+        };
+        self.keyed.store(false, Ordering::SeqCst);
+        guard.take()
+    }
+
     /// Install the key material a completed DTLS-SRTP handshake produced. Returns `false` if the
     /// mutex is poisoned, in which case the leg stays unkeyed and keeps dropping.
     pub fn attach(&self, leg: SecureLeg) -> bool {
