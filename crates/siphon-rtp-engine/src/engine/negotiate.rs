@@ -878,13 +878,47 @@ pub(super) fn bridge_source_filter(
     profile: &ProfileFlags,
     addr: std::net::SocketAddr,
 ) -> SourceFilter {
-    if profile.flags.iter().any(|flag| flag == "symmetric") {
-        SourceFilter::Any
-    } else if profile.flags.iter().any(|flag| flag == "subnet-source") {
-        let prefix = if addr.is_ipv4() { 24 } else { 64 };
-        SourceFilter::Subnet(addr.ip(), prefix)
-    } else {
-        SourceFilter::Exact(addr.ip())
+    SourcePosture::from_profile(profile).gate(addr)
+}
+
+/// How a leg's source gate is drawn around its expected address, as the profile's `symmetric` and
+/// `subnet-source` flags ask (docs/security-and-nat.md §4 layer 2). Kept on the call for a pipeline
+/// built after the command that carried the flags — the single-leg anchor `answer_local` promotes
+/// into, which is otherwise built from the call alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SourcePosture {
+    /// Only the expected IP — the tightest RTPBleed defence, and the default.
+    #[default]
+    Exact,
+    /// The expected address's /24 (v4) or /64 (v6): `subnet-source`.
+    Subnet,
+    /// Any source, the latch then following the first stream: `symmetric`, for a peer whose signalled
+    /// address is unusable (a NATed UA advertising its private one).
+    Any,
+}
+
+impl SourcePosture {
+    /// The posture the profile's flags ask for; `symmetric` wins over `subnet-source`.
+    pub(super) fn from_profile(profile: &ProfileFlags) -> Self {
+        if profile.flags.iter().any(|flag| flag == "symmetric") {
+            Self::Any
+        } else if profile.flags.iter().any(|flag| flag == "subnet-source") {
+            Self::Subnet
+        } else {
+            Self::Exact
+        }
+    }
+
+    /// The gate around `addr`.
+    pub(super) fn gate(self, addr: std::net::SocketAddr) -> SourceFilter {
+        match self {
+            Self::Any => SourceFilter::Any,
+            Self::Subnet => {
+                let prefix = if addr.is_ipv4() { 24 } else { 64 };
+                SourceFilter::Subnet(addr.ip(), prefix)
+            }
+            Self::Exact => SourceFilter::Exact(addr.ip()),
+        }
     }
 }
 

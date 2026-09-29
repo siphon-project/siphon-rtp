@@ -593,6 +593,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 fax_passthrough: snapshot.fax_passthrough,
                 near_sip_call_id: snapshot.near_sip_call_id.clone(),
                 far_sip_call_id: snapshot.far_sip_call_id.clone(),
+                // Only read by the single-leg anchor, and a single-leg call is never checkpointed.
+                caller_source_posture: super::negotiate::SourcePosture::default(),
                 relay_flows: media.relay_flows,
                 promotion_reasons: HashSet::new(),
                 // The source gate is reconstructed from the snapshot's per-flow `accepted_source`
