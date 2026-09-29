@@ -14013,22 +14013,8 @@ async fn a_bridge_facing_a_secure_offerer_refuses_every_verb_that_needs_decoded_
                     )
                     .await,
             ),
-            (
-                "attach_ws_tee",
-                engine
-                    .handle(
-                        CLIENT,
-                        Command::AttachWsTee {
-                            call_id: call_id.clone(),
-                            from_tag: "a".into(),
-                            ws_uri: "ws://127.0.0.1:1/tee".into(),
-                            direction: WsTeeDirection::Caller,
-                            channels: None,
-                            sample_rate: None,
-                        },
-                    )
-                    .await,
-            ),
+            // `attach_ws_tee` is not here any more: a tee decodes the bridge's plaintext itself
+            // (`a_ws_tee_attached_mid_call_hears_a_bridged_secure_leg`).
             (
                 "subscribe_request",
                 engine
@@ -14674,7 +14660,7 @@ async fn a_dtls_leg_is_transcoded_to_a_plain_leg_with_a_different_codec_each_sid
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dtls_media_leg_can_be_ws_teed_but_a_dtls_bridge_leg_cannot() {
+async fn a_dtls_leg_can_be_ws_teed_on_the_media_path_and_on_the_bridge() {
     // The second half of what WP-R4 unlocks: once a DTLS leg's media reaches the pipeline it is an
     // ordinary media call, so the post-decode fan-out works and a WS tee attaches. The plain DTLS
     // *bridge* (same codec both sides, no pipeline) still cannot be teed — it relays ciphertext it
@@ -14778,8 +14764,8 @@ async fn a_dtls_media_leg_can_be_ws_teed_but_a_dtls_bridge_leg_cannot() {
         !engine.media().is_media_call("dtls-bridged"),
         "a same-codec DTLS call stays on the cheaper crypto bridge"
     );
-    let (uri, _frames) = tee_server().await;
-    let refused = engine
+    let (uri, frames) = tee_server().await;
+    let attached = engine
         .handle(
             CLIENT,
             Command::AttachWsTee {
@@ -14792,13 +14778,15 @@ async fn a_dtls_media_leg_can_be_ws_teed_but_a_dtls_bridge_leg_cannot() {
             },
         )
         .await;
-    match refused {
-        CmdResult::Error { reason } => assert!(
-            reason.contains("ciphertext"),
-            "expected the crypto-bridge refusal, got {reason}"
-        ),
-        other => panic!("expected an error, got {other:?}"),
-    }
+    assert!(
+        matches!(attached, CmdResult::Ok { .. }),
+        "a DTLS bridge is teed from its plaintext, without being rebuilt: {attached:?}"
+    );
+    expect_tee_start(&frames).await;
+    assert!(
+        !engine.media().is_media_call("dtls-bridged"),
+        "the bridge stays a bridge"
+    );
 }
 
 /// A WebRTC-shaped (`UDP/TLS/RTP/SAVPF`) conference offer from `addr`, with an `a=fingerprint` line
@@ -26522,5 +26510,208 @@ async fn two_secure_parties_on_different_codecs_are_each_shown_their_own() {
             .collect::<Vec<_>>(),
         vec![0],
         "the caller is shown its own codec"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ws_tee_attached_mid_call_hears_a_bridged_secure_leg() {
+    // A live SDES bridge (plain caller, secure callee on a shared codec) teed mid-call. The bridge
+    // never decodes and is not rebuilt: the tee decodes the plaintext the bridge already holds
+    // between its transforms, and the relay carries on untouched.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "bridge-tee".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let far_addr = sdp::parse(&ok_sdp_text(&offer)).expect("offer").remote_rtp;
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "bridge-tee".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_eq!(
+        engine.calls.get("bridge-tee").expect("call").pipeline,
+        PipelineKind::Srtp
+    );
+
+    let (uri, frames) = tee_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsTee {
+                call_id: "bridge-tee".into(),
+                from_tag: "tag-a".into(),
+                ws_uri: uri,
+                direction: WsTeeDirection::Callee,
+                channels: None,
+                sample_rate: None,
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    expect_tee_start(&frames).await;
+    assert!(
+        !engine.media().is_media_call("bridge-tee"),
+        "still a bridge"
+    );
+
+    let mut seal = SrtpContext::from_key_material(&callee_key.key);
+    for sequence in 0..6u16 {
+        let mut sealed = Vec::new();
+        seal.protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x20), &mut sealed)
+            .expect("B encrypts");
+        phone_b.send_to(&sealed, far_addr).await.expect("b send");
+    }
+    let audio = next_tee_audio(&frames).await;
+    assert_eq!(audio.len(), 320, "one decoded 20 ms frame of the callee");
+    assert!(
+        audio.iter().any(|&byte| byte != 0),
+        "the tee hears the callee's decrypted audio, not silence"
+    );
+    // The relay is untouched: A still receives B's audio.
+    let mut buffer = [0u8; 2048];
+    let (len, _) = timeout(Duration::from_secs(2), phone_a.recv_from(&mut buffer))
+        .await
+        .expect("the caller still hears the callee")
+        .expect("recv");
+    assert!(len > 12);
+
+    // Detach takes the tap off the bridge and ends the stream.
+    let detached = engine
+        .handle(
+            CLIENT,
+            Command::DetachWsTee {
+                call_id: "bridge-tee".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }));
+    assert_eq!(engine.ws_tee_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ws_tee_attached_mid_call_hears_both_parties_of_a_transcrypt() {
+    // Two SRTP phones on the transcrypt bridge: the only plaintext of the call exists between the
+    // bridge's two transforms, and the tee takes both parties from there as stereo.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "transcrypt-tee".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let far_addr = sdp::parse(&ok_sdp_text(&offered))
+        .expect("offer")
+        .remote_rtp;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "transcrypt-tee".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let near_addr = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer")
+        .remote_rtp;
+    assert_eq!(
+        engine.calls.get("transcrypt-tee").expect("call").pipeline,
+        PipelineKind::SrtpTranscrypt
+    );
+    let (uri, frames) = tee_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsTee {
+                call_id: "transcrypt-tee".into(),
+                from_tag: "tag-a".into(),
+                ws_uri: uri,
+                direction: WsTeeDirection::Both,
+                channels: None,
+                sample_rate: None,
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    assert_eq!(expect_tee_start(&frames).await.media.channels, 2);
+
+    let mut seal_a = SrtpContext::from_key_material(&caller_key.key);
+    let mut seal_b = SrtpContext::from_key_material(&callee_key.key);
+    for sequence in 0..6u16 {
+        let mut sealed = Vec::new();
+        seal_a
+            .protect(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), &mut sealed)
+            .expect("A encrypts");
+        phone_a.send_to(&sealed, near_addr).await.expect("a send");
+        let mut sealed = Vec::new();
+        seal_b
+            .protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x30), &mut sealed)
+            .expect("B encrypts");
+        phone_b.send_to(&sealed, far_addr).await.expect("b send");
+    }
+    assert_eq!(
+        next_tee_audio(&frames).await.len(),
+        640,
+        "a stereo 20 ms frame: both parties, decoded"
     );
 }

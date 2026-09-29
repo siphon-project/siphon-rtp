@@ -1462,9 +1462,8 @@ pub struct ProfileFlags {
     /// — the NG/bencode front-end does not set it.
     ///
     /// A tee is a reason to decode, like `record_call`: a secure call the engine would otherwise carry
-    /// on a crypto bridge (which relays ciphertext and cannot be teed) is carried by its decoding
-    /// pipeline instead. That choice is made on the answer, so a secure call that must be teed names
-    /// the tee here rather than attaching one later.
+    /// on a crypto bridge is carried by its decoding pipeline instead. A tee attached later to such a
+    /// bridge works too, decoding the plaintext the bridge holds between its transforms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_tee: Option<String>,
     /// Which leg(s) `ws_tee` streams. `None` ⇒ both. Inert without `ws_tee`.

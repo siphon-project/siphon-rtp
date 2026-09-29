@@ -1279,6 +1279,120 @@ async fn ws_bridge_attach_repoint_detach_does_not_leak() {
     gate.assert_no_leak();
 }
 
+/// One bridged-tee cycle: a plain caller toward an SDES callee on a shared codec (the SRTP bridge),
+/// a tee attached mid-call (a plaintext tap on the bridge plus a decoder task per leg), detached,
+/// and the call deleted. The tap, the decoders and the transport must all go with the detach.
+async fn bridged_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &str, index: usize) {
+    let call_id = format!("bridged-tee-soak-{index}");
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for("198.51.100.1", 40_000),
+                    profile: siphon_rtp_proto::ProfileFlags {
+                        transport_protocol: Some("RTP/SAVP".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await,
+        "offer toward a secure callee",
+    );
+    let key = siphon_rtp_srtp::sdes::CryptoAttribute::generate(
+        1,
+        siphon_rtp_srtp::sdes::CryptoSuite::AesCm128HmacSha1_80,
+    )
+    .expect("key");
+    let answer = format!(
+        "v=0\r\no=- 1 1 IN IP4 203.0.113.1\r\ns=-\r\nc=IN IP4 203.0.113.1\r\nt=0 0\r\n\
+         m=audio 41000 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\na={}\r\n",
+        key.to_attribute_value()
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer,
+                    profile: Default::default(),
+                },
+            )
+            .await,
+        "secure answer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri.to_string(),
+                    direction: WsTeeDirection::Both,
+                    channels: Some(2),
+                    sample_rate: None,
+                },
+            )
+            .await,
+        "tee the bridge",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::DetachWsTee {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await,
+        "detach the tee",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id,
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridged_tee_attach_detach_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let (uri, live) = tee_sink_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let mut gate = LeakGate::new("bridged tee", 100, 40).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            bridged_tee_attach_detach(&engine, &uri, index).await;
+            index += 1;
+        }
+        drain_tee_server(&live).await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(engine.ws_tee_count(), 0, "no tee outlives its detach");
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// A DTLS-SRTP offerer's SDP (RFC 5764 / RFC 5763 §5). Documentation-range address (RFC 5737).
 fn dtls_offerer_sdp(host: &str, port: u16, fingerprint: &siphon_rtp_dtls::Fingerprint) -> String {
     let hex = fingerprint
