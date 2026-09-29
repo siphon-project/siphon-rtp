@@ -134,6 +134,9 @@ pub enum PipelineSnapshot {
     /// legs where the secure record carries one, so `checkpoint` refuses it and this never reaches a
     /// blob; it exists so the mapping cannot quietly file a two-legged call as a one-legged one.
     SrtpTranscryptMedia,
+    /// A secure offerer toward a plain callee, transcoded (`PipelineKind::SrtpOffererMedia`). Never
+    /// written — `checkpoint` refuses the call — and refused by `restore`.
+    SrtpOffererMedia,
 }
 
 /// ICE-lite credentials (engine side).

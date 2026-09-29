@@ -129,6 +129,9 @@ pub(super) fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSn
         PipelineKind::SrtpTranscrypt => PipelineSnapshot::SrtpTranscrypt,
         // Same reasoning, and the same refusal: the transcode twin holds two legs as well.
         PipelineKind::SrtpTranscryptMedia => PipelineSnapshot::SrtpTranscryptMedia,
+        // Its own kind for the same reason: the caller's keying is not in the record, and
+        // `checkpoint` refuses the call before it reaches a blob.
+        PipelineKind::SrtpOffererMedia => PipelineSnapshot::SrtpOffererMedia,
         PipelineKind::Media => PipelineSnapshot::Media,
         PipelineKind::SrtpMedia => PipelineSnapshot::SrtpMedia,
         PipelineKind::Ws => PipelineSnapshot::Ws,

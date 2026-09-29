@@ -166,51 +166,66 @@ fn bench_secure_pipeline(criterion: &mut Criterion) {
 /// ciphertext: the packets are pre-sealed under A's key into a replay-safe ring, and the leg is
 /// rebuilt when the ring wraps so the SRTP replay window never rejects a repeat. Sealing inside the
 /// loop would measure a `protect` the real ingress path never performs.
+///
+/// `caller_secure` is the same ring into the offerer's transcode twin (`SrtpOffererMedia`): the caller
+/// on SDES, the callee plaintext — one `unprotect` on ingress and nothing on egress toward B.
 fn bench_secure_transcrypt_pipeline(criterion: &mut Criterion) {
     const RING: usize = 256;
-    criterion.bench_function("media_pipeline_process_8k_20ms/both_secure", |bencher| {
-        let a_key = SrtpKeyMaterial::from_inline_bytes(&[0xA7u8; 30]).expect("30 bytes");
-        let b_key = SrtpKeyMaterial::from_inline_bytes(&[0xB7u8; 30]).expect("30 bytes");
-        // A's own sender context, standing in for the caller's phone.
-        let mut peer = siphon_rtp_srtp::SrtpContext::from_key_material(&a_key);
-        let ring: Vec<Vec<u8>> = (0..RING)
-            .map(|sequence| {
-                let mut sealed = Vec::with_capacity(256);
-                peer.protect(&ulaw_packet(sequence as u16), &mut sealed)
-                    .expect("seed protect");
-                sealed
-            })
-            .collect();
-
-        let build = || {
-            let near = Arc::new(Mutex::new(SecureLeg::new(&a_key, &a_key)));
-            let far = Arc::new(Mutex::new(SecureLeg::new(&b_key, &b_key)));
-            call(Secure::None).with_both_secure_legs(near, far)
-        };
-        let mut media_call = build();
-        let mut index = 0usize;
-        let mut out = Vec::with_capacity(4);
-        let mut events = Vec::with_capacity(4);
-        bencher.iter(|| {
-            if index == 0 {
-                media_call = build(); // fresh replay window so the ring repeats
-            }
-            out.clear();
-            events.clear();
-            let accepted = media_call.process(
-                &RxPacket {
-                    endpoint: EndpointId(1),
-                    source: addr(A_ADDR),
-                    arrival: index as u64 * 20_000,
-                    data: bytes::Bytes::copy_from_slice(&ring[index]),
-                },
-                &mut out,
-                &mut events,
-            );
-            index = if index + 1 == RING { 0 } else { index + 1 };
-            black_box(accepted)
-        });
-    });
+    let a_key = SrtpKeyMaterial::from_inline_bytes(&[0xA7u8; 30]).expect("30 bytes");
+    let b_key = SrtpKeyMaterial::from_inline_bytes(&[0xB7u8; 30]).expect("30 bytes");
+    // A's own sender context, standing in for the caller's phone.
+    let mut peer = siphon_rtp_srtp::SrtpContext::from_key_material(&a_key);
+    let ring: Vec<Vec<u8>> = (0..RING)
+        .map(|sequence| {
+            let mut sealed = Vec::with_capacity(256);
+            peer.protect(&ulaw_packet(sequence as u16), &mut sealed)
+                .expect("seed protect");
+            sealed
+        })
+        .collect();
+    let both_secure = || {
+        let near = Arc::new(Mutex::new(SecureLeg::new(&a_key, &a_key)));
+        let far = Arc::new(Mutex::new(SecureLeg::new(&b_key, &b_key)));
+        call(Secure::None).with_both_secure_legs(near, far)
+    };
+    let caller_secure = || {
+        let near = Arc::new(Mutex::new(SecureLeg::new(&a_key, &a_key)));
+        call(Secure::None).with_near_secure_leg(near)
+    };
+    let builds: [(&str, &dyn Fn() -> MediaCall); 2] = [
+        ("both_secure", &both_secure),
+        ("caller_secure", &caller_secure),
+    ];
+    for (label, build) in builds {
+        criterion.bench_function(
+            &format!("media_pipeline_process_8k_20ms/{label}"),
+            |bencher| {
+                let mut media_call = build();
+                let mut index = 0usize;
+                let mut out = Vec::with_capacity(4);
+                let mut events = Vec::with_capacity(4);
+                bencher.iter(|| {
+                    if index == 0 {
+                        media_call = build(); // fresh replay window so the ring repeats
+                    }
+                    out.clear();
+                    events.clear();
+                    let accepted = media_call.process(
+                        &RxPacket {
+                            endpoint: EndpointId(1),
+                            source: addr(A_ADDR),
+                            arrival: index as u64 * 20_000,
+                            data: bytes::Bytes::copy_from_slice(&ring[index]),
+                        },
+                        &mut out,
+                        &mut events,
+                    );
+                    index = if index + 1 == RING { 0 } else { index + 1 };
+                    black_box(accepted)
+                });
+            },
+        );
+    }
 }
 
 /// The per-packet crypto a **WebSocket-takeover** leg pays once its offerer is secure. The takeover

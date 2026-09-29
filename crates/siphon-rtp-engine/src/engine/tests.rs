@@ -6973,43 +6973,6 @@ async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
     assert!(!engine.calls.contains_key("sdes-toward-dtls"));
     assert_eq!(engine.client_call_count(CLIENT), 0, "no quota slot leaked");
 
-    // (b) a codec mismatch — the secure offerer's leg would have to reach the transcoder. Only B's
-    // answer names B's codec, so this one is still refused on the ANSWER. That the offer above is
-    // refused earlier while this one is not is the whole distinction.
-    let engine = Engine::new(UdpLoopbackDatapath::new());
-    let (_phone_a, addr_a) = phone().await;
-    let (_phone_b, addr_b) = phone().await;
-    engine
-        .handle(
-            CLIENT,
-            Command::Offer {
-                call_id: "secure-transcode".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdes_offerer_sdp(addr_a, &caller_key),
-                profile: Default::default(),
-            },
-        )
-        .await;
-    let result = engine
-        .handle(
-            CLIENT,
-            Command::Answer {
-                call_id: "secure-transcode".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_single_codec(addr_b, 8, "PCMA"),
-                profile: Default::default(),
-            },
-        )
-        .await;
-    match result {
-        CmdResult::Error { reason } => {
-            assert!(reason.contains("secure-offerer-unsupported"), "{reason}");
-            assert!(reason.contains("codecs differ"), "{reason}");
-        }
-        other => panic!("expected a refusal for a transcoding secure offerer, got {other:?}"),
-    }
-
     // (c) both parties secure **and** the call wants the audio decoded is no longer refused: it
     // resolves to the transcode twin, which holds both parties' legs in the media actor. Asserted
     // here, in the test that enumerates what is *left* unsupported, so this case cannot quietly
@@ -7054,47 +7017,6 @@ async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
         engine.calls.get("secure-record").expect("call").pipeline,
         PipelineKind::SrtpTranscryptMedia,
     );
-
-    // (d) a secure caller toward a plain callee with a tee on the answer. The bridge cannot be teed
-    // and has no decoding twin, so the answer refuses it before anything is installed, rather than
-    // answering on the bridge and then failing to attach the tee.
-    let engine = Engine::new(UdpLoopbackDatapath::new());
-    let (_phone_a, addr_a) = phone().await;
-    let (_phone_b, addr_b) = phone().await;
-    engine
-        .handle(
-            CLIENT,
-            Command::Offer {
-                call_id: "secure-offerer-teed".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdes_offerer_sdp(addr_a, &caller_key),
-                profile: Default::default(),
-            },
-        )
-        .await;
-    let result = engine
-        .handle(
-            CLIENT,
-            Command::Answer {
-                call_id: "secure-offerer-teed".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_single_codec(addr_b, 0, "PCMU"),
-                profile: ProfileFlags {
-                    ws_tee: Some("ws://127.0.0.1:9/never-dialled".into()),
-                    ..Default::default()
-                },
-            },
-        )
-        .await;
-    match result {
-        CmdResult::Error { reason } => {
-            assert!(reason.contains("secure-offerer-unsupported"), "{reason}");
-            assert!(reason.contains("WebSocket tee"), "{reason}");
-        }
-        other => panic!("expected a refusal for a teed secure offerer, got {other:?}"),
-    }
-    assert_eq!(engine.ws_tee_count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -26346,4 +26268,259 @@ fn sdp_single_codec_nomux(rtp: SocketAddr, payload_type: u8, name: &str) -> Stri
         ip = rtp.ip(),
         port = rtp.port(),
     )
+}
+
+/// Drain `socket` until an RTP packet with `payload_type` arrives, and return it.
+async fn next_rtp_with_payload_type(socket: &UdpSocket, payload_type: u8) -> Vec<u8> {
+    let mut buffer = [0u8; 2048];
+    for _ in 0..50 {
+        let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(100), socket.recv_from(&mut buffer)).await
+        else {
+            continue;
+        };
+        if len > 12 && buffer[1] & 0x7f == payload_type {
+            return buffer[..len].to_vec();
+        }
+    }
+    panic!("no RTP packet with payload type {payload_type} arrived");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secure_caller_is_transcoded_toward_a_plain_callee() {
+    // An SRTP phone calling out to a plain trunk on another codec. The offerer bridge relays without
+    // decoding, so this answer used to be refused outright (`secure-offerer-unsupported`). The
+    // transcode twin decrypts the caller, transcodes both ways and encrypts back toward the caller
+    // under the engine's own key — and shows the caller only its own codec.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "secure-caller-transcode".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let engine_far = sdp::parse(&ok_sdp_text(&offered)).expect("far").remote_rtp;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "secure-caller-transcode".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let near = sdp::parse(&ok_sdp_text(&answered)).expect("answer");
+    assert_eq!(
+        engine
+            .calls
+            .get("secure-caller-transcode")
+            .expect("call")
+            .pipeline,
+        PipelineKind::SrtpOffererMedia
+    );
+    assert_eq!(
+        near.audio_codecs()
+            .iter()
+            .map(|codec| codec.payload_type)
+            .collect::<Vec<_>>(),
+        vec![0],
+        "the caller is shown its own codec, not the callee's"
+    );
+    let engine_key = *near.crypto.first().expect("the engine's key");
+
+    // A → B: SRTP PCMU in, plaintext PCMA out.
+    let mut protect = SrtpContext::from_key_material(&caller_key.key);
+    for sequence in 0..6u16 {
+        let mut sealed = Vec::new();
+        protect
+            .protect(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), &mut sealed)
+            .expect("protect");
+        phone_a
+            .send_to(&sealed, near.remote_rtp)
+            .await
+            .expect("caller send");
+    }
+    let to_b = next_rtp_with_payload_type(&phone_b, 8).await;
+    assert_eq!(
+        to_b.len(),
+        12 + 160,
+        "a plaintext 20 ms PCMA frame, no auth tag"
+    );
+
+    // B → A: plaintext PCMA in, SRTP PCMU out under the engine's key.
+    for sequence in 0..6u16 {
+        phone_b
+            .send_to(&g711_rtp(8, sequence, 0x0B0B_0B0B, 0x55), engine_far)
+            .await
+            .expect("callee send");
+    }
+    let mut unprotect = SrtpContext::from_key_material(&engine_key.key);
+    let mut buffer = [0u8; 2048];
+    let mut heard = false;
+    for _ in 0..50 {
+        let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(100), phone_a.recv_from(&mut buffer)).await
+        else {
+            continue;
+        };
+        let mut clear = Vec::new();
+        if unprotect.unprotect(&buffer[..len], &mut clear).is_ok() && clear[1] & 0x7f == 0 {
+            heard = true;
+            break;
+        }
+    }
+    assert!(
+        heard,
+        "the caller receives PCMU it decrypts under the engine's key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ws_tee_on_the_answer_decodes_a_secure_caller() {
+    // The outbound half of transcribing SRTP phones: a secure caller toward a plain callee on a
+    // shared codec, teed at answer time. It resolves to the transcode twin, and the caller's SRTP
+    // reaches the tee decoded.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let (uri, frames) = tee_server().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "tee-secure-caller".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "tee-secure-caller".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                profile: ProfileFlags {
+                    ws_tee: Some(uri),
+                    ws_tee_direction: Some(WsTeeDirection::Caller),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let near = sdp::parse(&ok_sdp_text(&answered)).expect("answer");
+    assert_eq!(
+        engine
+            .calls
+            .get("tee-secure-caller")
+            .expect("call")
+            .pipeline,
+        PipelineKind::SrtpOffererMedia
+    );
+    expect_tee_start(&frames).await;
+    let mut protect = SrtpContext::from_key_material(&caller_key.key);
+    for sequence in 0..6u16 {
+        let mut sealed = Vec::new();
+        protect
+            .protect(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), &mut sealed)
+            .expect("protect");
+        phone_a
+            .send_to(&sealed, near.remote_rtp)
+            .await
+            .expect("caller send");
+    }
+    assert_eq!(next_tee_audio(&frames).await.len(), 320);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_secure_parties_on_different_codecs_are_each_shown_their_own() {
+    // The secure↔secure transcode was missing from every "is this call transcoded" list, so the
+    // answer to the caller was not narrowed to the caller's codec.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "secure-pair-codecs".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "secure-pair-codecs".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_codec(addr_b, 8, "PCMA", &callee_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let near = sdp::parse(&ok_sdp_text(&answered)).expect("answer");
+    assert_eq!(
+        engine
+            .calls
+            .get("secure-pair-codecs")
+            .expect("call")
+            .pipeline,
+        PipelineKind::SrtpTranscryptMedia
+    );
+    assert_eq!(
+        near.audio_codecs()
+            .iter()
+            .map(|codec| codec.payload_type)
+            .collect::<Vec<_>>(),
+        vec![0],
+        "the caller is shown its own codec"
+    );
 }

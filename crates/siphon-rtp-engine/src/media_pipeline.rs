@@ -2732,6 +2732,16 @@ impl MediaCall {
         self
     }
 
+    /// Install the **offerer's** SDES-SRTP leg on a two-party call whose callee is plaintext
+    /// (`PipelineKind::SrtpOffererMedia`): A→B decrypts what A sends, B→A encrypts what goes back to
+    /// A, and B's side stays in the clear. The mirror of [`MediaCall::with_far_secure_leg`].
+    #[must_use]
+    pub fn with_near_secure_leg(mut self, near: Arc<Mutex<SecureLeg>>) -> Self {
+        self.a_to_b.secure_ingress = Some(near.clone());
+        self.b_to_a.secure_egress = Some(near);
+        self
+    }
+
     /// Mark this call's far (B) leg as **DTLS-keyed-later**: the topology is the same as
     /// [`MediaCall::with_far_secure_leg`], but the [`SecureLeg`] does not exist yet because the DTLS
     /// handshake (RFC 5764) has not completed. Until [`MediaCall::attach_secure_leg`] delivers it,

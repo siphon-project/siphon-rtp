@@ -83,13 +83,13 @@ behind it is not built. **Which verb refuses matters**, so each says:
   keys. Refused on the **`offer`**: the far leg's keying comes from the offer's
   own `transport_protocol`, so the engine knows this before it hands back an SDP
   and declines there rather than after the callee has rung and answered;
-- **a codec mismatch** on a secure caller — its `SecureLeg` would have to be
-  threaded into the transcoding pipeline. Refused on the **`answer`**, because
-  only the answer names the callee's codec. Likewise a `record_call`,
-  `noise_suppression`, `echo_cancellation` or `beep_detection` flag that first
-  appears on the answer profile: a crypto bridge relays the payload without
-  decoding it, so a secure pair that asks for the decoded audio is refused even
-  though the same pair without it is carried;
+- **a DTLS-SRTP caller whose call needs the decoded audio** — a codec mismatch,
+  or `record_call`, `noise_suppression`, `echo_cancellation`, `beep_detection` or
+  `ws_tee` on the answer. Its leg cannot be threaded into the media pipeline yet.
+  Refused on the **`answer`**, because only the answer names the callee's codec.
+  An **SDES** caller in the same position is transcoded instead
+  (`SrtpOffererMedia`): the media actor holds the caller's `SecureLeg`, decrypting
+  what it sends and encrypting what goes back, and the callee's side stays plain;
 - a **DTLS-SRTP (WebRTC) offerer** on `answer_local` — it needs a full ICE agent
   on the promoted leg. It is answered `secure-offerer-unsupported`, naming DTLS.
   On the two-party relay a DTLS caller toward a plain callee *is* terminated; see

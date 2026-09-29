@@ -611,6 +611,13 @@ is wrong, and encryption defeats A2 eavesdrop.
 > decode-forcing flag (`record_call`, `noise_suppression`, `echo_cancellation`, `beep_detection`)
 > first named on the answer profile, and a renegotiation that changes the posture.
 >
+> **An SDES caller toward a plain callee is transcoded too** (`PipelineKind::SrtpOffererMedia`):
+> `MediaCall::with_near_secure_leg` puts the caller's leg on the A→B ingress and the B→A egress, and
+> the callee's side is plaintext — the mirror of `with_far_secure_leg`. The caller never receives a
+> packet in the clear, and its key is never presented to the callee, exactly as on the offerer
+> bridge. A DTLS caller in the same position is still refused: its leg is keyed by a handshake the
+> media pipeline cannot host on that side yet.
+>
 > **A secure pair that asks for any of those is transcoded, not refused** (`PipelineKind::
 > SrtpTranscryptMedia`). No crypto *bridge* yields decoded audio, but the media pipeline does, and it
 > can hold the same two legs: `MediaCall::with_both_secure_legs` puts A's leg on the A→B ingress and

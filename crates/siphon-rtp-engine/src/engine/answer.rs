@@ -206,10 +206,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // only its own codec, so B's is the one B already had. Leading B's list with it lets
                 // the codec machinery below read it as B's primary, so the pipeline decision does not
                 // move on a renegotiation that changes no codec.
-                let transcoding = matches!(
-                    call.pipeline,
-                    PipelineKind::Media | PipelineKind::SrtpMedia | PipelineKind::DtlsMedia
-                );
+                let transcoding = call.pipeline.is_transcode();
                 let far_codec = match answered.primary_codec() {
                     Some(selected)
                         if !transcoding
@@ -1012,11 +1009,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // A WS-bridged call has no B leg to relay to (the WS server is A's far side); it never
         // transcodes A↔B, so its answer is never codec-rewritten.
         let becoming_ws = offer_pipeline == PipelineKind::Ws || profile.ws_uri.is_some();
-        let transcoding = !becoming_ws
-            && matches!(
-                pipeline,
-                PipelineKind::Media | PipelineKind::SrtpMedia | PipelineKind::DtlsMedia
-            );
+        let transcoding = !becoming_ws && pipeline.is_transcode();
 
         // A call that becomes a takeover here keeps the takeover meaning of `ice: remove`: no ICE agent
         // runs for a takeover leg on offer/answer (see `offer_takeover_refusal`), so a `ws_uri` named

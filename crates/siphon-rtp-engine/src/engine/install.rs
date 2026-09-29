@@ -393,6 +393,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             PipelineKind::SrtpMedia => {
                 self.install_srtp_media(wiring, far_local_crypto, owner_events)?;
             }
+            PipelineKind::SrtpOffererMedia => {
+                // A secure caller toward a plain callee whose call needs the decoded audio: the
+                // offerer bridge's topology with the caller's leg held in the media actor instead.
+                let (Some(near_local), Some(near_remote)) = (near_local_crypto, near_remote_crypto)
+                else {
+                    return Err(boxed_error_result(
+                        "secure offerer transcode",
+                        &"a secure offerer has no engine key or no peer key (internal)",
+                    ));
+                };
+                self.install_srtp_transcrypt_media(
+                    wiring,
+                    (near_local, near_remote),
+                    None,
+                    owner_events,
+                )?;
+            }
             PipelineKind::SrtpTranscryptMedia => {
                 // Both parties SDES **and** the call needs the audio decoded — a recorded internal
                 // call between two SRTP desk phones, or a secure pair whose codecs differ. The
@@ -410,7 +427,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.install_srtp_transcrypt_media(
                     wiring,
                     (near_local, near_remote),
-                    far_local,
+                    Some(far_local),
                     owner_events,
                 )?;
             }
@@ -797,20 +814,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Both parties' SRTP rollovers are carried across a renegotiation (RFC 3711 §3.3.1). Seeding
     /// only one would leave the other party's ROC restarting at 0 on every re-INVITE, which its
     /// peer cannot verify — the same defect the bridge's two-leg rollover read exists to avoid.
+    ///
+    /// `far_local` is `None` for a plaintext callee (`PipelineKind::SrtpOffererMedia`): the caller's
+    /// leg alone is threaded in, and B's side stays in the clear.
     fn install_srtp_transcrypt_media(
         &self,
         wiring: &AnswerWiring<'_>,
         near_keys: (CryptoAttribute, CryptoAttribute),
-        far_local: CryptoAttribute,
+        far_local: Option<CryptoAttribute>,
         owner_events: Option<flume::Sender<Event>>,
     ) -> Result<(), Box<CmdResult>> {
         let AnswerWiring { near, far, .. } = *wiring;
         let (near_local, near_remote) = near_keys;
-        let Some(far_remote) = wiring.info.crypto.first().copied() else {
-            return Err(boxed_error_result(
-                "SAVP answer",
-                &"missing a=crypto in the answer",
-            ));
+        let far_keys = match far_local {
+            None => None,
+            Some(far_local) => {
+                let Some(far_remote) = wiring.info.crypto.first().copied() else {
+                    return Err(boxed_error_result(
+                        "SAVP answer",
+                        &"missing a=crypto in the answer",
+                    ));
+                };
+                Some((far_local, far_remote))
+            }
         };
         let inputs = wiring.transcode_inputs("secure↔secure media pipeline")?;
         let directions = build_transcode_pair(&wiring.transcode_pair(&inputs)).map_err(
@@ -829,12 +855,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(rollover) = self.media.near_rollover_snapshot(wiring.call_id) {
             near_leg.seed_rollover(&rollover);
         }
-        let mut far_leg = SecureLeg::new(&far_local.key, &far_remote.key);
-        if let Some(rollover) = self.media.rollover_snapshot(wiring.call_id) {
-            far_leg.seed_rollover(&rollover);
-        }
+        let far_leg = far_keys.map(|(far_local, far_remote)| {
+            let mut far_leg = SecureLeg::new(&far_local.key, &far_remote.key);
+            if let Some(rollover) = self.media.rollover_snapshot(wiring.call_id) {
+                far_leg.seed_rollover(&rollover);
+            }
+            Arc::new(Mutex::new(far_leg))
+        });
         let near_leg = Arc::new(Mutex::new(near_leg));
-        let far_leg = Arc::new(Mutex::new(far_leg));
         // Non-muxed companion RTCP, keyed on both sides for the same reason the RTP directions are.
         let mut rtcp_relays = Vec::new();
         if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp)) =
@@ -844,20 +872,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 [near_rtcp.id, far_rtcp.id],
                 "install secure↔secure media RTCP redirect",
             )?;
-            rtcp_relays = wiring.rtcp_relays(
-                near_rtcp.id,
-                far_rtcp.id,
-                a_rtcp,
-                &RtcpKeying::BothLegs {
+            let keying = match &far_leg {
+                Some(far) => RtcpKeying::BothLegs {
                     near: near_leg.clone(),
-                    far: far_leg.clone(),
+                    far: far.clone(),
                 },
-            );
+                None => RtcpKeying::NearLeg(near_leg.clone()),
+            };
+            rtcp_relays = wiring.rtcp_relays(near_rtcp.id, far_rtcp.id, a_rtcp, &keying);
         }
-        let call = wiring
-            .media_call(directions, inputs.record_path)
-            .with_both_secure_legs(near_leg, far_leg)
-            .with_rtcp_relays(rtcp_relays);
+        let call = wiring.media_call(directions, inputs.record_path);
+        let call = match far_leg {
+            Some(far_leg) => call.with_both_secure_legs(near_leg, far_leg),
+            None => call.with_near_secure_leg(near_leg),
+        }
+        .with_rtcp_relays(rtcp_relays);
         self.media
             .register(call, self.datapath.clone(), owner_events);
         Ok(())
