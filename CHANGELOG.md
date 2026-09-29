@@ -53,6 +53,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   them now report through one path, and the first refusal of each kind per flow is logged at `warn`
   with the source it came from and the gate it failed. A failed SRTP authentication on the media and
   text pipelines is now counted as a drop too; it still keeps the call alive, as before.
+- **A `play_media` blob travels as base64.** It was serialized as a JSON array of decimal byte
+  values, roughly 3.5 characters per byte, so against the 1 MiB control frame a prompt over about
+  300 KB could never play. It now goes out as `data_base64` and fits up to `MAX_PLAY_BLOB_LEN`
+  (783,360 bytes). The engine still reads the old `data` array. The key changed with the encoding so
+  that an older engine refuses a new controller's blob instead of playing base64 text as audio. An
+  oversized frame's error now names the blob bound and the alternatives. The proto crate drops its
+  `serde_bytes` dependency.
 
 ## [0.9.1] — 2026-09-27
 

@@ -148,6 +148,11 @@ harness = false
 name = "udptl_relay_bench"
 harness = false
 
+# Reading a `play_media` blob off a control frame, in the base64 form and the earlier array form.
+[[bench]]
+name = "play_blob_bench"
+harness = false
+
 [lints]
 workspace = true
 
