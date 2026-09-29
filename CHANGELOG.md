@@ -7,6 +7,15 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **An SDES-SRTP caller toward a plain callee can be transcoded.** The only pipeline for that shape
+  was the offerer bridge, which never decodes, so a codec mismatch was refused on the answer
+  (`secure-offerer-unsupported`), and so were recording, noise suppression, echo cancellation, beep
+  detection and a tee. An SRTP phone calling out to a plain trunk on another codec could not be
+  connected at all. The new `SrtpOffererMedia` pipeline holds the caller's `SecureLeg` in the media
+  actor. A DTLS-SRTP caller in the same position is still refused.
+
 ### Fixed
 
 - **`answer_local` no longer overwrites a live call with the same call-id.** It used to register its
@@ -18,6 +27,11 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   `unknown call`. Re-answering the client's own single-leg call still works and replaces it through
   the `delete` path, only after the replacement has validated and bound its ports, and is admitted
   at a full quota.
+- **Two secure parties on different codecs are each shown their own.** The secure↔secure transcode
+  was missing from every "is this call transcoded" check, so the answer to the caller was not narrowed
+  to the caller's codec and could name the callee's instead: a caller that only offered PCMU was told
+  to send PCMA. The checks now read one list. The same gap left a secure pair's transcode out of the
+  `fax_passthrough` guard.
 - **A tee named on the answer decodes a secure call instead of bridging it.** `ws_tee` was not one of
   the reasons `resolve_pipeline` decodes a call, so an SDES-SRTP callee, two SDES parties, or a
   DTLS-SRTP callee on a shared codec resolved to a crypto bridge, and the tee was then refused against

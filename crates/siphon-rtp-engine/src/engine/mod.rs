@@ -886,6 +886,12 @@ enum PipelineKind {
     /// ever presented to the other, exactly as on the bridge; what differs is that the plaintext
     /// reaches the pipeline instead of living only in a stack buffer.
     SrtpTranscryptMedia,
+    /// A secure **offerer** toward a plain callee *and* the call needs the decoded audio: the
+    /// transcode twin of [`PipelineKind::SrtpOfferer`]. The [`MediaCall`] actor holds the caller's
+    /// [`SecureLeg`](siphon_rtp_srtp::leg::SecureLeg) — decrypting what A sends, encrypting what
+    /// goes back to A — and the callee's side is plaintext. Without it an SRTP phone calling out to
+    /// a plain trunk could be bridged but never transcoded, recorded, teed or noise-suppressed.
+    SrtpOffererMedia,
     /// WebSocket bridge: leg A's audio is attached to an external WS media server (mod_audio_stream /
     /// voice-AI). The A↔B relay/transcode path is not wired — the WS server is A's far side.
     Ws,
@@ -919,7 +925,7 @@ impl PipelineKind {
     fn checkpoint_refusal(self) -> Option<&'static str> {
         match self {
             Self::Passthrough | Self::Srtp | Self::Media | Self::SrtpMedia => None,
-            Self::SrtpOfferer => Some(
+            Self::SrtpOfferer | Self::SrtpOffererMedia => Some(
                 "a secure caller's own keying is not carried in the snapshot record, so a standby \
                  would resume the call with the caller demoted to plaintext",
             ),
@@ -956,9 +962,21 @@ impl PipelineKind {
     /// Used to refuse a call that asked for opaque relay (`fax_passthrough`) and then resolved to a
     /// pipeline that would requantize it.
     fn decodes_audio(self) -> bool {
+        self.is_transcode() || self == Self::Ws
+    }
+
+    /// Whether A↔B runs through a [`MediaCall`] actor that decodes what each party sends and
+    /// re-encodes it for the other, so each party is presented its own codec. The one list every
+    /// "is this call transcoded" decision reads — three copies of it had drifted, each missing the
+    /// secure↔secure kind.
+    fn is_transcode(self) -> bool {
         matches!(
             self,
-            Self::Media | Self::SrtpMedia | Self::DtlsMedia | Self::Ws
+            Self::Media
+                | Self::SrtpMedia
+                | Self::DtlsMedia
+                | Self::SrtpTranscryptMedia
+                | Self::SrtpOffererMedia
         )
     }
 }

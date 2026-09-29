@@ -248,6 +248,7 @@ pub(super) fn settle_secure_offerer(
     let near_sdes_carried = matches!(
         pipeline,
         super::PipelineKind::SrtpOfferer
+            | super::PipelineKind::SrtpOffererMedia
             | super::PipelineKind::SrtpTranscrypt
             | super::PipelineKind::SrtpTranscryptMedia
     );
@@ -268,18 +269,19 @@ pub(super) fn settle_secure_offerer(
             "both parties are secure and one is keyed by DTLS, which needs a transcrypt between two \
              keying mechanisms rather than between two keys"
         } else if codecs_differ {
-            "the two legs' codecs differ, which needs the secure offerer's leg threaded into the \
-             transcoding pipeline"
+            "the two legs' codecs differ, and a DTLS-SRTP caller's leg cannot be threaded into the \
+             transcoding pipeline yet"
         } else {
             "the call needs the decoded audio (recording, noise suppression, echo cancellation, \
-             beep detection or a WebSocket tee), which needs the secure offerer's leg threaded into \
-             the media pipeline"
+             beep detection or a WebSocket tee), and a DTLS-SRTP caller's leg cannot be threaded \
+             into the media pipeline yet"
         };
         let supported = if far_secure {
             "two SDES parties are bridged as a transcrypt, and transcoded as one where the call \
              needs the decoded audio"
         } else {
-            "a secure caller toward a plain callee on a shared codec is supported"
+            "an SDES-SRTP caller toward a plain callee is bridged, or transcoded where the call \
+             needs the decoded audio; a DTLS-SRTP caller is bridged on a shared codec"
         };
         return Err(Box::new(siphon_rtp_proto::CmdResult::Error {
             reason: format!("answer: secure-offerer-unsupported: {why}; {supported}"),
@@ -737,6 +739,9 @@ pub(super) enum RtcpKeying {
         near: Arc<Mutex<SecureLeg>>,
         far: Arc<Mutex<SecureLeg>>,
     },
+    /// With the **offerer's** leg alone, for a secure caller toward a plain callee: A's SRTCP is
+    /// decrypted on its way to B, and B's RTCP encrypted on its way to A.
+    NearLeg(Arc<Mutex<SecureLeg>>),
     /// Pending until the DTLS handshake delivers a leg; the relays drop until then (RFC 5764).
     Pending,
 }
@@ -771,6 +776,10 @@ pub(super) fn secure_rtcp_relays(
             toward_near
                 .with_secure_ingress(far.clone())
                 .with_secure_egress(near.clone()),
+        ],
+        RtcpKeying::NearLeg(near) => vec![
+            toward_far.with_secure_ingress(near.clone()),
+            toward_near.with_secure_egress(near.clone()),
         ],
         RtcpKeying::Pending => vec![
             toward_far.with_pending_secure(SecureSide::Egress),
@@ -1067,17 +1076,16 @@ pub(super) fn resolve_pipeline_kind(
             PipelineKind::SrtpTranscrypt
         };
     }
-    // A secure **offerer** toward a plain callee: the mirror of the secure-far-leg bridge below. Only
-    // the crypto-bridge shape is wired, so this yields `SrtpOfferer` exactly when nothing needs the
-    // decoded audio. Anything that does — a codec mismatch, recording, NS, AEC, beep detection, a
-    // tee — falls through to a media pipeline that has no A-facing `SecureLeg` threaded into it, which the
-    // caller then refuses rather than silently relaying the caller's audio undecrypted or unencrypted.
-    if near_local_crypto.is_some()
-        && far_local_crypto.is_none()
-        && !far_dtls
-        && !needs_decoded_audio
-    {
-        return PipelineKind::SrtpOfferer;
+    // A secure **offerer** toward a plain callee: the mirror of the secure-far-leg arm below. The
+    // bridge when nothing needs the decoded audio; the transcode twin, which holds the caller's
+    // `SecureLeg` in the media actor, when something does — a codec mismatch, recording, NS, AEC,
+    // beep detection, a tee.
+    if near_local_crypto.is_some() && far_local_crypto.is_none() && !far_dtls {
+        return if needs_decoded_audio {
+            PipelineKind::SrtpOffererMedia
+        } else {
+            PipelineKind::SrtpOfferer
+        };
     }
     if far_local_crypto.is_some() {
         // Secure far leg: the plain SRTP bridge when both legs share a codec and nothing needs the
@@ -1171,9 +1179,9 @@ mod tests {
         );
     }
 
-    /// A secure offerer toward a plain callee has no decoding twin, so a tee must not resolve to the
-    /// bridge (which would answer and then fail to tee) — it falls through, and the answer refuses it
-    /// before anything is installed.
+    /// A secure offerer toward a plain callee: an SDES caller is decoded in its transcode twin when
+    /// the call needs the audio, and a DTLS caller — which has no twin yet — is taken off its bridge
+    /// so the answer refuses it rather than answering on a bridge that cannot serve the tee.
     #[test]
     fn a_ws_tee_takes_a_secure_offerer_off_its_bridge() {
         let teed = ProfileFlags {
@@ -1184,9 +1192,9 @@ mod tests {
             resolve(&ProfileFlags::default(), (true, false, false, false)),
             PipelineKind::SrtpOfferer
         );
-        assert_ne!(
+        assert_eq!(
             resolve(&teed, (true, false, false, false)),
-            PipelineKind::SrtpOfferer
+            PipelineKind::SrtpOffererMedia
         );
         assert_eq!(
             resolve(&ProfileFlags::default(), (false, false, true, false)),
@@ -1195,6 +1203,35 @@ mod tests {
         assert_ne!(
             resolve(&teed, (false, false, true, false)),
             PipelineKind::DtlsOfferer
+        );
+    }
+
+    /// Every reason to decode takes an SDES offerer to its transcode twin, the codec mismatch
+    /// included — which the bridge cannot carry at all.
+    #[test]
+    fn an_sdes_offerer_that_needs_decoding_is_transcoded() {
+        let recorded = ProfileFlags {
+            record_call: true,
+            ..ProfileFlags::default()
+        };
+        assert_eq!(
+            resolve(&recorded, (true, false, false, false)),
+            PipelineKind::SrtpOffererMedia
+        );
+        let info = pcmu_answer();
+        let pcma = CodecSpec::new(8, "PCMA", 8000, 1, 20);
+        assert_eq!(
+            resolve_pipeline_kind(
+                Some(&pcma),
+                &info,
+                &ProfileFlags::default(),
+                None,
+                Some(key()),
+                false,
+                false,
+            ),
+            PipelineKind::SrtpOffererMedia,
+            "a codec mismatch is a transcode"
         );
     }
 }
