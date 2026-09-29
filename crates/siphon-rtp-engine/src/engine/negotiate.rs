@@ -271,8 +271,9 @@ pub(super) fn settle_secure_offerer(
             "the two legs' codecs differ, which needs the secure offerer's leg threaded into the \
              transcoding pipeline"
         } else {
-            "the call needs the decoded audio (recording, noise suppression, echo cancellation or \
-             beep detection), which needs the secure offerer's leg threaded into the media pipeline"
+            "the call needs the decoded audio (recording, noise suppression, echo cancellation, \
+             beep detection or a WebSocket tee), which needs the secure offerer's leg threaded into \
+             the media pipeline"
         };
         let supported = if far_secure {
             "two SDES parties are bridged as a transcrypt, and transcoded as one where the call \
@@ -1024,11 +1025,17 @@ pub(super) fn resolve_pipeline_kind(
     // `record_path`: the answer said `ok`, the audio crossed, and the recording never existed. Noise
     // suppression and echo cancellation were inert on the same calls for the same reason. A new flag
     // is added here and nowhere else.
-    let needs_decoded_audio = transcode
+    let decodes_for_the_whole_call = transcode
         || profile.record_call
         || profile.noise_suppression
         || profile.echo_cancellation
         || profile.beep_detection;
+    // A tee streams the decoded audio too, so it is the same kind of reason — but only the plain relay
+    // can meet it later: `start_ws_tee` promotes a relay to the processing pipeline for the tee's
+    // lifetime and demotes it on detach. A crypto bridge has no such promotion (it relays ciphertext
+    // and holds no media actor to fan out from), so a bridge chosen here is a tee refused there. The
+    // plain arm at the bottom therefore tests `decodes_for_the_whole_call`, every other arm this.
+    let needs_decoded_audio = decodes_for_the_whole_call || profile.ws_tee.is_some();
     // A terminated DTLS-SRTP **offerer** toward a plain callee: the mirror of the DTLS far leg below,
     // and like `SrtpOfferer` only in its crypto-bridge shape. Anything that needs the decoded audio
     // falls through to a pipeline with no A-facing DTLS leg, which the caller then refuses.
@@ -1037,15 +1044,9 @@ pub(super) fn resolve_pipeline_kind(
     }
     if far_dtls {
         // DTLS-SRTP far leg. Route it through the media pipeline when something actually needs the
-        // decoded audio — a codec mismatch, recording, noise suppression, echo cancellation or
-        // record-tone (beep) detection — and through the plain crypto bridge otherwise, which stays
-        // cheaper (no decode/re-encode) and is all a same-codec WebRTC↔SIP call needs.
-        return if transcode
-            || profile.record_call
-            || profile.noise_suppression
-            || profile.echo_cancellation
-            || profile.beep_detection
-        {
+        // decoded audio, and through the plain crypto bridge otherwise, which stays cheaper (no
+        // decode/re-encode) and is all a same-codec WebRTC↔SIP call needs.
+        return if needs_decoded_audio {
             PipelineKind::DtlsMedia
         } else {
             PipelineKind::Dtls
@@ -1068,8 +1069,8 @@ pub(super) fn resolve_pipeline_kind(
     }
     // A secure **offerer** toward a plain callee: the mirror of the secure-far-leg bridge below. Only
     // the crypto-bridge shape is wired, so this yields `SrtpOfferer` exactly when nothing needs the
-    // decoded audio. Anything that does — a codec mismatch, recording, NS, AEC, beep detection —
-    // falls through to a media pipeline that has no A-facing `SecureLeg` threaded into it, which the
+    // decoded audio. Anything that does — a codec mismatch, recording, NS, AEC, beep detection, a
+    // tee — falls through to a media pipeline that has no A-facing `SecureLeg` threaded into it, which the
     // caller then refuses rather than silently relaying the caller's audio undecrypted or unencrypted.
     if near_local_crypto.is_some()
         && far_local_crypto.is_none()
@@ -1089,12 +1090,111 @@ pub(super) fn resolve_pipeline_kind(
             PipelineKind::Srtp
         };
     }
-    if needs_decoded_audio {
+    if decodes_for_the_whole_call {
         // Recording, noise suppression, echo cancellation, record-tone (beep) detection, or a codec
         // mismatch all need the decoded audio, so force the userspace media slow path instead of the
-        // in-kernel passthrough.
+        // in-kernel passthrough. A tee alone does not: it promotes the relay itself (see above).
         PipelineKind::Media
     } else {
         PipelineKind::Passthrough
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use siphon_rtp_srtp::sdes::CryptoSuite;
+
+    fn pcmu_answer() -> sdp::MediaInfo {
+        sdp::parse(concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.0.2.20\r\n",
+            "s=-\r\n",
+            "c=IN IP4 192.0.2.20\r\n",
+            "t=0 0\r\n",
+            "m=audio 40000 RTP/AVP 0\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+        ))
+        .expect("a well-formed answer")
+    }
+
+    fn key() -> CryptoAttribute {
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("a key")
+    }
+
+    /// Resolve a same-codec call in one security posture: `(near_sdes, far_sdes, near_dtls,
+    /// far_dtls)`. Same codec on both legs, so nothing but the profile can force a decode.
+    fn resolve(profile: &ProfileFlags, posture: (bool, bool, bool, bool)) -> PipelineKind {
+        let info = pcmu_answer();
+        let near_codec = info.primary_codec();
+        let (near_sdes, far_sdes, near_dtls, far_dtls) = posture;
+        resolve_pipeline_kind(
+            near_codec.as_ref(),
+            &info,
+            profile,
+            far_sdes.then(key),
+            near_sdes.then(key),
+            far_dtls,
+            near_dtls,
+        )
+    }
+
+    /// A tee streams the *decoded* audio, so it is a reason to decode exactly like a recording.
+    /// Every crypto bridge that has a decoding twin resolves to it once a tee is named on the answer —
+    /// the bridge relays ciphertext and has no post-decode fan-out to tap, and it cannot be converted
+    /// mid-call, so the choice has to be made here. A plain relay is the exception: it can be promoted
+    /// to the processing pipeline for the tee's lifetime and demoted on detach, so the answer keeps
+    /// it on the kernel fast path and leaves the promotion to the tee.
+    #[test]
+    fn a_ws_tee_decodes_every_bridge_that_has_a_decoding_twin() {
+        let teed = ProfileFlags {
+            ws_tee: Some("ws://example.invalid/tee".to_string()),
+            ..ProfileFlags::default()
+        };
+        let plain = ProfileFlags::default();
+        let secure_callee = (false, true, false, false);
+        let both_sdes = (true, true, false, false);
+        let dtls_callee = (false, false, false, true);
+        let neither = (false, false, false, false);
+
+        assert_eq!(resolve(&plain, secure_callee), PipelineKind::Srtp);
+        assert_eq!(resolve(&teed, secure_callee), PipelineKind::SrtpMedia);
+        assert_eq!(resolve(&plain, both_sdes), PipelineKind::SrtpTranscrypt);
+        assert_eq!(resolve(&teed, both_sdes), PipelineKind::SrtpTranscryptMedia);
+        assert_eq!(resolve(&plain, dtls_callee), PipelineKind::Dtls);
+        assert_eq!(resolve(&teed, dtls_callee), PipelineKind::DtlsMedia);
+        assert_eq!(resolve(&plain, neither), PipelineKind::Passthrough);
+        assert_eq!(
+            resolve(&teed, neither),
+            PipelineKind::Passthrough,
+            "a plain relay is promoted by the tee itself, and demoted again on detach"
+        );
+    }
+
+    /// A secure offerer toward a plain callee has no decoding twin, so a tee must not resolve to the
+    /// bridge (which would answer and then fail to tee) — it falls through, and the answer refuses it
+    /// before anything is installed.
+    #[test]
+    fn a_ws_tee_takes_a_secure_offerer_off_its_bridge() {
+        let teed = ProfileFlags {
+            ws_tee: Some("ws://example.invalid/tee".to_string()),
+            ..ProfileFlags::default()
+        };
+        assert_eq!(
+            resolve(&ProfileFlags::default(), (true, false, false, false)),
+            PipelineKind::SrtpOfferer
+        );
+        assert_ne!(
+            resolve(&teed, (true, false, false, false)),
+            PipelineKind::SrtpOfferer
+        );
+        assert_eq!(
+            resolve(&ProfileFlags::default(), (false, false, true, false)),
+            PipelineKind::DtlsOfferer
+        );
+        assert_ne!(
+            resolve(&teed, (false, false, true, false)),
+            PipelineKind::DtlsOfferer
+        );
     }
 }
