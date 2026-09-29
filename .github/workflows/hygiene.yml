@@ -48,7 +48,7 @@ jobs:
           threshold=1500
           # path  max production lines  # why
           allowlist='
-          crates/siphon-rtp-engine/src/media_pipeline.rs 4556 # large, no function over 250 lines; +64 for the secure-to-secure transcode wiring, +55 for publishing the latched source, +32 for the actor teardown grace that flushes a recording, +86 for the fax-passthrough profile validation, +10 for the secure offerer transcode, +106 for counting and logging every refused datagram, +42 for publishing received RTCP to the telemetry tap, +24 for stopping an actor and awaiting it
+          crates/siphon-rtp-engine/src/media_pipeline.rs 4569 # large, no function over 250 lines; +64 for the secure-to-secure transcode wiring, +55 for publishing the latched source, +32 for the actor teardown grace that flushes a recording, +86 for the fax-passthrough profile validation, +10 for the secure offerer transcode, +106 for counting and logging every refused datagram, +42 for publishing received RTCP to the telemetry tap, +24 for stopping an actor and awaiting it, +13 for writing a teardown recording whole
           crates/siphon-rtp-engine/src/conference.rs 2715 # large, no function over 250 lines; +5 for counting refused datagrams
           crates/siphon-rtp-engine/src/sdp.rs 2461 # large, no function over 250 lines; +27 for RFC 8842 a=tls-id, +290 for the T.38 m=image section (parse, anchor/decline directive, and the audio-less switchover entry points)
           crates/siphon-rtp-dsp/src/aec.rs 2554 # one algorithm

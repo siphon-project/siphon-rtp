@@ -38,6 +38,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **X3 loss is reported when delivery reconnects.** Content dropped while the Mediation Function was
+  unreachable was reported only on the first loss-report tick of the connection that ended the
+  outage, up to five seconds after it came back. It is now reported as the connection comes up.
+- **A `record_call` recording is never visible half-written.** The teardown flush created the file
+  and then filled it, so a collector watching the directory could pick up an empty or truncated WAV.
+  It is now written under a temporary name and renamed into place.
 - **`answer_local` no longer overwrites a live call with the same call-id.** It used to register its
   single-leg call on top of whatever was there, so an `answer_local` sent for an in-dialog re-offer
   on what was really a two-party relay cut the far party's audio, orphaned the relay's ports,

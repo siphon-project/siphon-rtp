@@ -5936,8 +5936,13 @@ async fn a_takeover_leg_latches_its_downlink_when_the_signalled_port_is_wrong() 
     }
     assert!(heard, "the caller hears the bot once the leg has latched");
 
-    // Nothing keeps going to the port the signalling named once the latch has moved.
+    // Nothing keeps going to the port the signalling named once the latch has moved. The bridge's
+    // ticker aims its downlink at the seeded guess from the moment it is up, so frames sent *before*
+    // the latch can still be sitting in that socket — under load there are more of them. The caller
+    // has already heard the bot, so the drain is aimed at the latched source by now; clear what was
+    // queued before that, then require silence.
     let mut stale = [0u8; 2048];
+    while stale_phone.try_recv_from(&mut stale).is_ok() {}
     let after_latch = timeout(
         Duration::from_millis(300),
         stale_phone.recv_from(&mut stale),
