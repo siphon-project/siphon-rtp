@@ -52,7 +52,7 @@ jobs:
           crates/siphon-rtp-engine/src/conference.rs 2715 # large, no function over 250 lines; +5 for counting refused datagrams
           crates/siphon-rtp-engine/src/sdp.rs 2461 # large, no function over 250 lines; +27 for RFC 8842 a=tls-id, +290 for the T.38 m=image section (parse, anchor/decline directive, and the audio-less switchover entry points)
           crates/siphon-rtp-dsp/src/aec.rs 2554 # one algorithm
-          crates/siphon-rtp-proto/src/lib.rs 2192 # the control contract, type definitions; +27 for the authenticate controller id, +9 for the setup_timeout media-timeout reason, +26 for the fax_passthrough profile flag, +4 documenting that ws_tee decodes a secure call, +18 for the play_media blob bound, +14 for the sip_call_id profile flag
+          crates/siphon-rtp-proto/src/lib.rs 2231 # the control contract, type definitions; +27 for the authenticate controller id, +9 for the setup_timeout media-timeout reason, +26 for the fax_passthrough profile flag, +4 documenting that ws_tee decodes a secure call, +18 for the play_media blob bound, +14 for the sip_call_id profile flag, +39 for the media_started event
           crates/siphon-rtp-codec/src/opus/celt/encoder.rs 1996 # reference port
           crates/siphon-rtp-codec/src/amr/nb/enc_cb.rs 1905 # reference port
           crates/siphon-rtp-codec/src/amr/wb/enc_acelp.rs 1850 # reference port

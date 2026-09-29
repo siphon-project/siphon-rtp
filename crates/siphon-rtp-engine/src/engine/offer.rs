@@ -891,6 +891,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // answered — the setup ceiling applies until the first packet, not the media one.
                 anchored_before_answer: true,
                 started_at_unix_ms: super::unix_time_ms(),
+                near_media_started_at_unix_ms: None,
+                far_media_started_at_unix_ms: None,
                 ice: ice_creds,
                 // A's own credentials, from the offer — needed to *address* checks to A later
                 // (RFC 8445 §7.1.2); B's arrive with its answer.

@@ -135,6 +135,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // dead-path ceiling.
                 anchored_before_answer: false,
                 started_at_unix_ms: super::unix_time_ms(),
+                near_media_started_at_unix_ms: None,
+                far_media_started_at_unix_ms: None,
                 ice: None,
                 // A single-leg local answer mints no ICE of its own, so there is no pair to keep
                 // consent on either side.

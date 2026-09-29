@@ -517,6 +517,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 to_free.extend(text_endpoint);
                 if let Some(text_endpoint) = text_endpoint {
                     self.endpoint_calls.remove(&text_endpoint.id);
+                    self.awaiting_media.remove(&text_endpoint.id);
                 }
                 self.free(&to_free).await;
                 return error_result("conference_join: install DTLS redirect", &error);
@@ -598,9 +599,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.stop_seat_ice_follow(&[endpoint.id]);
                 self.retire_dtls_endpoints(&[endpoint.id]);
                 self.endpoint_calls.remove(&endpoint.id);
+                self.awaiting_media.remove(&endpoint.id);
                 self.datapath.remove_endpoint(endpoint.id).await;
                 if let Some(text_endpoint) = text_endpoint {
                     self.endpoint_calls.remove(&text_endpoint.id);
+                    self.awaiting_media.remove(&text_endpoint.id);
                     self.datapath.remove_endpoint(text_endpoint.id).await;
                 }
                 error_result("conference_join: SDP rewrite", &error)
@@ -663,6 +666,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.retire_dtls_endpoints(&endpoints);
         for endpoint in endpoints {
             self.endpoint_calls.remove(&endpoint);
+            self.awaiting_media.remove(&endpoint);
             self.datapath.remove_endpoint(endpoint).await;
         }
         ok_empty()

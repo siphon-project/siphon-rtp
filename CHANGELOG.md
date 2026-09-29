@@ -27,6 +27,14 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   the engine's own pipeline, the same anchor `answer_local` builds without a bot. An SDES-SRTP leg's
   key material moves with it, so the SRTP context carries on. A two-leg negotiated takeover, and a
   leg running ICE or keyed by DTLS-SRTP, are still refused, each with its own reason.
+- **`media_started` event.** Raised once per leg when its first packet clears the source gate,
+  naming the leg, the address the packet came from (when latched) and the signalled one, so a
+  controller can wait on media rather than on a fixed delay, and see a NAT when the two differ.
+  Detected from the datapath's own activity stamp, so it covers every path, including flows the XDP
+  program relays in-kernel. `call_summary` legs carry `media_started_at_unix_ms`, absent for a leg
+  that never carried media. `siphon-rtp-proto` gains `Event::MediaStarted`, `LegSide` and the
+  `LegSummary` field; the field is additive on the wire but breaks a struct literal, so the proto
+  crate needs a minor bump.
 
 ### Fixed
 

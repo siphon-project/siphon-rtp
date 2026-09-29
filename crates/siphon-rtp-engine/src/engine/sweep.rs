@@ -203,6 +203,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             self.stop_seat_ice_follow(&[seat_endpoint]);
                             self.retire_dtls_endpoints(&[seat_endpoint]);
                             self.endpoint_calls.remove(&seat_endpoint);
+                            self.awaiting_media.remove(&seat_endpoint);
                             self.datapath.remove_endpoint(seat_endpoint).await;
                         }
                         tracing::warn!(
@@ -495,6 +496,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         for endpoint in &freed {
             self.datapath.remove_endpoint(*endpoint).await;
             self.endpoint_calls.remove(endpoint);
+            self.awaiting_media.remove(endpoint);
         }
         freed.len()
     }

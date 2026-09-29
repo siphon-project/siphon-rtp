@@ -932,6 +932,21 @@ where
         });
     }
 
+    // First-media detection (`Event::MediaStarted`): one packetization interval, far finer than the
+    // 1 Hz sweep below, because a controller holding a prompt until media flows waits on it. Visits
+    // only the endpoints still awaiting their first packet, so it is idle on a settled box.
+    let media_watcher = engine.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+            crate::engine::MEDIA_STARTED_POLL_MS,
+        ));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            media_watcher.detect_media_started();
+        }
+    });
+
     // Media-timeout sweep: advance the logical clock ~1 tick/second, reap calls idle past the
     // timeout (docs/security-and-nat.md §4 layer 6), and reap expired TURN allocations on the same
     // clock (§11). `advance_clock` is the additive `Datapath` trait method — a no-op on a real-time

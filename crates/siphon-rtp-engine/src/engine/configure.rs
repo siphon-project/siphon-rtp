@@ -56,6 +56,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             controllers: DashMap::new(),
             controller_ids: DashMap::new(),
             endpoint_calls: DashMap::new(),
+            awaiting_media: DashMap::new(),
             bridge,
             media: Arc::new(MediaRegistry::default()),
             ws: Arc::new(WsRegistry::default()),
