@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-09-29
+
 ### Added
 
 - **The engine answers WebRTC callers itself.** `answer_local` without `ws_uri` refused a DTLS-SRTP
@@ -15,7 +17,6 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   handshake now keys the local pipeline, and with `--ice-full` the agent runs on the leg: the
   pipeline sends nothing until a pair is selected and then sends only to that pair, never to the
   signalled `c=`. Without an agent the answer declines ICE instead.
-
 - **An SDES-SRTP caller toward a plain callee can be transcoded.** The only pipeline for that shape
   was the offerer bridge, which never decodes, so a codec mismatch was refused on the answer
   (`secure-offerer-unsupported`), and so were recording, noise suppression, echo cancellation, beep
@@ -42,8 +43,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   Detected from the datapath's own activity stamp, so it covers every path, including flows the XDP
   program relays in-kernel. `call_summary` legs carry `media_started_at_unix_ms`, absent for a leg
   that never carried media. `siphon-rtp-proto` gains `Event::MediaStarted`, `LegSide` and the
-  `LegSummary` field; the field is additive on the wire but breaks a struct literal, so the proto
-  crate needs a minor bump.
+  `LegSummary` field; the field is additive on the wire but breaks a struct literal, hence the minor
+  bump of the proto crate.
 
 ### Fixed
 
@@ -81,9 +82,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   DTLS-SRTP callee on a shared codec resolved to a crypto bridge, and the tee was then refused against
   the bridge that choice produced. A tee now counts like a recording: those calls take `SrtpMedia`,
   `SrtpTranscryptMedia` and `DtlsMedia`. A plain relay is unchanged; the tee still promotes it for its
-  own lifetime and demotes it on detach. A secure caller toward a plain callee has no decoding pipeline,
-  so a tee on that answer is refused up front as `secure-offerer-unsupported` rather than answering on
-  the bridge and failing the tee. `fax_passthrough` now refuses `ws_tee` in the profile, like every
+  own lifetime and demotes it on detach. A secure caller toward a plain callee takes its transcode
+  twin (`SrtpOffererMedia` or `DtlsOffererMedia`). `fax_passthrough` now refuses `ws_tee` in the profile, like every
   other flag that decodes.
 - **A tee can be attached mid-call to a crypto bridge.** `attach_ws_tee` refused an SDES or DTLS-SRTP
   bridge because the bridge relays without decoding. The tee now takes the plaintext the bridge
