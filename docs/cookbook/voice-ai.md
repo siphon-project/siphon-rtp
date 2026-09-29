@@ -552,10 +552,22 @@ reasons: on a two-leg call the engine is not the offerer's cryptographic far sid
 is armed to re-point a takeover leg's egress. Negotiate those takeovers with `answer_local`.
 
 **Detaching** reinstalls the exact forward rules the takeover displaced — gate and latch policy
-included — and the two parties hear each other again. It is refused (`ws-bridge-negotiated`) on a
-bridge that was **negotiated** with `ws_uri`: that bridge *is* the call's media path. Nothing was
-displaced, and on an `answer_local` takeover there is no second party that could ever be relayed to,
-so detaching would leave the caller connected to nothing. Re-point it, or `delete` the call.
+included — and the two parties hear each other again.
+
+A bridge **negotiated** with `ws_uri` on a single-leg call (`answer_local`, or an offer nobody
+answered) displaced nothing, so detaching it hands the caller to the engine's own pipeline instead:
+the same anchor `answer_local` builds without a bot. From there `play_media`, recording, DTMF and a
+fresh `attach_ws_bridge` all work, which is what lets a bot understand the caller, step away, and let
+the controller play an announcement, take a message or route the call. An SDES-SRTP leg keeps its
+SRTP context across the hand-over. Three shapes are still refused, each before anything stops:
+
+| Shape | Refusal |
+|---|---|
+| A negotiated takeover on a two-leg call (never wired A to B) | `ws-bridge-negotiated-two-leg` |
+| A leg running ICE (the engine's own pipeline has no ICE agent) | `ws-bridge-detach-ice` |
+| A leg keyed by DTLS-SRTP (the engine's own pipeline cannot terminate it) | `ws-bridge-detach-dtls` |
+
+Re-point those, or `delete` the call.
 
 `block_media` / `unblock_media` are refused on a taken-over call for a related reason: the call is
 still holding the displaced relay's forward rules for its detach, and an unblock walks that list.

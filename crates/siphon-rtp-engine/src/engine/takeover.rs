@@ -14,7 +14,10 @@ use std::sync::Arc;
 use crate::sdp;
 
 use super::negotiate::{apply_received_from, bridge_source_filter, random_ssrc};
-use super::{error_result, ok_empty, ok_sdp, unknown_call, ClientId, Engine, Leg, PipelineKind};
+use super::{
+    error_result, ok_empty, ok_sdp, unknown_call, ClientId, Engine, Leg, PipelineKind, PromoteMode,
+    PromotionReason,
+};
 
 /// Everything [`Engine::setup_ws_bridge`] needs to stand one WebSocket-takeover bridge up. A struct
 /// rather than a parameter list because a secure takeover adds the leg's SRTP state and its ICE gate
@@ -772,13 +775,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// carries on where it left off; the datapath's latch is separate state that a flow install does
     /// not disturb, so a NATed leg keeps the path it had.
     ///
-    /// On a bridge that was **negotiated** (`ProfileFlags::ws_uri`) it is refused. That bridge *is*
-    /// the call's media path: nothing was displaced, and there is nothing to go back to — a two-leg
-    /// negotiated takeover never wired A↔B (leg B's ports exist but its codec was never negotiated
-    /// against A's), and a single-leg `answer_local` takeover has no second party at all. Answering
-    /// `ok` and leaving the caller connected to nothing is the failure mode this whole verb exists
-    /// to prevent, so the controller is told plainly and keeps its two working options: re-point the
-    /// bridge, or `delete` the call.
+    /// On a bridge that was **negotiated** on a single-leg call (`answer_local` or an unanswered
+    /// `offer` with `ws_uri`) nothing was displaced, so the leg goes to the engine's own pipeline
+    /// instead — the anchor `answer_local` builds when it is not given a `ws_uri` — and prompts,
+    /// recording, DTMF and a later `attach_ws_bridge` all work on it (see
+    /// [`Self::return_takeover_to_anchor`]). A negotiated takeover on a *two-leg* call is still
+    /// refused: it never wired A↔B (leg B's ports exist but its codec was never negotiated against
+    /// A's), and answering `ok` while leaving the caller connected to nothing is the failure mode this
+    /// verb exists to prevent.
     pub(super) async fn detach_ws_bridge(&self, client: ClientId, call_id: &str) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
@@ -793,12 +797,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return ok_empty();
         };
         let Some(takeover) = takeover else {
-            return error_result(
-                "detach_ws_bridge",
-                &"ws-bridge-negotiated: this bridge is the call's negotiated media path (ws_uri), \
-                  not a takeover of a relay, so there is no media path to return it to; re-point it \
-                  with attach_ws_bridge, or end the call with delete",
-            );
+            return match self.return_takeover_to_anchor(call_id).await {
+                Ok(()) => ok_empty(),
+                Err(reason) => error_result("detach_ws_bridge", &reason),
+            };
         };
         self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
             .await;
@@ -816,6 +818,97 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             "ws bridge detached; the displaced relay is back"
         );
         ok_empty()
+    }
+
+    /// Hand a negotiated single-leg takeover's leg to the engine's own pipeline: the anchor
+    /// `answer_local` builds without a `ws_uri`, reached here by the same promotion.
+    ///
+    /// The gate needs no carrying: the anchor draws it from the call's stored posture and
+    /// `received-from` hint, the same inputs the bridge's was drawn from. An SDES leg's key material
+    /// *is* carried — taken out of the bridge's leg and attached to the pipeline — so the peer's
+    /// rollover counter and the replay window survive the hand-over (RFC 3711 §3.3.1).
+    ///
+    /// Refused, before anything is stopped, where the anchor could not carry the leg: a two-leg call
+    /// (see [`Self::detach_ws_bridge`]), and a leg running ICE or keyed by DTLS-SRTP. The engine's
+    /// own pipeline runs neither a full ICE agent nor a DTLS handshake — the same missing piece
+    /// `answer_local` reports for a DTLS offerer without a `ws_uri` — so handing it such a leg would
+    /// strand the caller behind a gate nothing re-points, or behind a key nothing renews.
+    async fn return_takeover_to_anchor(&self, call_id: &str) -> Result<(), String> {
+        let (single_leg, has_ice, endpoint) = self
+            .owned_call_internal(call_id, |call| {
+                (
+                    call.is_single_leg(),
+                    call.ice.is_some(),
+                    call.caller_leg().rtp.id,
+                )
+            })
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        if !single_leg {
+            return Err(
+                "ws-bridge-negotiated-two-leg: this bridge was negotiated on a two-leg call, which \
+                 never wired A to B, so there is no media path to return it to; re-point it with \
+                 attach_ws_bridge, or end the call with delete"
+                    .to_string(),
+            );
+        }
+        if has_ice {
+            return Err(
+                "ws-bridge-detach-ice: the leg runs ICE, and the engine's own pipeline has no ICE \
+                 agent to keep it on the selected pair; re-point it with attach_ws_bridge, or end \
+                 the call with delete"
+                    .to_string(),
+            );
+        }
+        if self.dtls_bridge().owns(endpoint) {
+            return Err(
+                "ws-bridge-detach-dtls: the leg is keyed by DTLS-SRTP, which the engine's own \
+                 pipeline cannot terminate yet; re-point it with attach_ws_bridge, or end the call \
+                 with delete"
+                    .to_string(),
+            );
+        }
+        let secure = self.ws.route_state(call_id).and_then(|state| state.secure);
+        self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
+            .await;
+        // After the stop: the bridge and its drain have been joined, so nothing crypts with it any
+        // more and the key material can be moved rather than copied.
+        let key = secure.and_then(|secure| secure.take_leg());
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.pipeline = PipelineKind::Passthrough;
+        }
+        if let Err(reason) = self
+            .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
+            .await
+        {
+            tracing::error!(
+                target: "siphon_rtp::media",
+                call_id,
+                %reason,
+                "a detached takeover leg could not be anchored; it has no media path"
+            );
+            return Err(format!("ws-bridge-detach-anchor: {reason}"));
+        }
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            // A single-leg pipeline encodes back into the codec the caller sends, as `answer_local`
+            // records it.
+            call.far_codec = call.near_codec.clone();
+            call.pipeline = PipelineKind::Media;
+        }
+        if let Some(key) = key {
+            let leg = Arc::new(std::sync::Mutex::new(key));
+            if !self.media.control(
+                call_id,
+                crate::media_pipeline::MediaControl::AttachNearSecureLeg { leg },
+            ) {
+                return Err("ws-bridge-detach-anchor: media actor unavailable".to_string());
+            }
+        }
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id,
+            "ws bridge detached; the caller is on the engine's own pipeline"
+        );
+        Ok(())
     }
 
     /// Tear a call's takeover bridge down: drop its route, abort **and await** the bridge + drain

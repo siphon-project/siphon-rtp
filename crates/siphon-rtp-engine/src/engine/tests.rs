@@ -24949,16 +24949,67 @@ async fn re_pointing_a_ws_bridge_moves_a_live_call_to_a_second_consumer() {
     );
 }
 
+/// Record `call_id`'s caller for as long as `speak` takes, and return the finished WAV's samples.
+async fn record_caller_while<F: std::future::Future<Output = ()>>(
+    engine: &Engine<UdpLoopbackDatapath>,
+    events: &flume::Receiver<Event>,
+    call_id: &str,
+    speak: F,
+) -> Vec<i16> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let started = engine
+        .handle(
+            CLIENT,
+            Command::StartRecording {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                direction: Some(siphon_rtp_proto::RecordingDirection::Ingress),
+                channels: None,
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(started, CmdResult::Ok { .. }),
+        "recording starts on the anchored leg: {started:?}"
+    );
+    speak.await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    engine
+        .handle(
+            CLIENT,
+            Command::StopRecording {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                recording_id: None,
+            },
+        )
+        .await;
+    let (_, path, _, _) = next_recording_finished(events)
+        .await
+        .expect("a recording_finished event arrives");
+    let bytes = std::fs::read(path.expect("the event names the file")).expect("read");
+    siphon_rtp_media::player::WavSource::parse(&bytes)
+        .expect("a valid WAV")
+        .samples()
+        .to_vec()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn detaching_a_negotiated_ws_bridge_is_refused_rather_than_muting_the_call() {
-    // The decision this verb turns on. A bridge negotiated with `ws_uri` *is* the call's media
-    // path — on `answer_local` there is not even a second party — so there is nothing to hand
-    // the call back to. Refuse and say so, rather than answer `ok` on a call that now has no
-    // audio path at all, which is the exact failure the lifecycle work is meant to prevent.
+async fn detaching_a_negotiated_takeover_returns_the_caller_to_the_engine() {
+    // The case this verb could not serve: a voice bot answered the call with `answer_local` +
+    // `ws_uri`, decided where the caller goes, and has to hand the call back. The leg lands on the
+    // engine's own pipeline — the anchor `answer_local` builds without a bot — so the controller can
+    // play, record and route from there instead of being left with a bot it cannot remove.
     use crate::srtp_bridge::run_redirect_dispatcher;
 
     let (ws_uri, frames, _down) = takeover_ws_server().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
     tokio::spawn(run_redirect_dispatcher(
         engine.datapath().rx(),
         engine.bridge(),
@@ -24987,7 +25038,7 @@ async fn detaching_a_negotiated_ws_bridge_is_refused_rather_than_muting_the_call
         .remote_rtp;
     let _ = expect_bridge_start(&frames).await;
 
-    let refused = engine
+    let detached = engine
         .handle(
             CLIENT,
             Command::DetachWsBridge {
@@ -24996,23 +25047,236 @@ async fn detaching_a_negotiated_ws_bridge_is_refused_rather_than_muting_the_call
             },
         )
         .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+    assert!(!engine.ws().is_ws_call("ws-negotiated"));
+    assert!(engine.media().is_media_call("ws-negotiated"));
+    assert_eq!(
+        engine.calls.get("ws-negotiated").expect("call").pipeline,
+        PipelineKind::Media
+    );
+    let ended = std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| match event {
+        Event::WsBridgeEnded { reason, .. } => Some(reason),
+        _ => None,
+    });
+    assert_eq!(ended, Some(WsBridgeEndReason::Detached));
+
+    // The caller is heard by the engine now…
+    let samples = record_caller_while(&engine, &events, "ws-negotiated", async {
+        for sequence in 0..10u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), caller_target)
+                .await
+                .expect("caller send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        samples.iter().any(|&sample| sample != 0),
+        "the caller is recorded"
+    );
+
+    // …and hears it: a prompt reaches the caller in its own codec.
+    let played = engine
+        .handle(
+            CLIENT,
+            Command::PlayMedia {
+                call_id: "ws-negotiated".into(),
+                from_tag: "tag-a".into(),
+                source: PlayMediaSource::Tone {
+                    tone: "ringback_eu".into(),
+                },
+                repeat_times: None,
+                start_pos_ms: None,
+                duration_ms: Some(200),
+                overlay: false,
+                gain_decibels: None,
+                to_tag: None,
+            },
+        )
+        .await;
+    assert!(matches!(played, CmdResult::Ok { .. }), "{played:?}");
+    let mut buffer = [0u8; 2048];
+    let (len, _) = timeout(Duration::from_secs(2), phone_a.recv_from(&mut buffer))
+        .await
+        .expect("the caller hears the engine")
+        .expect("recv");
+    let packet = siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).expect("rtp");
+    assert_eq!(packet.payload_type, 0, "in the caller's codec");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detached_sdes_takeover_keeps_the_callers_srtp_context() {
+    // The key material moves from the bridge to the pipeline rather than being re-derived, so the
+    // caller carries on with the SRTP context it already has — its rollover counter and replay
+    // window intact (RFC 3711 §3.3.1) — and the engine's egress still decrypts under the key the
+    // answer advertised.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+
+    let (ws_uri, frames, _down) = takeover_ws_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let peer_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("peer key");
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "sdes-detach".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, &peer_key),
+                profile: ProfileFlags {
+                    ws_uri: Some(ws_uri),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let answer = sdp::parse(&ok_sdp_text(&result)).expect("answer sdp");
+    let engine_key = answer.crypto.first().copied().expect("engine a=crypto");
+    let caller_target = answer.remote_rtp;
+    let _ = expect_bridge_start(&frames).await;
+    let caller_leg = Arc::new(Mutex::new(SecureLeg::new(&peer_key.key, &engine_key.key)));
+
+    // A few seconds of the call on the bot first, so the context has state worth keeping.
+    for sequence in 0..5u16 {
+        let mut sealed = Vec::new();
+        caller_leg
+            .lock()
+            .expect("leg")
+            .protect(&ulaw_rtp_packet(sequence, 0x0A0A_0A0A, 0xFF), &mut sealed)
+            .expect("caller SRTP");
+        phone_a
+            .send_to(&sealed, caller_target)
+            .await
+            .expect("caller send");
+    }
+    assert!(
+        next_uplink_frame(&frames).await.is_some(),
+        "the bot heard it"
+    );
+
+    let detached = engine
+        .handle(
+            CLIENT,
+            Command::DetachWsBridge {
+                call_id: "sdes-detach".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+
+    // The same context, continuing its sequence: the anchor decrypts it.
+    let speaking = caller_leg.clone();
+    let samples = record_caller_while(&engine, &events, "sdes-detach", async {
+        for sequence in 5..15u16 {
+            let clear = ulaw_rtp_packet(sequence, 0x0A0A_0A0A, 0x20);
+            let mut sealed = Vec::new();
+            speaking
+                .lock()
+                .expect("leg")
+                .protect(&clear, &mut sealed)
+                .expect("caller SRTP");
+            phone_a
+                .send_to(&sealed, caller_target)
+                .await
+                .expect("caller send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        samples.iter().any(|&sample| sample != 0),
+        "the anchor decrypted the caller's continuing SRTP stream"
+    );
+
+    // The engine's own egress (comfort noise while idle) is SRTP under the advertised key.
+    let mut buffer = [0u8; 2048];
+    let mut decrypted = false;
+    for _ in 0..20 {
+        let Ok(Ok((len, _))) =
+            timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+        else {
+            continue;
+        };
+        let mut clear = Vec::new();
+        if caller_leg
+            .lock()
+            .expect("leg")
+            .unprotect(&buffer[..len], &mut clear)
+            .is_ok()
+        {
+            decrypted = true;
+            break;
+        }
+    }
+    assert!(
+        decrypted,
+        "the anchored leg's egress decrypts under the engine's key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detaching_a_negotiated_takeover_on_a_two_leg_call_is_still_refused() {
+    // Two legs negotiated around a bot were never wired to each other, so there is no path to give
+    // back and no single caller to anchor. Refused, and the call left as it was.
+    let (ws_uri, frames, _down) = takeover_ws_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "ws-two-leg".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags {
+                    ws_uri: Some(ws_uri),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let _ = expect_bridge_start(&frames).await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "ws-two-leg".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let refused = engine
+        .handle(
+            CLIENT,
+            Command::DetachWsBridge {
+                call_id: "ws-two-leg".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await;
     match refused {
-        CmdResult::Error { reason } => assert!(
-            reason.contains("ws-bridge-negotiated"),
-            "the refusal must name the reason, got: {reason}"
-        ),
+        CmdResult::Error { reason } => {
+            assert!(reason.contains("ws-bridge-negotiated-two-leg"), "{reason}");
+        }
         other => panic!("expected a refusal, got {other:?}"),
     }
-
-    // And the refusal left the call exactly as it was — still bridged, still carrying audio.
-    assert!(engine.ws().is_ws_call("ws-negotiated"));
-    for sequence in 0..12u16 {
-        phone_a
-            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), caller_target)
-            .await
-            .expect("a send");
-    }
-    assert_eq!(expect_bridge_uplink(&frames).await.len(), 320);
+    assert!(engine.ws().is_ws_call("ws-two-leg"), "still bridged");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -27226,5 +27490,59 @@ async fn a_voicemail_records_an_opus_caller() {
         energy.sqrt(),
         parsed.sample_rate_hz(),
         parsed.samples().len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detaching_a_dtls_keyed_takeover_is_refused_before_anything_stops() {
+    // The engine's own pipeline cannot terminate DTLS-SRTP, so handing it this leg would leave the
+    // caller behind a key nothing renews. Refused with the reason, and the bot keeps the call.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let (ws_uri, frames, _down) = takeover_ws_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone().await;
+    let caller_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "dtls-detach".into(),
+                from_tag: "tag-a".into(),
+                sdp: dtls_offerer_sdp(addr_a, &caller_cert.fingerprint(), "active"),
+                profile: ProfileFlags {
+                    ws_uri: Some(ws_uri),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    assert!(matches!(result, CmdResult::Ok { .. }), "{result:?}");
+    let _ = expect_bridge_start(&frames).await;
+    let refused = engine
+        .handle(
+            CLIENT,
+            Command::DetachWsBridge {
+                call_id: "dtls-detach".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await;
+    match refused {
+        CmdResult::Error { reason } => {
+            assert!(reason.contains("ws-bridge-detach-dtls"), "{reason}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        engine.ws().is_ws_call("dtls-detach"),
+        "the bot keeps the call"
     );
 }
