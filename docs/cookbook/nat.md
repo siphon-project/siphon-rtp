@@ -39,6 +39,10 @@ Per-leg knobs, passed in `profile.flags` (native JSON) or `flags` (NG):
 `symmetric` is the weakest gate; before reaching for it, try `received-from` below, which usually
 solves the same problem without opening the leg.
 
+The flags apply to every leg shape, including a leg the engine answers itself (`answer_local`: an
+IVR, an announcement, a voicemail). That leg's media runs through the engine's own pipeline, built
+from the call after the command returns, so the posture is recorded when the call is answered.
+
 ## The `received-from` hint
 
 A UA behind NAT advertises its private address in `c=`; its media then arrives from the NAT's

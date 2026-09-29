@@ -1,8 +1,6 @@
 //! Moving a call between the in-kernel relay and the userspace media pipeline.
 
-use siphon_rtp_datapath::{
-    Datapath, EndpointId, FlowAction, ForwardRule, LatchPolicy, SourceFilter,
-};
+use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, ForwardRule, LatchPolicy};
 
 use crate::media_pipeline::{MediaCall, RelayConfig};
 use crate::text_pipeline::{TextCall, TextDirectionConfig};
@@ -124,6 +122,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             offer_received_from,
             comfort_noise_pt,
             near_secure,
+            caller_source_posture,
         )) = self.owned_call_internal(call_id, |call| {
             (
                 call.owner,
@@ -148,6 +147,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // Whether the offerer's own media is secure. The actor must start **gated** in that
                 // case — see the `with_near_secure_pending` call below.
                 call.near_secure,
+                call.caller_source_posture,
             )
         })
         else {
@@ -238,7 +238,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             .to_string(),
                     );
                 };
-                let accepted_source = SourceFilter::Exact(caller.ip());
+                // The posture the caller's leg was set up with: `symmetric` / `subnet-source` mean the
+                // same here as on every two-leg path. An exact gate on a NATed UA's private `c=` would
+                // refuse every packet it sends.
+                let accepted_source = caller_source_posture.gate(caller);
                 let a_to_b = build_direction(
                     caller_facing_endpoint,
                     accepted_source,

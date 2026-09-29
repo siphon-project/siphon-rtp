@@ -510,6 +510,10 @@ struct Call {
     /// no `received-from`. Replaced by a re-offer from A that carries one (the app changed network),
     /// and kept when it carries none.
     offer_received_from: Option<std::net::IpAddr>,
+    /// The source-gate posture the offerer's leg was set up with (`symmetric` / `subnet-source`),
+    /// for the single-leg anchor, which is built later from the call and would otherwise gate on the
+    /// exact signalled IP whatever the controller asked for.
+    caller_source_posture: negotiate::SourcePosture,
     /// The **far** (B) leg's `received-from`, from B's answer — the far-side twin of
     /// [`Self::offer_received_from`]. Stored so a later renegotiation can keep or refresh it: an answer
     /// or a re-offer from B that carries one replaces it, one that carries none keeps it. Without it an

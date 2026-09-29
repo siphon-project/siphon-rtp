@@ -70,6 +70,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   tapped, so SDES and DTLS-SRTP bridges, secure and plain transcodes and locally answered legs
   exported no RTCP at all. Each now publishes the RTCP it receives, decrypted, through the new
   `Datapath::rtcp_tap`.
+- **A locally answered leg honours `symmetric` and `subnet-source`.** The pipeline behind
+  `answer_local` (and behind an offer nobody answered) gated the caller on the exact signalled IP
+  whatever the profile asked for. A NATed phone that signals its LAN address had every packet
+  refused, so an IVR heard nothing and a voicemail recorded silence, and the only thing a controller
+  could do about it was `received_from`. The gate posture is now recorded when the call is set up and
+  applied when the pipeline is built, as on every two-leg path. An Opus caller's voicemail is now
+  covered by a test too; nothing Opus-specific was wrong.
 
 ## [0.9.1] — 2026-09-27
 

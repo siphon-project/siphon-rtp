@@ -27031,3 +27031,200 @@ async fn a_sip_call_id_that_cannot_be_one_is_refused() {
     assert!(matches!(result, CmdResult::Error { .. }), "{result:?}");
     assert!(!engine.calls.contains_key("bad-sip-call-id"));
 }
+
+/// Answer a single-leg call whose caller signalled `127.0.0.2`, send five packets from a socket on
+/// `sender`, and report whether the anchor accepted them (the endpoint's liveness moved).
+async fn anchor_accepts_from(flags: &[&str], sender: Ipv4Addr) -> bool {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_signalled, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+    let (natted, _) = phone_at(sender).await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "anchor-posture".into(),
+                from_tag: "a".into(),
+                sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                profile: ProfileFlags {
+                    flags: flags.iter().map(|flag| (*flag).to_string()).collect(),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let engine_addr = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer SDP")
+        .remote_rtp;
+    let endpoint = engine
+        .calls
+        .get("anchor-posture")
+        .expect("call")
+        .near
+        .rtp
+        .id;
+    for sequence in 0..5u16 {
+        natted
+            .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), engine_addr)
+            .await
+            .expect("send");
+    }
+    for _ in 0..50 {
+        if engine.datapath().last_activity(endpoint).unwrap_or(0) > 0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_locally_answered_leg_honours_the_source_gate_flags() {
+    // A NATed phone that signals its LAN address sends from somewhere else. `symmetric` exists for
+    // exactly that and every two-leg path honours it; the single-leg anchor gated on the exact
+    // signalled IP regardless, so such a caller reached an IVR or a mailbox as silence.
+    let elsewhere = Ipv4Addr::new(127, 0, 1, 9);
+    assert!(
+        !anchor_accepts_from(&[], elsewhere).await,
+        "the default gate stays exact"
+    );
+    assert!(
+        anchor_accepts_from(&["symmetric"], elsewhere).await,
+        "`symmetric` accepts the caller's real source"
+    );
+    assert!(
+        anchor_accepts_from(&["subnet-source"], Ipv4Addr::new(127, 0, 0, 9)).await,
+        "`subnet-source` accepts the signalled /24"
+    );
+    assert!(
+        !anchor_accepts_from(&["subnet-source"], elsewhere).await,
+        "and nothing outside it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_voicemail_records_an_opus_caller() {
+    // The same voicemail shape with an Opus caller (RFC 7587): real Opus frames from the engine's own
+    // encoder, a 440 Hz tone, recorded through the single-leg anchor. What is on disk must be the
+    // caller's audio at the codec's 48 kHz rate, not an empty file.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone, addr) = phone().await;
+    let offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n",
+        ip = addr.ip(),
+        port = addr.port(),
+    );
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "vm-opus".into(),
+                from_tag: "tag-a".into(),
+                sdp: offer,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let engine_near = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer SDP")
+        .remote_rtp;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let started = engine
+        .handle(
+            CLIENT,
+            Command::StartRecording {
+                call_id: "vm-opus".into(),
+                from_tag: "tag-a".into(),
+                recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                direction: Some(siphon_rtp_proto::RecordingDirection::Ingress),
+                channels: None,
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
+            },
+        )
+        .await;
+    let recording_id = match started {
+        CmdResult::Ok {
+            recording_id: Some(id),
+            ..
+        } => id,
+        other => panic!("a wav recording accepts with a recording_id, got {other:?}"),
+    };
+
+    let mut encoder =
+        factory::encoder_for(&CodecSpec::new(111, "opus", 48_000, 2, 20)).expect("opus encoder");
+    let mut payload = vec![0u8; 1500];
+    for sequence in 0..25u16 {
+        let pcm: Vec<i16> = (0..960u32)
+            .map(|index| {
+                let time = f64::from(u32::from(sequence) * 960 + index) / 48_000.0;
+                (8000.0 * (2.0 * std::f64::consts::PI * 440.0 * time).sin()) as i16
+            })
+            .collect();
+        let length = encoder.encode(&pcm, &mut payload).expect("encode");
+        let mut packet = vec![0x80, 111];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&(u32::from(sequence) * 960).to_be_bytes());
+        packet.extend_from_slice(&0x0A0A_0A0A_u32.to_be_bytes());
+        packet.extend_from_slice(&payload[..length]);
+        phone
+            .send_to(&packet, engine_near)
+            .await
+            .expect("caller send");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    engine
+        .handle(
+            CLIENT,
+            Command::StopRecording {
+                call_id: "vm-opus".into(),
+                from_tag: "tag-a".into(),
+                recording_id: Some(recording_id),
+            },
+        )
+        .await;
+    let (_, path, duration_ms, _) = next_recording_finished(&events)
+        .await
+        .expect("a recording_finished event arrives");
+    assert!(duration_ms > 0, "the Opus caller's audio was recorded");
+    let bytes = std::fs::read(path.expect("the event names the file")).expect("read");
+    let parsed = siphon_rtp_media::player::WavSource::parse(&bytes).expect("a valid WAV");
+    assert_eq!(parsed.channels(), 1);
+    let energy: f64 = parsed
+        .samples()
+        .iter()
+        .map(|&sample| f64::from(sample).powi(2))
+        .sum::<f64>()
+        / parsed.samples().len().max(1) as f64;
+    assert!(
+        energy.sqrt() > 1000.0,
+        "the recording holds the tone, not silence (rms {:.0}, rate {} Hz, {} samples)",
+        energy.sqrt(),
+        parsed.sample_rate_hz(),
+        parsed.samples().len()
+    );
+}

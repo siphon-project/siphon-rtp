@@ -210,6 +210,13 @@ Only **accept** (and only latch from) media whose source matches the address lea
 - **Enforcement:** new accepted-source constraint on the forward rule (§4.7); engine fills it from
   parsed SDP + `ProfileFlags.received_from` + `ProfileFlags.flags` (`trust-address`, `strict-source`,
   `port-latching`, `symmetric`).
+- **The single-leg anchor honours the same flags.** A leg the engine answers itself (`answer_local`,
+  or an offer nobody answered) is carried by a pipeline `promote_to_processing` builds from the call
+  after the command has returned, so the posture the flags asked for (`negotiate::SourcePosture`) is
+  stored on the call and applied there. It used to gate on the exact signalled IP whatever the
+  flags said, which made `symmetric` and `subnet-source` inert on exactly the leg shape a NATed
+  caller reaching an IVR or a mailbox uses: every packet refused, a recording with no audio, and
+  nothing the controller could set to fix it but `received_from`.
 - **Effect on A1:** with `SignalledOnly`, a blind attacker must *also* spoof the signalled source IP
   to land a packet — collapses the off-path attack for non-NAT and full-cone-NAT peers.
 
