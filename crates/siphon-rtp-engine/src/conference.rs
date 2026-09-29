@@ -26,7 +26,9 @@ use bytes::Bytes;
 use dashmap::DashMap;
 
 use siphon_rtp_codec::{Decoder, Encoder};
-use siphon_rtp_datapath::{rtp_media_ssrc, Datapath, EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_datapath::{
+    rtp_media_ssrc, Datapath, EndpointId, ObservedRtcp, RxPacket, SourceFilter,
+};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_dsp::EnergyVad;
 use siphon_rtp_media::dtmf::DtmfDetector;
@@ -183,6 +185,16 @@ pub struct ParticipantTextConfig {
     pub secure: Option<SecureLeg>,
 }
 
+/// What the RTCP telemetry export needs to file a seat's reports: the engine address the seat sends
+/// to (the capture's destination, since the room terminates RTCP rather than relaying it) and the
+/// SIP `Call-ID` of the seat's own dialog (the capture's correlation id — every seat is a dialog of
+/// its own). Either may be absent; a seat with no `local` publishes nothing.
+#[derive(Clone, Debug, Default)]
+pub struct SeatTelemetry {
+    pub local: Option<SocketAddr>,
+    pub sip_call_id: Option<String>,
+}
+
 /// Everything the engine resolves from a participant's SDP offer/answer to seat them in a room.
 pub struct ParticipantConfig {
     /// The leg tag (SIP From/To tag) — the participant's stable id for routing + events.
@@ -233,6 +245,8 @@ pub struct ParticipantConfig {
     pub ice_pending: bool,
     /// Initial role / routing.
     pub routing: Routing,
+    /// How this seat's RTCP is filed by the telemetry export.
+    pub telemetry: SeatTelemetry,
 }
 
 /// One seated participant's RFC 4103 text leg: its own endpoint/gate/latch, the negotiated payload
@@ -267,6 +281,8 @@ struct ParticipantText {
 
 /// One seated participant: its leg, resamplers to/from the room rate, VAD, and ingress security state.
 struct Participant {
+    /// Where this seat's received RTCP is filed ([`SeatTelemetry`]).
+    telemetry: SeatTelemetry,
     tag: String,
     leg: MediaLeg,
     ingress_endpoint: EndpointId,
@@ -451,6 +467,9 @@ pub struct Conference {
     /// Reused scratch for a reassembled inbound text increment (so ingest copies once, off the
     /// reassembler borrow, before queueing it in the mixer).
     text_ingress_buf: String,
+    /// The telemetry tap every seat's received RTCP is published to ([`Datapath::rtcp_tap`]), set
+    /// when the room's actor is spawned. `None` while nothing exports RTCP.
+    rtcp_tap: Option<flume::Sender<ObservedRtcp>>,
     /// Reused egress text RTP packet buffer (header + CSRC + RED payload).
     text_rtp: Vec<u8>,
 }
@@ -505,6 +524,7 @@ impl Conference {
             text_mixer: TextMixer::new(TEXT_FLUSH_INTERVAL_MS),
             text_flush_counter: 0,
             text_ingress_buf: String::with_capacity(256),
+            rtcp_tap: None,
             text_rtp: vec![0u8; MAX_TEXT_RTP],
         }
     }
@@ -679,6 +699,7 @@ impl Conference {
         };
         self.text_mixer.add_participant(text_source);
         self.participants.push(Participant {
+            telemetry: config.telemetry,
             tag: config.tag,
             leg,
             ingress_endpoint: config.ingress_endpoint,
@@ -898,6 +919,17 @@ impl Conference {
         // sent (RFC 3550 §6.4.1). Consume both, then drop (RTCP is never mixed).
         let packet_type = data[1] & 0x7f;
         if (64..=95).contains(&packet_type) {
+            // Telemetry: the seat's RTCP as the room received it, decrypted. The room terminates RTCP,
+            // so the capture's destination is the seat's own engine address.
+            if let Some(local) = participant.telemetry.local {
+                ObservedRtcp::offer(
+                    self.rtcp_tap.as_ref(),
+                    participant.ingress_endpoint,
+                    packet.source,
+                    local,
+                    data,
+                );
+            }
             // Sender Report (V=2, PT=200): the 64-bit NTP timestamp sits at offset 8 (after the
             // 8-byte header), so the packet must hold at least 16 bytes.
             if data[0] >> 6 == 2 && data[1] == 200 && data.len() >= 16 {
@@ -2355,6 +2387,10 @@ struct ConferenceMember {
     /// its own SDP asked for, so it is measured against the held ceiling rather than the media timeout
     /// — the same rule [`crate::engine::Engine::reap_idle`] applies to a two-party call.
     held: bool,
+    /// The seat's dialog `Call-ID` and G.107 codec with its RTP clock rate, for the telemetry export,
+    /// which files a seat's RTCP from outside the room actor.
+    sip_call_id: Option<String>,
+    qos_codec: (siphon_rtp_hep::mos::Codec, u32),
 }
 
 /// A handle to a running conference actor.
@@ -2435,12 +2471,15 @@ impl ConferenceRegistry {
         // T.140/RED datagram redirected for it reaches this room's `ingest`.
         let text_endpoint = config.text.as_ref().map(|text| text.ingress_endpoint);
         let tag = config.tag.clone();
+        let sip_call_id = config.telemetry.sip_call_id.clone();
+        let qos_codec = (config.mos_codec, config.decoder.rtp_clock_rate_hz().max(1));
         let mailbox = self
             .rooms
             .entry(conference_id.to_string())
             .or_insert_with(|| {
                 let (mailbox, inbox) = flume::bounded(1024);
-                let conference = Conference::new(conference_id.to_string(), DEFAULT_TOP_M);
+                let mut conference = Conference::new(conference_id.to_string(), DEFAULT_TOP_M);
+                conference.rtcp_tap = datapath.rtcp_tap();
                 let task = tokio::spawn(run_conference(conference, inbox, datapath, events));
                 ConferenceHandle {
                     mailbox,
@@ -2470,9 +2509,28 @@ impl ConferenceRegistry {
                 text_endpoint,
                 joined_tick,
                 held,
+                sip_call_id,
+                qos_codec,
             });
         }
         true
+    }
+
+    /// The dialog `Call-ID` a seat named when it joined, and its G.107 codec with the RTP clock rate —
+    /// how the telemetry export files that seat's RTCP. `None` when `endpoint` is no seat's.
+    #[must_use]
+    pub fn seat_telemetry(
+        &self,
+        endpoint: EndpointId,
+    ) -> Option<(Option<String>, (siphon_rtp_hep::mos::Codec, u32))> {
+        self.rooms.iter().find_map(|room| {
+            room.members
+                .iter()
+                .find(|member| {
+                    member.endpoint == endpoint || member.text_endpoint == Some(endpoint)
+                })
+                .map(|member| (member.sip_call_id.clone(), member.qos_codec))
+        })
     }
 
     /// Whether a room exists, for a verb that must answer `unknown conference` rather than silently
@@ -2750,6 +2808,7 @@ mod tests {
             text: None,
             ice_pending: false,
             routing: Routing::default(),
+            telemetry: SeatTelemetry::default(),
         }
     }
 
@@ -2951,6 +3010,7 @@ mod tests {
             text: None,
             ice_pending: false,
             routing: Routing::default(),
+            telemetry: SeatTelemetry::default(),
         };
         (config, encoded)
     }
@@ -2987,6 +3047,7 @@ mod tests {
             text: None,
             ice_pending: false,
             routing: Routing::default(),
+            telemetry: SeatTelemetry::default(),
         };
         (config, encoded)
     }
@@ -3148,6 +3209,7 @@ mod tests {
             text: None,
             ice_pending: false,
             routing: Routing::default(),
+            telemetry: SeatTelemetry::default(),
         };
         (config, encoded)
     }

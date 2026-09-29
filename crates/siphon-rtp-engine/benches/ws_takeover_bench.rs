@@ -111,6 +111,7 @@ fn registry(
         // on the ingress path being measured.
         bridge_task: tokio::spawn(std::future::pending()),
         drain_task: tokio::spawn(std::future::pending()),
+        rtcp_tap: None,
     });
     (registry, rtp_in_rx)
 }

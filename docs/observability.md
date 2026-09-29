@@ -157,10 +157,12 @@ legs (keyed by `call_id`); exactly one identifier is present, matching the
     engine carries in userspace publishes its own RTCP after decrypting it: the SDES and DTLS-SRTP
     bridges, and the media pipeline (transcoded calls, secure transcodes, locally answered legs).
     The captured payload is always plaintext. Conference seats and WebSocket takeover legs terminate
-    RTCP rather than relay it and are not exported; their quality is on `call_quality`.
+    RTCP rather than relay it; they publish what they receive too, with the seat's or leg's own
+    engine address as the capture's destination (a secure takeover leg's SRTCP is authenticated and
+    decrypted for this alone — the bridge still never sees it).
   - **Correlation.** Each capture's correlation id is the SIP `Call-ID` of the leg's dialog, which
     the controller names as `sip_call_id` on the offer (offerer's leg) and the answer (answerer's
-    leg). A B2BUA's two legs are two dialogs, so each is filed under its own. Unset, a leg is
+    leg), or on `conference_join` for a seat (each seat is its own dialog). A B2BUA's two legs are two dialogs, so each is filed under its own. Unset, a leg is
     correlated by the engine `call_id` — correct over NG, where that is the Call-ID, and nowhere
     else, since a controller's media id is not a SIP identifier a collector can join on.
 

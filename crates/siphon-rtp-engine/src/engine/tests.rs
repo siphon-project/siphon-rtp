@@ -27299,6 +27299,27 @@ async fn a_sip_call_id_that_cannot_be_one_is_refused() {
         .await;
     assert!(matches!(result, CmdResult::Error { .. }), "{result:?}");
     assert!(!engine.calls.contains_key("bad-sip-call-id"));
+
+    // A conference seat names its dialog the same way, and is held to the same rule.
+    let seat = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "bad-sip-call-id-room".into(),
+                from_tag: "alice".into(),
+                sdp: sdp_for(addr_a, true),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags {
+                    sip_call_id: Some("has space".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    match seat {
+        CmdResult::Error { reason } => assert!(reason.contains("sip_call_id"), "{reason}"),
+        other => panic!("a seat with an invalid sip_call_id was seated: {other:?}"),
+    }
 }
 
 /// Answer a single-leg call whose caller signalled `127.0.0.2`, send five packets from a socket on
@@ -28068,4 +28089,136 @@ async fn a_refused_source_does_not_start_media() {
 
     // Teardown drains the watch list itself — no poll has run since the delete.
     assert!(engine.awaiting_media.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conference_seats_rtcp_is_exported_under_its_own_dialog() {
+    // The room terminates each seat's RTCP instead of relaying it, and every seat is a dialog of its
+    // own, so the capture is filed under the Call-ID the seat named when it joined — not the room's.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let (engine, collector) = hep_exporting_engine().await;
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone, addr) = phone().await;
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "room-telemetry".into(),
+                from_tag: "alice".into(),
+                sdp: sdp_for(addr, true),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags {
+                    sip_call_id: Some("5a1e0c77-seat".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let seat = sdp::parse(&ok_sdp_text(&joined)).expect("join").remote_rtp;
+    let report = rtcp_sr(0x0A0A_0A0A);
+    phone.send_to(&report, seat).await.expect("send");
+    let capture = hep_capture_carrying(&collector, &report).await;
+    assert!(
+        contains_bytes(&capture, b"5a1e0c77-seat"),
+        "the seat's dialog"
+    );
+    assert!(
+        !contains_bytes(&capture, b"room-telemetry"),
+        "not the room's id"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_legs_rtcp_is_exported() {
+    // A bot has no use for the caller's reception reports, but they are the call's quality.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    let (engine, collector) = hep_exporting_engine().await;
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (ws_uri, frames, _down) = takeover_ws_server().await;
+    let (phone, addr) = phone().await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "bot-rtcp".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr, true),
+                profile: ProfileFlags {
+                    ws_uri: Some(ws_uri),
+                    sip_call_id: Some("7f3e0a1c-a-leg".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let target = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer")
+        .remote_rtp;
+    let _ = expect_bridge_start(&frames).await;
+    let report = rtcp_sr(0x0A0A_0A0A);
+    phone.send_to(&report, target).await.expect("send");
+    let capture = hep_capture_carrying(&collector, &report).await;
+    assert!(contains_bytes(&capture, b"7f3e0a1c-a-leg"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secure_takeover_legs_srtcp_is_exported_decrypted() {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::srtcp::SrtcpContext;
+    let (engine, collector) = hep_exporting_engine().await;
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (ws_uri, frames, _down) = takeover_ws_server().await;
+    let (phone, addr) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "bot-srtcp".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr, &caller_key),
+                profile: ProfileFlags {
+                    ws_uri: Some(ws_uri),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let target = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer")
+        .remote_rtp;
+    let _ = expect_bridge_start(&frames).await;
+    let report = rtcp_sr(0x0A0A_0A0A);
+    let mut sealed = Vec::new();
+    SrtcpContext::from_key_material(&caller_key.key)
+        .protect(&report, &mut sealed)
+        .expect("caller SRTCP");
+    phone.send_to(&sealed, target).await.expect("send");
+    let capture = hep_capture_carrying(&collector, &report).await;
+    assert!(
+        contains_bytes(&capture, b"bot-srtcp"),
+        "correlated by the call"
+    );
 }

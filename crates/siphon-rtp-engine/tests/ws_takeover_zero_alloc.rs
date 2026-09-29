@@ -99,6 +99,7 @@ fn leg(
         rtp_in,
         bridge_task: tokio::spawn(std::future::pending()),
         drain_task: tokio::spawn(std::future::pending()),
+        rtcp_tap: None,
     });
     (registry, rtp_in_rx)
 }

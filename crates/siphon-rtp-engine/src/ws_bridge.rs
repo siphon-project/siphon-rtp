@@ -44,7 +44,7 @@ use std::sync::{
 use bytes::Bytes;
 use dashmap::DashMap;
 
-use siphon_rtp_datapath::{rtp_media_ssrc, EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_datapath::{rtp_media_ssrc, EndpointId, ObservedRtcp, RxPacket, SourceFilter};
 use siphon_rtp_srtp::leg::{is_rtcp, SecureLeg};
 
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
@@ -102,6 +102,19 @@ impl WsSecureLeg {
         };
         self.keyed.store(false, Ordering::SeqCst);
         guard.take()
+    }
+
+    /// Decrypt one inbound SRTCP datagram for the telemetry export (RFC 3711 §3.4). The bridge has
+    /// no use for RTCP, but the leg's reception reports are the call's quality; `None` when the leg
+    /// is not keyed or the datagram fails authentication.
+    pub fn unprotect_rtcp(&self, packet: &[u8]) -> Option<Vec<u8>> {
+        let mut plain = Vec::with_capacity(packet.len());
+        let Ok(mut guard) = self.leg.lock() else {
+            tracing::error!("ws secure-leg mutex poisoned; dropping ingress");
+            return None;
+        };
+        guard.as_mut()?.unprotect(packet, &mut plain).ok()?;
+        Some(plain)
     }
 
     /// Install the key material a completed DTLS-SRTP handshake produced. Returns `false` if the
@@ -335,6 +348,10 @@ struct WsRoute {
     call_id: String,
     /// Which refusals of this leg's ingress have already been logged at `warn`.
     refusals: RefusalLog,
+    /// The telemetry tap for this leg's received RTCP and the leg's own engine address (the capture's
+    /// destination: a takeover leg terminates RTCP rather than relaying it). `None` while nothing
+    /// exports RTCP.
+    rtcp_tap: Option<(flume::Sender<ObservedRtcp>, std::net::SocketAddr)>,
 }
 
 /// The per-leg state a **re-point** ([`Command::AttachWsBridge`](siphon_rtp_proto::Command) on a
@@ -388,6 +405,10 @@ pub struct WsCallPlan {
     pub bridge_task: tokio::task::JoinHandle<()>,
     /// The drain task pumping the bridge's `rtp_out` to the datapath toward A.
     pub drain_task: tokio::task::JoinHandle<()>,
+    /// The telemetry tap for this leg's received RTCP and the leg's own engine address (the capture's
+    /// destination: a takeover leg terminates RTCP rather than relaying it). `None` while nothing
+    /// exports RTCP.
+    pub rtcp_tap: Option<(flume::Sender<ObservedRtcp>, std::net::SocketAddr)>,
 }
 
 /// A handle to a running WS-bridge call: its endpoint(s) and the two tasks to abort on teardown.
@@ -429,6 +450,7 @@ impl WsRegistry {
                 activity: plan.activity,
                 call_id: plan.call_id.clone(),
                 refusals: RefusalLog::default(),
+                rtcp_tap: plan.rtcp_tap.clone(),
             },
         );
         self.calls.insert(
@@ -532,6 +554,21 @@ impl WsRegistry {
             None => packet.data,
             Some(secure) => match secure.unprotect_ingress(&packet.data) {
                 Some(plain) => plain,
+                None if is_rtcp(&packet.data) => {
+                    // SRTCP has no consumer in the bridge, only in telemetry — authenticated first.
+                    if let Some((tap, local)) = &route.rtcp_tap {
+                        if let Some(plain) = secure.unprotect_rtcp(&packet.data) {
+                            ObservedRtcp::offer(
+                                Some(tap),
+                                packet.endpoint,
+                                packet.source,
+                                *local,
+                                &plain,
+                            );
+                        }
+                    }
+                    return;
+                }
                 None => {
                     // SRTCP has no consumer on a takeover leg and is dropped by design, so it is
                     // neither a refusal nor a drop worth counting — a healthy call would otherwise
@@ -573,6 +610,13 @@ impl WsRegistry {
         // packet must not be able to hold a dead call open, and a bridge whose mailbox is momentarily
         // full is still a live call.
         route.activity.stamp(packet.endpoint);
+        // Telemetry: a plaintext leg's RTCP, accepted like its media. (A secure leg's SRTCP never gets
+        // here; it is exported above, after its own authentication.)
+        if let Some((tap, local)) = &route.rtcp_tap {
+            if is_rtcp(&payload) {
+                ObservedRtcp::offer(Some(tap), packet.endpoint, packet.source, *local, &payload);
+            }
+        }
         // Drop on a full or closed mailbox — late audio is worthless, and a closed channel means the
         // bridge task has already exited.
         if route.rtp_in.try_send(payload).is_err() {
@@ -728,6 +772,7 @@ mod tests {
             rtp_in,
             bridge_task,
             drain_task,
+            rtcp_tap: None,
         }
     }
 
@@ -889,6 +934,7 @@ mod tests {
             rtp_in: rtp_in_tx,
             bridge_task,
             drain_task,
+            rtcp_tap: None,
         });
 
         // ICE selects a pair: the gate narrows and the watch is re-pointed.
