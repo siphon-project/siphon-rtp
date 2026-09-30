@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-09-30
+
 ### Added
 
 - **A runtime `attach_ws_bridge` takes a media profile.** The command carried only `call_id` and
