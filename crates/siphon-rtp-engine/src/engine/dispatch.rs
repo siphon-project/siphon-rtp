@@ -397,8 +397,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             Command::DetachWsTee { call_id, .. } => self.detach_ws_tee(client, &call_id).await,
             Command::AttachWsBridge {
-                call_id, ws_uri, ..
-            } => self.attach_ws_bridge(client, &call_id, &ws_uri).await,
+                call_id,
+                ws_uri,
+                profile,
+                ..
+            } => {
+                self.attach_ws_bridge(client, &call_id, &ws_uri, profile.as_ref())
+                    .await
+            }
             Command::DetachWsBridge { call_id, .. } => {
                 self.detach_ws_bridge(client, &call_id).await
             }

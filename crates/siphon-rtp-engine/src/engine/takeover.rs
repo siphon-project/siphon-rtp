@@ -39,16 +39,10 @@ pub(super) struct WsBridgeSetup<'a> {
     pub(super) ice_pending: bool,
     /// SRTP crypto for a secure offerer — SDES-keyed up front, or DTLS-pending. `None` = plaintext.
     pub(super) secure: Option<Arc<crate::ws_bridge::WsSecureLeg>>,
-    /// The L16 wire rate the WS server exchanges, independent of A's codec rate and applied in both
-    /// directions. `None` follows A's codec rate. Validated before anything is installed or dialled.
-    pub(super) wire_sample_rate: Option<u32>,
-    /// Clean A's uplink toward the WS server.
-    pub(super) noise_suppression: bool,
-    /// Cancel A's uplink echo against the downlink the bridge plays toward the call, and how — the
-    /// search window or long tail, and whether the residual post-filter is chained.
-    pub(super) echo: crate::media_pipeline::EchoProfile,
-    /// Local energy-VAD turn-taking / barge-in, when the profile asked for it.
-    pub(super) vad_config: Option<WsVadConfig>,
+    /// The wire rate and uplink processing, resolved from the controller's profile by
+    /// [`WsBridgeProcessing::from_profile`]. The wire rate is validated before anything is installed
+    /// or dialled.
+    pub(super) processing: WsBridgeProcessing,
     /// The downlink destination + latch to **reuse**, on a re-point ([`Engine::start_ws_bridge`] on
     /// a call that already has a bridge). `None` mints a fresh one aimed at `a_rtp`, which is what
     /// every negotiation-time setup wants. Carried across a re-point because it is leg A's state, not
@@ -70,6 +64,70 @@ pub(super) struct WsBridgeSetup<'a> {
     /// — is, on a re-point, a rerun of a computation that already succeeded for these exact
     /// parameters, so nothing between here and the redirect can fail on that path.
     pub(super) socket: Option<WsClientSocket>,
+}
+
+/// A takeover bridge's L16 wire rate and uplink processing — everything about a bridge a
+/// controller's [`ProfileFlags`] decides, as one value.
+///
+/// One type, resolved in one place, because four paths build a bridge from a profile: `offer` and
+/// `answer` on a two-leg call, `answer_local` on a single-leg one, and a runtime
+/// [`Command::AttachWsBridge`](siphon_rtp_proto::Command) that names one. A runtime attach reading
+/// its profile any differently would give the same bot a different wire from the same request, and
+/// that difference is exactly what a runtime attach without a profile used to show (an 8 kHz
+/// `start` where the answer path reported 16 kHz, and no turn-taking).
+///
+/// [`Default`] is the posture of a bridge nobody configured: the leg's own codec rate, every uplink
+/// stage off. An empty profile resolves to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct WsBridgeProcessing {
+    /// The L16 wire rate the WS server exchanges, independent of A's codec rate and applied in both
+    /// directions. `None` follows A's codec rate.
+    pub(super) wire_sample_rate: Option<u32>,
+    /// Clean A's uplink toward the WS server.
+    pub(super) noise_suppression: bool,
+    /// Cancel A's uplink echo against the downlink the bridge plays toward the call, and how — the
+    /// search window or long tail, and whether the residual post-filter is chained.
+    pub(super) echo: crate::media_pipeline::EchoProfile,
+    /// Local energy-VAD turn-taking / barge-in, when the profile asked for it.
+    pub(super) vad_config: Option<WsVadConfig>,
+}
+
+impl WsBridgeProcessing {
+    /// Resolve the bridge's wire rate and uplink processing from a controller profile:
+    /// `ws_sample_rate`, `noise_suppression`, the `echo_*` settings and the `ws_vad*` /
+    /// `ws_barge_in` turn-taking. Nothing else in the profile is read.
+    pub(super) fn from_profile(profile: &ProfileFlags) -> Self {
+        Self {
+            wire_sample_rate: profile.ws_sample_rate,
+            noise_suppression: profile.noise_suppression,
+            echo: crate::media_pipeline::EchoProfile::from_profile(profile),
+            vad_config: WsVadConfig::from_profile(profile),
+        }
+    }
+}
+
+/// Check and resolve the profile a runtime [`Command::AttachWsBridge`](siphon_rtp_proto::Command)
+/// names, exactly as the negotiation paths treat the profile that carries `ws_uri`.
+///
+/// # Errors
+/// The reason the profile cannot be served — the same refusal `answer_local` gives it, or an
+/// unserviceable `ws_sample_rate` — before anything about the call has changed.
+fn resolve_attach_profile(profile: &ProfileFlags) -> Result<WsBridgeProcessing, String> {
+    crate::media_pipeline::validate_profile(profile)?;
+    let processing = WsBridgeProcessing::from_profile(profile);
+    if let Some(rate) = processing.wire_sample_rate {
+        siphon_rtp_media::bridge::wire_rate::validate_wire_sample_rate(rate)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(processing)
+}
+
+#[cfg(test)]
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// The wire rate and uplink processing the call's takeover bridge runs, if it has one.
+    pub(super) fn ws_bridge_processing(&self, call_id: &str) -> Option<WsBridgeProcessing> {
+        self.ws_bridges.get(call_id).map(|bridge| bridge.processing)
+    }
 }
 
 /// A dialled WebSocket client connection to a media server — what
@@ -129,10 +187,7 @@ pub(super) struct WsBridge {
     /// The negotiated L16 wire rate, and the uplink processing the profile asked for. Carried across
     /// a re-point: a controller moving a voice-AI call to a second consumer asked for a different
     /// *destination*, not for its VAD, noise suppression or wire rate to be silently turned off.
-    wire_sample_rate: Option<u32>,
-    noise_suppression: bool,
-    echo: crate::media_pipeline::EchoProfile,
-    vad_config: Option<WsVadConfig>,
+    processing: WsBridgeProcessing,
     /// The relay this bridge displaced, or `None` when the bridge *is* the call's negotiated media
     /// path (`ProfileFlags::ws_uri`). This is exactly what makes a detach possible or not — see
     /// [`Engine::detach_ws_bridge`].
@@ -178,15 +233,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             accepted_source,
             ice_pending,
             secure,
-            noise_suppression,
-            echo,
-            vad_config,
-            wire_sample_rate,
+            processing,
             egress: existing_egress,
             takeover,
             socket: dialled,
         } = setup;
         use siphon_rtp_media::bridge::wire_rate::{validate_wire_sample_rate, wire_resampler};
+        let WsBridgeProcessing {
+            wire_sample_rate,
+            noise_suppression,
+            echo,
+            vad_config,
+        } = processing;
 
         // The lifecycle events are addressed to the call's owner and carry its offerer tag, and both
         // have to be captured now: teardown emits the end event after `delete` has removed the call.
@@ -466,10 +524,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ended,
                 codec: codec.clone(),
                 a_rtp,
-                wire_sample_rate,
-                noise_suppression,
-                echo,
-                vad_config,
+                processing,
                 takeover,
             },
         );
@@ -526,16 +581,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// The runtime half of what `ProfileFlags::ws_uri` could previously only do at negotiation.
     /// Ownership is checked here (A3 — docs/security-and-nat.md §5); the work is in
     /// [`Self::start_ws_bridge`].
+    ///
+    /// A `profile` is checked the way `answer_local` checks the one that carries `ws_uri` — the same
+    /// [`crate::media_pipeline::validate_profile`], plus the wire rate — and resolved by the same
+    /// [`WsBridgeProcessing::from_profile`], before anything is dialled or stopped. Refusing here
+    /// matters on an anchored call: past this point the attach stops the engine's pipeline, and a
+    /// profile refused after that would cost the caller a re-anchor.
     pub(super) async fn attach_ws_bridge(
         &self,
         client: ClientId,
         call_id: &str,
         ws_uri: &str,
+        profile: Option<&ProfileFlags>,
     ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
         }
-        match self.start_ws_bridge(call_id, ws_uri).await {
+        let requested = match profile.map(resolve_attach_profile).transpose() {
+            Ok(requested) => requested,
+            Err(reason) => return error_result("attach_ws_bridge", &reason),
+        };
+        match self.start_ws_bridge(call_id, ws_uri, requested).await {
             Ok(()) => ok_empty(),
             Err(reason) => error_result("attach_ws_bridge", &reason),
         }
@@ -572,17 +638,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// **Anchor** (a single-leg call on the engine's own pipeline — `answer_local` without `ws_uri`,
     /// or one a detach handed back). The bot takes the leg from the pipeline and a detach hands it
     /// back; see [`Self::attach_to_anchor`].
-    async fn start_ws_bridge(&self, call_id: &str, ws_uri: &str) -> Result<(), String> {
+    ///
+    /// `requested` is the processing the attach's own profile resolved to, if it named one: it
+    /// replaces a re-pointed bridge's, and sets a takeover's (which otherwise runs with it off).
+    async fn start_ws_bridge(
+        &self,
+        call_id: &str,
+        ws_uri: &str,
+        requested: Option<WsBridgeProcessing>,
+    ) -> Result<(), String> {
         // --- re-point ------------------------------------------------------------------------
         if let Some(state) = self.ws.route_state(call_id) {
             let Some(previous) = self.ws_bridges.get(call_id).map(|bridge| {
                 (
                     bridge.codec.clone(),
                     bridge.a_rtp,
-                    bridge.wire_sample_rate,
-                    bridge.noise_suppression,
-                    bridge.echo,
-                    bridge.vad_config,
+                    bridge.processing,
                     bridge.takeover.clone(),
                     bridge.ws_uri.clone(),
                 )
@@ -595,16 +666,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         .to_string(),
                 );
             };
-            let (
-                codec,
-                a_rtp,
-                wire_sample_rate,
-                noise_suppression,
-                echo,
-                vad_config,
-                takeover,
-                old_uri,
-            ) = previous;
+            let (codec, a_rtp, carried, takeover, old_uri) = previous;
+            // A profile on the re-point replaces the bridge's processing; without one the leg keeps
+            // what it had (see `WsBridge::processing`).
+            let processing = requested.unwrap_or(carried);
             // Dial first, while the outgoing bridge still owns the leg: a re-point that cannot reach
             // the new consumer must be a clean refusal on a call that is still up, not a call left
             // redirected into nothing with its relay-restore plan already dropped.
@@ -621,10 +686,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     accepted_source: state.accepted_source,
                     ice_pending: state.ice_pending,
                     secure: state.secure,
-                    noise_suppression,
-                    echo,
-                    vad_config,
-                    wire_sample_rate,
+                    processing,
                     egress: Some(state.egress),
                     // Carried forward: a re-point moves the far side, it does not change what the
                     // bridge displaced, so a detach after one still restores the original relay.
@@ -652,7 +714,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .unwrap_or(false)
             && self.media.is_media_call(call_id);
         if anchored {
-            return self.attach_to_anchor(call_id, ws_uri).await;
+            return self
+                .attach_to_anchor(call_id, ws_uri, requested.unwrap_or_default())
+                .await;
         }
 
         // --- takeover of a live relay ----------------------------------------------------------
@@ -774,13 +838,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // Refused above for both shapes that would need them.
             ice_pending: false,
             secure: None,
-            // A runtime attach carries no offer/answer profile, so the uplink processing knobs are
-            // off. They are set on the negotiation that armed the bridge, which is where the
-            // controller states them; a re-point then carries whatever that negotiation chose.
-            noise_suppression: false,
-            echo: crate::media_pipeline::EchoProfile::default(),
-            vad_config: None,
-            wire_sample_rate: None,
+            // The attach's own profile, or — without one — the leg's own rate with every uplink
+            // stage off: the relay being taken over was negotiated without a bridge, so there is no
+            // earlier choice to inherit.
+            processing: requested.unwrap_or_default(),
             egress: None,
             takeover: Some(takeover),
             // Nothing has been displaced yet — `setup_ws_bridge` dials before it installs a flow, so
@@ -935,7 +996,7 @@ pub(super) const DEFAULT_WS_VAD_THRESHOLD: i64 = 1_000_000;
 pub(super) const DEFAULT_WS_VAD_HANGOVER_MS: u32 = 200;
 
 /// Local-VAD turn-taking config for a WS voice-AI leg, resolved from [`ProfileFlags`] at offer time.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WsVadConfig {
     /// Which detector to run (`ws_vad_engine`); the energy gate unless the controller says otherwise.
     pub(super) engine: WsVadEngine,
@@ -1119,10 +1180,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         // Refused above for both shapes that would need them.
                         ice_pending: false,
                         secure: None,
-                        noise_suppression: profile.noise_suppression,
-                        echo: crate::media_pipeline::EchoProfile::from_profile(profile),
-                        vad_config: WsVadConfig::from_profile(profile),
-                        wire_sample_rate: profile.ws_sample_rate,
+                        processing: WsBridgeProcessing::from_profile(profile),
                         egress: None,
                         takeover: None,
                         socket: None,

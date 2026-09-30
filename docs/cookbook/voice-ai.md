@@ -525,10 +525,32 @@ two-party relay can be taken over and handed back.
   "call_id": "abc@example.com", "from_tag": "1a2b", "ws_uri": "ws://127.0.0.1:9002/stream" }
 ```
 
+**The profile.** `attach_ws_bridge` takes an optional `profile`, the same object `answer_local`
+takes, and reads the same fields from it the answer path reads alongside `ws_uri`: `ws_sample_rate`,
+`noise_suppression`, `echo_cancellation` and the other `echo_*` settings, and `ws_vad` /
+`ws_vad_engine` / `ws_vad_threshold` / `ws_vad_hangover_ms` / `ws_vad_min_speech_ms` /
+`ws_barge_in`. A bot attached with the profile it would have been answered with gets the same wire
+and the same uplink processing. Nothing else in the profile is read: the codec, the source gate and
+the keying stay the leg's own, so an attach cannot widen the gate the negotiation installed. A
+profile the answer path would refuse is refused here too, before anything is dialled or stopped.
+
+```json
+{ "id": 8, "command": "attach_ws_bridge",
+  "call_id": "abc@example.com", "from_tag": "1a2b", "ws_uri": "ws://127.0.0.1:9002/stream",
+  "profile": { "ws_sample_rate": 16000, "ws_vad": true, "ws_barge_in": true,
+               "echo_cancellation": true, "noise_suppression": true } }
+```
+
+**Without a profile**, a takeover (of a relay, or of a call the engine answered) runs at the leg's
+own codec rate with every uplink stage off: no VAD, no barge-in, no echo cancellation, no noise
+suppression. A G.711 leg's `start` frame then reports 8000, not the 16000 the same bot gets from
+`answer_local` with `ws_sample_rate: 16000`. A re-point without a profile keeps what the bridge had;
+one with a profile replaces it.
+
 **Re-pointing** is the one to reach for when a live call's audio has to move to a different consumer
 — a second model, a fallback when the first server drains, a handoff between two stages of a flow.
 The leg does not renegotiate: same ports, same codec, same wire rate and uplink VAD / noise
-suppression / echo cancellation, same source gate, same SRTP keying, same ICE-selected path. Only
+suppression / echo cancellation (unless the re-point names a `profile`), same source gate, same SRTP keying, same ICE-selected path. Only
 the far side moves, so there is no re-INVITE and the caller hears a gap, not a new call. The old
 connection is closed and *awaited* before the new one is registered, so the two never overlap on the
 leg. You get one `ws_bridge_ended` (`reason: "detached"`) and one `ws_bridge_started` for the new

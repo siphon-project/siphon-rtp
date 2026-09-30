@@ -693,12 +693,24 @@ pub enum Command {
     ///   for as long as the takeover lasts**; that is what a takeover *is*, and
     ///   [`Command::DetachWsBridge`] puts the relay back.
     ///
+    /// The bridge's uplink processing and wire rate come from `profile`, read exactly as
+    /// `answer_local` / `answer` read the profile that carried `ws_uri`: `ws_sample_rate`,
+    /// `noise_suppression`, the `echo_*` settings and the `ws_vad*` / `ws_barge_in` turn-taking.
+    /// Nothing else in it is read — the source gate, codec and keying stay the leg's own, so an
+    /// attach can never widen the gate the negotiation installed. **Absent**, a takeover runs at the
+    /// leg's own codec rate with every uplink stage off, and a re-point keeps what the bridge it
+    /// replaces had; present on a re-point, it replaces that.
+    ///
     /// A native siphon-rtp extension — the NG/bencode front-end does not carry it.
     AttachWsBridge {
         call_id: String,
         from_tag: String,
         /// `ws://` or `wss://` URI of the media server the engine dials as a client.
         ws_uri: String,
+        /// The bridge's wire rate and uplink processing (see above). Omitted from the wire when
+        /// `None`, and defaulted when absent, so either side may predate it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<ProfileFlags>,
     },
     /// Detach a call's WebSocket **takeover** bridge and put its media path back the way it was.
     ///
@@ -2806,6 +2818,33 @@ mod tests {
     }
 
     #[test]
+    fn attach_ws_bridge_carries_an_optional_profile() {
+        let wire = concat!(
+            r#"{"command":"attach_ws_bridge","call_id":"c","from_tag":"f","ws_uri":"ws://h/s","#,
+            r#""profile":{"ws_sample_rate":16000,"ws_vad":true,"ws_barge_in":true,"#,
+            r#""echo_cancellation":true,"noise_suppression":true}}"#,
+        );
+        let decoded = serde_json::from_str::<Command>(wire).expect("decode attach_ws_bridge");
+        let Command::AttachWsBridge {
+            profile: Some(profile),
+            ..
+        } = &decoded
+        else {
+            panic!("expected attach_ws_bridge with a profile, got {decoded:?}");
+        };
+        assert_eq!(profile.ws_sample_rate, Some(16000));
+        assert!(profile.ws_vad && profile.ws_barge_in);
+        assert!(profile.echo_cancellation && profile.noise_suppression);
+        // The profile rides the wire as the same object `offer` / `answer_local` carry.
+        let value = serde_json::to_value(&decoded).expect("serialize");
+        assert_eq!(value["profile"]["ws_sample_rate"], 16000);
+        assert_eq!(
+            serde_json::from_value::<Command>(value).expect("roundtrip"),
+            decoded
+        );
+    }
+
+    #[test]
     fn attach_detach_ws_bridge_wire_shape() {
         // The takeover twin of `attach_ws_tee`: same keying triple, and deliberately no direction /
         // channels — a takeover is one leg, duplex, and its wire rate comes from the negotiation.
@@ -2816,10 +2855,15 @@ mod tests {
                 call_id,
                 from_tag,
                 ws_uri,
+                profile,
             } => {
                 assert_eq!(call_id, "c");
                 assert_eq!(from_tag, "f");
                 assert_eq!(ws_uri, "ws://h/s");
+                assert_eq!(
+                    profile, None,
+                    "a controller predating the profile still decodes"
+                );
             }
             other => panic!("expected attach_ws_bridge, got {other:?}"),
         }
@@ -2827,10 +2871,15 @@ mod tests {
             call_id: "c".into(),
             from_tag: "f".into(),
             ws_uri: "wss://h/s".into(),
+            profile: None,
         })
         .expect("serialize");
         assert_eq!(value["command"], "attach_ws_bridge");
         assert_eq!(value["ws_uri"], "wss://h/s");
+        assert!(
+            value.get("profile").is_none(),
+            "no profile, no field: an engine predating it sees the exact wire it always did"
+        );
 
         match serde_json::from_str::<Command>(
             r#"{"command":"detach_ws_bridge","call_id":"c","from_tag":"f"}"#,
