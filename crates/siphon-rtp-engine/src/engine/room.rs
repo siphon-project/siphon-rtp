@@ -1031,6 +1031,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ingress_legs: Vec::new(),
                 egress_legs: Vec::new(),
                 room: Some(conference_id.to_string()),
+                bridge_taps: Vec::new(),
                 source_reason,
                 writer,
             },

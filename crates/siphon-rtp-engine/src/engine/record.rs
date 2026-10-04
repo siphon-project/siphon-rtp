@@ -1,7 +1,7 @@
 //! Runtime recording: raw-RTP pcap and decoded-audio WAV.
 
 use siphon_rtp_codec::factory::{self, CodecSpec};
-use siphon_rtp_datapath::Datapath;
+use siphon_rtp_datapath::{Datapath, EndpointId};
 use siphon_rtp_media::pcap::{self, CapturedPacket};
 use siphon_rtp_proto::{
     CmdResult, Event, RecordingChannels, RecordingDirection, RecordingEndReason,
@@ -12,6 +12,7 @@ use crate::conference::ConferenceControl;
 use crate::media_pipeline::{MediaControl, PcapCapture};
 use crate::text_pipeline::TextControl;
 
+use super::tee::{run_bridge_tap_decoder, BRIDGE_TAP_QUEUE};
 use super::{
     error_result, ok_empty, unknown_call, ClientId, Engine, PipelineKind, PromoteMode,
     PromotionReason,
@@ -41,6 +42,9 @@ pub(super) struct AudioRecording {
     /// The conference this recording taps, when it is a room recording rather than a call one. The
     /// detach then targets the room actor's own tap list instead of a call's fan-out.
     pub(super) room: Option<String>,
+    /// On a crypto-bridged call: each tapped endpoint and the task decoding its plaintext for the
+    /// recording. Empty on a pipeline call, whose sinks sit on the actor's own post-decode fan-out.
+    pub(super) bridge_taps: Vec<(EndpointId, tokio::task::JoinHandle<()>)>,
     /// Why the recording ended when the *source* simply went away. Set by an explicit stop before it
     /// detaches; left at `CallEnded` otherwise, because a writer cannot tell a stop from a hangup —
     /// both are just "the sinks are gone" — and guessing would report one as the other.
@@ -56,6 +60,23 @@ impl AudioRecording {
     fn call_id_matches(&self, call_id: &str) -> bool {
         self.call_id == call_id
     }
+}
+
+/// What a call recording's writer task needs to finish the file and report it.
+struct RecordingWriter {
+    owner: ClientId,
+    call_id: String,
+    from_tag: String,
+    to_tag: Option<String>,
+    recording_id: String,
+    path: std::path::PathBuf,
+    file: tokio::fs::File,
+    rate: u32,
+    channels: u8,
+    limits: crate::recording::RecordingLimits,
+    frames: flume::Receiver<Vec<u8>>,
+    recycle: flume::Sender<Vec<u8>>,
+    source_reason: Arc<std::sync::Mutex<RecordingEndReason>>,
 }
 
 /// The decoded-recording knobs, grouped so the start path takes one parameter rather than six.
@@ -300,11 +321,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
         use siphon_rtp_media::bridge::wire_rate::wire_resampler;
 
-        // Same exclusions the tee has, and for the same reason: a WS-takeover call's media never
-        // reaches the pipeline, and a crypto *bridge* relays ciphertext without decoding, so neither
-        // has a post-decode fan-out to tap. A secure call that runs through the media pipeline
-        // (`SrtpMedia` / `DtlsMedia`) decodes like any other and records fine — which is the case the
-        // pcap recorder has to refuse and this one does not.
+        // The same exclusion the tee has, and for the same reason: a WS-takeover call's media never
+        // reaches the pipeline. A secure call that runs through the media pipeline (`SrtpMedia` /
+        // `DtlsMedia`) decodes like any other and records fine — which is the case the pcap recorder
+        // has to refuse and this one does not.
         let pipeline = self
             .owned_call_internal(call_id, |call| call.pipeline)
             .ok_or_else(|| "call no longer exists".to_string())?;
@@ -313,12 +333,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 "a WebSocket-takeover call (ws_uri) has no relay path to record".to_string(),
             );
         }
+        // A crypto *bridge* relays without decoding, so it has no post-decode fan-out to tap. It
+        // does hold each party's plaintext between its two transforms — where the tee and lawful
+        // interception tap too — so the recording decodes a copy of that instead.
         if pipeline.is_crypto_bridge() {
-            return Err(
-                "recording a secure crypto-bridge call is not supported — the bridge relays \
-                 ciphertext without decoding; a transcoded secure call records fine"
-                    .to_string(),
-            );
+            return self
+                .begin_bridged_wav_recording(call_id, from_tag, request)
+                .await;
         }
 
         let (near_codec, far_codec, two_leg, to_tag, owner) = self
@@ -411,27 +432,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return Err("the call has no leg matching the requested direction".to_string());
         }
 
-        let recording_id = format!(
-            "rec-{}",
-            self.next_recording_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let path = match request.path {
-            Some(path) => std::path::PathBuf::from(path),
-            None => {
-                let directory = request.recording_dir.ok_or_else(|| {
-                    "no output location (set `path`, or `recording_dir`)".to_string()
-                })?;
-                std::path::PathBuf::from(directory).join(format!("{call_id}-{recording_id}.wav"))
-            }
-        };
-
-        // Open the output up front, exactly as the pcap path does: a bad path must fail the verb with
-        // the call untouched — nothing promoted, no sink attached — rather than being reported minutes
-        // later as a `RecordingFinished{Error}` for a recording the controller believes is running.
-        let file = tokio::fs::File::create(&path)
-            .await
-            .map_err(|error| format!("open {}: {error}", path.display()))?;
+        let recording_id = self.next_recording_id();
+        let (path, file) =
+            open_recording_output(call_id, &recording_id, request.path, request.recording_dir)
+                .await?;
 
         // A relay-only actor (a pcap recording, a DTMF block) forwards RTP verbatim and never decodes,
         // so the fan-out this taps would stay dry. Rebuild it as a processing actor, then hold it for
@@ -481,52 +485,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        // `CallEnded` is the default because it is the truthful answer when nothing set it: the sinks
-        // went away and nobody asked them to.
-        let source_reason = Arc::new(std::sync::Mutex::new(RecordingEndReason::CallEnded));
-        let writer = {
-            let events = self.event_sink(owner);
-            let call_id = call_id.to_string();
-            let from_tag = from_tag.to_string();
-            let to_tag = to_tag.clone();
-            let recording_id = recording_id.clone();
-            let path = path.clone();
-            let source_reason = source_reason.clone();
-            let frames = plan.frames;
-            let recycle = plan.recycle;
-            tokio::spawn(async move {
-                let outcome = crate::recording::run_wav_recorder(
-                    file,
-                    path.clone(),
-                    rate,
-                    u16::from(channels),
-                    request.limits,
-                    frames,
-                    recycle,
-                )
-                .await;
-                let source_reason = source_reason
-                    .lock()
-                    .map(|reason| *reason)
-                    .unwrap_or(RecordingEndReason::CallEnded);
-                let reason = outcome.end.into_reason(source_reason);
-                // Emitted only now — after the header has been finalized and the file flushed — so a
-                // consumer that acts on this event never opens a half-written file. That is the whole
-                // reason the event exists.
-                if let Some(events) = events {
-                    let _ = events.try_send(Event::RecordingFinished {
-                        conference_id: None,
-                        call_id,
-                        from_tag,
-                        to_tag,
-                        recording_id,
-                        path: Some(path.to_string_lossy().into_owned()),
-                        duration_ms: outcome.duration_ms,
-                        reason,
-                    });
-                }
-            })
-        };
+        let source_reason = new_source_reason();
+        let writer = self.spawn_recording_writer(RecordingWriter {
+            owner,
+            call_id: call_id.to_string(),
+            from_tag: from_tag.to_string(),
+            to_tag,
+            recording_id: recording_id.clone(),
+            path: path.clone(),
+            file,
+            rate,
+            channels,
+            limits: request.limits,
+            frames: plan.frames,
+            recycle: plan.recycle,
+            source_reason: source_reason.clone(),
+        });
 
         self.recordings.insert(
             recording_id.clone(),
@@ -538,11 +512,228 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ingress_legs,
                 egress_legs,
                 room: None,
+                bridge_taps: Vec::new(),
                 source_reason,
                 writer,
             },
         );
         Ok(recording_id)
+    }
+
+    /// Stand a decoded recording up on a **crypto-bridged** call: one plaintext tap per recorded
+    /// party on the bridge, each decoded by a task of its own into the recording's frame assembler.
+    ///
+    /// The bridge keeps relaying untouched — nothing is re-keyed, the call is not rebuilt and no
+    /// media actor is created — so recording a same-codec secure call costs the relay one copy per
+    /// packet and nothing else. The taps sit after the source gate, the latch and the SRTP
+    /// authentication (docs/security-and-nat.md §10a), so a forged or replayed packet is never
+    /// recorded.
+    ///
+    /// A bridge originates no audio of its own: what reaches one party is exactly what the other
+    /// sent. `egress` (what the caller was sent) is therefore the callee's stream, and `both` is each
+    /// party once.
+    async fn begin_bridged_wav_recording(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        request: WavRecordingRequest,
+    ) -> Result<String, String> {
+        use siphon_rtp_media::bridge::protocol::{Encoding, Endianness, MediaFormat};
+        use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
+        use siphon_rtp_media::bridge::wire_rate::wire_resampler;
+
+        let (near_codec, far_codec, near_endpoint, far_endpoint, to_tag, owner) = self
+            .owned_call_internal(call_id, |call| {
+                (
+                    call.near_codec.clone(),
+                    call.far_codec.clone(),
+                    call.near.rtp.id,
+                    call.far.as_ref().map(|far| far.rtp.id),
+                    call.to_tag.clone(),
+                    call.owner,
+                )
+            })
+            .ok_or_else(|| "call no longer exists".to_string())?;
+
+        let record_caller = !matches!(request.direction, RecordingDirection::Egress);
+        // Every tapped party gets its decoder before anything is touched, so a codec this build
+        // cannot decode is a clean refusal on an untouched call.
+        let mut parties = Vec::new();
+        for (wanted, channel, codec, endpoint) in [
+            (
+                record_caller,
+                TeeChannel::Caller,
+                near_codec.as_ref(),
+                Some(near_endpoint),
+            ),
+            (true, TeeChannel::Callee, far_codec.as_ref(), far_endpoint),
+        ] {
+            if !wanted {
+                continue;
+            }
+            let (Some(codec), Some(endpoint)) = (codec, endpoint) else {
+                return Err("a recorded leg has no negotiated codec".to_string());
+            };
+            let decoder = factory::decoder_for(codec)
+                .map_err(|error| format!("no decoder for {}: {error}", codec.encoding_name))?;
+            parties.push((channel, endpoint, decoder, codec.payload_type));
+        }
+        // The recording rate is the first recorded party's decoded PCM rate (the caller's when it is
+        // recorded), exactly as on a pipeline call; a party at another rate is resampled into it.
+        let rate = parties
+            .first()
+            .map(|(_, _, decoder, _)| decoder.params().sample_rate_hz)
+            .ok_or_else(|| "the call has no leg matching the requested direction".to_string())?;
+        let ptime = near_codec
+            .as_ref()
+            .map_or(20, |codec| codec.ptime_ms.max(1));
+        let mut taps = Vec::new();
+        for (channel, endpoint, decoder, payload_type) in parties {
+            let resampler = wire_resampler(decoder.params().sample_rate_hz, rate)
+                .map_err(|error| error.to_string())?;
+            taps.push((channel, endpoint, decoder, payload_type, resampler));
+        }
+
+        // Two parties are mixed into a mono file or laid out caller-left / callee-right; one party
+        // is mono whatever was asked for, rather than a stereo frame whose other half never fills.
+        let two_parties = taps.len() == 2;
+        let channels: u8 = if two_parties && matches!(request.channels, RecordingChannels::Stereo) {
+            2
+        } else {
+            1
+        };
+        let format = MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: rate,
+            channels,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime,
+        };
+
+        let recording_id = self.next_recording_id();
+        let (path, file) =
+            open_recording_output(call_id, &recording_id, request.path, request.recording_dir)
+                .await?;
+
+        let plan = plan_ws_tee(format, two_parties, !record_caller);
+        let mut bridge_taps = Vec::new();
+        for (channel, endpoint, decoder, payload_type, resampler) in taps {
+            let sink = WsTeeSink::new(channel, plan.mixer.clone(), recording_id.clone(), resampler);
+            let (packets, received) = flume::bounded(BRIDGE_TAP_QUEUE);
+            if !self.bridge.add_plain_tap(endpoint, &recording_id, packets) {
+                self.remove_bridge_taps(&recording_id, bridge_taps).await;
+                return Err("the call's crypto bridge is no longer installed".to_string());
+            }
+            let task = tokio::spawn(run_bridge_tap_decoder(
+                received,
+                decoder,
+                payload_type,
+                sink,
+            ));
+            bridge_taps.push((endpoint, task));
+        }
+
+        let source_reason = new_source_reason();
+        let writer = self.spawn_recording_writer(RecordingWriter {
+            owner,
+            call_id: call_id.to_string(),
+            from_tag: from_tag.to_string(),
+            to_tag,
+            recording_id: recording_id.clone(),
+            path: path.clone(),
+            file,
+            rate,
+            channels,
+            limits: request.limits,
+            frames: plan.frames,
+            recycle: plan.recycle,
+            source_reason: source_reason.clone(),
+        });
+        self.recordings.insert(
+            recording_id.clone(),
+            AudioRecording {
+                recording_id: recording_id.clone(),
+                call_id: call_id.to_string(),
+                owner,
+                path,
+                ingress_legs: Vec::new(),
+                egress_legs: Vec::new(),
+                room: None,
+                bridge_taps,
+                source_reason,
+                writer,
+            },
+        );
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id,
+            recording_id,
+            channels,
+            sample_rate = rate,
+            "decoded recording started on a crypto bridge"
+        );
+        Ok(recording_id)
+    }
+
+    /// Take a recording's taps off the bridge and wait for their decoders, which end once the tap
+    /// that fed them is gone.
+    async fn remove_bridge_taps(
+        &self,
+        recording_id: &str,
+        bridge_taps: Vec<(EndpointId, tokio::task::JoinHandle<()>)>,
+    ) {
+        for (endpoint, task) in bridge_taps {
+            self.bridge.remove_plain_tap(endpoint, recording_id);
+            let _ = task.await;
+        }
+    }
+
+    /// The next recording id — also the tag on everything the recording attaches.
+    fn next_recording_id(&self) -> String {
+        format!(
+            "rec-{}",
+            self.next_recording_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    /// Spawn the task that streams a call recording to disk and reports it finished.
+    fn spawn_recording_writer(&self, writer: RecordingWriter) -> tokio::task::JoinHandle<()> {
+        let events = self.event_sink(writer.owner);
+        tokio::spawn(async move {
+            let outcome = crate::recording::run_wav_recorder(
+                writer.file,
+                writer.path.clone(),
+                writer.rate,
+                u16::from(writer.channels),
+                writer.limits,
+                writer.frames,
+                writer.recycle,
+            )
+            .await;
+            let source_reason = writer
+                .source_reason
+                .lock()
+                .map(|reason| *reason)
+                .unwrap_or(RecordingEndReason::CallEnded);
+            let reason = outcome.end.into_reason(source_reason);
+            // Emitted only now — after the header has been finalized and the file flushed — so a
+            // consumer that acts on this event never opens a half-written file. That is the whole
+            // reason the event exists.
+            if let Some(events) = events {
+                let _ = events.try_send(Event::RecordingFinished {
+                    conference_id: None,
+                    call_id: writer.call_id,
+                    from_tag: writer.from_tag,
+                    to_tag: writer.to_tag,
+                    recording_id: writer.recording_id,
+                    path: Some(writer.path.to_string_lossy().into_owned()),
+                    duration_ms: outcome.duration_ms,
+                    reason,
+                });
+            }
+        })
     }
 
     /// Detach every sink a recording attached, without touching anything else on the same legs.
@@ -600,6 +791,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 let _ = recording.writer.await;
             }
             None => {
+                // A bridged call's recording: the taps come off the bridge, which ends each
+                // decoder's feed. No hold was taken, so none is released below.
+                let bridged = !recording.bridge_taps.is_empty();
+                self.remove_bridge_taps(&recording.recording_id, recording.bridge_taps)
+                    .await;
                 self.detach_recording_sinks(
                     &recording.call_id,
                     &recording.recording_id,
@@ -607,8 +803,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &recording.egress_legs,
                 );
                 let _ = recording.writer.await;
-                self.release_userspace_hold(&recording.call_id, PromotionReason::AudioRecording)
+                if !bridged {
+                    self.release_userspace_hold(
+                        &recording.call_id,
+                        PromotionReason::AudioRecording,
+                    )
                     .await;
+                }
             }
         }
         tracing::info!(
@@ -638,6 +839,38 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.stop_wav_recording(&recording_id, reason).await;
         }
     }
+}
+
+/// Why a recording ended when nothing said otherwise. `CallEnded` is the truthful default: the
+/// sources went away and nobody asked them to.
+fn new_source_reason() -> Arc<std::sync::Mutex<RecordingEndReason>> {
+    Arc::new(std::sync::Mutex::new(RecordingEndReason::CallEnded))
+}
+
+/// Resolve and open a call recording's output file: `path` exactly, or a generated name under
+/// `recording_dir`.
+///
+/// Opened up front, exactly as the pcap path does: a bad path must fail the verb with the call
+/// untouched — nothing promoted, no sink attached — rather than being reported minutes later as a
+/// `RecordingFinished{Error}` for a recording the controller believes is running.
+async fn open_recording_output(
+    call_id: &str,
+    recording_id: &str,
+    path: Option<String>,
+    recording_dir: Option<String>,
+) -> Result<(std::path::PathBuf, tokio::fs::File), String> {
+    let path = match path {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let directory = recording_dir
+                .ok_or_else(|| "no output location (set `path`, or `recording_dir`)".to_string())?;
+            std::path::PathBuf::from(directory).join(format!("{call_id}-{recording_id}.wav"))
+        }
+    };
+    let file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    Ok((path, file))
 }
 
 /// The decoded-PCM sample rate of `codec` — what the media pipeline's fan-out actually hands a sink.

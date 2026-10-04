@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 
 use crate::dtls_session::{spawn_session, DriverPlan, SessionOutcome};
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
+use crate::plain_tap::{PlainTapSender, PlainTaps};
 use crate::x3::X3Tap;
 
 /// How many inbound DTLS records a leg's driver will queue. Bounded so a stalled association cannot
@@ -237,9 +238,9 @@ struct Flow {
     /// Where RTCP decrypted on this flow goes when the plain peer has a separate RTCP port: that
     /// endpoint and the peer's RTCP address. `None` sends RTCP wherever RTP goes.
     rtcp_out: Option<(EndpointId, SocketAddr)>,
-    /// A WebSocket tee's tap on this endpoint's plaintext RTP ([`DtlsBridge::set_plain_tap`]). The
-    /// bridge never decodes, so a tee on a bridged call decodes this copy in its own task.
-    plain_tap: Option<flume::Sender<bytes::Bytes>>,
+    /// The taps on this endpoint's plaintext RTP ([`DtlsBridge::add_plain_tap`]). The bridge never
+    /// decodes, so a tee or a decoded recording on a bridged call decodes its copy in its own task.
+    plain_taps: PlainTaps,
     /// Which refusals of this flow's ingress have already been logged at `warn`.
     refusals: Arc<RefusalLog>,
 }
@@ -440,7 +441,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             secure,
             // X3 content is the call's media, tapped on the RTP endpoints; RTCP is not content.
             x3: None,
-            plain_tap: None,
+            plain_taps: PlainTaps::default(),
             rtcp_only: true,
             refusals: Arc::new(RefusalLog::default()),
             rtcp_out: None,
@@ -609,6 +610,16 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         {
             self.flows.remove(&previous);
         }
+        // A new association on a live call replaces its flows; a tee or a recording was attached to
+        // the call, not to one association, so its taps move to the rebuilt flows.
+        let carried_taps = |endpoint: EndpointId| {
+            self.flows
+                .get(&endpoint)
+                .map(|previous| previous.plain_taps.clone())
+                .unwrap_or_default()
+        };
+        let plain_side_taps = carried_taps(plan.plain_endpoint);
+        let secure_side_taps = carried_taps(plan.secure_endpoint);
         self.flows.insert(
             plan.plain_endpoint,
             Flow {
@@ -620,7 +631,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure_dst: Some(destination.clone()),
                 secure: secure.clone(),
                 x3: None,
-                plain_tap: None,
+                plain_taps: plain_side_taps,
                 rtcp_only: false,
                 refusals: Arc::new(RefusalLog::default()),
                 rtcp_out: None,
@@ -649,7 +660,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure_dst: None,
                 secure,
                 x3: None,
-                plain_tap: None,
+                plain_taps: secure_side_taps,
                 rtcp_only: false,
                 refusals: Arc::new(RefusalLog::default()),
                 // Decrypted RTCP goes to the plain peer's own RTCP port when it has one.
@@ -726,7 +737,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure_dst: Some(destination.clone()),
                 secure: Arc::new(Mutex::new(None)),
                 x3: None,
-                plain_tap: None,
+                plain_taps: PlainTaps::default(),
                 // The per-call actor relays RTCP itself (`plan.plain_rtcp` is not used here).
                 rtcp_only: false,
                 refusals: Arc::new(RefusalLog::default()),
@@ -860,22 +871,25 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         true
     }
 
-    /// Install or remove a WebSocket tee's plaintext tap on one relaying flow (see
-    /// `SrtpBridge::set_plain_tap`). A pipeline flow hands its media to an actor that decodes it
-    /// anyway, so it takes none. Returns whether the flow took it.
-    pub fn set_plain_tap(
-        &self,
-        endpoint: EndpointId,
-        tap: Option<flume::Sender<bytes::Bytes>>,
-    ) -> bool {
+    /// Add a plaintext tap labelled `tag` on one relaying flow (see `SrtpBridge::add_plain_tap`).
+    /// A pipeline flow hands its media to an actor that decodes it anyway, so it takes none.
+    /// Returns whether the flow took it.
+    pub fn add_plain_tap(&self, endpoint: EndpointId, tag: &str, tap: PlainTapSender) -> bool {
         let Some(mut flow) = self.flows.get_mut(&endpoint) else {
             return false;
         };
         if matches!(flow.direction, Direction::Pipeline { .. }) {
             return false;
         }
-        flow.plain_tap = tap;
+        flow.plain_taps.add(tag, tap);
         true
+    }
+
+    /// Remove the plaintext tap labelled `tag` from one flow. Idempotent.
+    pub fn remove_plain_tap(&self, endpoint: EndpointId, tag: &str) {
+        if let Some(mut flow) = self.flows.get_mut(&endpoint) {
+            flow.plain_taps.remove(tag);
+        }
     }
 
     /// Remove the lawful-interception tap from one bridged endpoint. Idempotent.
@@ -895,7 +909,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             out_dst,
             secure,
             x3,
-            plain_tap,
+            plain_taps,
             rtcp_only,
             rtcp_out,
             refusals,
@@ -910,7 +924,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                     .or_else(|| flow.secure_dst.as_ref().and_then(|dst| *dst.borrow())),
                 flow.secure.clone(),
                 flow.x3.clone(),
-                flow.plain_tap.clone(),
+                flow.plain_taps.clone(),
                 flow.rtcp_only,
                 flow.rtcp_out,
                 flow.refusals.clone(),
@@ -1036,11 +1050,9 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         if let Some(x3) = &x3 {
             x3.deliver(packet.source, packet.arrival, plaintext);
         }
-        // A WebSocket tee's copy of the same plaintext (the SDES bridge taps identically).
-        if let Some(tap) = &plain_tap {
-            if kind != PacketKind::Rtcp {
-                let _ = tap.try_send(bytes::Bytes::copy_from_slice(plaintext));
-            }
+        // A tee's or a recording's copy of the same plaintext (the SDES bridge taps identically).
+        if !plain_taps.is_empty() && kind != PacketKind::Rtcp {
+            plain_taps.offer(plaintext);
         }
         // Telemetry: the plaintext RTCP either party sent, which the datapath's relay tap never sees
         // on a bridged leg.
@@ -1398,6 +1410,15 @@ mod tests {
             plain_rtcp: None,
         });
 
+        // A tee and a recording tap the DTLS peer's leg at once, and a recording taps the plain one:
+        // each is keyed by its own tag, so neither attach displaces the other.
+        let (tee, tee_received) = flume::bounded(32);
+        let (recording, recording_received) = flume::bounded(32);
+        let (plain_tap, plain_received) = flume::bounded(32);
+        assert!(bridge.add_plain_tap(secure.id, "tee-1", tee));
+        assert!(bridge.add_plain_tap(secure.id, "rec-1", recording));
+        assert!(bridge.add_plain_tap(plain.id, "rec-1", plain_tap));
+
         // Dispatch the datapath's redirect stream into the bridge.
         let rx = datapath.rx();
         let dispatch = bridge.clone();
@@ -1441,6 +1462,17 @@ mod tests {
             media,
             "B's SRTP is decrypted and relayed to A as plaintext"
         );
+        for received in [&tee_received, &recording_received] {
+            let copy = timeout(RECV_TIMEOUT, received.recv_async())
+                .await
+                .expect("a tap copy arrives")
+                .expect("tap open");
+            assert_eq!(
+                copy.as_ref(),
+                media.as_slice(),
+                "each tap hears B decrypted"
+            );
+        }
 
         // A → engine: plaintext RTP, encrypted and relayed to B as SRTP.
         let media_ab = rtp(2000, 0x0A0A_0A0A);
@@ -1460,6 +1492,32 @@ mod tests {
         assert_eq!(
             recovered, media_ab,
             "A's plaintext is encrypted and relayed to B as SRTP"
+        );
+        let copy = timeout(RECV_TIMEOUT, plain_received.recv_async())
+            .await
+            .expect("the plain leg's tap copy arrives")
+            .expect("tap open");
+        assert_eq!(copy.as_ref(), media_ab.as_slice());
+
+        // Removing one tag leaves the other tap on the same leg attached.
+        bridge.remove_plain_tap(secure.id, "tee-1");
+        while tee_received.try_recv().is_ok() {}
+        while recording_received.try_recv().is_ok() {}
+        let later = rtp(1001, 0x0B0B_0B0B);
+        sealed.clear();
+        peer_leg.protect(&later, &mut sealed).expect("peer protect");
+        peer_b
+            .send_to(&sealed, secure.local_addr)
+            .await
+            .expect("b send");
+        let copy = timeout(RECV_TIMEOUT, recording_received.recv_async())
+            .await
+            .expect("the recording still hears B")
+            .expect("tap open");
+        assert_eq!(copy.as_ref(), later.as_slice());
+        assert!(
+            tee_received.try_recv().is_err(),
+            "the removed tap was offered nothing more"
         );
     }
 

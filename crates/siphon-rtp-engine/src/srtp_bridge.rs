@@ -26,6 +26,7 @@ use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use crate::dtls_bridge::DtlsBridge;
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
+use crate::plain_tap::{PlainTapSender, PlainTaps};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
 
@@ -128,9 +129,9 @@ struct Flow {
     /// per negotiation rather than 50 times a second. Every refused datagram is still counted in the
     /// endpoint's `packets_dropped`.
     refusals: Arc<RefusalLog>,
-    /// A WebSocket tee's tap on this endpoint's plaintext RTP ([`SrtpBridge::set_plain_tap`]). The
-    /// bridge never decodes, so a tee on a bridged call decodes this copy in its own task.
-    plain_tap: Option<flume::Sender<bytes::Bytes>>,
+    /// The taps on this endpoint's plaintext RTP ([`SrtpBridge::add_plain_tap`]). The bridge never
+    /// decodes, so a tee or a decoded recording on a bridged call decodes its copy in its own task.
+    plain_taps: PlainTaps,
 }
 
 /// The bridge registry: redirected endpoint → its `Flow`. Shared (`Arc`) between the control path
@@ -216,6 +217,14 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             resolved.push((flow.endpoint, ingress_leg, egress_leg, flow));
         }
         for (endpoint, ingress_leg, egress_leg, flow) in resolved {
+            // A renegotiation re-registers a live call's flows. Whatever is listening to the call
+            // was attached to the call, not to one negotiation of it, so its taps move to the
+            // rebuilt flow: a hold re-INVITE must not silently end a recording.
+            let plain_taps = self
+                .flows
+                .get(&endpoint)
+                .map(|previous| previous.plain_taps.clone())
+                .unwrap_or_default();
             self.flows.insert(
                 endpoint,
                 Flow {
@@ -232,7 +241,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     egress_leg,
                     x3: None,
                     refusals: Arc::new(RefusalLog::default()),
-                    plain_tap: None,
+                    plain_taps,
                 },
             );
         }
@@ -357,19 +366,27 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         self.dtls.clear_x3_tap(endpoint);
     }
 
-    /// Install (`Some`) or remove (`None`) a WebSocket tee's tap on one bridged endpoint: every
-    /// plaintext RTP datagram the endpoint's peer sends, after its crypto, is offered to it. Whichever
-    /// bridge — SDES or DTLS — owns the endpoint takes it. Returns whether one did.
-    pub fn set_plain_tap(
-        &self,
-        endpoint: EndpointId,
-        tap: Option<flume::Sender<bytes::Bytes>>,
-    ) -> bool {
+    /// Add a tap labelled `tag` on one bridged endpoint: every plaintext RTP datagram the endpoint's
+    /// peer sends, after its crypto, is offered to it. Whichever bridge — SDES or DTLS — owns the
+    /// endpoint takes it. Returns whether one did.
+    ///
+    /// Taps are keyed by tag so that a tee and a recording on the same leg coexist, and each is
+    /// removed by its own tag without touching the other.
+    pub fn add_plain_tap(&self, endpoint: EndpointId, tag: &str, tap: PlainTapSender) -> bool {
         if let Some(mut flow) = self.flows.get_mut(&endpoint) {
-            flow.plain_tap = tap;
+            flow.plain_taps.add(tag, tap);
             return true;
         }
-        self.dtls.set_plain_tap(endpoint, tap)
+        self.dtls.add_plain_tap(endpoint, tag, tap)
+    }
+
+    /// Remove the tap labelled `tag` from one bridged endpoint. Idempotent.
+    pub fn remove_plain_tap(&self, endpoint: EndpointId, tag: &str) {
+        if let Some(mut flow) = self.flows.get_mut(&endpoint) {
+            flow.plain_taps.remove(tag);
+            return;
+        }
+        self.dtls.remove_plain_tap(endpoint, tag);
     }
 
     /// Log a secure peer's datagram that failed to decrypt. A replay is routine and stays at `debug`;
@@ -423,7 +440,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             egress_leg,
             x3,
             refusals,
-            plain_tap,
+            plain_taps,
         )) = self.flows.get(&packet.endpoint).map(|flow| {
             (
                 flow.accepted_source,
@@ -434,7 +451,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 flow.egress_leg.clone(),
                 flow.x3.clone(),
                 flow.refusals.clone(),
-                flow.plain_tap.clone(),
+                flow.plain_taps.clone(),
             )
         })
         else {
@@ -563,12 +580,10 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         if let Some(x3) = &x3 {
             x3.deliver(packet.source, packet.arrival, plaintext);
         }
-        // A WebSocket tee's copy, from the same place and for the same reason: the only plaintext.
-        // Dropped rather than queued when the tee falls behind — late audio is worthless.
-        if let Some(tap) = &plain_tap {
-            if !siphon_rtp_srtp::leg::is_rtcp(plaintext) {
-                let _ = tap.try_send(bytes::Bytes::copy_from_slice(plaintext));
-            }
+        // A tee's or a recording's copy, from the same place and for the same reason: the only
+        // plaintext. Dropped rather than queued when a consumer falls behind.
+        if !plain_taps.is_empty() && !siphon_rtp_srtp::leg::is_rtcp(plaintext) {
+            plain_taps.offer(plaintext);
         }
 
         // Prefer where the peer's own flow saw its media come from over the address it signalled —
@@ -1569,5 +1584,118 @@ mod tests {
                 siphon_rtp_li::PayloadDirection::FromTarget
             ),
         ));
+    }
+
+    /// Seal `plaintext` as the secure peer does and send it to the bridge's secure endpoint.
+    async fn send_from_secure_peer(
+        harness: &Harness,
+        phone_b: &UdpSocket,
+        peer: &mut SrtpContext,
+        plaintext: &[u8],
+    ) {
+        let mut sealed = Vec::new();
+        peer.protect(plaintext, &mut sealed).expect("peer encrypt");
+        phone_b
+            .send_to(&sealed, harness.secure_addr)
+            .await
+            .expect("send secure");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_plain_taps_on_one_endpoint_each_receive_the_decrypted_media() {
+        // A tee and a recording on the same bridged leg. One tap slot would have the second
+        // attach silence the first; each is keyed by its own tag and removed by it.
+        let (harness, (phone_a, _), (phone_b, _)) = live_bridge().await;
+        let (tee, tee_received) = flume::bounded(8);
+        let (recording, recording_received) = flume::bounded(8);
+        assert!(harness
+            .bridge
+            .add_plain_tap(harness.secure_endpoint, "tee-1", tee));
+        assert!(harness
+            .bridge
+            .add_plain_tap(harness.secure_endpoint, "rec-1", recording));
+
+        let mut peer = SrtpContext::from_key_material(&harness.remote);
+        let first = rtp(1, 0x2222_2222);
+        send_from_secure_peer(&harness, &phone_b, &mut peer, &first).await;
+        assert_eq!(recv(&phone_a).await, first, "the relay is untouched");
+        for received in [&tee_received, &recording_received] {
+            let copy = timeout(SHORT, received.recv_async())
+                .await
+                .expect("a tap copy arrives")
+                .expect("tap open");
+            assert_eq!(copy.as_ref(), first.as_slice(), "decrypted, not ciphertext");
+        }
+
+        harness
+            .bridge
+            .remove_plain_tap(harness.secure_endpoint, "tee-1");
+        let second = rtp(2, 0x2222_2222);
+        send_from_secure_peer(&harness, &phone_b, &mut peer, &second).await;
+        let copy = timeout(SHORT, recording_received.recv_async())
+            .await
+            .expect("the recording still hears the leg")
+            .expect("tap open");
+        assert_eq!(copy.as_ref(), second.as_slice());
+        assert!(
+            matches!(timeout(SHORT, tee_received.recv_async()).await, Ok(Err(_))),
+            "the removed tap is closed and was offered nothing more"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plain_tap_survives_the_calls_flows_being_re_registered() {
+        // A renegotiation (a hold re-INVITE) re-registers a live call's flows. Whatever taps the
+        // call must keep hearing it afterwards.
+        let (harness, (_phone_a, addr_a), (phone_b, addr_b)) = live_bridge().await;
+        let (recording, received) = flume::bounded(8);
+        assert!(harness
+            .bridge
+            .add_plain_tap(harness.secure_endpoint, "rec-1", recording));
+
+        harness.bridge.register(BridgeCallPlan {
+            near_leg: None,
+            far_leg: Some(SecureLeg::new(&harness.local, &harness.remote)),
+            flows: vec![
+                BridgeFlowPlan {
+                    endpoint: harness.plain_endpoint,
+                    ingress_leg: None,
+                    egress_leg: Some(BridgeLeg::Far),
+                    accepted_source: SourceFilter::Exact(addr_a.ip()),
+                    latch: true,
+                    out_endpoint: harness.secure_endpoint,
+                    out_dst: addr_b,
+                },
+                BridgeFlowPlan {
+                    endpoint: harness.secure_endpoint,
+                    ingress_leg: Some(BridgeLeg::Far),
+                    egress_leg: None,
+                    accepted_source: SourceFilter::Exact(addr_b.ip()),
+                    latch: true,
+                    out_endpoint: harness.plain_endpoint,
+                    out_dst: addr_a,
+                },
+            ],
+        });
+
+        let mut peer = SrtpContext::from_key_material(&harness.remote);
+        let plaintext = rtp(7, 0x2222_2222);
+        send_from_secure_peer(&harness, &phone_b, &mut peer, &plaintext).await;
+        let copy = timeout(SHORT, received.recv_async())
+            .await
+            .expect("the tap outlives the re-registration")
+            .expect("tap open");
+        assert_eq!(copy.as_ref(), plaintext.as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plain_tap_on_an_endpoint_this_bridge_does_not_own_reports_failure() {
+        // The engine unwinds on this rather than reporting a recording that taps nothing.
+        let (harness, _phone_a, _phone_b) = live_bridge().await;
+        let (tap, _received) = flume::bounded(1);
+        assert!(!harness
+            .bridge
+            .add_plain_tap(EndpointId(9_999), "rec-1", tap));
+        harness.bridge.remove_plain_tap(EndpointId(9_999), "rec-1"); // idempotent
     }
 }

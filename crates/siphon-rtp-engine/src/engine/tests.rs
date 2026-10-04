@@ -14333,8 +14333,8 @@ async fn a_reversed_answer_never_hands_the_callee_a_terminated_sdes_offerers_key
 
 #[tokio::test]
 async fn a_bridge_facing_a_secure_offerer_refuses_every_verb_that_needs_decoded_audio() {
-    // A crypto bridge relays SRTP without decoding it, whichever party it faces, so a pcap or WAV
-    // recording, a WebSocket tee, a SIPREC fork and a DTMF block have nothing to attach to. On the
+    // A crypto bridge relays SRTP without decoding it, whichever party it faces, so a pcap
+    // recording, a SIPREC fork and a DTMF block have nothing to attach to. On the
     // bridge facing an SDES offerer each of these answered `ok` for something that never carried a
     // packet; on it and on the DTLS offerer's bridge every one is refused, as on a bridge facing the
     // callee.
@@ -14368,34 +14368,25 @@ async fn a_bridge_facing_a_secure_offerer_refuses_every_verb_that_needs_decoded_
         .await;
 
         let dir = tempfile::tempdir().expect("recording dir");
-        let recording =
-            |format: Option<siphon_rtp_proto::RecordingFormat>| Command::StartRecording {
-                call_id: call_id.clone(),
-                from_tag: "a".into(),
-                recording_dir: Some(dir.path().to_string_lossy().into_owned()),
-                format,
-                direction: None,
-                channels: None,
-                max_duration_ms: None,
-                silence_ms: None,
-                path: None,
-            };
+        let pcap_recording = Command::StartRecording {
+            call_id: call_id.clone(),
+            from_tag: "a".into(),
+            recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+            format: None,
+            direction: None,
+            channels: None,
+            max_duration_ms: None,
+            silence_ms: None,
+            path: None,
+        };
         let verbs = [
             (
                 "start_recording pcap",
-                engine.handle(CLIENT, recording(None)).await,
+                engine.handle(CLIENT, pcap_recording).await,
             ),
-            (
-                "start_recording wav",
-                engine
-                    .handle(
-                        CLIENT,
-                        recording(Some(siphon_rtp_proto::RecordingFormat::Wav)),
-                    )
-                    .await,
-            ),
-            // `attach_ws_tee` is not here any more: a tee decodes the bridge's plaintext itself
-            // (`a_ws_tee_attached_mid_call_hears_a_bridged_secure_leg`).
+            // `attach_ws_tee` and a `wav` `start_recording` are not here any more: each decodes the
+            // bridge's plaintext itself (`a_ws_tee_attached_mid_call_hears_a_bridged_secure_leg`,
+            // `a_stereo_recording_of_a_transcrypt_bridge_holds_each_party_on_its_own_channel`).
             (
                 "subscribe_request",
                 engine
@@ -27367,6 +27358,496 @@ async fn a_ws_tee_attached_mid_call_hears_both_parties_of_a_transcrypt() {
         next_tee_audio(&frames).await.len(),
         640,
         "a stereo 20 ms frame: both parties, decoded"
+    );
+}
+
+/// Start a decoded recording on a live call and return its id.
+async fn start_decoded_recording(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+    directory: &std::path::Path,
+    direction: siphon_rtp_proto::RecordingDirection,
+    channels: siphon_rtp_proto::RecordingChannels,
+) -> String {
+    let started = engine
+        .handle(
+            CLIENT,
+            Command::StartRecording {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                recording_dir: Some(directory.to_string_lossy().into_owned()),
+                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                direction: Some(direction),
+                channels: Some(channels),
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
+            },
+        )
+        .await;
+    match started {
+        CmdResult::Ok {
+            recording_id: Some(id),
+            ..
+        } => id,
+        other => panic!("a wav recording accepts with a recording_id, got {other:?}"),
+    }
+}
+
+/// Stop a decoded recording and read back the finished file's samples, rate and channel count.
+async fn stop_and_read_recording(
+    engine: &Engine<UdpLoopbackDatapath>,
+    events: &flume::Receiver<Event>,
+    call_id: &str,
+    recording_id: &str,
+) -> (Vec<i16>, u32, u16) {
+    let stopped = engine
+        .handle(
+            CLIENT,
+            Command::StopRecording {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                recording_id: Some(recording_id.into()),
+            },
+        )
+        .await;
+    assert!(matches!(stopped, CmdResult::Ok { .. }), "{stopped:?}");
+    let (finished_id, path, _, reason) = next_recording_finished(events)
+        .await
+        .expect("a recording_finished event arrives");
+    assert_eq!(finished_id, recording_id);
+    assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::Stopped);
+    let bytes = std::fs::read(path.expect("the event names the file")).expect("the file exists");
+    let parsed =
+        siphon_rtp_media::player::WavSource::parse(&bytes).expect("the finished file is a WAV");
+    (
+        parsed.samples().to_vec(),
+        parsed.sample_rate_hz(),
+        parsed.channels(),
+    )
+}
+
+/// Two SDES-SRTP phones on a shared codec: the transcrypt bridge, whose only plaintext exists
+/// between its two transforms. Returns the engine's address facing each phone.
+async fn transcrypt_bridge_call(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+    (addr_a, caller_key): (SocketAddr, &CryptoAttribute),
+    (addr_b, callee_key): (SocketAddr, &CryptoAttribute),
+) -> (SocketAddr, SocketAddr) {
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                sdp: sdes_offerer_sdp(addr_a, caller_key),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let far_addr = sdp::parse(&ok_sdp_text(&offered))
+        .expect("offer")
+        .remote_rtp;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, callee_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let near_addr = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer")
+        .remote_rtp;
+    assert_eq!(
+        engine.calls.get(call_id).expect("call").pipeline,
+        PipelineKind::SrtpTranscrypt
+    );
+    (near_addr, far_addr)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stereo_recording_of_a_transcrypt_bridge_holds_each_party_on_its_own_channel() {
+    // Two SRTP phones on a shared codec are a crypto bridge, which never decodes. A decoded
+    // recording used to be refused there, so the ordinary secure phone-to-phone call could not be
+    // recorded past the point it was bridged. It now decodes the plaintext the bridge holds
+    // between its transforms; the bridge keeps relaying and no media actor is built.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    let (near_addr, far_addr) = transcrypt_bridge_call(
+        &engine,
+        "bridge-rec",
+        (addr_a, &caller_key),
+        (addr_b, &callee_key),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let recording_id = start_decoded_recording(
+        &engine,
+        "bridge-rec",
+        dir.path(),
+        siphon_rtp_proto::RecordingDirection::Ingress,
+        siphon_rtp_proto::RecordingChannels::Stereo,
+    )
+    .await;
+    assert!(
+        !engine.media().is_media_call("bridge-rec"),
+        "still a bridge: recording it builds no media actor"
+    );
+
+    let mut seal_a = SrtpContext::from_key_material(&caller_key.key);
+    let mut seal_b = SrtpContext::from_key_material(&callee_key.key);
+    for sequence in 0..10u16 {
+        let mut sealed = Vec::new();
+        seal_a
+            .protect(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), &mut sealed)
+            .expect("A encrypts");
+        phone_a.send_to(&sealed, near_addr).await.expect("a send");
+        let mut sealed = Vec::new();
+        seal_b
+            .protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x30), &mut sealed)
+            .expect("B encrypts");
+        phone_b.send_to(&sealed, far_addr).await.expect("b send");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The relay is untouched: each phone still receives the other's media.
+    let mut buffer = [0u8; 2048];
+    for (name, phone) in [("caller", &phone_a), ("callee", &phone_b)] {
+        let (len, _) = timeout(Duration::from_secs(2), phone.recv_from(&mut buffer))
+            .await
+            .unwrap_or_else(|_| panic!("the {name} still hears the other party"))
+            .expect("recv");
+        assert!(len > 12);
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let (samples, rate, channels) =
+        stop_and_read_recording(&engine, &events, "bridge-rec", &recording_id).await;
+    assert_eq!(rate, 8000, "µ-law decodes to 8 kHz PCM");
+    assert_eq!(channels, 2, "caller left, callee right");
+    assert!(!samples.is_empty(), "the recording holds audio");
+    let (left, right) = (samples[0], samples[1]);
+    assert_ne!(left, 0, "the caller was decrypted and decoded");
+    assert_ne!(right, 0, "the callee was decrypted and decoded");
+    assert_ne!(left, right, "each party is on its own channel");
+    assert!(
+        samples
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|frame| frame[0] == left && frame[1] == right),
+        "every frame carries the caller's level left and the callee's right"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mono_recording_of_a_transcrypt_bridge_mixes_the_parties_in_time() {
+    // The default shape. Both parties land in one channel as a sum, sample for sample: ten 20 ms
+    // frames from each is 200 ms of audio, not 400 ms of the two laid end to end.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    let (near_addr, far_addr) = transcrypt_bridge_call(
+        &engine,
+        "bridge-rec-mono",
+        (addr_a, &caller_key),
+        (addr_b, &callee_key),
+    )
+    .await;
+
+    // First learn each party's decoded level from a stereo take, then record the mix.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut seal_a = SrtpContext::from_key_material(&caller_key.key);
+    let mut seal_b = SrtpContext::from_key_material(&callee_key.key);
+    let mut takes = Vec::new();
+    for (take, channels) in [
+        siphon_rtp_proto::RecordingChannels::Stereo,
+        siphon_rtp_proto::RecordingChannels::Mono,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let recording_id = start_decoded_recording(
+            &engine,
+            "bridge-rec-mono",
+            dir.path(),
+            siphon_rtp_proto::RecordingDirection::Ingress,
+            channels,
+        )
+        .await;
+        for frame in 0..10u16 {
+            let sequence = take as u16 * 10 + frame;
+            let mut sealed = Vec::new();
+            seal_a
+                .protect(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), &mut sealed)
+                .expect("A encrypts");
+            phone_a.send_to(&sealed, near_addr).await.expect("a send");
+            let mut sealed = Vec::new();
+            seal_b
+                .protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x30), &mut sealed)
+                .expect("B encrypts");
+            phone_b.send_to(&sealed, far_addr).await.expect("b send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        takes.push(
+            stop_and_read_recording(&engine, &events, "bridge-rec-mono", &recording_id).await,
+        );
+    }
+    let (stereo, _, _) = &takes[0];
+    let (mono, _, mono_channels) = &takes[1];
+    let (caller, callee) = (stereo[0], stereo[1]);
+    assert_eq!(*mono_channels, 1);
+    assert!(!mono.is_empty(), "the mix holds audio");
+    assert!(
+        mono.len() <= 10 * 160,
+        "ten frames from each party is ten frames of mix, got {} samples",
+        mono.len()
+    );
+    assert!(
+        mono.iter()
+            .all(|&sample| sample == caller.saturating_add(callee)),
+        "every sample is the two parties summed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tee_and_a_recording_share_a_bridged_leg_and_detach_independently() {
+    // A recorded call that is also being transcribed. The bridge held one tap per endpoint, so the
+    // second consumer would have silenced the first, and detaching either would have cut both.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "bridge-shared".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let far_addr = sdp::parse(&ok_sdp_text(&offer)).expect("offer").remote_rtp;
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "bridge-shared".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_eq!(
+        engine.calls.get("bridge-shared").expect("call").pipeline,
+        PipelineKind::Srtp
+    );
+
+    // `egress` is what the caller was sent, which on a bridge is exactly the callee's stream.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let recording_id = start_decoded_recording(
+        &engine,
+        "bridge-shared",
+        dir.path(),
+        siphon_rtp_proto::RecordingDirection::Egress,
+        siphon_rtp_proto::RecordingChannels::Stereo,
+    )
+    .await;
+    let (uri, frames) = tee_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsTee {
+                call_id: "bridge-shared".into(),
+                from_tag: "tag-a".into(),
+                ws_uri: uri,
+                direction: WsTeeDirection::Callee,
+                channels: None,
+                sample_rate: None,
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    expect_tee_start(&frames).await;
+
+    let mut seal = SrtpContext::from_key_material(&callee_key.key);
+    let mut send = |sequence: u16| {
+        let mut sealed = Vec::new();
+        seal.protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x20), &mut sealed)
+            .expect("B encrypts");
+        sealed
+    };
+    for sequence in 0..6u16 {
+        let sealed = send(sequence);
+        phone_b.send_to(&sealed, far_addr).await.expect("b send");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let audio = next_tee_audio(&frames).await;
+    assert!(
+        audio.iter().any(|&byte| byte != 0),
+        "the tee hears the callee while the recording is attached to the same leg"
+    );
+
+    let detached = engine
+        .handle(
+            CLIENT,
+            Command::DetachWsTee {
+                call_id: "bridge-shared".into(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }));
+    for sequence in 6..12u16 {
+        let sealed = send(sequence);
+        phone_b.send_to(&sealed, far_addr).await.expect("b send");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let (samples, _, channels) =
+        stop_and_read_recording(&engine, &events, "bridge-shared", &recording_id).await;
+    assert_eq!(channels, 1, "one recorded party is mono whatever was asked");
+    assert!(
+        samples.len() > 6 * 160,
+        "the recording kept running after the tee on the same leg was detached, got {} samples",
+        samples.len()
+    );
+    assert!(samples.iter().all(|&sample| sample != 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bridged_recording_is_finalized_when_the_call_ends_under_it() {
+    // A hangup is how most recordings end. The bridge's flows go with the call, which closes each
+    // decoder's feed; the file must still be finalized and reported, not abandoned.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let caller_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    let (_near_addr, far_addr) = transcrypt_bridge_call(
+        &engine,
+        "bridge-rec-hangup",
+        (addr_a, &caller_key),
+        (addr_b, &callee_key),
+    )
+    .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    // `egress` records the callee alone, so the take does not wait on a party that never speaks.
+    let recording_id = start_decoded_recording(
+        &engine,
+        "bridge-rec-hangup",
+        dir.path(),
+        siphon_rtp_proto::RecordingDirection::Egress,
+        siphon_rtp_proto::RecordingChannels::Mono,
+    )
+    .await;
+    let mut seal_b = SrtpContext::from_key_material(&callee_key.key);
+    for sequence in 0..10u16 {
+        let mut sealed = Vec::new();
+        seal_b
+            .protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x30), &mut sealed)
+            .expect("B encrypts");
+        phone_b.send_to(&sealed, far_addr).await.expect("b send");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let deleted = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "bridge-rec-hangup".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert!(matches!(deleted, CmdResult::Ok { .. }), "{deleted:?}");
+    let (finished_id, path, _, reason) = next_recording_finished(&events)
+        .await
+        .expect("a recording_finished event arrives");
+    assert_eq!(finished_id, recording_id);
+    assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::CallEnded);
+    let bytes = std::fs::read(path.expect("the event names the file")).expect("the file exists");
+    let parsed =
+        siphon_rtp_media::player::WavSource::parse(&bytes).expect("the finished file is a WAV");
+    assert!(
+        parsed.samples().iter().any(|&sample| sample != 0),
+        "the file holds what the callee said before the hangup"
     );
 }
 

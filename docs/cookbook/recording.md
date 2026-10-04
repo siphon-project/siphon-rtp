@@ -270,10 +270,29 @@ To end it yourself, name the recording so anything else on the call keeps runnin
 | rate | The caller leg's decoded PCM rate — **not** its RTP clock, which for G.722 is half of it (RFC 3551 §4.5.2) and would replay the file at the wrong pitch. A second leg at another rate is resampled into it. |
 | where | `path` names the file exactly; otherwise `recording_dir` plus a generated `{call_id}-{recording_id}.wav`. A path that cannot be opened fails the verb immediately, with the call untouched. |
 
-Unlike the pcap form, a decoded recording works on a **secure transcoded** call:
-it taps the audio after decryption and decode, so there is nothing ciphered about
-it. A secure *crypto bridge* (which relays ciphertext without ever decoding) and a
-WebSocket-takeover call still have no post-decode audio to tap, and are refused.
+Unlike the pcap form, a decoded recording works on a **secure** call. On a
+transcoded one it taps the audio after decryption and decode, so there is nothing
+ciphered about it.
+
+A secure *crypto bridge* (two legs on a shared codec, where the engine only
+re-keys and never decodes) records too. The bridge holds each party's plaintext
+between its two transforms, after the source gate and the SRTP authentication, and
+the recording decodes a copy of that in a task of its own. The bridge keeps
+relaying untouched: nothing is re-keyed, the call is not moved onto the media
+path, and a recording and a WebSocket tee can sit on the same leg and be stopped
+independently. Three things differ from a call on the media path:
+
+- A bridge originates no audio, so what reaches one party is exactly what the
+  other sent. `egress` is therefore the callee's stream, and `both` is each party
+  once.
+- Each packet is decoded as it arrives. There is no jitter buffer and no loss
+  concealment in front of the file, so a lost packet is a gap rather than a
+  concealed frame.
+- A two-party recording advances when both parties have delivered a frame. A
+  party that sends nothing for a while (silence suppression, a hold) holds the
+  other back, and audio older than 160 ms is dropped while it waits.
+
+A WebSocket-takeover call still has no relayed audio to tap, and is refused.
 
 ### Why not the `record_call` offer flag
 
