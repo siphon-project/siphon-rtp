@@ -38,6 +38,11 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   A well-formed collector that cannot be resolved or connected yet does not hold media back: the
   engine starts, reports it once at `error`, and retries until export begins. Unset or empty
   still means off.
+- **A health check the runtime image can run.** The image is distroless, so a container health
+  check had no shell, `curl` or `wget` to ask `/healthz` with. `--healthcheck <ADDR>` makes the
+  engine binary the probe: it asks `GET /healthz` on a running engine's `--metrics-addr`, exits
+  `0` on a `200` and `1` otherwise with the reason on stderr, and starts nothing. Liveness, not
+  readiness, so a draining node is not restarted under its calls. Both daemons take the flag.
 
 ## [0.11.0] — 2026-09-30
 

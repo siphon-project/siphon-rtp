@@ -203,6 +203,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         xdp_queue: cli_xdp_queue,
     } = cli;
 
+    // A health probe is a different program in the same binary: it asks a running engine whether
+    // it is alive and exits, before any configuration is read or anything is attached.
+    if let Some(address) = engine.healthcheck {
+        siphon_rtp_engine::healthcheck::probe_and_exit("siphon-rtp-xdp-daemon", address).await;
+    }
+
     // Load the optional `--config` TOML file. A missing/malformed file is fatal: fail loudly before
     // the subscriber exists (no tracing yet) rather than starting with a half-applied config.
     let file = match &engine.config {

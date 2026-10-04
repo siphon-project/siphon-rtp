@@ -81,6 +81,7 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 | `--port-min <PORT>` / `--port-max <PORT>` | OS-ephemeral | Bounded media port range (rtpengine `port-min`/`port-max` parity). Both-or-neither; a half-set or inverted range is a fatal startup error. Required for HA takeover. |
 | `--media-dscp <DSCP>` | `EF` | DiffServ marking (RFC 2474) on outbound media. A name (`EF`, `CS3`, `AF41`, `VA`, `BE`, …) or a raw `0`–`63`. `EF` is TOS byte 184 — Asterisk's `tos_audio`, rtpengine's `--tos`. `BE`/`0` disables marking and leaves the TOS byte untouched. Applies to every egress path (UDP sockets, AF_XDP TX, in-kernel XDP_TX); never to the control, metrics, HEP or WS sockets. |
 | `--metrics-addr <ADDR>` | off | Prometheus + health HTTP: `GET /metrics`, `GET /healthz`, `GET /readyz`. |
+| `--healthcheck <ADDR>` | off | Probe instead of serve: ask `GET /healthz` on a running engine's `--metrics-addr`, exit `0` on a `200` and `1` otherwise, and start nothing. See [Health probes](#health-probes). |
 | `--max-control-rps <N>` | `200` | Per-connection control request cap (requests/second). `0` disables the limit. |
 | `--prompt-cache-bytes <N>` | `67108864` (64 MiB) | Decoded prompt audio to cache, so a bed played to many callers is decoded once. Keyed by path + mtime + size, so re-recording a prompt takes effect on the next play. `0` disables caching. |
 | `--control-secret-file <PATH>` | none | File holding the control-plane shared secret, read once at start. Surrounding whitespace (including the trailing newline) is trimmed. Mutually exclusive with `SIPHON_RTP_CONTROL_SECRET`. |
@@ -280,6 +281,26 @@ Served on `--metrics-addr`:
   node before it finished draining.
 - **Readiness: `GET /readyz`** answers `200` normally and `503` while draining, so load balancers
   and Kubernetes pull the node from rotation the moment you issue `drain`.
+
+Kubernetes probes these over HTTP itself. A plain container runtime runs a command *inside* the
+container, and the runtime image is distroless: there is no shell, `curl` or `wget` to run. The
+engine binary carries the probe instead. `--healthcheck <ADDR>` asks `GET /healthz` on a running
+engine and exits `0` on a `200`, `1` on anything else (refused, no answer within 2 s, another
+status), with the reason on stderr. It reads no configuration and binds nothing.
+
+```yaml
+services:
+  siphon-rtp:
+    command: ["--control", "0.0.0.0:8080", "--metrics-addr", "127.0.0.1:9464"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/siphon-rtp", "--healthcheck", "127.0.0.1:9464"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+```
+
+It probes liveness on purpose. A health check wired to `/readyz` would mark a draining node
+unhealthy, and a runtime that restarts unhealthy containers would then cut its remaining calls.
 
 ### Media-timeout reaping
 
