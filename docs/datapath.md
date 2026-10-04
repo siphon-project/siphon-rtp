@@ -79,7 +79,11 @@ undersells it: every endpoint is a real tokio UDP socket, and it is the same cod
 the lab, and in production.
 
 - By default endpoints bind loopback (safe, NIC-free, what CI runs). With `--relay-bind-ip` they
-  bind a routable address and the engine serves real peers. With `--port-min`/`--port-max` ports
+  bind a routable address and the engine serves real peers. That address has one family. A leg
+  signalled in the other one (`c=IN IP6` on a relay bound to an IPv4 address) is refused with
+  `no IPv6 media address configured`, never bound to loopback; a dual-stack relay names an
+  address per family with `[[interface]]`. Only a relay whose own address is loopback answers
+  the other family with that family's loopback. With `--port-min`/`--port-max` ports
   come from a deterministic, firewallable pool (round-robin cursor, reserve-before-bind, specific
   ports bindable for HA restore) instead of OS-ephemeral.
 - Its `Forward` implementation is the behavioural reference for the future in-kernel path: it

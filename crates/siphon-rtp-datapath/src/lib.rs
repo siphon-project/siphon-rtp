@@ -57,6 +57,15 @@ pub enum AddressFamily {
     V6,
 }
 
+impl std::fmt::Display for AddressFamily {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            AddressFamily::V4 => "IPv4",
+            AddressFamily::V6 => "IPv6",
+        })
+    }
+}
+
 impl AddressFamily {
     /// The address family of an [`IpAddr`].
     #[must_use]
@@ -285,6 +294,18 @@ pub enum DatapathError {
     PortUnavailable {
         /// The requested port that could not be reserved.
         port: u16,
+    },
+    /// An endpoint was asked for in an address family the backend has no address in: a `c=IN IP6`
+    /// leg on a relay configured with an IPv4 address alone, or the reverse. The address in a `c=`
+    /// line is where the peer sends its media (RFC 4566 §5.7), so there is no usable substitute
+    /// and the leg is refused rather than bound somewhere the peer cannot reach.
+    #[error(
+        "no {family} media address configured: add an interface address in that family, \
+         or bridge the leg to the other one with the `address family` flag"
+    )]
+    NoAddressForFamily {
+        /// The family the leg needed.
+        family: AddressFamily,
     },
     /// Transmitting a datagram failed.
     #[error("send failed: {0}")]

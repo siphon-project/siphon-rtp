@@ -1723,8 +1723,10 @@ Elastic-IP case: bind private, advertise the public IP, same port, family-matche
 - **Enforcement:** `siphon_rtp_engine::interface::InterfaceTable` (pure policy) resolves the pair to each
   leg's bind + advertised address; `Engine::leg_binding` maps it to a datapath bind IP and an advertised
   IP; the leg allocates via `Datapath::alloc_endpoint_on(bind_ip)`. A leg whose interface serves no
-  address of the call's family falls back to the datapath's family default (never a cross-family bind —
-  a v4 address in a `c=IN IP6` line is invalid SDP).
+  address of the call's family falls back to the datapath's own address when that is of the family,
+  and is otherwise refused (`no IPv6 media address configured`). There is never a cross-family bind
+  (a v4 address in a `c=IN IP6` line is invalid SDP) and never a loopback one on a routable relay
+  (a peer told to send to `::1` sends to itself).
 - **Datapath reach:** the UDP backend binds any source IP directly. The XDP fast path carries a per-flow
   source IP end-to-end already (`FlowAction.out_local_ipv4`, no eBPF change), so per-leg source IPs work
   for addresses on its **one attached NIC**; a second source IP on a *different* NIC needs a second

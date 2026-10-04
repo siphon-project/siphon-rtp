@@ -43,6 +43,19 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   engine binary the probe: it asks `GET /healthz` on a running engine's `--metrics-addr`, exits
   `0` on a `200` and `1` otherwise with the reason on stderr, and starts nothing. Liveness, not
   readiness, so a draining node is not restarted under its calls. Both daemons take the flag.
+### Fixed
+
+- **A leg in a family the relay has no address for is refused, not bound to loopback.** A relay
+  given one routable address (`--relay-bind-ip 203.0.113.10`) answered a `c=IN IP6` leg by binding
+  `::1` and advertising it, a fallback meant for the NIC-free test posture where every peer is on
+  the same host. The SDP was valid and the call connected, and the peer sent its media to its own
+  loopback: nothing arrived in either direction and every counter read zero. The offer is now
+  refused with `no IPv6 media address configured` (or `IPv4`, the other way round), and the reason
+  names the two ways out: give the relay an address in that family with a second `[[interface]]`
+  entry under the same name, or bridge the leg with the `address family` flag. A wildcard bind
+  address is refused the same way. A relay whose configured address is itself loopback keeps the
+  old behaviour, so tests and CI are unchanged. Named interfaces bind by exact address and were
+  never affected. New `DatapathError::NoAddressForFamily`, and `AddressFamily` implements `Display`.
 
 ## [0.11.0] — 2026-09-30
 

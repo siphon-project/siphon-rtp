@@ -575,17 +575,34 @@ impl UdpLoopbackDatapath {
         self.inner.clock.fetch_add(ticks, Ordering::Relaxed);
     }
 
-    /// Resolve the local IP to bind for a requested address family. When the configured `bind_ip`
-    /// already matches the family it is used verbatim (so a production v6 bind IP, or a non-default
-    /// loopback v4, is honoured); otherwise the loopback of the requested family is used
-    /// (`127.0.0.1` for v4, `::1` for v6) — the NIC-free CI posture for a call signalled in a family
-    /// the backend was not configured for.
-    fn bind_ip_for(&self, family: AddressFamily) -> IpAddr {
+    /// Resolve the local IP to bind for a requested address family.
+    ///
+    /// The configured `bind_ip` is used when it already is of that family. When it is not, there
+    /// are two cases and they must not be confused:
+    ///
+    /// - `bind_ip` is itself loopback. This is the NIC-free test posture, where every peer is on
+    ///   this host too, so the loopback of the requested family (`127.0.0.1` / `::1`) is reachable
+    ///   by them and is used.
+    /// - `bind_ip` is anything else, a routable or wildcard address. The backend then has no
+    ///   address in the requested family, and the leg is refused with
+    ///   [`DatapathError::NoAddressForFamily`]. Loopback is not a substitute here: the bound
+    ///   address is what the rewritten SDP advertises in `c=` (RFC 4566 §5.7), and a remote peer
+    ///   told to send to `::1` sends to itself. That call connects and carries nothing, with
+    ///   every counter at zero, which is worse than a call that is refused.
+    ///
+    /// A relay that has to serve both families is given an address in each through named
+    /// interfaces, which bind by exact address and never come through here.
+    fn bind_ip_for(&self, family: AddressFamily) -> Result<IpAddr, DatapathError> {
         match (self.inner.bind_ip, family) {
-            (addr @ IpAddr::V4(_), AddressFamily::V4) => addr,
-            (addr @ IpAddr::V6(_), AddressFamily::V6) => addr,
-            (_, AddressFamily::V4) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            (_, AddressFamily::V6) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            (addr @ IpAddr::V4(_), AddressFamily::V4) => Ok(addr),
+            (addr @ IpAddr::V6(_), AddressFamily::V6) => Ok(addr),
+            (configured, AddressFamily::V4) if configured.is_loopback() => {
+                Ok(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            }
+            (configured, AddressFamily::V6) if configured.is_loopback() => {
+                Ok(IpAddr::V6(Ipv6Addr::LOCALHOST))
+            }
+            (_, family) => Err(DatapathError::NoAddressForFamily { family }),
         }
     }
 
@@ -629,7 +646,8 @@ impl UdpLoopbackDatapath {
         family: AddressFamily,
         port: u16,
     ) -> Result<Endpoint, DatapathError> {
-        self.alloc_specific_on(self.bind_ip_for(family), port).await
+        self.alloc_specific_on(self.bind_ip_for(family)?, port)
+            .await
     }
 
     /// Allocate an endpoint bound to a **specific local IP and port** — the interface-aware
@@ -1005,7 +1023,7 @@ impl Datapath for UdpLoopbackDatapath {
     }
 
     async fn alloc_endpoint_for(&self, family: AddressFamily) -> Result<Endpoint, DatapathError> {
-        self.alloc_on(self.bind_ip_for(family)).await
+        self.alloc_on(self.bind_ip_for(family)?).await
     }
 
     async fn alloc_endpoint_on_port(
@@ -2358,6 +2376,74 @@ mod tests {
             .expect("rebind the exact source IP and port");
         assert_eq!(endpoint.local_addr.ip(), bind_ip);
         assert_eq!(endpoint.local_addr.port(), free_port);
+    }
+
+    #[tokio::test]
+    async fn a_routable_bind_ip_refuses_a_family_it_has_no_address_for() {
+        // A production relay bound to one routable IPv4 address has no IPv6 address to offer. It
+        // used to bind `::1` for a `c=IN IP6` leg and advertise it, so the call answered and no
+        // packet could ever arrive. RFC 4566 §5.7: the address in `c=` is where media is sent, and
+        // a peer cannot reach this host's loopback. Refusing is the only honest answer.
+        let routable = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let datapath = UdpLoopbackDatapath::with_bind_ip(routable);
+
+        let refused = datapath.alloc_endpoint_for(AddressFamily::V6).await;
+        assert!(
+            matches!(
+                refused,
+                Err(DatapathError::NoAddressForFamily {
+                    family: AddressFamily::V6
+                })
+            ),
+            "a v6 endpoint on a v4-only relay is refused, got {refused:?}"
+        );
+        assert_eq!(
+            datapath.inner.live.load(Ordering::Acquire),
+            0,
+            "a refused allocation holds no pool slot"
+        );
+
+        // The HA-restore path selects its bind IP the same way and must refuse the same way.
+        let restored = datapath.alloc_specific(AddressFamily::V6, 40_000).await;
+        assert!(
+            matches!(
+                restored,
+                Err(DatapathError::NoAddressForFamily {
+                    family: AddressFamily::V6
+                })
+            ),
+            "a v6 restore on a v4-only relay is refused, got {restored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_routable_v6_bind_ip_refuses_ipv4_the_same_way() {
+        let routable = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10));
+        let datapath = UdpLoopbackDatapath::with_bind_ip(routable);
+
+        let refused = datapath.alloc_endpoint_for(AddressFamily::V4).await;
+        assert!(
+            matches!(
+                refused,
+                Err(DatapathError::NoAddressForFamily {
+                    family: AddressFamily::V4
+                })
+            ),
+            "a v4 endpoint on a v6-only relay is refused, got {refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_bind_ip_refuses_the_other_family() {
+        // `0.0.0.0` is every IPv4 interface and no IPv6 one. Its v6 counterpart `::` is not an
+        // address a peer can be told to send to either, so there is nothing to fall back on.
+        let datapath = UdpLoopbackDatapath::with_bind_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+        let refused = datapath.alloc_endpoint_for(AddressFamily::V6).await;
+        assert!(
+            matches!(refused, Err(DatapathError::NoAddressForFamily { .. })),
+            "got {refused:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

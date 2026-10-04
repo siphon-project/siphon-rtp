@@ -1277,6 +1277,67 @@ async fn offer_address_family_ip4_puts_the_far_leg_on_ipv4_for_a_v6_offer() {
     );
 }
 
+#[tokio::test]
+async fn a_v6_offer_to_a_relay_with_no_v6_address_is_refused_not_answered_with_loopback() {
+    // The relay is bound to one routable IPv4 address and has no interface in IPv6. A `c=IN IP6`
+    // offer used to be answered with `c=IN IP6 ::1`: valid SDP, a call that connects, and media
+    // addressed to the peer's own loopback. The offer is refused instead, and the reason says
+    // which family is missing so the operator knows what to configure.
+    let relay = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10));
+    let engine = Engine::new(UdpLoopbackDatapath::with_bind_ip(relay));
+    let offer_sdp = "v=0\r\no=- 1 1 IN IP6 2001:db8::7\r\ns=-\r\nc=IN IP6 2001:db8::7\r\nt=0 0\r\n\
+                         m=audio 6000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n";
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "no-v6".into(),
+                from_tag: "a".into(),
+                sdp: offer_sdp.into(),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    match offer {
+        CmdResult::Error { reason } => {
+            assert!(
+                reason.contains("IPv6"),
+                "the reason names the family: {reason}"
+            );
+            assert!(!reason.contains("::1"), "{reason}");
+        }
+        other => panic!("a v6 offer on a v4-only relay must be refused, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_v6_offer_bridged_to_ipv4_is_still_refused_when_the_near_leg_has_no_address() {
+    // `address family = IP4` settles the far leg only. The near leg is the offerer's and stays in
+    // the offer's family, so a relay with no v6 address cannot serve it whatever the far leg is.
+    let relay = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10));
+    let engine = Engine::new(UdpLoopbackDatapath::with_bind_ip(relay));
+    let offer_sdp = "v=0\r\no=- 1 1 IN IP6 2001:db8::7\r\ns=-\r\nc=IN IP6 2001:db8::7\r\nt=0 0\r\n\
+                         m=audio 6000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n";
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "no-v6-bridged".into(),
+                from_tag: "a".into(),
+                sdp: offer_sdp.into(),
+                profile: ProfileFlags {
+                    address_family: Some("IP4".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(&offer, CmdResult::Error { reason } if reason.contains("IPv6")),
+        "got {offer:?}"
+    );
+}
+
 async fn recv(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     let mut buffer = [0u8; 2048];
     let (len, from) = timeout(Duration::from_secs(1), socket.recv_from(&mut buffer))
