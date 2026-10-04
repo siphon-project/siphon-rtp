@@ -24,7 +24,6 @@ use clap::parser::ValueSource;
 use clap::ArgMatches;
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::{Datapath, Dscp, RxPacket};
-use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_turn::{tls, NoFastPath, SystemUnixClock, Turn, TurnConfig};
 use tokio::net::{TcpListener, UdpSocket};
 use tracing_subscriber::EnvFilter;
@@ -798,6 +797,9 @@ where
     // SDP-rewrite time. Built once here so both datapath binaries inherit it; a malformed table is a
     // fatal startup error (never a silent fallback).
     let interfaces = config.interface_table()?;
+    // Read before anything is bound, so a malformed collector fails the start instead of leaving
+    // a node that runs without the telemetry it was configured to send.
+    let hep = crate::hep_export::HepSettings::from_env()?;
 
     // Cluster state for the `load` / `node_info` / `drain` control commands. The node id falls back to
     // the host's `HOSTNAME` (else `siphon-rtp`); the advertised media addresses are the interfaces'
@@ -1033,25 +1035,24 @@ where
     }
 
     // Optional HEP telemetry export of relayed RTCP to a VoIPmonitor / Homer collector, enabled by
-    // SIPHON_RTP_HEP_COLLECTOR=<ip:port> (+ optional SIPHON_RTP_HEP_AGENT_ID).
-    if let Ok(collector) = std::env::var("SIPHON_RTP_HEP_COLLECTOR") {
-        match collector.parse::<SocketAddr>() {
-            Ok(addr) => match HepExporter::connect(addr).await {
-                Ok(exporter) => {
-                    let agent_id = std::env::var("SIPHON_RTP_HEP_AGENT_ID")
-                        .ok()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(0);
-                    tracing::info!(collector = %addr, "HEP RTCP export enabled");
-                    // Share the one connected exporter with both the live RTCP loop and the
-                    // end-of-call RFC 4103 text-QoS export in `finish_call`.
-                    engine.set_hep_export(exporter, agent_id);
-                    tokio::spawn(engine.clone().run_rtcp_export());
-                }
-                Err(error) => tracing::warn!(%error, "HEP export disabled: connect failed"),
-            },
-            Err(_) => tracing::warn!("SIPHON_RTP_HEP_COLLECTOR is not a valid socket address"),
-        }
+    // SIPHON_RTP_HEP_COLLECTOR=<host:port> (+ optional SIPHON_RTP_HEP_AGENT_ID). The value was
+    // checked above; reaching the collector happens off the startup path, because a collector that
+    // is not up yet must not hold media back (see `hep_export`).
+    if let Some(settings) = hep {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let (exporter, collector) = crate::hep_export::connect_when_reachable(
+                &settings,
+                crate::hep_export::resolve,
+                crate::hep_export::RETRY_INTERVAL,
+            )
+            .await;
+            tracing::info!(host = %settings.host, %collector, "HEP RTCP export enabled");
+            // Share the one connected exporter with both the live RTCP loop and the end-of-call
+            // RFC 4103 text-QoS export in `finish_call`.
+            engine.set_hep_export(exporter, settings.capture_agent_id);
+            engine.run_rtcp_export().await;
+        });
     }
 
     // Optional rtpengine NG/bencode control front-end (UDP) — the drop-in for SIPhon/Kamailio/
