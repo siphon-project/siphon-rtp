@@ -144,6 +144,13 @@ pub struct EngineArgs {
     #[arg(long)]
     pub metrics_addr: Option<SocketAddr>,
 
+    /// Probe a running engine instead of starting one: ask `GET /healthz` on ADDR (that engine's
+    /// `--metrics-addr`) and exit `0` on a `200`, `1` otherwise. Nothing is bound and no
+    /// configuration is read. For a container health check on an image with no shell or HTTP
+    /// client.
+    #[arg(long, value_name = "ADDR")]
+    pub healthcheck: Option<SocketAddr>,
+
     /// Per-connection control request cap (requests/second). 0 disables the limit. The default is
     /// generous for a legitimate SIPhon controller; floods beyond it are rejected, not processed.
     #[arg(long, default_value_t = server::DEFAULT_MAX_CONTROL_RPS)]

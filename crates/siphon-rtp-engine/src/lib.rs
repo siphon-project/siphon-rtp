@@ -22,6 +22,7 @@ pub mod dtls_bridge;
 mod dtls_session;
 pub mod engine;
 pub mod ha;
+pub mod healthcheck;
 pub mod hep_export;
 pub mod ice;
 pub mod ingress;
