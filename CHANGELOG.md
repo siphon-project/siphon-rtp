@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-10-05
+
 ### Fixed
 
 - **An SRTP answer to a leg that was offered plain RTP is refused.** A callee offered `RTP/AVP`
