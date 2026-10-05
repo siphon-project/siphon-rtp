@@ -376,24 +376,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             RecordingDirection::Egress => (false, true),
             RecordingDirection::Both => (true, true),
         };
-        // Two sources exist only on an answered two-party call. A single-leg call records mono
-        // whatever was asked for, rather than stalling on a stereo frame whose second ring never
-        // fills — the same degradation the tee applies.
-        let two_sources = two_leg && !(want_ingress && want_egress);
-        let stereo = matches!(request.channels, RecordingChannels::Stereo) && two_sources;
-        let channels: u8 = if stereo { 2 } else { 1 };
-
-        let format = MediaFormat {
-            encoding: Encoding::L16,
-            sample_rate: rate,
-            channels,
-            bit_depth: 16,
-            endianness: Endianness::Little,
-            ptime,
-        };
-
         // Every conversion is built before anything is touched, so a rate this engine cannot serve
         // fails with the call exactly as it was.
+        //
+        // At most two sources, one per channel of the frame assembler, and never two on one
+        // channel: two writers into one ring are laid end to end, not mixed. The caller's side is
+        // what the caller sent. The other side is what the caller was *sent* when egress is asked
+        // for — on a two-party call that already is the callee's audio as the caller heard it, plus
+        // any prompt played to the caller, so the callee's own ingress is not tapped as well — and
+        // the callee's ingress otherwise.
         let mut taps: Vec<(
             bool,
             bool,
@@ -402,24 +393,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         )> = Vec::new();
         for (is_ingress, source_a, channel, leg_rate, wanted) in [
             (true, true, TeeChannel::Caller, caller_rate, want_ingress),
+            (false, true, TeeChannel::Callee, caller_rate, want_egress),
             (
                 true,
                 false,
                 TeeChannel::Callee,
                 callee_rate,
-                want_ingress && two_leg,
+                want_ingress && !want_egress && two_leg,
             ),
-            // Egress toward A is the engine's audio for the caller; on a two-party call it is what B
-            // sent, already covered by B's ingress, so only the caller-facing side is tapped unless
-            // both directions were asked for.
-            (false, true, TeeChannel::Callee, caller_rate, want_egress),
         ] {
             if !wanted {
                 continue;
             }
-            // A stereo recording puts the caller left and everything else right; a mono one folds
-            // every source into ring 0 so the assembler sums them.
-            let channel = if stereo { channel } else { TeeChannel::Caller };
             let resampler = match leg_rate {
                 Some(leg_rate) => {
                     wire_resampler(leg_rate, rate).map_err(|error| error.to_string())?
@@ -431,6 +416,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if taps.is_empty() {
             return Err("the call has no leg matching the requested direction".to_string());
         }
+        // Two sources are summed into a mono file, or laid out caller-left / other-right on a
+        // two-party call that asked for stereo. One source is mono whatever was asked for, and so
+        // is a single-leg call: its second source is the engine's own prompts, not a party.
+        let two_sources = taps.len() == 2;
+        let callee_only = !two_sources && taps[0].2 == TeeChannel::Callee;
+        let channels: u8 =
+            if two_sources && two_leg && matches!(request.channels, RecordingChannels::Stereo) {
+                2
+            } else {
+                1
+            };
+
+        let format = MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: rate,
+            channels,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime,
+        };
 
         let recording_id = self.next_recording_id();
         let (path, file) =
@@ -450,7 +455,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         )
         .await?;
 
-        let plan = plan_ws_tee(format, stereo, false);
+        let plan = plan_ws_tee(format, two_sources, callee_only);
         let mut ingress_legs = Vec::new();
         let mut egress_legs = Vec::new();
         for (is_ingress, source_a, channel, resampler) in taps {
