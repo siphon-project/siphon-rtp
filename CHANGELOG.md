@@ -7,6 +7,37 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-05
+
+### Added
+
+- **A decoded recording can be started on a crypto bridge.** `start_recording` with `format: "wav"`
+  refused an SDES or DTLS-SRTP call on a shared codec, because the bridge relays without decoding
+  and so has no post-decode audio to tap. The ordinary secure phone-to-phone call could therefore
+  not be recorded once it was bridged. The recording now decodes the plaintext the bridge holds
+  between its two transforms, where a WebSocket tee and lawful interception already tap: after the
+  source gate, the latch and the SRTP authentication, so a forged or replayed packet is never
+  written. The bridge keeps relaying, nothing is re-keyed, and no media actor is built. A bridge
+  originates no audio, so `egress` is the callee's stream and `both` is each party once. Packets
+  are decoded as they arrive, with no jitter buffer or concealment ahead of the file. The `pcap`
+  form is still refused on a secure call: it captures wire bytes, which there are ciphertext.
+- **A health check the runtime image can run.** The image is distroless, so a container health
+  check had no shell, `curl` or `wget` to ask `/healthz` with. `--healthcheck <ADDR>` makes the
+  engine binary the probe: it asks `GET /healthz` on a running engine's `--metrics-addr`, exits
+  `0` on a `200` and `1` otherwise with the reason on stderr, and starts nothing. Liveness, not
+  readiness, so a draining node is not restarted under its calls. Both daemons take the flag.
+
+### Changed
+
+- **The HEP collector can be named, and a bad value is refused.** `SIPHON_RTP_HEP_COLLECTOR` took
+  an `ip:port` only, so a deployment that addresses its collector by service name could not use
+  it, and a value that did not parse turned export off behind one `warn` line while the node kept
+  running. It now takes `host:port` with a DNS name or an IP literal. A malformed value, or a
+  `SIPHON_RTP_HEP_AGENT_ID` that is not a number (which used to be read as `0`), fails the start.
+  A well-formed collector that cannot be resolved or connected yet does not hold media back: the
+  engine starts, reports it once at `error`, and retries until export begins. Unset or empty
+  still means off.
+
 ### Fixed
 
 - **A decoded recording of a two-party call mixes the parties.** On a call carried by the media
@@ -31,45 +62,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   the hold that keeps the call decoded. The second attach answered `ok`, announced
   `ws_tee_started` and streamed nothing. Each attach now labels its own taps, and a replacement
   keeps the hold.
-
-### Added
-
-- **A decoded recording can be started on a crypto bridge.** `start_recording` with `format: "wav"`
-  refused an SDES or DTLS-SRTP call on a shared codec, because the bridge relays without decoding
-  and so has no post-decode audio to tap. The ordinary secure phone-to-phone call could therefore
-  not be recorded once it was bridged. The recording now decodes the plaintext the bridge holds
-  between its two transforms, where a WebSocket tee and lawful interception already tap: after the
-  source gate, the latch and the SRTP authentication, so a forged or replayed packet is never
-  written. The bridge keeps relaying, nothing is re-keyed, and no media actor is built. A bridge
-  originates no audio, so `egress` is the callee's stream and `both` is each party once. Packets
-  are decoded as they arrive, with no jitter buffer or concealment ahead of the file. The `pcap`
-  form is still refused on a secure call: it captures wire bytes, which there are ciphertext.
-
-### Fixed
-
 - **A tee and a recording no longer displace each other on a bridged leg.** A bridge endpoint held
   one plaintext tap, replaced on every attach and cleared on every detach. It now holds a set keyed
   by consumer, so the two coexist and each is removed by its own tag.
 - **A renegotiation no longer silences a tee on an SDES bridge.** Re-registering a call's bridge
   flows (any re-INVITE) built them with no tap, so a tee attached before a hold heard nothing
   after it while still reporting itself attached. The taps now move to the rebuilt flows.
-### Changed
-
-- **The HEP collector can be named, and a bad value is refused.** `SIPHON_RTP_HEP_COLLECTOR` took
-  an `ip:port` only, so a deployment that addresses its collector by service name could not use
-  it, and a value that did not parse turned export off behind one `warn` line while the node kept
-  running. It now takes `host:port` with a DNS name or an IP literal. A malformed value, or a
-  `SIPHON_RTP_HEP_AGENT_ID` that is not a number (which used to be read as `0`), fails the start.
-  A well-formed collector that cannot be resolved or connected yet does not hold media back: the
-  engine starts, reports it once at `error`, and retries until export begins. Unset or empty
-  still means off.
-- **A health check the runtime image can run.** The image is distroless, so a container health
-  check had no shell, `curl` or `wget` to ask `/healthz` with. `--healthcheck <ADDR>` makes the
-  engine binary the probe: it asks `GET /healthz` on a running engine's `--metrics-addr`, exits
-  `0` on a `200` and `1` otherwise with the reason on stderr, and starts nothing. Liveness, not
-  readiness, so a draining node is not restarted under its calls. Both daemons take the flag.
-### Fixed
-
 - **A leg in a family the relay has no address for is refused, not bound to loopback.** A relay
   given one routable address (`--relay-bind-ip 203.0.113.10`) answered a `c=IN IP6` leg by binding
   `::1` and advertising it, a fallback meant for the NIC-free test posture where every peer is on
