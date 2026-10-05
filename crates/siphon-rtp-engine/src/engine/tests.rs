@@ -30056,3 +30056,221 @@ async fn a_runtime_attach_with_an_unserviceable_profile_leaves_the_anchor_untouc
         assert!(!engine.ws().is_ws_call("anchor-bad"));
     }
 }
+
+#[tokio::test]
+async fn an_srtp_answer_to_a_leg_that_was_offered_plain_rtp_is_refused() {
+    // The callee was offered `RTP/AVP` (nothing asked the engine to offer it SRTP) and answers
+    // `RTP/SAVP` with its own key. The engine used to accept that as a plain relay: it forwarded
+    // the callee's ciphertext to a caller that negotiated plain RTP, sent the callee plaintext it
+    // expected encrypted, and answered the caller's `RTP/AVP` offer with `RTP/SAVP` carrying the
+    // callee's key. RFC 3264 §6.1 does not allow the answer at all.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "plain-offer".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let to_callee = ok_sdp_text(&offered);
+    assert!(
+        to_callee.contains(" RTP/AVP ") && !to_callee.contains("a=crypto"),
+        "the callee is offered plain RTP: {to_callee}"
+    );
+
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    let answer = |sdp: String| Command::Answer {
+        call_id: "plain-offer".into(),
+        from_tag: "tag-a".into(),
+        to_tag: "tag-b".into(),
+        sdp,
+        profile: Default::default(),
+    };
+    let refused = engine
+        .handle(CLIENT, answer(savp_answer_sdp(addr_b, &callee_key)))
+        .await;
+    match refused {
+        CmdResult::Error { reason } => assert!(
+            reason.contains("secure-answer-to-plain-offer"),
+            "the refusal leads with its stable token: {reason}"
+        ),
+        other => panic!("an SRTP answer to a plain offer must be refused, got {other:?}"),
+    }
+
+    // The call is as it was: the same leg can still answer what it was offered.
+    let accepted = engine.handle(CLIENT, answer(sdp_for(addr_b, true))).await;
+    let to_caller = ok_sdp_text(&accepted);
+    assert!(
+        to_caller.contains(" RTP/AVP ") && !to_caller.contains("a=crypto"),
+        "the caller is answered what it offered: {to_caller}"
+    );
+    assert_eq!(
+        engine.calls.get("plain-offer").expect("call").pipeline,
+        PipelineKind::Passthrough
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_anchored_caller_bridged_to_an_srtp_phone_hears_it() {
+    // The inbound business call: the caller is answered and anchored for a menu, the phone is rung
+    // and answered on a session of its own, and the two are then joined on a fresh call — the
+    // caller's plain offer presented to the phone as SRTP, and the phone's answer to that. The
+    // phone is behind NAT (a private address in its SDP), does not multiplex RTCP, sends a
+    // keepalive on its media port, and starts sending before the engine has its answer.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+    let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let private = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 77), addr_b.port()));
+    let phone_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("phone key");
+    let caller_sdp = sdp_for(addr_a, false);
+    let phone_sdp = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/SAVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na={crypto}\r\n",
+        ip = private.ip(),
+        port = private.port(),
+        crypto = phone_key.to_attribute_value(),
+    );
+    let toward_phone = || ProfileFlags {
+        transport_protocol: Some("RTP/SAVP".into()),
+        received_from: Some(addr_b.ip()),
+        ..Default::default()
+    };
+
+    // Each party's own session, as it stands when the bridge is formed.
+    for (call_id, tag, sdp, profile) in [
+        (
+            "caller-leg",
+            "tag-a",
+            caller_sdp.clone(),
+            ProfileFlags::default(),
+        ),
+        ("phone-leg", "tag-b", phone_sdp.clone(), toward_phone()),
+    ] {
+        let anchored = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: call_id.into(),
+                    from_tag: tag.into(),
+                    sdp,
+                    profile,
+                },
+            )
+            .await;
+        assert!(matches!(anchored, CmdResult::Ok { .. }), "{anchored:?}");
+    }
+
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "joined".into(),
+                from_tag: "tag-a".into(),
+                sdp: caller_sdp,
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let engine_toward_phone = sdp::parse(&ok_sdp_text(&offered))
+        .expect("offer to the phone")
+        .remote_rtp;
+
+    let mut seal = SrtpContext::from_key_material(&phone_key.key);
+    let mut send = |sequence: u16| {
+        let mut sealed = Vec::new();
+        seal.protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x30), &mut sealed)
+            .expect("the phone encrypts");
+        sealed
+    };
+    for sequence in 0..3u16 {
+        let early = send(sequence);
+        phone_b
+            .send_to(&early, engine_toward_phone)
+            .await
+            .expect("early media");
+    }
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "joined".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: phone_sdp,
+                // The anchor's own profile shapes the answer: plain, toward the caller.
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/AVP".into()),
+                    received_from: Some(addr_b.ip()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
+    assert_eq!(
+        engine.calls.get("joined").expect("call").pipeline,
+        PipelineKind::Srtp
+    );
+    for (call_id, tag) in [("phone-leg", "tag-b"), ("caller-leg", "tag-a")] {
+        engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: call_id.into(),
+                    from_tag: tag.into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+    }
+
+    phone_b
+        .send_to(&[0u8; 4], engine_toward_phone)
+        .await
+        .expect("keepalive");
+    for sequence in 3..13u16 {
+        let sealed = send(sequence);
+        phone_b
+            .send_to(&sealed, engine_toward_phone)
+            .await
+            .expect("phone media");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The caller's own anchored session was still sending it the engine's audio until it was
+    // deleted, so skip to the first datagram that is the phone's.
+    let mut buffer = [0u8; 2048];
+    let heard = timeout(Duration::from_secs(2), async {
+        loop {
+            let (len, _) = phone_a.recv_from(&mut buffer).await.expect("recv");
+            if len == 172 && buffer[12..len] == [0x30u8; 160] {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        heard.is_ok(),
+        "the caller hears the phone, decrypted to the plain RTP it negotiated"
+    );
+}

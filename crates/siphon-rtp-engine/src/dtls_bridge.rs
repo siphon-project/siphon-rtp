@@ -1019,9 +1019,10 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         let kind = match transformed {
             Ok(kind) => kind,
             Err(error) => {
-                tracing::debug!(?error, "DTLS bridge crypto failed; dropping packet");
                 if matches!(direction, Direction::Decrypt { .. }) {
-                    refusals.log(Refusal::NotAuthenticated, context);
+                    refusals.log_undecryptable(&error, &packet.data, "secure", context);
+                } else {
+                    tracing::debug!(?error, "DTLS bridge encrypt failed; dropping packet");
                 }
                 self.datapath.note_dropped(packet.endpoint);
                 return;

@@ -2059,8 +2059,14 @@ impl Direction {
             let Ok(mut guard) = leg.lock() else {
                 return Err(Dropped::Unkeyed);
             };
-            if guard.unprotect(data, &mut plain).is_err() {
-                return Err(Dropped::NotAuthenticated);
+            if let Err(error) = guard.unprotect(data, &mut plain) {
+                // A datagram that is not SRTP at all (a NAT keepalive on the media port) is
+                // malformed, not a key mismatch: it must not take the flow's authentication
+                // warning ahead of a real one.
+                return Err(match Refusal::of_unprotect(&error) {
+                    Some(Refusal::NotSrtp) => Dropped::Malformed,
+                    _ => Dropped::NotAuthenticated,
+                });
             }
             drop(guard);
             decrypted = plain;

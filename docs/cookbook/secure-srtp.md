@@ -86,6 +86,14 @@ the callee has rung and answered. The reason carries the stable
 `secure-offerer-unsupported` token, so a controller can match on it without
 parsing the sentence that follows.
 
+The other refusal is on the **`answer`**: `secure-answer-to-plain-offer`. A leg
+that was offered plain `RTP/AVP` (no `transport_protocol` asked the engine to
+offer it SRTP) and answers `RTP/SAVP` with its own `a=crypto` has answered a
+different transport than it was offered, which RFC 3264 §6.1 does not allow, and
+nothing can carry it: the engine never gave that leg a key. Offer the leg SRTP,
+or have it answer plain. The call is left as it was, so a corrected answer is
+still accepted.
+
 A secure caller toward a plain callee whose call needs the decoded audio (a codec
 mismatch, or `record_call`, `noise_suppression`, `echo_cancellation`,
 `beep_detection` or `ws_tee` on the answer) is transcoded rather than bridged,
