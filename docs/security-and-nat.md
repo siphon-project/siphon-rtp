@@ -1576,7 +1576,10 @@ no key) and must never deliver a packet the engine refused — a failed SRTP `un
 media arriving before a DTLS handshake keys the leg — because forged traffic presented to an agency
 as the target's media is worse than no delivery at all. It also runs on the SDES and DTLS **crypto
 bridges**, which relay without ever entering the media pipeline: without that, a same-codec WebRTC
-call would be silently uninterceptable.
+call would be silently uninterceptable. A bridge's taps belong to the endpoint, not to one
+negotiation of the call: when a re-INVITE re-registers the bridge's flows, or replaces a DTLS
+association, the rebuilt flow keeps the interception tap and the plaintext taps the old one carried.
+A flow rebuilt without them would keep relaying while the delivery stopped, with nothing reporting it.
 
 The source gate (layer 2) runs before all of them, so no consumer ever sees a packet from an
 unsignalled source. See [Lawful interception](lawful-interception.md).

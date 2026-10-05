@@ -219,11 +219,13 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         for (endpoint, ingress_leg, egress_leg, flow) in resolved {
             // A renegotiation re-registers a live call's flows. Whatever is listening to the call
             // was attached to the call, not to one negotiation of it, so its taps move to the
-            // rebuilt flow: a hold re-INVITE must not silently end a recording.
-            let plain_taps = self
+            // rebuilt flow: a hold re-INVITE must not silently end a recording, and above all not a
+            // lawful interception, which would go on reporting itself attached while delivering
+            // nothing.
+            let (x3, plain_taps) = self
                 .flows
                 .get(&endpoint)
-                .map(|previous| previous.plain_taps.clone())
+                .map(|previous| (previous.x3.clone(), previous.plain_taps.clone()))
                 .unwrap_or_default();
             self.flows.insert(
                 endpoint,
@@ -239,7 +241,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     out_dst: flow.out_dst,
                     ingress_leg,
                     egress_leg,
-                    x3: None,
+                    x3,
                     refusals: Arc::new(RefusalLog::default()),
                     plain_taps,
                 },
@@ -1686,6 +1688,66 @@ mod tests {
             .expect("the tap outlives the re-registration")
             .expect("tap open");
         assert_eq!(copy.as_ref(), plaintext.as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interception_survives_the_calls_flows_being_re_registered() {
+        // A warrant is served on the call, not on one negotiation of it. A re-INVITE re-registers
+        // the bridge's flows, and a flow rebuilt without its tap would end the delivery silently:
+        // the call keeps relaying, the interception still reports itself attached, and the agency
+        // receives nothing from the hold onwards.
+        let (harness, (phone_a, addr_a), (phone_b, addr_b)) = live_bridge().await;
+        let (factory, delivery) = crate::x3::x3_channel(8);
+        assert!(harness.bridge.set_x3_tap(
+            harness.secure_endpoint,
+            factory.tap(
+                harness.secure_addr,
+                siphon_rtp_li::PayloadDirection::FromTarget
+            ),
+        ));
+
+        harness.bridge.register(BridgeCallPlan {
+            near_leg: None,
+            far_leg: Some(SecureLeg::new(&harness.local, &harness.remote)),
+            flows: vec![
+                BridgeFlowPlan {
+                    endpoint: harness.plain_endpoint,
+                    ingress_leg: None,
+                    egress_leg: Some(BridgeLeg::Far),
+                    accepted_source: SourceFilter::Exact(addr_a.ip()),
+                    latch: true,
+                    out_endpoint: harness.secure_endpoint,
+                    out_dst: addr_b,
+                },
+                BridgeFlowPlan {
+                    endpoint: harness.secure_endpoint,
+                    ingress_leg: Some(BridgeLeg::Far),
+                    egress_leg: None,
+                    accepted_source: SourceFilter::Exact(addr_b.ip()),
+                    latch: true,
+                    out_endpoint: harness.plain_endpoint,
+                    out_dst: addr_a,
+                },
+            ],
+        });
+
+        let mut peer = SrtpContext::from_key_material(&harness.remote);
+        let plaintext = rtp(7, 0x2222_2222);
+        send_from_secure_peer(&harness, &phone_b, &mut peer, &plaintext).await;
+        assert_eq!(recv(&phone_a).await, plaintext, "the call keeps relaying");
+        let delivered = timeout(SHORT, delivery.packets.recv_async())
+            .await
+            .expect("the interception outlives the re-registration")
+            .expect("delivery open");
+        assert_eq!(delivered.payload.as_slice(), plaintext.as_slice());
+
+        // Detaching still ends it, on the rebuilt flow as on the original.
+        harness.bridge.clear_x3_tap(harness.secure_endpoint);
+        send_from_secure_peer(&harness, &phone_b, &mut peer, &rtp(8, 0x2222_2222)).await;
+        let _ = recv(&phone_a).await;
+        assert!(timeout(NEGATIVE, delivery.packets.recv_async())
+            .await
+            .is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

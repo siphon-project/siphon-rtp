@@ -20,6 +20,11 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   phone that suppresses silence) the other side's audio older than 160 ms was overwritten. The
   quiet side is now filled with silence once the wait reaches 160 ms, and what is still waiting
   when a recording stops is written out instead of discarded.
+- **A lawful interception on a crypto bridge survives a re-INVITE.** Re-registering a bridged
+  call's flows (any renegotiation of an SDES bridge, or a new DTLS association) rebuilt them
+  without the X3 tap. The call kept relaying, the interception still reported itself attached,
+  and no content was delivered from that point on. The tap now moves to the rebuilt flow, as the
+  tee's and the recording's do.
 
 ### Added
 
