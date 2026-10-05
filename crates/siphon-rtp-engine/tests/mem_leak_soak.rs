@@ -1280,17 +1280,14 @@ async fn ws_bridge_attach_repoint_detach_does_not_leak() {
     gate.assert_no_leak();
 }
 
-/// One bridged-tee cycle: a plain caller toward an SDES callee on a shared codec (the SRTP bridge),
-/// a tee attached mid-call (a plaintext tap on the bridge plus a decoder task per leg), detached,
-/// and the call deleted. The tap, the decoders and the transport must all go with the detach.
-async fn bridged_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &str, index: usize) {
-    let call_id = format!("bridged-tee-soak-{index}");
+/// Stand up a plain caller toward an SDES callee on a shared codec: the SRTP crypto bridge.
+async fn secure_bridge_call(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) {
     assert_ok(
         &engine
             .handle(
                 CLIENT,
                 Command::Offer {
-                    call_id: call_id.clone(),
+                    call_id: call_id.to_string(),
                     from_tag: "tag-a".into(),
                     sdp: sdp_for("198.51.100.1", 40_000),
                     profile: siphon_rtp_proto::ProfileFlags {
@@ -1317,7 +1314,7 @@ async fn bridged_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &s
             .handle(
                 CLIENT,
                 Command::Answer {
-                    call_id: call_id.clone(),
+                    call_id: call_id.to_string(),
                     from_tag: "tag-a".into(),
                     to_tag: "tag-b".into(),
                     sdp: answer,
@@ -1327,6 +1324,14 @@ async fn bridged_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &s
             .await,
         "secure answer",
     );
+}
+
+/// One bridged-tee cycle: a plain caller toward an SDES callee on a shared codec (the SRTP bridge),
+/// a tee attached mid-call (a plaintext tap on the bridge plus a decoder task per leg), detached,
+/// and the call deleted. The tap, the decoders and the transport must all go with the detach.
+async fn bridged_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &str, index: usize) {
+    let call_id = format!("bridged-tee-soak-{index}");
+    secure_bridge_call(engine, &call_id).await;
     assert_ok(
         &engine
             .handle(
@@ -1389,6 +1394,85 @@ async fn bridged_tee_attach_detach_does_not_leak() {
             "registry drained after every segment"
         );
         assert_eq!(engine.ws_tee_count(), 0, "no tee outlives its detach");
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
+/// One bridged-recording cycle: a decoded recording started on the SRTP bridge (a plaintext tap
+/// plus a decoder task per party, and the file writer), stopped, and the call deleted. The taps, the
+/// decoders and the writer must all go with the stop.
+async fn bridged_recording_start_stop(
+    engine: &Engine<UdpLoopbackDatapath>,
+    path: &str,
+    index: usize,
+) {
+    let call_id = format!("bridged-recording-soak-{index}");
+    secure_bridge_call(engine, &call_id).await;
+    let started = engine
+        .handle(
+            CLIENT,
+            Command::StartRecording {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                recording_dir: None,
+                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                direction: None,
+                channels: Some(siphon_rtp_proto::RecordingChannels::Stereo),
+                max_duration_ms: None,
+                silence_ms: None,
+                path: Some(path.to_string()),
+            },
+        )
+        .await;
+    assert_ok(&started, "record the bridge");
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::StopRecording {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    recording_id: None,
+                },
+            )
+            .await,
+        "stop the recording",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id,
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridged_recording_start_stop_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    // One file, rewritten every cycle, so the soak measures the engine and not the directory.
+    let path = dir.path().join("soak.wav").to_string_lossy().into_owned();
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let mut gate = LeakGate::new("bridged recording", 100, 40).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            bridged_recording_start_stop(&engine, &path, index).await;
+            index += 1;
+        }
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
         gate.sample().await;
     }
     gate.assert_no_leak();

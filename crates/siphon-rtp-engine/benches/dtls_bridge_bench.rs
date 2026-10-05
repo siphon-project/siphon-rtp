@@ -10,6 +10,9 @@
 //! - `secure_rtcp_to_plain_rtcp_port` — the DTLS peer's SRTCP decrypted onto the plain peer's
 //!   separate RTCP port (RFC 5761 §5.1.1). The delta against `secure_rtp_to_plain` is the RTCP split.
 //! - `plain_rtcp_port_to_secure` — plain RTCP from that port, encrypted as SRTCP.
+//! - `secure_rtp_to_plain_tapped` — the same packet with one plaintext tap on the leg (a decoded
+//!   recording or a WebSocket tee on a bridged call). The delta against `secure_rtp_to_plain` is what
+//!   a tapped bridge leg pays per packet: one copy of the plaintext and a `try_send`.
 //! - `unkeyed_drop` — SRTP arriving before any handshake has keyed the leg. It has to stay cheaper
 //!   than a keyed packet: a peer that floods before the handshake must not cost more than one that
 //!   completes it.
@@ -310,6 +313,28 @@ fn dtls_bridge_handle(criterion: &mut Criterion) {
                 unkeyed_frame.clone(),
             ))))
         })
+    });
+
+    // Last, because the tap stays on the leg. Its consumer is drained in the setup closure, outside
+    // the measurement; the copy is paid on every packet whether or not the consumer has room.
+    let (tap, tapped) = flume::bounded(64);
+    assert!(bridge.add_plain_tap(secure.id, "rec-1", tap));
+    // `sequence` carries on from `secure_rtp_to_plain`: restarting it would hand the leg packets
+    // behind its replay window (RFC 3711 §3.3.2) and measure the reject branch instead.
+    group.bench_function("secure_rtp_to_plain_tapped", |bencher| {
+        bencher.iter_batched(
+            || {
+                while tapped.try_recv().is_ok() {}
+                sequence = sequence.wrapping_add(1);
+                let mut sealed = Vec::new();
+                peer_leg
+                    .protect(&rtp_packet(sequence, 0x0B0B_0B0B), &mut sealed)
+                    .expect("peer protect rtp");
+                Bytes::from(sealed)
+            },
+            |sealed| runtime.block_on(bridge.handle(black_box(packet(secure.id, addr_b, sealed)))),
+            BatchSize::SmallInput,
+        )
     });
 
     group.finish();

@@ -241,15 +241,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             {
                 let sink =
                     WsTeeSink::new(channel, plan.mixer.clone(), stream_id.clone(), resampler);
-                let (packets, received) = flume::bounded(BRIDGE_TEE_QUEUE);
-                if !self.bridge.set_plain_tap(endpoint, Some(packets)) {
+                let (packets, received) = flume::bounded(BRIDGE_TAP_QUEUE);
+                if !self.bridge.add_plain_tap(endpoint, &stream_id, packets) {
                     for (attached, task) in bridge_taps.drain(..) {
-                        self.bridge.set_plain_tap(attached, None);
+                        self.bridge.remove_plain_tap(attached, &stream_id);
                         let _ = task.await;
                     }
                     return Err("the call's crypto bridge is no longer installed".to_string());
                 }
-                let task = tokio::spawn(run_bridge_tee_decoder(
+                let task = tokio::spawn(run_bridge_tap_decoder(
                     received,
                     decoder,
                     payload_type,
@@ -566,7 +566,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // wait for the decoders to drain and finish. No hold was taken, so none is released below.
         let bridged = !tee.bridge_taps.is_empty();
         for (endpoint, task) in tee.bridge_taps {
-            self.bridge.set_plain_tap(endpoint, None);
+            self.bridge.remove_plain_tap(endpoint, &tee.stream_id);
             let _ = task.await;
         }
         for source_a in &tee.tapped_legs {
@@ -616,15 +616,15 @@ struct TeeShape {
     sample_rate: u32,
 }
 
-/// How many plaintext datagrams a bridged tee's decoder may fall behind by before the bridge drops
-/// them for it: about a second of 20 ms packets. The bridge never waits on the tee.
-const BRIDGE_TEE_QUEUE: usize = 64;
+/// How many plaintext datagrams a bridged call's tap decoder may fall behind by before the bridge
+/// drops them for it: about a second of 20 ms packets. The bridge never waits on a consumer.
+pub(super) const BRIDGE_TAP_QUEUE: usize = 64;
 
-/// Decode a crypto bridge's plaintext RTP for a tee. The bridge relays without decoding, so this is
-/// the leg's one decode — the "never a second decode" rule the pipeline tee keeps is kept here too.
-/// Each packet is decoded as it arrives, as the pipeline's fan-out does; a lost packet is a gap. Only
-/// the leg's audio payload type is decoded: telephone-events and comfort noise are not audio to tee.
-async fn run_bridge_tee_decoder(
+/// Decode a crypto bridge's plaintext RTP for a tee or a decoded recording. The bridge relays without
+/// decoding, so this is the consumer's own decode of the leg and costs the relay nothing. Each packet
+/// is decoded as it arrives, as the pipeline's fan-out does; a lost packet is a gap. Only the leg's
+/// audio payload type is decoded: telephone-events and comfort noise are not audio to tap.
+pub(super) async fn run_bridge_tap_decoder(
     packets: flume::Receiver<bytes::Bytes>,
     mut decoder: Box<dyn siphon_rtp_codec::Decoder>,
     payload_type: u8,
@@ -647,7 +647,7 @@ async fn run_bridge_tee_decoder(
                 sink.write_pcm(&decoded[..mono]);
             }
             Err(error) => {
-                tracing::debug!(%error, "bridged tee dropped an undecodable frame");
+                tracing::debug!(%error, "bridged tap dropped an undecodable frame");
             }
         }
     }

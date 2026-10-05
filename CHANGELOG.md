@@ -7,6 +7,28 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **A decoded recording can be started on a crypto bridge.** `start_recording` with `format: "wav"`
+  refused an SDES or DTLS-SRTP call on a shared codec, because the bridge relays without decoding
+  and so has no post-decode audio to tap. The ordinary secure phone-to-phone call could therefore
+  not be recorded once it was bridged. The recording now decodes the plaintext the bridge holds
+  between its two transforms, where a WebSocket tee and lawful interception already tap: after the
+  source gate, the latch and the SRTP authentication, so a forged or replayed packet is never
+  written. The bridge keeps relaying, nothing is re-keyed, and no media actor is built. A bridge
+  originates no audio, so `egress` is the callee's stream and `both` is each party once. Packets
+  are decoded as they arrive, with no jitter buffer or concealment ahead of the file. The `pcap`
+  form is still refused on a secure call: it captures wire bytes, which there are ciphertext.
+
+### Fixed
+
+- **A tee and a recording no longer displace each other on a bridged leg.** A bridge endpoint held
+  one plaintext tap, replaced on every attach and cleared on every detach. It now holds a set keyed
+  by consumer, so the two coexist and each is removed by its own tag.
+- **A renegotiation no longer silences a tee on an SDES bridge.** Re-registering a call's bridge
+  flows (any re-INVITE) built them with no tap, so a tee attached before a hold heard nothing
+  after it while still reporting itself attached. The taps now move to the rebuilt flows.
+
 ## [0.11.0] — 2026-09-30
 
 ### Added

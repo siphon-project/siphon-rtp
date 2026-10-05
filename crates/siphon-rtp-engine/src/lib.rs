@@ -28,6 +28,7 @@ pub mod interface;
 pub mod media_fetch;
 pub mod media_pipeline;
 pub mod metrics;
+pub mod plain_tap;
 pub mod prompt_cache;
 pub mod recording;
 mod reply_latch;
