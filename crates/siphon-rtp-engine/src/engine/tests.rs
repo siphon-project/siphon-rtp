@@ -27912,6 +27912,228 @@ async fn a_bridged_recording_is_finalized_when_the_call_ends_under_it() {
     );
 }
 
+/// A plain two-party call on a shared codec, with the dispatcher running. Returns the phones and
+/// the engine's address facing each.
+async fn plain_two_party_call(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+) -> ((UdpSocket, SocketAddr), (UdpSocket, SocketAddr)) {
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let far_addr = sdp::parse(&ok_sdp_text(&offered))
+        .expect("offer")
+        .remote_rtp;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for(addr_b, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let near_addr = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer")
+        .remote_rtp;
+    ((phone_a, near_addr), (phone_b, far_addr))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recording_of_a_plain_two_party_call_mixes_the_parties_in_time() {
+    // Every shape of a decoded recording on an ordinary relayed call. Each used to put both
+    // parties in one ring of the frame assembler, which laid them end to end: ten frames from each
+    // came out as twenty (thirty with `both`), alternating, and `egress` in stereo fed a ring the
+    // assembler never read and wrote an empty file.
+    use siphon_rtp_proto::{RecordingChannels, RecordingDirection};
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    let ((phone_a, near_addr), (phone_b, far_addr)) =
+        plain_two_party_call(&engine, "plain-rec").await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut sequence = 0u16;
+    let mut take = |direction, channels| {
+        let first = sequence;
+        sequence += 10;
+        let (engine, events, phone_a, phone_b, dir) =
+            (&engine, &events, &phone_a, &phone_b, dir.path());
+        async move {
+            let id = start_decoded_recording(engine, "plain-rec", dir, direction, channels).await;
+            for frame in first..first + 10 {
+                phone_a
+                    .send_to(&g711_rtp(0, frame, 0x0A0A_0A0A, 0x20), near_addr)
+                    .await
+                    .expect("a send");
+                phone_b
+                    .send_to(&g711_rtp(0, frame, 0x0B0B_0B0B, 0x30), far_addr)
+                    .await
+                    .expect("b send");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            stop_and_read_recording(engine, events, "plain-rec", &id).await
+        }
+    };
+
+    let (stereo, _, stereo_channels) =
+        take(RecordingDirection::Ingress, RecordingChannels::Stereo).await;
+    assert_eq!(stereo_channels, 2);
+    let (caller, callee) = (stereo[0], stereo[1]);
+    assert_ne!(caller, 0);
+    assert_ne!(callee, 0);
+    assert_ne!(caller, callee);
+    assert!(
+        stereo
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|frame| frame[0] == caller && frame[1] == callee),
+        "caller left, callee right"
+    );
+    assert!(stereo.len() <= 2 * 10 * 160, "got {}", stereo.len());
+
+    for direction in [RecordingDirection::Ingress, RecordingDirection::Both] {
+        let (mono, _, channels) = take(direction, RecordingChannels::Mono).await;
+        assert_eq!(channels, 1);
+        assert!(!mono.is_empty(), "{direction:?}: the mix holds audio");
+        assert!(
+            mono.len() <= 10 * 160,
+            "{direction:?}: ten frames from each party is ten frames of mix, got {} samples",
+            mono.len()
+        );
+        assert!(
+            mono.iter().all(|&sample| sample == caller + callee),
+            "{direction:?}: every sample is the two parties summed"
+        );
+    }
+
+    // `both` in stereo: what the caller said left, what the caller heard right.
+    let (both, _, channels) = take(RecordingDirection::Both, RecordingChannels::Stereo).await;
+    assert_eq!(channels, 2);
+    assert!(!both.is_empty());
+    assert!(both
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .all(|frame| frame[0] == caller && frame[1] == callee));
+
+    // `egress` is one source — what the caller was sent — so it is mono whatever is asked.
+    let (egress, _, channels) = take(RecordingDirection::Egress, RecordingChannels::Stereo).await;
+    assert_eq!(channels, 1);
+    assert!(!egress.is_empty(), "egress used to write an empty file");
+    assert!(egress.iter().all(|&sample| sample == callee));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recording_keeps_the_party_that_talks_while_the_other_is_silent() {
+    // One party on hold, or a phone that suppresses silence: it sends nothing at all. Everything
+    // the other party says has to be in the file, against silence, including the tail still
+    // waiting when the recording is stopped.
+    use siphon_rtp_proto::{RecordingChannels, RecordingDirection};
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    let ((phone_a, near_addr), _callee) = plain_two_party_call(&engine, "one-sided").await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = start_decoded_recording(
+        &engine,
+        "one-sided",
+        dir.path(),
+        RecordingDirection::Ingress,
+        RecordingChannels::Stereo,
+    )
+    .await;
+    for frame in 0..25u16 {
+        phone_a
+            .send_to(&g711_rtp(0, frame, 0x0A0A_0A0A, 0x20), near_addr)
+            .await
+            .expect("a send");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let (samples, _, channels) = stop_and_read_recording(&engine, &events, "one-sided", &id).await;
+    assert_eq!(channels, 2);
+    let frames = samples.as_chunks::<2>().0;
+    assert!(
+        frames.len() >= 24 * 160,
+        "the caller spoke for 25 frames and the file holds {} samples of it",
+        frames.len()
+    );
+    assert!(frames.iter().all(|frame| frame[0] != 0 && frame[1] == 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_voicemail_recorded_in_both_directions_is_not_doubled() {
+    // A single-leg call recorded with `both`: the caller, plus whatever the engine plays to it.
+    // The two shared a ring, so any prompt audio was appended to the caller's instead of mixed
+    // under it. With no prompt playing the file is exactly the caller.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_proto::{RecordingChannels, RecordingDirection};
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone, addr) = phone().await;
+    let engine_near = voicemail_call(&engine, "vm-both", addr).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = start_decoded_recording(
+        &engine,
+        "vm-both",
+        dir.path(),
+        RecordingDirection::Both,
+        RecordingChannels::Stereo,
+    )
+    .await;
+    for frame in 0..15u16 {
+        phone
+            .send_to(&g711_rtp(0, frame, 0x0A0A_0A0A, 0x20), engine_near)
+            .await
+            .expect("caller send");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let (samples, _, channels) = stop_and_read_recording(&engine, &events, "vm-both", &id).await;
+    assert_eq!(
+        channels, 1,
+        "a single-leg call records mono whatever is asked"
+    );
+    assert!(samples.len() >= 14 * 160, "got {} samples", samples.len());
+    assert!(
+        samples.len() <= 15 * 160 + 160,
+        "got {} samples",
+        samples.len()
+    );
+    assert!(samples.iter().any(|&sample| sample != 0));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_anchored_legs_gate_refusals_reach_the_call_summary() {
     // A locally answered leg is carried on a `Redirect` endpoint whose source gate the media

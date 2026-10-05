@@ -265,8 +265,9 @@ To end it yourself, name the recording so anything else on the call keeps runnin
 
 | | |
 |---|---|
-| `direction` | `ingress` (default) = what the parties sent. `egress` = what the engine sent them (its prompts and announcements) — the only way to capture the engine's own audio on a single-leg call, where there is no second party whose ingress it would be. `both` = both. |
-| `channels` | `mono` (default) mixes the sources; `stereo` puts the caller left and the callee right. A single-leg call has one source, so it records mono whatever is asked. |
+| `direction` | `ingress` (default) = what the parties sent. `egress` = what the engine sent them (its prompts and announcements) — the only way to capture the engine's own audio on a single-leg call, where there is no second party whose ingress it would be. `both` = both: what the caller said and what the caller heard, which on a two-party call is the other party plus any prompt played to the caller. |
+| `channels` | `mono` (default) sums the sources sample for sample; `stereo` puts the caller left and the other side right. A single source is mono whatever is asked (`egress` alone, or a single-leg call). |
+| silence | A party that sends nothing (a hold, a phone that suppresses silence, a prompt that has ended) is recorded as silence. The other party is never held back by more than 160 ms and nothing it says is dropped to wait. |
 | rate | The caller leg's decoded PCM rate — **not** its RTP clock, which for G.722 is half of it (RFC 3551 §4.5.2) and would replay the file at the wrong pitch. A second leg at another rate is resampled into it. |
 | where | `path` names the file exactly; otherwise `recording_dir` plus a generated `{call_id}-{recording_id}.wav`. A path that cannot be opened fails the verb immediately, with the call untouched. |
 
@@ -280,7 +281,7 @@ between its two transforms, after the source gate and the SRTP authentication, a
 the recording decodes a copy of that in a task of its own. The bridge keeps
 relaying untouched: nothing is re-keyed, the call is not moved onto the media
 path, and a recording and a WebSocket tee can sit on the same leg and be stopped
-independently. Three things differ from a call on the media path:
+independently. Two things differ from a call on the media path:
 
 - A bridge originates no audio, so what reaches one party is exactly what the
   other sent. `egress` is therefore the callee's stream, and `both` is each party
@@ -288,9 +289,6 @@ independently. Three things differ from a call on the media path:
 - Each packet is decoded as it arrives. There is no jitter buffer and no loss
   concealment in front of the file, so a lost packet is a gap rather than a
   concealed frame.
-- A two-party recording advances when both parties have delivered a frame. A
-  party that sends nothing for a while (silence suppression, a hold) holds the
-  other back, and audio older than 160 ms is dropped while it waits.
 
 A WebSocket-takeover call still has no relayed audio to tap, and is refused.
 

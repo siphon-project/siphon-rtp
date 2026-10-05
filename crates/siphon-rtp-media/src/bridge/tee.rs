@@ -49,9 +49,11 @@ const CHANNEL_DEPTH: usize = 16;
 /// one extra sample in a frame when the rate ratio is not an integer.
 const RESAMPLE_SLACK_SAMPLES: usize = 8;
 
-/// How many wire frames' worth of samples each channel's ring holds before dropping the oldest. Sized
-/// so a modest producer/consumer skew (one leg quiet for a few frames) is absorbed, while a
-/// permanently silent opposite channel can never grow the tee without bound.
+/// How many wire frames' worth of samples each channel's ring holds. Sized so a modest
+/// producer/consumer skew (one leg late by a few frames) is absorbed, and it is also how long a
+/// two-party tee waits for a party that has gone quiet before it stops waiting and pairs the other
+/// party's audio with silence — so a silent opposite channel can never grow the tee without bound,
+/// and never costs the party that is talking its audio either.
 const RING_FRAMES: usize = 8;
 
 /// Which of a call's two legs a [`WsTeeSink`] carries — the tee's wire channel index.
@@ -134,11 +136,31 @@ impl SampleRing {
     fn len(&self) -> usize {
         self.length
     }
+
+    fn capacity(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Top the ring up to `count` samples with silence. A no-op once it already holds that many.
+    fn pad_to(&mut self, count: usize) {
+        let capacity = self.buffer.len();
+        while self.length < count.min(capacity) {
+            let tail = (self.head + self.length) % capacity;
+            self.buffer[tail] = 0;
+            self.length += 1;
+        }
+    }
 }
 
 /// The shared frame assembler behind a call's tee sinks: per-channel rings in, L16 wire frames out on
 /// a bounded channel. A one-leg tee reads one ring; a stereo tee waits until **both** rings hold a
 /// full frame and interleaves them; a `channels = 1` tee over both legs mixes them (saturating sum).
+///
+/// "Waits" is bounded. A party that sends nothing — it is on hold, its phone suppresses silence, a
+/// prompt has ended, its sink has gone — is silent, and silence is part of the call. Once the other
+/// party's ring is full, or the quiet party's sink is dropped, its side of the frame is filled with
+/// silence and the frame goes out. The party that is talking is never overwritten to wait for one
+/// that is not.
 pub struct TeeMixer {
     /// Per-channel sample rings, indexed by [`TeeChannel::index`].
     rings: [SampleRing; 2],
@@ -148,6 +170,8 @@ pub struct TeeMixer {
     stereo_source: bool,
     /// When only one leg feeds it, whether that leg is the callee (so the tee reads ring 1).
     callee_only: bool,
+    /// Channels whose sink has been dropped: nothing more will arrive, so nothing waits for it.
+    closed: [bool; 2],
     /// Samples **per channel** in one wire frame.
     frame_samples: usize,
     /// Scratch for one ring read (preallocated).
@@ -201,6 +225,7 @@ impl TeeMixer {
             channels,
             stereo_source,
             callee_only,
+            closed: [false; 2],
             frame_samples,
             channel_scratch: vec![0i16; frame_samples],
             wire_scratch: vec![0i16; frame_samples * usize::from(channels)],
@@ -221,7 +246,7 @@ impl TeeMixer {
     }
 
     /// Frames dropped because the outbound channel was full or closed, plus samples overwritten in a
-    /// channel ring because the opposite channel stalled. Never a reason to stall the call.
+    /// channel ring by a single write larger than the ring. Never a reason to stall the call.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped
@@ -251,10 +276,15 @@ impl TeeMixer {
         }
     }
 
-    /// Whether every fed channel holds a full wire frame.
+    /// Whether a wire frame can go out: every fed channel holds one, or the only channel that
+    /// does not has closed and will never hold one.
     fn frame_ready(&self) -> bool {
         if self.stereo_source {
-            self.rings[0].len() >= self.frame_samples && self.rings[1].len() >= self.frame_samples
+            let full = [
+                self.rings[0].len() >= self.frame_samples,
+                self.rings[1].len() >= self.frame_samples,
+            ];
+            (full[0] || full[1]) && (full[0] || self.closed[0]) && (full[1] || self.closed[1])
         } else {
             self.rings[usize::from(self.callee_only)].len() >= self.frame_samples
         }
@@ -268,7 +298,29 @@ impl TeeMixer {
         if !self.stereo_source && index != usize::from(self.callee_only) {
             return;
         }
+        if self.stereo_source {
+            // The other party has sent nothing for as long as this ring could wait. Send what is
+            // waiting here with silence on the other side, rather than overwrite it.
+            while self.rings[index].len() + pcm.len() > self.rings[index].capacity()
+                && self.rings[index].len() >= self.frame_samples
+            {
+                self.emit();
+            }
+        }
         self.dropped += self.rings[index].push(pcm) as u64;
+        while self.frame_ready() {
+            self.emit();
+        }
+    }
+
+    /// `channel`'s sink is gone, so nothing more arrives on it. Whatever the other party still has
+    /// waiting goes out against silence instead of waiting for audio that will never come — the
+    /// tail of a recording is not lost because one side stopped first.
+    fn close(&mut self, channel: TeeChannel) {
+        if !self.stereo_source {
+            return;
+        }
+        self.closed[channel.index()] = true;
         while self.frame_ready() {
             self.emit();
         }
@@ -278,6 +330,9 @@ impl TeeMixer {
     fn emit(&mut self) {
         let samples = self.frame_samples;
         if self.stereo_source {
+            // A channel short of a frame is a party that sent nothing: its share is silence.
+            self.rings[0].pad_to(samples);
+            self.rings[1].pad_to(samples);
             self.rings[0].read_into(&mut self.channel_scratch[..samples]);
             if self.channels == 2 {
                 // Caller → even wire slots.
@@ -364,6 +419,14 @@ impl WsTeeSink {
             tag: tag.into(),
             resampler,
             resampled,
+        }
+    }
+}
+
+impl Drop for WsTeeSink {
+    fn drop(&mut self) {
+        if let Ok(mut mixer) = self.mixer.lock() {
+            mixer.close(self.channel);
         }
     }
 }
@@ -641,19 +704,113 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_opposite_channel_bounds_the_ring_instead_of_growing_it() {
-        // The callee never speaks: the caller's ring must stop at its cap, dropping the oldest.
+    fn a_silent_opposite_channel_costs_the_talking_party_nothing() {
+        // The callee never speaks (on hold, or its phone suppresses silence). The caller's ring
+        // used to overwrite its oldest audio while it waited for a stereo partner that was not
+        // coming, so a recording lost everything said in the meantime. The wait is bounded by the
+        // ring; past it the caller's audio goes out with silence on the callee's side.
         let plan = plan_ws_tee(format(8000, 2), true, false);
         let mut caller = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee-1", None);
-        for _ in 0..(RING_FRAMES + 20) {
-            caller.write_pcm(&[5i16; 160]);
+        let total = RING_FRAMES + 20;
+        let mut sent = Vec::new();
+        for frame in 0..total {
+            caller.write_pcm(&[frame as i16 + 1; 160]);
+            // Drained as it goes, as the transport does, so the bounded frame channel is not what
+            // this measures.
+            sent.extend(plan.frames.try_iter().map(|frame| samples(&frame)));
         }
         let mixer = plan.mixer.lock().expect("lock");
-        assert_eq!(mixer.forwarded(), 0, "no stereo frame without the callee");
+        assert_eq!(
+            mixer.dropped(),
+            0,
+            "nothing the caller said was overwritten"
+        );
+        assert_eq!(
+            sent.len(),
+            total - RING_FRAMES,
+            "the ring still bounds the wait: only what it cannot hold has gone out"
+        );
+        // In order, the caller on the left and silence on the right.
+        for (index, pcm) in sent.iter().enumerate() {
+            assert_eq!(pcm.len(), 320);
+            assert!(pcm
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|pair| pair[0] == index as i16 + 1 && pair[1] == 0));
+        }
+    }
+
+    #[test]
+    fn a_party_that_resumes_is_paired_with_the_other_again() {
+        let plan = plan_ws_tee(format(8000, 1), true, false);
+        let mut caller = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee-1", None);
+        let mut callee = WsTeeSink::new(TeeChannel::Callee, plan.mixer.clone(), "tee-1", None);
+        for _ in 0..(RING_FRAMES + 2) {
+            caller.write_pcm(&[10i16; 160]);
+        }
+        while plan.frames.try_recv().is_ok() {}
+        // The callee comes back: its audio is mixed with the caller's, not appended after it.
+        callee.write_pcm(&[5i16; 160]);
+        let pcm = samples(&plan.frames.try_recv().expect("a mixed frame"));
+        assert!(pcm.iter().all(|&sample| sample == 15));
+    }
+
+    #[test]
+    fn a_partial_frame_from_the_quiet_party_is_kept_and_padded() {
+        let plan = plan_ws_tee(format(8000, 2), true, false);
+        let mut caller = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee-1", None);
+        let mut callee = WsTeeSink::new(TeeChannel::Callee, plan.mixer.clone(), "tee-1", None);
+        callee.write_pcm(&[7i16; 40]);
+        for _ in 0..=RING_FRAMES {
+            caller.write_pcm(&[3i16; 160]);
+        }
+        let pcm = samples(&plan.frames.try_recv().expect("a frame"));
+        let right: Vec<i16> = pcm.as_chunks::<2>().0.iter().map(|pair| pair[1]).collect();
+        assert!(right[..40].iter().all(|&sample| sample == 7));
+        assert!(right[40..].iter().all(|&sample| sample == 0));
+    }
+
+    #[test]
+    fn dropping_one_partys_sink_flushes_what_the_other_still_holds() {
+        // The end of a recording: one side's sink goes first. What the other had waiting for it
+        // must reach the file, and what it sends afterwards must not wait at all.
+        let plan = plan_ws_tee(format(8000, 2), true, false);
+        let mut caller = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee-1", None);
+        let callee = WsTeeSink::new(TeeChannel::Callee, plan.mixer.clone(), "tee-1", None);
+        caller.write_pcm(&[9i16; 320]);
         assert!(
-            mixer.dropped() >= 20 * 160,
-            "the ring dropped the oldest samples rather than growing: {}",
-            mixer.dropped()
+            plan.frames.try_recv().is_err(),
+            "still waiting for the callee"
+        );
+        drop(callee);
+        assert!(plan.frames.try_recv().is_ok());
+        assert!(
+            plan.frames.try_recv().is_ok(),
+            "both waiting frames went out"
+        );
+        caller.write_pcm(&[9i16; 160]);
+        assert!(
+            plan.frames.try_recv().is_ok(),
+            "nothing waits for a party that is gone"
+        );
+        drop(caller);
+        assert!(
+            plan.frames.try_recv().is_err(),
+            "nothing is invented at the end"
+        );
+    }
+
+    #[test]
+    fn a_single_write_larger_than_the_ring_is_still_bounded() {
+        let plan = plan_ws_tee(format(8000, 2), true, false);
+        let mut caller = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee-1", None);
+        caller.write_pcm(&vec![1i16; 160 * (RING_FRAMES + 5)]);
+        let mixer = plan.mixer.lock().expect("lock");
+        assert_eq!(
+            mixer.dropped(),
+            5 * 160,
+            "only the excess over the ring is lost"
         );
     }
 

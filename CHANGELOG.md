@@ -7,6 +7,20 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A decoded recording of a two-party call mixes the parties.** On a call carried by the media
+  path, a `wav` recording put both parties into one buffer, which laid their audio end to end
+  instead of summing it: ten frames from each side came out as twenty frames alternating between
+  them, and thirty with `direction: "both"`. `egress` in stereo wrote an empty file. Each source
+  now has its own channel, so `mono` is a true sum and `stereo` is caller left, other side right.
+  `both` is what the caller said and what the caller heard, and `egress` alone is mono.
+- **A silent party no longer costs the other its audio.** A two-party recording or stereo
+  WebSocket tee waited for a frame from each side, and while one side sent nothing (a hold, a
+  phone that suppresses silence) the other side's audio older than 160 ms was overwritten. The
+  quiet side is now filled with silence once the wait reaches 160 ms, and what is still waiting
+  when a recording stops is written out instead of discarded.
+
 ### Added
 
 - **A decoded recording can be started on a crypto bridge.** `start_recording` with `format: "wav"`
