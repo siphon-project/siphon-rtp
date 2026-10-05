@@ -7,6 +7,22 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An SRTP answer to a leg that was offered plain RTP is refused.** A callee offered `RTP/AVP`
+  that answered `RTP/SAVP` with its own `a=crypto` was accepted as a plain relay: the engine
+  forwarded its ciphertext to a caller that had negotiated plain RTP, sent it plaintext it
+  expected encrypted, and answered the caller's `RTP/AVP` offer with `RTP/SAVP` carrying the
+  callee's key. The answer is now refused with `secure-answer-to-plain-offer` (RFC 3264 §6.1) and
+  the call is left as it was. A leg that should be on SRTP has to be offered it, with
+  `transport_protocol`.
+- **A keepalive no longer hides why a secure leg is being dropped.** Each flow warned once about
+  a datagram it could not decrypt, whatever the reason. A phone's NAT keepalive on the media port
+  is too short to be SRTP, so it took that one warning as `packet too short`, and the
+  authentication failure on every packet after it was logged at `debug`. Each reason now has its
+  own first warning (failed authentication, unknown MKI, not SRTP at all), and it carries the
+  datagram's size, SSRC and sequence number.
+
 ## [0.12.0] — 2026-10-05
 
 ### Added

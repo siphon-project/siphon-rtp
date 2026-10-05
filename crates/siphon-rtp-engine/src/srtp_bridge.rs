@@ -391,39 +391,6 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         self.dtls.remove_plain_tap(endpoint, tag);
     }
 
-    /// Log a secure peer's datagram that failed to decrypt. A replay is routine and stays at `debug`;
-    /// anything else (a wrong key, an MKI the key does not carry, a truncated packet) means this
-    /// direction of the call is inaudible, so the first one per flow is a `warn`, once.
-    fn report_ingress_failure(
-        &self,
-        packet: &RxPacket,
-        party: BridgeLeg,
-        error: &siphon_rtp_srtp::SrtpError,
-    ) {
-        let first = !matches!(error, siphon_rtp_srtp::SrtpError::Replayed)
-            && self
-                .flows
-                .get(&packet.endpoint)
-                .is_some_and(|flow| flow.refusals.first(Refusal::NotAuthenticated));
-        if first {
-            tracing::warn!(
-                target: "siphon_rtp::media",
-                endpoint = ?packet.endpoint,
-                source = %packet.source,
-                ?party,
-                %error,
-                "bridge cannot decrypt the secure peer's media; this direction is dropped \
-                 (counted in packets_dropped, logged once per negotiation)"
-            );
-        } else {
-            tracing::debug!(
-                %error,
-                ?party,
-                "bridge ingress decrypt failed; dropping packet"
-            );
-        }
-    }
-
     /// Handle one redirected datagram: gate the source, apply the flow's crypto, and forward it.
     /// Anything that fails to gate or transform is dropped (never forwarded into the void).
     pub async fn handle(&self, packet: RxPacket) {
@@ -490,7 +457,11 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 leg.unprotect(&packet.data, &mut decrypted)
             };
             if let Err(error) = transformed {
-                self.report_ingress_failure(&packet, side.party, &error);
+                let party = match side.party {
+                    BridgeLeg::Near => "near",
+                    BridgeLeg::Far => "far",
+                };
+                refusals.log_undecryptable(&error, &packet.data, party, context);
                 self.datapath.note_dropped(packet.endpoint);
                 return;
             }

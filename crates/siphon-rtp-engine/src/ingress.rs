@@ -61,6 +61,13 @@ pub(crate) enum Refusal {
     NewSource,
     /// The datagram failed SRTP authentication or replay protection (RFC 3711 §3.3).
     NotAuthenticated,
+    /// The datagram is not SRTP at all: too short to hold a header and an authentication tag, or
+    /// not RTP version 2 (RFC 3550 §5.1). A NAT keepalive on the media port is the usual one. It
+    /// says nothing about the peer's key, so it is kept apart from [`Self::NotAuthenticated`] — a
+    /// keepalive that arrives first must not use up the one warning a real key mismatch gets.
+    NotSrtp,
+    /// The datagram's MKI is not the one the peer's `a=crypto` signalled (RFC 3711 §3.3 step 1).
+    UnknownMki,
 }
 
 impl Refusal {
@@ -69,6 +76,47 @@ impl Refusal {
             Self::UnsignalledSource => 1,
             Self::NewSource => 2,
             Self::NotAuthenticated => 4,
+            Self::NotSrtp => 8,
+            Self::UnknownMki => 16,
+        }
+    }
+
+    /// The refusal an SRTP `unprotect` failure amounts to. `None` for a replay, which is routine
+    /// (a duplicated datagram) and never worth a warning.
+    pub(crate) const fn of_unprotect(error: &siphon_rtp_srtp::SrtpError) -> Option<Self> {
+        use siphon_rtp_srtp::SrtpError;
+        match error {
+            SrtpError::Replayed => None,
+            SrtpError::TooShort | SrtpError::BadVersion => Some(Self::NotSrtp),
+            SrtpError::UnknownMki => Some(Self::UnknownMki),
+            SrtpError::AuthFailed => Some(Self::NotAuthenticated),
+        }
+    }
+
+    /// What this refusal means for the call, for the one `warn` it gets per flow.
+    const fn explanation(self) -> &'static str {
+        match self {
+            Self::UnsignalledSource => {
+                "refused media from a source the SDP did not signal; the direction stays dropped \
+                 until the peer sends from the signalled address (a NATed peer that signals its \
+                 private address needs the symmetric flag)"
+            }
+            Self::NewSource => {
+                "refused media from a new source that could not prove it is the latched stream"
+            }
+            Self::NotAuthenticated => {
+                "refused media that failed SRTP authentication; the peer is not sending under \
+                 the key its a=crypto carried in this negotiation, so this direction is dropped"
+            }
+            Self::NotSrtp => {
+                "dropped a datagram that is not SRTP (too short for a header and tag, or not RTP \
+                 version 2), typically a NAT keepalive on the media port; it says nothing about \
+                 the peer's key"
+            }
+            Self::UnknownMki => {
+                "refused SRTP whose MKI is not the one the peer's a=crypto signalled; this \
+                 direction is dropped"
+            }
         }
     }
 }
@@ -139,20 +187,7 @@ impl RefusalLog {
             );
             return;
         }
-        let what = match refusal {
-            Refusal::UnsignalledSource => {
-                "refused media from a source the SDP did not signal; the direction stays dropped \
-                 until the peer sends from the signalled address (a NATed peer that signals its \
-                 private address needs the symmetric flag)"
-            }
-            Refusal::NewSource => {
-                "refused media from a new source that could not prove it is the latched stream"
-            }
-            Refusal::NotAuthenticated => {
-                "refused media that failed SRTP authentication; the peer's key does not match the \
-                 negotiated one"
-            }
-        };
+        let what = refusal.explanation();
         tracing::warn!(
             target: "siphon_rtp::media",
             component,
@@ -161,6 +196,64 @@ impl RefusalLog {
             %source,
             ?expected,
             "{what} (counted in packets_dropped, logged once per flow)"
+        );
+    }
+
+    /// Log a datagram from the signalled peer that SRTP `unprotect` refused.
+    ///
+    /// Each *reason* gets its own first `warn` on the flow, carrying what tells one cause from
+    /// another without a capture: the datagram's size, and the SSRC and sequence number its header
+    /// carries in the clear. One shared warning for every reason hid the reason that mattered: a
+    /// four-byte keepalive logged `packet too short` and every authentication failure after it
+    /// went to `debug`.
+    pub(crate) fn log_undecryptable(
+        &self,
+        error: &siphon_rtp_srtp::SrtpError,
+        datagram: &[u8],
+        party: &'static str,
+        context: RefusalContext<'_>,
+    ) {
+        let RefusalContext {
+            component,
+            call_id,
+            endpoint,
+            source,
+            ..
+        } = context;
+        let refusal = Refusal::of_unprotect(error);
+        if !refusal.is_some_and(|refusal| self.first(refusal)) {
+            tracing::debug!(
+                target: "siphon_rtp::media",
+                component,
+                call_id,
+                ?endpoint,
+                %source,
+                party,
+                %error,
+                "datagram from the secure peer dropped"
+            );
+            return;
+        }
+        // RFC 3550 §5.1: both sit in the fixed header, which SRTP leaves in the clear.
+        let header = (datagram.len() >= 12 && datagram[0] >> 6 == 2).then(|| {
+            (
+                u32::from_be_bytes([datagram[8], datagram[9], datagram[10], datagram[11]]),
+                u16::from_be_bytes([datagram[2], datagram[3]]),
+            )
+        });
+        let what = refusal.map_or("", Refusal::explanation);
+        tracing::warn!(
+            target: "siphon_rtp::media",
+            component,
+            call_id,
+            ?endpoint,
+            %source,
+            party,
+            %error,
+            bytes = datagram.len(),
+            ssrc = ?header.map(|(ssrc, _)| ssrc),
+            sequence = ?header.map(|(_, sequence)| sequence),
+            "{what} (counted in packets_dropped, logged once per reason per flow)"
         );
     }
 }
@@ -183,6 +276,93 @@ mod tests {
         assert!(log.first(Refusal::NotAuthenticated));
         assert!(!log.first(Refusal::NewSource));
         assert!(!log.first(Refusal::NotAuthenticated));
+    }
+
+    fn context() -> RefusalContext<'static> {
+        RefusalContext {
+            component: "test",
+            call_id: "call",
+            endpoint: EndpointId(1),
+            source: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 4000),
+            expected: SourceFilter::Exact(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+        }
+    }
+
+    #[test]
+    fn a_keepalive_does_not_use_up_the_warning_a_key_mismatch_gets() {
+        // A phone's NAT keepalive reaches the media port ahead of its audio. It is too short to
+        // be SRTP, and it used to take the flow's only decrypt warning, so the authentication
+        // failure on every packet after it was logged at `debug` and never seen.
+        use siphon_rtp_srtp::SrtpError;
+        let log = RefusalLog::default();
+        log.log_undecryptable(&SrtpError::TooShort, &[0u8; 4], "far", context());
+        assert!(!log.first(Refusal::NotSrtp), "the keepalive was reported");
+        assert!(
+            log.first(Refusal::NotAuthenticated),
+            "and the key mismatch still has its own first warning"
+        );
+    }
+
+    #[test]
+    fn each_unprotect_failure_is_reported_as_what_it_is() {
+        use siphon_rtp_srtp::SrtpError;
+        assert_eq!(
+            Refusal::of_unprotect(&SrtpError::TooShort),
+            Some(Refusal::NotSrtp)
+        );
+        assert_eq!(
+            Refusal::of_unprotect(&SrtpError::BadVersion),
+            Some(Refusal::NotSrtp)
+        );
+        assert_eq!(
+            Refusal::of_unprotect(&SrtpError::AuthFailed),
+            Some(Refusal::NotAuthenticated)
+        );
+        assert_eq!(
+            Refusal::of_unprotect(&SrtpError::UnknownMki),
+            Some(Refusal::UnknownMki)
+        );
+        assert_eq!(Refusal::of_unprotect(&SrtpError::Replayed), None);
+    }
+
+    #[test]
+    fn a_replay_is_never_a_warning_and_uses_up_none() {
+        use siphon_rtp_srtp::SrtpError;
+        let log = RefusalLog::default();
+        log.log_undecryptable(&SrtpError::Replayed, &[0x80; 182], "far", context());
+        for refusal in [
+            Refusal::NotAuthenticated,
+            Refusal::NotSrtp,
+            Refusal::UnknownMki,
+        ] {
+            assert!(log.first(refusal));
+        }
+    }
+
+    #[test]
+    fn every_reason_warns_once_and_a_short_datagram_is_read_safely() {
+        use siphon_rtp_srtp::SrtpError;
+        let log = RefusalLog::default();
+        for datagram in [&[][..], &[0x80; 11], &[0x80; 12], &[0x00; 40]] {
+            log.log_undecryptable(&SrtpError::AuthFailed, datagram, "near", context());
+            log.log_undecryptable(&SrtpError::UnknownMki, datagram, "near", context());
+        }
+        assert!(!log.first(Refusal::NotAuthenticated));
+        assert!(!log.first(Refusal::UnknownMki));
+        assert!(log.first(Refusal::NotSrtp));
+    }
+
+    #[test]
+    fn the_bit_of_each_refusal_is_its_own() {
+        let all = [
+            Refusal::UnsignalledSource,
+            Refusal::NewSource,
+            Refusal::NotAuthenticated,
+            Refusal::NotSrtp,
+            Refusal::UnknownMki,
+        ];
+        let combined = all.iter().fold(0u8, |bits, refusal| bits | refusal.bit());
+        assert_eq!(combined.count_ones() as usize, all.len());
     }
 
     #[test]

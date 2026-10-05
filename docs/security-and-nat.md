@@ -1611,6 +1611,12 @@ WebSocket takeover never counted an authentication failure as liveness and still
 A refusal is also logged once per flow and kind at `warn` (`ingress::RefusalLog`), naming the source
 the datagram came from and the gate it failed — the signal that a NATed peer is signalling its private
 address. Every later refusal of the same kind is `debug`, so a hostile stream cannot flood the log.
+A datagram from the signalled peer that SRTP `unprotect` refuses is logged by *reason*, each with
+its own first warning: failed authentication (the peer is not sending under the key its `a=crypto`
+carried), an MKI the key does not carry, and a datagram that is not SRTP at all. The last is usually
+a NAT keepalive on the media port and says nothing about the key, so it must not take the warning a
+real key mismatch gets. The warning carries the datagram's size and the SSRC and sequence number its
+header carries in the clear (RFC 3550 §5.1), which is what tells the causes apart without a capture.
 SRTCP on a takeover leg is not counted: it has no consumer there and is discarded by design, and
 counting it would give every healthy secure call a drop every few seconds.
 

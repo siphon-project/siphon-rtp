@@ -676,6 +676,29 @@ fn log_answer_applied(
     );
 }
 
+/// Refuse an SDES-SRTP answer from a leg the engine offered plain RTP.
+///
+/// RFC 3264 §6.1: an answer keeps the transport its offer carried. B was offered this stream with
+/// no key of the engine's, and answers `RTP/SAVP` with its own `a=crypto` (RFC 4568). Nothing can
+/// carry that: B will send SRTP nobody holds the context for, and expects SRTP under a key it was
+/// never given. Relaying it, which is what a plain pipeline does, hands B's ciphertext to a party
+/// that negotiated plain RTP and answers that party's `RTP/AVP` offer with `RTP/SAVP` carrying B's
+/// key. Refusing tells the controller that this leg has to be *offered* SRTP.
+fn refuse_secure_answer_to_plain_offer(
+    info: &sdp::MediaInfo,
+    far_offered_secure: bool,
+) -> Result<(), Box<CmdResult>> {
+    if !info.secure || info.dtls || far_offered_secure {
+        return Ok(());
+    }
+    Err(Box::new(CmdResult::Error {
+        reason: "answer: secure-answer-to-plain-offer: the answer is RTP/SAVP with a=crypto, but \
+                 this leg was offered plain RTP and holds no key of the engine's (RFC 3264 §6.1). \
+                 Offer it SRTP with transport_protocol RTP/SAVP, or have it answer RTP/AVP."
+            .to_string(),
+    }))
+}
+
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Snapshot what an answer reads from the call, refusing a call `client` does not own and one
     /// the engine answered itself.
@@ -983,6 +1006,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let far_received_from =
             far_received_from_hint(reversed.is_some(), profile, stored_far_received_from);
         let addresses = answer_gate_addresses(&near, &info, offer_received_from, far_received_from);
+
+        if reversed.is_none() {
+            if let Err(refusal) =
+                refuse_secure_answer_to_plain_offer(&info, far_local_crypto.is_some() || far_dtls)
+            {
+                return *refusal;
+            }
+        }
 
         // Resolve how this call's media is carried — an SRTP bridge (secure far leg), the userspace
         // media slow path (transcode / record), or the in-datapath plain relay — before the SDP is
