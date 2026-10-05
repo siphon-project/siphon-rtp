@@ -610,16 +610,17 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         {
             self.flows.remove(&previous);
         }
-        // A new association on a live call replaces its flows; a tee or a recording was attached to
-        // the call, not to one association, so its taps move to the rebuilt flows.
+        // A new association on a live call replaces its flows; a tee, a recording or a lawful
+        // interception was attached to the call, not to one association, so its taps move to the
+        // rebuilt flows. A flow that was handing its media to the pipeline carried none.
         let carried_taps = |endpoint: EndpointId| {
             self.flows
                 .get(&endpoint)
-                .map(|previous| previous.plain_taps.clone())
+                .map(|previous| (previous.x3.clone(), previous.plain_taps.clone()))
                 .unwrap_or_default()
         };
-        let plain_side_taps = carried_taps(plan.plain_endpoint);
-        let secure_side_taps = carried_taps(plan.secure_endpoint);
+        let (plain_side_x3, plain_side_taps) = carried_taps(plan.plain_endpoint);
+        let (secure_side_x3, secure_side_taps) = carried_taps(plan.secure_endpoint);
         self.flows.insert(
             plan.plain_endpoint,
             Flow {
@@ -630,7 +631,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: None,
                 secure_dst: Some(destination.clone()),
                 secure: secure.clone(),
-                x3: None,
+                x3: plain_side_x3,
                 plain_taps: plain_side_taps,
                 rtcp_only: false,
                 refusals: Arc::new(RefusalLog::default()),
@@ -659,7 +660,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: Some(plan.plain_dst),
                 secure_dst: None,
                 secure,
-                x3: None,
+                x3: secure_side_x3,
                 plain_taps: secure_side_taps,
                 rtcp_only: false,
                 refusals: Arc::new(RefusalLog::default()),
@@ -1519,6 +1520,107 @@ mod tests {
             tee_received.try_recv().is_err(),
             "the removed tap was offered nothing more"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn taps_survive_a_new_association_on_the_same_call() {
+        // A re-INVITE that changes the DTLS association re-registers the call's flows. A lawful
+        // interception and a recording were attached to the call, so both must still be fed once
+        // the new association has keyed.
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        for endpoint in [plain.id, secure.id] {
+            datapath
+                .install_flow(endpoint, FlowAction::Redirect)
+                .expect("redirect");
+        }
+        let phone_a = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a");
+        let addr_a = phone_a.local_addr().expect("addr a");
+        let peer_b = Arc::new(
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind b"),
+        );
+        let addr_b = peer_b.local_addr().expect("addr b");
+        let engine_cert = DtlsCertificate::generate().expect("engine cert");
+        let peer_cert = DtlsCertificate::generate().expect("peer cert");
+        let plan = || DtlsCallPlan {
+            plain_endpoint: plain.id,
+            plain_source: SourceFilter::Exact(addr_a.ip()),
+            plain_dst: addr_a,
+            secure_endpoint: secure.id,
+            secure_source: SourceFilter::Exact(addr_b.ip()),
+            secure_dst: addr_b,
+            secure_local: secure.local_addr,
+            certificate: engine_cert.clone(),
+            role: DtlsRole::Server,
+            peer_fingerprint: peer_cert.fingerprint(),
+            gate_on_ice: false,
+            ice_validated: None,
+            plain_rtcp: None,
+        };
+        let bridge = Arc::new(DtlsBridge::new(datapath.clone()));
+        bridge.register(plan());
+        let (factory, delivery) = crate::x3::x3_channel(32);
+        assert!(bridge.set_x3_tap(
+            secure.id,
+            factory.tap(
+                secure.local_addr,
+                siphon_rtp_li::PayloadDirection::FromTarget
+            ),
+        ));
+        let (recording, recorded) = flume::bounded(32);
+        assert!(bridge.add_plain_tap(secure.id, "rec-1", recording));
+
+        // The call is renegotiated onto a new association before any media crosses.
+        bridge.register(plan());
+
+        let rx = datapath.rx();
+        let dispatch = bridge.clone();
+        tokio::spawn(async move {
+            while let Ok(packet) = rx.recv_async().await {
+                dispatch.handle(packet).await;
+            }
+        });
+        let mut peer_leg = peer_handshake(
+            peer_b.clone(),
+            secure.local_addr,
+            &peer_cert,
+            &engine_cert.fingerprint(),
+        )
+        .await;
+        let media = rtp(1000, 0x0B0B_0B0B);
+        let mut relayed = false;
+        for _ in 0..25 {
+            let mut sealed = Vec::new();
+            peer_leg.protect(&media, &mut sealed).expect("peer protect");
+            peer_b
+                .send_to(&sealed, secure.local_addr)
+                .await
+                .expect("b send");
+            let mut buffer = [0u8; 2048];
+            if timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer))
+                .await
+                .is_ok()
+            {
+                relayed = true;
+                break;
+            }
+        }
+        assert!(relayed, "the new association relays");
+        let delivered = timeout(RECV_TIMEOUT, delivery.packets.recv_async())
+            .await
+            .expect("the interception outlives the new association")
+            .expect("delivery open");
+        assert_eq!(delivered.payload.as_slice(), media.as_slice());
+        let copy = timeout(RECV_TIMEOUT, recorded.recv_async())
+            .await
+            .expect("the recording outlives the new association")
+            .expect("tap open");
+        assert_eq!(copy.as_ref(), media.as_slice());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
