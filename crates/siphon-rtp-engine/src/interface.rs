@@ -52,8 +52,9 @@ pub struct Interface {
 impl Interface {
     /// The interface's address of **exactly** `family`, or `None` when it serves no address of that
     /// family. The engine never cross-family-substitutes a bind IP (a v4 address in a `c=IN IP6` line
-    /// is invalid SDP); a `None` here means "fall back to the datapath's family default" — so a v6 call
-    /// on a v4-only interface still binds the datapath's v6 default rather than the wrong family.
+    /// is invalid SDP); a `None` here means "ask the datapath for its own address of that family".
+    /// A datapath that has none refuses the leg, so a v6 call on a v4-only relay fails loudly
+    /// instead of binding either the wrong family or an address the peer cannot reach.
     #[must_use]
     pub fn exact_address_for(&self, family: AddressFamily) -> Option<InterfaceAddress> {
         self.addresses

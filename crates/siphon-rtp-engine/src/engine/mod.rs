@@ -1227,9 +1227,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// `c=IN IP6` call gets v6 engine endpoints and a `c=IN IP4` call gets v4.
     ///
     /// `bind` selects the local source IP (named-interface selection): `Some(ip)` binds/emits from that
-    /// exact IP via [`Datapath::alloc_endpoint_on`]; `None` uses the datapath's family default
-    /// ([`Datapath::alloc_endpoint_for`]). The caller resolves `bind` from the interface table so a
-    /// v6 leg on a v4-only interface still binds the datapath's v6 default rather than a wrong-family IP.
+    /// exact IP via [`Datapath::alloc_endpoint_on`]; `None` asks the datapath for its own address of
+    /// that family ([`Datapath::alloc_endpoint_for`]). The caller resolves `bind` from the interface
+    /// table, so a v6 leg on a v4-only interface is never bound to a wrong-family IP; when the
+    /// datapath has no v6 address either, the allocation fails and the offer is refused.
     async fn alloc_endpoints(
         &self,
         count: usize,
