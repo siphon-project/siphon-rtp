@@ -116,7 +116,7 @@ dependencies = [
  "nom",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
 ]
 
@@ -756,9 +756,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-util"
-version = "0.1.20"
+version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
+checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
 dependencies = [
  "bytes",
  "http",
@@ -1405,7 +1405,7 @@ dependencies = [
  "ring",
  "sha1 0.10.7",
  "subtle",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "zeroize",
 ]
 
@@ -1441,7 +1441,7 @@ dependencies = [
  "rand",
  "serde",
  "substring",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "url",
  "winapi",
 ]
@@ -1648,7 +1648,7 @@ dependencies = [
  "siphon-rtp-srtp",
  "siphon-rtp-stun",
  "siphon-rtp-turn",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
@@ -1665,7 +1665,7 @@ name = "siphon-rtp-codec"
 version = "0.11.0"
 dependencies = [
  "siphon-rtp-simd",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1678,7 +1678,7 @@ dependencies = [
  "siphon-rtp-ebpf-common",
  "siphon-rtp-stun",
  "socket2",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -1688,7 +1688,7 @@ name = "siphon-rtp-dsp"
 version = "0.11.0"
 dependencies = [
  "siphon-rtp-simd",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1701,7 +1701,7 @@ dependencies = [
  "sha1 0.10.7",
  "sha2",
  "siphon-rtp-srtp",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1735,7 +1735,7 @@ name = "siphon-rtp-ice"
 version = "0.11.0"
 dependencies = [
  "siphon-rtp-stun",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1753,7 +1753,7 @@ dependencies = [
  "serde_json",
  "siphon-rtp-codec",
  "siphon-rtp-dsp",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -1764,7 +1764,7 @@ name = "siphon-rtp-ngcompat"
 version = "0.11.0"
 dependencies = [
  "siphon-rtp-proto",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -1775,7 +1775,7 @@ version = "0.11.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1793,7 +1793,7 @@ dependencies = [
  "hmac",
  "sha1 0.10.7",
  "subtle",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1801,7 +1801,7 @@ name = "siphon-rtp-stun"
 version = "0.11.0"
 dependencies = [
  "getrandom 0.3.4",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1816,7 +1816,7 @@ dependencies = [
  "rustls-pki-types",
  "siphon-rtp-datapath",
  "siphon-rtp-stun",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -1935,11 +1935,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.20",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -1955,9 +1955,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2080,9 +2080,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.5"
+version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
  "tokio",
@@ -2230,7 +2230,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sha1 0.11.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2543,7 +2543,7 @@ dependencies = [
  "oid-registry 0.8.1",
  "ring",
  "rusticata-macros",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
 ]
 
