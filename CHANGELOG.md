@@ -28,6 +28,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 - **A renegotiation no longer silences a tee on an SDES bridge.** Re-registering a call's bridge
   flows (any re-INVITE) built them with no tap, so a tee attached before a hold heard nothing
   after it while still reporting itself attached. The taps now move to the rebuilt flows.
+### Changed
+
+- **The HEP collector can be named, and a bad value is refused.** `SIPHON_RTP_HEP_COLLECTOR` took
+  an `ip:port` only, so a deployment that addresses its collector by service name could not use
+  it, and a value that did not parse turned export off behind one `warn` line while the node kept
+  running. It now takes `host:port` with a DNS name or an IP literal. A malformed value, or a
+  `SIPHON_RTP_HEP_AGENT_ID` that is not a number (which used to be read as `0`), fails the start.
+  A well-formed collector that cannot be resolved or connected yet does not hold media back: the
+  engine starts, reports it once at `error`, and retries until export begins. Unset or empty
+  still means off.
 
 ## [0.11.0] — 2026-09-30
 
