@@ -28134,6 +28134,133 @@ async fn a_voicemail_recorded_in_both_directions_is_not_doubled() {
     assert!(samples.iter().any(|&sample| sample != 0));
 }
 
+/// Attach a WebSocket tee of the callee's audio and wait for its `start`.
+async fn attach_callee_tee(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+) -> flume::Receiver<tokio_tungstenite::tungstenite::Message> {
+    let (uri, frames) = tee_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsTee {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                ws_uri: uri,
+                direction: WsTeeDirection::Callee,
+                channels: None,
+                sample_rate: None,
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    expect_tee_start(&frames).await;
+    frames
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tee_re_attached_to_a_bridged_call_streams_to_the_new_server() {
+    // `attach_ws_tee` on a call that already has a tee replaces it. The new tee's taps went onto
+    // the bridge under the stream id the old one used, and stopping the old tee then removed that
+    // id — so the replacement reported itself attached and streamed nothing.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "bridge-retee".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let far_addr = sdp::parse(&ok_sdp_text(&offer)).expect("offer").remote_rtp;
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "bridge-retee".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+
+    let _first = attach_callee_tee(&engine, "bridge-retee").await;
+    let second = attach_callee_tee(&engine, "bridge-retee").await;
+    assert_eq!(
+        engine.ws_tee_count(),
+        1,
+        "the second attach replaced the first"
+    );
+
+    let mut seal = SrtpContext::from_key_material(&callee_key.key);
+    for sequence in 0..6u16 {
+        let mut sealed = Vec::new();
+        seal.protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x20), &mut sealed)
+            .expect("B encrypts");
+        phone_b.send_to(&sealed, far_addr).await.expect("b send");
+    }
+    let audio = next_tee_audio(&second).await;
+    assert!(
+        audio.iter().any(|&byte| byte != 0),
+        "the replacement tee hears the callee"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tee_re_attached_to_a_relayed_call_streams_to_the_new_server() {
+    // The same replacement on a call carried by the media path, where the old tee's sinks share a
+    // tag with the new one's and its teardown releases the hold that keeps the call decoded.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_caller, (phone_b, far_addr)) = plain_two_party_call(&engine, "plain-retee").await;
+
+    let _first = attach_callee_tee(&engine, "plain-retee").await;
+    let second = attach_callee_tee(&engine, "plain-retee").await;
+    assert_eq!(
+        engine.ws_tee_count(),
+        1,
+        "the second attach replaced the first"
+    );
+    assert!(
+        engine.media().is_media_call("plain-retee"),
+        "the call is still held in the decoding pipeline for the tee it has"
+    );
+
+    for sequence in 0..6u16 {
+        phone_b
+            .send_to(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x20), far_addr)
+            .await
+            .expect("b send");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let audio = next_tee_audio(&second).await;
+    assert!(
+        audio.iter().any(|&byte| byte != 0),
+        "the replacement tee hears the callee"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_anchored_legs_gate_refusals_reach_the_call_summary() {
     // A locally answered leg is carried on a `Redirect` endpoint whose source gate the media

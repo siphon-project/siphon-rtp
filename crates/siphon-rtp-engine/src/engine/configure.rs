@@ -92,6 +92,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             )),
             recordings: DashMap::new(),
             next_recording_id: std::sync::atomic::AtomicU64::new(1),
+            next_tee_attach: std::sync::atomic::AtomicU64::new(1),
             ws_bridges: DashMap::new(),
             // Lawful interception is unconfigured unless the daemon supplies `x3_*`, and `attach_x3`
             // refuses while it is — never accepted and left delivering nowhere.

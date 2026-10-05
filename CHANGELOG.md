@@ -25,6 +25,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   without the X3 tap. The call kept relaying, the interception still reported itself attached,
   and no content was delivered from that point on. The tap now moves to the rebuilt flow, as the
   tee's and the recording's do.
+- **Re-attaching a tee streams to the new server.** `attach_ws_tee` on a call that already had a
+  tee replaces it, but the replacement's sinks carried the same label as the old tee's, so
+  tearing the old one down removed both. On a call carried by the media path it also released
+  the hold that keeps the call decoded. The second attach answered `ok`, announced
+  `ws_tee_started` and streamed nothing. Each attach now labels its own taps, and a replacement
+  keeps the hold.
 
 ### Added
 

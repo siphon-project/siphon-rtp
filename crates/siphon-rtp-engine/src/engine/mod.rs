@@ -1159,6 +1159,9 @@ pub struct Engine<D: Datapath> {
     recordings: DashMap<String, AudioRecording>,
     /// Monotonic source for `recording_id`, so two recordings on one call never collide.
     next_recording_id: std::sync::atomic::AtomicU64,
+    /// Numbers each tee attach, so a replacement tee's taps never share a label with the tee it
+    /// replaces (see `WsTee::tap_tag`).
+    next_tee_attach: std::sync::atomic::AtomicU64,
     /// Live WebSocket **takeover** bridges, keyed by call-id — the control-plane half of what the
     /// [`crate::ws_bridge::WsRegistry`] routes. One per call; attaching again re-points it. Held
     /// here for the same reason `ws_tees` is: the `ws_bridge_ended` event is emitted during teardown,

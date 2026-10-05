@@ -14,8 +14,12 @@ use super::{
 };
 
 pub(super) struct WsTee {
-    /// The tee's stream id — also the fork tag on every leg it taps, and the event correlator.
+    /// The tee's stream id — the event correlator, and what the consumer sees in `start`.
     stream_id: String,
+    /// The label on every sink and bridge tap this tee attached. Unique per attach, unlike the
+    /// stream id, which a call's replacement tee reuses: the new tee's taps go on before the old
+    /// one's come off, so removing the old tee by a shared label would take the new one's with it.
+    tap_tag: String,
     /// The call's offerer tag and owning control client, copied here at attach time: teardown runs
     /// *after* `delete` has already removed the call from the registry, so the end event cannot look
     /// them up any more.
@@ -220,6 +224,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         let plan = plan_ws_tee(format, stereo_source, !tap_caller);
         let stream_id = format!("tee-{call_id}");
+        let tap_tag = format!(
+            "{stream_id}#{}",
+            self.next_tee_attach
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
 
         // Dial before attaching anything, so a bad URI fails cleanly with nothing to unwind.
         let connector = tokio_tungstenite::Connector::Rustls(self.ws_tls_client_config());
@@ -239,12 +248,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             for ((source_a, channel, resampler), (endpoint, decoder, payload_type)) in
                 tap_plan.into_iter().zip(bridge_decoders)
             {
-                let sink =
-                    WsTeeSink::new(channel, plan.mixer.clone(), stream_id.clone(), resampler);
+                let sink = WsTeeSink::new(channel, plan.mixer.clone(), tap_tag.clone(), resampler);
                 let (packets, received) = flume::bounded(BRIDGE_TAP_QUEUE);
-                if !self.bridge.add_plain_tap(endpoint, &stream_id, packets) {
+                if !self.bridge.add_plain_tap(endpoint, &tap_tag, packets) {
                     for (attached, task) in bridge_taps.drain(..) {
-                        self.bridge.remove_plain_tap(attached, &stream_id);
+                        self.bridge.remove_plain_tap(attached, &tap_tag);
                         let _ = task.await;
                     }
                     return Err("the call's crypto bridge is no longer installed".to_string());
@@ -259,13 +267,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 tapped_legs.push(source_a);
             }
         } else {
-            self.attach_pipeline_tee(call_id, &stream_id, &plan, tap_plan, &mut tapped_legs)
+            self.attach_pipeline_tee(call_id, &tap_tag, &plan, tap_plan, &mut tapped_legs)
                 .await?;
         }
 
-        // Replacing an existing tee: detach the old one first so its sinks and task go away.
+        // Replacing an existing tee: the new one's taps are on, so the old one's come off now, by
+        // their own label. A pipeline tee keeps the call's hold — the new tee took the same one, and
+        // releasing it here would demote the call out from under the tee it now carries.
         if self.ws_tees.contains_key(call_id) {
-            self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+            self.end_ws_tee(call_id, WsTeeEndReason::Detached, bridged)
+                .await;
         }
         self.announce_ws_tee(
             call_id,
@@ -275,7 +286,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 channels: wire_channels,
                 sample_rate: wire_rate,
             },
-            (socket, plan, stream_id),
+            (socket, plan, stream_id, tap_tag),
             (tapped_legs, bridge_taps),
         )
     }
@@ -285,7 +296,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     async fn attach_pipeline_tee(
         &self,
         call_id: &str,
-        stream_id: &str,
+        tap_tag: &str,
         plan: &siphon_rtp_media::bridge::tee::WsTeePlan,
         tap_plan: Vec<(
             bool,
@@ -304,12 +315,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Attach one sink per tapped leg, carrying the conversion into the wire rate built above.
         for (source_a, channel, resampler) in tap_plan {
-            let sink = WsTeeSink::new(
-                channel,
-                plan.mixer.clone(),
-                stream_id.to_string(),
-                resampler,
-            );
+            let sink = WsTeeSink::new(channel, plan.mixer.clone(), tap_tag.to_string(), resampler);
             if !self.media.control(
                 call_id,
                 MediaControl::AddFork {
@@ -323,7 +329,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         call_id,
                         MediaControl::RemoveForkTagged {
                             source_a: *attached,
-                            tag: stream_id.to_string(),
+                            tag: tap_tag.to_string(),
                         },
                     );
                 }
@@ -344,7 +350,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         call_id: &str,
         ws_uri: &str,
         shape: TeeShape,
-        (socket, plan, stream_id): (TeeSocket, siphon_rtp_media::bridge::tee::WsTeePlan, String),
+        (socket, plan, stream_id, tap_tag): (
+            TeeSocket,
+            siphon_rtp_media::bridge::tee::WsTeePlan,
+            String,
+            String,
+        ),
         (tapped_legs, bridge_taps): (
             Vec<bool>,
             Vec<(siphon_rtp_datapath::EndpointId, tokio::task::JoinHandle<()>)>,
@@ -421,6 +432,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call_id.to_string(),
             WsTee {
                 stream_id,
+                tap_tag,
                 from_tag,
                 owner,
                 mixer: plan.mixer,
@@ -559,6 +571,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// already, and release the userspace hold — demoting a promoted relay back to the kernel fast path
     /// when nothing else holds it. A no-op when the call has no tee.
     pub(super) async fn stop_ws_tee(&self, call_id: &str, reason: WsTeeEndReason) {
+        self.end_ws_tee(call_id, reason, true).await;
+    }
+
+    /// [`Self::stop_ws_tee`], with the hold release made explicit: a tee being *replaced* by
+    /// another pipeline tee passes `false`, because the replacement holds the call for the same
+    /// reason and the hold is one flag, not a count.
+    async fn end_ws_tee(&self, call_id: &str, reason: WsTeeEndReason, release_hold: bool) {
         let Some((_, tee)) = self.ws_tees.remove(call_id) else {
             return;
         };
@@ -566,7 +585,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // wait for the decoders to drain and finish. No hold was taken, so none is released below.
         let bridged = !tee.bridge_taps.is_empty();
         for (endpoint, task) in tee.bridge_taps {
-            self.bridge.remove_plain_tap(endpoint, &tee.stream_id);
+            self.bridge.remove_plain_tap(endpoint, &tee.tap_tag);
             let _ = task.await;
         }
         for source_a in &tee.tapped_legs {
@@ -574,7 +593,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 call_id,
                 MediaControl::RemoveForkTagged {
                     source_a: *source_a,
-                    tag: tee.stream_id.clone(),
+                    tag: tee.tap_tag.clone(),
                 },
             );
         }
@@ -598,7 +617,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             reason,
             &tee.mixer,
         );
-        if !bridged {
+        if !bridged && release_hold {
             self.release_userspace_hold(call_id, PromotionReason::WsTee)
                 .await;
         }
