@@ -30498,3 +30498,63 @@ async fn a_relayed_offer_still_carries_an_active_video_stream_through() {
         "{presented}"
     );
 }
+
+#[tokio::test]
+async fn a_relayed_answer_and_reoffer_keep_every_media_line_they_were_given() {
+    // RFC 3264 §6 and §8: an answer, and any later offer, carries one m-line per m-line of the
+    // session, in order. The engine neither adds nor removes one on a relayed call, so the count the
+    // controller hands it is the count the other party is shown.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let video_from_b = "m=video 49650 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=sendonly\r\n";
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "relay-video-reoffer".into(),
+                from_tag: "a".into(),
+                sdp: audio_offer_with_sections(addr_a, &[ACTIVE_VIDEO_SECTION]),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "relay-video-reoffer".into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp: audio_offer_with_sections(addr_b, &[video_from_b]),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&answer);
+    assert_eq!(
+        media_lines(&answer)[1],
+        "m=video 49650 RTP/AVP 96",
+        "the far party's own answer to the video stream is relayed: {answer}"
+    );
+    assert!(answer.contains("a=sendonly"), "{answer}");
+
+    let reoffer = engine
+        .handle(
+            CLIENT,
+            Command::Reoffer {
+                call_id: "relay-video-reoffer".into(),
+                from_tag: "a".into(),
+                sdp: audio_offer_with_sections(addr_a, &[ACTIVE_VIDEO_SECTION]),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let reoffer = ok_sdp_text(&reoffer);
+    assert_eq!(
+        media_lines(&reoffer)[1],
+        "m=video 49550 RTP/AVP 96 97 98",
+        "{reoffer}"
+    );
+    assert_eq!(media_lines(&reoffer).len(), 2, "{reoffer}");
+}

@@ -1991,10 +1991,11 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
         .iter()
         .filter_map(|f| f.parse::<u8>().ok())
         .collect();
+    let audio_section = audio_section(&lines, media_index);
 
     // Resolve each payload type to its encoding name (uppercased), via `a=rtpmap` then the static table.
     let name_of = |payload_type: u8| -> Option<String> {
-        for line in &lines {
+        for line in &lines[audio_section.clone()] {
             if let Some(map) = line
                 .strip_prefix("a=rtpmap:")
                 .and_then(|body| body.split_once(char::is_whitespace))
@@ -2125,10 +2126,8 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
                 .or_else(|| line.strip_prefix("a=fmtp:"))
                 .and_then(|body| body.split(|c: char| c.is_whitespace() || c == '/').next())
                 .and_then(|pt| pt.trim().parse::<u8>().ok());
-            if let Some(pt) = attr_pt {
-                if removed.contains(&pt) {
-                    continue;
-                }
+            if attr_pt.is_some_and(|pt| removed.contains(&pt)) && audio_section.contains(&index) {
+                continue;
             }
             // Preserve the trailing empty line if the input ended with CRLF.
             if !(index == lines.len() - 1 && line.is_empty()) {
@@ -2149,6 +2148,20 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
         rewritten.push_str(CRLF);
     }
     rewritten
+}
+
+/// The lines of the audio media description opened by the `m=` line at `media_index`: that line up
+/// to the next `m=` line or the end of the body. Payload types are scoped to their own media
+/// description (RFC 4566 §5.14), so an audio codec edit reads and drops per-payload-type attributes
+/// inside this range only. A video section may reuse the same dynamic numbers for other codecs.
+fn audio_section(lines: &[&str], media_index: usize) -> std::ops::Range<usize> {
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(media_index + 1)
+        .find(|(_, line)| line.starts_with("m="))
+        .map_or(lines.len(), |(index, _)| index);
+    media_index..end
 }
 
 /// The optional `/<channels>` suffix of an `a=rtpmap` line (RFC 4566 §6), or an empty string when it
@@ -2309,8 +2322,10 @@ pub fn force_answer_codec(sdp: &str, primary: &CodecSpec, telephone_event: Optio
         .last()
         .unwrap_or(media_index);
 
+    let audio_section = audio_section(&lines, media_index);
     let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
     for (index, line) in lines.iter().enumerate() {
+        let in_audio = audio_section.contains(&index);
         if index == media_index {
             let formats: Vec<String> = kept.iter().map(u8::to_string).collect();
             out.push(format!(
@@ -2320,16 +2335,17 @@ pub fn force_answer_codec(sdp: &str, primary: &CodecSpec, telephone_event: Optio
                 media_fields[2],
                 formats.join(" ")
             ));
-        } else if line.starts_with("a=ptime:") || line.starts_with("a=maxptime:") {
+        } else if in_audio && (line.starts_with("a=ptime:") || line.starts_with("a=maxptime:")) {
             // Drop the far side's `a=ptime` / `a=maxptime` — we re-emit our own effective ptime and
             // our own frame-duration ceiling below. Leaking the far side's would advertise a
             // packetization this leg never receives.
-        } else if line
-            .strip_prefix("a=rtpmap:")
-            .or_else(|| line.strip_prefix("a=fmtp:"))
-            .and_then(|body| body.split(|c: char| c.is_whitespace() || c == '/').next())
-            .and_then(|pt| pt.trim().parse::<u8>().ok())
-            .is_some()
+        } else if in_audio
+            && line
+                .strip_prefix("a=rtpmap:")
+                .or_else(|| line.strip_prefix("a=fmtp:"))
+                .and_then(|body| body.split(|c: char| c.is_whitespace() || c == '/').next())
+                .and_then(|pt| pt.trim().parse::<u8>().ok())
+                .is_some()
         {
             // Drop the far side's per-payload-type codec attributes; we re-emit our own below.
         } else if !(index == lines.len() - 1 && line.is_empty()) {
@@ -5761,5 +5777,109 @@ mod tests {
         assert_eq!(section[0], "m=audio 49170 RTP/AVP 0 8 96 9");
         assert_eq!(section[1], "a=rtpmap:9 G722/8000");
         assert!(rewritten.ends_with("\r\n"), "{rewritten:?}");
+    }
+
+    /// The video section [`audio_video_sdp`] carries. Its payload type 96 is also an audio one:
+    /// payload types are scoped to their own media description (RFC 4566 §5.14), so a dynamic number
+    /// reused across sections is ordinary.
+    const VIDEO_SECTION: &str = concat!(
+        "m=video 20200 RTP/AVP 96 97\r\n",
+        "a=rtpmap:96 H264/90000\r\n",
+        "a=fmtp:96 profile-level-id=42e01f\r\n",
+        "a=rtpmap:97 VP8/90000\r\n",
+        "a=ptime:40\r\n",
+    );
+
+    /// PCMA, Opus on payload type 96 and telephone-event, with [`VIDEO_SECTION`] ahead of the audio
+    /// section or behind it.
+    fn audio_video_sdp(video_first: bool) -> String {
+        let audio = concat!(
+            "m=audio 20100 RTP/AVP 8 96 101\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=rtpmap:96 opus/48000/2\r\n",
+            "a=fmtp:96 useinbandfec=1\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=ptime:20\r\n",
+        );
+        let session = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n";
+        if video_first {
+            format!("{session}{VIDEO_SECTION}{audio}")
+        } else {
+            format!("{session}{audio}{VIDEO_SECTION}")
+        }
+    }
+
+    fn video_section_lines() -> Vec<&'static str> {
+        VIDEO_SECTION.lines().collect()
+    }
+
+    #[test]
+    fn forcing_the_answer_codec_leaves_a_video_section_alone() {
+        // The codec being forced is the audio stream's. A video section's own `a=rtpmap` / `a=fmtp`
+        // / `a=ptime` describe a different stream and were being stripped with the audio ones.
+        let pcma = CodecSpec::new(8, "PCMA", 8000, 1, 20);
+        for video_first in [false, true] {
+            let sdp = audio_video_sdp(video_first);
+            let out = force_answer_codec(&sdp, &pcma, Some(101));
+            assert_eq!(
+                media_section(&out, "video"),
+                video_section_lines(),
+                "video_first={video_first}: {out}"
+            );
+            assert_eq!(
+                media_section(&out, "audio"),
+                vec![
+                    "m=audio 20100 RTP/AVP 8 101",
+                    "a=rtpmap:8 PCMA/8000",
+                    "a=rtpmap:101 telephone-event/8000",
+                    "a=ptime:20",
+                ],
+                "video_first={video_first}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_codec_policy_leaves_a_video_section_alone() {
+        // Removing Opus removes audio payload type 96. The video section's 96 is H.264.
+        let policy = CodecPolicy {
+            remove: vec!["OPUS".to_string()],
+            ..CodecPolicy::default()
+        };
+        for video_first in [false, true] {
+            let sdp = audio_video_sdp(video_first);
+            let out = apply_codec_policy(&sdp, &policy);
+            assert_eq!(
+                media_section(&out, "video"),
+                video_section_lines(),
+                "video_first={video_first}: {out}"
+            );
+            assert_eq!(
+                media_section(&out, "audio"),
+                vec![
+                    "m=audio 20100 RTP/AVP 8 101",
+                    "a=rtpmap:8 PCMA/8000",
+                    "a=rtpmap:101 telephone-event/8000",
+                    "a=ptime:20",
+                ],
+                "video_first={video_first}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_codec_policy_names_an_audio_payload_type_from_the_audio_section() {
+        // With the video section first, its `a=rtpmap:96 H264` is the first rtpmap for 96 in the
+        // body. Read as the audio codec's name, it made Opus unremovable and H.264 an audio codec.
+        let policy = CodecPolicy {
+            remove: vec!["H264".to_string()],
+            ..CodecPolicy::default()
+        };
+        let sdp = audio_video_sdp(true);
+        assert_eq!(
+            apply_codec_policy(&sdp, &policy),
+            sdp,
+            "no audio codec is called H264, so nothing is removed"
+        );
     }
 }
