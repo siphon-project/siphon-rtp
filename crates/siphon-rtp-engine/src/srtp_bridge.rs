@@ -1077,12 +1077,16 @@ mod tests {
             "every packet that fails authentication is a drop"
         );
         let mut buffer = [0u8; 2048];
-        assert!(
-            timeout(NEGATIVE, phone_a.recv_from(&mut buffer))
-                .await
-                .is_err(),
-            "and none of them was forwarded"
-        );
+        if let Ok(arrived) = timeout(NEGATIVE, phone_a.recv_from(&mut buffer)).await {
+            // Name what arrived: a datagram from the engine's plain endpoint was forwarded by this
+            // bridge, and one from anywhere else was never this bridge's to refuse.
+            let described = arrived.map(|(len, source)| (source, buffer[..len].to_vec()));
+            panic!(
+                "none of them may be forwarded, but the phone received {described:02x?} \
+                 (the engine's plain endpoint is {})",
+                harness.plain_addr
+            );
+        }
 
         let (stranger, _) = phone(Ipv4Addr::new(127, 0, 0, 9)).await;
         stranger
