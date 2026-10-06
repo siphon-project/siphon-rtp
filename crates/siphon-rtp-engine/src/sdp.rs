@@ -17,6 +17,9 @@ use siphon_rtp_codec::factory::{CodecSpec, OpusParams, OPUS_MAX_PTIME_MS};
 use siphon_rtp_ice::{Candidate, IceOptions, END_OF_CANDIDATES_ATTRIBUTE, ICE_MISMATCH_ATTRIBUTE};
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
+mod decline;
+pub use decline::decline_unanswered_media;
+
 /// Default packetization when the SDP carries no `a=ptime` (RFC 3551: 20 ms for telephony codecs).
 const DEFAULT_PTIME_MS: u8 = 20;
 

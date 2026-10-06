@@ -151,6 +151,11 @@ than session level — §5.7 permits either, and an offer with no session-level 
 former. A section the engine re-originates comes back in §5 order; a section it does not anchor
 (`m=video`, and `m=text` when text is not anchored) is copied through line for line.
 
+That is a relay's rule: the section belongs to the two parties, and the far party's own answer to it
+comes back the same way. Where the engine answers an offer itself (`answer_local`,
+`conference_join`) there is no far party to answer it, so a stream the engine does not carry is
+declined with port 0 instead (RFC 3264 §6).
+
 ## Nothing touches the payload
 
 On a plain relay the RTP payload is forwarded unchanged: same payload type, same SSRC, same

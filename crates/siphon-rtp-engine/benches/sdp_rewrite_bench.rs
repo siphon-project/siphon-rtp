@@ -19,7 +19,7 @@
 
 use std::net::SocketAddr;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use siphon_rtp_engine::sdp::{self, EngineMedia, IceAdvertisement, IceRewrite, TextRewrite};
 use siphon_rtp_ice::{Candidate, CandidateKind, GatherConfig, Gatherer};
 
@@ -175,6 +175,29 @@ fn sdp_rewrite(criterion: &mut Criterion) {
             )
             .expect("rewrite")
         });
+    });
+
+    // The pass an answer the engine writes itself runs after `rewrite`, declining what it does not
+    // carry (RFC 3264 §6). The audio-only answer is the common one and has nothing to decline, so it
+    // is the floor: one scan of the body, no copy. The input is cloned outside the measured closure
+    // because the pass takes its SDP by value.
+    group.bench_function("declines_nothing_audio_only", |bencher| {
+        bencher.iter_batched(
+            || session_level.clone(),
+            |answer| sdp::decline_unanswered_media(black_box(answer), false),
+            BatchSize::SmallInput,
+        );
+    });
+
+    let with_video = format!(
+        "{session_level}m=video 20200 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=recvonly\r\n"
+    );
+    group.bench_function("declines_a_video_stream", |bencher| {
+        bencher.iter_batched(
+            || with_video.clone(),
+            |answer| sdp::decline_unanswered_media(black_box(answer), false),
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();
