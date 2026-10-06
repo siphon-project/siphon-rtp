@@ -30274,3 +30274,287 @@ async fn an_anchored_caller_bridged_to_an_srtp_phone_hears_it() {
         "the caller hears the phone, decrypted to the plain RTP it negotiated"
     );
 }
+
+/// A desk client's offer: audio, then each of `sections` as a further media description.
+fn audio_offer_with_sections(audio: SocketAddr, sections: &[&str]) -> String {
+    let mut offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+        ip = audio.ip(),
+        port = audio.port(),
+    );
+    for section in sections {
+        offer.push_str(section);
+    }
+    offer
+}
+
+/// Every `m=` line of `sdp`, in order.
+fn media_lines(sdp: &str) -> Vec<&str> {
+    sdp.lines().filter(|line| line.starts_with("m=")).collect()
+}
+
+/// An active, receive-only video stream, as a desk client with its camera off but video enabled
+/// offers it.
+const ACTIVE_VIDEO_SECTION: &str = concat!(
+    "m=video 49550 RTP/AVP 96 97 98\r\n",
+    "a=rtpmap:96 H264/90000\r\n",
+    "a=recvonly\r\n",
+);
+
+#[tokio::test]
+async fn answer_local_declines_an_active_video_stream() {
+    // RFC 3264 §6: the engine answers this offer itself and carries no video, so the stream is
+    // declined with port 0. Copying the offer's own section back named the offerer's own port as the
+    // place to send its video, and answered `recvonly` with `recvonly` (RFC 3264 §6.1).
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "al-video".into(),
+                from_tag: "tag-a".into(),
+                sdp: audio_offer_with_sections(addr, &[ACTIVE_VIDEO_SECTION]),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&result);
+    let media = media_lines(&answer);
+    assert_eq!(media.len(), 2, "one m-line per offered one: {answer}");
+    assert_eq!(media[1], "m=video 0 RTP/AVP 96 97 98", "{answer}");
+    let audio = sdp::parse(&answer).expect("answer");
+    assert_ne!(audio.remote_rtp.port(), 0, "audio is still answered");
+    assert_ne!(
+        audio.remote_rtp.port(),
+        addr.port(),
+        "and on the engine's port, not the offerer's"
+    );
+}
+
+#[tokio::test]
+async fn answer_local_declines_every_stream_it_does_not_carry() {
+    // A single-leg answer relays no text and no fax either, and anchors one audio stream. Each of
+    // these was copied back at the offerer exactly as the video section was.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "al-multi".into(),
+                from_tag: "tag-a".into(),
+                sdp: audio_offer_with_sections(
+                    addr,
+                    &[
+                        "m=text 49560 RTP/AVP 98\r\na=rtpmap:98 t140/1000\r\n",
+                        "m=image 49570 udptl t38\r\n",
+                        "m=application 49580 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+                        "m=audio 49590 RTP/AVP 8\r\n",
+                    ],
+                ),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&result);
+    assert_eq!(
+        media_lines(&answer)[1..],
+        [
+            "m=text 0 RTP/AVP 98",
+            "m=image 0 udptl t38",
+            "m=application 0 UDP/DTLS/SCTP webrtc-datachannel",
+            "m=audio 0 RTP/AVP 8",
+        ],
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+async fn answer_local_leaves_an_already_declined_video_stream_alone() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "al-video-off".into(),
+                from_tag: "tag-a".into(),
+                sdp: audio_offer_with_sections(addr, &["m=video 0 RTP/AVP 0\r\n"]),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&result);
+    assert_eq!(media_lines(&answer)[1], "m=video 0 RTP/AVP 0", "{answer}");
+}
+
+#[tokio::test]
+async fn conference_join_declines_an_active_video_stream() {
+    // A conference seat is answered by the engine too, and a room mixes audio (and text) only.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "video-room".into(),
+                from_tag: "alice".into(),
+                sdp: audio_offer_with_sections(addr, &[ACTIVE_VIDEO_SECTION]),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&joined);
+    assert_eq!(
+        media_lines(&answer)[1],
+        "m=video 0 RTP/AVP 96 97 98",
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+async fn conference_join_keeps_the_text_stream_it_anchors_beside_a_declined_video_one() {
+    // Declining what the room does not carry must not take the text stream it does carry with it.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_audio, audio_addr) = phone().await;
+    let (_phone_text, text_addr) = phone().await;
+    let text_section = format!(
+        "m=text {port} RTP/AVP 98 99\r\na=rtpmap:98 red/1000\r\na=rtpmap:99 t140/1000\r\n",
+        port = text_addr.port(),
+    );
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "text-video-room".into(),
+                from_tag: "alice".into(),
+                sdp: audio_offer_with_sections(audio_addr, &[&text_section, ACTIVE_VIDEO_SECTION]),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&joined);
+    let text = sdp::parse(&answer)
+        .expect("answer")
+        .text
+        .expect("the answer keeps its m=text section");
+    assert_ne!(text.remote_rtp.port(), 0, "text is anchored: {answer}");
+    assert_ne!(text.remote_rtp.port(), text_addr.port(), "{answer}");
+    assert_eq!(
+        media_lines(&answer)[2],
+        "m=video 0 RTP/AVP 96 97 98",
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+async fn conference_join_declines_a_text_stream_it_cannot_anchor() {
+    // A plaintext text section with no usable `t140` format is not seated, so it is declined
+    // rather than copied back at the participant.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "no-t140-room".into(),
+                from_tag: "alice".into(),
+                sdp: audio_offer_with_sections(addr, &["m=text 49560 RTP/AVP 98\r\n"]),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&joined);
+    assert_eq!(media_lines(&answer)[1], "m=text 0 RTP/AVP 98", "{answer}");
+}
+
+#[tokio::test]
+async fn a_relayed_offer_still_carries_an_active_video_stream_through() {
+    // The other half of the rule: between two parties the engine relays, a stream it does not
+    // handle is the two parties' own business and its section is copied through line for line. Only
+    // an answer the engine writes itself declines it.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone, addr) = phone().await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "relay-video".into(),
+                from_tag: "tag-a".into(),
+                sdp: audio_offer_with_sections(addr, &[ACTIVE_VIDEO_SECTION]),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let presented = ok_sdp_text(&result);
+    assert_eq!(
+        media_lines(&presented)[1],
+        "m=video 49550 RTP/AVP 96 97 98",
+        "{presented}"
+    );
+}
+
+#[tokio::test]
+async fn a_relayed_answer_and_reoffer_keep_every_media_line_they_were_given() {
+    // RFC 3264 §6 and §8: an answer, and any later offer, carries one m-line per m-line of the
+    // session, in order. The engine neither adds nor removes one on a relayed call, so the count the
+    // controller hands it is the count the other party is shown.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let video_from_b = "m=video 49650 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=sendonly\r\n";
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "relay-video-reoffer".into(),
+                from_tag: "a".into(),
+                sdp: audio_offer_with_sections(addr_a, &[ACTIVE_VIDEO_SECTION]),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "relay-video-reoffer".into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp: audio_offer_with_sections(addr_b, &[video_from_b]),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&answer);
+    assert_eq!(
+        media_lines(&answer)[1],
+        "m=video 49650 RTP/AVP 96",
+        "the far party's own answer to the video stream is relayed: {answer}"
+    );
+    assert!(answer.contains("a=sendonly"), "{answer}");
+
+    let reoffer = engine
+        .handle(
+            CLIENT,
+            Command::Reoffer {
+                call_id: "relay-video-reoffer".into(),
+                from_tag: "a".into(),
+                sdp: audio_offer_with_sections(addr_a, &[ACTIVE_VIDEO_SECTION]),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let reoffer = ok_sdp_text(&reoffer);
+    assert_eq!(
+        media_lines(&reoffer)[1],
+        "m=video 49550 RTP/AVP 96 97 98",
+        "{reoffer}"
+    );
+    assert_eq!(media_lines(&reoffer).len(), 2, "{reoffer}");
+}

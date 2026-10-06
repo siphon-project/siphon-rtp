@@ -219,7 +219,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // A secure text section we cannot key/anchor (no usable `t140`, or no usable
                     // `a=crypto`) is declined (`m=text 0`), never downgraded to plaintext.
                     _ if text.secure => (None, TextRewrite::Decline, None),
-                    // A plaintext `m=text` with no usable `t140` rtpmap is left untouched.
+                    // A plaintext `m=text` with no usable `t140` rtpmap is not seated. The answer
+                    // declines it with every other stream the room does not carry.
                     _ => (None, TextRewrite::None, None),
                 }
             }
@@ -600,7 +601,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text_rewrite,
             ImageRewrite::None,
         ) {
-            Ok(rewritten) => ok_sdp(rewritten.sdp, Some(from_tag)),
+            // RFC 3264 §6: the room is the answerer, and it mixes audio and the text it anchored.
+            // Every other stream the participant offered is declined with port 0.
+            Ok(rewritten) => ok_sdp(
+                sdp::decline_unanswered_media(rewritten.sdp, text_rewrite.is_anchored()),
+                Some(from_tag),
+            ),
             Err(error) => {
                 let _ = self.conference.leave(conference_id, &from_tag);
                 self.stop_seat_ice_follow(&[endpoint.id]);

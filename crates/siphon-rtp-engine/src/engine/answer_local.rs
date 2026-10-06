@@ -854,8 +854,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None => IceRewrite::Keep,
         };
         let mut rewritten =
-            // A single-leg local answer (IVR/echo) does not relay a text stream — leave any `m=text`
-            // section untouched (text anchoring/relay is a 2-leg concern; PR 1 scope).
+            // A single-leg local answer (IVR/echo) carries audio only: no text, no fax, nothing else.
+            // `rewrite` leaves those sections as the offer wrote them and they are declined below.
             match sdp::rewrite(
                 sdp,
                 engine,
@@ -873,6 +873,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     };
                 }
             };
+        // RFC 3264 §6: the engine is the answerer here, so every stream it does not carry is declined
+        // with port 0 rather than handed back as the offer wrote it.
+        rewritten.sdp = sdp::decline_unanswered_media(rewritten.sdp, false);
         // rtpengine `replace: [origin]`: hide the originator's real IP behind the engine's advertised
         // address (topology hiding).
         if profile.replace.iter().any(|field| field == "origin") {

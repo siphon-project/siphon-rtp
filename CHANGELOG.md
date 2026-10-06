@@ -7,6 +7,27 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An answer the engine writes itself declines the streams it does not carry.** `answer_local`
+  and `conference_join` copied every section they do not handle back as the offer wrote it, which
+  is right for a relay (the far party answers it) and wrong for an answerer. An offer with an
+  active `m=video` beside its audio was answered with the offerer's own video port and its own
+  direction, so `recvonly` came back as `recvonly` where RFC 3264 §6.1 allows `sendonly` or
+  `inactive`, and a client can drop the whole session over it, audio included. The same happened
+  to `m=application`, to a second `m=audio`, to `m=image`, and to a text stream the engine did
+  not anchor. Each is now answered with port 0 (RFC 3264 §6), keeping its place, transport and
+  formats. A stream the offer already declined is untouched, and a relayed offer or answer still
+  carries these sections through unchanged.
+- **An audio codec edit no longer reaches into another media section.** The `codec-strip` /
+  `codec-mask` / `codec-offer` policies, and the single-codec answer a transcoded or locally
+  answered call is given, drop `a=rtpmap` and `a=fmtp` lines by payload type, and they dropped
+  them from every section of the SDP. Payload types are scoped to their own media description
+  (RFC 4566 §5.14), so a relayed `m=video` whose dynamic numbers overlapped the audio ones lost
+  its codec lines, and its `a=ptime` on a transcoded call. A video section ahead of the audio
+  one could also lend its codec name to an audio payload type, so the policy removed the wrong
+  codec or none. Both now read and edit the audio section only.
+
 ## [0.12.1] — 2026-10-05
 
 ### Fixed
