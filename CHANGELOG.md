@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.12.2] — 2026-10-06
+
 ### Fixed
 
 - **An answer the engine writes itself declines the streams it does not carry.** `answer_local`
