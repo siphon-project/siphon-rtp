@@ -56,6 +56,11 @@ const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(250);
 /// Ceiling on the reconnect backoff. A Mediation Function outage is measured in minutes, and the
 /// buffer is what covers it; retrying faster than this only burns connections.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How long one connection attempt to the Mediation Function may take, from the TCP connect to the
+/// end of the mutual-TLS handshake. An endpoint that accepts and then says nothing would otherwise
+/// hold the delivery on that one attempt for as long as the connection stays open, with nothing
+/// logged and nothing retried.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the delivery task checks whether the drop counter moved, to emit a loss report.
 const LOSS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -433,6 +438,8 @@ pub struct X3DeliveryTask {
     pub interception_point_id: String,
     /// Idle keepalive period.
     pub keepalive: Duration,
+    /// The bound on one connection attempt ([`DEFAULT_CONNECT_TIMEOUT`]).
+    pub connect_timeout: Duration,
     /// The ring-backed mutual-TLS client configuration.
     pub tls: Arc<rustls::ClientConfig>,
 }
@@ -531,8 +538,22 @@ enum ConnectionEnd {
     Reconnect,
 }
 
-/// Dial the Mediation Function and complete the mutual-TLS handshake.
+/// Dial the Mediation Function and complete the mutual-TLS handshake, inside the task's connect
+/// timeout. Giving up drops the half-made connection, and the caller retries with its backoff.
 async fn connect(
+    task: &X3DeliveryTask,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    match tokio::time::timeout(task.connect_timeout, connect_unbounded(task)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(format!(
+            "connect {}: timed out after {} ms without completing the TLS handshake",
+            task.address,
+            task.connect_timeout.as_millis()
+        )),
+    }
+}
+
+async fn connect_unbounded(
     task: &X3DeliveryTask,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
     let (server_name, address) =

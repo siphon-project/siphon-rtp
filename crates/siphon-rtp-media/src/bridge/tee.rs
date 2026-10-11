@@ -1015,6 +1015,58 @@ mod tests {
         );
     }
 
+    /// A server that completes the upgrade and then stops reading: its socket fills, the transport
+    /// waits on the write, and the sinks on the call's media path go on returning at once, dropping
+    /// what the bounded channel cannot hold and counting it. Ending the tee does not wait for the
+    /// stalled write either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_that_stops_reading_stalls_the_transport_and_never_the_media_path() {
+        // A pipe a few frames deep with nobody reading the far end.
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+
+        let plan = plan_ws_tee(format(8000, 1), false, false);
+        let start = tee_start_message("tee-1", "call-1", plan.format, plan.tracks.clone());
+        let mixer = plan.mixer.clone();
+        let mut sink = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee-1", None);
+        let transport = tokio::spawn(run_ws_tee(server_ws, start, plan.frames, plan.recycle));
+
+        // Ten seconds of audio at 20 ms a frame. Each write has to return whether or not the
+        // transport has room, and the whole run must take no time worth the name.
+        let frames = 500;
+        let started = std::time::Instant::now();
+        for _ in 0..frames {
+            sink.write_pcm(&[1234i16; 160]);
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the media path waited on the transport: {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (forwarded, dropped) = {
+            let mixer = mixer.lock().expect("lock");
+            (mixer.forwarded(), mixer.dropped())
+        };
+        assert_eq!(forwarded + dropped, frames, "every frame is accounted for");
+        // The pipe holds three 320-octet frames and the channel sixteen: the rest were dropped.
+        assert!(
+            forwarded <= (CHANNEL_DEPTH + 8) as u64 && dropped >= 400,
+            "{forwarded} forwarded, {dropped} dropped"
+        );
+        assert!(
+            !transport.is_finished(),
+            "the transport is waiting on the write"
+        );
+
+        // Ending the tee aborts the transport, which lets go of the stalled write at once.
+        transport.abort();
+        let joined = timeout(Duration::from_secs(1), transport).await;
+        assert!(joined.is_ok_and(|outcome| outcome.is_err_and(|error| error.is_cancelled())));
+        drop(client_io);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_transport_announces_start_then_streams_binary_frames() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);

@@ -21,6 +21,12 @@ Two things to be clear about up front:
 
 - This is a native siphon-rtp extension. The `ws_uri` field exists only on the JSON-over-TCP
   control channel; the rtpengine NG/bencode front-end never sets it.
+- The dial is bounded. Name resolution, the TCP connect, TLS and the WebSocket upgrade together
+  get `--ws-connect-timeout-ms` (3 s by default). A server that accepts the connection and then
+  says nothing fails the command that named it, with `dial <uri>: timed out after N ms ...`, and
+  nothing else: the call's media is as it was, and the engine goes on serving every other
+  command and call meanwhile. Each failure is logged at `warn` with its class (`timeout`,
+  `connect`, `tls`, `handshake`) and counted, see [Observability](../observability.md).
 - Both `ws://` and `wss://` are dialled. `wss://` runs the TLS handshake on the pure-Rust
   ring/rustls stack (no OpenSSL, no C), validating the server against the built-in webpki-roots
   Mozilla CA bundle. Prefer `wss://` when the WS server is off the trusted segment.

@@ -78,6 +78,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // Start at 1 so a `play_id` of 0 never appears (a controller can treat 0 as "no play").
             play_id_counter: std::sync::atomic::AtomicU64::new(1),
             media_fetch_limits: MediaFetchLimits::default(),
+            ws_connect_timeout: super::ws_dial::DEFAULT_WS_CONNECT_TIMEOUT,
             pending_fetches: Arc::new(DashMap::new()),
             // Off unless the operator opts in — see `with_consent`.
             consent: None,
@@ -369,6 +370,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     #[must_use]
     pub fn with_media_fetch_limits(mut self, limits: MediaFetchLimits) -> Self {
         self.media_fetch_limits = limits;
+        self
+    }
+
+    /// Bound every WebSocket dial (`attach_ws_tee`, `attach_ws_bridge`, a `ws_uri` or `ws_tee`
+    /// profile) by `timeout`, covering the TCP connect, the TLS handshake and the upgrade. Zero is
+    /// read as the default: a dial with no bound is the defect this setting exists to prevent.
+    #[must_use]
+    pub fn with_ws_connect_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.ws_connect_timeout = if timeout.is_zero() {
+            super::ws_dial::DEFAULT_WS_CONNECT_TIMEOUT
+        } else {
+            timeout
+        };
         self
     }
 

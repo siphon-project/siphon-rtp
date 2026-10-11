@@ -230,12 +230,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
 
-        // Dial before attaching anything, so a bad URI fails cleanly with nothing to unwind.
-        let connector = tokio_tungstenite::Connector::Rustls(self.ws_tls_client_config());
-        let (socket, _response) =
-            tokio_tungstenite::connect_async_tls_with_config(ws_uri, None, false, Some(connector))
-                .await
-                .map_err(|error| format!("dial {ws_uri}: {error}"))?;
+        // Dial before attaching anything, so a bad URI or a server that never answers fails
+        // cleanly with nothing to unwind. Bounded: see `ws_dial`.
+        let socket = self.dial_ws(call_id, ws_uri).await?;
 
         // A SIPREC subscription (or a pcap recording / DTMF block) may already hold this relay in
         // userspace with a **relay-only** actor, which forwards RTP verbatim and never decodes — the
@@ -625,8 +622,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 }
 
 /// The dialled tee connection, named so the dial and the transport task can be split.
-type TeeSocket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type TeeSocket = super::ws_dial::WsClientSocket;
 
 /// The negotiated shape a tee announces in `ws_tee_started`.
 struct TeeShape {

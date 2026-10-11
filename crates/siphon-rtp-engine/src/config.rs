@@ -183,6 +183,9 @@ pub struct FileConfig {
     pub turn_tls_key: Option<PathBuf>,
     /// Public IP to advertise in XOR-RELAYED-ADDRESS (`--turn-relay-ip`).
     pub turn_relay_ip: Option<IpAddr>,
+    /// Bound on a WebSocket dial (connect, TLS and upgrade), milliseconds
+    /// (`--ws-connect-timeout-ms`).
+    pub ws_connect_timeout_ms: Option<u64>,
     /// Bound on DNS + TCP connect + TLS for a `play_media` URL fetch, milliseconds
     /// (`--media-fetch-connect-timeout-ms`).
     pub media_fetch_connect_timeout_ms: Option<u64>,
@@ -386,6 +389,7 @@ mod tests {
     fn deserializes_the_media_fetch_bounds() {
         let toml = concat!(
             "media_fetch_connect_timeout_ms = 1500\n",
+            "ws_connect_timeout_ms = 2500\n",
             "media_fetch_first_byte_timeout_ms = 4000\n",
             "media_fetch_timeout_ms = 12000\n",
             "media_fetch_max_bytes = 2097152\n",
@@ -394,6 +398,7 @@ mod tests {
         );
         let config = FileConfig::parse_str(toml).expect("valid TOML deserializes");
         assert_eq!(config.media_fetch_connect_timeout_ms, Some(1_500));
+        assert_eq!(config.ws_connect_timeout_ms, Some(2_500));
         assert_eq!(config.media_fetch_first_byte_timeout_ms, Some(4_000));
         assert_eq!(config.media_fetch_timeout_ms, Some(12_000));
         assert_eq!(config.media_fetch_max_bytes, Some(2_097_152));

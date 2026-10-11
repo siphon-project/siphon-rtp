@@ -224,6 +224,13 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS)]
     pub shutdown_grace_secs: u64,
 
+    /// Bound (milliseconds) on a WebSocket dial the engine makes on a controller's word
+    /// (`attach_ws_tee`, `attach_ws_bridge`, a `ws_uri` or `ws_tee` profile): name resolution, TCP
+    /// connect, TLS and the WebSocket upgrade together. The command fails when it runs out, and no
+    /// other command waits for it. `0` is read as the default.
+    #[arg(long, default_value_t = DEFAULT_WS_CONNECT_TIMEOUT_MS)]
+    pub ws_connect_timeout_ms: u64,
+
     /// Bound (milliseconds) on DNS + TCP connect + TLS for a `play_media` fetch from an http(s)
     /// URL, per redirect hop.
     #[arg(long, default_value_t = media_fetch::DEFAULT_CONNECT_TIMEOUT_MS)]
@@ -388,6 +395,8 @@ pub struct RunConfig {
     pub x3: Option<crate::x3::X3Config>,
     /// Bounds a `play_media` fetch from an http(s) URL runs under.
     pub media_fetch: MediaFetchLimits,
+    /// Bound on a WebSocket dial: connect, TLS and upgrade together.
+    pub ws_connect_timeout: Duration,
     /// Only carried through for the log filter: the file may set it, but the process environment
     /// (`RUST_LOG` / the default-env filter) always wins, so it is applied before anything is logged.
     pub log_filter: Option<String>,
@@ -521,6 +530,12 @@ impl RunConfig {
             // is treated as "not configured" rather than half-configured: a partially-provisioned
             // node would accept a warrant it cannot deliver on.
             x3,
+            ws_connect_timeout: Duration::from_millis(resolve_defaulted(
+                args.ws_connect_timeout_ms,
+                explicit("ws_connect_timeout_ms"),
+                file.ws_connect_timeout_ms,
+                DEFAULT_WS_CONNECT_TIMEOUT_MS,
+            )),
             media_fetch: MediaFetchLimits {
                 connect_timeout: Duration::from_millis(resolve_defaulted(
                     args.media_fetch_connect_timeout_ms,
@@ -742,6 +757,9 @@ const DEFAULT_HELD_MEDIA_TIMEOUT_SECS: u64 = 7200;
 const DEFAULT_SETUP_TIMEOUT_SECS: u64 = 300;
 /// Built-in default for `--shutdown-grace-secs` (mirrors the clap `default_value_t`).
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 25;
+/// The default bound on a WebSocket dial, in the unit the flag takes.
+const DEFAULT_WS_CONNECT_TIMEOUT_MS: u64 =
+    crate::engine::DEFAULT_WS_CONNECT_TIMEOUT.as_millis() as u64;
 /// How often the full-ICE driver polls its agents. Below the RFC 8445 §14.2 `Ta` of 50 ms, so pacing
 /// is decided by the agent rather than by the tick granularity.
 const ICE_DRIVER_INTERVAL_MS: u64 = 20;
@@ -878,6 +896,7 @@ where
         .with_cluster(cluster.clone())
         .with_interfaces(interfaces)
         .with_prompt_cache_bytes(usize::try_from(config.prompt_cache_bytes).unwrap_or(usize::MAX))
+        .with_ws_connect_timeout(config.ws_connect_timeout)
         .with_media_fetch_limits(config.media_fetch.clone());
     if let Some(x3) = config.x3.clone() {
         // Logged at startup so an operator can see, without placing a call, that this node will
@@ -1451,6 +1470,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_websocket_connect_timeout_resolves_from_flag_file_and_default() {
+        use std::time::Duration;
+        let unset = resolve_from(&["siphon-rtp"], FileConfig::default());
+        assert_eq!(unset.ws_connect_timeout, Duration::from_secs(3));
+        let file = || FileConfig {
+            ws_connect_timeout_ms: Some(1_500),
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            resolve_from(&["siphon-rtp"], file()).ws_connect_timeout,
+            Duration::from_millis(1_500)
+        );
+        let flag = resolve_from(&["siphon-rtp", "--ws-connect-timeout-ms", "800"], file());
+        assert_eq!(flag.ws_connect_timeout, Duration::from_millis(800));
+    }
+
     /// Resolve a `RunConfig` from a command line + a config file, the way the binaries do.
     fn resolve_from(argv: &[&str], file: FileConfig) -> RunConfig {
         let matches = <TestCommandLine as clap::CommandFactory>::command()
@@ -1641,6 +1677,7 @@ mod tests {
             turn_relay_ip: None,
             x3: None,
             media_fetch: MediaFetchLimits::default(),
+            ws_connect_timeout: crate::engine::DEFAULT_WS_CONNECT_TIMEOUT,
             log_filter: None,
             node_id: None,
             max_sessions: 0,

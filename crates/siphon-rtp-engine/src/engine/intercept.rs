@@ -230,6 +230,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 network_function_id: config.network_function_id.clone(),
                 interception_point_id: config.interception_point_id.clone(),
                 keepalive: config.keepalive,
+                connect_timeout: crate::x3::DEFAULT_CONNECT_TIMEOUT,
                 tls,
             };
             let call_id = call_id.to_string();
