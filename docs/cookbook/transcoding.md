@@ -106,9 +106,9 @@ B answers PCMA only; you pass that answer to the engine:
 Near primary AMR-WB, far primary PCMA: the codecs differ, the transcoder engages. The answer the
 engine returns for A is rewritten to advertise **A's own codec** (AMR-WB, plus the negotiated
 telephone-event PT), never B's: an answer may only contain formats from the recipient's own offer
-(RFC 3264 §6). For AMR-WB it also advertises `octet-align=1` and, when a `mode-set` was
-negotiated, the mode the engine will actually send (RFC 4867 §8.1); the engine's AMR-WB egress is
-octet-aligned framing (RFC 4867 §4.4).
+(RFC 3264 §6). For AMR and AMR-WB it returns `octet-align` and the `mode-set` exactly as A
+offered them (RFC 4867 §8.3.1), and sends in that payload format; see
+[AMR on RTP](../codecs.md#amr-on-rtp).
 
 If the far side is codec-capable and simply *answers* a different codec than A offered, the same
 promotion happens with no flags at all. The flags only shape the offer.
@@ -117,12 +117,11 @@ promotion happens with no flags at all. The flags only shape the offer.
 
 Same shape: the NB leg offers `AMR/8000` (RFC 4867), the far side ends up on G.711, and the
 differing primaries engage the transcoder. Ingress AMR-NB decodes in all 8 modes; egress toward
-the AMR-NB leg encodes MR122.
+the AMR-NB leg encodes the highest mode of the negotiated `mode-set`, 12.2 kbit/s when there is none.
 
-One asymmetry to know: `codec-transcode-AMR` is **not** an accepted directive target. AMR-NB cannot
-be forced into an offer that never contained it (the directive is skipped, the call proceeds without
-it). `codec-transcode-AMR-WB` *is* accepted on `amr` builds.
-In practice this costs nothing: the AMR leg is the access leg that offered AMR itself.
+`codec-transcode-AMR` and `codec-transcode-AMR-WB` are both accepted on `amr` builds. Each adds
+the codec to the far offer twice, bandwidth-efficient first and octet-aligned second, the way a
+handset offers it.
 
 ## The codec directives
 
@@ -142,22 +141,21 @@ the only offered codec leaves it in place, RFC 4566 requires a non-empty format 
 fails a call over an unknown or not-yet-encodable `transcode` target (the directive is skipped),
 and telephone-event (RFC 4733) survives every sweep unless named outright.
 
-Accepted `codec-transcode` targets today: `PCMU`, `PCMA`, `G722`, `GSM`, `G726-32`, and, on
-`amr` builds, `AMR-WB`.
+Accepted `codec-transcode` targets today: `PCMU`, `PCMA`, `G722`, `GSM`, `G726-32`, `OPUS`, and,
+on `amr` builds, `AMR-WB` and `AMR`. A target whose dynamic payload type the offer already uses
+for something else is added on the next free one.
 
 ## Mode-set, ptime, DTMF
 
-**`mode-set` (AMR-WB).** The peer's `a=fmtp` `mode-set` (RFC 4867 §8.1) is honoured: the egress
-encode mode is clamped into the set (default mode 2 when permitted, else the nearest allowed),
-and per-frame CMR adaptation stays within it, so the engine never sends a mode the peer
-disallowed. An AMR-NB `mode-set` is not yet resolved onto the egress mode; AMR-NB egress is
-MR122.
+**`mode-set` (AMR and AMR-WB).** The peer's `a=fmtp` `mode-set` (RFC 4867 §8.1) is honoured: the
+engine sends the highest mode of the set, a codec mode request from the peer lowers that within
+the set, and no mode outside it is ever sent. The answer returns the set unmodified.
 
 **ptime.** Each leg's packetization follows its own SDP `a=ptime`, defaulting to 20 ms
 (RFC 3551); the transcoder builds each leg's codec at that leg's ptime. The NG `ptime=N` option
 now re-frames the egress via a repacketizer (decoupling ingress from egress framing) and forces
-the egress packetization, updating the answer `a=ptime`. AMR (frame-based) ignores the override
-by construction (fixed native frame).
+the egress packetization, updating the answer `a=ptime`. AMR is frame-based: it sends one 20 ms
+frame for every 20 ms of the ptime, up to four in a packet.
 
 **DTMF.** RFC 4733 telephone-events are not decoded as audio: they are detected, surfaced as
 `dtmf` events on the control channel, and repacketized onto the egress stream using the far

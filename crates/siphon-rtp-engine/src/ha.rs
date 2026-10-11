@@ -205,6 +205,12 @@ pub struct CodecSnapshot {
     /// would be free to answer a CMR with a mode the peer disallowed). Empty when unconstrained.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_modes: Vec<u8>,
+    /// The negotiated RFC 4867 `a=fmtp` parameters of an AMR or AMR-WB leg, preserved so a restored
+    /// call keeps its payload format (a bandwidth-efficient stream restored as octet-aligned is
+    /// noise to the peer) and its mode change restrictions. `None` for every other codec, and for
+    /// an AMR leg whose peer declared nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amr: Option<AmrSnapshot>,
     /// The negotiated RFC 7587 Opus `a=fmtp` parameters, preserved so a restored Opus leg keeps the
     /// channel layout, packetization ceiling, and rate-control/FEC/DTX limits it negotiated. `None`
     /// for a non-Opus codec, and for an Opus leg whose peer declared nothing (the RFC defaults apply).
@@ -343,6 +349,33 @@ pub struct SecureLegRolloverSnapshot {
     pub outbound_rtcp_index: u32,
 }
 
+/// Portable mirror of `siphon_rtp_codec::factory::AmrParams` (RFC 4867 §8.1), each parameter as
+/// the peer wrote it and absent when it wrote none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AmrSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub octet_align: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crc: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub robust_sorting: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interleaving: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_change_period: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_change_capability: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_change_neighbor: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_red: Option<u16>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub malformed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_request: Option<u8>,
+}
+
 /// Portable mirror of `siphon_rtp_srtp::StreamRollover` (per-SSRC ROC + rollover anchor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamRolloverSnapshot {
@@ -473,6 +506,7 @@ mod tests {
                 ptime_ms: 20,
                 encode_mode: None,
                 allowed_modes: Vec::new(),
+                amr: None,
                 opus: None,
             }),
             far_codec: None,

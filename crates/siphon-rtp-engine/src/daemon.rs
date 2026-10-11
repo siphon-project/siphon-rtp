@@ -161,6 +161,23 @@ pub struct EngineArgs {
     /// the next play with no cache-clearing step.
     #[arg(long, default_value_t = DEFAULT_PROMPT_CACHE_BYTES)]
     pub prompt_cache_bytes: u64,
+    /// Highest AMR mode the engine sends, 0 (4.75 kbit/s) to 7 (12.2 kbit/s). Unset: the highest
+    /// mode of each stream's negotiated `mode-set` (3GPP TS 26.114 §7.5.2.1.2.1). The mode sent is
+    /// always one of the `mode-set`, and never above a codec mode request from the peer.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=7))]
+    pub amr_max_mode: Option<u8>,
+    /// Highest AMR-WB mode the engine sends, 0 (6.60 kbit/s) to 8 (23.85 kbit/s). Unset: the highest
+    /// mode of each stream's negotiated `mode-set`; `2` holds wideband legs at 12.65 kbit/s.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=8))]
+    pub amr_wb_max_mode: Option<u8>,
+    /// Codec mode request (RFC 4867 §4.3.1) the engine puts in every AMR payload it sends, asking
+    /// the peer for no mode above this one. Unset: 15, no request. Not sent on a stream whose
+    /// `mode-set` lacks the mode.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=7))]
+    pub amr_mode_request: Option<u8>,
+    /// The same request on AMR-WB streams, 0 to 8.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=8))]
+    pub amr_wb_mode_request: Option<u8>,
     /// File holding the control-plane shared secret, read once at start (`SIPHON_RTP_CONTROL_SECRET`
     /// is the direct-value alternative; `SIPHON_RTP_CONTROL_SECRET_FILE` names this file from the
     /// environment). Surrounding whitespace, including the trailing newline every tool writes, is
@@ -326,6 +343,10 @@ pub struct RunConfig {
     pub max_control_rps: u64,
     /// Bytes of decoded prompt audio to cache; `0` disables caching.
     pub prompt_cache_bytes: u64,
+    /// The engine-wide AMR policy: highest mode sent and codec mode request, `None` = defaults.
+    pub amr: crate::sdp::AmrPolicy,
+    /// The same for AMR-WB.
+    pub amr_wb: crate::sdp::AmrPolicy,
     /// File holding the control-plane shared secret; `None` ⇒ the environment variable, or no
     /// authentication at all.
     pub control_secret_file: Option<PathBuf>,
@@ -422,6 +443,20 @@ impl RunConfig {
                 file.prompt_cache_bytes,
                 DEFAULT_PROMPT_CACHE_BYTES,
             ),
+            // A mode the codec does not have is left unset rather than applied: the flag's own
+            // range refuses it, and the file is held to the same range here.
+            amr: crate::sdp::AmrPolicy {
+                max_mode: resolve_optional(args.amr_max_mode, file.amr_max_mode)
+                    .filter(|&mode| mode <= 7),
+                mode_request: resolve_optional(args.amr_mode_request, file.amr_mode_request)
+                    .filter(|&mode| mode <= 7),
+            },
+            amr_wb: crate::sdp::AmrPolicy {
+                max_mode: resolve_optional(args.amr_wb_max_mode, file.amr_wb_max_mode)
+                    .filter(|&mode| mode <= 8),
+                mode_request: resolve_optional(args.amr_wb_mode_request, file.amr_wb_mode_request)
+                    .filter(|&mode| mode <= 8),
+            },
             control_secret_file: resolve_optional(
                 args.control_secret_file,
                 file.control_secret_file,
@@ -837,6 +872,8 @@ where
             "play_media URL fetches restricted to these hosts"
         );
     }
+    crate::sdp::set_amr_policy(false, config.amr);
+    crate::sdp::set_amr_policy(true, config.amr_wb);
     let mut engine = Engine::new(datapath.clone())
         .with_cluster(cluster.clone())
         .with_interfaces(interfaces)
@@ -1374,6 +1411,46 @@ mod tests {
         <TestCommandLine as clap::Parser>::parse_from(["siphon-rtp"]).engine
     }
 
+    #[test]
+    fn the_amr_mode_options_resolve_from_flags_and_file_within_each_codecs_modes() {
+        use crate::sdp::AmrPolicy;
+        // Nothing set: the defaults, which leave every stream at the highest mode of its set.
+        let unset = resolve_from(&["siphon-rtp"], FileConfig::default());
+        assert_eq!(
+            (unset.amr, unset.amr_wb),
+            (AmrPolicy::default(), AmrPolicy::default())
+        );
+        // The file sets them, a flag overrides the file, and each codec keeps its own.
+        let file = || FileConfig {
+            amr_max_mode: Some(4),
+            amr_wb_max_mode: Some(2),
+            amr_wb_mode_request: Some(1),
+            ..FileConfig::default()
+        };
+        let config = resolve_from(&["siphon-rtp", "--amr-wb-max-mode", "8"], file());
+        assert_eq!(config.amr.max_mode, Some(4));
+        assert_eq!(config.amr.mode_request, None);
+        assert_eq!(config.amr_wb.max_mode, Some(8));
+        assert_eq!(config.amr_wb.mode_request, Some(1));
+        // AMR has no mode 8: the flag refuses it, and a file that names it is not applied.
+        let parsed = <TestCommandLine as clap::Parser>::try_parse_from([
+            "siphon-rtp",
+            "--amr-max-mode",
+            "8",
+        ]);
+        assert!(parsed.is_err());
+        let out_of_range = FileConfig {
+            amr_max_mode: Some(8),
+            amr_wb_mode_request: Some(9),
+            ..FileConfig::default()
+        };
+        let config = resolve_from(&["siphon-rtp"], out_of_range);
+        assert_eq!(
+            (config.amr.max_mode, config.amr_wb.mode_request),
+            (None, None)
+        );
+    }
+
     /// Resolve a `RunConfig` from a command line + a config file, the way the binaries do.
     fn resolve_from(argv: &[&str], file: FileConfig) -> RunConfig {
         let matches = <TestCommandLine as clap::CommandFactory>::command()
@@ -1544,6 +1621,8 @@ mod tests {
             metrics_addr: None,
             max_control_rps: 0,
             prompt_cache_bytes: super::DEFAULT_PROMPT_CACHE_BYTES,
+            amr: crate::sdp::AmrPolicy::default(),
+            amr_wb: crate::sdp::AmrPolicy::default(),
             control_secret_file: None,
             media_timeout_secs: 30,
             held_media_timeout_secs: super::DEFAULT_HELD_MEDIA_TIMEOUT_SECS,

@@ -46,6 +46,18 @@ pub(super) fn codec_snapshot(codec: &CodecSpec) -> crate::ha::CodecSnapshot {
         ptime_ms: codec.ptime_ms,
         encode_mode: codec.encode_mode,
         allowed_modes: codec.allowed_modes.clone(),
+        amr: codec.amr.map(|params| crate::ha::AmrSnapshot {
+            octet_align: params.octet_align,
+            crc: params.crc,
+            robust_sorting: params.robust_sorting,
+            interleaving: params.interleaving,
+            mode_change_period: params.mode_change_period,
+            mode_change_capability: params.mode_change_capability,
+            mode_change_neighbor: params.mode_change_neighbor,
+            max_red: params.max_red,
+            malformed: params.malformed,
+            mode_request: params.mode_request,
+        }),
         opus: codec.opus.map(|params| crate::ha::OpusSnapshot {
             max_average_bitrate: params.max_average_bitrate,
             max_playback_rate_hz: params.max_playback_rate_hz,
@@ -70,6 +82,22 @@ pub(super) fn restore_codec(snapshot: &crate::ha::CodecSnapshot) -> CodecSpec {
     )
     .with_encode_mode(snapshot.encode_mode)
     .with_allowed_modes(snapshot.allowed_modes.clone())
+    .with_amr_params(
+        snapshot
+            .amr
+            .map(|params| siphon_rtp_codec::factory::AmrParams {
+                octet_align: params.octet_align,
+                crc: params.crc,
+                robust_sorting: params.robust_sorting,
+                interleaving: params.interleaving,
+                mode_change_period: params.mode_change_period,
+                mode_change_capability: params.mode_change_capability,
+                mode_change_neighbor: params.mode_change_neighbor,
+                max_red: params.max_red,
+                malformed: params.malformed,
+                mode_request: params.mode_request,
+            }),
+    )
     .with_opus_params(
         snapshot
             .opus

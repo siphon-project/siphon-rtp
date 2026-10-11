@@ -371,33 +371,53 @@ pub fn sort_table(mode: u8) -> &'static [u16] {
 
 /// Un-sort an RTP-payload speech frame (MSB-first bytes in `data`) into encoder-order
 /// `BIT_0`/`BIT_1` words for the core decoder of `mode` (0..=8), using the RFC 4867 sort table
-/// (`Read_serial` MIME path). The returned vector has `NB_BITS[mode]` entries; missing payload
-/// bits read as `BIT_0` so a truncated frame never panics (the caller validates length first).
-#[must_use]
-pub fn unsort(data: &[u8], mode: u8) -> Vec<i16> {
-    let sort = sort_table(mode);
-    let mut prms = vec![BIT_0; sort.len()];
-    for (i, &dest) in sort.iter().enumerate() {
+/// (`Read_serial` MIME path), writing the first `NB_BITS[mode]` entries of `prms`. Missing payload
+/// bits read as `BIT_0` and a short `prms` is filled as far as it goes, so a truncated frame never
+/// panics (the caller validates length first). Allocates nothing: this runs once per received frame.
+pub fn unsort_into(data: &[u8], mode: u8, prms: &mut [i16]) {
+    for (i, &dest) in sort_table(mode).iter().enumerate() {
         let byte = data.get(i / 8).copied().unwrap_or(0);
         let bit = (byte >> (7 - (i % 8))) & 1;
-        prms[dest as usize] = if bit != 0 { BIT_1 } else { BIT_0 };
+        if let Some(slot) = prms.get_mut(dest as usize) {
+            *slot = if bit != 0 { BIT_1 } else { BIT_0 };
+        }
     }
+}
+
+/// [`unsort_into`] into a fresh vector of `NB_BITS[mode]` entries.
+#[must_use]
+pub fn unsort(data: &[u8], mode: u8) -> Vec<i16> {
+    let mut prms = vec![BIT_0; sort_table(mode).len()];
+    unsort_into(data, mode, &mut prms);
     prms
 }
 
 /// Pack encoder-order `BIT_0`/`BIT_1` speech bits into an RTP-payload speech frame (MSB-first bytes,
-/// the trailing partial byte zero-padded) for `mode` (0..=8) — the exact inverse of [`unsort`], using
-/// the RFC 4867 sort table. Produces `ceil(NB_BITS[mode] / 8)` bytes: the per-frame speech data the
-/// [`crate::amr::payload`] framer wraps with the CMR + ToC. Bits beyond `bits.len()` pack as 0.
-#[must_use]
-pub fn pack(bits: &[i16], mode: u8) -> Vec<u8> {
+/// the trailing partial byte zero-padded) for `mode` (0..=8), the exact inverse of [`unsort_into`],
+/// using the RFC 4867 sort table. Writes `ceil(NB_BITS[mode] / 8)` bytes at the head of `data` and
+/// returns that count, or 0 when `data` is too short. Bits beyond `bits.len()` pack as 0. Allocates
+/// nothing: this runs once per frame sent.
+pub fn pack_into(bits: &[i16], mode: u8, data: &mut [u8]) -> usize {
     let sort = sort_table(mode);
-    let mut data = vec![0u8; sort.len().div_ceil(8)];
+    let octets = sort.len().div_ceil(8);
+    let Some(data) = data.get_mut(..octets) else {
+        return 0;
+    };
+    data.fill(0);
     for (i, &source) in sort.iter().enumerate() {
         if bits.get(source as usize).copied().unwrap_or(BIT_0) == BIT_1 {
             data[i / 8] |= 1 << (7 - (i % 8));
         }
     }
+    octets
+}
+
+/// [`pack_into`] into a fresh vector: the per-frame speech data the [`crate::amr::payload`] framer
+/// wraps with the CMR + ToC.
+#[must_use]
+pub fn pack(bits: &[i16], mode: u8) -> Vec<u8> {
+    let mut data = vec![0u8; sort_table(mode).len().div_ceil(8)];
+    pack_into(bits, mode, &mut data);
     data
 }
 

@@ -1,14 +1,20 @@
 //! AMR-NB (3GPP TS 26.071 / .090, RTP RFC 4867) and AMR-WB (TS 26.171 / .190) — the VoLTE codecs.
 //!
 //! Both codecs are implemented bit-exact against the 3GPP reference vectors. [`AmrWb`] decodes and
-//! encodes all nine modes (TS 26.174); [`AmrNb`] decodes all eight modes (TS 26.074) and
-//! encodes MR475 and MR122. Alongside the codecs the module carries the fixed-point [`basic_ops`],
-//! the mode tables (bit/byte sizes, frame-type mapping), and RFC 4867 payload framing. Modes that
-//! have no encoder yet, and SID/DTX, return [`CodecError::Unsupported`] rather than panicking.
+//! encodes all nine modes (TS 26.174); [`AmrNb`] decodes and encodes all eight (TS 26.074).
+//! Alongside the codecs the module carries the fixed-point [`basic_ops`], the mode tables (bit/byte
+//! sizes, frame-type mapping), and the RFC 4867 RTP payload format in both its variants ([`rtp`]),
+//! with the mode decision a negotiated stream needs ([`mode_control`], [`stream`]).
+//!
+//! Discontinuous transmission is not ported: the encoders send speech frames only, and a received
+//! SID or NO_DATA frame is rendered as silence rather than as synthesised comfort noise.
 
 pub mod math_op;
+pub mod mode_control;
 pub mod nb;
 pub mod payload;
+pub mod rtp;
+pub mod stream;
 pub mod wb;
 
 // The G.191 basic operators and the 32-bit helpers built on them are not AMR's — the G.729
@@ -16,6 +22,12 @@ pub mod wb;
 // so a second ITU codec reuses them instead of restating them, and are re-exported here because
 // every AMR module below refers to them by these paths, as its reference C does.
 pub use crate::itu::{basic_ops, oper_32b};
+
+pub use rtp::PayloadFormat;
+pub use stream::RtpConfig;
+
+use rtp::{Variant, MAX_FRAME_OCTETS};
+use stream::{FrameCodec, RtpStream};
 
 use crate::{CodecError, CodecParams, Decoder, Encoder};
 
@@ -197,8 +209,8 @@ pub struct OctetAlignedHeader {
 
 /// Parse the header of an octet-aligned AMR (RFC 4867 §4.4.2) RTP payload.
 ///
-/// Returns the CMR, the ToC list, and the offset to the first frame's data. The
-/// bandwidth-efficient mode (bit-packed) is a separate parser, not yet implemented.
+/// Returns the CMR, the ToC list, and the offset to the first frame's data. [`rtp::read_payload`]
+/// reads either payload format, frames included.
 pub fn parse_octet_aligned(payload: &[u8]) -> Result<OctetAlignedHeader, CodecError> {
     if payload.is_empty() {
         return Err(CodecError::Malformed("empty AMR payload"));
@@ -225,21 +237,19 @@ pub fn parse_octet_aligned(payload: &[u8]) -> Result<OctetAlignedHeader, CodecEr
     })
 }
 
-/// AMR-NB codec (8 kHz, mono, 20 ms = 160 samples).
+/// AMR-NB codec (8 kHz, mono, 20 ms = 160 samples a frame).
 ///
-/// Decode is wired for **all 8 speech modes** (4.75 .. 12.2 kbit/s) end to end, bit-exact against
-/// the 3GPP TS 26.074 `T_<mode>` vectors. DTX/CNG and error-concealment (the bad-frame branch) are
-/// not yet implemented; [`Decoder::conceal`] therefore returns [`CodecError::Unsupported`]. The
-/// encoder is a separate, later tier.
+/// Decode and encode cover **all 8 speech modes** (4.75 .. 12.2 kbit/s), bit-exact against the 3GPP
+/// TS 26.074 `T_<mode>` vectors, in both RFC 4867 payload formats. Not ported: discontinuous
+/// transmission (the encoder sends speech frames only; a received SID or NO_DATA frame is rendered
+/// as silence) and error concealment (a lost or damaged frame is rendered as silence).
 #[derive(Debug, Clone)]
 pub struct AmrNb {
     params: CodecParams,
     decoder: Box<nb::dec_main::SpeechDecoder>,
     encoder: Box<nb::enc_main::EncoderState>,
-    /// Target speech mode for [`Encoder::encode`]. Defaults to MR122 (12.2 kbit/s, GSM-EFR — the
-    /// highest-quality wired mode). Only MR122 and MR475 are wired; other modes return
-    /// [`CodecError::Unsupported`]. Set via [`AmrNb::with_encode_mode`].
-    encode_mode: AmrNbMode,
+    /// Payload format, mode decision and codec mode requests of the stream.
+    stream: RtpStream,
 }
 
 impl Default for AmrNb {
@@ -249,28 +259,51 @@ impl Default for AmrNb {
 }
 
 impl AmrNb {
-    /// Create an AMR-NB codec at the canonical 8 kHz / 20 ms configuration.
+    /// The bare codec at 8 kHz / 20 ms: **octet-aligned** payloads at MR122 (12.2 kbit/s), every
+    /// mode allowed. A stream negotiated in SDP is built with [`AmrNb::negotiated`] instead, whose
+    /// default is the RFC 4867 one (bandwidth-efficient).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_stream(RtpStream::bare(
+            Variant::Narrowband,
+            AmrNbMode::Mr1220.frame_type(),
+        ))
+    }
+
+    /// The codec for a stream as negotiated (RFC 4867 §8.1), or [`CodecError::Unsupported`] when
+    /// its `mode-set` or preferred mode names a mode AMR does not have.
+    pub fn negotiated(config: &RtpConfig<'_>) -> Result<Self, CodecError> {
+        Ok(Self::with_stream(RtpStream::new(
+            Variant::Narrowband,
+            config,
+        )?))
+    }
+
+    fn with_stream(stream: RtpStream) -> Self {
         Self {
             params: CodecParams {
                 sample_rate_hz: 8000,
                 channels: 1,
-                ptime_ms: 20,
+                ptime_ms: 20 * stream.frames_per_packet,
             },
             decoder: Box::new(nb::dec_main::SpeechDecoder::new()),
             encoder: Box::new(nb::enc_main::EncoderState::new()),
-            encode_mode: AmrNbMode::Mr1220,
+            stream,
         }
     }
 
-    /// Set the target speech mode for [`Encoder::encode`] (e.g. from the SDP `mode-set` / RFC 4867
-    /// CMR). Only MR122 and MR475 are wired; other modes make [`Encoder::encode`] return
-    /// [`CodecError::Unsupported`].
+    /// Set the speech mode [`Encoder::encode`] prefers: the highest allowed mode at or below it is
+    /// sent while no codec mode request restricts it.
     #[must_use]
     pub fn with_encode_mode(mut self, mode: AmrNbMode) -> Self {
-        self.encode_mode = mode;
+        self.stream.modes = self.stream.modes.preferring(mode.frame_type());
         self
+    }
+
+    /// Speech frames received so far in a mode outside the negotiated `mode-set`. They are decoded.
+    #[must_use]
+    pub fn frames_outside_mode_set(&self) -> u64 {
+        self.stream.frames_outside_mode_set
     }
 
     /// Encode one 20 ms frame (160 samples @ 8 kHz) at `mode` into its serial speech bits in
@@ -334,6 +367,33 @@ impl AmrNb {
     }
 }
 
+impl FrameCodec for AmrNb {
+    fn decode_speech(&mut self, mode: u8, frame: &[u8], pcm: &mut [i16]) -> Result<(), CodecError> {
+        let bits = nb::bitstream::unsort(frame, usize::from(mode));
+        self.decode_mode_bits(usize::from(mode), &bits, pcm)
+            .map(|_| ())
+    }
+
+    /// The error concealment of 3GPP TS 26.091 is not ported: a lost or damaged frame is silence.
+    fn conceal_frame(&mut self, pcm: &mut [i16]) {
+        pcm.fill(0);
+    }
+
+    fn encode_speech(
+        &mut self,
+        mode: u8,
+        pcm: &[i16],
+        frame: &mut [u8; MAX_FRAME_OCTETS],
+    ) -> Result<(), CodecError> {
+        let mode = AmrNbMode::from_frame_type(mode)
+            .ok_or(CodecError::Unsupported("AMR-NB invalid speech mode"))?;
+        let mut bits = [0i16; nb::bitstream::MAX_SERIAL_SIZE];
+        self.encode_mode_bits(mode, pcm, &mut bits)?;
+        nb::bitstream::pack_into(&bits, usize::from(mode.frame_type()), frame);
+        Ok(())
+    }
+}
+
 impl Decoder for AmrNb {
     fn params(&self) -> CodecParams {
         self.params
@@ -342,35 +402,27 @@ impl Decoder for AmrNb {
         self.params.frame_samples()
     }
 
-    /// Decode one AMR-NB RTP frame. All 8 speech modes (0..=7) are wired bit-exact; the payload's
-    /// first frame is un-sorted from RFC 4867 order to encoder order before the core decode.
-    /// SID/no-data frames are not yet supported (DTX/CNG is a separate tier).
+    /// Decode one AMR RTP payload in the stream's payload format: every frame it carries, 160
+    /// samples for each. See [`stream`] for what each frame type becomes.
     fn decode(&mut self, payload: &[u8], out: &mut [i16]) -> Result<usize, CodecError> {
-        // Default to octet-aligned framing (the common VoLTE posture); fall back to
-        // bandwidth-efficient if that does not parse cleanly.
-        let parsed = payload::AmrPayload::parse_amr_nb(payload, true)
-            .or_else(|_| payload::AmrPayload::parse_amr_nb(payload, false))?;
-        let frame = parsed
-            .frames
-            .first()
-            .ok_or(CodecError::Malformed("AMR-NB payload has no frames"))?;
-        match frame.frame_type {
-            mode @ 0..=7 => {
-                let nb_mode = AmrNbMode::from_frame_type(mode)
-                    .ok_or(CodecError::Unsupported("AMR-NB invalid speech mode"))?;
-                if frame.data.len() < nb_mode.bytes() {
-                    return Err(CodecError::Malformed("AMR-NB speech frame truncated"));
-                }
-                let bits = nb::bitstream::unsort(&frame.data, mode as usize);
-                self.decode_mode_bits(mode as usize, &bits, out)
-            }
-            _ => Err(CodecError::Unsupported(
-                "AMR-NB SID/no-data decode not yet implemented",
-            )),
-        }
+        let mut stream = self.stream;
+        let decoded = stream::decode_payload(self, &mut stream, payload, out);
+        self.stream = stream;
+        decoded
     }
-    fn conceal(&mut self, _out: &mut [i16]) -> Result<usize, CodecError> {
-        Err(CodecError::Unsupported("AMR-NB PLC not yet implemented"))
+
+    /// One packet's worth of silence for a lost packet (no error concealment is ported).
+    fn conceal(&mut self, out: &mut [i16]) -> Result<usize, CodecError> {
+        let samples = self.params.frame_samples();
+        let Some(out) = out.get_mut(..samples) else {
+            return Err(CodecError::Malformed("AMR-NB output buffer too small"));
+        };
+        out.fill(0);
+        Ok(samples)
+    }
+
+    fn last_mode_request(&self) -> Option<u8> {
+        self.stream.last_request
     }
 }
 
@@ -381,36 +433,27 @@ impl Encoder for AmrNb {
     fn frame_samples(&self) -> usize {
         self.params.frame_samples()
     }
-    /// Encode one 20 ms frame (160 samples @ 8 kHz) into an RFC 4867 **octet-aligned** single-frame
-    /// AMR-NB payload at the configured [`AmrNb::with_encode_mode`] mode (default MR122 / 12.2 kbit/s):
-    /// the bit-exact core ([`AmrNb::encode_mode_bits`]) → RFC 4867 sort/pack → `CMR | ToC | speech`.
-    /// CMR = 15 (no mode request); ToC = `F=0, FT=mode, Q=1` (RFC 4867 §4.3.2 / §4.4).
+
+    /// Encode one packet (20 ms a frame, the stream's frames per packet) into an RFC 4867 payload in
+    /// the stream's payload format, each frame at the mode [`mode_control::ModeControl`] decides.
     fn encode(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, CodecError> {
-        let mode = self.encode_mode;
-        let nb_bits = mode.bits() as usize;
-        let mut bits = [0i16; 244]; // max AMR-NB serial size (MR122)
-        self.encode_mode_bits(mode, pcm, &mut bits[..nb_bits])?;
-        let speech = nb::bitstream::pack(&bits, mode.frame_type() as usize);
-        // Octet-aligned single-frame payload: CMR byte + ToC byte + speech bytes.
-        let total = 2 + speech.len();
-        if out.len() < total {
-            return Err(CodecError::OutputTooSmall {
-                needed: total,
-                have: out.len(),
-            });
-        }
-        out[0] = 0xF0; // CMR = 15 (no codec-mode request), low 4 bits reserved = 0
-        out[1] = (mode.frame_type() << 3) | 0x04; // F=0 (last frame), FT=mode, Q=1 (good)
-        out[2..total].copy_from_slice(&speech);
-        Ok(total)
+        let mut stream = self.stream;
+        let encoded = stream::encode_payload(self, &mut stream, pcm, out);
+        self.stream = stream;
+        encoded
+    }
+
+    fn request_mode(&mut self, mode: u8) {
+        self.stream.modes.request(mode);
     }
 }
 
-/// AMR-WB codec (16 kHz, mono, 20 ms = 320 samples).
+/// AMR-WB codec (16 kHz, mono, 20 ms = 320 samples a frame).
 ///
-/// Decode is wired for **all 9 speech modes** (6.60 .. 23.85 kbit/s) end to end, bit-exact against
-/// the 3GPP `tst_mN` vectors, plus bad-frame concealment ([`Decoder::conceal`]). DTX/CNG (comfort
-/// noise) remains WIP and returns [`CodecError::Unsupported`].
+/// Decode and encode cover **all 9 speech modes** (6.60 .. 23.85 kbit/s), bit-exact against the
+/// 3GPP `tst_mN` vectors, in both RFC 4867 payload formats, plus bad-frame concealment
+/// ([`Decoder::conceal`]). Not ported: discontinuous transmission (the encoder sends speech frames
+/// only; a received SID or NO_DATA frame of a silence period is rendered as silence).
 #[derive(Debug, Clone)]
 pub struct AmrWb {
     params: CodecParams,
@@ -418,19 +461,8 @@ pub struct AmrWb {
     encoder_state: Box<wb::enc_main::EncoderState>,
     /// Last decoded speech mode (0..=8), used to size concealed frames after a loss.
     last_mode: u8,
-    /// Target speech mode for [`Encoder::encode`] (0..=8). Defaults to 2 (12.65 kbit/s) — the common
-    /// VoLTE rate. The SDP `mode-set`-resolved default is set via [`AmrWb::with_encode_mode`];
-    /// per-frame RFC 4867 CMR adaptation moves it via [`Encoder::request_mode`], clamped to
-    /// `allowed_mask`. Sticky until the next request.
-    encode_mode: u8,
-    /// Bitmask of the modes the SDP `mode-set` permits (bit *i* ⇒ mode *i* allowed), for clamping a
-    /// per-frame CMR so the engine never encodes a disallowed mode (RFC 4867 §8.1). `0` ⇒ no `mode-set`
-    /// constraint (any mode 0..=8).
-    allowed_mask: u16,
-    /// The RFC 4867 §4.3.1 Codec Mode Request carried by the most recently decoded payload:
-    /// `Some(0..=8)` when the peer requested a mode, `None` for "no request" (CMR = 15). Surfaced via
-    /// [`Decoder::last_mode_request`] so the media path can steer the reverse-direction encoder.
-    last_cmr: Option<u8>,
+    /// Payload format, mode decision and codec mode requests of the stream.
+    stream: RtpStream,
 }
 
 impl Default for AmrWb {
@@ -440,60 +472,61 @@ impl Default for AmrWb {
 }
 
 impl AmrWb {
-    /// Create an AMR-WB codec at the canonical 16 kHz / 20 ms configuration.
+    /// The bare codec at 16 kHz / 20 ms: **octet-aligned** payloads at mode 2 (12.65 kbit/s), every
+    /// mode allowed. A stream negotiated in SDP is built with [`AmrWb::negotiated`] instead, whose
+    /// default is the RFC 4867 one (bandwidth-efficient).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_stream(RtpStream::bare(
+            Variant::Wideband,
+            AmrWbMode::Mr1265.frame_type(),
+        ))
+    }
+
+    /// The codec for a stream as negotiated (RFC 4867 §8.2), or [`CodecError::Unsupported`] when
+    /// its `mode-set` or preferred mode names a mode AMR-WB does not have.
+    pub fn negotiated(config: &RtpConfig<'_>) -> Result<Self, CodecError> {
+        Ok(Self::with_stream(RtpStream::new(
+            Variant::Wideband,
+            config,
+        )?))
+    }
+
+    fn with_stream(stream: RtpStream) -> Self {
         Self {
             params: CodecParams {
                 sample_rate_hz: 16000,
                 channels: 1,
-                ptime_ms: 20,
+                ptime_ms: 20 * stream.frames_per_packet,
             },
             decoder_state: Box::new(wb::dec_main::DecoderState::new()),
             encoder_state: Box::new(wb::enc_main::EncoderState::new()),
             last_mode: 0,
-            encode_mode: 2,
-            allowed_mask: 0,
-            last_cmr: None,
+            stream,
         }
     }
 
-    /// Set the target speech mode (0..=8) for [`Encoder::encode`] (e.g. from the SDP `mode-set`).
-    /// Out-of-range values are clamped to mode 8.
+    /// Set the speech mode (0..=8) [`Encoder::encode`] prefers: the highest allowed mode at or below
+    /// it is sent while no codec mode request restricts it. Out-of-range values are read as mode 8.
     #[must_use]
     pub fn with_encode_mode(mut self, mode: u8) -> Self {
-        self.encode_mode = mode.min(8);
+        self.stream.modes = self.stream.modes.preferring(mode);
         self
     }
 
-    /// Constrain per-frame CMR adaptation to the modes the SDP `mode-set` permits (RFC 4867 §8.1), so
-    /// a peer's Codec Mode Request can never make the engine encode a disallowed mode. An empty set
-    /// leaves the codec unconstrained (any mode 0..=8). Modes above 8 are ignored.
+    /// Restrict the stream to the modes an SDP `mode-set` permits (RFC 4867 §8.1), so that no other
+    /// mode is sent and a codec mode request for another is ignored. An empty set leaves the codec
+    /// unrestricted (any mode 0..=8). Modes above 8 are ignored.
     #[must_use]
     pub fn with_allowed_modes(mut self, modes: &[u8]) -> Self {
-        self.allowed_mask = modes
-            .iter()
-            .filter(|&&mode| mode <= 8)
-            .fold(0u16, |mask, &mode| mask | (1 << mode));
+        self.stream.modes = self.stream.modes.restricted_to(modes);
         self
     }
 
-    /// Clamp a requested speech mode into the `allowed_mask`: the request itself when permitted, else
-    /// the highest allowed mode below it (never exceed what the peer asked for), else the lowest
-    /// allowed mode. Unconstrained (`allowed_mask == 0`) returns the request capped at mode 8.
-    fn clamp_to_allowed(&self, mode: u8) -> u8 {
-        let mode = mode.min(8);
-        if self.allowed_mask == 0 || self.allowed_mask & (1 << mode) != 0 {
-            return mode;
-        }
-        // Highest allowed mode strictly below the request.
-        if let Some(lower) = (0..mode).rev().find(|&m| self.allowed_mask & (1 << m) != 0) {
-            return lower;
-        }
-        // Else the lowest allowed mode above it (the mask is non-zero, so one exists).
-        (mode + 1..=8)
-            .find(|&m| self.allowed_mask & (1 << m) != 0)
-            .unwrap_or(mode)
+    /// Speech frames received so far in a mode outside the negotiated `mode-set`. They are decoded.
+    #[must_use]
+    pub fn frames_outside_mode_set(&self) -> u64 {
+        self.stream.frames_outside_mode_set
     }
 
     /// Encode one 20 ms frame (320 samples @ 16 kHz) at `mode` (0..=8) into its speech bits in
@@ -587,6 +620,35 @@ impl AmrWb {
     }
 }
 
+impl FrameCodec for AmrWb {
+    fn decode_speech(&mut self, mode: u8, frame: &[u8], pcm: &mut [i16]) -> Result<(), CodecError> {
+        let mut bits = [wb::bitstream::BIT_0; 477]; // max AMRWB_SPEECH_BITS (mode 8)
+        let nb_bits = wb::bitstream::sort_table(mode).len();
+        wb::bitstream::unsort_into(frame, mode, &mut bits[..nb_bits]);
+        self.decode_mode_bits(mode, &bits[..nb_bits], pcm)
+            .map(|_| ())
+    }
+
+    /// The bad-frame branch of `dec_main.c`: lag/gain/ISF extrapolation and an energy fade.
+    fn conceal_frame(&mut self, pcm: &mut [i16]) {
+        if pcm.len() >= wb::constants::L_FRAME16K {
+            wb::dec_main::conceal(&mut self.decoder_state, self.last_mode, pcm);
+        }
+    }
+
+    fn encode_speech(
+        &mut self,
+        mode: u8,
+        pcm: &[i16],
+        frame: &mut [u8; MAX_FRAME_OCTETS],
+    ) -> Result<(), CodecError> {
+        let mut bits = [0i16; 477]; // max AMRWB_SPEECH_BITS (mode 8)
+        let nb_bits = self.encode_mode_bits(mode, pcm, &mut bits)?;
+        wb::bitstream::pack_into(&bits[..nb_bits], mode, frame);
+        Ok(())
+    }
+}
+
 impl Decoder for AmrWb {
     fn params(&self) -> CodecParams {
         self.params
@@ -595,55 +657,33 @@ impl Decoder for AmrWb {
         self.params.frame_samples()
     }
 
-    /// Decode one AMR-WB RTP frame. All 9 speech modes (0..=8) are wired bit-exact; the payload's
-    /// first frame is un-sorted from RFC 4867 order to encoder order before the core decode.
-    /// SID/no-data frames are not yet supported (DTX/CNG is a separate tier).
+    /// Decode one AMR-WB RTP payload in the stream's payload format: every frame it carries, 320
+    /// samples for each. See [`stream`] for what each frame type becomes.
     fn decode(&mut self, payload: &[u8], out: &mut [i16]) -> Result<usize, CodecError> {
-        // Default to octet-aligned framing (the common VoLTE posture); fall back to
-        // bandwidth-efficient if that does not parse cleanly.
-        let parsed = payload::AmrPayload::parse_amr_wb(payload, true)
-            .or_else(|_| payload::AmrPayload::parse_amr_wb(payload, false))?;
-        // Record the RTP-header Codec Mode Request (RFC 4867 §4.3.1): 0..=8 request a speech mode; 15
-        // (0xF) is "no request". The media path feeds it to the reverse direction's encoder.
-        self.last_cmr = (parsed.cmr <= 8).then_some(parsed.cmr);
-        let frame = parsed
-            .frames
-            .first()
-            .ok_or(CodecError::Malformed("AMR-WB payload has no frames"))?;
-        match frame.frame_type {
-            mode @ 0..=8 => {
-                let wb_mode = AmrWbMode::from_frame_type(mode)
-                    .ok_or(CodecError::Unsupported("AMR-WB invalid speech mode"))?;
-                if frame.data.len() < wb_mode.bytes() {
-                    return Err(CodecError::Malformed("AMR-WB speech frame truncated"));
-                }
-                let bits = wb::bitstream::unsort(&frame.data, mode);
-                self.decode_mode_bits(mode, &bits, out)
-            }
-            _ => Err(CodecError::Unsupported(
-                "AMR-WB SID/no-data decode not yet implemented",
-            )),
-        }
+        let mut stream = self.stream;
+        let decoded = stream::decode_payload(self, &mut stream, payload, out);
+        self.stream = stream;
+        decoded
     }
 
-    /// Conceal one lost/erased AMR-WB frame (bad-frame branch of `dec_main.c`): lag/gain/ISF
-    /// extrapolation and energy fade, producing a faded continuation of the last decoded mode.
-    /// Writes `L_FRAME16K` (320) samples. Never panics, never emits guessed bitstream audio.
+    /// Conceal one lost packet (bad-frame branch of `dec_main.c`): lag/gain/ISF extrapolation and
+    /// energy fade, producing a faded continuation of the last decoded mode, 320 samples for each
+    /// frame of the packet. Never panics, never emits guessed bitstream audio.
     fn conceal(&mut self, out: &mut [i16]) -> Result<usize, CodecError> {
-        if out.len() < wb::constants::L_FRAME16K {
+        let samples = self.params.frame_samples();
+        let Some(out) = out.get_mut(..samples) else {
             return Err(CodecError::Malformed("AMR-WB output buffer too small"));
+        };
+        for frame in out.chunks_mut(wb::constants::L_FRAME16K) {
+            self.conceal_frame(frame);
         }
-        Ok(wb::dec_main::conceal(
-            &mut self.decoder_state,
-            self.last_mode,
-            out,
-        ))
+        Ok(samples)
     }
 
-    /// The Codec Mode Request from the most recently decoded payload (RFC 4867 §4.3.1): `Some(0..=8)`
-    /// for a mode request, `None` for "no request" (CMR = 15).
+    /// The speech mode the peer asked for in the most recently decoded payload (RFC 4867 §4.3.1):
+    /// `Some(0..=8)` for a request, `None` once it sends CMR 15 (no request).
     fn last_mode_request(&self) -> Option<u8> {
-        self.last_cmr
+        self.stream.last_request
     }
 }
 
@@ -654,38 +694,20 @@ impl Encoder for AmrWb {
     fn frame_samples(&self) -> usize {
         self.params.frame_samples()
     }
-    /// Encode one 20 ms frame (320 samples @ 16 kHz) into an RFC 4867 **octet-aligned** single-frame
-    /// AMR-WB payload at the configured [`AmrWb::with_encode_mode`] mode (default 2 / 12.65 kbit/s):
-    /// the bit-exact core ([`AmrWb::encode_mode_bits`]) → RFC 4867 sort/pack → `CMR | ToC | speech`.
-    /// CMR = 15 (no mode request); ToC = `F=0, FT=mode, Q=1` (RFC 4867 §4.3.2 / §4.4).
+
+    /// Encode one packet (20 ms a frame, the stream's frames per packet) into an RFC 4867 payload in
+    /// the stream's payload format, each frame at the mode [`mode_control::ModeControl`] decides.
     fn encode(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, CodecError> {
-        let mode = self.encode_mode;
-        let nb_bits = AmrWbMode::from_frame_type(mode)
-            .ok_or(CodecError::Unsupported("AMR-WB invalid speech mode"))?
-            .bits() as usize;
-        let mut bits = [0i16; 477]; // max AMRWB_SPEECH_BITS (mode 8)
-        self.encode_mode_bits(mode, pcm, &mut bits[..nb_bits])?;
-        let speech = wb::bitstream::pack(&bits[..nb_bits], mode);
-        // Octet-aligned single-frame payload: CMR byte + ToC byte + speech bytes.
-        let total = 2 + speech.len();
-        if out.len() < total {
-            return Err(CodecError::OutputTooSmall {
-                needed: total,
-                have: out.len(),
-            });
-        }
-        out[0] = 0xF0; // CMR = 15 (no codec-mode request), low 4 bits reserved = 0
-        out[1] = (mode << 3) | 0x04; // F=0 (last frame), FT=mode, Q=1 (good)
-        out[2..total].copy_from_slice(&speech);
-        Ok(total)
+        let mut stream = self.stream;
+        let encoded = stream::encode_payload(self, &mut stream, pcm, out);
+        self.stream = stream;
+        encoded
     }
 
-    /// Adapt the egress speech mode to a peer's Codec Mode Request (RFC 4867 §4.3.1), clamped into the
-    /// SDP `mode-set` (`with_allowed_modes`) so a disallowed mode is never emitted. Sticky until the
-    /// next request. (The engine's own egress CMR stays 15/"no request" — it is a transcoder, not a
-    /// mode-requesting endpoint.)
+    /// Take the peer's codec mode request (RFC 4867 §4.3.1): a mode of the `mode-set` caps what is
+    /// sent, 15 lifts the cap, anything else is ignored.
     fn request_mode(&mut self, mode: u8) {
-        self.encode_mode = self.clamp_to_allowed(mode);
+        self.stream.modes.request(mode);
     }
 }
 

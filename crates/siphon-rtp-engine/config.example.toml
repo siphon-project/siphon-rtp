@@ -60,6 +60,15 @@ control = "127.0.0.1:8080"
 # (CLI: --prompt-cache-bytes). Keyed by path + mtime + size, so re-recording a prompt takes effect on
 # the next play with no cache-clearing step. 0 disables caching. Default: 67108864 (64 MiB).
 # prompt_cache_bytes = 67108864
+# Highest AMR / AMR-WB speech mode the node sends (CLI: --amr-max-mode 0-7, --amr-wb-max-mode 0-8).
+# Unset: the highest mode of each stream's negotiated mode-set, which with no mode-set is 12.2 kbit/s
+# for AMR and 23.85 kbit/s for AMR-WB. 2 holds AMR-WB legs at 12.65 kbit/s. Only on `amr` builds.
+# amr_max_mode = 7
+# amr_wb_max_mode = 2
+# Codec mode request (RFC 4867) the node puts in every AMR / AMR-WB payload it sends, asking the peer
+# for no mode above it (CLI: --amr-mode-request, --amr-wb-mode-request). Unset: 15, no request.
+# amr_mode_request = 7
+# amr_wb_mode_request = 2
 # File holding the control-plane shared secret, read once at start and trimmed of surrounding
 # whitespace (CLI: --control-secret-file; SIPHON_RTP_CONTROL_SECRET_FILE names it from the
 # environment). Setting this and SIPHON_RTP_CONTROL_SECRET together is a fatal startup error, and an

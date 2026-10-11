@@ -1333,9 +1333,8 @@ pub(super) fn parse_ptime_override(flags: &[String]) -> Option<u8> {
 
 /// Apply a `ptime` override to a codec: `Some(ms)` returns a clone repacketized to `ms`, `None`
 /// leaves the negotiated ptime. Sample-based codecs (G.711/G.722/G.726/L16/CN) honour any ptime;
-/// a frame-based codec (AMR) keeps its native 20 ms frame regardless (its encoder emits one fixed
-/// frame), so the override is inert there — building the encoder from the returned spec is what
-/// re-frames the codecs that honour it.
+/// a frame-based codec (AMR) sends one 20 ms frame per 20 ms of it, up to four in a packet;
+/// building the encoder from the returned spec is what re-frames the egress.
 pub(super) fn with_ptime_override(codec: &CodecSpec, override_ms: Option<u8>) -> CodecSpec {
     match override_ms {
         Some(ptime_ms) => {

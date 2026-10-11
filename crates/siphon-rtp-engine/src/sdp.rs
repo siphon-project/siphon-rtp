@@ -17,7 +17,11 @@ use siphon_rtp_codec::factory::{CodecSpec, OpusParams, OPUS_MAX_PTIME_MS};
 use siphon_rtp_ice::{Candidate, IceOptions, END_OF_CANDIDATES_ATTRIBUTE, ICE_MISMATCH_ATTRIBUTE};
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
+mod amr;
 mod decline;
+
+pub(crate) use amr::offered as offered_amr;
+pub use amr::{set_policy as set_amr_policy, AmrFmtp, AmrPolicy};
 pub use decline::decline_unanswered_media;
 
 /// Default packetization when the SDP carries no `a=ptime` (RFC 3551: 20 ms for telephony codecs).
@@ -99,10 +103,10 @@ pub struct MediaInfo {
     pub payload_types: Vec<u8>,
     /// `a=rtpmap` entries for the audio stream (payload type → encoding name / clock / channels).
     pub rtpmaps: Vec<RtpMap>,
-    /// `a=fmtp` `mode-set` constraints (payload type → allowed AMR speech modes), for variable-rate
-    /// codecs (RFC 4867 §8.1). The engine clamps its egress encode mode into this set so it never
-    /// sends a mode the peer disallowed. Empty when no `mode-set` was offered.
-    pub mode_sets: Vec<(u8, Vec<u8>)>,
+    /// `a=fmtp` RFC 4867 parameters (payload type → `mode-set`, `octet-align` and the rest), for
+    /// each payload type whose fmtp carried at least one. Only read for a payload type that
+    /// resolves to AMR or AMR-WB; one that declared nothing reads the RFC defaults.
+    pub amr_fmtp: Vec<(u8, AmrFmtp)>,
     /// `a=fmtp` Opus parameters (payload type → RFC 7587 §6.1 parameter set), for each payload type
     /// whose fmtp carried at least one recognised Opus parameter. Only read for a payload type that
     /// resolves to Opus; an Opus stream that declared no fmtp is absent here and reads the RFC
@@ -403,10 +407,13 @@ impl MediaInfo {
             .collect()
     }
 
-    /// The first negotiated audio codec the engine can build (the primary codec for the stream).
+    /// The primary codec for the stream: the first audio codec, passing over an AMR payload type in
+    /// a configuration the engine does not implement (RFC 4867 §8.3.1) when another codec follows.
     #[must_use]
     pub fn primary_codec(&self) -> Option<CodecSpec> {
-        self.audio_codecs().into_iter().next()
+        let codecs = self.audio_codecs();
+        let supported = codecs.iter().find(|spec| spec.amr_unsupported().is_none());
+        supported.or(codecs.first()).cloned()
     }
 
     /// The RFC 4733 telephone-event payload type negotiated on this stream, if any.
@@ -468,17 +475,10 @@ impl MediaInfo {
                 map.channels,
                 ptime_ms,
             );
-            // Honour an AMR-WB `mode-set` (RFC 4867 §8.1) by clamping the egress encode mode into
-            // the allowed set, so the engine never sends the peer a mode it disallowed. The full set
-            // is carried through so per-frame RFC 4867 CMR adaptation stays within it too.
-            if spec.encoding_name == "AMR-WB" {
-                if let Some((_, modes)) = self.mode_sets.iter().find(|(pt, _)| *pt == payload_type)
-                {
-                    return Some(
-                        spec.with_encode_mode(choose_amr_wb_mode(modes))
-                            .with_allowed_modes(modes.clone()),
-                    );
-                }
+            // The RFC 4867 parameters: payload format, mode set and mode change restrictions.
+            if spec.is_amr() {
+                let fmtp = self.amr_fmtp.iter().find(|(pt, _)| *pt == payload_type);
+                return Some(amr::negotiated(spec, fmtp.map(|(_, fmtp)| fmtp)));
             }
             // Honour the peer's G.729 `annexb=` (RFC 3555 §4.1.13). Absent means yes, which is what
             // `CodecSpec::new` already sets, so only an explicit declaration moves it.
@@ -577,8 +577,8 @@ struct AudioScan {
     payload_types: Vec<u8>,
     /// `a=rtpmap` entries in the audio section.
     rtpmaps: Vec<RtpMap>,
-    /// `a=fmtp` `mode-set` constraints in the audio section (payload type → allowed AMR modes).
-    fmtp_mode_sets: Vec<(u8, Vec<u8>)>,
+    /// `a=fmtp` RFC 4867 parameters in the audio section (payload type → parameter set).
+    fmtp_amr: Vec<(u8, AmrFmtp)>,
     /// `a=fmtp` RFC 7587 Opus parameters in the audio section (payload type → parameter set).
     fmtp_opus: Vec<(u8, OpusParams)>,
     /// `a=fmtp` `annexb=` declarations in the audio section (payload type → wanted).
@@ -689,21 +689,6 @@ fn fmtp_flag(params: &str, key: &str, default: bool) -> bool {
     }
 }
 
-/// Parse an `a=fmtp:<pt> ...mode-set=<m0,m1,...>...` body into `(payload_type, allowed_modes)`.
-/// Returns `None` when the line carries no parseable payload type or no `mode-set` parameter — the
-/// engine only acts on `mode-set`; every other fmtp parameter is passed through untouched.
-fn parse_fmtp_mode_set(value: &str) -> Option<(u8, Vec<u8>)> {
-    let (payload_type, params) = split_fmtp(value)?;
-    // fmtp params are `;`-separated `key=value` pairs in any order (RFC 4867 §8.1).
-    let modes_field = fmtp_param(params, "mode-set")?;
-    let modes: Vec<u8> = modes_field
-        .split(',')
-        .filter_map(|token| token.trim().parse::<u8>().ok())
-        .filter(|&mode| mode <= 8)
-        .collect();
-    (!modes.is_empty()).then_some((payload_type, modes))
-}
-
 /// Parse an `a=fmtp:<pt> …annexb=<yes|no>…` body into `(payload_type, wanted)` (RFC 3555 §4.1.13).
 ///
 /// Returns `None` when the line has no parseable payload type or carries no `annexb=` parameter, so
@@ -770,25 +755,6 @@ fn parse_fmtp_opus(value: &str) -> Option<(u8, OpusParams)> {
     Some((payload_type, parsed))
 }
 
-/// Choose the AMR-WB egress encode mode from an `allowed` `mode-set`: the engine default (mode 2 /
-/// 12.65 kbit/s) when permitted, else the highest allowed mode below it, else the lowest allowed —
-/// always a member of the set, so the engine never emits a mode the peer disallowed.
-fn choose_amr_wb_mode(allowed: &[u8]) -> Option<u8> {
-    const DEFAULT_MODE: u8 = 2;
-    if allowed.is_empty() {
-        return None;
-    }
-    if allowed.contains(&DEFAULT_MODE) {
-        return Some(DEFAULT_MODE);
-    }
-    allowed
-        .iter()
-        .copied()
-        .filter(|&mode| mode < DEFAULT_MODE)
-        .max()
-        .or_else(|| allowed.iter().copied().min())
-}
-
 /// Parse a `c=` connection line body (`IN IP4 <addr>` or `IN IP6 <addr>`, RFC 4566 §5.7). The
 /// addrtype declares the family, so the parsed address must match it — an `IP6` line carrying an
 /// IPv4 literal (or vice versa) is rejected rather than silently mis-typed. Multicast TTL/count
@@ -848,7 +814,7 @@ fn scan(sdp: &str) -> AudioScan {
         ice_mismatch: false,
         payload_types: Vec::new(),
         rtpmaps: Vec::new(),
-        fmtp_mode_sets: Vec::new(),
+        fmtp_amr: Vec::new(),
         fmtp_annex_b: Vec::new(),
         fmtp_opus: Vec::new(),
         ptime_ms: None,
@@ -1074,8 +1040,8 @@ fn scan(sdp: &str) -> AudioScan {
                         // not known until the rtpmaps are resolved (SDP attribute order is free —
                         // RFC 4566 §5), so parse it for every parameter set the engine understands
                         // and let `MediaInfo::codec_spec` pick the one its codec cares about.
-                        if let Some(mode_set) = parse_fmtp_mode_set(value) {
-                            scan.fmtp_mode_sets.push(mode_set);
+                        if let Some(amr) = amr::parse_fmtp(value) {
+                            scan.fmtp_amr.push(amr);
                         }
                         if let Some(opus) = parse_fmtp_opus(value) {
                             scan.fmtp_opus.push(opus);
@@ -1143,7 +1109,7 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         ice_mismatch: scan.ice_mismatch,
         payload_types: scan.payload_types.clone(),
         rtpmaps: scan.rtpmaps.clone(),
-        mode_sets: scan.fmtp_mode_sets.clone(),
+        amr_fmtp: scan.fmtp_amr.clone(),
         annex_b: scan.fmtp_annex_b.clone(),
         opus_params: scan.fmtp_opus.clone(),
         ptime_ms: scan.ptime_ms.unwrap_or(DEFAULT_PTIME_MS),
@@ -2073,12 +2039,9 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
             .filter(|pt| !removed.contains(pt))
             .collect::<Vec<_>>();
 
-    // Codecs to append (skip any already present after removal).
-    let added: Vec<&CodecSpec> = policy
-        .add
-        .iter()
-        .filter(|spec| !present.contains(&spec.payload_type))
-        .collect();
+    // Codecs to append (skip any already present after removal), each on a free payload type.
+    let offered: Vec<(u8, Option<String>)> = present.iter().map(|&pt| (pt, name_of(pt))).collect();
+    let added = amr::place_added(&policy.add, &offered);
     if removed.is_empty() && added.is_empty() && !reordered {
         return sdp.to_string();
     }
@@ -2140,6 +2103,7 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
         if index == rtpmap_after {
             for spec in &added {
                 out.push(rtpmap_line(spec));
+                out.extend(amr::fmtp_line(spec));
             }
         }
     }
@@ -2196,10 +2160,8 @@ fn rtpmap_line(codec: &CodecSpec) -> String {
 
 /// The `a=fmtp` line describing the engine's egress framing for a codec that needs one, or `None`.
 ///
-/// **AMR-WB:** the engine's encoder emits **octet-aligned** single-frame payloads (RFC 4867 §4.4 —
-/// see `siphon_rtp_codec::amr`), so the answer must advertise `octet-align=1`; when a `mode-set` was
-/// negotiated it also advertises the single mode the engine actually sends (RFC 4867 §8.1).
-/// (Bandwidth-efficient AMR-WB egress is a separate follow-up.)
+/// **AMR and AMR-WB:** the payload format parameters and the `mode-set` exactly as the peer
+/// offered them (RFC 4867 §8.3.1), which is also what the engine then sends; see [`amr::fmtp_line`].
 ///
 /// **Opus:** every RFC 7587 §6.1 parameter is *declarative and unidirectional* (§7.1) — there is no
 /// negotiation, each side states its own posture — so this line is the **engine's** statement, not an
@@ -2237,14 +2199,7 @@ fn egress_fmtp_line(codec: &CodecSpec) -> Option<String> {
         let value = if codec.annex_b { "yes" } else { "no" };
         return Some(format!("a=fmtp:{} annexb={value}", codec.payload_type));
     }
-    if codec.encoding_name != "AMR-WB" {
-        return None;
-    }
-    let mut params = String::from("octet-align=1");
-    if let Some(mode) = codec.encode_mode {
-        params.push_str(&format!(";mode-set={mode}"));
-    }
-    Some(format!("a=fmtp:{} {params}", codec.payload_type))
+    amr::fmtp_line(codec)
 }
 
 /// The `a=maxptime` line the engine advertises for a codec, or `None` when it advertises none.
@@ -2253,9 +2208,12 @@ fn egress_fmtp_line(codec: &CodecSpec) -> Option<String> {
 /// engine's scratch ceiling, and RFC 7587 §7 maps its `maxptime` parameter to this attribute (RFC
 /// 4566 §6). The advertised value is the engine's real ceiling — [`OPUS_MAX_PTIME_MS`], which is both
 /// the RFC 7587 §6.1 maximum and the duration the media path's frame buffers are sized for — so it is
-/// a statement the engine can keep. Fixed-frame codecs (G.711 at any ptime, AMR's native 20 ms)
-/// advertise nothing, exactly as before.
+/// a statement the engine can keep. AMR and AMR-WB advertise the twelve frames a receiver has to
+/// accept ([`amr::MAXPTIME_MS`]). Fixed-frame codecs (G.711 at any ptime) advertise nothing.
 fn egress_maxptime_line(codec: &CodecSpec) -> Option<String> {
+    if codec.is_amr() {
+        return Some(format!("a=maxptime:{}", amr::MAXPTIME_MS));
+    }
     codec
         .is_opus()
         .then(|| format!("a=maxptime:{OPUS_MAX_PTIME_MS}"))
@@ -2701,48 +2659,6 @@ mod tests {
         );
     }
 
-    /// An AMR-WB offer (PT 96, 16 kHz) at `addr`, optionally carrying an `a=fmtp` `mode-set`.
-    fn amr_wb_offer(mode_set: Option<&str>) -> String {
-        let fmtp = match mode_set {
-            Some(modes) => format!("a=fmtp:96 mode-set={modes};octet-align=1\r\n"),
-            None => String::new(),
-        };
-        format!(
-            "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n\
-             m=audio 5004 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\n{fmtp}"
-        )
-    }
-
-    fn amr_wb_encode_mode(mode_set: Option<&str>) -> Option<u8> {
-        parse(&amr_wb_offer(mode_set))
-            .expect("parse")
-            .primary_codec()
-            .expect("amr-wb codec")
-            .encode_mode
-    }
-
-    #[test]
-    fn amr_wb_mode_set_clamps_the_egress_encode_mode() {
-        // The mode-set is parsed onto the stream.
-        let info = parse(&amr_wb_offer(Some("0,1,2"))).expect("parse");
-        assert_eq!(info.mode_sets, vec![(96u8, vec![0u8, 1, 2])]);
-
-        // Default mode 2 allowed ⇒ encode at 2.
-        assert_eq!(amr_wb_encode_mode(Some("0,1,2")), Some(2));
-        // Order-independent and whitespace-tolerant.
-        assert_eq!(amr_wb_encode_mode(Some("2, 1, 0")), Some(2));
-        // Restricted below the default ⇒ the highest allowed below 2.
-        assert_eq!(amr_wb_encode_mode(Some("0,1")), Some(1));
-        // Entirely above the default ⇒ the lowest allowed (never a disallowed mode).
-        assert_eq!(amr_wb_encode_mode(Some("7,4")), Some(4));
-        // A single allowed mode is honoured exactly.
-        assert_eq!(amr_wb_encode_mode(Some("8")), Some(8));
-        // No mode-set ⇒ no constraint (the codec default, mode 2, applies downstream).
-        assert_eq!(amr_wb_encode_mode(None), None);
-        // Out-of-range tokens are ignored; an all-invalid set leaves no constraint.
-        assert_eq!(amr_wb_encode_mode(Some("9,42")), None);
-    }
-
     /// A G.729 offer (static payload type 18), with an optional `a=fmtp:18` body appended.
     fn g729_offer(fmtp: Option<&str>) -> String {
         let fmtp = fmtp.map_or_else(String::new, |body| format!("a=fmtp:18 {body}\r\n"));
@@ -2983,17 +2899,20 @@ mod tests {
             egress_fmtp_line(&with_peer_params).as_deref(),
             Some("a=fmtp:111 stereo=0;sprop-stereo=0")
         );
-        // Non-Opus codecs are untouched: AMR-WB keeps its own line, G.711 has none, and neither
-        // advertises a maxptime (their frame duration is fixed).
+        // Non-Opus codecs are untouched: G.711 has no line and no maxptime (its frame duration is
+        // fixed), and AMR-WB keeps its own (`sdp::amr`).
         let g711 = CodecSpec::new(0, "PCMU", 8000, 1, 20);
         assert_eq!(egress_fmtp_line(&g711), None);
         assert_eq!(egress_maxptime_line(&g711), None);
-        let amr = CodecSpec::new(96, "AMR-WB", 16_000, 1, 20).with_encode_mode(Some(2));
+        let amr = CodecSpec::new(96, "AMR-WB", 16_000, 1, 20);
         assert_eq!(
             egress_fmtp_line(&amr).as_deref(),
-            Some("a=fmtp:96 octet-align=1;mode-set=2")
+            Some("a=fmtp:96 mode-change-capability=2")
         );
-        assert_eq!(egress_maxptime_line(&amr), None);
+        assert_eq!(
+            egress_maxptime_line(&amr).as_deref(),
+            Some("a=maxptime:240")
+        );
     }
 
     #[test]
@@ -4299,17 +4218,23 @@ mod tests {
     }
 
     #[test]
-    fn force_answer_codec_amr_wb_advertises_octet_align_and_mode_set() {
-        // The engine encodes octet-aligned AMR-WB at the mode-set-resolved mode; the answer must say so.
-        let amr = CodecSpec::new(96, "AMR-WB", 16000, 1, 20).with_encode_mode(Some(1));
+    fn force_answer_codec_amr_wb_returns_octet_align_and_mode_set_as_negotiated() {
+        // RFC 4867 §8.3.1: `octet-align` and the `mode-set` go back unmodified, whichever mode the
+        // engine then sends from the set.
+        let amr = CodecSpec::new(96, "AMR-WB", 16000, 1, 20)
+            .with_allowed_modes(vec![0, 1])
+            .with_amr_params(Some(siphon_rtp_codec::factory::AmrParams {
+                octet_align: Some(true),
+                ..Default::default()
+            }));
         let far = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
                    m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
         let out = force_answer_codec(far, &amr, None);
         assert!(out.contains("m=audio 40000 RTP/AVP 96"), "{out}");
         assert!(out.contains("a=rtpmap:96 AMR-WB/16000"));
         assert!(
-            out.contains("a=fmtp:96 octet-align=1;mode-set=1"),
-            "octet-align + negotiated mode advertised: {out}"
+            out.contains("a=fmtp:96 octet-align=1;mode-set=0,1;mode-change-capability=2\r\n"),
+            "octet-align and the whole mode-set returned: {out}"
         );
         assert!(!out.contains("PCMU"), "B's PCMU dropped: {out}");
     }

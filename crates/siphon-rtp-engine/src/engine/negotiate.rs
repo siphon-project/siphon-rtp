@@ -425,9 +425,7 @@ pub(super) fn parse_codec_flags(flags: &[String]) -> sdp::CodecPolicy {
         } else if let Some(name) = flag.strip_prefix("codec-offer-") {
             policy.order.push(name.to_ascii_uppercase());
         } else if let Some(name) = flag.strip_prefix("codec-transcode-") {
-            if let Some(spec) = transcode_codec_spec(name) {
-                policy.add.push(spec);
-            }
+            policy.add.extend(transcode_codec_specs(name));
         }
     }
     policy
@@ -436,19 +434,23 @@ pub(super) fn parse_codec_flags(flags: &[String]) -> sdp::CodecPolicy {
 /// A conventional dynamic RTP payload type for Opus. Not registered — RFC 7587 §7 makes Opus a
 /// dynamic payload type — but 111 is what WebRTC endpoints offer in practice, so using it keeps the
 /// engine's offer familiar to the peers most likely to answer it. Distinct from the 96 the other
-/// dynamic entries in [`transcode_codec_spec`] use, so an offer can carry both.
+/// dynamic entries in [`transcode_codec_specs`] use, so an offer can carry both.
 pub(super) const OPUS_DYNAMIC_PAYLOAD_TYPE: u8 = 111;
 
-/// Map a `codec-transcode-<NAME>` target to a [`CodecSpec`] the engine can both advertise and
-/// **encode** (so the forced transcode does not fail at answer). Static codecs use their RFC 3551
-/// payload type; dynamic ones use a conventional number.
+/// Map a `codec-transcode-<NAME>` target to the [`CodecSpec`]s the engine offers for it, each one
+/// the engine can both advertise and **encode** (so the forced transcode does not fail at answer).
+/// Static codecs use their RFC 3551 payload type; dynamic ones use a conventional number, which
+/// `sdp::apply_codec_policy` moves when the offer already uses it.
 ///
-/// `None` for an unknown name, and — crucially — for a *known* name the codec factory cannot actually
+/// One spec for every codec but the AMR pair, which is offered in both of its payload formats,
+/// bandwidth-efficient first (`sdp::offered_amr`).
+///
+/// Empty for an unknown name, and — crucially — for a *known* name the codec factory cannot actually
 /// build an encoder for. That is enforced by probing [`factory::encoder_for`] rather than by a
 /// hand-maintained list, so this table can never drift into advertising a transcode target that fails
 /// at answer: AMR-WB without the `amr` build feature simply drops out, and lights up on its own once
 /// the factory can serve it (which is exactly how Opus arrived, with no edit here).
-pub(super) fn transcode_codec_spec(name: &str) -> Option<CodecSpec> {
+pub(super) fn transcode_codec_specs(name: &str) -> Vec<CodecSpec> {
     let upper = name.to_ascii_uppercase();
     // (payload type, RTP clock, rtpmap channels, ptime): the last two are per-codec, not universal —
     // Opus signals `opus/48000/2` (RFC 7587 §7) even for a mono stream.
@@ -458,8 +460,8 @@ pub(super) fn transcode_codec_spec(name: &str) -> Option<CodecSpec> {
         "G722" => (9, 8000, 1, 20),
         "GSM" => (3, 8000, 1, 20),
         "G726-32" => (96, 8000, 1, 20),
-        #[cfg(feature = "amr")]
-        "AMR-WB" => (96, 16000, 1, 20),
+        "AMR-WB" => return encodable(sdp::offered_amr([96, 97], &upper, 16000).to_vec()),
+        "AMR" => return encodable(sdp::offered_amr([98, 99], &upper, 8000).to_vec()),
         // RFC 7587: 48 kHz clock (§4.1), rtpmap channel count 2 (§7 — normalised by `CodecSpec::new`
         // regardless), 20 ms default ptime (§6.1). The engine's egress is mono, declared as
         // `sprop-stereo=0` by `sdp::egress_fmtp_line`.
@@ -469,11 +471,21 @@ pub(super) fn transcode_codec_spec(name: &str) -> Option<CodecSpec> {
             siphon_rtp_codec::factory::OPUS_RTPMAP_CHANNELS,
             20,
         ),
-        _ => return None,
+        _ => return Vec::new(),
     };
-    let spec = CodecSpec::new(payload_type, &upper, clock_rate_hz, channels, ptime_ms);
-    // Advertise only what we can genuinely encode — see the doc comment.
-    factory::encoder_for(&spec).is_ok().then_some(spec)
+    encodable(vec![CodecSpec::new(
+        payload_type,
+        &upper,
+        clock_rate_hz,
+        channels,
+        ptime_ms,
+    )])
+}
+
+/// Advertise only what the engine can genuinely encode, see [`transcode_codec_specs`].
+fn encodable(mut specs: Vec<CodecSpec>) -> Vec<CodecSpec> {
+    specs.retain(|spec| factory::encoder_for(spec).is_ok());
+    specs
 }
 
 /// The explicit ICE posture requested by the control `profile.ice` field (rtpengine `ICE=…`),

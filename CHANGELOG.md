@@ -7,6 +7,60 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **AMR and AMR-WB are sent in the payload format that was negotiated.** The engine wrote
+  octet-aligned payloads on every AMR leg, whatever the offer said, and read a received payload
+  by trying one format and then the other. RFC 4867 §8.1 makes bandwidth-efficient the format of
+  a stream whose `a=fmtp` has no `octet-align=1`, which is what a VoLTE handset offers first, so
+  such a leg was sent a stream it could not read. Both formats are now implemented in both
+  directions, a stream uses the one its offer/answer settled, and a payload that does not match
+  its own table of contents is dropped and counted (§4.5.1) instead of being tried in the other
+  format.
+- **The answer returns the AMR parameters it was offered.** RFC 4867 §8.3.1 has `octet-align`,
+  `crc`, `robust-sorting` and the `mode-set` come back unmodified. An AMR-WB answer always said
+  `octet-align=1` and narrowed the `mode-set` to the one mode sent, and an AMR answer carried no
+  `a=fmtp` at all. Both now return what was offered, add `mode-change-capability=2`, return an
+  offered `max-red`, drop unknown parameters, and advertise `a=maxptime:240`.
+- **A payload type in a configuration the engine does not implement is no longer selected.**
+  Frame CRCs, robust sorting, interleaving, a second channel, or a `mode-set` naming a mode the
+  codec lacks: the answer falls to the next payload type, and an offer with nothing else is
+  refused with `no-encodable-codec`. A VoLTE handset's offer of each codec in both formats is
+  answered AMR-WB bandwidth-efficient (3GPP TS 26.114 Table A.3.1).
+- **AMR honours the `mode-set`.** AMR was sent at 12.2 kbit/s whatever the `mode-set` allowed.
+  Both codecs now send the highest mode of the set (3GPP TS 26.114 §7.5.2.1.2.1), which for an
+  AMR-WB leg with no `mode-set` is 23.85 kbit/s where it was 12.65: set `--amr-wb-max-mode 2` to
+  keep 12.65.
+- **Codec mode requests follow RFC 4867 §4.3.1.** A request for a mode outside the `mode-set` was
+  moved to the nearest allowed mode; it is now ignored. A CMR of 15 after a request lifts it,
+  where the request used to stick for the rest of the call. AMR requests are acted on, where only
+  AMR-WB ones were. `mode-change-period=2` and `mode-change-neighbor=1` from the peer are obeyed.
+- **A received SID or NO_DATA frame is silence, not an error**, and a frame with the Q bit clear
+  is concealed rather than decoded. Every frame of a multi-frame packet is decoded, where only the
+  first was. A lost AMR packet is silence instead of an error from the concealment call.
+
+### Added
+
+- **`codec-transcode-AMR`**, and both AMR targets are offered in both payload formats,
+  bandwidth-efficient first (GSMA IR.92 §3.2.5). An added codec whose dynamic payload type the
+  offer already uses moves to a free one instead of being left out.
+- **`--amr-max-mode`, `--amr-wb-max-mode`, `--amr-mode-request`, `--amr-wb-mode-request`** (and the
+  same keys in the config file): the highest mode the node sends, and the codec mode request it
+  puts in what it sends (default 15, none).
+- **AMR packs one frame per 20 ms of the negotiated `ptime`**, up to four in a packet.
+
+### Changed
+
+- The RTP path of both AMR codecs no longer allocates per packet.
+- The HA call snapshot carries the AMR `a=fmtp` parameters, so a restored call keeps its payload
+  format. A snapshot from an older node restores as bandwidth-efficient.
+
+### Not implemented, stated
+
+- AMR discontinuous transmission: no SID frames are sent, and a received silence period is
+  played as digital silence, not comfort noise. Redundant frames from a peer are decoded as new
+  audio. See [AMR on RTP](docs/codecs.md#amr-on-rtp).
+
 ## [0.12.2] — 2026-10-06
 
 ### Fixed

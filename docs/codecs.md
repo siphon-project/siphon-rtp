@@ -116,9 +116,9 @@ decision of the media path, not a per-frame codec.
 **AMR-WB** (behind `amr`). Decode covers all 9 speech modes, 6.60 through 23.85 kbit/s,
 bit-exact against the 3GPP TS 26.174 vectors, including the RFC 4867 payload
 un-sorting. Encode is likewise vector-exact for all 9 modes, mode 8's high-band gain
-tier included. The egress mode defaults to mode 2 (12.65 kbit/s), honours the SDP
-`a=fmtp` `mode-set` (RFC 4867 §8.1), and adapts per frame to the peer's CMR clamped
-into that mode-set. This is the VoLTE codec; it is what the `amr` feature exists for.
+tier included. This is the VoLTE codec; it is what the `amr` feature exists for. How a
+stream is framed and which mode it is sent in is negotiated, see
+[AMR on RTP](#amr-on-rtp) below.
 
 **AMR-NB** (behind `amr`). Decode and encode both cover all 8 speech modes (4.75 through
 12.2 kbit/s), bit-exact against 3GPP TS 26.074: MR475, MR515, MR59, MR67, MR74, MR795
@@ -126,7 +126,8 @@ into that mode-set. This is the VoLTE codec; it is what the `amr` feature exists
 MR795 carries an adaptive gain quantizer (a pre-quantizer over three pitch-gain candidates,
 a gain adaptor, then a modified codebook-gain search) and is the only mode that sends two
 gain indices per subframe. This is a full AMR-NB encoder for G.711 transcoding in both
-directions; only DTX/SID (comfort-noise generation) is out of scope.
+directions. Error concealment (3GPP TS 26.091) is not ported: a lost or damaged AMR-NB
+frame is played as 20 ms of silence, where AMR-WB conceals it.
 
 **Opus.** **Both directions are complete and wired into the codec factory**, so an Opus leg
 transcodes either way — Opus ↔ G.711 and Opus ↔ AMR-WB, the WebRTC-trunk and voice-AI
@@ -206,6 +207,68 @@ feature** — see [Codec licensing](codec-licensing.md). It appears in the `node
 capability list only when the factory can build a decoder *and* an encoder for it — which it
 now can, so a dispatcher may route Opus calls here, and could never have been told about a
 transcode this build cannot perform.
+
+## AMR on RTP
+
+Both codecs use the payload format of RFC 4867, and everything about a stream is what the
+offer/answer settled. Nothing is guessed from the packets.
+
+**Payload format.** Both formats are implemented, for sending and receiving: bandwidth-efficient
+(RFC 4867 §4.3, the default: `octet-align` absent or `0`) and octet-aligned (§4.4,
+`octet-align=1`). A stream is read and written in the one it negotiated. A payload that is not
+exactly what its own table of contents describes is dropped and counted as a decode error
+(§4.5.1), and the stream carries on with the next packet.
+
+**What an answer returns** (RFC 4867 §8.3.1). `octet-align`, `crc`, `robust-sorting` and the
+`mode-set` come back exactly as offered, an absent one staying absent. The engine adds
+`mode-change-capability=2` (it can restrict mode changes to every second frame) and returns an
+offered `max-red`. It obeys the peer's `mode-change-period` and `mode-change-neighbor` when it
+sends and declares neither itself, since it accepts a change on any frame to any mode. Unknown
+parameters are removed. The answer carries `a=maxptime:240`: up to twelve frames per packet are
+accepted (3GPP TS 26.114 §7.5.2.1.2.3).
+
+**What is not implemented, and what happens then.** Frame CRCs (`crc=1`), robust sorting
+(`robust-sorting=1`), interleaving (`interleaving=N`), more than one channel, and a `mode-set`
+naming a mode the codec does not have. A payload type that asks for one of these is not selected:
+the answer falls to the next payload type of the offer, the usual one being the same codec in a
+plain configuration, and an offer with nothing else is refused with `no-encodable-codec`.
+
+**Several AMR payload types in one offer.** A VoLTE handset offers each codec twice, bandwidth-
+efficient first and octet-aligned second (3GPP TS 26.114 Table A.1.2). The first payload type the
+engine can serve wins, so that offer is answered AMR-WB bandwidth-efficient, as Table A.3.1 has it.
+
+**When the engine offers AMR** (`codec-transcode-AMR-WB`, `codec-transcode-AMR`), it offers both
+formats, bandwidth-efficient first (GSMA IR.92 §3.2.5), each with `mode-change-capability=2;max-red=0`
+and no `mode-set`.
+
+**The mode sent.** The highest mode of the negotiated `mode-set`, or of all modes when there is
+none (3GPP TS 26.114 §7.5.2.1.2.1): 12.2 kbit/s for AMR, 23.85 kbit/s for AMR-WB. `--amr-max-mode`
+and `--amr-wb-max-mode` lower that ceiling for the whole node (`--amr-wb-max-mode 2` holds wideband
+legs at 12.65 kbit/s); the mode sent is then the highest of the set at or below it, and when the
+whole set lies above it, the lowest of the set. No mode outside the `mode-set` is ever sent.
+
+**Codec mode requests.** The CMR in each received payload caps the mode sent back to that party
+from the next frame on, CMR 15 lifts the cap, and a request for a mode outside the `mode-set`, or
+for a value that is not a mode, is ignored (RFC 4867 §4.3.1). With `mode-change-period=2`
+negotiated, the mode changes on every second frame only; with `mode-change-neighbor=1`, one mode
+of the set at a time. The engine itself sends CMR 15 unless `--amr-mode-request` /
+`--amr-wb-mode-request` name a mode, which is then sent on every stream whose `mode-set` has it.
+
+**Frames per packet.** One per 20 ms of the negotiated `ptime`, up to four (TS 26.114 §7.4.2); a
+`ptime` below 40 sends one. Received packets may carry up to twelve.
+
+**Receiving.** Every frame of a packet is decoded, 20 ms each. A frame with the Q bit clear, and an
+AMR-WB `SPEECH_LOST` frame, are concealed rather than decoded. A frame in a mode outside the
+`mode-set` is decoded all the same.
+
+**Discontinuous transmission is not implemented.** The encoders send speech frames only, never
+SID frames, whatever the peer negotiated. A received SID frame starts a silence period, which is
+played as digital silence, not synthesised comfort noise: the SID frame and each `NO_DATA` frame
+until speech returns become 20 ms of silence. Between the peer's SID updates no packet arrives and
+nothing is generated for that time.
+
+**Redundancy is not implemented.** The engine sends none. A peer that sends redundant copies of
+earlier frames (RFC 4867 §3.7.1) has them decoded as if they were new audio.
 
 ## Channels and PCM layout
 

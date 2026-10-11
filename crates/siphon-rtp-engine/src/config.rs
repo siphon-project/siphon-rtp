@@ -139,6 +139,14 @@ pub struct FileConfig {
     pub max_control_rps: Option<u64>,
     /// Bytes of decoded prompt audio to cache; `0` disables (`--prompt-cache-bytes`).
     pub prompt_cache_bytes: Option<u64>,
+    /// Highest AMR mode sent, 0 to 7 (`--amr-max-mode`).
+    pub amr_max_mode: Option<u8>,
+    /// Highest AMR-WB mode sent, 0 to 8 (`--amr-wb-max-mode`).
+    pub amr_wb_max_mode: Option<u8>,
+    /// AMR codec mode request sent to the peer, 0 to 7 (`--amr-mode-request`).
+    pub amr_mode_request: Option<u8>,
+    /// AMR-WB codec mode request sent to the peer, 0 to 8 (`--amr-wb-mode-request`).
+    pub amr_wb_mode_request: Option<u8>,
     /// File holding the control-plane shared secret, read once at start
     /// (`--control-secret-file`). The one secret the config file may name, because it names a
     /// *path* rather than carrying the secret itself.
@@ -300,6 +308,9 @@ mod tests {
             "port_max = 40000\n",
             "metrics_addr = \"127.0.0.1:9090\"\n",
             "max_control_rps = 500\n",
+            "amr_max_mode = 7\n",
+            "amr_wb_max_mode = 2\n",
+            "amr_wb_mode_request = 2\n",
             "control_secret_file = \"/run/secrets/siphon-rtp-control\"\n",
             "media_timeout_secs = 45\n",
             "held_media_timeout_secs = 3600\n",
@@ -346,6 +357,10 @@ mod tests {
         );
         assert_eq!(config.media_timeout_secs, Some(45));
         assert_eq!(config.held_media_timeout_secs, Some(3600));
+        assert_eq!(config.amr_max_mode, Some(7));
+        assert_eq!(config.amr_wb_max_mode, Some(2));
+        assert_eq!(config.amr_mode_request, None);
+        assert_eq!(config.amr_wb_mode_request, Some(2));
         assert_eq!(config.setup_timeout_secs, Some(240));
         assert_eq!(config.shutdown_grace_secs, Some(30));
         assert_eq!(

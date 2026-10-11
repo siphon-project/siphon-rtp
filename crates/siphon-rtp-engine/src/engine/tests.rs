@@ -32,7 +32,7 @@ use super::answer_local::{resolve_offerer_security, WsTakeoverSecurity};
 use super::dispatch::{command_call_id, is_chatty_command};
 use super::inject::resolve_toward_a;
 use super::negotiate::{
-    apply_replace_directives, parse_codec_flags, same_codec, transcode_codec_spec,
+    apply_replace_directives, parse_codec_flags, same_codec, transcode_codec_specs,
     OPUS_DYNAMIC_PAYLOAD_TYPE,
 };
 use super::offer::far_address_family;
@@ -239,6 +239,11 @@ fn codec_snapshot_stays_compatible_with_a_pre_opus_standby() {
         .expect("serialize");
     assert!(!plain.contains("allowed_modes"), "{plain}");
     assert!(!plain.contains("opus"), "{plain}");
+}
+
+/// The first spec offered for a `codec-transcode-<NAME>` target (the only one, outside the AMR pair).
+fn transcode_codec_spec(name: &str) -> Option<CodecSpec> {
+    transcode_codec_specs(name).into_iter().next()
 }
 
 #[test]
@@ -23288,6 +23293,104 @@ async fn answer_local_volte_offer_answers_amr_wb_with_the_amr_feature() {
     let far = call.far_codec.as_ref().expect("far codec chosen");
     assert_eq!(far.encoding_name, "AMR-WB");
     assert_eq!(far.payload_type, 96);
+}
+
+/// A local answer to `offer` on a fresh engine: the answer SDP and the codec the call encodes.
+#[cfg(feature = "amr")]
+async fn answer_locally(call_id: &str, offer: &str) -> (String, CodecSpec) {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let answer = ok_sdp_text(
+        &engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer.into(),
+                    profile: Default::default(),
+                },
+            )
+            .await,
+    );
+    let call = engine.calls.get(call_id).expect("call present");
+    let codec = call.far_codec.clone().expect("far codec chosen");
+    (answer, codec)
+}
+
+/// 3GPP TS 26.114 Table A.3.1: a terminal offers AMR-WB and AMR, each bandwidth-efficient first
+/// and octet-aligned second, and is answered payload type 97 with
+/// `mode-change-capability=2; max-red=220`. The engine's local answer is the same one, and what it
+/// then encodes is that payload format.
+#[cfg(feature = "amr")]
+#[tokio::test]
+async fn answer_local_answers_a_terminal_offer_in_a_payload_format_it_offered() {
+    let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
+                 m=audio 49152 RTP/AVP 97 98 99 100 101\r\n\
+                 a=rtpmap:97 AMR-WB/16000\r\n\
+                 a=fmtp:97 mode-change-capability=2; max-red=220\r\n\
+                 a=rtpmap:98 AMR-WB/16000\r\n\
+                 a=fmtp:98 mode-change-capability=2; max-red=220; octet-align=1\r\n\
+                 a=rtpmap:99 AMR/8000\r\n\
+                 a=fmtp:99 mode-change-capability=2; max-red=220\r\n\
+                 a=rtpmap:100 AMR/8000\r\n\
+                 a=fmtp:100 mode-change-capability=2; max-red=220; octet-align=1\r\n\
+                 a=rtpmap:101 telephone-event/8000\r\n\
+                 a=ptime:20\r\na=maxptime:240\r\n";
+    let (answer, codec) = answer_locally("al-terminal", offer).await;
+    assert!(answer.contains("RTP/AVP 97 101\r\n"), "{answer}");
+    assert!(
+        answer.contains("a=fmtp:97 mode-change-capability=2;max-red=220\r\n"),
+        "{answer}"
+    );
+    assert!(!answer.contains("octet-align"), "{answer}");
+    assert!(answer.contains("a=maxptime:240\r\n"), "{answer}");
+    assert_eq!(codec.payload_type, 97);
+    // The encoder built from the chosen codec writes bandwidth-efficient payloads: 4 + 6 + 477
+    // bits for the highest AMR-WB mode, 61 octets, where octet-aligned would be 62.
+    let mut encoder = factory::encoder_for(&codec).expect("encoder");
+    let mut payload = [0u8; 128];
+    assert_eq!(encoder.encode(&[0i16; 320], &mut payload), Ok(61));
+    assert_eq!(payload[0] >> 4, 15, "CMR 15");
+}
+
+/// RFC 4867 §8.3.1: a payload type in a configuration the answerer cannot honour is removed, and
+/// the answer falls to the next one. Here the first asks for frame CRCs.
+#[cfg(feature = "amr")]
+#[tokio::test]
+async fn answer_local_passes_over_an_amr_configuration_it_does_not_implement() {
+    let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
+                 m=audio 49152 RTP/AVP 96 97\r\n\
+                 a=rtpmap:96 AMR/8000\r\na=fmtp:96 octet-align=1;crc=1\r\n\
+                 a=rtpmap:97 AMR/8000\r\na=fmtp:97 octet-align=1;mode-set=0,2,4,7\r\n";
+    let (answer, codec) = answer_locally("al-crc", offer).await;
+    assert!(answer.contains("RTP/AVP 97\r\n"), "{answer}");
+    assert!(
+        answer.contains("a=fmtp:97 octet-align=1;mode-set=0,2,4,7;mode-change-capability=2\r\n"),
+        "{answer}"
+    );
+    assert!(!answer.contains("crc"), "{answer}");
+    assert_eq!(codec.allowed_modes, [0, 2, 4, 7]);
+
+    // And when every AMR payload type is one it cannot do, the call is refused, not half-answered.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let refused = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "al-crc-only".into(),
+                from_tag: "tag-a".into(),
+                sdp: "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
+                      m=audio 49152 RTP/AVP 96\r\na=rtpmap:96 AMR/8000\r\n\
+                      a=fmtp:96 interleaving=30\r\n"
+                    .into(),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(&refused, CmdResult::Error { reason } if reason == "no-encodable-codec"),
+        "{refused:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

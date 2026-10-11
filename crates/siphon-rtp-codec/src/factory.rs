@@ -5,7 +5,7 @@
 //! leg's codec here once, at call setup, then runs the returned trait objects per frame.
 
 #[cfg(feature = "amr")]
-use crate::amr::{AmrNb, AmrNbMode, AmrWb};
+use crate::amr::{AmrNb, AmrWb, PayloadFormat, RtpConfig};
 use crate::cn::Cn;
 use crate::g711::{Variant, G711};
 use crate::g722::G722;
@@ -152,6 +152,68 @@ impl OpusParams {
     }
 }
 
+/// The RFC 4867 §8.1 / §8.2 `a=fmtp` parameters of one AMR or AMR-WB payload type, as the peer
+/// wrote them. `mode-set` is not here: it is [`CodecSpec::allowed_modes`]. Every field is `None`
+/// when the parameter was absent, which matters twice over: the RFC gives each its own default,
+/// and an answer returns the payload format parameters "unmodified" (§8.3.1), so an absent one
+/// stays absent and `octet-align=0` stays `octet-align=0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AmrParams {
+    /// `octet-align`: "If 1, octet-aligned operation SHALL be used. If 0 or if not present,
+    /// bandwidth-efficient operation is employed."
+    pub octet_align: Option<bool>,
+    /// `crc`: frame CRCs in the payload. Not implemented.
+    pub crc: Option<bool>,
+    /// `robust-sorting`: robust payload sorting. Not implemented.
+    pub robust_sorting: Option<bool>,
+    /// `interleaving`: its presence means frame-block interleaving is used. Not implemented.
+    pub interleaving: Option<u16>,
+    /// `mode-change-period`: what the peer requires of the stream it receives, 1 or 2.
+    pub mode_change_period: Option<u8>,
+    /// `mode-change-capability`: what the peer can do when it sends, 1 or 2.
+    pub mode_change_capability: Option<u8>,
+    /// `mode-change-neighbor`: the peer asks for mode changes to neighbouring modes only.
+    pub mode_change_neighbor: Option<bool>,
+    /// `max-red`: the peer's bound on redundancy, in milliseconds.
+    pub max_red: Option<u16>,
+    /// A parameter carried a value RFC 4867 does not permit for it (`octet-align=2`, a `mode-set`
+    /// that is not a list of numbers, ...). The payload type is then not one the engine can
+    /// promise to honour, and it is not selected.
+    pub malformed: bool,
+    /// The codec mode request the engine sends to the peer in every payload, `None` for 15 (no
+    /// request). The engine's own setting, never a parameter of the peer.
+    pub mode_request: Option<u8>,
+}
+
+impl AmrParams {
+    /// Whether the stream is octet-aligned.
+    #[must_use]
+    pub fn octet_aligned(&self) -> bool {
+        self.octet_align == Some(true)
+    }
+
+    /// Why the engine cannot send or receive this configuration, or `None` when it can.
+    ///
+    /// RFC 4867 §4.5 makes interleaving, robust sorting and frame CRCs "OPTIONAL to implement", and
+    /// §8.3.1 has an answerer return each of these parameters unmodified "unless it removes the
+    /// payload type", so a configuration that uses one is declined rather than answered and then
+    /// sent in another bit pattern.
+    #[must_use]
+    pub fn unsupported(&self) -> Option<&'static str> {
+        if self.malformed {
+            Some("an AMR fmtp parameter has a value RFC 4867 does not permit")
+        } else if self.crc == Some(true) {
+            Some("AMR frame CRCs (crc=1) are not implemented")
+        } else if self.robust_sorting == Some(true) {
+            Some("AMR robust payload sorting (robust-sorting=1) is not implemented")
+        } else if self.interleaving.is_some() {
+            Some("AMR frame interleaving is not implemented")
+        } else {
+            None
+        }
+    }
+}
+
 /// A negotiated codec for one RTP stream: the wire payload type plus the encoding parameters needed
 /// to build the codec. `encoding_name` is the `a=rtpmap` token (e.g. `"PCMU"`, `"L16"`, `"AMR-WB"`),
 /// matched case-insensitively (SDP encoding names are case-insensitive — RFC 4566 §6).
@@ -167,14 +229,19 @@ pub struct CodecSpec {
     pub channels: u8,
     /// Packetization time in milliseconds.
     pub ptime_ms: u8,
-    /// Egress encode mode for a variable-rate codec (AMR-WB speech mode 0..=8), when the peer's SDP
-    /// `a=fmtp` `mode-set` constrains it. `None` ⇒ the codec's own default (AMR-WB mode 2 / 12.65
-    /// kbit/s). Honoured by [`encoder_for`]; ignored by decoders (the wire frame carries its own mode).
+    /// The egress mode an AMR or AMR-WB encoder prefers: it sends the highest mode of the mode set
+    /// at or below this one while no codec mode request restricts it. `None` ⇒ the highest mode of
+    /// the set (3GPP TS 26.114 §7.5.2.1.2.1). Honoured by [`encoder_for`]; ignored by decoders (the
+    /// wire frame carries its own mode).
     pub encode_mode: Option<u8>,
-    /// The full set of AMR speech modes the peer's SDP `mode-set` permits (RFC 4867 §8.1), empty when
-    /// unconstrained. Passed to the AMR-WB encoder so a per-frame RFC 4867 CMR is clamped into it and
-    /// the engine never encodes a disallowed mode. Distinct from `encode_mode` (the *default* mode).
+    /// The AMR speech modes the SDP `mode-set` permits (RFC 4867 §8.1), in the order it listed them,
+    /// empty when there was none. No other mode is sent, and a codec mode request for another is
+    /// ignored. Distinct from `encode_mode` (the *preferred* mode).
     pub allowed_modes: Vec<u8>,
+    /// The peer's remaining RFC 4867 `a=fmtp` parameters, when this spec names AMR or AMR-WB and the
+    /// peer sent an `a=fmtp`. `None` reads as every RFC default: bandwidth-efficient, no CRC, no
+    /// robust sorting, no interleaving, no mode change restriction.
+    pub amr: Option<AmrParams>,
     /// The peer's RFC 7587 §6.1 Opus `a=fmtp` parameters, when this spec names Opus and the peer sent
     /// an `a=fmtp` (or an `a=maxptime`). `None` for every other codec, and for an Opus leg that
     /// declared nothing — a consumer reads [`OpusParams::default`] then, which *is* the RFC default
@@ -224,6 +291,7 @@ impl CodecSpec {
             ptime_ms: ptime_ms.max(1),
             encode_mode: None,
             allowed_modes: Vec::new(),
+            amr: None,
             opus: None,
             // RFC 3555 §4.1.13: absent means yes.
             annex_b: true,
@@ -294,12 +362,45 @@ impl CodecSpec {
         self
     }
 
-    /// Set the AMR `mode-set`-permitted speech modes for per-frame CMR clamping. Chainable on
-    /// [`CodecSpec::new`].
+    /// Set the speech modes an AMR `mode-set` permits. Chainable on [`CodecSpec::new`].
     #[must_use]
     pub fn with_allowed_modes(mut self, modes: Vec<u8>) -> Self {
         self.allowed_modes = modes;
         self
+    }
+
+    /// Whether this spec names AMR or AMR-WB, the two codecs of the RFC 4867 payload format.
+    #[must_use]
+    pub fn is_amr(&self) -> bool {
+        matches!(self.encoding_name.as_str(), "AMR" | "AMR-WB")
+    }
+
+    /// Attach the peer's RFC 4867 `a=fmtp` parameters. A spec for any other codec is left untouched.
+    #[must_use]
+    pub fn with_amr_params(mut self, params: Option<AmrParams>) -> Self {
+        if self.is_amr() {
+            self.amr = params;
+        }
+        self
+    }
+
+    /// Why the engine cannot carry this AMR configuration, or `None` when it can (and for every
+    /// other codec). See [`AmrParams::unsupported`]; an AMR stream of more than one channel is the
+    /// other configuration RFC 4867 defines and the engine does not implement.
+    #[must_use]
+    pub fn amr_unsupported(&self) -> Option<&'static str> {
+        if !self.is_amr() {
+            return None;
+        }
+        if self.channels > 1 {
+            return Some("multi-channel AMR is not implemented");
+        }
+        // AMR has speech modes 0 to 7, AMR-WB 0 to 8 (3GPP TS 26.101 / TS 26.201 Table 1a).
+        let highest_mode = if self.encoding_name == "AMR" { 7 } else { 8 };
+        if self.allowed_modes.iter().any(|&mode| mode > highest_mode) {
+            return Some("the AMR mode-set names a mode the codec does not have");
+        }
+        self.amr.and_then(|params| params.unsupported())
     }
 
     /// Attach the peer's RFC 7587 Opus `a=fmtp` parameters (the Opus counterpart of
@@ -405,14 +506,13 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
         // (patent-encumbered transcoding — see docs/codec-licensing.md); AMR passthrough/relay does not
         // reach here and is always available.
         #[cfg(feature = "amr")]
-        "AMR-WB" => Ok(Box::new(AmrWb::new())),
-        // AMR-NB decode is bit-exact for all 8 speech modes (0..=7) against 3GPP TS 26.074, with the
-        // RFC 4867 RTP payload un-sorted to encoder order in `AmrNb::decode`. Encode is bit-exact for
-        // all 8 speech modes as well (see `encoder_for`), so AMR-NB works as both a decode-side codec
-        // and an egress encoder (enabling AMR-NB↔G.711 transcode). Same `amr`-feature gate
-        // (patent-licensed — docs/codec-licensing.md).
+        "AMR-WB" => Ok(Box::new(AmrWb::negotiated(&amr_rtp_config(spec)?)?)),
+        // AMR-NB decode is bit-exact for all 8 speech modes (0..=7) against 3GPP TS 26.074, and so
+        // is encode (see `encoder_for`), so AMR-NB transcodes in both directions. Same
+        // `amr`-feature gate (patent-licensed, docs/codec-licensing.md). Both decoders read the
+        // payload format the stream negotiated (RFC 4867 §8.1 `octet-align`), never a guess.
         #[cfg(feature = "amr")]
-        "AMR" => Ok(Box::new(AmrNb::new())),
+        "AMR" => Ok(Box::new(AmrNb::negotiated(&amr_rtp_config(spec)?)?)),
         // Opus decode is complete and conformant (RFC 6716 §4: SILK, CELT and Hybrid, every
         // bandwidth and frame duration, stereo, PLC and in-band FEC — gated on all 12 official
         // vectors plus exact per-packet `final_range`). Royalty-free, so no build feature.
@@ -452,42 +552,16 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
         // frame is 10 ms, so a packet carries `ptime/10` of them concatenated with no payload header
         // (RFC 3551 §4.5.6). Same `g729`-feature gate as decode.
         #[cfg(feature = "g729")]
-        "G729" => Ok(Box::new(G729::new(spec.ptime_ms).with_annex_b(spec.annex_b))),
-        // AMR-WB encode is bit-exact (all 9 modes, 0..=8) against 3GPP TS 26.174 — same `amr`-feature gate as
-        // decode (docs/codec-licensing.md). The egress mode is the SDP `mode-set`-resolved
-        // `spec.encode_mode` when present, else the codec default (mode 2 / 12.65 kbit/s). The full
-        // `mode-set` (`spec.allowed_modes`) bounds per-frame RFC 4867 CMR adaptation (`request_mode`).
+        "G729" => Ok(Box::new(
+            G729::new(spec.ptime_ms).with_annex_b(spec.annex_b),
+        )),
+        // AMR-WB encode is bit-exact (all 9 modes, 0..=8) against 3GPP TS 26.174, and AMR-NB encode
+        // (all 8 modes) against TS 26.074, behind the same `amr`-feature gate as decode
+        // (docs/codec-licensing.md). The stream is sent as it was negotiated: see `amr_rtp_config`.
         #[cfg(feature = "amr")]
-        "AMR-WB" => {
-            let mut encoder = AmrWb::new().with_allowed_modes(&spec.allowed_modes);
-            if let Some(mode) = spec.encode_mode {
-                encoder = encoder.with_encode_mode(mode);
-            }
-            Ok(Box::new(encoder))
-        }
-        // AMR-NB encode is bit-exact (3GPP TS 26.074) for all 8 speech modes: MR475 (4.75k), MR515
-        // (5.15k), MR59 (5.90k), MR67 (6.70k), MR74 (7.40k), MR795 (7.95k), MR102 (10.2k) and MR122
-        // (12.2k, GSM-EFR). No `mode-set` ⇒ the codec default (MR122). Same `amr`-feature gate.
+        "AMR-WB" => Ok(Box::new(AmrWb::negotiated(&amr_rtp_config(spec)?)?)),
         #[cfg(feature = "amr")]
-        "AMR" => match spec.encode_mode {
-            None => Ok(Box::new(AmrNb::new())),
-            Some(m) => match AmrNbMode::from_frame_type(m) {
-                Some(
-                    mode @ (AmrNbMode::Mr475
-                    | AmrNbMode::Mr515
-                    | AmrNbMode::Mr590
-                    | AmrNbMode::Mr670
-                    | AmrNbMode::Mr740
-                    | AmrNbMode::Mr795
-                    | AmrNbMode::Mr1020
-                    | AmrNbMode::Mr1220),
-                ) => Ok(Box::new(AmrNb::new().with_encode_mode(mode))),
-                // Only non-speech frame types (SID/DTX/NO_DATA) remain unsupported for encode.
-                _ => Err(CodecError::Unsupported(
-                    "AMR-NB encode is wired for all 8 speech modes; SID/DTX frame types are not encodable",
-                )),
-            },
-        },
+        "AMR" => Ok(Box::new(AmrNb::negotiated(&amr_rtp_config(spec)?)?)),
         // Opus encode is complete and conformant (RFC 6716: SILK, CELT and Hybrid, every bandwidth
         // and frame duration, mono and stereo, VBR/CVBR/CBR, LBRR/FEC and DTX — gated by encoding
         // the full configuration matrix and holding the result up to libopus' own decoder and
@@ -513,6 +587,36 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
     }
 }
 
+/// What an AMR or AMR-WB spec negotiated, as the codec acts on it, or
+/// [`CodecError::Unsupported`] for a configuration the engine does not implement.
+///
+/// - **Payload format** from `octet-align` (RFC 4867 §8.1: bandwidth-efficient "if 0 or if not
+///   present").
+/// - **Modes** from `mode-set`, and the preferred one from [`CodecSpec::encode_mode`].
+/// - **Mode changes** as the peer requires them of what it receives: `mode-change-period` and
+///   `mode-change-neighbor` are declarative, each side stating what it wants sent to it (§8.3.1).
+/// - **Frames per packet** from the negotiated `ptime`, at 20 ms a frame.
+#[cfg(feature = "amr")]
+fn amr_rtp_config(spec: &CodecSpec) -> Result<RtpConfig<'_>, CodecError> {
+    if let Some(reason) = spec.amr_unsupported() {
+        return Err(CodecError::Unsupported(reason));
+    }
+    let params = spec.amr.unwrap_or_default();
+    Ok(RtpConfig {
+        format: if params.octet_aligned() {
+            PayloadFormat::OctetAligned
+        } else {
+            PayloadFormat::BandwidthEfficient
+        },
+        mode_set: &spec.allowed_modes,
+        preferred_mode: spec.encode_mode,
+        mode_change_period: params.mode_change_period.unwrap_or(1),
+        mode_change_neighbor: params.mode_change_neighbor.unwrap_or(false),
+        mode_request: params.mode_request,
+        frames_per_packet: crate::amr::stream::frames_per_packet(spec.ptime_ms),
+    })
+}
+
 /// Fold the G.729 annex spellings onto the one registered encoding name.
 ///
 /// `G729` is the only name IANA registers (RFC 3551 §6): Annex A, Annex B and their combination are
@@ -533,14 +637,6 @@ fn normalise_encoding_name(uppercased: &str) -> String {
 fn unsupported_name(encoding_name: &str) -> &'static str {
     match encoding_name {
         "CN" => "comfort-noise generation (DTX) is a media-path policy, not an audio encoder",
-        // With `amr` on, AMR-WB (decode + encode) and AMR-NB decode + all 8 speech-mode encoders are
-        // wired, so supported specs never reach here. `encoder_for("AMR")` handles a SID/DTX-mode
-        // request with its own message; this fallback is only hit for a decode-side "AMR" spec that
-        // has no encoder.
-        #[cfg(feature = "amr")]
-        "AMR" => {
-            "AMR-NB encode is wired for all 8 speech modes; SID/DTX frame types are not encodable"
-        }
         #[cfg(not(feature = "amr"))]
         "AMR" | "AMR-WB" => {
             "AMR transcoding requires the `amr` build feature (patent-licensed — see \
@@ -1313,11 +1409,26 @@ mod tests {
         assert!(encoder_for(&wb).is_ok(), "AMR-WB encoder");
     }
 
+    /// The frame type of a single-frame bandwidth-efficient payload (RFC 4867 §4.3): a 4-bit CMR,
+    /// then the ToC entry F, FT (4 bits), Q. FT straddles the first two octets.
+    #[cfg(feature = "amr")]
+    fn bandwidth_efficient_frame_type(payload: &[u8]) -> u8 {
+        ((payload[0] & 0x07) << 1) | (payload[1] >> 7)
+    }
+
+    #[cfg(feature = "amr")]
+    fn octet_aligned(spec: CodecSpec) -> CodecSpec {
+        spec.with_amr_params(Some(AmrParams {
+            octet_align: Some(true),
+            ..AmrParams::default()
+        }))
+    }
+
     #[cfg(feature = "amr")]
     #[test]
     fn amr_wb_encoder_honours_the_spec_encode_mode() {
-        // The SDP-`mode-set`-resolved `encode_mode` selects the egress AMR-WB speech mode; the RFC
-        // 4867 octet-aligned ToC byte (byte 1) carries the frame type FT in bits 6..3.
+        // `encode_mode` is the preferred egress mode. A spec with no fmtp is bandwidth-efficient
+        // (RFC 4867 §8.1: "If 0 or if not present, bandwidth-efficient operation is employed").
         let pcm: Vec<i16> = (0..320)
             .map(|i| ((i as f32 * 0.2).sin() * 6000.0) as i16)
             .collect();
@@ -1327,29 +1438,31 @@ mod tests {
             encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20).with_encode_mode(Some(0)))
                 .expect("amr-wb encoder");
         assert!(mode0.encode(&pcm, &mut payload).expect("encode") > 0);
-        assert_eq!(
-            (payload[1] >> 3) & 0x0F,
-            0,
-            "egress frame is mode 0 (ToC FT=0)"
-        );
+        assert_eq!(bandwidth_efficient_frame_type(&payload), 0);
 
+        // 3GPP TS 26.114 §7.5.2.1.2.1: "the highest codec mode of the negotiated mode-set (or of
+        // all modes, if no mode-set was included in the SDP answer) should be used".
         let mut default =
             encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("encoder");
         assert!(default.encode(&pcm, &mut payload).expect("encode") > 0);
-        assert_eq!(
-            (payload[1] >> 3) & 0x0F,
-            2,
-            "default egress frame is mode 2 (ToC FT=2)"
-        );
+        assert_eq!(bandwidth_efficient_frame_type(&payload), 8);
+
+        // The octet-aligned ToC octet (§4.4.2) carries FT in bits 6..3.
+        let mut aligned = encoder_for(
+            &octet_aligned(CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).with_encode_mode(Some(2)),
+        )
+        .expect("encoder");
+        assert_eq!(aligned.encode(&pcm, &mut payload), Ok(2 + 32));
+        assert_eq!((payload[0], (payload[1] >> 3) & 0x0F), (0xF0, 2));
     }
 
     #[cfg(feature = "amr")]
     #[test]
     fn amr_nb_decodes_and_encodes_the_wired_modes() {
-        // AMR-NB decode is bit-exact for all 8 modes (3GPP TS 26.074). Encode is now bit-exact for
-        // every speech mode too, enabling AMR-NB↔G.711 transcode at any negotiated rate.
+        // AMR-NB decode and encode are bit-exact for all 8 modes (3GPP TS 26.074), enabling
+        // AMR-NB↔G.711 transcode at any negotiated rate.
         let nb = CodecSpec::new(97, "AMR", 8000, 1, 20);
-        let mut decoder = decoder_for(&nb).expect("AMR-NB decoder builds");
+        let mut decoder = decoder_for(&octet_aligned(nb.clone())).expect("AMR-NB decoder builds");
         // A minimal RFC 4867 octet-aligned mode-0 (MR475) frame: CMR=0xF, then ToC (F=0, FT=0, Q=1),
         // then 12 speech bytes — decodes to one 160-sample 8 kHz frame.
         let payload = {
@@ -1363,36 +1476,89 @@ mod tests {
             160,
             "one 20 ms / 160-sample frame"
         );
-        // No mode-set ⇒ default MR122 encoder; every speech frame type builds: MR475 (FT=0),
-        // MR515 (FT=1), MR59 (FT=2), MR67 (FT=3), MR74 (FT=4), MR795 (FT=5), MR102 (FT=6),
-        // MR122 (FT=7).
-        assert!(encoder_for(&nb).is_ok(), "default AMR-NB encoder (MR122)");
-        for (frame_type, name) in [
-            (0u8, "MR475"),
-            (1, "MR515"),
-            (2, "MR59"),
-            (3, "MR67"),
-            (4, "MR74"),
-            (5, "MR795"),
-            (6, "MR102"),
-            (7, "MR122"),
-        ] {
-            assert!(
-                encoder_for(
-                    &CodecSpec::new(97, "AMR", 8000, 1, 20).with_encode_mode(Some(frame_type))
-                )
-                .is_ok(),
-                "{name} encoder builds"
-            );
+        // Every speech frame type builds as the preferred mode, and is the mode sent.
+        let speech: Vec<i16> = (0..160)
+            .map(|i| ((i as f32 * 0.3).sin() * 6000.0) as i16)
+            .collect();
+        for frame_type in 0u8..=7 {
+            let mut encoder = encoder_for(&nb.clone().with_encode_mode(Some(frame_type)))
+                .expect("encoder builds");
+            let mut payload = [0u8; 64];
+            encoder.encode(&speech, &mut payload).expect("encode");
+            assert_eq!(bandwidth_efficient_frame_type(&payload), frame_type);
         }
         // A non-speech frame type (e.g. FT=8 / SID) is declined.
         assert!(
             matches!(
-                encoder_for(&CodecSpec::new(97, "AMR", 8000, 1, 20).with_encode_mode(Some(8))),
+                encoder_for(&nb.with_encode_mode(Some(8))),
                 Err(CodecError::Unsupported(_))
             ),
             "SID/DTX frame type is declined"
         );
+    }
+
+    /// RFC 4867 §4.5: interleaving, robust sorting and frame CRCs are "OPTIONAL to implement", and
+    /// §8.3.1 lets an answerer drop a payload type it cannot return unmodified. The factory is what
+    /// the answer's codec choice asks, so it has to say no.
+    #[cfg(feature = "amr")]
+    #[test]
+    fn amr_configurations_the_engine_does_not_implement_are_refused() {
+        let refused = [
+            AmrParams {
+                crc: Some(true),
+                octet_align: Some(true),
+                ..AmrParams::default()
+            },
+            AmrParams {
+                robust_sorting: Some(true),
+                ..AmrParams::default()
+            },
+            AmrParams {
+                interleaving: Some(30),
+                ..AmrParams::default()
+            },
+            AmrParams {
+                malformed: true,
+                ..AmrParams::default()
+            },
+        ];
+        for name in ["AMR", "AMR-WB"] {
+            let rate = if name == "AMR" { 8000 } else { 16000 };
+            for params in refused {
+                let spec = CodecSpec::new(96, name, rate, 1, 20).with_amr_params(Some(params));
+                assert!(spec.amr_unsupported().is_some(), "{name} {params:?}");
+                assert!(matches!(
+                    encoder_for(&spec),
+                    Err(CodecError::Unsupported(_))
+                ));
+                assert!(matches!(
+                    decoder_for(&spec),
+                    Err(CodecError::Unsupported(_))
+                ));
+            }
+            // The same parameters spelled out as off are the plain configuration.
+            let plain = CodecSpec::new(96, name, rate, 1, 20).with_amr_params(Some(AmrParams {
+                crc: Some(false),
+                robust_sorting: Some(false),
+                octet_align: Some(false),
+                ..AmrParams::default()
+            }));
+            assert!(encoder_for(&plain).is_ok() && decoder_for(&plain).is_ok());
+            // Two channels, and a mode-set naming a mode the codec does not have.
+            assert!(encoder_for(&CodecSpec::new(96, name, rate, 2, 20)).is_err());
+            let bad_set = CodecSpec::new(96, name, rate, 1, 20).with_allowed_modes(vec![0, 9]);
+            assert!(matches!(
+                encoder_for(&bad_set),
+                Err(CodecError::Unsupported(_))
+            ));
+        }
+        // AMR has modes 0 to 7 only; 8 is an AMR-WB mode.
+        let narrowband = CodecSpec::new(97, "AMR", 8000, 1, 20).with_allowed_modes(vec![0, 8]);
+        assert!(encoder_for(&narrowband).is_err());
+        // The parameters of another codec's fmtp never reach an AMR decision.
+        let other = CodecSpec::new(0, "PCMU", 8000, 1, 20).with_amr_params(Some(refused[0]));
+        assert_eq!(other.amr, None);
+        assert_eq!(other.amr_unsupported(), None);
     }
 
     #[test]
