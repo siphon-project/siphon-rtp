@@ -21,7 +21,7 @@ use siphon_rtp_datapath::Datapath;
 use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher_with_text;
 use siphon_rtp_engine::{server, Engine};
 use siphon_rtp_proto::{
-    frame, CmdResult, Command, ProfileFlags, Request, Response, WsTeeDirection,
+    frame, CmdResult, Command, ProfileFlags, Request, Response, Scoped, WsTeeDirection,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -52,9 +52,16 @@ impl Control {
 
     /// Put a request on the wire and return its id.
     async fn send(&mut self, command: Command) -> u64 {
+        self.send_scoped(None, command).await
+    }
+
+    /// Put a request on the wire in a frame that names `scope`, and return its id. With no scope
+    /// the frame is the plain request.
+    async fn send_scoped(&mut self, scope: Option<&str>, command: Command) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let bytes = frame::encode(&Request { id, command }).expect("encode request");
+        let request = Scoped::new(scope.map(str::to_owned), Request { id, command });
+        let bytes = frame::encode(&request).expect("encode request");
         self.stream.write_all(&bytes).await.expect("write request");
         id
     }
@@ -623,4 +630,82 @@ async fn a_dialling_commands_response_still_precedes_the_events_it_raised() {
     assert_eq!(frames[0]["id"], attach, "{frames:?}");
     assert_eq!(frames[0]["result"], "ok", "{frames:?}");
     assert_eq!(frames[1]["event"], "ws_tee_started", "{frames:?}");
+}
+
+/// A lane is one call, and a call is the one of its scope. A dial in flight on a scoped call
+/// holds back what was sent for that scope of the `call_id` and nothing sent for another, and the
+/// event the command raised still follows its response, named as the wire names a scoped call.
+#[tokio::test]
+async fn a_dial_on_a_scoped_call_holds_its_own_scope_only() {
+    let (_engine, mut control) = engine_and_control().await;
+    // One `call_id` anchored twice on this connection: unscoped, and under a scope.
+    two_party_call(&mut control, "shared").await;
+    let offer = Command::Offer {
+        call_id: "shared".into(),
+        from_tag: "tag-a".into(),
+        sdp: sdp_for(phone().await),
+        profile: ProfileFlags::default(),
+    };
+    let answer = Command::Answer {
+        call_id: "shared".into(),
+        from_tag: "tag-a".into(),
+        to_tag: "tag-b".into(),
+        sdp: sdp_for(phone().await),
+        profile: ProfileFlags::default(),
+    };
+    for command in [offer, answer] {
+        let id = control.send_scoped(Some("bgcf"), command).await;
+        let result = control.response_to(id, Duration::from_secs(3)).await;
+        assert!(matches!(result, CmdResult::Ok { .. }), "{result:?}");
+    }
+
+    let (slow, _accepted, _closed) = endpoint(Endpoint::AnswersAfter(PROMPT)).await;
+    let attach = control
+        .send_scoped(
+            Some("bgcf"),
+            attach_tee("shared", format!("ws://{slow}/stream")),
+        )
+        .await;
+    let scoped_delete = control.send_scoped(Some("bgcf"), delete("shared")).await;
+    let unscoped_delete = control.send(delete("shared")).await;
+
+    // Every frame up to the response of the delete that waited.
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while !frames.iter().any(|frame| frame["id"] == scoped_delete) {
+        while let Some((value, consumed)) =
+            frame::decode::<serde_json::Value>(&control.buffer).expect("decode frame")
+        {
+            control.buffer.drain(..consumed);
+            frames.push(value);
+        }
+        if !frames.iter().any(|frame| frame["id"] == scoped_delete) {
+            let read = timeout(CONNECT_TIMEOUT, control.stream.read(&mut chunk))
+                .await
+                .expect("a frame")
+                .expect("read");
+            control.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+    let position = |wanted: &dyn Fn(&serde_json::Value) -> bool| {
+        frames
+            .iter()
+            .position(wanted)
+            .unwrap_or_else(|| panic!("frame missing in {frames:?}"))
+    };
+    let unscoped_deleted = position(&|frame| frame["id"] == unscoped_delete);
+    let attached = position(&|frame| frame["id"] == attach);
+    let scoped_deleted = position(&|frame| frame["id"] == scoped_delete);
+    let started = position(&|frame| frame["event"] == "ws_tee_started");
+    // The unscoped call of the same `call_id` is another lane: its delete overtakes the dial.
+    assert!(unscoped_deleted < attached, "{frames:?}");
+    assert_eq!(frames[unscoped_deleted]["result"], "ok", "{frames:?}");
+    // The delete of the dialling scope waited for the attach it was sent after.
+    assert_eq!(frames[attached]["result"], "ok", "{frames:?}");
+    assert!(attached < scoped_deleted, "{frames:?}");
+    assert_eq!(frames[scoped_deleted]["result"], "ok", "{frames:?}");
+    // `ok` and then `ws_tee_started`, which names the call by `call_id` with its scope beside it.
+    assert!(attached < started, "{frames:?}");
+    assert_eq!(frames[started]["call_id"], "shared", "{frames:?}");
+    assert_eq!(frames[started]["scope"], "bgcf", "{frames:?}");
 }

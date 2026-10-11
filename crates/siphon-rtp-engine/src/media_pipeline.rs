@@ -47,6 +47,7 @@ use siphon_rtp_media::tone::{ToneGenerator, ToneSpec};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{Event, PlayEndReason, ProfileFlags};
 
+use crate::engine::scope;
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
@@ -3938,7 +3939,7 @@ impl MediaCall {
         if let Some(recorder) = self.a_to_b.recorder.take() {
             if recorder.sample_count() > 0 {
                 files.push((
-                    format!("{base}/{}-a.wav", self.call_id),
+                    format!("{base}/{}-a.wav", scope::external(&self.call_id)),
                     recorder.into_wav(),
                 ));
             }
@@ -3946,7 +3947,7 @@ impl MediaCall {
         if let Some(recorder) = self.b_to_a.recorder.take() {
             if recorder.sample_count() > 0 {
                 files.push((
-                    format!("{base}/{}-b.wav", self.call_id),
+                    format!("{base}/{}-b.wav", scope::external(&self.call_id)),
                     recorder.into_wav(),
                 ));
             }

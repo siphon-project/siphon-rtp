@@ -415,7 +415,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// separate control verb that does not exist yet.
     async fn replace_offered_call(&self, client: ClientId, call_id: &str) -> Option<CmdResult> {
         if let Some(existing) = self.calls.get(call_id) {
-            if existing.owner != client {
+            if !existing.admits(client, call_id) {
                 drop(existing);
                 return Some(unknown_call(call_id));
             }

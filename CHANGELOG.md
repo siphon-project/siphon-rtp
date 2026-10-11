@@ -41,6 +41,33 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 - **`siphon_rtp_ws_dial_timeouts_total`**, `..._connect_failures_total`, `..._tls_failures_total`
   and `..._handshake_failures_total`: failed WebSocket dials by class, each also logged at
   `warn` with the call, the URI and the class.
+- **One engine can anchor several functions on the same SIP Call-ID.** A control frame may carry
+  a top-level `scope`, and the engine keys the call by `(scope, call_id)`. A P-CSCF, a BGCF and
+  an MRF on one call path can then share an engine, each with its own ports, offer/answer state,
+  timers and events, where the second of them used to be answered `unknown call`. The scope is a
+  name the controller chooses (1 to 64 bytes of ASCII letters, digits, `-` and `_`), it applies
+  to every verb that names a `call_id`, and a frame without one addresses the unscoped call
+  exactly as before: the request, response, event and snapshot bytes of an unscoped call are
+  unchanged. Events for a scoped call carry the same `scope` key. A scoped call is reachable by
+  every client that names its scope, so two instances of one function sharing a scope meet in
+  one call (offer from one, answer or delete from the other); `list` still returns only the
+  calling client's own calls, one scope per request. A scope is not an access boundary. See
+  [Call scope](docs/control/json.md#call-scope) and
+  [Sharing one engine between functions](docs/deployment.md#sharing-one-engine-between-functions).
+- `siphon-rtp-proto`: `Scoped<T>` carries the scope around `Request` and `Event`, with
+  `validate_scope`, `normalize_scope`, `MAX_SCOPE_LEN`, `Command::call_id_mut` and
+  `Event::call_id_mut`. No existing type changed, so this is additive for a crate that builds
+  against it.
+- `node_info` lists `scope` in `features`. An engine without it reads a scoped frame as an
+  unscoped one, so a controller checks the feature before relying on scopes.
+- `siphon_rtp_scoped_offers_total` counts the calls anchored under a scope.
+
+### Changed
+
+- A snapshot of a scoped call carries its scope and is written at format version 3, which a
+  standby from before scopes refuses instead of restoring the call unscoped. Unscoped snapshots
+  stay at version 2 and restore in both directions across the upgrade.
+- A `call_id` containing the control character U+001F is refused. No SIP Call-ID can hold one.
 
 ## [0.13.0] — 2026-10-12
 

@@ -132,9 +132,26 @@ snapshot it. `restore` rejects a blob whose format version it does not understan
 on compatible builds; upgrade the standby first), rejects a call-id that already exists on the
 target, and rolls back cleanly if any port bind or flow install fails.
 
+### Scopes across a failover
+
+A call anchored under a [scope](control/json.md#call-scope) is checkpointed and restored like any
+other. Its snapshot carries the scope, and `restore` puts the call back under it, whatever scope
+the restoring frame names, so two functions' calls on one `Call-ID` stay two calls on the
+standby.
+
+Two things follow for the proxy that stores the blobs:
+
+- **Key the stored blob by scope and call-id**, not by call-id alone, or one function's snapshot
+  overwrites another's.
+- **Upgrade the standby before any controller starts naming scopes.** A scoped call's snapshot
+  is written at format version 3; an unscoped call's stays at version 2, byte for byte what it
+  was. A standby from before scopes accepts only version 2, so it refuses a scoped blob instead
+  of restoring the call as the unscoped one of the same call-id. Unscoped calls keep failing
+  over in either direction across the upgrade.
+
 ### What a snapshot contains, and what it deliberately does not
 
-In: the call identity (call-id, tags), each leg's **local media ports** and the peers' negotiated
+In: the call identity (call-id, scope, tags), each leg's **local media ports** and the peers' negotiated
 remote addresses, the resolved pipeline and codecs (including the AMR-WB `mode-set` egress mode),
 ICE-lite credentials, the SDES crypto attributes, the SRTP rollover counters and SRTCP index
 (RFC 3711 §3.3.1, not recoverable from the wire), and the installed forward rules with their

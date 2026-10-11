@@ -2239,7 +2239,9 @@ pub mod frame {
 }
 
 mod base64;
+pub mod scope;
 pub mod vq_rtcpxr;
+pub use scope::{normalize_scope, validate_scope, ScopeError, Scoped, MAX_SCOPE_LEN};
 
 #[cfg(test)]
 mod tests {

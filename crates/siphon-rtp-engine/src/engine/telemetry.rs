@@ -69,7 +69,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
             let (src, dst) = text_stream_addresses(leg);
             let report = TextQosReport {
-                correlation_id: sip_call_id.unwrap_or(call_id).to_string(),
+                correlation_id: sip_call_id
+                    .unwrap_or(super::scope::call_id(call_id))
+                    .to_string(),
                 tag: tag.to_string(),
                 direction,
                 packets: stats.packets,
@@ -130,7 +132,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // The leg's SIP Call-ID, so a collector files the RTCP under the dialog it belongs to.
             let correlation_id = self
                 .sip_call_id_for_endpoint(observed.endpoint)
-                .unwrap_or_else(|| call_id.clone());
+                .unwrap_or_else(|| super::scope::call_id(&call_id).to_string());
             let (timestamp_secs, timestamp_micros) = wall_clock_now();
             // Raw RTCP passthrough (unchanged) — a passive collector still gets the bytes verbatim.
             let raw = rtcp_capture(

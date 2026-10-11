@@ -76,7 +76,8 @@ Two more per-connection guards apply regardless of auth:
   presented a `controller_id` (below). `query`, `delete`, `checkpoint`, and the
   media-control verbs on someone else's call answer as if the call did not exist, and `list`
   returns only your own calls. See [Security and NAT](../security-and-nat.md) for the threat
-  model.
+  model. A call anchored under a [scope](#call-scope) is the exception: every client that names
+  the scope may act on it.
 
 ## Controller identity
 
@@ -112,6 +113,76 @@ name) and never mix in a boot epoch or a PID, which defeats the point. Rules:
 
 Ownership is unaffected: a stable identity does not widen `list` or `delete`, so a controller
 still sees and deletes only its own calls, and a shared engine stays safe to enumerate.
+
+## Call scope
+
+A SIP proxy does not change the `Call-ID`, so every function that anchors media on one call path
+names its engine call by the same id: a P-CSCF, a BGCF on breakout, an MRF playing an
+announcement into the call. Each of those is its own pair of legs with its own offer/answer
+state. To hold them on one engine, a frame may carry a `scope`, and the engine keys the call by
+`(scope, call_id)`:
+
+```json
+{"id": 3, "scope": "bgcf", "command": "offer", "call_id": "7f9a2b1c@198.51.100.20", "from_tag": "a7c31f", "sdp": "..."}
+```
+
+`scope` is a top-level key of the frame, beside `id` and `command`, on **every** verb that names
+a `call_id`. Two scopes of one `call_id` are two calls: separate ports, separate offer/answer
+state, separate timers. Deleting one leaves the other relaying. Without the key the frame
+addresses the unscoped call, exactly as it did before scopes existed, and the unscoped call is a
+third call beside any scoped ones.
+
+- **What a scope is.** A name the controller chooses: 1 to 64 bytes of ASCII letters, digits, `-`
+  and `_`. Anything else is refused before any work (`scope is 65 bytes; the maximum is 64`,
+  `scope may hold only ASCII letters, digits, '-' and '_'`), on every verb including `ping`. An
+  empty string is the same as no scope.
+- **One scope per function, not per instance.** Give every instance of a function the same
+  scope (`pcscf` on both P-CSCF instances of a pair) and each other function its own (`bgcf`,
+  `mrf`). An on-net call whose parties sit on two instances is then one call with two legs, as
+  it is on a single instance: one instance sends the `offer`, the other the `answer`.
+- **Who may act on a scoped call.** Every client that names its scope. That is what lets the
+  second instance answer, re-offer or delete what the first one offered, and it is the one place
+  ownership is relaxed. The client that created the call still owns it for the per-client quota
+  and for `list`.
+- **`list`** returns the calls the calling client created in the frame's scope: one scope per
+  request, and the unscoped calls when the frame carries none. It never returns a call another
+  client created, shared scope or not, because a controller deletes what it lists and does not
+  recognise.
+- **Events** for a scoped call carry the same top-level `scope` key, beside `event`, and
+  `call_id` is the id the controller sent. An event for the unscoped call has no `scope` key.
+  Every event of a call goes to the client that created it, whichever client sent the command
+  behind it. The one exception is `play_finished`, which goes to the client that sent the
+  `play_media` it completes.
+- **`checkpoint` and `restore`.** A snapshot records the scope, and `restore` puts the call back
+  under it whatever scope the restoring frame names. See
+  [Scaling & HA](../scaling-and-ha.md#scopes-across-a-failover).
+- **Names the engine derives** include the scope, so two scopes never write one file or share a
+  stream id: a recording is `<call_id>.<scope>.pcap`, `<call_id>.<scope>-a.wav` and so on, a tee's
+  `stream_id` is `tee-<call_id>.<scope>`, a takeover bridge's `ws-<call_id>.<scope>`. The WebSocket
+  `start` frame's `callId` and the HEP correlation id stay the plain `call_id`. In an error string
+  the call reads `unknown call: <call_id> (scope <scope>)`.
+- **Conference verbs take no scope.** A room is named by an id its controller chose, not by a
+  `Call-ID`, so there is nothing to tell apart. A scope on a `conference_*` verb is refused
+  rather than dropped; put the function in the `conference_id`.
+- **A `call_id` may not contain U+001F** (the unit separator), scoped or not. No SIP `Call-ID`
+  can (RFC 3261 section 25.1).
+
+!!! warning "A scope is a name, not a credential"
+    Any client that may speak to the control port may name any scope, and so reach every call
+    in it. A scope separates functions that cooperate; it does not protect one from another.
+    The engine has one shared secret for all controllers and no per-connection permissions, so
+    restricting which scopes a connection may name would need per-controller credentials first:
+    a secret per `controller_id`, with the allowed scopes listed beside it in the engine's
+    configuration, checked where the frame's scope is validated. That is not built. Until it
+    is, put functions that must not reach each other's calls on separate engines.
+
+**Detecting support.** `node_info` lists `scope` in `features`. An engine without it reads a
+scoped frame as an unscoped one, silently: two functions would then meet in one call. Check the
+feature once per connection before relying on scopes.
+
+In Rust the key is carried by `siphon_rtp_proto::Scoped<T>`, around `Request` on the way in and
+around `Event` on the way out. `Request`, `Command` and `Event` are unchanged, and still decode a
+frame that carries a scope, ignoring it.
 
 ## Request catalogue
 
@@ -183,7 +254,7 @@ bridge a T.38 leg to a G.711 one.
 | Verb | Fields | Result |
 |---|---|---|
 | `ping` | none | `{"result": "pong"}`. |
-| `list` | none | `{"result": "list", "call_ids": [...]}`, scoped to the calling connection. |
+| `list` | none | `{"result": "list", "call_ids": [...]}`, scoped to the calling connection and to the frame's [scope](#call-scope). |
 | `statistics` | none | Global process counters: `offers_total`, `answers_total`, `deletes_total`, `control_errors_total`, live `sessions`. |
 
 ### Cluster placement
@@ -191,7 +262,7 @@ bridge a T.38 leg to a G.711 one.
 | Verb | Fields | Result |
 |---|---|---|
 | `load` | none | Live load snapshot for a dispatcher: `node_id`, `sessions`, `max_sessions`, `load_permille` (0..=1000), `transcode_sessions`, `cpu_permille?`, `jemalloc_allocated_bytes`, `draining`. |
-| `node_info` | none | Static identity: `node_id`, `version`, `media_addresses`, `codecs`, `features`, `max_sessions`, `draining`. Read once and cache; poll `load` instead. `codecs` names what this build transcodes in both directions, the licensed codecs (`G729`, `AMR`, `AMR-WB`) included when it was built with them; match on the names, not on their order. |
+| `node_info` | none | Static identity: `node_id`, `version`, `media_addresses`, `codecs`, `features`, `max_sessions`, `draining`. Read once and cache; poll `load` instead. `codecs` names what this build transcodes in both directions, the licensed codecs (`G729`, `AMR`, `AMR-WB`) included when it was built with them; match on the names, not on their order. `features` includes `scope` on an engine that keys calls by [scope](#call-scope). |
 | `drain` | none | Stop admitting new sessions (`offer` and `conference_join` are rejected); live calls run to completion. Idempotent. |
 | `undrain` | none | Resume admitting new sessions. |
 
@@ -457,7 +528,9 @@ Every response is one of:
 
 ## Asynchronous events
 
-Events are pushed down the same TCP connection, tagged on `"event"`, with no `id`:
+Events are pushed down the same TCP connection, tagged on `"event"`, with no `id`. An event
+about a call anchored under a [scope](#call-scope) carries that `scope` as one more top-level
+key; the table lists the rest:
 
 | Event | Fields | When |
 |---|---|---|

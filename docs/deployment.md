@@ -366,7 +366,66 @@ exists.
   `--ng` as trusted-network-only.
 - **Ownership.** A call is private to the control connection that created it. Another connection
   cannot query, delete, checkpoint or otherwise touch it (it sees `unknown call`), so a
-  compromised or misbehaving second controller cannot enumerate calls.
+  compromised or misbehaving second controller cannot enumerate calls. A call anchored under a
+  scope is shared on purpose with every client that names the scope; see the next section.
+
+### Sharing one engine between functions
+
+One engine can anchor media for several network functions, including several that sit on the
+same call. Without any configuration it cannot: SIP proxies keep the `Call-ID`, so a P-CSCF and
+the BGCF behind it both name their engine call by the same id, the engine holds one call per id,
+and the second function is answered `unknown call`. That forces an engine per function.
+
+A **scope** lifts it. Each function puts its own name on the control frames it sends, and the
+engine keys the call by `(scope, call_id)`
+([control reference](control/json.md#call-scope)). There is nothing to configure on the engine;
+the scope is chosen in the controller.
+
+Take a breakout call in an IMS core, UE to P-CSCF to BGCF to trunk, on one engine:
+
+```text
+   UE ----------- [ anchor "pcscf" ] ----------- [ anchor "bgcf" ] ----------- trunk
+                     ports A / B                    ports C / D
+
+   control frames, all with call_id 7f9a2b1c@198.51.100.20:
+     P-CSCF   {"scope": "pcscf", "command": "offer",  ...}   -> port B toward the core
+     BGCF     {"scope": "bgcf",  "command": "offer",  ...}   -> port D toward the trunk
+     BGCF     {"scope": "bgcf",  "command": "answer", ...}   -> port C toward the P-CSCF's anchor
+     P-CSCF   {"scope": "pcscf", "command": "answer", ...}   -> port A toward the UE
+```
+
+Media crosses the engine twice, once per anchor, exactly as it would cross two engines. The two
+calls share nothing but the id: each has its own ports, its own timers and its own events, and a
+`delete` from the BGCF leaves the P-CSCF's anchor relaying.
+
+How to choose scopes:
+
+- **One scope per function.** `pcscf`, `bgcf`, `mrf`, `atcf`. Every instance of a function uses
+  the same one.
+- **Instances of one function share theirs.** With two P-CSCF instances on one engine, an on-net
+  call can enter at one and leave at the other. Both use `pcscf`, so the `offer` from the
+  originating instance and the `answer` from the terminating instance meet in one call with two
+  legs, as they do on a single instance. Giving each instance its own scope would split that
+  call in two.
+- **A function that anchors once per call needs no more than that.** A second scope per
+  direction (`pcscf-orig`, `pcscf-term`) is only for a controller that really sends two
+  offer/answer pairs for one `Call-ID`, and then media crosses the engine once more.
+- **Keep `controller_id` per instance.** The scope says which function a call belongs to; the
+  controller id says which process created it, and still decides the quota, the `list` result
+  and where the call's own events go.
+
+What to know before turning it on:
+
+- Every engine in the pool has to list `scope` in `node_info` `features`. An engine without it
+  ignores the key and reads every frame as unscoped, which puts the functions back in one call.
+- A scope is not an access boundary. Any controller that holds the control secret can name any
+  scope. Functions that must not reach each other's calls belong on separate engines.
+- A call's events (`media_timeout`, `call_summary`, `dtmf` and the rest) go to the instance
+  that sent the `offer`. With two instances sharing a scope, the answering instance does not
+  receive them; only a `play_finished` follows the instance that sent the `play_media`.
+- `siphon_rtp_scoped_offers_total` counts the calls anchored under a scope. Scope names are not
+  a metric label.
+- The NG front end has no scope: every NG client addresses the unscoped call.
 
 ### Metrics and alerting
 

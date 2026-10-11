@@ -215,11 +215,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// Handle one control command from `client`, producing the result to return to the caller.
     ///
+    /// The command addresses the unscoped call of its `call_id`. This is the entry every front end
+    /// that has no scope to offer uses (the NG front end, an embedder), and it is exactly
+    /// [`Self::handle_scoped`] with no scope.
+    pub async fn handle(&self, client: ClientId, command: Command) -> CmdResult {
+        self.handle_scoped(client, None, command).await
+    }
+
+    /// Handle one control command that addresses the call `(scope, call_id)`.
+    ///
+    /// `scope` is as the frame carried it: absent or empty for the unscoped call, otherwise a name
+    /// that must pass [`siphon_rtp_proto::validate_scope`]. A malformed one is refused before any
+    /// work, on every verb.
+    ///
     /// Increments the operational counters as a side effect: per-command totals (offer/answer/
     /// delete) before dispatch, and `control_errors_total` whenever the result is an error — so the
     /// `/metrics` surface reflects every command this engine processed (including over the NG and WS
     /// front-ends, which all funnel through here).
-    pub async fn handle(&self, client: ClientId, command: Command) -> CmdResult {
+    pub async fn handle_scoped(
+        &self,
+        client: ClientId,
+        scope: Option<&str>,
+        mut command: Command,
+    ) -> CmdResult {
         match &command {
             Command::Offer { .. } => self.metrics.record_offer(),
             Command::Answer { .. } => self.metrics.record_answer(),
@@ -232,31 +250,43 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // `call_id`/`conference_id` the command addresses — the same key the SBC logs, so a single
         // grep reconstructs a call across both processes. `call_id` is captured before `dispatch`
         // consumes `command`; the clone is a control-path (call-setup) allocation, never hot-path.
+        // The `scope` field is recorded only when the frame named one.
         let verb = command_name(&command);
         let call_id = command_call_id(&command).map(str::to_owned);
         let call_id_field = call_id.as_deref().unwrap_or("-");
         let chatty = is_chatty_command(&command);
         // A `received` breadcrumb at DEBUG so a hung or panicking handler still shows the command's
         // arrival before its completion line; the INFO story is the single `handled` line below.
-        tracing::debug!(target: "siphon_rtp::control", verb, call_id = call_id_field, client = client.0, "control command received");
+        tracing::debug!(target: "siphon_rtp::control", verb, call_id = call_id_field, scope, client = client.0, "control command received");
 
+        let anchors = matches!(command, Command::Offer { .. } | Command::AnswerLocal { .. });
         let started = std::time::Instant::now();
-        let result = self.dispatch(client, command).await;
+        // From here on the command names its call by key (see [`super::scope`]).
+        let result = match key_command(scope, &mut command) {
+            Ok(scope) => self.dispatch(client, scope, command).await,
+            Err(reason) => CmdResult::Error { reason },
+        };
+        if scope.is_some_and(|scope| !scope.is_empty()) && anchors && !is_error(&result) {
+            self.metrics.record_scoped_offer();
+        }
         let elapsed_us = started.elapsed().as_micros() as u64;
 
         if let CmdResult::Error { reason } = &result {
             self.metrics.record_control_error();
-            tracing::warn!(target: "siphon_rtp::control", verb, call_id = call_id_field, client = client.0, elapsed_us, reason = reason.as_str(), "control command failed");
+            tracing::warn!(target: "siphon_rtp::control", verb, call_id = call_id_field, scope, client = client.0, elapsed_us, reason = reason.as_str(), "control command failed");
         } else if chatty {
-            tracing::debug!(target: "siphon_rtp::control", verb, call_id = call_id_field, client = client.0, elapsed_us, "control command handled");
+            tracing::debug!(target: "siphon_rtp::control", verb, call_id = call_id_field, scope, client = client.0, elapsed_us, "control command handled");
         } else {
-            tracing::info!(target: "siphon_rtp::control", verb, call_id = call_id_field, client = client.0, elapsed_us, "control command handled");
+            tracing::info!(target: "siphon_rtp::control", verb, call_id = call_id_field, scope, client = client.0, elapsed_us, "control command handled");
         }
         result
     }
 
     /// Dispatch one control command to its handler (the metric-free inner of [`Self::handle`]).
-    async fn dispatch(&self, client: ClientId, command: Command) -> CmdResult {
+    ///
+    /// `scope` is the validated scope of the frame. Every verb that names a call already carries it
+    /// in the call's key; it is passed on only for `list`, which names none.
+    async fn dispatch(&self, client: ClientId, scope: Option<&str>, command: Command) -> CmdResult {
         // Drain gate: a draining node runs its live calls to completion but admits no new session, so
         // it can be taken out of a rolling upgrade cleanly. Reject the two session-creating verbs;
         // everything else — query/delete/media-control on existing calls, and the cluster/census
@@ -298,7 +328,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 end_of_candidates,
             ),
             Command::Ping => CmdResult::Pong,
-            Command::List => self.list(client),
+            Command::List => self.list(client, scope),
             Command::Statistics => self.statistics(),
             Command::Load => self.load_snapshot(),
             Command::NodeInfo => self.node_info(),
@@ -665,6 +695,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         }
     }
+}
+
+/// Turn the `call_id` a command names into the key of the call it addresses under `scope`, and
+/// return the scope as validated (`None` for an absent or an empty one).
+///
+/// A conference verb names a room by an id its controller chose, not by a SIP Call-ID, so a scope
+/// has nothing to tell apart there. One is refused rather than dropped: a controller that believes
+/// two functions' rooms are separate when they are one room would otherwise find out in the mix.
+fn key_command<'a>(
+    scope: Option<&'a str>,
+    command: &mut Command,
+) -> Result<Option<&'a str>, String> {
+    let scope = siphon_rtp_proto::normalize_scope(scope).map_err(|error| error.to_string())?;
+    if scope.is_some() && command.is_conference() {
+        return Err(
+            "scope does not apply to conference verbs; put the function in the conference_id"
+                .to_string(),
+        );
+    }
+    if let Some(call_id) = command.call_id_mut() {
+        *call_id = super::scope::compose(scope, call_id)?;
+    }
+    Ok(scope)
+}
+
+fn is_error(result: &CmdResult) -> bool {
+    matches!(result, CmdResult::Error { .. })
 }
 
 fn command_name(command: &Command) -> &'static str {

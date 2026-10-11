@@ -82,7 +82,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some(existing) = self.calls.get(call_id) else {
             return Ok(false);
         };
-        if existing.owner != client {
+        if !existing.admits(client, call_id) {
             return Err(Box::new(unknown_call(call_id)));
         }
         if existing.far.is_some() {
@@ -106,7 +106,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// than destroyed. `None` means the call-id is free to register.
     async fn replace_local_call(&self, client: ClientId, call_id: &str) -> Option<CmdResult> {
         if let Some((_, previous)) = self.calls.remove_if(call_id, |_, call| {
-            call.owner == client && call.far.is_none()
+            call.admits(client, call_id) && call.far.is_none()
         }) {
             tracing::info!(
                 target: "siphon_rtp::control",

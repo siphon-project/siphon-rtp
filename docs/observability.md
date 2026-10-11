@@ -20,6 +20,7 @@ per connection, never blocking the engine. Routes: `GET /metrics`, `GET /healthz
 | `siphon_rtp_deletes_total` | counter | control `delete` commands accepted |
 | `siphon_rtp_conference_joins_total` | counter | conference `join` commands accepted |
 | `siphon_rtp_conference_leaves_total` | counter | conference `leave` commands accepted |
+| `siphon_rtp_scoped_offers_total` | counter | `offer` / `answer_local` commands accepted that named a call scope |
 | `siphon_rtp_control_errors_total` | counter | control commands that returned an error |
 | `siphon_rtp_control_rate_limited_total` | counter | control commands rejected by the rate limiter |
 | `siphon_rtp_transcode_sessions` | gauge | live media-processing (transcode / bridge) sessions |

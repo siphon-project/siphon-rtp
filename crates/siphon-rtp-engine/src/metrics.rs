@@ -64,6 +64,7 @@ pub struct Metrics {
     control_rate_limited_total: AtomicU64,
     conference_joins_total: AtomicU64,
     conference_leaves_total: AtomicU64,
+    scoped_offers_total: AtomicU64,
     /// WebSocket dials that failed, by [`WsDialFailure`] class: timeout, connect, TLS, handshake.
     ws_dial_failures_total: [AtomicU64; 4],
 }
@@ -154,6 +155,17 @@ impl Metrics {
         self.conference_joins_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count an `offer` or `answer_local` that named a scope: a call anchored beside others of its
+    /// Call-ID. A counter and not a label, so the series count does not follow the scope names.
+    pub fn record_scoped_offer(&self) {
+        self.scoped_offers_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many scoped calls have been anchored since start ([`Self::record_scoped_offer`]).
+    pub fn scoped_offers_total(&self) -> u64 {
+        self.scoped_offers_total.load(Ordering::Relaxed)
+    }
+
     /// Count an accepted `conference leave` command.
     pub fn record_conference_leave(&self) {
         self.conference_leaves_total.fetch_add(1, Ordering::Relaxed);
@@ -191,6 +203,7 @@ impl Metrics {
         let rate_limited = self.control_rate_limited_total.load(Ordering::Relaxed);
         let conference_joins = self.conference_joins_total.load(Ordering::Relaxed);
         let conference_leaves = self.conference_leaves_total.load(Ordering::Relaxed);
+        let scoped_offers = self.scoped_offers_total.load(Ordering::Relaxed);
 
         let mut output = String::with_capacity(1024);
         metric(
@@ -320,6 +333,13 @@ impl Metrics {
             "Conference leave commands accepted.",
             "counter",
             conference_leaves,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_scoped_offers_total",
+            "Offer and answer_local commands that named a call scope.",
+            "counter",
+            scoped_offers,
         );
         metric(
             &mut output,
@@ -732,9 +752,11 @@ mod tests {
                 "# TYPE siphon_rtp_ws_dial_{class}_total counter\nsiphon_rtp_ws_dial_{class}_total 0\n"
             )));
         }
-        // Every series carries a HELP + TYPE line (28 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 28);
-        assert_eq!(body.matches("# TYPE ").count(), 28);
+        assert!(body.contains("# TYPE siphon_rtp_scoped_offers_total counter\n"));
+        assert!(body.contains("siphon_rtp_scoped_offers_total 0\n"));
+        // Every series carries a HELP + TYPE line (29 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 29);
+        assert_eq!(body.matches("# TYPE ").count(), 29);
     }
 
     #[test]
@@ -756,8 +778,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (27 vs 28).
-        assert_eq!(body.matches("# TYPE ").count(), 27);
+        // One fewer series than the CPU-present case (28 vs 29).
+        assert_eq!(body.matches("# TYPE ").count(), 28);
     }
 
     #[test]

@@ -327,12 +327,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         // The `streamId` the WS `start` frame announces — and, on the control plane, the correlator
         // carried by `ws_bridge_started` / `ws_bridge_ended`. One value, so the two line up.
-        let stream_id = format!("ws-{call_id}");
+        // The `start` frame's `callId` is the SIP call id; the stream id carries the scope too, so
+        // two scopes of one call id are two streams.
+        let stream_id = format!("ws-{}", super::scope::external(call_id));
         let mut session = BridgeSession::new(
             leg,
             format,
             stream_id.clone(),
-            call_id.to_string(),
+            super::scope::call_id(call_id).to_string(),
             WsDirection::Duplex,
             8, // playout cap (drop-oldest): late audio is worthless
         )

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use siphon_rtp_datapath::Datapath;
-use siphon_rtp_proto::{frame, CmdResult, Command, Event, Request, Response};
+use siphon_rtp_proto::{frame, CmdResult, Command, Event, Request, Response, Scoped};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -200,8 +200,14 @@ where
     loop {
         // Drain every complete request frame currently buffered, writing each response.
         loop {
-            match frame::decode::<Request>(&buffer) {
-                Ok(Some((request, consumed))) => {
+            match frame::decode::<Scoped<Request>>(&buffer) {
+                Ok(Some((frame, consumed))) => {
+                    // A frame without a `scope` key is the frame every earlier controller sends,
+                    // and addresses the unscoped call.
+                    let Scoped {
+                        scope,
+                        inner: request,
+                    } = frame;
                     buffer.drain(..consumed);
                     // Spend a rate-limit token first: a breach is rejected before any work (and
                     // before the auth check) so a flood cannot drive engine work or probe auth.
@@ -256,7 +262,7 @@ where
                                     reason: "authentication required".to_string(),
                                 })
                             }
-                            command => lanes.admit(request.id, command).await,
+                            command => lanes.admit(request.id, scope, command).await,
                         }
                     };
                     if let Some(result) = result {
@@ -293,8 +299,8 @@ where
                     for event in lanes.take_deferred(&lane) {
                         write_half.write_all(&event).await?;
                     }
-                    while let Some((id, command)) = lanes.next_waiting(&lane) {
-                        if let Some(result) = lanes.serve(id, command, &lane).await {
+                    while let Some((id, scope, command)) = lanes.next_waiting(&lane) {
+                        if let Some(result) = lanes.serve(id, scope, command, &lane).await {
                             write_response(&mut write_half, id, result).await?;
                         } else {
                             break; // it dials too: the lane stays held until it answers
@@ -304,9 +310,13 @@ where
             }
             event = identity.events.recv_async() => {
                 if let Ok(event) = event {
-                    match frame::encode(&event) {
+                    // The engine's actors name a call by its key; the wire names it by `call_id`
+                    // with the scope beside it, and an unscoped event is unchanged by this. A held
+                    // lane is named by the key too, so it is looked up before the key is taken out.
+                    let lane = lanes.held_lane(&event);
+                    match frame::encode(&crate::engine::scope::scoped_event(event)) {
                         Ok(bytes) => {
-                            if let Some(bytes) = lanes.defer_event(&event, bytes) {
+                            if let Some(bytes) = lanes.defer_event(lane, bytes) {
                                 write_half.write_all(&bytes).await?;
                             }
                         }
@@ -350,6 +360,10 @@ async fn write_response(
 /// more than this onto a call that is still dialling is answered with an error for the excess.
 const MAX_WAITING_PER_LANE: usize = 64;
 
+/// A command waiting behind its call's pending dial: the request id, the scope its frame named and
+/// the command.
+type Waiting = (u64, Option<String>, Command);
+
 /// A command that ran off the connection's loop, finished.
 struct Finished {
     id: u64,
@@ -369,7 +383,8 @@ struct Finished {
 /// other call is set up or torn down.
 ///
 /// So a command that dials runs as a task of its own, and its answer is written when it has one.
-/// While it runs, its **lane** (the call or conference it addresses) is held: later commands for
+/// While it runs, its **lane** (the call or conference it addresses, a call being the one of its
+/// scope: two scopes of one `call_id` are two lanes) is held: later commands for
 /// the same call wait behind it and are then served in the order they arrived, so nothing a
 /// controller sent for one call is ever reordered. Commands for any other call, and the ones that
 /// address no call at all, are served at once. Responses carry the request id, so one that
@@ -385,7 +400,7 @@ struct Lanes<D: Datapath> {
     engine: Arc<Engine<D>>,
     client: ClientId,
     /// The lanes held by a running task, each with the commands waiting behind it.
-    held: std::collections::HashMap<String, std::collections::VecDeque<(u64, Command)>>,
+    held: std::collections::HashMap<String, std::collections::VecDeque<Waiting>>,
     /// Encoded events kept back for a held lane, in the order they were raised.
     deferred: std::collections::HashMap<String, Vec<Vec<u8>>>,
     done: flume::Sender<Finished>,
@@ -410,8 +425,13 @@ where
 
     /// Take a command off the wire: its result when it was served in line, `None` when it waits
     /// behind its call's pending dial or dials itself, and will be answered later.
-    async fn admit(&mut self, id: u64, command: Command) -> Option<CmdResult> {
-        let lane = Engine::<D>::command_lane(&command).map(str::to_owned);
+    async fn admit(
+        &mut self,
+        id: u64,
+        scope: Option<String>,
+        command: Command,
+    ) -> Option<CmdResult> {
+        let lane = Self::lane(scope.as_deref(), &command);
         if let Some(waiting) = lane.as_ref().and_then(|lane| self.held.get_mut(lane)) {
             if waiting.len() >= MAX_WAITING_PER_LANE {
                 return Some(CmdResult::Error {
@@ -419,49 +439,77 @@ where
                         .to_string(),
                 });
             }
-            waiting.push_back((id, command));
+            waiting.push_back((id, scope, command));
             return None;
         }
         match lane {
-            Some(lane) => self.serve(id, command, &lane).await,
-            None => Some(self.engine.handle(self.client, command).await),
+            Some(lane) => self.serve(id, scope, command, &lane).await,
+            None => Some(self.handle(scope.as_deref(), command).await),
         }
+    }
+
+    /// The lane of a command: the key of the call it addresses under `scope`, which is how the
+    /// engine and its events name that call, or the conference it addresses. `None` for a verb
+    /// that addresses neither, and for a frame the engine refuses before any work (a malformed
+    /// scope, a `call_id` that cannot be keyed), which is answered at once.
+    fn lane(scope: Option<&str>, command: &Command) -> Option<String> {
+        let addressed = Engine::<D>::command_lane(command)?;
+        let scope = siphon_rtp_proto::normalize_scope(scope).ok()?;
+        crate::engine::scope::compose(scope, addressed).ok()
+    }
+
+    async fn handle(&self, scope: Option<&str>, command: Command) -> CmdResult {
+        self.engine.handle_scoped(self.client, scope, command).await
     }
 
     /// Serve a command whose lane is free (or is this command's to hold): in line, or as a task
     /// that holds the lane when it dials.
-    async fn serve(&mut self, id: u64, command: Command, lane: &str) -> Option<CmdResult> {
+    async fn serve(
+        &mut self,
+        id: u64,
+        scope: Option<String>,
+        command: Command,
+        lane: &str,
+    ) -> Option<CmdResult> {
         if !Engine::<D>::command_dials(&command) {
-            return Some(self.engine.handle(self.client, command).await);
+            return Some(self.handle(scope.as_deref(), command).await);
         }
         self.held.entry(lane.to_owned()).or_default();
         let (engine, client, done) = (self.engine.clone(), self.client, self.done.clone());
         let lane = lane.to_owned();
         tokio::spawn(async move {
-            let result = engine.handle(client, command).await;
+            let result = engine
+                .handle_scoped(client, scope.as_deref(), command)
+                .await;
             // The connection may be gone by now; the command was served all the same.
             let _ = done.send(Finished { id, lane, result });
         });
         None
     }
 
-    /// Keep an encoded event back when it is about a call whose lane is held, or hand it back to
-    /// be written now. Only looks when a lane is held at all, which is the rare case.
-    fn defer_event(&mut self, event: &Event, bytes: Vec<u8>) -> Option<Vec<u8>> {
+    /// The held lane an event is about, if any, read off the event as the engine emitted it (it
+    /// names a call by its key). Only looks when a lane is held at all, which is the rare case.
+    fn held_lane(&self, event: &Event) -> Option<String> {
         if self.held.is_empty() {
-            return Some(bytes);
+            return None;
         }
         let lane = serde_json::to_value(event).ok().and_then(|value| {
             ["call_id", "conference_id"]
                 .iter()
                 .find_map(|key| value.get(key)?.as_str().map(str::to_owned))
-        });
+        })?;
+        self.held.contains_key(&lane).then_some(lane)
+    }
+
+    /// Keep an encoded event back when it is about a call whose lane is held ([`Self::held_lane`]),
+    /// or hand it back to be written now.
+    fn defer_event(&mut self, lane: Option<String>, bytes: Vec<u8>) -> Option<Vec<u8>> {
         match lane {
-            Some(lane) if self.held.contains_key(&lane) => {
+            Some(lane) => {
                 self.deferred.entry(lane).or_default().push(bytes);
                 None
             }
-            _ => Some(bytes),
+            None => Some(bytes),
         }
     }
 
@@ -471,7 +519,7 @@ where
     }
 
     /// The next command waiting on `lane`, releasing the lane when there is none.
-    fn next_waiting(&mut self, lane: &str) -> Option<(u64, Command)> {
+    fn next_waiting(&mut self, lane: &str) -> Option<Waiting> {
         let next = self
             .held
             .get_mut(lane)
