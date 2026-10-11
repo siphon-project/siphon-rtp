@@ -24,7 +24,7 @@ use tokio::time::timeout;
 use crate::interface::InterfaceTable;
 use crate::sdp;
 
-use super::admin::{opus_is_transcodable, supported_codecs};
+use super::admin::supported_codecs;
 use super::answer::{
     negotiated_near_codec, parse_ptime_override, with_ptime_override, MAX_PTIME_OVERRIDE_MS,
 };
@@ -293,6 +293,18 @@ fn transcode_codec_spec_advertises_only_what_the_factory_can_encode() {
             assert_eq!(spec.payload_type, OPUS_DYNAMIC_PAYLOAD_TYPE);
         }
     }
+}
+
+/// Whether the factory yields both a decoder and an encoder for an RFC 7587 Opus spec.
+fn opus_is_transcodable() -> bool {
+    let spec = CodecSpec::new(
+        OPUS_DYNAMIC_PAYLOAD_TYPE,
+        "opus",
+        siphon_rtp_codec::factory::OPUS_CLOCK_RATE_HZ,
+        siphon_rtp_codec::factory::OPUS_RTPMAP_CHANNELS,
+        20,
+    );
+    factory::decoder_for(&spec).is_ok() && factory::encoder_for(&spec).is_ok()
 }
 
 #[test]
@@ -30666,4 +30678,36 @@ async fn a_relayed_answer_and_reoffer_keep_every_media_line_they_were_given() {
         "{reoffer}"
     );
     assert_eq!(media_lines(&reoffer).len(), 2, "{reoffer}");
+}
+
+/// `node_info` lists a licensed codec exactly when the build has it, the same answer the codec
+/// factory gives the offer/answer code: a dispatcher that reads the list must not be kept away
+/// from the only nodes able to serve a G.729 call.
+#[test]
+fn supported_codecs_lists_g729_and_amr_exactly_when_the_build_transcodes_them() {
+    let codecs = supported_codecs();
+    let listed = |name: &str| codecs.iter().any(|codec| codec == name);
+    assert_eq!(listed("G729"), cfg!(feature = "g729"), "{codecs:?}");
+    assert_eq!(listed("AMR"), cfg!(feature = "amr"), "{codecs:?}");
+    assert_eq!(listed("AMR-WB"), cfg!(feature = "amr"), "{codecs:?}");
+    // Whatever is listed, the factory builds in both directions, and nothing is listed twice.
+    for (name, payload_type, clock_rate_hz) in [
+        ("G729", 18u8, 8000u32),
+        ("AMR", 96, 8000),
+        ("AMR-WB", 96, 16000),
+        ("PCMU", 0, 8000),
+        ("PCMA", 8, 8000),
+        ("G722", 9, 8000),
+        ("GSM", 3, 8000),
+        ("L16", 96, 16000),
+    ] {
+        let spec = CodecSpec::new(payload_type, name, clock_rate_hz, 1, 20);
+        let transcodable =
+            factory::decoder_for(&spec).is_ok() && factory::encoder_for(&spec).is_ok();
+        assert_eq!(listed(name), transcodable, "{name}: {codecs:?}");
+    }
+    let mut unique = codecs.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), codecs.len(), "{codecs:?}");
 }

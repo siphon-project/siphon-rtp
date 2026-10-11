@@ -183,7 +183,7 @@ bridge a T.38 leg to a G.711 one.
 | Verb | Fields | Result |
 |---|---|---|
 | `load` | none | Live load snapshot for a dispatcher: `node_id`, `sessions`, `max_sessions`, `load_permille` (0..=1000), `transcode_sessions`, `cpu_permille?`, `jemalloc_allocated_bytes`, `draining`. |
-| `node_info` | none | Static identity: `node_id`, `version`, `media_addresses`, `codecs`, `features`, `max_sessions`, `draining`. Read once and cache; poll `load` instead. |
+| `node_info` | none | Static identity: `node_id`, `version`, `media_addresses`, `codecs`, `features`, `max_sessions`, `draining`. Read once and cache; poll `load` instead. `codecs` names what this build transcodes in both directions, the licensed codecs (`G729`, `AMR`, `AMR-WB`) included when it was built with them; match on the names, not on their order. |
 | `drain` | none | Stop admitting new sessions (`offer` and `conference_join` are rejected); live calls run to completion. Idempotent. |
 | `undrain` | none | Resume admitting new sessions. |
 
