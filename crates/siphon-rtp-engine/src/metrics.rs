@@ -64,6 +64,36 @@ pub struct Metrics {
     control_rate_limited_total: AtomicU64,
     conference_joins_total: AtomicU64,
     conference_leaves_total: AtomicU64,
+    /// WebSocket dials that failed, by [`WsDialFailure`] class: timeout, connect, TLS, handshake.
+    ws_dial_failures_total: [AtomicU64; 4],
+}
+
+/// Why a WebSocket dial failed, as counted in the metrics and named in the log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsDialFailure {
+    /// The bound ran out: the endpoint accepted and did not finish TLS or the upgrade, or the
+    /// connect itself hung.
+    TimedOut,
+    /// The TCP connection could not be made or was cut: refused, reset, unreachable, no such host.
+    Connect,
+    /// The TLS handshake was refused: an untrusted certificate, a protocol mismatch.
+    Tls,
+    /// The endpoint answered, and not with a WebSocket upgrade: another status, a malformed
+    /// response, a URI that is not a WebSocket one.
+    Handshake,
+}
+
+impl WsDialFailure {
+    /// The class as it appears in the log line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TimedOut => "timeout",
+            Self::Connect => "connect",
+            Self::Tls => "tls",
+            Self::Handshake => "handshake",
+        }
+    }
 }
 
 /// A point-in-time read of the monotonic control-plane counters, taken by [`Metrics::snapshot`] for
@@ -112,6 +142,11 @@ impl Metrics {
     pub fn record_rate_limited(&self) {
         self.control_rate_limited_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a WebSocket dial that failed, under its class.
+    pub fn record_ws_dial_failure(&self, class: WsDialFailure) {
+        self.ws_dial_failures_total[class as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count an accepted `conference join` command.
@@ -207,6 +242,36 @@ impl Metrics {
             "counter",
             live.ws_tee_frames_dropped,
         );
+        for (class, name, help) in [
+            (
+                WsDialFailure::TimedOut,
+                "siphon_rtp_ws_dial_timeouts_total",
+                "WebSocket dials given up at the connect timeout: the endpoint accepted and never finished TLS or the upgrade.",
+            ),
+            (
+                WsDialFailure::Connect,
+                "siphon_rtp_ws_dial_connect_failures_total",
+                "WebSocket dials whose TCP connection was refused, reset or unroutable.",
+            ),
+            (
+                WsDialFailure::Tls,
+                "siphon_rtp_ws_dial_tls_failures_total",
+                "WebSocket dials whose TLS handshake was refused.",
+            ),
+            (
+                WsDialFailure::Handshake,
+                "siphon_rtp_ws_dial_handshake_failures_total",
+                "WebSocket dials answered with something other than an upgrade.",
+            ),
+        ] {
+            metric(
+                &mut output,
+                name,
+                help,
+                "counter",
+                self.ws_dial_failures_total[class as usize].load(Ordering::Relaxed),
+            );
+        }
         metric(
             &mut output,
             "siphon_rtp_offers_total",
@@ -656,9 +721,20 @@ mod tests {
         assert!(body.contains("# TYPE siphon_rtp_aec_delay_weak_locks_total counter\n"));
         assert!(body.contains("# TYPE siphon_rtp_aec_delay_never_locked_total counter\n"));
         assert!(body.contains("# TYPE siphon_rtp_aec_delay_rewidens_total counter\n"));
-        // Every series carries a HELP + TYPE line (24 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 24);
-        assert_eq!(body.matches("# TYPE ").count(), 24);
+        // The four WebSocket dial failure classes, each its own counter.
+        for class in [
+            "timeouts",
+            "connect_failures",
+            "tls_failures",
+            "handshake_failures",
+        ] {
+            assert!(body.contains(&format!(
+                "# TYPE siphon_rtp_ws_dial_{class}_total counter\nsiphon_rtp_ws_dial_{class}_total 0\n"
+            )));
+        }
+        // Every series carries a HELP + TYPE line (28 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 28);
+        assert_eq!(body.matches("# TYPE ").count(), 28);
     }
 
     #[test]
@@ -680,8 +756,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (23 vs 24).
-        assert_eq!(body.matches("# TYPE ").count(), 23);
+        // One fewer series than the CPU-present case (27 vs 28).
+        assert_eq!(body.matches("# TYPE ").count(), 27);
     }
 
     #[test]

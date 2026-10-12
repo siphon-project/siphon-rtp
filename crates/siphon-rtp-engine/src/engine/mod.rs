@@ -43,6 +43,9 @@ mod takeover;
 mod teardown;
 mod tee;
 mod telemetry;
+mod ws_dial;
+
+pub use ws_dial::DEFAULT_WS_CONNECT_TIMEOUT;
 
 pub(crate) use telemetry::validate_sip_call_id;
 
@@ -1129,6 +1132,10 @@ pub struct Engine<D: Datapath> {
     /// documented on [`MediaFetchLimits`]; the daemon replaces them from config
     /// ([`Self::with_media_fetch_limits`]).
     media_fetch_limits: MediaFetchLimits,
+    /// How long a WebSocket dial may take, from the TCP connect through TLS to the end of the
+    /// RFC 6455 upgrade, before the command that asked for it fails
+    /// ([`Self::with_ws_connect_timeout`]).
+    ws_connect_timeout: std::time::Duration,
     /// Playbacks accepted from a URL whose fetch has not finished yet, keyed by `play_id`.
     ///
     /// A URL playback accepts before its bytes exist, so between the accept and the fetch there is a

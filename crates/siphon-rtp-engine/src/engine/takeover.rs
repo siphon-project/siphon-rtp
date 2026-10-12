@@ -130,11 +130,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 }
 
-/// A dialled WebSocket client connection to a media server — what
-/// [`tokio_tungstenite::connect_async_tls_with_config`] hands back, named so it can be dialled by one
-/// function and consumed by another.
-type WsClientSocket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+use super::ws_dial::WsClientSocket;
 
 /// Switching a live two-party relay onto a WebSocket takeover, and back again.
 ///
@@ -286,7 +282,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // call's datapath untouched, which for a runtime attach means still relaying.
         let socket = match dialled {
             Some(socket) => socket,
-            None => self.dial_ws_bridge(ws_uri).await?,
+            None => self.dial_ws(call_id, ws_uri).await?,
         };
 
         // Switch the displaced relay off (all `Drop`) and redirect A's RTP here in one step, so the
@@ -540,17 +536,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Ok(())
     }
 
-    /// Dial a WebSocket media server as a client. A `wss://` URI completes the RFC 8446 handshake on
-    /// the ring/rustls connector before the RFC 6455 upgrade; a `ws://` URI ignores the connector.
-    async fn dial_ws_bridge(&self, ws_uri: &str) -> Result<WsClientSocket, String> {
-        let connector = tokio_tungstenite::Connector::Rustls(self.ws_tls_client_config());
-        let (socket, _response) =
-            tokio_tungstenite::connect_async_tls_with_config(ws_uri, None, false, Some(connector))
-                .await
-                .map_err(|error| format!("dial {ws_uri}: {error}"))?;
-        Ok(socket)
-    }
-
     /// Reinstall the `Forward` rules a takeover displaced. Shared by the detach path and by the
     /// rollback in [`Self::setup_ws_bridge`].
     ///
@@ -673,7 +658,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // Dial first, while the outgoing bridge still owns the leg: a re-point that cannot reach
             // the new consumer must be a clean refusal on a call that is still up, not a call left
             // redirected into nothing with its relay-restore plan already dropped.
-            let socket = self.dial_ws_bridge(ws_uri).await?;
+            let socket = self.dial_ws(call_id, ws_uri).await?;
             self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
                 .await;
             let result = self

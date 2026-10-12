@@ -16,6 +16,31 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   has an arm for is asked of it, so a codec is listed exactly when the build decodes and encodes
   it, and a test holds the registry to the factory's own arms. The order of the list changed
   (`telephone-event` is last); the names did not.
+- **A WebSocket server that accepts a connection and never answers no longer stops the control
+  connection.** `attach_ws_tee`, `attach_ws_bridge` and a `ws_uri` / `ws_tee` profile make the
+  engine dial an address the controller names, and that dial had no bound. Against a process
+  that completed the TCP handshake and then did nothing (stuck, overloaded, a backlog nobody
+  accepts on) it never returned, and because a connection's requests were served strictly one
+  after another, nothing after it was served either: no health probe, no other call's `offer`,
+  not the `delete` of the call itself. One hung endpoint took the node's whole media control
+  down for as long as it stayed hung. Two changes. The dial is bounded, from name resolution
+  through TCP and TLS to the end of the upgrade, by `--ws-connect-timeout-ms` (3 s by default,
+  `ws_connect_timeout_ms` in the config file), and running out fails that command with
+  `dial <uri>: timed out after N ms ...` and closes the half-made connection. And a command that
+  dials runs beside the connection's loop: requests for the same call wait behind it, in order,
+  and everything else is served at once. Its response can therefore arrive after those of
+  requests sent later, which is what the request `id` is for. A failed dial leaves the call's
+  media untouched, as before.
+- **An interception delivery endpoint that accepts and never answers is given up on and
+  retried.** The X3 connect had no bound either. It runs in its own task, so it stalled no
+  command, but a stuck Mediation Function held the delivery on one connection attempt with
+  nothing logged and nothing retried. Each attempt now gets 10 s, then the usual backoff.
+
+### Added
+
+- **`siphon_rtp_ws_dial_timeouts_total`**, `..._connect_failures_total`, `..._tls_failures_total`
+  and `..._handshake_failures_total`: failed WebSocket dials by class, each also logged at
+  `warn` with the call, the URI and the class.
 
 ## [0.13.0] — 2026-10-12
 
@@ -113,7 +138,6 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   alone would not be right either: the event's timestamp has to be placed on the egress stream's
   own timeline, which needs per-event state the media path does not keep. See
   [Mode-set, ptime, DTMF](docs/cookbook/transcoding.md#mode-set-ptime-dtmf).
-
 
 ## [0.12.2] — 2026-10-06
 

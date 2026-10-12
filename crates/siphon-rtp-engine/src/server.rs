@@ -196,6 +196,7 @@ where
     let mut refill = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
+    let mut lanes = Lanes::new(engine.clone(), client);
     loop {
         // Drain every complete request frame currently buffered, writing each response.
         loop {
@@ -204,13 +205,13 @@ where
                     buffer.drain(..consumed);
                     // Spend a rate-limit token first: a breach is rejected before any work (and
                     // before the auth check) so a flood cannot drive engine work or probe auth.
-                    // Every command answers immediately — `play_media` accepts on start and reports
-                    // its end asynchronously via `Event::PlayFinished`, so nothing defers the response.
+                    // Every command answers at once, except one that dials a WebSocket server: that
+                    // one runs off this loop and answers when its dial has, see [`Lanes`].
                     let result = if !rate_limiter.try_acquire() {
                         metrics.record_rate_limited();
-                        CmdResult::Error {
+                        Some(CmdResult::Error {
                             reason: "rate limit exceeded".to_string(),
-                        }
+                        })
                     } else {
                         match request.command {
                             Command::Authenticate {
@@ -229,39 +230,37 @@ where
                                 // A controller id is an identity claim, not a credential: where a
                                 // secret is configured it is honoured only on a connection that
                                 // presented the matching token (docs/security-and-nat.md §5).
-                                match (accepted, controller_id) {
+                                Some(match (accepted, controller_id) {
                                     (false, _) => CmdResult::Error {
                                         reason: "authentication failed".to_string(),
                                     },
                                     (true, None) => auth_ok(),
                                     (true, Some(controller_id)) => {
                                         match identity.claim(&controller_id) {
-                                            Ok(()) => auth_ok(),
+                                            Ok(()) => {
+                                                // The claim may have given this connection another
+                                                // identity's calls: later commands act as it.
+                                                lanes.client = identity.client;
+                                                auth_ok()
+                                            }
                                             Err(error) => CmdResult::Error {
                                                 reason: error.to_string(),
                                             },
                                         }
                                     }
-                                }
+                                })
                             }
                             command if !authenticated => {
                                 let _ = command;
-                                CmdResult::Error {
+                                Some(CmdResult::Error {
                                     reason: "authentication required".to_string(),
-                                }
+                                })
                             }
-                            command => engine.handle(identity.client, command).await,
+                            command => lanes.admit(request.id, command).await,
                         }
                     };
-                    let response = Response {
-                        id: request.id,
-                        result,
-                    };
-                    match frame::encode(&response) {
-                        Ok(bytes) => write_half.write_all(&bytes).await?,
-                        Err(error) => {
-                            tracing::error!(%error, "failed to encode control response");
-                        }
+                    if let Some(result) = result {
+                        write_response(&mut write_half, request.id, result).await?;
                     }
                 }
                 Ok(None) => break,
@@ -283,10 +282,34 @@ where
                 }
                 buffer.extend_from_slice(&chunk[..read]);
             }
+            finished = lanes.finished.recv_async() => {
+                // A command that was dialling has its answer. Write it, then serve what waited
+                // behind it on the same call, in the order it arrived.
+                if let Ok(finished) = finished {
+                    let lane = finished.lane;
+                    write_response(&mut write_half, finished.id, finished.result).await?;
+                    // Then the events it raised, which were kept back so that they follow the
+                    // response as they do for a command served in line.
+                    for event in lanes.take_deferred(&lane) {
+                        write_half.write_all(&event).await?;
+                    }
+                    while let Some((id, command)) = lanes.next_waiting(&lane) {
+                        if let Some(result) = lanes.serve(id, command, &lane).await {
+                            write_response(&mut write_half, id, result).await?;
+                        } else {
+                            break; // it dials too: the lane stays held until it answers
+                        }
+                    }
+                }
+            }
             event = identity.events.recv_async() => {
                 if let Ok(event) = event {
                     match frame::encode(&event) {
-                        Ok(bytes) => write_half.write_all(&bytes).await?,
+                        Ok(bytes) => {
+                            if let Some(bytes) = lanes.defer_event(&event, bytes) {
+                                write_half.write_all(&bytes).await?;
+                            }
+                        }
                         Err(error) => tracing::error!(%error, "failed to encode control event"),
                     }
                 }
@@ -305,6 +328,158 @@ where
                 rate_limiter.refill(1);
             }
         }
+    }
+}
+
+/// Write one response frame.
+async fn write_response(
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    id: u64,
+    result: CmdResult,
+) -> std::io::Result<()> {
+    match frame::encode(&Response { id, result }) {
+        Ok(bytes) => write_half.write_all(&bytes).await,
+        Err(error) => {
+            tracing::error!(%error, "failed to encode control response");
+            Ok(())
+        }
+    }
+}
+
+/// The most commands that may wait behind one call's pending dial. A controller that pipelines
+/// more than this onto a call that is still dialling is answered with an error for the excess.
+const MAX_WAITING_PER_LANE: usize = 64;
+
+/// A command that ran off the connection's loop, finished.
+struct Finished {
+    id: u64,
+    lane: String,
+    result: CmdResult,
+}
+
+/// Which commands of one control connection run when.
+///
+/// A connection serves its requests in order, one at a time, and that order is what a controller
+/// relies on: an `answer` after its `offer`, a `delete` after everything else. Almost every
+/// command is over in microseconds, so serving them in line is also the fastest way. The
+/// exception is a command that makes the engine dial a WebSocket server
+/// ([`Engine::command_dials`]): it takes as long as that server takes to answer, up to the connect
+/// timeout, and a server that accepts a connection and then says nothing takes all of it. Served
+/// in line, such a command stops the connection for that long: no health probe is answered, no
+/// other call is set up or torn down.
+///
+/// So a command that dials runs as a task of its own, and its answer is written when it has one.
+/// While it runs, its **lane** (the call or conference it addresses) is held: later commands for
+/// the same call wait behind it and are then served in the order they arrived, so nothing a
+/// controller sent for one call is ever reordered. Commands for any other call, and the ones that
+/// address no call at all, are served at once. Responses carry the request id, so one that
+/// arrives after a later request's is still correlated.
+///
+/// An event about a call whose lane is held is kept back until that command's response has been
+/// written, so that a controller sees `ok` and then `ws_tee_started`, never the reverse, exactly
+/// as it does for a command served in line. Events about other calls are written at once.
+///
+/// A task is not cancelled when the connection goes away: a command half-applied is worse than
+/// one whose answer nobody reads, and the dial inside it is bounded.
+struct Lanes<D: Datapath> {
+    engine: Arc<Engine<D>>,
+    client: ClientId,
+    /// The lanes held by a running task, each with the commands waiting behind it.
+    held: std::collections::HashMap<String, std::collections::VecDeque<(u64, Command)>>,
+    /// Encoded events kept back for a held lane, in the order they were raised.
+    deferred: std::collections::HashMap<String, Vec<Vec<u8>>>,
+    done: flume::Sender<Finished>,
+    finished: flume::Receiver<Finished>,
+}
+
+impl<D> Lanes<D>
+where
+    D: Datapath + Clone + Send + 'static,
+{
+    fn new(engine: Arc<Engine<D>>, client: ClientId) -> Self {
+        let (done, finished) = flume::unbounded();
+        Self {
+            engine,
+            client,
+            held: std::collections::HashMap::new(),
+            deferred: std::collections::HashMap::new(),
+            done,
+            finished,
+        }
+    }
+
+    /// Take a command off the wire: its result when it was served in line, `None` when it waits
+    /// behind its call's pending dial or dials itself, and will be answered later.
+    async fn admit(&mut self, id: u64, command: Command) -> Option<CmdResult> {
+        let lane = Engine::<D>::command_lane(&command).map(str::to_owned);
+        if let Some(waiting) = lane.as_ref().and_then(|lane| self.held.get_mut(lane)) {
+            if waiting.len() >= MAX_WAITING_PER_LANE {
+                return Some(CmdResult::Error {
+                    reason: "too many commands queued behind a pending dial on this call"
+                        .to_string(),
+                });
+            }
+            waiting.push_back((id, command));
+            return None;
+        }
+        match lane {
+            Some(lane) => self.serve(id, command, &lane).await,
+            None => Some(self.engine.handle(self.client, command).await),
+        }
+    }
+
+    /// Serve a command whose lane is free (or is this command's to hold): in line, or as a task
+    /// that holds the lane when it dials.
+    async fn serve(&mut self, id: u64, command: Command, lane: &str) -> Option<CmdResult> {
+        if !Engine::<D>::command_dials(&command) {
+            return Some(self.engine.handle(self.client, command).await);
+        }
+        self.held.entry(lane.to_owned()).or_default();
+        let (engine, client, done) = (self.engine.clone(), self.client, self.done.clone());
+        let lane = lane.to_owned();
+        tokio::spawn(async move {
+            let result = engine.handle(client, command).await;
+            // The connection may be gone by now; the command was served all the same.
+            let _ = done.send(Finished { id, lane, result });
+        });
+        None
+    }
+
+    /// Keep an encoded event back when it is about a call whose lane is held, or hand it back to
+    /// be written now. Only looks when a lane is held at all, which is the rare case.
+    fn defer_event(&mut self, event: &Event, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        if self.held.is_empty() {
+            return Some(bytes);
+        }
+        let lane = serde_json::to_value(event).ok().and_then(|value| {
+            ["call_id", "conference_id"]
+                .iter()
+                .find_map(|key| value.get(key)?.as_str().map(str::to_owned))
+        });
+        match lane {
+            Some(lane) if self.held.contains_key(&lane) => {
+                self.deferred.entry(lane).or_default().push(bytes);
+                None
+            }
+            _ => Some(bytes),
+        }
+    }
+
+    /// The events kept back for `lane`, to be written after its command's response.
+    fn take_deferred(&mut self, lane: &str) -> Vec<Vec<u8>> {
+        self.deferred.remove(lane).unwrap_or_default()
+    }
+
+    /// The next command waiting on `lane`, releasing the lane when there is none.
+    fn next_waiting(&mut self, lane: &str) -> Option<(u64, Command)> {
+        let next = self
+            .held
+            .get_mut(lane)
+            .and_then(|waiting| waiting.pop_front());
+        if next.is_none() {
+            self.held.remove(lane);
+        }
+        next
     }
 }
 

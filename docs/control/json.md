@@ -23,6 +23,14 @@ Each frame is a big-endian `u32` byte length followed by a JSON body:
 - Maximum frame size is 1 MiB. A length prefix beyond that is treated as corruption and
   the connection is closed.
 - Requests are processed in order per connection; connections are handled concurrently.
+  One kind of request is the exception: a command that makes the engine dial a WebSocket server
+  (`attach_ws_tee`, `attach_ws_bridge`, and `offer` / `answer` / `answer_local` / `reoffer` with
+  a `ws_uri` or `ws_tee` profile) runs beside the connection's loop, because it takes as long as
+  that server takes to answer, up to `--ws-connect-timeout-ms` (3 s by default). While it runs,
+  requests for the **same call** wait behind it and are then served in the order they were sent;
+  requests for any other call, and `ping`, `node_info`, `load`, `list` and `statistics`, are
+  served at once. Its response is therefore the one response that may arrive after those of
+  requests sent later: match responses on `id`, not on position.
 - A request carries a numeric `id`; the matching response echoes it. Asynchronous events
   are server-initiated frames with no `id`.
 - Commands are tagged on `"command"`, results on `"result"`, events on `"event"`, all in

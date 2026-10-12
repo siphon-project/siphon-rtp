@@ -102,7 +102,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .unwrap_or(expected);
 
         // Nothing has changed yet, so a dial failure is a clean refusal on a call still anchored.
-        let socket = self.dial_ws_bridge(ws_uri).await?;
+        let socket = self.dial_ws(call_id, ws_uri).await?;
 
         self.media.stop(call_id).await;
         // Taken, not cloned, and only now: with the actor gone the call's handle is the last one, so

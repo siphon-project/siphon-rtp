@@ -92,6 +92,12 @@ control = "127.0.0.1:8080"
 # path or the control connection) and every bound below is a hard stop — a fetch that outlives one
 # ends the playback with `play_finished` reason `error`, and the leg keeps relaying untouched.
 #
+# Bound on a WebSocket dial the engine makes on a controller's word (attach_ws_tee,
+# attach_ws_bridge, a ws_uri or ws_tee profile): name resolution, TCP connect, TLS and the
+# WebSocket upgrade together (CLI: --ws-connect-timeout-ms). The command that asked fails when it
+# runs out; no other command waits for it. Default: 3000.
+# ws_connect_timeout_ms = 3000
+#
 # DNS + TCP connect + TLS, per redirect hop (CLI: --media-fetch-connect-timeout-ms). Default: 2000.
 # media_fetch_connect_timeout_ms = 2000
 #

@@ -221,6 +221,7 @@ fn delivery_task(
         network_function_id: pki.config.network_function_id.clone(),
         interception_point_id: pki.config.interception_point_id.clone(),
         keepalive: pki.config.keepalive,
+        connect_timeout: siphon_rtp_engine::x3::DEFAULT_CONNECT_TIMEOUT,
         tls: build_tls_client_config(&pki.config).expect("client tls config"),
     }
 }
@@ -853,4 +854,37 @@ async fn attach_x3_on_a_terminated_dtls_offerer_delivers_both_parties_in_the_cle
         Some(engine_toward_callee.port().to_be_bytes().as_slice()),
         "and the engine port facing the callee"
     );
+}
+
+/// A Mediation Function that accepts the TCP connection and never starts the TLS handshake: a
+/// stuck process behind a live socket. The connect attempt has to give up and be retried, as a
+/// refused one is, or delivery would wait on that one connection for as long as it stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mediation_function_that_never_answers_is_given_up_on_and_retried() {
+    let pki = pki();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mdf");
+    let address = listener.local_addr().expect("mdf addr");
+    let (accepted_tx, accepted) = flume::unbounded();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream); // never read, never written, never closed
+            let _ = accepted_tx.send(());
+        }
+    });
+
+    let (_factory, delivery) = x3_channel(64);
+    let mut task = delivery_task(&pki, address, delivery);
+    task.connect_timeout = Duration::from_millis(300);
+    let transport = tokio::spawn(run_x3_delivery(task, |_, _| {}));
+
+    // The first attempt is abandoned at its bound and a second connection is opened.
+    for attempt in 1..=2 {
+        timeout(Duration::from_secs(3), accepted.recv_async())
+            .await
+            .unwrap_or_else(|_| panic!("connection attempt {attempt} never came"))
+            .expect("accept");
+    }
+    transport.abort();
+    let _ = transport.await;
 }
