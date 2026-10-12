@@ -51,7 +51,7 @@ struct ReofferState {
     /// Whether B's answer accepted the text stream, so the near leg's text was presented anchored.
     text_relayed: bool,
     near_codec: Option<CodecSpec>,
-    near_telephone_event: Option<u8>,
+    near_telephone_event: Option<sdp::TelephoneEvent>,
     /// Whether the call transcodes, so each party is presented only its own codec.
     transcoding: bool,
 }
@@ -427,6 +427,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // that resolves no codec at all leaves the stored set alone — it tells us nothing.
                     if !reoffered_codecs.is_empty() {
                         call.near_offered_codecs = reoffered_codecs;
+                        call.near_offered_telephone_events = info.telephone_events();
                     }
                     call.near_remote_ice = new_remote_ice;
                     call.near_remote_candidates = info.candidates.clone();

@@ -140,7 +140,10 @@ impl AnswerWiring<'_> {
             near_codec: &inputs.near_codec,
             far_codec: &inputs.far_codec,
             near_telephone_event: self.near_telephone_event,
-            far_telephone_event: self.info.telephone_event_payload_type(),
+            far_telephone_event: self
+                .info
+                .primary_telephone_event()
+                .map(|event| event.payload_type),
             record_path: inputs.record_path.as_deref(),
             noise_suppression: self.profile.noise_suppression,
             echo: EchoProfile::from_profile(self.profile),

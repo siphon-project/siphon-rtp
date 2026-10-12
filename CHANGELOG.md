@@ -38,6 +38,37 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 - **A received SID or NO_DATA frame is silence, not an error**, and a frame with the Q bit clear
   is concealed rather than decoded. Every frame of a multi-frame packet is decoded, where only the
   first was. A lost AMR packet is silence instead of an error from the concealment call.
+- **A transcoded call is answered with a codec the engine can transcode.** On a call the engine
+  transcodes, the offerer was held on the codec it listed first, whatever that was. An offer led
+  by a codec the engine relays but does not decode (EVS ahead of AMR-WB and AMR, as a VoLTE
+  terminal sends it) had its `answer` refused with `cannot decode the ingress codec`, after the
+  far side had already answered. The offerer is now answered the first codec of its offer the
+  engine can transcode to the far side's, in its own order of preference. The `answer` is refused
+  only when there is none, and the error names the offered codec and the answered one.
+- **A codec directive removes the first offered codec like any other.** `codec-mask`,
+  `codec-strip`, `codec-consume`, their `all` forms and a `codec-offer` whitelist left the first
+  audio codec of the offer in what the far side was sent, ahead of the `codec-transcode` targets:
+  the rule that keeps an `m=` line from going empty looked at the removals and not at what was
+  added. A far side that knew that codec was offered it although the profile masked it, and no
+  profile could offer G.711 alone. The first codec now stays only when nothing is added in its
+  place. With no codec of the offer left, the added ones lead the format list, ahead of
+  telephone-event.
+- **A transcoded answer maps telephone-event at the clock rate it was offered.** It was always
+  written as `telephone-event/8000`, on the first event payload type the offer declared, so an
+  offer of `telephone-event/16000` and `telephone-event/8000` had its 16 kHz payload type come
+  back relabelled (RFC 3264 §6.1). The answer now keeps the payload type whose clock rate is that
+  of the selected codec (RFC 4733 §2.1), at the rate the offer gave it; an offer with none at that
+  rate keeps the one it has. The far side's answer and a locally answered call are read the same
+  way. The HA call snapshot carries the rate, and a snapshot from an older node restores it as
+  8 kHz.
+
+- **`codec-strip` of the first offered codec no longer forces a transcode.** Strip shared the
+  reading of `codec-mask`: the offerer was held on the codec that had been removed and the call
+  transcoded, whatever the far side answered. With `codec-strip-EVS` alone the far side answered
+  AMR-WB, which the offerer had offered too, and the `answer` was refused for want of an EVS
+  decoder on a call that needed no codec at all. Strip now only removes: the offerer follows the
+  far side's answer and the call is a relay. `codec-mask` and `codec-consume` still hold the
+  offerer on its first codec when the engine can transcode it.
 
 ### Added
 
@@ -60,6 +91,17 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 - AMR discontinuous transmission: no SID frames are sent, and a received silence period is
   played as digital silence, not comfort noise. Redundant frames from a peer are decoded as new
   audio. See [AMR on RTP](docs/codecs.md#amr-on-rtp).
+
+### Not included, and why
+
+- **Telephone-events are not rescaled between event clocks.** An event is forwarded to the other
+  leg with the timestamp and duration it arrived with. Between a 16 kHz leg and an 8 kHz one that
+  leaves the duration the far side reads off by the ratio of the two clocks, and the `duration_ms`
+  of a `dtmf` control event is computed at 8 kHz whatever the leg's clock. Rescaling the duration
+  alone would not be right either: the event's timestamp has to be placed on the egress stream's
+  own timeline, which needs per-event state the media path does not keep. See
+  [Mode-set, ptime, DTMF](docs/cookbook/transcoding.md#mode-set-ptime-dtmf).
+
 
 ## [0.12.2] — 2026-10-06
 

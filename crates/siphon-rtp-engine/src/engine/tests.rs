@@ -46,6 +46,8 @@ use super::*;
 /// The default control client for tests that don't exercise per-client isolation.
 const CLIENT: ClientId = ClientId(1);
 
+mod transcode_offer;
+
 #[test]
 fn ws_vad_config_is_absent_unless_vad_or_barge_in_is_requested() {
     assert!(WsVadConfig::from_profile(&ProfileFlags::default()).is_none());
@@ -4188,6 +4190,7 @@ fn negotiated_near_codec_adopts_the_answered_codec_when_a_offered_it() {
     let pcma = CodecSpec::new(8, "PCMA", 8000, 1, 20);
     let offered = vec![CodecSpec::new(18, "G729", 8000, 1, 20), pcma.clone()];
     let negotiated = negotiated_near_codec(&offered, offered.first().cloned(), Some(&pcma), false)
+        .expect("bridged")
         .expect("codec");
     assert_eq!(
         negotiated.encoding_name, "PCMA",
@@ -4206,6 +4209,7 @@ fn negotiated_near_codec_keeps_as_own_codec_when_the_answer_diverges() {
     let offered = vec![CodecSpec::new(0, "PCMU", 8000, 1, 20)];
     let g722 = CodecSpec::new(9, "G722", 8000, 1, 20);
     let negotiated = negotiated_near_codec(&offered, offered.first().cloned(), Some(&g722), false)
+        .expect("bridged")
         .expect("codec");
     assert_eq!(negotiated.encoding_name, "PCMU", "A keeps its own codec");
 }
@@ -4215,12 +4219,12 @@ fn negotiated_near_codec_keeps_the_primary_without_an_answer_or_an_offer_set() {
     let pcmu = CodecSpec::new(0, "PCMU", 8000, 1, 20);
     assert_eq!(
         negotiated_near_codec(std::slice::from_ref(&pcmu), Some(pcmu.clone()), None, false),
-        Some(pcmu.clone()),
+        Ok(Some(pcmu.clone())),
         "an answer that resolves no codec changes nothing"
     );
     assert_eq!(
         negotiated_near_codec(&[], Some(pcmu.clone()), Some(&pcmu), false),
-        Some(pcmu),
+        Ok(Some(pcmu)),
         "an empty offered set (a restored call) changes nothing"
     );
 }
@@ -4232,7 +4236,9 @@ fn negotiated_near_codec_keeps_a_codec_the_policy_withheld_from_the_far_side() {
     let g722 = CodecSpec::new(9, "G722", 8000, 1, 20);
     let pcmu = CodecSpec::new(0, "PCMU", 8000, 1, 20);
     let offered = vec![g722.clone(), pcmu.clone()];
-    let negotiated = negotiated_near_codec(&offered, Some(g722), Some(&pcmu), true).expect("codec");
+    let negotiated = negotiated_near_codec(&offered, Some(g722), Some(&pcmu), true)
+        .expect("bridged")
+        .expect("codec");
     assert_eq!(
         negotiated.encoding_name, "G722",
         "a masked near codec still engages the transcoder"

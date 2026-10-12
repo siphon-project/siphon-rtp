@@ -12,9 +12,10 @@ use crate::sdp::{self, IceRewrite, SecurityAdvertisement, TextRewrite};
 
 use super::install::{AnswerIce, AnswerText, AnswerWiring, AnsweredText};
 use super::negotiate::{
-    answer_gate_addresses, answer_ice_rewrite, far_received_from_hint, far_security, near_security,
-    peer_ice_credentials, present_leg, resolve_pipeline, same_codec, settle_secure_offerer,
-    setup_for_role, CodecPresentation, LegPresentation, NearDtlsAnswer,
+    answer_gate_addresses, answer_ice_rewrite, cannot_bridge, describe_codec,
+    far_received_from_hint, far_security, near_security, peer_ice_credentials, present_leg,
+    resolve_pipeline, same_codec, settle_secure_offerer, setup_for_role, CodecPresentation,
+    LegPresentation, NearDtlsAnswer,
 };
 use super::takeover::AnswerTakeover;
 use super::Leg;
@@ -177,8 +178,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 if !answered_codecs.is_empty() {
                     call.near_offered_codecs = answered_codecs;
                 }
-                if let Some(telephone_event) = answered.telephone_event_payload_type() {
+                if let Some(telephone_event) = answered.primary_telephone_event() {
                     call.near_telephone_event = Some(telephone_event);
+                    call.near_offered_telephone_events = answered.telephone_events();
                 }
                 // A's answer states A's own direction — this is how A accepts (or declines) a hold B
                 // asked for. `far_direction` needs nothing here: `info` below is B's re-offer, i.e. B's
@@ -261,7 +263,7 @@ struct AnswerPresentation<'a> {
     far: Leg,
     near_codec: Option<&'a CodecSpec>,
     ptime_override: Option<u8>,
-    near_telephone_event: Option<u8>,
+    near_telephone_event: Option<sdp::TelephoneEvent>,
     /// The call transcodes, so each party is shown only its own codec.
     transcoding: bool,
     ice_creds: Option<&'a IceCredentials>,
@@ -341,7 +343,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Some(_) => info.primary_codec().map(|codec| {
                 (
                     with_ptime_override(&codec, ptime_override),
-                    info.telephone_event_payload_type(),
+                    info.primary_telephone_event(),
                 )
             }),
         };
@@ -589,10 +591,7 @@ struct AnswerState {
     far_dtls: bool,
     far_downgraded_to_plain: bool,
     near_secure: bool,
-    near_codec: Option<CodecSpec>,
-    near_offered_codecs: Vec<CodecSpec>,
-    near_codec_withheld: bool,
-    near_telephone_event: Option<u8>,
+    near_negotiation: NearNegotiation,
     offer_pipeline: PipelineKind,
     offer_received_from: Option<std::net::IpAddr>,
     stored_far_received_from: Option<std::net::IpAddr>,
@@ -603,6 +602,45 @@ struct AnswerState {
     text_events: bool,
 }
 
+/// Leg A's side of the negotiation as the stored call holds it when an answer arrives: what A
+/// offered, and what was selected from it so far.
+struct NearNegotiation {
+    /// The codec A is held on: its first-listed one until an answer says otherwise.
+    codec: Option<CodecSpec>,
+    offered_codecs: Vec<CodecSpec>,
+    /// The codec policy took `codec` out of the offer B saw.
+    codec_withheld: bool,
+    telephone_event: Option<sdp::TelephoneEvent>,
+    offered_telephone_events: Vec<sdp::TelephoneEvent>,
+}
+
+impl NearNegotiation {
+    /// Leg A's codec and the telephone-event payload type that goes with it, both settled by B's
+    /// `answered` codec: the codec by [`negotiated_near_codec`], and of the event payload types A
+    /// declared the one at that codec's clock rate (RFC 4733 §2.1 — the event stream runs at the
+    /// clock of the audio it accompanies). A call restored from an HA snapshot declared none here
+    /// and keeps the one it had selected.
+    ///
+    /// # Errors
+    /// The refusal of [`negotiated_near_codec`], as the `answer` result.
+    fn settle(
+        self,
+        answered: Option<&CodecSpec>,
+    ) -> Result<(Option<CodecSpec>, Option<sdp::TelephoneEvent>), Box<CmdResult>> {
+        let codec = negotiated_near_codec(
+            &self.offered_codecs,
+            self.codec,
+            answered,
+            self.codec_withheld,
+        )
+        .map_err(|reason| Box::new(error_result("answer", &reason)))?;
+        let telephone_event =
+            sdp::TelephoneEvent::accompanying(&self.offered_telephone_events, codec.as_ref())
+                .or(self.telephone_event);
+        Ok((codec, telephone_event))
+    }
+}
+
 /// What an answer records on the call once its media path is installed.
 struct AnswerRecord<'a> {
     to_tag: &'a str,
@@ -611,6 +649,7 @@ struct AnswerRecord<'a> {
     /// B's signalled UDPTL address, when a T.38 stream was relayed. `None` otherwise.
     far_image_remote: Option<std::net::SocketAddr>,
     near_codec: Option<&'a CodecSpec>,
+    near_telephone_event: Option<sdp::TelephoneEvent>,
     ptime_override: Option<u8>,
     pipeline: PipelineKind,
     relay_flows: Vec<(
@@ -733,10 +772,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     far_dtls: call.far_dtls,
                     far_downgraded_to_plain: call.far_downgraded_to_plain,
                     near_secure: call.near_secure,
-                    near_codec: call.near_codec.clone(),
-                    near_offered_codecs: call.near_offered_codecs.clone(),
-                    near_codec_withheld: call.near_codec_withheld,
-                    near_telephone_event: call.near_telephone_event,
+                    near_negotiation: NearNegotiation {
+                        codec: call.near_codec.clone(),
+                        offered_codecs: call.near_offered_codecs.clone(),
+                        codec_withheld: call.near_codec_withheld,
+                        telephone_event: call.near_telephone_event,
+                        offered_telephone_events: call.near_offered_telephone_events.clone(),
+                    },
                     offer_pipeline: call.pipeline,
                     offer_received_from: call.offer_received_from,
                     stored_far_received_from: call.far_received_from,
@@ -818,6 +860,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_text_remote,
             far_image_remote,
             near_codec,
+            near_telephone_event,
             ptime_override,
             pipeline,
             relay_flows,
@@ -854,9 +897,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.far_codec = info
                 .primary_codec()
                 .map(|codec| with_ptime_override(&codec, ptime_override));
+            call.near_telephone_event = near_telephone_event;
             // The far leg's RFC 4733 telephone-event PT from its answer, so `block DTMF` can gate leg
             // B's telephone-event even on a plain relay.
-            call.far_telephone_event = info.telephone_event_payload_type();
+            call.far_telephone_event = info
+                .primary_telephone_event()
+                .map(|event| event.payload_type);
             // B's own direction, for the idle reaper. This is where hold becomes visible on an answered
             // call: A offers `sendonly` and B answers `recvonly` (RFC 3264 §8.4), so neither party is
             // expected to send and the call is held rather than dead.
@@ -953,10 +999,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_dtls,
             far_downgraded_to_plain,
             near_secure,
-            near_codec,
-            near_offered_codecs,
-            near_codec_withheld,
-            near_telephone_event,
+            near_negotiation,
             offer_pipeline,
             offer_received_from,
             stored_far_received_from,
@@ -986,12 +1029,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // call is a plain relay. Adopt it as A's codec here, before anything reads `near_codec`: the
         // pipeline decision, the WebSocket bridge, the answer-side codec presentation and the CDR all
         // then name the codec A is really sending, instead of whichever one A happened to list first.
-        let near_codec = negotiated_near_codec(
-            &near_offered_codecs,
-            near_codec,
-            info.primary_codec().as_ref(),
-            near_codec_withheld,
-        );
+        let (near_codec, near_telephone_event) =
+            match near_negotiation.settle(info.primary_codec().as_ref()) {
+                Ok(settled) => settled,
+                Err(result) => return *result,
+            };
 
         // rtpengine `received-from`: the real post-NAT source the SIP proxy saw each request come
         // from. A's hint (stored on the call: from its offer, refreshed by its re-offer or by its
@@ -1196,7 +1238,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_ice,
             far_ice,
             near_codec: near_codec.as_ref(),
-            near_telephone_event,
+            near_telephone_event: near_telephone_event.map(|event| event.payload_type),
             ptime_override,
             dtls_role,
             near_dtls: near_dtls_settled.as_ref().map(NearDtlsAnswer::wiring),
@@ -1258,6 +1300,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_text_remote,
                 far_image_remote,
                 near_codec: near_codec.as_ref(),
+                near_telephone_event,
                 ptime_override,
                 pipeline,
                 relay_flows,
@@ -1364,28 +1407,47 @@ pub(super) fn with_ptime_override(codec: &CodecSpec, override_ms: Option<u8>) ->
 /// The transcoder engages only where the two sides genuinely diverge: B answered a codec A never
 /// offered (reachable only when `codec-transcode` put a codec in the far offer that was not in A's),
 /// or `withheld_from_far` says the profile removed A's own codec from what B saw (`codec-mask` /
-/// `codec-consume`). There A keeps its own primary codec and the engine bridges the two, which is what
-/// those flags exist to ask for.
+/// `codec-consume`). There A stays on a codec of its own offer and the engine bridges the two, which
+/// is what those flags exist to ask for: its first-listed one when the engine can transcode it, else
+/// the next it listed that the engine can, in A's order of preference. An offer that leads with a
+/// codec the engine only relays (EVS) and follows it with ones it runs is a call that works, so it is
+/// not refused over the one that leads.
+///
+/// # Errors
+/// When the call needs the transcoder and nothing A offered can be bridged to what B answered: the
+/// reason, naming A's first codec, B's, and what the codec factory said of the one that failed.
 pub(super) fn negotiated_near_codec(
     offered: &[CodecSpec],
     primary: Option<CodecSpec>,
     answered: Option<&CodecSpec>,
     withheld_from_far: bool,
-) -> Option<CodecSpec> {
+) -> Result<Option<CodecSpec>, String> {
+    let (Some(primary), Some(answered)) = (primary.as_ref(), answered) else {
+        return Ok(primary);
+    };
     // `codec-mask-X` / `codec-consume-X` (and a `codec-offer` whitelist that omits X) mean exactly
     // "keep A on X and transcode it" — the operator removed A's own codec from what B was offered, so
     // B could not have selected it and its answer is not evidence that A moved. Honour that: the
-    // transcoder is what those flags are for.
-    if withheld_from_far {
-        return primary;
+    // transcoder is what those flags are for. Otherwise a codec B selected from A's offer is adopted.
+    if !withheld_from_far && offered.iter().any(|spec| same_codec(spec, answered)) {
+        return Ok(Some(answered.clone()));
     }
-    let Some(answered) = answered else {
-        return primary;
-    };
-    if offered.iter().any(|spec| same_codec(spec, answered)) {
-        return Some(answered.clone());
+    // A codec A shares with B needs no codec run at all, so it counts whatever the engine builds.
+    let bridges =
+        |near: &CodecSpec| same_codec(near, answered) || cannot_bridge(near, answered).is_none();
+    if bridges(primary) {
+        return Ok(Some(primary.clone()));
     }
-    primary
+    match offered.iter().find(|spec| bridges(spec)) {
+        Some(shared) if same_codec(shared, answered) => Ok(Some(answered.clone())),
+        Some(near) => Ok(Some(near.clone())),
+        None => Err(format!(
+            "none of the offered codecs, {} first, can be transcoded to the answered {}: {}",
+            describe_codec(primary),
+            describe_codec(answered),
+            cannot_bridge(primary, answered).unwrap_or_default(),
+        )),
+    }
 }
 
 /// Build the relay rule for one ingress endpoint: gate its incoming source to the SDP-signalled

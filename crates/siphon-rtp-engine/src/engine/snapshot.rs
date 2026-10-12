@@ -608,7 +608,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // granted the long held one on a guess. A re-offer after the restore corrects it.
                 near_direction: sdp::MediaDirection::default(),
                 far_direction: sdp::MediaDirection::default(),
-                near_telephone_event: snapshot.near_telephone_event,
+                near_telephone_event: snapshot.near_telephone_event.map(|payload_type| {
+                    sdp::TelephoneEvent {
+                        payload_type,
+                        clock_rate_hz: snapshot
+                            .near_telephone_event_clock_rate_hz
+                            .unwrap_or(sdp::TelephoneEvent::DEFAULT_CLOCK_RATE_HZ),
+                    }
+                }),
+                // Like the offered codecs, the declared set is not carried: the selection above is.
+                near_offered_telephone_events: Vec::new(),
                 // The far leg's telephone-event PT is not carried in the HA snapshot (a restored call
                 // is not DTMF-blocked — the reason set is cleared above too); resolved only on a fresh
                 // answer. `block DTMF` after a restore on a plain relay gates whichever side's PT is

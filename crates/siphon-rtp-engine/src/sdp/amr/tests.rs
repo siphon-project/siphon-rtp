@@ -126,7 +126,7 @@ fn answer(offer: &str) -> Option<(CodecSpec, String)> {
         .audio_codecs()
         .into_iter()
         .find(|spec| siphon_rtp_codec::factory::encoder_for(spec).is_ok())?;
-    let answered = force_answer_codec(&sdp(offer), &chosen, info.telephone_event_payload_type());
+    let answered = force_answer_codec(&sdp(offer), &chosen, info.primary_telephone_event());
     Some((chosen, answered))
 }
 

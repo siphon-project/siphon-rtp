@@ -28,15 +28,18 @@ from the offer/answer, once, at `answer`:
   offer B saw. The two sides genuinely differ, so the transcoder runs and A is answered with its own
   codec.
 - **The profile withheld A's codec from B** (`codec-mask-X`, `codec-consume-X`, or a `codec-offer`
-  whitelist that omits it) — the operator asking for exactly that transcode. A stays on the codec B
+  whitelist that omits it) — the operator asking for exactly that transcode. A stays on a codec B
   never saw.
 - **Something else needs the audio** — recording at answer (`record-call`), noise suppression, echo
   cancellation or record-tone detection put the call on the media path even when both legs share a
   codec, and that path decodes.
 
-Only the last three need the codec compiled in. When one of them names a codec this build cannot
-build, the `answer` fails and says which codec and which direction — it does not quietly relay a
-stream the far side cannot decode.
+Only the last three need the codec compiled in. On a call that transcodes, A is held on the first
+codec of its offer this build can transcode, in A's order, so an offer led by a codec the engine
+only relays is still answered when a later one can be run; the `answer` fails, naming A's codec
+and B's, only when none can. When recording or another audio feature names a codec this build
+cannot build, the `answer` fails and says which codec and which direction — it does not quietly
+relay a stream the far side cannot decode.
 
 ## The matrix
 

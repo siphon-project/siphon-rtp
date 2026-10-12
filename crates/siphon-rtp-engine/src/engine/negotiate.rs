@@ -50,7 +50,7 @@ pub(super) enum CodecPresentation<'a> {
     /// would offer a codec this leg never receives (RFC 3264 §6).
     Own {
         codec: &'a CodecSpec,
-        telephone_event: Option<u8>,
+        telephone_event: Option<sdp::TelephoneEvent>,
     },
 }
 
@@ -387,13 +387,15 @@ pub(super) fn offered_dtls_setup(directive: Option<DtlsDirective>) -> sdp::Setup
 /// Parse rtpengine codec-manipulation flags into a [`sdp::CodecPolicy`] for the SDP offered to the
 /// far side. The NG/JSON front-ends flatten the `codec` dictionary
 /// (`docs/ng_control_protocol.md`) into `codec-<op>-<NAME>` flag strings, which map as:
-/// - `codec-strip-X` — remove X from the offer.
+/// - `codec-strip-X` — remove X from the offer. A leg whose first codec was stripped follows B's
+///   answer like any other ([`held_on_withheld_codec`]); a stripped codec is still one the near leg
+///   may end up on when B answers a codec A never offered, which is *not* rtpengine's "remove it, I
+///   do not want it".
 /// - `codec-mask-X` / `codec-consume-X` — remove X from the offer but keep it usable near-side for
 ///   transcoding. Removing A's own codec from what B is offered is read as exactly that request: the
 ///   answer-time adoption of B's selection is skipped and the near side keeps X, which engages the
-///   transcoder because the near/far codecs then differ (see [`negotiated_near_codec`]). `strip`
-///   shares this branch, so it behaves the same way — which is *not* rtpengine's "remove it, I do not
-///   want it" and cannot be used to keep a codec off the near leg.
+///   transcoder because the near/far codecs then differ (see [`negotiated_near_codec`], which also
+///   settles what A is held on when the engine cannot transcode X).
 /// - `codec-transcode-X` — add X to the offer; the transcoder engages when the far side selects it.
 /// - `codec-except-X` / `codec-accept-X` — a keep-list: X is never stripped (the exception to
 ///   `strip-all` / `mask-all`).
@@ -411,6 +413,9 @@ pub(super) fn parse_codec_flags(flags: &[String]) -> sdp::CodecPolicy {
             .or_else(|| flag.strip_prefix("codec-mask-"))
             .or_else(|| flag.strip_prefix("codec-consume-"))
         {
+            if flag.starts_with("codec-strip-") {
+                policy.stripped.push(name.to_ascii_uppercase());
+            }
             // The special value `all` / `full` sweeps every codec (bar the keep-list).
             if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("full") {
                 policy.remove_all = true;
@@ -429,6 +434,15 @@ pub(super) fn parse_codec_flags(flags: &[String]) -> sdp::CodecPolicy {
         }
     }
     policy
+}
+
+/// Whether a leg whose first codec `primary` the policy took out of the far offer is held on it, so
+/// the call transcodes whatever B answers: yes for `mask`, `consume` and an `offer` whitelist, which
+/// ask for exactly that, and no for `strip`, which only removes. A codec named by both is stripped.
+pub(super) fn held_on_withheld_codec(policy: &sdp::CodecPolicy, primary: &CodecSpec) -> bool {
+    !policy.stripped.iter().any(|name| {
+        name == "ALL" || name == "FULL" || name.eq_ignore_ascii_case(&primary.encoding_name)
+    })
 }
 
 /// A conventional dynamic RTP payload type for Opus. Not registered — RFC 7587 §7 makes Opus a
@@ -594,6 +608,26 @@ pub(super) fn same_codec(left: &CodecSpec, right: &CodecSpec) -> bool {
         && left.channels == right.channels
 }
 
+/// Why the engine cannot transcode between `near` and `far`, or `None` when it can: the first of the
+/// two codecs it has no decoder or no encoder for, with the codec factory's own reason. A transcoding
+/// call runs both codecs in both directions, so one missing half is enough.
+pub(super) fn cannot_bridge(near: &CodecSpec, far: &CodecSpec) -> Option<String> {
+    [near, far].into_iter().find_map(|codec| {
+        let missing = factory::decoder_for(codec)
+            .err()
+            .or_else(|| factory::encoder_for(codec).err())?;
+        Some(format!("{}: {missing}", describe_codec(codec)))
+    })
+}
+
+/// A codec as an operator reads it in an SDP: `<encoding>/<clock rate> (payload type <n>)`.
+pub(super) fn describe_codec(codec: &CodecSpec) -> String {
+    format!(
+        "{}/{} (payload type {})",
+        codec.encoding_name, codec.clock_rate_hz, codec.payload_type
+    )
+}
+
 /// Build one transcode direction's config: decode the ingress codec, encode the egress codec, and
 /// (when recording) capture the decoded ingress audio. Fails if either codec is unimplemented.
 #[allow(clippy::too_many_arguments)]
@@ -617,14 +651,14 @@ pub(super) fn build_direction(
     // which leg's codec the engine could not build.
     let decoder = factory::decoder_for(ingress_codec).map_err(|error| {
         format!(
-            "cannot decode the ingress codec {}/{} (payload type {}): {error}",
-            ingress_codec.encoding_name, ingress_codec.clock_rate_hz, ingress_codec.payload_type
+            "cannot decode the ingress codec {}: {error}",
+            describe_codec(ingress_codec)
         )
     })?;
     let encoder = factory::encoder_for(egress_codec).map_err(|error| {
         format!(
-            "cannot encode the egress codec {}/{} (payload type {}): {error}",
-            egress_codec.encoding_name, egress_codec.clock_rate_hz, egress_codec.payload_type
+            "cannot encode the egress codec {}: {error}",
+            describe_codec(egress_codec)
         )
     })?;
     // Record at the codec's *native* PCM rate (what the decoder emits), not the RTP clock — they
