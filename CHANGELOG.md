@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-10-12
+
 ### Fixed
 
 - **AMR and AMR-WB are sent in the payload format that was negotiated.** The engine wrote
