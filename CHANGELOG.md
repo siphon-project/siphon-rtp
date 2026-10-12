@@ -7,6 +7,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`node_info` lists G.729 on a build that has it.** A node built with the `g729` feature
+  answered and transcoded G.729 calls and left `G729` out of its `codecs` list, so a dispatcher
+  that routes on the list kept those calls away from the only nodes able to serve them. The list
+  was a hand-kept one beside the codec factory. It is now derived from the factory: every codec it
+  has an arm for is asked of it, so a codec is listed exactly when the build decodes and encodes
+  it, and a test holds the registry to the factory's own arms. The order of the list changed
+  (`telephone-event` is last); the names did not.
+
 ## [0.13.0] — 2026-10-12
 
 ### Fixed

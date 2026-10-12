@@ -1,10 +1,9 @@
 //! Read-only census verbs: `query`, `list`, `statistics`, `load` and `node_info`.
 
-use siphon_rtp_codec::factory::{self, CodecSpec};
+use siphon_rtp_codec::factory;
 use siphon_rtp_datapath::Datapath;
 use siphon_rtp_proto::{CmdResult, EngineStatistics, SessionStats};
 
-use super::negotiate::OPUS_DYNAMIC_PAYLOAD_TYPE;
 use super::{unknown_call, ClientId, Engine};
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -96,57 +95,23 @@ fn engine_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// The codec payload names this build can relay or transcode, advertised in `node_info` so a
-/// dispatcher only routes a call to a node that can serve its codec. The always-available set (pure
-/// relay + the bit-exact pure-Rust codecs) plus the AMR family under the `amr` build feature — kept
-/// in step with `factory::encoder_for`.
+/// The codec payload names this build can transcode, advertised in `node_info` so a dispatcher only
+/// routes a call to a node that can serve its codec.
 ///
-/// Opus is **not** in the static list and carries no build feature (it is royalty-free —
-/// docs/codec-licensing.md). It is added only when the codec factory can build **both** a decoder and
-/// an encoder for it, probed at runtime by [`opus_is_transcodable`]. The list has no per-direction
-/// field, so advertising Opus while only one direction worked would let a dispatcher route a call the
-/// engine then fails at setup; requiring both keeps the advertisement honest and needs no further edit
-/// when the codec lands.
+/// The list is not kept here. It is [`factory::available_codecs`]: every codec the factory has an
+/// arm for, asked of the factory itself, which is also what the offer/answer code asks when it
+/// picks a codec. A codec behind a build feature (`amr`, `g729`) is listed exactly when the feature
+/// is compiled in, and one with a single direction would not be listed at all: the list has no
+/// per-direction field, so advertising such a codec would let a dispatcher route a call the engine
+/// then fails at setup. `telephone-event` (RFC 4733) is added because it is not a codec, the media
+/// path carries it itself.
 pub(super) fn supported_codecs() -> Vec<String> {
-    let base = [
-        "PCMU",
-        "PCMA",
-        "G722",
-        "G726",
-        "GSM",
-        "CN",
-        "L16",
-        "telephone-event",
-    ];
-    // The AMR family is compiled in only under the `amr` build feature (docs/codec-licensing.md).
-    #[cfg(feature = "amr")]
-    let extra: &[&str] = &["AMR-WB", "AMR"];
-    #[cfg(not(feature = "amr"))]
-    let extra: &[&str] = &[];
-    let opus: &[&str] = if opus_is_transcodable() {
-        &["opus"]
-    } else {
-        &[]
-    };
-    base.iter()
-        .chain(extra.iter())
-        .chain(opus.iter())
-        .map(|name| (*name).to_string())
-        .collect()
-}
-
-/// Whether this build can transcode Opus in **both** directions — i.e. whether `factory` yields both a
-/// decoder and an encoder for an RFC 7587 Opus spec. Probed rather than assumed so the capability
-/// advertisement cannot drift from the factory (see [`supported_codecs`]).
-pub(super) fn opus_is_transcodable() -> bool {
-    let spec = CodecSpec::new(
-        OPUS_DYNAMIC_PAYLOAD_TYPE,
-        "opus",
-        siphon_rtp_codec::factory::OPUS_CLOCK_RATE_HZ,
-        siphon_rtp_codec::factory::OPUS_RTPMAP_CHANNELS,
-        20,
-    );
-    factory::decoder_for(&spec).is_ok() && factory::encoder_for(&spec).is_ok()
+    let mut codecs: Vec<String> = factory::available_codecs()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    codecs.push("telephone-event".to_owned());
+    codecs
 }
 
 /// The capability flags this build ships, advertised in `node_info`.

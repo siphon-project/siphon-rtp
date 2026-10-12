@@ -88,6 +88,11 @@ family, and Annex B is selected by `annexb=`, not by the name.
 
 Relaying is unaffected by any of this — the engine never executes a codec on that path.
 
+**What `node_info` lists.** The `codecs` list of `node_info` is derived from the codec factory, not
+kept beside it: a codec is listed exactly when this build both decodes and encodes it, so `G729`,
+`AMR` and `AMR-WB` appear on a build with their feature and on no other. `CN` is listed although it
+has no encoder (it is a generator), and `telephone-event` although it is not a codec.
+
 The engine resolves a codec from the `a=rtpmap` encoding name (case-insensitive, RFC
 4566 §6), falling back to the RFC 3551 §6 static payload-type table (`PCMU` 0, `GSM` 3,
 `PCMA` 8, `G722` 9, `CN` 13) when no rtpmap is present. `telephone-event` (RFC 4733

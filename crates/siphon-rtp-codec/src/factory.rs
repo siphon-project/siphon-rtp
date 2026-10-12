@@ -617,6 +617,83 @@ fn amr_rtp_config(spec: &CodecSpec) -> Result<RtpConfig<'_>, CodecError> {
     })
 }
 
+/// One codec the factory knows by name: how it is advertised, and a spec that builds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownCodec {
+    /// The name a capability list advertises it under.
+    pub name: &'static str,
+    /// The `a=rtpmap` encoding name [`decoder_for`] and [`encoder_for`] match on.
+    pub encoding_name: &'static str,
+    /// A clock rate the codec runs at.
+    pub clock_rate_hz: u32,
+    /// The rtpmap channel count of that spec.
+    pub channels: u8,
+    /// A generator with no encoder by design (comfort noise): having a decoder is all there is.
+    pub decode_only: bool,
+}
+
+impl KnownCodec {
+    const fn new(name: &'static str, encoding_name: &'static str, clock_rate_hz: u32) -> Self {
+        Self {
+            name,
+            encoding_name,
+            clock_rate_hz,
+            channels: 1,
+            decode_only: false,
+        }
+    }
+
+    /// Whether this build serves the codec: the factory builds a decoder for it, and an encoder
+    /// unless the codec has none by design. A codec behind a build feature that is off is not
+    /// available, because the factory refuses it.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        let spec = CodecSpec::new(
+            96,
+            self.encoding_name,
+            self.clock_rate_hz,
+            self.channels,
+            20,
+        );
+        decoder_for(&spec).is_ok() && (self.decode_only || encoder_for(&spec).is_ok())
+    }
+}
+
+/// Every codec [`decoder_for`] and [`encoder_for`] have an arm for. This is the one list of them:
+/// a capability advertisement is [`available_codecs`], which asks the factory about each entry, so
+/// a codec the factory serves cannot be missing from it and one it refuses cannot be in it. A test
+/// holds this list to the arms of the two functions, so a codec added to them is added here.
+pub const KNOWN_CODECS: [KnownCodec; 11] = [
+    KnownCodec::new("PCMU", "PCMU", 8000),
+    KnownCodec::new("PCMA", "PCMA", 8000),
+    KnownCodec::new("G722", "G722", 8000),
+    // One name for the four rates (`G726-16` .. `G726-40`), probed at the common one.
+    KnownCodec::new("G726", "G726-32", 8000),
+    KnownCodec::new("GSM", "GSM", 8000),
+    KnownCodec::new("G729", "G729", 8000),
+    KnownCodec {
+        decode_only: true,
+        ..KnownCodec::new("CN", "CN", 8000)
+    },
+    KnownCodec::new("L16", "L16", 16000),
+    KnownCodec::new("AMR-WB", "AMR-WB", 16000),
+    KnownCodec::new("AMR", "AMR", 8000),
+    KnownCodec {
+        channels: OPUS_RTPMAP_CHANNELS,
+        ..KnownCodec::new("opus", OPUS_ENCODING_NAME, OPUS_CLOCK_RATE_HZ)
+    },
+];
+
+/// The names of the codecs this build serves, in [`KNOWN_CODECS`] order.
+#[must_use]
+pub fn available_codecs() -> Vec<&'static str> {
+    KNOWN_CODECS
+        .iter()
+        .filter(|codec| codec.is_available())
+        .map(|codec| codec.name)
+        .collect()
+}
+
 /// Fold the G.729 annex spellings onto the one registered encoding name.
 ///
 /// `G729` is the only name IANA registers (RFC 3551 §6): Annex A, Annex B and their combination are
@@ -1559,6 +1636,68 @@ mod tests {
         let other = CodecSpec::new(0, "PCMU", 8000, 1, 20).with_amr_params(Some(refused[0]));
         assert_eq!(other.amr, None);
         assert_eq!(other.amr_unsupported(), None);
+    }
+
+    /// The string literals `function` matches an encoding name against, read from this file.
+    fn match_arm_names(function: &str) -> Vec<String> {
+        let source = include_str!("factory.rs");
+        let start = source
+            .find(&format!("pub fn {function}("))
+            .expect("function");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("end of function");
+        body[..end]
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("=>") && !line.starts_with("//"))
+            .filter_map(|line| line.split("=>").next())
+            .flat_map(|pattern| pattern.split('|'))
+            .map(str::trim)
+            .filter_map(|name| name.strip_prefix('"')?.strip_suffix('"'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn every_codec_the_factory_has_an_arm_for_is_a_known_codec() {
+        // The capability list is derived from `KNOWN_CODECS`, so an arm with no entry there would
+        // be a codec the engine serves and never advertises.
+        for function in ["decoder_for", "encoder_for"] {
+            let names = match_arm_names(function);
+            assert!(names.len() >= 6, "{function}: read {names:?}");
+            for name in names {
+                assert!(
+                    KNOWN_CODECS.iter().any(|codec| codec.encoding_name == name),
+                    "{function} has an arm for {name} and KNOWN_CODECS has no entry for it"
+                );
+            }
+        }
+        // The two arms that are not string literals.
+        for name in [OPUS_ENCODING_NAME, "G726-32"] {
+            assert!(KNOWN_CODECS.iter().any(|codec| codec.encoding_name == name));
+        }
+        // And the other way: an entry names something the factory at least recognises, which a
+        // feature being off does not change (the refusal then names the feature).
+        for codec in KNOWN_CODECS {
+            let spec = CodecSpec::new(96, codec.encoding_name, codec.clock_rate_hz, 1, 20);
+            if let Err(CodecError::Unsupported(reason)) = decoder_for(&spec) {
+                assert!(reason.contains("build feature"), "{}: {reason}", codec.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_available_codecs_are_the_ones_the_factory_builds() {
+        let available = available_codecs();
+        for name in ["PCMU", "PCMA", "G722", "G726", "GSM", "CN", "L16", "opus"] {
+            assert!(available.contains(&name), "{name}: {available:?}");
+        }
+        assert_eq!(available.contains(&"G729"), cfg!(feature = "g729"));
+        assert_eq!(available.contains(&"AMR"), cfg!(feature = "amr"));
+        assert_eq!(available.contains(&"AMR-WB"), cfg!(feature = "amr"));
+        // Comfort noise has a decoder and, by design, no encoder; it is available all the same.
+        let noise = CodecSpec::new(13, "CN", 8000, 1, 20);
+        assert!(decoder_for(&noise).is_ok() && encoder_for(&noise).is_err());
     }
 
     #[test]
