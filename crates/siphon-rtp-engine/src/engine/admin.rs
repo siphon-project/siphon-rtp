@@ -12,7 +12,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return unknown_call(call_id);
         };
         // A call is invisible to clients that do not own it (A3 — docs §5).
-        if call.owner != client {
+        if !call.admits(client, call_id) {
             return unknown_call(call_id);
         }
         let mut stats = SessionStats::default();
@@ -39,12 +39,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// clients that do not own it (A3 — docs §5), so the listing never leaks another client's
     /// call-ids. Order is unspecified (the `DashMap` is unordered). Cheap and lock-light: a sharded
     /// scan that clones only the matching keys.
-    pub(super) fn list(&self, client: ClientId) -> CmdResult {
+    ///
+    /// One scope at a time: the `call_id`s of the calls `client` created in exactly `scope`, `None`
+    /// being the unscoped calls.
+    ///
+    /// Still the creating client's calls only, although any client naming a scope may act on a
+    /// call in it. A controller reconciles this listing against its own sessions and deletes what
+    /// it does not recognise, so listing a peer instance's calls would have each instance tear
+    /// down the other's.
+    pub(super) fn list(&self, client: ClientId, scope: Option<&str>) -> CmdResult {
         let call_ids = self
             .calls
             .iter()
-            .filter(|entry| entry.value().owner == client)
-            .map(|entry| entry.key().clone())
+            .filter(|entry| {
+                entry.value().owner == client && super::scope::is_in(entry.key(), scope)
+            })
+            .map(|entry| super::scope::call_id(entry.key()).to_string())
             .collect();
         CmdResult::List { call_ids }
     }
@@ -134,5 +144,8 @@ fn supported_features() -> Vec<String> {
         // before we answer.
         "trickle".to_string(),
         "turn".to_string(),
+        // A controller can tell, before it relies on it, whether this node keys a call by
+        // `(scope, call_id)`. A node without the feature reads a scoped frame as an unscoped one.
+        "scope".to_string(),
     ]
 }

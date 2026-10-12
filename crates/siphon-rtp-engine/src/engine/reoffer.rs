@@ -245,7 +245,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Snapshot what we need under the guard: ownership first, then which party is re-offering.
         let Some(state) = self.calls.get(call_id).and_then(|call| {
-            if call.owner != client {
+            if !call.admits(client, call_id) {
                 return None;
             }
             let party = if call.from_tag == from_tag {

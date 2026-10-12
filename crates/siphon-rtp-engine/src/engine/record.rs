@@ -152,7 +152,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         };
         // Open the pcap up front so a bad path fails cleanly before we promote or spawn anything.
-        let path = format!("{directory}/{call_id}.pcap");
+        let path = format!("{directory}/{}.pcap", super::scope::external(call_id));
         let file = match tokio::fs::File::create(&path).await {
             Ok(file) => file,
             Err(error) => return error_result("start_recording: open pcap", &error),
@@ -869,7 +869,8 @@ async fn open_recording_output(
         None => {
             let directory = recording_dir
                 .ok_or_else(|| "no output location (set `path`, or `recording_dir`)".to_string())?;
-            std::path::PathBuf::from(directory).join(format!("{call_id}-{recording_id}.wav"))
+            let stem = super::scope::external(call_id);
+            std::path::PathBuf::from(directory).join(format!("{stem}-{recording_id}.wav"))
         }
     };
     let file = tokio::fs::File::create(&path)

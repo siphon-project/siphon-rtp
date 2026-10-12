@@ -1404,6 +1404,16 @@ Distinct from the media latch but part of the same security surface.
   created it via `offer`; `answer` / `query` / `delete` from any other client see the call as
   unknown (so a client cannot tear down, inspect, or even probe for a call it does not own), and
   `list` returns only the caller's own calls.
+- **Call scope relaxes ownership, on purpose.** **Landed:** a control frame may name a `scope`,
+  and the engine keys the call by `(scope, call_id)` so that several functions on one call path
+  can share an engine. An unscoped call is owned exactly as above. A scoped call is reachable by
+  **every** client that names its scope, because two instances of one function have to be able
+  to answer and release each other's offers. `list` stays the creating client's own calls, in one
+  scope per request, so a controller's orphan reap still cannot delete a peer's calls. A scope is
+  a name, not a credential: it is bounded (64 bytes of ASCII letters, digits, `-`, `_`) and
+  validated on every verb, but any authenticated client may name any scope. **Remaining:**
+  restricting scopes per connection, which needs a credential per controller before it means
+  anything (one shared secret cannot tell controllers apart).
 - **Control-client identity survives a reconnect.** **Landed:** `Authenticate` carries an optional
   `controller_id`, the stable identity of the controller *process*. The server resolves it to a
   `ClientId` — minted from the connection's own ordinal on first sight, returned unchanged on every

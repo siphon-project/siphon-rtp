@@ -319,8 +319,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .to_string(),
             };
         };
-        // The registry key is the authoritative call-id (the snapshot builder left it blank).
-        snapshot.call_id = call_id.to_string();
+        // The registry key is the authoritative identity (the snapshot builder left it blank): the
+        // controller's call-id, and the scope beside it when the call has one.
+        let (plain_call_id, call_scope) = super::scope::split(call_id);
+        snapshot.call_id = plain_call_id.to_string();
+        snapshot.scope = call_scope.map(str::to_owned);
+        snapshot.version = crate::ha::CallSnapshot::version_for(call_scope);
         // For a secure call, fold in the live SRTP rollover (+ bridge flow plans, for `Srtp`). Sourced
         // from the SRTP bridge for `Srtp`, from the media actor's shared `SecureLeg` for `SrtpMedia`.
         snapshot.secure = match secure_ctx {
@@ -411,9 +415,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// front. Any endpoint bind or flow install that fails rolls back the endpoints already bound.
     pub(super) async fn restore(&self, client: ClientId, blob: &str) -> CmdResult {
         use crate::ha::{self, PipelineSnapshot};
-        let snapshot = match ha::CallSnapshot::from_json(blob) {
+        let mut snapshot = match ha::CallSnapshot::from_json(blob) {
             Ok(snapshot) => snapshot,
             Err(error) => return error_result("restore: parse snapshot", &error),
+        };
+        // The call comes back under the scope it was checkpointed in, whatever the restoring frame
+        // named: from here on `snapshot.call_id` is the registry key.
+        let key = siphon_rtp_proto::normalize_scope(snapshot.scope.as_deref())
+            .map_err(|error| error.to_string())
+            .and_then(|scope| super::scope::compose(scope, &snapshot.call_id));
+        snapshot.call_id = match key {
+            Ok(key) => key,
+            Err(reason) => return error_result("restore", &reason),
         };
         // Supported: a plain relay, a secure SDES-SRTP bridge (`Srtp`), a plaintext transcode (`Media`),
         // and a secure transcode (`SrtpMedia`). `Ws` (external WS-bridge session, unrecoverable from a
@@ -435,7 +448,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         if self.calls.contains_key(&snapshot.call_id) {
             return CmdResult::Error {
-                reason: format!("cannot restore: call {} already exists", snapshot.call_id),
+                reason: format!(
+                    "cannot restore: call {} already exists",
+                    super::scope::Key(&snapshot.call_id)
+                ),
             };
         }
 

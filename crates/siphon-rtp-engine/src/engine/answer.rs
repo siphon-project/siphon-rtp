@@ -95,7 +95,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // the owning client may answer (A3 — docs/security-and-nat.md §5); to anyone else the call is
         // unknown.
         let far_reoffer_sdp = match self.calls.get(call_id) {
-            Some(call) if call.owner == client => {
+            Some(call) if call.admits(client, call_id) => {
                 if call.from_tag == from_tag {
                     None
                 } else if call.to_tag.as_deref() == Some(from_tag) && call.from_tag == to_tag {
@@ -743,7 +743,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// the engine answered itself.
     fn answer_state(&self, client: ClientId, call_id: &str) -> Result<AnswerState, Box<CmdResult>> {
         match self.calls.get(call_id) {
-            Some(call) if call.owner == client => {
+            Some(call) if call.admits(client, call_id) => {
                 // A call the engine answered itself (`answer_local`) has no B-facing leg and no second
                 // party to answer *with* — the caller is already talking to the single-leg pipeline on
                 // the engine's only socket. Refuse plainly: relaying B's media onto that socket would
@@ -1014,7 +1014,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let far = self.settle_far_rtcp_fallback(call_id, far, &info).await;
         // The owner's async event sink (DTMF events flow here from the media actor), if registered.
-        let owner_events = self.event_sink(client);
+        // In a shared scope the answering client need not be the one that created the call.
+        let owner = self.owned_call_internal(call_id, |call| call.owner);
+        let owner_events = self.event_sink(owner.unwrap_or(client));
         // Cloned up front for the secure text actor: `owner_events` is moved into the audio pipeline's
         // actor registration below, so the secure-text branch (which registers its own text actor after
         // that) takes its event sink here. `Event::Text` flows only when the controller asked for it.

@@ -223,7 +223,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
 
         let plan = plan_ws_tee(format, stereo_source, !tap_caller);
-        let stream_id = format!("tee-{call_id}");
+        let stream_id = format!("tee-{}", super::scope::external(call_id));
         let tap_tag = format!(
             "{stream_id}#{}",
             self.next_tee_attach
@@ -384,7 +384,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         );
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let start = tee_start_message(&stream_id, call_id, plan.format, plan.tracks.clone());
+        // The server is told the SIP call id; the stream id is what differs between two scopes.
+        let start = tee_start_message(
+            &stream_id,
+            super::scope::call_id(call_id),
+            plan.format,
+            plan.tracks.clone(),
+        );
         let transport = {
             let events = self.event_sink(owner);
             let frames = plan.frames;

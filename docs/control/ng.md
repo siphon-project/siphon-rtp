@@ -137,6 +137,13 @@ Honest differences from stock rtpengine, and from siphon-rtp's own native protoc
   answers with an error.
 - **Extensions are extensions.** `load`, `node info`, `drain`, `undrain`, `checkpoint`,
   `restore` are siphon-rtp additions; do not send them to a real rtpengine.
+- **No call scope.** The NG protocol has no field for one, so every NG command addresses the
+  unscoped call of its `call-id`, and all NG clients are one control client to the engine: a
+  second proxy that offers a `call-id` another already anchored replaces that call. Functions
+  that share a call path and an engine need the [JSON front-end](json.md#call-scope). Deriving a
+  scope from `via-branch` was considered and left out: the front end does not read that key
+  today, a `delete` without it means every branch of the call, and a proxy that re-offers under
+  a new branch would land in a second call.
 - **Unknown verbs return an error**, never a crash and never silence:
   `{"result": "error", "error-reason": "unsupported command: ..."}`.
 - The bencode parser and NG mapper are fuzzed; malformed datagrams from the network

@@ -47,7 +47,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         end_of_candidates: bool,
     ) -> CmdResult {
         let Some(endpoints) = self.calls.get(call_id).and_then(|call| {
-            (call.owner == client && call.from_tag == from_tag)
+            (call.admits(client, call_id) && call.from_tag == from_tag)
                 .then(|| {
                     // A `to_tag` selects the answerer's leg — which a locally-answered call does not
                     // have, and neither does it run ICE, so there is nothing to trickle into.

@@ -65,7 +65,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // missing call) gets `unknown_call`, so it cannot even probe for a call's existence.
         match self
             .calls
-            .remove_if(call_id, |_, call| call.owner == client)
+            .remove_if(call_id, |_, call| call.admits(client, call_id))
         {
             Some((_, call)) => {
                 // Emit the CDR and free everything the call held (shared with the media-timeout reaper).

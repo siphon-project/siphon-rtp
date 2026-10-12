@@ -29,6 +29,15 @@ use serde::{Deserialize, Serialize};
 /// a blob whose version it does not understand.
 pub const SNAPSHOT_VERSION: u16 = 2;
 
+/// The version a snapshot of a **scoped** call carries ([`CallSnapshot::scope`]).
+///
+/// A build from before scopes reads version [`SNAPSHOT_VERSION`] only and ignores a key it does not
+/// know, so a scoped call written at that version would restore there as the *unscoped* call of the
+/// same `call_id`, beside or in place of a different call. Under its own version such a standby
+/// refuses the blob instead. An unscoped call keeps [`SNAPSHOT_VERSION`] and the bytes it always
+/// had, so a mixed-version pair still fails over every call that names no scope.
+pub const SNAPSHOT_VERSION_SCOPED: u16 = 3;
+
 /// A portable snapshot of one live call's negotiated state (see the module docs). All fields are
 /// plain data (strings / integers / enums / `std::net` addresses), so the whole thing round-trips
 /// through JSON and compares exactly.
@@ -36,8 +45,12 @@ pub const SNAPSHOT_VERSION: u16 = 2;
 pub struct CallSnapshot {
     /// Format version — must equal [`SNAPSHOT_VERSION`] for a standby to accept the blob.
     pub version: u16,
-    /// The call identity (the node-independent primary key).
+    /// The call identity (the node-independent primary key, together with [`Self::scope`]).
     pub call_id: String,
+    /// The scope the call was anchored under, when it has one. Omitted for an unscoped call, whose
+    /// snapshot is then byte for byte what it was before scopes existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     /// The offerer's SIP From-tag.
     pub from_tag: String,
     /// The answerer's SIP To-tag, once answered.
@@ -426,15 +439,28 @@ impl CallSnapshot {
     }
 
     /// Parse a blob produced by [`Self::to_json`], rejecting an unknown [`version`](Self::version).
+    ///
+    /// The version has to be the one its scope calls for: [`SNAPSHOT_VERSION_SCOPED`] with a scope,
+    /// [`SNAPSHOT_VERSION`] without.
     pub fn from_json(blob: &str) -> Result<Self, SnapshotError> {
         let snapshot: Self = serde_json::from_str(blob)?;
-        if snapshot.version != SNAPSHOT_VERSION {
+        let expected = Self::version_for(snapshot.scope.as_deref());
+        if snapshot.version != expected {
             return Err(SnapshotError::Version {
                 found: snapshot.version,
-                expected: SNAPSHOT_VERSION,
+                expected,
             });
         }
         Ok(snapshot)
+    }
+
+    /// The format version a snapshot of a call in `scope` carries.
+    #[must_use]
+    pub fn version_for(scope: Option<&str>) -> u16 {
+        match scope {
+            Some(_) => SNAPSHOT_VERSION_SCOPED,
+            None => SNAPSHOT_VERSION,
+        }
     }
 }
 
@@ -486,6 +512,7 @@ mod tests {
         CallSnapshot {
             version: SNAPSHOT_VERSION,
             call_id: "call-abc@host".into(),
+            scope: None,
             from_tag: "alice-tag".into(),
             to_tag: Some("bob-tag".into()),
             pipeline: PipelineSnapshot::Passthrough,
@@ -624,9 +651,52 @@ mod tests {
     }
 
     #[test]
+    fn an_unscoped_snapshot_has_no_scope_key_and_keeps_its_version() {
+        let blob = sample().to_json().expect("serialize");
+        assert!(
+            blob.starts_with(r#"{"version":2,"call_id":"call-abc@host","from_tag":"alice-tag","#),
+            "{blob}"
+        );
+        assert!(!blob.contains("scope"));
+    }
+
+    #[test]
+    fn a_scoped_snapshot_carries_its_scope_under_its_own_version() {
+        let mut snapshot = sample();
+        snapshot.scope = Some("bgcf".into());
+        snapshot.version = CallSnapshot::version_for(snapshot.scope.as_deref());
+        let blob = snapshot.to_json().expect("serialize");
+        assert!(
+            blob.starts_with(r#"{"version":3,"call_id":"call-abc@host","scope":"bgcf","#),
+            "{blob}"
+        );
+        assert_eq!(CallSnapshot::from_json(&blob).expect("parse"), snapshot);
+    }
+
+    /// What a standby from before scopes does with a scoped blob: its only accepted version is
+    /// [`SNAPSHOT_VERSION`], so it refuses rather than restoring the call unscoped.
+    #[test]
+    fn a_scoped_snapshot_is_not_readable_at_the_unscoped_version() {
+        let mut snapshot = sample();
+        snapshot.scope = Some("bgcf".into());
+        let blob = snapshot.to_json().expect("serialize");
+        assert!(matches!(
+            CallSnapshot::from_json(&blob).expect_err("a scope needs its version"),
+            SnapshotError::Version {
+                found: SNAPSHOT_VERSION,
+                expected: SNAPSHOT_VERSION_SCOPED
+            }
+        ));
+        let mut unscoped = sample();
+        unscoped.version = SNAPSHOT_VERSION_SCOPED;
+        let blob = unscoped.to_json().expect("serialize");
+        assert!(CallSnapshot::from_json(&blob).is_err());
+    }
+
+    #[test]
     fn from_json_rejects_an_unknown_version() {
         let mut snapshot = sample();
-        snapshot.version = SNAPSHOT_VERSION + 1;
+        snapshot.version = SNAPSHOT_VERSION_SCOPED + 1;
         let blob = snapshot.to_json().expect("serialize");
         let error = CallSnapshot::from_json(&blob).expect_err("version mismatch must error");
         assert!(matches!(error, SnapshotError::Version { .. }));

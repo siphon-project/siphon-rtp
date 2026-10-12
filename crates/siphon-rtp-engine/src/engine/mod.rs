@@ -37,6 +37,7 @@ mod promote;
 mod record;
 mod reoffer;
 mod room;
+pub mod scope;
 mod snapshot;
 mod sweep;
 mod takeover;
@@ -737,6 +738,16 @@ enum PromoteMode {
 }
 
 impl Call {
+    /// Whether `client` may act on this call, registered under `key`.
+    ///
+    /// An unscoped call is private to the client that created it (A3, docs/security-and-nat.md
+    /// section 5). A scoped call is reachable by every client that names its scope: two instances
+    /// of one function share a scope precisely so that the offer one of them sent can be answered,
+    /// re-offered or deleted by the other. The creating client still owns it for quota, for
+    /// `list` and for its lifecycle events.
+    fn admits(&self, client: ClientId, key: &str) -> bool {
+        self.owner == client || scope::is_scoped(key)
+    }
     /// Whether this call has **one** RTP party rather than two: no `answer` ever arrived, so there is
     /// no far peer and no `to_tag` (RFC 3264 — a dialog's answerer tag is what makes the second party
     /// real). True for `answer_local` (IVR / announcement / echo / voice-AI: the engine *is* the far
@@ -872,6 +883,7 @@ impl Call {
         Some(ha::CallSnapshot {
             version: ha::SNAPSHOT_VERSION,
             call_id: String::new(), // filled by the caller, which holds the registry key
+            scope: None,            // likewise
             from_tag: self.from_tag.clone(),
             to_tag: self.to_tag.clone(),
             pipeline: pipeline_snapshot(self.pipeline),
@@ -1344,7 +1356,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         f: impl FnOnce(&Call) -> T,
     ) -> Option<T> {
         let call = self.calls.get(call_id)?;
-        (call.owner == client).then(|| f(&call))
+        call.admits(client, call_id).then(|| f(&call))
     }
 
     /// Run `f` against a call by id without an ownership check (an internal helper for promotion /
@@ -1379,7 +1391,7 @@ fn ok_empty() -> CmdResult {
 
 fn unknown_call(call_id: &str) -> CmdResult {
     CmdResult::Error {
-        reason: format!("unknown call: {call_id}"),
+        reason: format!("unknown call: {}", scope::Key(call_id)),
     }
 }
 
