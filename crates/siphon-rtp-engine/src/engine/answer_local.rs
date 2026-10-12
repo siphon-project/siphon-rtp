@@ -206,7 +206,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // never contributes — `legs_expected_to_send` only walks a far leg that exists.
                 near_direction: info.direction,
                 far_direction: sdp::MediaDirection::default(),
-                near_telephone_event: info.telephone_event_payload_type(),
+                // Settled with the codec below, like `near_codec`.
+                near_telephone_event: None,
+                near_offered_telephone_events: info.telephone_events(),
                 far_telephone_event: None,
                 pipeline: PipelineKind::Passthrough,
                 // Refused above: a locally answered call synthesizes its own audio, so it can never
@@ -930,10 +932,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             "call created"
         );
 
-        // Narrow the answer's `m=audio` to the single chosen codec (+ telephone-event) on the already
-        // rewritten address (RFC 3264 §6.1 — the answer offers exactly one format back).
-        let mut answer_sdp =
-            sdp::force_answer_codec(&rewritten.sdp, &chosen, info.telephone_event_payload_type());
+        // Narrow the answer's `m=audio` to the single chosen codec (+ the telephone-event payload
+        // type that goes with it) on the already rewritten address (RFC 3264 §6.1 — the answer offers
+        // exactly one format back).
+        let telephone_event =
+            sdp::TelephoneEvent::accompanying(&info.telephone_events(), Some(&chosen));
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.near_telephone_event = telephone_event;
+        }
+        let mut answer_sdp = sdp::force_answer_codec(&rewritten.sdp, &chosen, telephone_event);
 
         if let Some(ws_uri) = profile.ws_uri.clone() {
             return self

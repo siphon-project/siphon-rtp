@@ -73,6 +73,11 @@ pub struct CallSnapshot {
     /// The near leg's RFC 4733 telephone-event payload type, if negotiated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub near_telephone_event: Option<u8>,
+    /// The clock rate the near party mapped that payload type at, so a re-offer after a restore
+    /// presents it unchanged (RFC 3264 §8.3.2). Defaulted: an older snapshot restores it at 8 kHz,
+    /// the rate it was presented at when that snapshot was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_telephone_event_clock_rate_hz: Option<u32>,
     /// The near (offerer) leg: local media ports + the peer's remote addresses.
     pub near: LegSnapshot,
     /// The far (answerer) leg.
@@ -511,6 +516,7 @@ mod tests {
             }),
             far_codec: None,
             near_telephone_event: Some(101),
+            near_telephone_event_clock_rate_hz: Some(8000),
             near: LegSnapshot {
                 rtp_local: "203.0.113.10:30000".parse().unwrap(),
                 rtcp_local: Some("203.0.113.10:30001".parse().unwrap()),
@@ -577,6 +583,20 @@ mod tests {
         let blob = snapshot.to_json().expect("serialize");
         let back = CallSnapshot::from_json(&blob).expect("deserialize");
         assert_eq!(snapshot, back);
+    }
+
+    #[test]
+    fn a_snapshot_without_a_telephone_event_clock_rate_still_restores() {
+        // Written by a node that predates the field: absent, and the restore reads it as 8 kHz.
+        let mut value = serde_json::to_value(sample()).expect("serialize");
+        let fields = value.as_object_mut().expect("an object");
+        assert_eq!(
+            fields.remove("near_telephone_event_clock_rate_hz"),
+            Some(serde_json::json!(8000))
+        );
+        let older: CallSnapshot = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(older.near_telephone_event, Some(101));
+        assert_eq!(older.near_telephone_event_clock_rate_hz, None);
     }
 
     #[test]

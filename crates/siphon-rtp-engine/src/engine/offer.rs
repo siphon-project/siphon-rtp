@@ -10,9 +10,9 @@ use crate::sdp::{self, ImageRewrite, SecurityAdvertisement, TextRewrite};
 use std::net::IpAddr;
 
 use super::negotiate::{
-    bridge_source_filter, dtls_directive, far_security, ice_directive, offer_ice_rewrite,
-    offered_dtls_setup, parse_codec_flags, peer_ice_credentials, present_leg, resolve_rtcp_mux,
-    same_codec, CodecPresentation, DtlsDirective, IceDirective, LegPresentation,
+    bridge_source_filter, dtls_directive, far_security, held_on_withheld_codec, ice_directive,
+    offer_ice_rewrite, offered_dtls_setup, parse_codec_flags, peer_ice_credentials, present_leg,
+    resolve_rtcp_mux, same_codec, CodecPresentation, DtlsDirective, IceDirective, LegPresentation,
 };
 use super::takeover::{ws_takeover_media_address, WsBridgeProcessing, WsBridgeSetup};
 use super::{
@@ -827,15 +827,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // needs the transcoder — see `negotiated_near_codec`.
         let near_offered_codecs = info.audio_codecs();
         let near_codec = near_offered_codecs.first().cloned();
+        // Likewise every telephone-event payload type A declared: which one A uses follows the
+        // codec it ends up on, so the one recorded here is re-selected at answer.
+        let near_offered_telephone_events = info.telephone_events();
         // Did the codec policy take A's own codec out of the offer B sees? Read off the far offer the
-        // policy actually produced rather than re-deriving it from the flags, so `mask`, `consume`, an
-        // `offer` whitelist and `strip-all` are all judged by their outcome. B cannot then select that
-        // codec, so its answer says nothing about whether A moved — `negotiated_near_codec` leaves A on
-        // its own codec and the transcoder engages, which is what those flags ask for. A far offer that
+        // policy actually produced rather than re-deriving it from the flags, so `mask`, `consume` and
+        // an `offer` whitelist are all judged by their outcome. B cannot then select that codec, so its
+        // answer says nothing about whether A moved — `negotiated_near_codec` leaves A on its own codec
+        // and the transcoder engages, which is what those flags ask for. `strip` asks for the removal
+        // alone, so a leg whose codec it took follows B's answer like any other. A far offer that
         // will not re-parse (our own rewrite, so a bug rather than input) counts as *not* withheld: the
         // relay that keeps the call up is the better failure mode.
         let near_codec_withheld = match near_codec.as_ref() {
-            Some(primary) if !codec_policy.is_noop() => {
+            Some(primary)
+                if !codec_policy.is_noop() && held_on_withheld_codec(&codec_policy, primary) =>
+            {
                 sdp::parse(&rewritten).is_ok_and(|far_offer| {
                     !far_offer
                         .audio_codecs()
@@ -943,7 +949,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // far party is not a party yet, so it defaults to sendrecv and contributes nothing.
                 near_direction: info.direction,
                 far_direction: sdp::MediaDirection::default(),
-                near_telephone_event: info.telephone_event_payload_type(),
+                near_telephone_event: sdp::TelephoneEvent::accompanying(
+                    &near_offered_telephone_events,
+                    near_codec.as_ref(),
+                ),
+                near_offered_telephone_events,
                 far_telephone_event: None,
                 pipeline,
                 fax_passthrough: profile.fax_passthrough,

@@ -129,15 +129,24 @@ All of them edit the SDP offered to the far side; names are matched case-insensi
 
 | Directive | Effect |
 |---|---|
-| `codec-strip-X` | remove X from the far offer |
-| `codec-mask-X` / `codec-consume-X` | remove X from the far offer, keeping it usable on the near leg (same far-offer edit as strip here; the near leg's codec always comes from its own unmodified offer) |
-| `codec-transcode-X` | append X to the far offer; the transcoder engages if the far side selects it |
+| `codec-strip-X` | remove X from the far offer; the near leg follows the far side's answer |
+| `codec-mask-X` / `codec-consume-X` | remove X from the far offer (the same edit as strip) and, when X is the near leg's first codec, hold the near leg on it and transcode |
+| `codec-transcode-X` | append X to the far offer, in flag order; the transcoder engages if the far side selects it |
 | `codec-except-X` / `codec-accept-X` | keep-list: X survives any strip/mask sweep |
 | `codec-offer-X` (repeatable) | whitelist and ordering: only the listed codecs survive, in flag order |
 | `codec-strip-all` / `codec-mask-all` (also `full`) | sweep every codec except the keep-list |
 
-Guard rails, deliberately conservative: the engine never empties the audio codec list (masking
-the only offered codec leaves it in place, RFC 4566 requires a non-empty format list), never
+A removal applies to every codec of the offer, the first one included: masking all of them and
+naming `codec-transcode` targets offers the far side those targets and nothing else, with the
+targets ahead of telephone-event. The near leg then stays on a codec of its own offer, the first
+one the engine can transcode, in the offerer's order: an offer of `EVS AMR-WB AMR` bridged to
+G.711 leaves the offerer on AMR-WB, because EVS is relayed and never decoded. The `answer` is
+refused only when nothing in the offer can be transcoded to the answered codec, and the error
+names both.
+
+Guard rails, deliberately conservative: the engine never empties the audio codec list (removing
+every offered codec with no `codec-transcode` target to take its place leaves the first one in,
+RFC 4566 requires a non-empty format list), never
 fails a call over an unknown or not-yet-encodable `transcode` target (the directive is skipped),
 and telephone-event (RFC 4733) survives every sweep unless named outright.
 
@@ -160,6 +169,14 @@ frame for every 20 ms of the ptime, up to four in a packet.
 **DTMF.** RFC 4733 telephone-events are not decoded as audio: they are detected, surfaced as
 `dtmf` events on the control channel, and repacketized onto the egress stream using the far
 leg's negotiated telephone-event payload type.
+
+An offer may declare telephone-event at more than one clock rate. A leg uses the payload type
+whose rate is that of the codec selected for it (RFC 4733 §2.1), and the answer maps it at the
+rate the offer gave it (RFC 3264 §6.1); a leg that declared none at that rate keeps the one it
+has. Events are forwarded with the timestamp and duration they arrived with. When the two legs'
+event clocks differ (a 16 kHz leg bridged to an 8 kHz one) neither is rescaled, so the duration
+the far side reads is off by the ratio of the clocks, and the `duration_ms` of the `dtmf` control
+event is computed at 8 kHz.
 
 ## How to verify
 

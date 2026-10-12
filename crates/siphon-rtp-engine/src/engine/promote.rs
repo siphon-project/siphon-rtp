@@ -28,7 +28,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.from_tag.clone(),
                     call.to_tag.clone(),
                     call.relay_flows.clone(),
-                    call.near_telephone_event,
+                    call.near_telephone_event.map(|event| event.payload_type),
                     call.far_telephone_event,
                 )
             })
@@ -131,7 +131,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 call.relay_flows.clone(),
                 call.near_codec.clone(),
                 call.far_codec.clone(),
-                call.near_telephone_event,
+                call.near_telephone_event.map(|event| event.payload_type),
                 call.far_telephone_event,
                 // The engine socket the caller reaches for a single-leg (offer-only) echo — recorded on
                 // the call when its legs were allocated, because only the verb that wrote the SDP knows

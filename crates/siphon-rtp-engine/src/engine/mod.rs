@@ -466,7 +466,8 @@ struct Call {
     /// The near (offerer) leg's primary audio codec, captured at offer — paired with the answer's
     /// codec to decide whether the call transcodes (the media slow path). Replaced at answer by the
     /// codec B actually selected whenever that codec is one A offered (RFC 3264 §6.1 — see
-    /// [`negotiated_near_codec`]), so it always names the codec A is really sending.
+    /// [`negotiated_near_codec`]), and on a transcoded call by the first codec A offered that the
+    /// engine can transcode, so it always names the codec A is really sending.
     near_codec: Option<CodecSpec>,
     /// Every audio codec A offered, in offer order, captured at offer and refreshed on a re-offer.
     /// Read at answer to tell an answer A can simply be relayed (B picked one of these — a plain
@@ -493,8 +494,14 @@ struct Call {
     /// on its re-offers. `SendRecv` until the call is answered — an unanswered call has no far party
     /// whose silence could be expected.
     far_direction: sdp::MediaDirection,
-    /// The near leg's negotiated RFC 4733 telephone-event payload type, if any.
-    near_telephone_event: Option<u8>,
+    /// The near leg's negotiated RFC 4733 telephone-event payload type, if any: of the ones A
+    /// declared, the one at the clock rate of `near_codec` (RFC 4733 §2.1), with the rate A mapped it
+    /// at, so the answer presents it as offered (RFC 3264 §6.1).
+    near_telephone_event: Option<sdp::TelephoneEvent>,
+    /// Every telephone-event payload type A declared, captured with `near_offered_codecs` so the
+    /// answer can pick the one that goes with the codec A ends up on. Empty for a call restored
+    /// from an HA snapshot, which keeps the one it had selected.
+    near_offered_telephone_events: Vec<sdp::TelephoneEvent>,
     /// The far leg's negotiated RFC 4733 telephone-event payload type, captured at answer. Paired
     /// with `near_telephone_event` so `block DTMF` can gate the telephone-event PT of either leg even
     /// on a plain (untranscoded) relay. `None` until the call is answered / if the far leg has none.
@@ -875,7 +882,10 @@ impl Call {
             far_local_crypto: self.far_local_crypto.as_ref().map(crypto_snapshot),
             near_codec: self.near_codec.as_ref().map(codec_snapshot),
             far_codec: self.far_codec.as_ref().map(codec_snapshot),
-            near_telephone_event: self.near_telephone_event,
+            near_telephone_event: self.near_telephone_event.map(|event| event.payload_type),
+            near_telephone_event_clock_rate_hz: self
+                .near_telephone_event
+                .map(|event| event.clock_rate_hz),
             near: leg_snapshot(&self.near),
             far: leg_snapshot(far),
             flows,
