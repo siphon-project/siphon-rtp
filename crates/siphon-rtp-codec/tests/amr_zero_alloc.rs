@@ -107,3 +107,62 @@ fn amr_wb_encode_core_makes_no_heap_allocation() {
         "AMR-WB encode core allocated {allocations} times across 50k frames (must be zero)"
     );
 }
+
+/// The whole RTP path of a negotiated stream, in both payload formats and both directions: framing
+/// a payload and taking one apart happen once per packet, so they must not reach the allocator.
+#[test]
+fn the_rtp_packet_path_makes_no_heap_allocation_in_either_payload_format() {
+    use siphon_rtp_codec::amr::{PayloadFormat, RtpConfig};
+    use siphon_rtp_codec::{Decoder, Encoder};
+
+    for format in [
+        PayloadFormat::BandwidthEfficient,
+        PayloadFormat::OctetAligned,
+    ] {
+        let config = RtpConfig {
+            format,
+            mode_set: &[0, 1, 2],
+            frames_per_packet: 2,
+            ..RtpConfig::default()
+        };
+        type Pair = (Box<dyn Encoder>, Box<dyn Decoder>, usize);
+        let mut codecs: [Pair; 2] = [
+            (
+                Box::new(AmrNb::negotiated(&config).expect("codec")),
+                Box::new(AmrNb::negotiated(&config).expect("codec")),
+                160,
+            ),
+            (
+                Box::new(AmrWb::negotiated(&config).expect("codec")),
+                Box::new(AmrWb::negotiated(&config).expect("codec")),
+                320,
+            ),
+        ];
+        for (encoder, decoder, frame) in &mut codecs {
+            let pcm: Vec<i16> = (0..*frame as i32 * 2)
+                .map(|i| (((i * 137) % 8000) - 4000) as i16)
+                .collect();
+            let mut payload = [0u8; 256];
+            let mut decoded = [0i16; 640];
+            let mut length = 0;
+            for _ in 0..200 {
+                length = encoder.encode(&pcm, &mut payload).expect("encode");
+                decoder
+                    .decode(&payload[..length], &mut decoded)
+                    .expect("decode");
+            }
+            let allocations = count_allocations(2_000, || {
+                encoder.request_mode(1);
+                length = encoder.encode(&pcm, &mut payload).expect("encode");
+                decoder
+                    .decode(&payload[..length], &mut decoded)
+                    .expect("decode");
+                decoder.conceal(&mut decoded).expect("conceal");
+            });
+            assert_eq!(
+                allocations, 0,
+                "{format:?}, {frame}-sample frames: {allocations} allocations across 2k packets"
+            );
+        }
+    }
+}

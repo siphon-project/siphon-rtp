@@ -118,6 +118,11 @@ pub fn downmix_to_mono(frame: &mut [i16], channels: u8) -> usize {
     samples
 }
 
+/// The codec mode request value that asks for nothing: RFC 4867 §4.3.1, "CMR value 15 indicates
+/// that no mode request is present". Passed to [`Encoder::request_mode`] it withdraws an earlier
+/// request.
+pub const NO_MODE_REQUEST: u8 = 15;
+
 /// Decodes codec payloads into linear 16-bit PCM.
 pub trait Decoder: Send {
     /// The codec's native parameters.
@@ -192,10 +197,10 @@ pub trait Encoder: Send {
         false
     }
 
-    /// Request the egress speech mode for subsequent frames (RFC 4867 §4.3.1 Codec Mode Request).
-    /// A variable-rate codec (AMR / AMR-WB) switches to `mode`, clamped into the modes its SDP
-    /// `mode-set` permits so it never emits a disallowed mode; the request is sticky until the next
-    /// one. Default no-op — a fixed-rate codec has a single mode and ignores it.
+    /// Take the peer's Codec Mode Request for subsequent frames (RFC 4867 §4.3.1). A variable-rate
+    /// codec (AMR / AMR-WB) sends no mode above `mode` from then on, until the next request;
+    /// [`NO_MODE_REQUEST`] withdraws it, and a mode outside the SDP `mode-set` "MUST be ignored".
+    /// Default no-op: a fixed-rate codec has a single mode and ignores it.
     fn request_mode(&mut self, _mode: u8) {}
 }
 

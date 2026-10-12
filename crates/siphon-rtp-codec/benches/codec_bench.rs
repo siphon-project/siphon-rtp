@@ -630,6 +630,139 @@ fn bench_amrwb_encode_cmr(criterion: &mut Criterion) {
     });
 }
 
+/// The RFC 4867 framing step on its own, and the whole per-packet RTP path around it: what one
+/// packet costs beyond the speech codec. The framing runs once per packet in each direction.
+#[cfg(feature = "amr")]
+fn bench_amr_rtp_packet(criterion: &mut Criterion) {
+    use siphon_rtp_codec::amr::rtp::{
+        read_payload, write_payload, FrameSource, Variant, MAX_FRAME_OCTETS,
+    };
+    use siphon_rtp_codec::amr::wb::bitstream;
+    use siphon_rtp_codec::amr::{PayloadFormat, RtpConfig};
+
+    let wideband_pcm: Vec<i16> = (0..constants::L_FRAME16K)
+        .map(|i| (((i as i32 * 137) % 8000) - 4000) as i16)
+        .collect();
+    let narrowband_pcm: Vec<i16> = (0..FRAME)
+        .map(|i| (((i as i32 * 137) % 8000) - 4000) as i16)
+        .collect();
+
+    // One mode-2 frame's encoder-order bits, and the payloads that carry them in each format.
+    let mut bits = vec![0i16; AMRWB_SPEECH_BITS[2] as usize];
+    AmrWb::new()
+        .encode_mode_bits(2, &wideband_pcm, &mut bits)
+        .expect("encode");
+    let wideband = AmrWb::new();
+    let narrowband = AmrNb::new();
+    let efficient = RtpConfig {
+        preferred_mode: Some(2),
+        ..RtpConfig::default()
+    };
+    let payload_of = |codec: &mut dyn Encoder, pcm: &[i16]| {
+        let mut payload = vec![0u8; 64];
+        let len = codec.encode(pcm, &mut payload).expect("encode");
+        payload.truncate(len);
+        payload
+    };
+    let wideband_payload = payload_of(&mut wideband.clone(), &wideband_pcm);
+    let narrowband_payload = payload_of(&mut narrowband.clone(), &narrowband_pcm);
+    let wideband_efficient = AmrWb::negotiated(&efficient).expect("codec");
+    let efficient_payload = payload_of(&mut wideband_efficient.clone(), &wideband_pcm);
+
+    for (suffix, format, payload) in [
+        ("", PayloadFormat::OctetAligned, &wideband_payload),
+        (
+            "_bandwidth_efficient",
+            PayloadFormat::BandwidthEfficient,
+            &efficient_payload,
+        ),
+    ] {
+        criterion.bench_function(&format!("amrwb_rtp_frame_pack{suffix}"), |bencher| {
+            let mut out = [0u8; 64];
+            let mut frame = [0u8; MAX_FRAME_OCTETS];
+            bencher.iter(|| {
+                bitstream::pack_into(black_box(&bits), 2, &mut frame);
+                let source = FrameSource {
+                    frame_type: 2,
+                    quality_ok: true,
+                    data: &frame,
+                };
+                write_payload(format, Variant::Wideband, 15, &[source], &mut out).expect("write");
+                black_box(&out);
+            });
+        });
+        criterion.bench_function(&format!("amrwb_rtp_frame_unpack{suffix}"), |bencher| {
+            let mut frame = [0u8; MAX_FRAME_OCTETS];
+            let mut unsorted = [0i16; 477];
+            bencher.iter(|| {
+                let layout =
+                    read_payload(black_box(payload), format, Variant::Wideband).expect("read");
+                layout.frames()[0].copy_bits(payload, &mut frame);
+                bitstream::unsort_into(&frame, 2, &mut unsorted[..253]);
+                black_box(&unsorted);
+            });
+        });
+    }
+
+    for (name, codec, payload) in [
+        ("amrwb_rtp_decode_packet", &wideband, &wideband_payload),
+        (
+            "amrwb_rtp_decode_packet_bandwidth_efficient",
+            &wideband_efficient,
+            &efficient_payload,
+        ),
+    ] {
+        criterion.bench_function(name, |bencher| {
+            let mut pcm = [0i16; constants::L_FRAME16K];
+            bencher.iter_batched(
+                || codec.clone(),
+                |mut codec| {
+                    codec
+                        .decode(black_box(payload), black_box(&mut pcm))
+                        .expect("decode")
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    criterion.bench_function("amrwb_rtp_encode_packet_bandwidth_efficient", |bencher| {
+        let mut out = [0u8; 64];
+        bencher.iter_batched(
+            || wideband_efficient.clone(),
+            |mut codec| {
+                codec
+                    .encode(black_box(&wideband_pcm), black_box(&mut out))
+                    .expect("encode")
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    criterion.bench_function("amrnb_rtp_decode_packet", |bencher| {
+        let mut pcm = [0i16; FRAME];
+        bencher.iter_batched(
+            || narrowband.clone(),
+            |mut codec| {
+                codec
+                    .decode(black_box(&narrowband_payload), black_box(&mut pcm))
+                    .expect("decode")
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    criterion.bench_function("amrnb_rtp_encode_packet", |bencher| {
+        let mut out = [0u8; 64];
+        bencher.iter_batched(
+            || narrowband.clone(),
+            |mut codec| {
+                codec
+                    .encode(black_box(&narrowband_pcm), black_box(&mut out))
+                    .expect("encode")
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 /// A deterministic 48 kHz test signal in `[-1, 1)` — a few harmonics plus a little noise, so the
 /// encoder's analysis has real decisions to make (a pure tone would take unrealistically cheap paths).
 fn celt_signal(samples: usize) -> Vec<f32> {
@@ -2105,7 +2238,8 @@ criterion_group!(
     bench_amrnb_decode,
     bench_amrwb_encode,
     bench_amrnb_encode,
-    bench_amrwb_encode_cmr
+    bench_amrwb_encode_cmr,
+    bench_amr_rtp_packet
 );
 #[cfg(not(feature = "amr"))]
 criterion_group!(

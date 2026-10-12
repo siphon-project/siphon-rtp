@@ -27,7 +27,7 @@ use dashmap::DashMap;
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use siphon_rtp_codec::cn::{Cn, COMFORT_NOISE_LEVEL_DBOV};
-use siphon_rtp_codec::{Decoder, Encoder};
+use siphon_rtp_codec::{Decoder, Encoder, NO_MODE_REQUEST};
 use siphon_rtp_datapath::{
     rtp_media_ssrc, Datapath, EndpointId, ObservedRtcp, RxPacket, SourceFilter,
 };
@@ -1436,7 +1436,7 @@ impl Direction {
         // `frame_samples` — sizing it here from the encoder guarantees the repacketizer always feeds
         // the encoder exactly one frame's worth. A ptime override reaches this via the egress
         // `CodecSpec.ptime_ms` the encoder was built with (sample-based codecs honour it; a frame-based
-        // codec such as AMR keeps its native 20 ms frame — the override is inert there by construction).
+        // codec such as AMR packs one 20 ms frame per 20 ms of it, up to four).
         //
         // Bound it to the scratch ceiling so an adversarial `a=ptime` can never overflow the fixed
         // egress frame buffer; the timestamp step is recomputed from the same bounded count so drain
@@ -3172,10 +3172,10 @@ impl MediaCall {
                     events,
                 );
                 // RFC 4867 §4.3.1: A's Codec Mode Request steers the mode of the stream sent *back* to
-                // A (the b_to_a egress encoder). No-op for a fixed-rate codec / no request.
-                if let Some(mode) = self.a_to_b.decoder.last_mode_request() {
-                    self.b_to_a.encoder.request_mode(mode);
-                }
+                // A (the b_to_a egress encoder), and CMR 15 withdraws it. No-op for a fixed-rate codec.
+                let request = self.a_to_b.decoder.last_mode_request();
+                let request = request.unwrap_or(NO_MODE_REQUEST);
+                self.b_to_a.encoder.request_mode(request);
                 admitted
             };
             // Symmetric-RTP latch (docs/security-and-nat.md §4 layer 3; RFC 3550 §8), decided inside
@@ -3253,9 +3253,9 @@ impl MediaCall {
                     events,
                 );
                 // Symmetric: B's CMR steers the a_to_b egress encoder (the stream sent back to B).
-                if let Some(mode) = self.b_to_a.decoder.last_mode_request() {
-                    self.a_to_b.encoder.request_mode(mode);
-                }
+                let request = self.b_to_a.decoder.last_mode_request();
+                let request = request.unwrap_or(NO_MODE_REQUEST);
+                self.a_to_b.encoder.request_mode(request);
                 admitted
             };
             // Symmetric-RTP latch for the A→B reply, mirroring the A branch: a rejected B source was
@@ -6525,21 +6525,29 @@ mod tests {
     }
 
     /// RFC 4867 §4.3.1: a Codec Mode Request on the A→B stream steers the mode of the AMR-WB stream
-    /// the engine sends *back* to A (the b_to_a egress encoder), clamped to any `mode-set`. Proves the
-    /// cross-direction wiring in `process()`.
+    /// the engine sends *back* to A (the b_to_a egress encoder), and CMR 15 withdraws the request.
+    /// Proves the cross-direction wiring in `process()`.
     #[cfg(feature = "amr")]
     #[test]
     fn amr_wb_cmr_steers_the_reverse_direction_encoder() {
-        use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
+        use siphon_rtp_codec::factory::{decoder_for, encoder_for, AmrParams, CodecSpec};
 
+        // An octet-aligned stream (`octet-align=1`), so the CMR is the high nibble of the first
+        // octet and the frame type sits in the second (RFC 4867 §4.4).
+        let spec = || {
+            CodecSpec::new(96, "AMR-WB", 16000, 1, 20).with_amr_params(Some(AmrParams {
+                octet_align: Some(true),
+                ..AmrParams::default()
+            }))
+        };
         let amr_dir =
             |ingress: u64, src: &str, egress: u64, dst: &str, ssrc: u32| DirectionConfig {
                 ingress_endpoint: endpoint(ingress),
                 accepted_source: SourceFilter::Exact(addr(src).ip()),
                 egress_endpoint: endpoint(egress),
                 egress_dst: addr(dst),
-                decoder: decoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("dec"),
-                encoder: encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("enc"),
+                decoder: decoder_for(&spec()).expect("dec"),
+                encoder: encoder_for(&spec()).expect("enc"),
                 egress_ssrc: ssrc,
                 egress_payload_type: 96,
                 telephone_event_in: None,
@@ -6553,8 +6561,8 @@ mod tests {
                 ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             };
 
-        // A payload at the default mode 2; flip its CMR nibble to request mode 0 for the B→A stream.
-        let mut encoder = encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("enc");
+        // A payload at the default mode; flip its CMR nibble to request mode 0 for the B→A stream.
+        let mut encoder = encoder_for(&spec()).expect("enc");
         let pcm: Vec<i16> = (0..320)
             .map(|i| ((i as f32 * 0.2).sin() * 6000.0) as i16)
             .collect();
@@ -6599,6 +6607,27 @@ mod tests {
             (packet.payload[1] >> 3) & 0x0F,
             0,
             "toward-A egress adapted to the CMR-requested mode 0"
+        );
+
+        // A then sends CMR 15, no request: the cap is lifted and the stream toward A returns to
+        // the highest mode (3GPP TS 26.114 §7.5.2.1.2.1).
+        a_payload[0] = 0xF0;
+        call.process(
+            &rx(1, A_ADDR, amr_wb_rtp(2, &a_payload)),
+            &mut out,
+            &mut events,
+        );
+        out.clear();
+        call.process(
+            &rx(2, B_ADDR, amr_wb_rtp(2, &b_payload)),
+            &mut out,
+            &mut events,
+        );
+        let packet = RtpPacket::parse(&out[0].data).expect("parse");
+        assert_eq!(
+            (packet.payload[1] >> 3) & 0x0F,
+            8,
+            "the request is withdrawn"
         );
     }
 

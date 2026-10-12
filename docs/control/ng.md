@@ -100,7 +100,8 @@ The operations the engine honours on the far-side offer:
 
 Names are matched case-insensitively. A `codec-transcode` target the engine cannot
 encode is skipped rather than failing the call; the targets it can currently add are
-`PCMU`, `PCMA`, `G722`, `GSM`, `G726-32`, and (with the `amr` build feature) `AMR-WB`.
+`PCMU`, `PCMA`, `G722`, `GSM`, `G726-32`, `OPUS`, and (with the `amr` build feature) `AMR-WB` and
+`AMR`, each of those two in both RFC 4867 payload formats.
 See [Codec support](../codecs.md) for the full matrix.
 
 ## NAT, transport, and RTCP flags

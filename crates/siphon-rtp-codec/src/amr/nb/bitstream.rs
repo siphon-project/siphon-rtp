@@ -302,17 +302,29 @@ pub fn unsort(data: &[u8], mode: usize) -> [i16; MAX_SERIAL_SIZE] {
 }
 
 /// Sort + pack a serial-bit array (`bits`, encoder/`bits2prm` order, `0`/`1`) into the octet-packed
-/// RFC 4867 speech-frame body for `mode` (the inverse of [`unsort`]). Returns
-/// `ceil(serial_bits(mode) / 8)` bytes, MSB-first.
-#[must_use]
-pub fn pack(bits: &[i16], mode: usize) -> Vec<u8> {
+/// RFC 4867 speech-frame body for `mode` (the inverse of [`unsort`]), MSB-first, at the head of
+/// `data`. Returns the `ceil(serial_bits(mode) / 8)` bytes written, or 0 when `data` is too short.
+/// Allocates nothing: this runs once per frame sent.
+pub fn pack_into(bits: &[i16], mode: usize, data: &mut [u8]) -> usize {
     let sort = SORT[mode];
-    let mut data = vec![0u8; sort.len().div_ceil(8)];
+    let octets = sort.len().div_ceil(8);
+    let Some(data) = data.get_mut(..octets) else {
+        return 0;
+    };
+    data.fill(0);
     for (i, &src) in sort.iter().enumerate() {
         if bits[src as usize] == BIT_1 {
             data[i / 8] |= 1 << (7 - (i % 8));
         }
     }
+    octets
+}
+
+/// [`pack_into`] into a fresh vector of `ceil(serial_bits(mode) / 8)` bytes.
+#[must_use]
+pub fn pack(bits: &[i16], mode: usize) -> Vec<u8> {
+    let mut data = vec![0u8; SORT[mode].len().div_ceil(8)];
+    pack_into(bits, mode, &mut data);
     data
 }
 
