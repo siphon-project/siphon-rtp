@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-10-13
+
 ### Fixed
 
 - **`node_info` lists G.729 on a build that has it.** A node built with the `g729` feature
