@@ -46,6 +46,7 @@ use super::*;
 /// The default control client for tests that don't exercise per-client isolation.
 const CLIENT: ClientId = ClientId(1);
 
+mod conference_seat;
 mod transcode_offer;
 
 #[test]

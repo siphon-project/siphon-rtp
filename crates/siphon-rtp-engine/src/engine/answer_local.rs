@@ -1045,7 +1045,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 ///
 /// The two float operations are a single stable sort (offer order is preserved among equals), with the
 /// explicit `offer` ordering taking precedence over the `transcode` preference.
-fn answer_codec_candidates(info: &sdp::MediaInfo, policy: &sdp::CodecPolicy) -> Vec<CodecSpec> {
+pub(super) fn answer_codec_candidates(
+    info: &sdp::MediaInfo,
+    policy: &sdp::CodecPolicy,
+) -> Vec<CodecSpec> {
     // The offerer's own audio codecs, in offer order, telephone-event already excluded.
     let mut candidates = info.audio_codecs();
     // `strip`/`mask`/`consume-X`: drop the named codec from the answer candidate set.

@@ -7,6 +7,25 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`conference_join` seats a participant in a codec the room can bridge, and refuses a seat it
+  cannot hold.** A join took the offer's first audio codec and nothing else, and never read the
+  profile's codec flags, so a VoLTE terminal whose offer lists EVS first was refused although it
+  offered AMR-WB right behind it, and a profile could not withhold a codec from a seat. The seat is
+  now chosen the way `answer_local` chooses a single leg's codec, from the same code: the offer's
+  codecs in offer order, edited by the codec flags, and the first one the engine can decode, encode
+  and hold in the room is taken. The answer names only that codec, with the payload type and
+  `a=fmtp` it was offered under (an AMR seat keeps its payload format and `mode-set`), and the
+  telephone-event at its clock rate. When nothing qualifies the join is refused with every offered
+  codec and why it was not taken, so a build without `amr` says so for each AMR payload type.
+  A join also answered `ok` before the room had seated anyone, and the room then dropped the seat
+  without a word for a duplicate from-tag, a 65th seat, a packetization interval over 120 ms or a
+  decoder and encoder that disagree. The join now waits (at most 1 s) for the room's verdict and
+  answers a refusal as an error naming it, leaving no member, route or empty room behind. The
+  conferencing cookbook said Opus is refused in a room, which has not been true since Opus gained
+  an encoder, and its room `play_finished` example left out `from_tag`, which is always sent.
+
 ## [0.14.0] — 2026-10-13
 
 ### Fixed

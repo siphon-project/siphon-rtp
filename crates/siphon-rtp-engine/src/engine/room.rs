@@ -1,6 +1,7 @@
 //! Conference verbs: join, leave, route, bridge, and room-wide playback and recording.
 
-use siphon_rtp_codec::factory;
+use siphon_rtp_codec::factory::{self, CodecSpec};
+use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{
     AddressFamily, Datapath, FlowAction, IceAgentMode, IceConfig, SourceFilter,
 };
@@ -17,15 +18,18 @@ use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 use std::sync::Arc;
 
-use crate::conference::{ConferenceControl, ParticipantConfig, ParticipantTextConfig, Routing};
+use crate::conference::{
+    seat, ConferenceControl, ParticipantConfig, ParticipantTextConfig, Routing,
+};
 use crate::dtls_bridge::DtlsCallPlan;
 use crate::ice;
 use crate::media_pipeline::PlayRequest;
 use crate::sdp::{self, EngineMedia, IceRewrite, ImageRewrite, SecurityAdvertisement, TextRewrite};
 
+use super::answer_local::answer_codec_candidates;
 use super::negotiate::{
-    filter_component, ice_directive, ice_tie_breaker, peer_ice_credentials, random_ssrc,
-    IceDirective,
+    filter_component, ice_directive, ice_tie_breaker, parse_codec_flags, peer_ice_credentials,
+    random_ssrc, IceDirective,
 };
 use super::play::{parse_prompt_wav, PlayOptions, ResolvedPlaySource};
 use super::record::AudioRecording;
@@ -282,28 +286,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"could not mint ICE credentials (OS RNG unavailable)",
             );
         }
-        let Some(codec) = info.primary_codec() else {
-            return error_result("conference_join", &"offer has no audio codec");
+        // The participant's codec, chosen before anything is allocated, so a seat the room could not
+        // hold is refused here with the reason for each offered codec.
+        let SeatCodec {
+            spec: codec,
+            decoder,
+            encoder,
+        } = match seat_codec(&info, profile) {
+            Ok(seat) => seat,
+            Err(reason) => return error_result("conference_join", &reason),
         };
-        // Build the participant's codecs. `encoder_for` rejects a decode-only codec: we can mix in
-        // such a leg's audio but cannot encode the room back to it, so the seat is refused.
-        let decoder = match factory::decoder_for(&codec) {
-            Ok(decoder) => decoder,
-            Err(error) => return error_result("conference_join: decoder", &error),
-        };
-        let encoder = match factory::encoder_for(&codec) {
-            Ok(encoder) => encoder,
-            Err(_) => {
-                return error_result(
-                    "conference_join",
-                    &format!(
-                    "codec {} has no encoder, so the room mix cannot be sent to this participant \
-                         (AMR-WB / AMR-NB need the `amr` build feature)",
-                    codec.encoding_name
-                ),
-                )
-            }
-        };
+        let telephone_event =
+            sdp::TelephoneEvent::accompanying(&info.telephone_events(), Some(&codec));
         // One engine endpoint in the offer's address family, redirected to the conference actor. A
         // participant is a single leg, so it uses the near (`direction[0]`) interface — its bind IP and
         // advertised (public) address — defaulting when the join carries no `direction`.
@@ -467,7 +461,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             secure_pending: dtls_leg,
             ice_pending,
             mos_codec: crate::conference::hep_codec_for_name(&codec.encoding_name),
-            telephone_event_in: info.telephone_event_payload_type(),
+            telephone_event_in: telephone_event.map(|event| event.payload_type),
             secure,
             text: text_config,
             routing: routing_of(role),
@@ -482,18 +476,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // the idle sweep must not read its silence as a dead path — a held seat and a listen-only
         // attendee are both legitimately quiet for the whole conference.
         let held = !info.direction.peer_sends();
-        if !self.conference.join(
-            conference_id,
-            config,
-            joined_tick,
-            held,
-            self.datapath.clone(),
-            events,
-        ) {
+        if let Err(refusal) = self
+            .conference
+            .join(
+                conference_id,
+                config,
+                joined_tick,
+                held,
+                self.datapath.clone(),
+                events,
+            )
+            .await
+        {
             let mut to_free = vec![endpoint];
             to_free.extend(text_endpoint);
             self.free(&to_free).await;
-            return error_result("conference_join", &"failed to seat participant");
+            return error_result("conference_join", &refusal);
         }
         // Seated: aim the room's egress at whatever ICE validates for this seat, for as long as it is
         // seated. A no-op on a seat without ICE.
@@ -602,9 +600,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ImageRewrite::None,
         ) {
             // RFC 3264 §6: the room is the answerer, and it mixes audio and the text it anchored.
-            // Every other stream the participant offered is declined with port 0.
+            // Every other stream the participant offered is declined with port 0, and the audio is
+            // answered in the one codec the seat was built for (§6.1).
             Ok(rewritten) => ok_sdp(
-                sdp::decline_unanswered_media(rewritten.sdp, text_rewrite.is_anchored()),
+                sdp::force_answer_codec(
+                    &sdp::decline_unanswered_media(rewritten.sdp, text_rewrite.is_anchored()),
+                    &codec,
+                    telephone_event,
+                ),
                 Some(from_tag),
             ),
             Err(error) => {
@@ -1112,4 +1115,66 @@ fn routing_of(role: ConferenceRole) -> Routing {
             monitor_target: Some(target),
         },
     }
+}
+
+/// The codec a participant is seated in, with both halves of its leg built.
+struct SeatCodec {
+    spec: CodecSpec,
+    decoder: Box<dyn Decoder>,
+    encoder: Box<dyn Encoder>,
+}
+
+/// Choose a participant's codec the way [`Engine::answer_local`] chooses a single leg's: the offer's
+/// own audio codecs, in offer order, edited by the profile's codec flags with answer-side semantics
+/// (RFC 3264 §6.1, [`answer_codec_candidates`]). A room also has to *decode* the participant and hold
+/// its frame, so the first candidate that has a decoder, an encoder and a frame [`seat::fit`] accepts
+/// is taken. The refusal names every offered codec and why it was not.
+fn seat_codec(info: &sdp::MediaInfo, profile: &ProfileFlags) -> Result<SeatCodec, String> {
+    let offered = info.audio_codecs();
+    if offered.is_empty() {
+        return Err("offer has no audio codec".to_string());
+    }
+    let mut passed_over = Vec::new();
+    for spec in answer_codec_candidates(info, &parse_codec_flags(&profile.flags)) {
+        let built = factory::decoder_for(&spec)
+            .map_err(|error| format!("no decoder: {error}"))
+            .and_then(|decoder| {
+                factory::encoder_for(&spec)
+                    .map(|encoder| (decoder, encoder))
+                    .map_err(|error| format!("no encoder: {error}"))
+            })
+            .and_then(|(decoder, encoder)| match seat::fit(&*decoder, &*encoder) {
+                Ok(_) => Ok((decoder, encoder)),
+                Err(refusal) => Err(format!("the room cannot hold it: {refusal}")),
+            });
+        match built {
+            Ok((decoder, encoder)) => {
+                return Ok(SeatCodec {
+                    spec,
+                    decoder,
+                    encoder,
+                })
+            }
+            Err(reason) => passed_over.push((spec.payload_type, reason)),
+        }
+    }
+    let reasons: Vec<String> = offered
+        .iter()
+        .map(|spec| {
+            let reason = passed_over
+                .iter()
+                .find(|(payload_type, _)| *payload_type == spec.payload_type)
+                .map_or("withheld by the profile's codec flags", |(_, reason)| {
+                    reason.as_str()
+                });
+            format!(
+                "{}/{} payload type {}: {reason}",
+                spec.encoding_name, spec.clock_rate_hz, spec.payload_type
+            )
+        })
+        .collect();
+    Err(format!(
+        "no offered codec can be seated: {}",
+        reasons.join("; ")
+    ))
 }
