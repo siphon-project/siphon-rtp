@@ -490,7 +490,7 @@ before recording is a follow-up.
 
 | Verb | Fields | Purpose |
 |---|---|---|
-| `conference_join` | `conference_id`, `from_tag`, `sdp`, `role`, `profile` | Join (or lazily create) a mixing conference. The engine answers the SDP; the participant hears the room mixed-minus-self. Beside the audio stream and a text stream the room anchors, every other stream in the offer is declined with port 0 (RFC 3264 §6). |
+| `conference_join` | `conference_id`, `from_tag`, `sdp`, `role`, `profile` | Join (or lazily create) a mixing conference. The engine answers the SDP in one codec, the first offered one it can decode, encode and hold in the room after the profile's codec flags (as `answer_local` chooses); the participant hears the room mixed-minus-self. `ok` means the room seated the participant: a refused seat (no codec qualifies, a from-tag already seated, a full room) is an error naming the reason, see [Conferencing](../cookbook/conferencing.md#which-codec-a-seat-gets). Beside the audio stream and a text stream the room anchors, every other stream in the offer is declined with port 0 (RFC 3264 §6). |
 | `conference_leave` | `conference_id`, `from_tag` | Leave; the room tears down when the last participant leaves. |
 | `conference_route` | `conference_id`, `from_tag`, `role` | Live-update a participant's routing role. |
 | `conference_bridge` | `conference_id_a`, `conference_id_b`, `direction` | Bridge two rooms (`both`, `a_to_b`, `b_to_a`). |

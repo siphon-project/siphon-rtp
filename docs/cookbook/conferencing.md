@@ -56,11 +56,13 @@ the mirror: two decodes fill a tick, and two packets leave it. Either way the le
 the wall clock. A 20 ms leg (all of G.711, G.722, G.726, GSM-FR, AMR-NB/WB, and the Opus default)
 takes the direct path and allocates neither buffer.
 
-Two things get a leg refused at join. Its decoder and encoder must agree on sample rate,
+Two things keep a codec from being seated. Its decoder and encoder must agree on sample rate,
 packetization interval, and channel count: the room works in one frame length per participant, and a
 mismatched pair would hand its encoder a wrong-length frame every tick. And its interval must be at
 most 120 ms — the interval sizes the leg's ingress carry, its egress accumulator, and its playout
-queue, so an unbounded `a=ptime` would buy a peer arbitrary per-participant buffering.
+queue, so an unbounded `a=ptime` would buy a peer arbitrary per-participant buffering. A codec that
+fails either is passed over for the next one offered (see [Which codec a seat
+gets](#which-codec-a-seat-gets)).
 
 ### Shared encode
 
@@ -83,12 +85,34 @@ Honest limits first:
   the seat is taken *pending*: it joins the mix only once the DTLS handshake keys it or ICE selects a
   pair; until then its ingress is dropped and it hears nothing.
 - The participant's codec must be both decodable and encodable by this build, because the engine
-  has to encode the mix back. AMR-WB and AMR-NB egress need the `amr` Cargo feature (off by default,
-  see [codec licensing](../codec-licensing.md)); without it an AMR join is refused. With `amr`,
-  AMR-NB mixes are encoded at MR122 (the SDP `mode-set` is not applied to the mix egress). Opus has
-  no encoder, so an Opus participant is refused.
+  has to encode the mix back. G.711, G.722, G.726, GSM-FR, L16 and Opus always are. AMR-WB and
+  AMR-NB need the `amr` Cargo feature (off by default, see [codec licensing](../codec-licensing.md))
+  and G.729 the `g729` one; without the feature that codec is passed over, and a join that offered
+  nothing else is refused. With `amr`, an AMR seat's mix is encoded in the payload format and
+  `mode-set` it offered.
 - 64 participants per room, hard cap (the active-speaker set is a u64 bitmask).
 - A node in drain mode rejects `conference_join` like it rejects `offer`.
+
+### Which codec a seat gets
+
+The room picks the participant's codec the way `answer_local` picks a single leg's: the offer's own
+audio codecs, in offer order, after the profile's codec flags (`codec-strip-X`, `codec-mask-X`,
+`codec-consume-X` remove X, `codec-except-X` / `codec-accept-X` keep only the listed codecs,
+`codec-offer-X` moves X to the front). The first one the engine can decode, encode and hold in the
+room is taken. A VoLTE terminal that offers EVS, AMR-WB and AMR is seated in AMR-WB on a build with
+`amr`. The answer names that one codec with the payload type and `a=fmtp` it was offered under
+(for AMR, the payload format and `mode-set` as offered), and telephone-event at the same clock rate
+when the offer carries one.
+
+A join is answered `ok` only once the room has seated the participant. Otherwise it is an error
+that says why, before any media is set up:
+
+| Refusal | `reason` |
+|---|---|
+| No offered codec qualifies | `conference_join: no offered codec can be seated: <codec>/<rate> payload type <n>: <why>; ...`, every offered codec named with why it was not taken (no decoder or encoder in this build, withheld by the profile's codec flags, or the room cannot hold its frame) |
+| The from-tag is already seated | `conference_join: from-tag <tag> is already seated in this room` |
+| The room holds 64 seats | `conference_join: the room is full (64 seats)` |
+| The room did not answer within 1 s | `conference_join: the room did not seat the participant within 1000 ms` |
 
 Every participant endpoint is a full inbound surface, so the same RTPBleed defence as the relay
 applies: ingress is gated to the SDP-signalled source address (or opened with the `symmetric`
@@ -102,7 +126,7 @@ as `dtmf` events on the control channel instead.
 
 Rooms are created lazily: the first `conference_join` for a `conference_id` creates it, the last
 `conference_leave` tears it down. The participant offers SDP; the engine answers with its own
-endpoint, the participant's codec, sendrecv. Frames on the control channel are a big-endian u32
+endpoint, the one codec the seat was given, sendrecv. Frames on the control channel are a big-endian u32
 length prefix plus a JSON body; the bodies below omit the prefix.
 
 ```json
@@ -260,7 +284,7 @@ Up to four run at once, each with its own `play_id`, and each ends with its own
 not on a call:
 
 ```json
-{"event": "play_finished", "call_id": "", "conference_id": "bridge-4412", "play_id": 12, "reason": "completed", "played_ms": 800}
+{"event": "play_finished", "call_id": "", "conference_id": "bridge-4412", "from_tag": "", "play_id": 12, "reason": "completed", "played_ms": 800}
 ```
 
 `conference_set_play_gain` retunes a running one (how an announcement ducks under a

@@ -52,6 +52,9 @@ use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::media_pipeline::{Outbound, PlayRequest};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 
+pub mod seat;
+pub use seat::{SeatRefusal, SEAT_VERDICT_TIMEOUT};
+
 /// The narrowband fast-path room rate (all-G.711/G.726/PSTN, unbridged).
 pub const NARROWBAND_RATE_HZ: u32 = 8_000;
 /// The wideband room rate — G.722 (RFC 3551 §4.5.2), AMR-WB (3GPP TS 26.171), 16 kHz Opus.
@@ -567,86 +570,33 @@ impl Conference {
         self.top_m = top_m;
     }
 
-    /// Seat a participant. Returns `false` if the room is full ([`MAX_PARTICIPANTS`]), a tag is
-    /// already seated, the codec's frame is larger than the scratch ceiling, or the participant's
-    /// decoder and encoder disagree (see the `native_frame` invariant below).
-    pub fn add_participant(&mut self, config: ParticipantConfig) -> bool {
-        if self.participants.len() >= MAX_PARTICIPANTS {
-            return false;
-        }
-        if self
+    /// Seat a participant, or say why the room cannot hold it: full ([`MAX_PARTICIPANTS`]), the tag
+    /// already seated, or a frame [`seat::fit`] refuses. A refusal is logged here and answered to the
+    /// join that asked for it.
+    pub fn add_participant(&mut self, config: ParticipantConfig) -> Result<(), SeatRefusal> {
+        let fitted = if self.participants.len() >= MAX_PARTICIPANTS {
+            Err(SeatRefusal::RoomFull)
+        } else if self
             .participants
             .iter()
             .any(|participant| participant.tag == config.tag)
         {
-            return false;
-        }
-        let native_params = config.decoder.params();
-        let native_rate = native_params.sample_rate_hz;
-        let native_channels = native_params.channels.max(1);
-        // Bound the packetization interval directly rather than only the frame length. A leg whose
-        // interval is not the room tick carries an ingress carry and an egress accumulator sized
-        // from it, and the jitter buffer holds `JITTER_MAX` of its frames — so an unbounded `a=ptime`
-        // (a `u8`, and `CodecSpec::new` only floors it at 1 for a non-Opus codec) buys the peer
-        // arbitrary per-participant buffering and playout latency. `MAX_PTIME_MS` is the RFC 7587
-        // §6.1 ceiling, well above the 20 ms every codec here actually negotiates, so nothing
-        // legitimate is turned away and a pathological value is refused loudly instead of quietly
-        // seated.
-        if native_params.ptime_ms == 0 || native_params.ptime_ms > MAX_PTIME_MS {
+            Err(SeatRefusal::DuplicateTag(config.tag.clone()))
+        } else {
+            seat::fit(config.decoder.as_ref(), config.encoder.as_ref())
+        };
+        let seat::SeatFrame {
+            native_rate,
+            native_channels,
+            native_frame,
+        } = fitted.inspect_err(|refusal| {
             tracing::warn!(
                 conference = %self.conference_id,
                 tag = %config.tag,
-                ptime_ms = native_params.ptime_ms,
-                "conference refused a participant: packetization interval outside 1..={MAX_PTIME_MS} ms"
+                %refusal,
+                "conference refused a participant"
             );
-            return false;
-        }
-        // `Decoder::frame_samples` is the interleaved value count (the channel contract in
-        // `siphon_rtp_codec`); the room works in per-channel samples, since a multi-channel frame is
-        // folded to mono on the way in. Bound the *interleaved* count against the scratch capacity —
-        // that is the buffer `next_pcm` decodes into.
-        let native_values = config.decoder.frame_samples();
-        if native_values == 0 || native_values > MAX_NATIVE_FRAME {
-            tracing::warn!(
-                conference = %self.conference_id,
-                tag = %config.tag,
-                native_values,
-                "conference refused a participant: decoded frame exceeds the room scratch ceiling"
-            );
-            return false;
-        }
-        let native_frame = native_values / native_channels as usize;
-        if native_frame == 0 {
-            return false;
-        }
-        // **The `native_frame` invariant.** One number does double duty: the room decodes each tick
-        // *into* a `native_frame`-sample buffer and encodes the participant's egress *out of* one.
-        // That is only sound while the two halves of the leg agree — same sample rate, same
-        // packetization interval, and a mono egress, since the mix bus is mono and hands the encoder
-        // mono PCM (a multi-channel *ingress* is folded at the codec boundary, but nothing ever
-        // re-interleaves on the way out). Enforce it here rather than documenting it: a mismatched
-        // pair would hand the encoder a wrong-length frame on every single tick, which most codecs
-        // answer with `BadFrameSize` and the room answers by silently dropping that leg's egress.
-        let egress_params = config.encoder.params();
-        if egress_params.sample_rate_hz != native_rate
-            || egress_params.ptime_ms != native_params.ptime_ms
-            || egress_params.channels > 1
-            || config.encoder.frame_samples() != native_frame
-        {
-            tracing::warn!(
-                conference = %self.conference_id,
-                tag = %config.tag,
-                decode_rate_hz = native_rate,
-                decode_ptime_ms = native_params.ptime_ms,
-                decode_frame = native_frame,
-                encode_rate_hz = egress_params.sample_rate_hz,
-                encode_ptime_ms = egress_params.ptime_ms,
-                encode_channels = egress_params.channels,
-                encode_frame = config.encoder.frame_samples(),
-                "conference refused a participant: its decoder and encoder disagree on rate / ptime / channels"
-            );
-            return false;
-        }
+        })?;
         let stateless = config.encoder.is_stateless();
         let egress_payload_type = config.egress_payload_type;
         // A leg whose packetization interval is not the 20 ms room tick needs a carry on each side —
@@ -734,7 +684,7 @@ impl Conference {
             started: false,
         });
         self.recompute_room_rate();
-        true
+        Ok(())
     }
 
     /// Remove a participant by tag. Returns `true` if it was seated.
@@ -2087,8 +2037,12 @@ fn saturate_i16(value: i32) -> i16 {
 
 /// A control message into a running [`Conference`] actor.
 pub enum ConferenceControl {
-    /// Seat a participant.
-    Add(Box<ParticipantConfig>),
+    /// Seat a participant. `reply` carries the room's verdict, so a join is answered `ok` only for a
+    /// participant the room actually seated.
+    Add {
+        config: Box<ParticipantConfig>,
+        reply: tokio::sync::oneshot::Sender<Result<(), SeatRefusal>>,
+    },
     /// Remove a participant by tag.
     Remove(String),
     /// Live-update a participant's role / routing.
@@ -2179,12 +2133,13 @@ async fn run_conference<D>(
                             }
                         }
                     }
-                    ConferenceInput::Control(ConferenceControl::Add(config)) => {
-                        conference.add_participant(*config);
+                    ConferenceInput::Control(ConferenceControl::Add { config, reply }) => {
+                        let _ = reply.send(conference.add_participant(*config));
                     }
                     ConferenceInput::Control(ConferenceControl::Remove(tag)) => {
-                        conference.remove_participant(&tag);
-                        if conference.is_empty() {
+                        // Only a leaver empties the room: the removal that follows a refused seat
+                        // must not stop a room another join is about to be seated in.
+                        if conference.remove_participant(&tag) && conference.is_empty() {
                             break; // last leaver tears the room down
                         }
                     }
@@ -2453,8 +2408,9 @@ impl ConferenceRegistry {
     }
 
     /// Seat a participant, creating the room actor (over `datapath`, pushing events to `events`) if it
-    /// does not yet exist. Returns `false` if the actor's mailbox is gone.
-    pub fn join<D>(
+    /// does not yet exist, and wait for the room's verdict (at most [`SEAT_VERDICT_TIMEOUT`]). A
+    /// refused participant leaves no member, route or empty room behind.
+    pub async fn join<D>(
         &self,
         conference_id: &str,
         config: ParticipantConfig,
@@ -2462,7 +2418,7 @@ impl ConferenceRegistry {
         held: bool,
         datapath: D,
         events: Option<flume::Sender<Event>>,
-    ) -> bool
+    ) -> Result<(), SeatRefusal>
     where
         D: Datapath + Clone + Send + 'static,
     {
@@ -2471,49 +2427,62 @@ impl ConferenceRegistry {
         // T.140/RED datagram redirected for it reaches this room's `ingest`.
         let text_endpoint = config.text.as_ref().map(|text| text.ingress_endpoint);
         let tag = config.tag.clone();
-        let sip_call_id = config.telemetry.sip_call_id.clone();
-        let qos_codec = (config.mos_codec, config.decoder.rtp_clock_rate_hz().max(1));
-        let mailbox = self
-            .rooms
-            .entry(conference_id.to_string())
-            .or_insert_with(|| {
-                let (mailbox, inbox) = flume::bounded(1024);
-                let mut conference = Conference::new(conference_id.to_string(), DEFAULT_TOP_M);
-                conference.rtcp_tap = datapath.rtcp_tap();
-                let task = tokio::spawn(run_conference(conference, inbox, datapath, events));
-                ConferenceHandle {
-                    mailbox,
-                    members: Vec::new(),
-                    task,
-                }
-            })
-            .mailbox
-            .clone();
-
-        if mailbox
-            .try_send(ConferenceInput::Control(ConferenceControl::Add(Box::new(
-                config,
-            ))))
-            .is_err()
-        {
-            return false;
+        let member = ConferenceMember {
+            tag: tag.clone(),
+            endpoint,
+            text_endpoint,
+            joined_tick,
+            held,
+            sip_call_id: config.telemetry.sip_call_id.clone(),
+            qos_codec: (config.mos_codec, config.decoder.rtp_clock_rate_hz().max(1)),
+        };
+        let mailbox = {
+            let mut handle = self
+                .rooms
+                .entry(conference_id.to_string())
+                .or_insert_with(|| {
+                    let (mailbox, inbox) = flume::bounded(1024);
+                    let mut conference = Conference::new(conference_id.to_string(), DEFAULT_TOP_M);
+                    conference.rtcp_tap = datapath.rtcp_tap();
+                    let task = tokio::spawn(run_conference(conference, inbox, datapath, events));
+                    ConferenceHandle {
+                        mailbox,
+                        members: Vec::new(),
+                        task,
+                    }
+                });
+            // Refused before the room is asked, so a second join under a seated tag (or one still
+            // waiting for its verdict) cannot take the first one's member entry with it.
+            if handle.members.iter().any(|seated| seated.tag == tag) {
+                return Err(SeatRefusal::DuplicateTag(tag));
+            }
+            handle.members.push(member);
+            handle.mailbox.clone()
+        };
+        let (reply, verdict) = tokio::sync::oneshot::channel();
+        let add = ConferenceControl::Add {
+            config: Box::new(config),
+            reply,
+        };
+        // No verdict means the actor is gone, or still has not answered.
+        let seated = match mailbox.try_send(ConferenceInput::Control(add)) {
+            Ok(()) => match tokio::time::timeout(SEAT_VERDICT_TIMEOUT, verdict).await {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(_)) | Err(_) => Err(SeatRefusal::NoVerdict),
+            },
+            Err(_) => Err(SeatRefusal::NoVerdict),
+        };
+        if let Err(refusal) = seated {
+            // `leave` also asks the actor to remove the tag, so a seat it takes after the timeout
+            // does not outlive the refused join, and it tears down a room this join created.
+            self.leave(conference_id, &tag);
+            return Err(refusal);
         }
         self.routes.insert(endpoint, mailbox.clone());
         if let Some(text_endpoint) = text_endpoint {
             self.routes.insert(text_endpoint, mailbox);
         }
-        if let Some(mut handle) = self.rooms.get_mut(conference_id) {
-            handle.members.push(ConferenceMember {
-                tag,
-                endpoint,
-                text_endpoint,
-                joined_tick,
-                held,
-                sip_call_id,
-                qos_codec,
-            });
-        }
-        true
+        Ok(())
     }
 
     /// The dialog `Call-ID` a seat named when it joined, and its G.107 codec with the RTP clock rate —
@@ -3264,11 +3233,11 @@ mod tests {
 
         let mut conference = Conference::new("opus-room".into(), DEFAULT_TOP_M);
         assert!(
-            conference.add_participant(opus_config(0)),
+            conference.add_participant(opus_config(0)).is_ok(),
             "a full-band Opus talker must be seated"
         );
         assert!(
-            conference.add_participant(opus_config(1)),
+            conference.add_participant(opus_config(1)).is_ok(),
             "a full-band Opus listener must be seated"
         );
 
@@ -3384,7 +3353,7 @@ mod tests {
                 ..ulaw_config(0, "127.0.0.2", "127.0.0.2:5000")
             };
             assert!(
-                room.add_participant(config),
+                room.add_participant(config).is_ok(),
                 "{ptime_ms} ms / 48 kHz participant must be seated"
             );
             assert_eq!(
@@ -3427,7 +3396,10 @@ mod tests {
                 ..ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")
             };
             assert!(
-                !room.add_participant(config),
+                matches!(
+                    room.add_participant(config),
+                    Err(SeatRefusal::Mismatch { .. })
+                ),
                 "a {what} mismatch between decoder and encoder must be refused"
             );
             assert_eq!(room.participant_count(), 0);
@@ -3440,7 +3412,7 @@ mod tests {
             encoder: Box::new(L16::new(16_000, 20)),
             ..ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")
         };
-        assert!(room.add_participant(config));
+        assert!(room.add_participant(config).is_ok());
         assert_eq!(room.participants[0].native_frame, 320);
     }
 
@@ -3458,8 +3430,9 @@ mod tests {
             encoder: Box::new(L16::new(8_000, MAX_PTIME_MS + 1)),
             ..ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")
         };
-        assert!(
-            !room.add_participant(too_long),
+        assert_eq!(
+            room.add_participant(too_long),
+            Err(SeatRefusal::Ptime(MAX_PTIME_MS + 1)),
             "121 ms is beyond the ceiling"
         );
 
@@ -3468,7 +3441,10 @@ mod tests {
             encoder: Box::new(L16::new(8_000, MAX_PTIME_MS)),
             ..ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")
         };
-        assert!(room.add_participant(at_ceiling), "120 ms is allowed");
+        assert!(
+            room.add_participant(at_ceiling).is_ok(),
+            "120 ms is allowed"
+        );
     }
 
     #[test]
@@ -3478,7 +3454,10 @@ mod tests {
         // folded once, on the way in. `native_frame` is the per-channel count, not the value count.
         let mut room = Conference::new("stereo-room".to_string(), DEFAULT_TOP_M);
         let (config, encoded) = wideband_config(0, 2, "127.0.0.2", "127.0.0.2:5000");
-        assert!(room.add_participant(config), "stereo participant is seated");
+        assert!(
+            room.add_participant(config).is_ok(),
+            "stereo participant is seated"
+        );
         assert_eq!(room.participants[0].native_channels, 2);
         assert_eq!(
             room.participants[0].native_frame, 960,
@@ -3647,9 +3626,15 @@ mod tests {
         // A three-party room; A and B each type one T.140 packet. On the text flush each receiver must
         // get the OTHER talkers' text, labelled with the source's CSRC (RFC 9071 §4.2), never its own.
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000")));
-        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
-        assert!(conference.add_participant(ulaw_text_config(2, "10.0.0.3", "10.0.0.3:4000")));
+        assert!(conference
+            .add_participant(ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_text_config(2, "10.0.0.3", "10.0.0.3:4000"))
+            .is_ok());
 
         // A (source id 0x7000_0000) types "Hi"; B (0x7000_0001) types "Yo". C stays silent.
         assert!(conference
@@ -3707,8 +3692,12 @@ mod tests {
         // The reassembler recovers a lost packet from RED redundancy, and each recovered increment is
         // surfaced as Event::Text for observability (RFC 9071 + RFC 4103 §4.2).
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000")));
-        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference
+            .add_participant(ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
 
         // A sends "H" then (packet 2 lost) "l" carrying "e" as redundancy: the receiver recovers "el".
         conference.ingest(&rx(
@@ -3746,8 +3735,12 @@ mod tests {
     fn text_packet_from_an_unsignalled_source_is_dropped() {
         // RTPBleed: a text packet from an address the SDP never signalled never enters the room.
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000")));
-        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference
+            .add_participant(ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
         assert!(
             !conference
                 .ingest(&rx(
@@ -3778,7 +3771,7 @@ mod tests {
                 } else {
                     ulaw_config(index, &source_ip, &dst)
                 };
-                assert!(conference.add_participant(config));
+                assert!(conference.add_participant(config).is_ok());
             }
             let loud = [6000i16; 160];
             for sequence in 0..10 {
@@ -3844,21 +3837,27 @@ mod tests {
 
         let mut conference = Conference::new("room".into(), 0);
         // Index 0: secure text source A; index 1: plaintext text B; index 2: secure text C.
-        assert!(conference.add_participant(secure_ulaw_text_config(
-            0,
-            "10.0.0.1",
-            "10.0.0.1:4000",
-            &a_local,
-            &a_remote,
-        )));
-        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
-        assert!(conference.add_participant(secure_ulaw_text_config(
-            2,
-            "10.0.0.3",
-            "10.0.0.3:4000",
-            &c_local,
-            &c_remote,
-        )));
+        assert!(conference
+            .add_participant(secure_ulaw_text_config(
+                0,
+                "10.0.0.1",
+                "10.0.0.1:4000",
+                &a_local,
+                &a_remote,
+            ))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(secure_ulaw_text_config(
+                2,
+                "10.0.0.3",
+                "10.0.0.3:4000",
+                &c_local,
+                &c_remote,
+            ))
+            .is_ok());
 
         // A builds a plaintext RED/T.140 "Hi" and encrypts it with its own key (A→engine).
         let plaintext = text_red_rtp(0x1111, 1, 1000, b"Hi", &[]);
@@ -3947,8 +3946,10 @@ mod tests {
         if let Some(text) = config.text.as_mut() {
             text.latch = true;
         }
-        assert!(conference.add_participant(config));
-        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference.add_participant(config).is_ok());
+        assert!(conference
+            .add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
 
         // Encrypt "steal" under a key the engine never negotiated, from the gated IP but a fresh port.
         let plaintext = text_red_rtp(0x1111, 1, 1000, b"steal", &[]);
@@ -4002,14 +4003,18 @@ mod tests {
         let (a_local, a_remote) = (generate(), generate());
 
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(secure_ulaw_text_config(
-            0,
-            "10.0.0.1",
-            "10.0.0.1:4000",
-            &a_local,
-            &a_remote,
-        )));
-        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference
+            .add_participant(secure_ulaw_text_config(
+                0,
+                "10.0.0.1",
+                "10.0.0.1:4000",
+                &a_local,
+                &a_remote,
+            ))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
 
         // A (secure) types "Hi": encrypt under A's key. B (plaintext) types "Yo": plain RED.
         let a_plain = text_red_rtp(0x1111, 1, 1000, b"Hi", &[]);
@@ -4077,7 +4082,7 @@ mod tests {
                 } else {
                     ulaw_config(index, &source_ip, &dst)
                 };
-                assert!(conference.add_participant(config));
+                assert!(conference.add_participant(config).is_ok());
             }
             let loud = [6000i16; 160];
             for sequence in 0..10 {
@@ -4114,14 +4119,17 @@ mod tests {
         // The registry must return BOTH the audio and text endpoints on leave so neither leaks.
         let registry = ConferenceRegistry::default();
         let datapath = siphon_rtp_datapath::udp::UdpLoopbackDatapath::new();
-        assert!(registry.join(
-            "room",
-            ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000"),
-            0,
-            false,
-            datapath.clone(),
-            None,
-        ));
+        registry
+            .join(
+                "room",
+                ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000"),
+                0,
+                false,
+                datapath.clone(),
+                None,
+            )
+            .await
+            .expect("seated");
         assert!(registry.owns(EndpointId(1)), "audio endpoint routed");
         assert!(
             registry.owns(EndpointId(text_endpoint(0))),
@@ -4139,9 +4147,15 @@ mod tests {
     #[test]
     fn three_participants_each_receive_one_mixed_packet() {
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")));
-        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
-        assert!(conference.add_participant(ulaw_config(2, "10.0.0.3", "10.0.0.3:4000")));
+        assert!(conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_config(2, "10.0.0.3", "10.0.0.3:4000"))
+            .is_ok());
 
         // Each party speaks a loud constant; feed enough to keep the jitter buffers primed.
         let loud = [6000i16; 160];
@@ -4181,8 +4195,12 @@ mod tests {
         // Party 0 is gated to 10.0.0.1; an attacker sprays loud audio from 10.0.0.99. Party 1 must
         // hear silence — the spoofed packets never enter the mix (RTPBleed defence).
         let mut conference = Conference::new("room".into(), 0);
-        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
-        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+        conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .expect("seated");
+        conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .expect("seated");
 
         let loud = [6000i16; 160];
         for sequence in 0..10 {
@@ -4216,8 +4234,10 @@ mod tests {
         let mut symmetric = ulaw_config(0, "10.0.0.1", "10.0.0.1:4000");
         symmetric.accepted_source = SourceFilter::Any;
         symmetric.latch = true;
-        conference.add_participant(symmetric);
-        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+        conference.add_participant(symmetric).expect("seated");
+        conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .expect("seated");
 
         let quiet = [0i16; 160];
         assert!(
@@ -4260,8 +4280,12 @@ mod tests {
     fn signalled_source_reaches_the_mix() {
         // Positive control for the gate test: from the correct source, party 1 hears party 0.
         let mut conference = Conference::new("room".into(), 0);
-        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
-        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+        conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .expect("seated");
+        conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .expect("seated");
 
         let loud = [6000i16; 160];
         for sequence in 0..10 {
@@ -4288,11 +4312,13 @@ mod tests {
     fn participant_without_destination_is_not_transmitted_to() {
         // A participant whose address is not yet resolved (latching, no packet seen) gets no egress.
         let mut conference = Conference::new("room".into(), 0);
-        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
+        conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .expect("seated");
         let mut pending = ulaw_config(1, "10.0.0.2", "10.0.0.2:4000");
         pending.egress_dst = addr("0.0.0.0:0"); // unresolved
         pending.latch = true;
-        conference.add_participant(pending);
+        conference.add_participant(pending).expect("seated");
 
         let loud = [6000i16; 160];
         for sequence in 0..10 {
@@ -4313,8 +4339,12 @@ mod tests {
     #[test]
     fn remove_and_empty_room_lifecycle() {
         let mut conference = Conference::new("room".into(), 0);
-        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
-        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+        conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .expect("seated");
+        conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .expect("seated");
         assert_eq!(conference.participant_count(), 2);
         assert!(conference.remove_participant("party-0"));
         assert_eq!(conference.participant_count(), 1);
@@ -4329,11 +4359,15 @@ mod tests {
         // participant hears A's audio even though no one in B is talking.
         let (bridge_sender, bridge_receiver) = flume::bounded(2);
         let mut room_a = Conference::new("a".into(), 0);
-        room_a.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
+        room_a
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .expect("seated");
         room_a.add_bridge_out(bridge_sender);
 
         let mut room_b = Conference::new("b".into(), 0);
-        room_b.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+        room_b
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .expect("seated");
         room_b.add_bridge_in(bridge_receiver);
 
         let loud = [6000i16; 160];
@@ -4375,8 +4409,12 @@ mod tests {
 
         // An all-G.711 (8 kHz) room uses the narrowband fast path.
         let mut conference = Conference::new("room".into(), 0);
-        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
-        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+        conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .expect("seated");
+        conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .expect("seated");
         assert_eq!(
             conference.room_rate(),
             8_000,
@@ -4388,7 +4426,7 @@ mod tests {
         wideband.decoder = Box::new(G722::new(20));
         wideband.encoder = Box::new(G722::new(20));
         wideband.egress_payload_type = 9;
-        conference.add_participant(wideband);
+        conference.add_participant(wideband).expect("seated");
         assert_eq!(
             conference.room_rate(),
             16_000,
@@ -4454,7 +4492,7 @@ mod tests {
                 config.decoder = decoder;
                 config.encoder = Box::new(L16::new(rate, ptime));
                 config.egress_payload_type = 96 + seat as u8;
-                assert!(conference.add_participant(config), "seat {seat}");
+                assert!(conference.add_participant(config).is_ok(), "seat {seat}");
             }
             assert_eq!(
                 conference.room_rate(),
@@ -4478,7 +4516,9 @@ mod tests {
         use siphon_rtp_codec::l16::L16;
 
         let mut conference = Conference::new("room".into(), 0);
-        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
+        conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .expect("seated");
         assert_eq!(conference.room_rate(), NARROWBAND_RATE_HZ);
         assert!(
             conference.participants[0].to_room.is_none(),
@@ -4490,7 +4530,7 @@ mod tests {
         wideband.decoder = Box::new(G722::new(20));
         wideband.encoder = Box::new(G722::new(20));
         wideband.egress_payload_type = 9;
-        conference.add_participant(wideband);
+        conference.add_participant(wideband).expect("seated");
         assert_eq!(conference.room_rate(), WIDEBAND_RATE_HZ);
         assert!(
             conference.participants[0].to_room.is_some(),
@@ -4503,7 +4543,7 @@ mod tests {
         full_band.decoder = Box::new(L16::new(48_000, 20));
         full_band.encoder = Box::new(L16::new(48_000, 20));
         full_band.egress_payload_type = 97;
-        conference.add_participant(full_band);
+        conference.add_participant(full_band).expect("seated");
         assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
         assert!(conference.participants[0].to_room.is_some(), "8 → 48 kHz");
         assert!(conference.participants[1].to_room.is_some(), "16 → 48 kHz");
@@ -4542,7 +4582,7 @@ mod tests {
             config.decoder = Box::new(L16::new(48_000, 20));
             config.encoder = Box::new(L16::new(48_000, 20));
             config.egress_payload_type = 96 + index as u8;
-            assert!(conference.add_participant(config));
+            assert!(conference.add_participant(config).is_ok());
         }
         assert_eq!(
             conference.room_rate(),
@@ -4575,8 +4615,8 @@ mod tests {
         let mut conference = Conference::new("opus-room".into(), 0);
         let (talker, _talker_log) = full_band_config(0, Box::new(Nyquist48Decoder), false);
         let (listener, listener_log) = full_band_config(1, Box::new(Nyquist48Decoder), false);
-        assert!(conference.add_participant(talker));
-        assert!(conference.add_participant(listener));
+        assert!(conference.add_participant(talker).is_ok());
+        assert!(conference.add_participant(listener).is_ok());
 
         assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
         assert_eq!(conference.room_frame(), 960, "48 kHz × 20 ms");
@@ -4630,14 +4670,16 @@ mod tests {
         let mut conference = Conference::new("mixed-room".into(), 0);
         // Seat 0: the full-band talker (a loud constant, so it survives the downsample as energy).
         let (talker, _talker_log) = wideband_config(0, 1, "10.0.0.1", "10.0.0.1:4000");
-        assert!(conference.add_participant(talker));
+        assert!(conference.add_participant(talker).is_ok());
         // Seats 1-2: G.711 (8 kHz) listeners. Seats 3-4: L16 (16 kHz) listeners. All stateless.
         for index in 1..3 {
-            assert!(conference.add_participant(ulaw_config(
-                index,
-                &format!("10.0.0.{}", index + 1),
-                &format!("10.0.0.{}:4000", index + 1),
-            )));
+            assert!(conference
+                .add_participant(ulaw_config(
+                    index,
+                    &format!("10.0.0.{}", index + 1),
+                    &format!("10.0.0.{}:4000", index + 1),
+                ))
+                .is_ok());
         }
         for index in 3..5 {
             let mut config = ulaw_config(
@@ -4648,7 +4690,7 @@ mod tests {
             config.decoder = Box::new(L16::new(16_000, 20));
             config.encoder = Box::new(L16::new(16_000, 20));
             config.egress_payload_type = 97;
-            assert!(conference.add_participant(config));
+            assert!(conference.add_participant(config).is_ok());
         }
         assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
 
@@ -4733,8 +4775,8 @@ mod tests {
         let mut conference = Conference::new("room".into(), 0);
         let (talker, _talker_log) = probe_config(0, 48_000, 20);
         let (long_ptime, long_log) = probe_config(1, 48_000, 60);
-        assert!(conference.add_participant(talker));
-        assert!(conference.add_participant(long_ptime));
+        assert!(conference.add_participant(talker).is_ok());
+        assert!(conference.add_participant(long_ptime).is_ok());
         assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
 
         // Only seat 0 speaks (level 6000, above the VAD threshold); seat 1 listens.
@@ -4799,8 +4841,8 @@ mod tests {
         let mut conference = Conference::new("room".into(), 0);
         let (talker, _talker_log) = probe_config(0, 48_000, 20);
         let (short_ptime, short_log) = probe_config(1, 48_000, 10);
-        assert!(conference.add_participant(talker));
-        assert!(conference.add_participant(short_ptime));
+        assert!(conference.add_participant(talker).is_ok());
+        assert!(conference.add_participant(short_ptime).is_ok());
 
         for sequence in 0..30 {
             assert!(conference
@@ -4842,8 +4884,8 @@ mod tests {
         let mut conference = Conference::new("room".into(), 0);
         let (long_ptime, _long_log) = probe_config(0, 48_000, 60);
         let (listener, listener_log) = probe_config(1, 48_000, 20);
-        assert!(conference.add_participant(long_ptime));
-        assert!(conference.add_participant(listener));
+        assert!(conference.add_participant(long_ptime).is_ok());
+        assert!(conference.add_participant(listener).is_ok());
 
         // Exactly four 60 ms packets = 240 ms of audio = 12 room ticks' worth.
         for sequence in 0..4 {
@@ -4886,13 +4928,15 @@ mod tests {
 
         let mut conference = Conference::new("room".into(), 0);
         let (talker, _log) = wideband_config(0, 1, "10.0.0.1", "10.0.0.1:4000");
-        assert!(conference.add_participant(talker));
-        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference.add_participant(talker).is_ok());
+        assert!(conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
         let mut wideband = ulaw_config(2, "10.0.0.3", "10.0.0.3:4000");
         wideband.decoder = Box::new(L16::new(16_000, 20));
         wideband.encoder = Box::new(L16::new(16_000, 20));
         wideband.egress_payload_type = 97;
-        assert!(conference.add_participant(wideband));
+        assert!(conference.add_participant(wideband).is_ok());
         assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
 
         let mut out = Vec::new();
@@ -4957,7 +5001,7 @@ mod tests {
         for index in 0..3 {
             let (config, log) =
                 full_band_config(index, Box::new(Wideband48Decoder { channels: 1 }), false);
-            assert!(conference.add_participant(config));
+            assert!(conference.add_participant(config).is_ok());
             logs.push(log);
         }
         assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
@@ -4996,11 +5040,13 @@ mod tests {
         // The 8 kHz fast path must still mix: three G.711 talkers, each hears the others, at 8 kHz.
         let mut conference = Conference::new("room".into(), 0);
         for index in 0..3 {
-            conference.add_participant(ulaw_config(
-                index,
-                &format!("10.0.0.{}", index + 1),
-                &format!("10.0.0.{}:4000", index + 1),
-            ));
+            conference
+                .add_participant(ulaw_config(
+                    index,
+                    &format!("10.0.0.{}", index + 1),
+                    &format!("10.0.0.{}:4000", index + 1),
+                ))
+                .expect("seated");
         }
         assert_eq!(conference.room_rate(), 8_000);
         let loud = [6000i16; 160];
@@ -5033,11 +5079,13 @@ mod tests {
         // its own RTP stream (distinct SSRC), and they decode to the talker's audio.
         let mut conference = Conference::new("room".into(), 0);
         for index in 0..3 {
-            conference.add_participant(ulaw_config(
-                index,
-                &format!("10.0.0.{}", index + 1),
-                &format!("10.0.0.{}:4000", index + 1),
-            ));
+            conference
+                .add_participant(ulaw_config(
+                    index,
+                    &format!("10.0.0.{}", index + 1),
+                    &format!("10.0.0.{}:4000", index + 1),
+                ))
+                .expect("seated");
         }
         let loud = [6000i16; 160];
         for sequence in 0..10 {
@@ -5084,9 +5132,13 @@ mod tests {
         wideband.decoder = Box::new(L16::new(16_000, 20));
         wideband.encoder = Box::new(L16::new(16_000, 20));
         wideband.egress_payload_type = 97;
-        conference.add_participant(wideband);
-        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
-        conference.add_participant(ulaw_config(2, "10.0.0.3", "10.0.0.3:4000"));
+        conference.add_participant(wideband).expect("seated");
+        conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .expect("seated");
+        conference
+            .add_participant(ulaw_config(2, "10.0.0.3", "10.0.0.3:4000"))
+            .expect("seated");
         assert_eq!(conference.room_rate(), 16_000, "wideband room");
 
         // A loud L16 RTP frame (320 samples @ 16 kHz).
@@ -5148,7 +5200,9 @@ mod tests {
         // An RFC 4733 telephone-event packet is detected as a DTMF press and surfaced on the control
         // channel — never fed to the audio decoder.
         let mut conference = Conference::new("room".into(), 0);
-        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
+        conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .expect("seated");
         // Event 5, End bit set, volume 10, duration 0x0320 = 800 samples (RFC 4733).
         let event_payload = [5u8, 0x80 | 10, 0x03, 0x20];
         let header = RtpHeader {
@@ -5187,8 +5241,12 @@ mod tests {
         use siphon_rtp_media::rtcp::{parse_compound, RtcpPacket};
 
         let mut conference = Conference::new("room".into(), 0);
-        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
-        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+        conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .expect("seated");
+        conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .expect("seated");
         let loud = [6000i16; 160];
         for sequence in 0..10 {
             conference.ingest(&rx(1, "10.0.0.1:5000", ulaw_rtp(0, sequence, &loud)));
@@ -5232,7 +5290,9 @@ mod tests {
         use siphon_rtp_media::rtcp::{parse_compound, RtcpPacket};
 
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")));
+        assert!(conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .is_ok());
 
         // Four audio packets whose arrivals drift off their RTP timestamps build interarrival jitter
         // (the schedule the MediaLeg unit test uses — jitter settles at 9 RTP units, RFC 3550 §6.4.1).
@@ -5281,7 +5341,9 @@ mod tests {
     #[test]
     fn quality_events_carry_jitter_loss_and_mos() {
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")));
+        assert!(conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .is_ok());
 
         // In-order audio with drifting arrivals: builds jitter, no loss (RFC 3550 §6.4.1).
         let pcm = [3000i16; 160];
@@ -5330,7 +5392,9 @@ mod tests {
         // peer replies with a reception report on the engine's egress SSRC echoing that LSR + a DLSR,
         // and the engine derives RTT — halved into the E-model one-way delay, which lowers the MOS.
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")));
+        assert!(conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .is_ok());
 
         // In-order audio so there is an inbound stream to report on (no loss).
         let pcm = [3000i16; 160];
@@ -5417,12 +5481,14 @@ mod tests {
         use siphon_rtp_codec::Decoder as _;
 
         let mut conference = Conference::new("room".into(), 0);
-        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
+        conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .expect("seated");
         let mut wideband = ulaw_config(1, "10.0.0.2", "10.0.0.2:4000");
         wideband.decoder = Box::new(AmrWb::new());
         wideband.encoder = Box::new(AmrWb::new());
         wideband.egress_payload_type = 96;
-        conference.add_participant(wideband);
+        conference.add_participant(wideband).expect("seated");
         assert_eq!(
             conference.room_rate(),
             16_000,
@@ -5471,8 +5537,10 @@ mod tests {
         let mut conference = Conference::new("room".into(), 0);
         let mut secure = ulaw_config(0, "10.0.0.1", "10.0.0.1:4000");
         secure.secure = Some(SecureLeg::new(&local.key, &remote.key));
-        conference.add_participant(secure);
-        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+        conference.add_participant(secure).expect("seated");
+        conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .expect("seated");
 
         // The secure leg's UA encrypts its audio with the remote key; the plain leg sends plaintext.
         let mut peer_encrypt = SrtpContext::from_key_material(&remote.key);
@@ -5540,7 +5608,7 @@ mod tests {
         let mut secure = ulaw_config(0, "10.0.0.1", "10.0.0.1:4000");
         secure.secure = Some(SecureLeg::new(&local.key, &remote.key));
         secure.latch = true; // symmetric-RTP: follow the participant to its real source
-        conference.add_participant(secure);
+        conference.add_participant(secure).expect("seated");
 
         // An authentic packet (encrypted by the peer) from a fresh source port latches the reply.
         let mut peer_encrypt = SrtpContext::from_key_material(&remote.key);
@@ -5586,8 +5654,12 @@ mod tests {
         // Media must follow ICE's decision, not race it. Without this gate the room would mix
         // whatever arrived first — the blind latch the connectivity check exists to replace.
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
-        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference
+            .add_participant(ice_config_pending(0, "10.0.0.1:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
 
         let gated_in = conference
             .ingest(&rx(1, "10.0.0.1:5000", ulaw_rtp(0, 1, &loud_frame())))
@@ -5603,8 +5675,12 @@ mod tests {
         // The signalled c= address of a NATed ICE peer is typically one it cannot receive on, so
         // sending the mix there before selection would leak the room to a third party or nowhere.
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
-        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference
+            .add_participant(ice_config_pending(0, "10.0.0.1:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
         // Give the room something to mix, from the *other* (non-ICE) participant.
         conference.ingest(&rx(2, "10.0.0.2:5000", ulaw_rtp(1, 1, &loud_frame())));
 
@@ -5619,8 +5695,12 @@ mod tests {
     #[test]
     fn ice_selection_opens_the_path_and_repoints_egress_at_the_selected_pair() {
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
-        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference
+            .add_participant(ice_config_pending(0, "10.0.0.1:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
 
         // The agent selects a peer-reflexive transport — deliberately neither the signalled address
         // nor its port, which is the whole point of ICE for a NATed peer.
@@ -5649,7 +5729,9 @@ mod tests {
         // The window before selection runs with SourceFilter::Any so a peer-reflexive check is not
         // dropped by address. Selection must close that window, not leave it open.
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
+        assert!(conference
+            .add_participant(ice_config_pending(0, "10.0.0.1:4000"))
+            .is_ok());
         conference.ice_selected("party-0", addr("203.0.113.9:60000"));
 
         assert!(
@@ -5664,7 +5746,9 @@ mod tests {
     fn ice_selection_for_a_departed_participant_is_discarded() {
         // A selection can race a leave; it must not panic or resurrect a seat.
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
+        assert!(conference
+            .add_participant(ice_config_pending(0, "10.0.0.1:4000"))
+            .is_ok());
         conference.remove_participant("party-0");
         conference.ice_selected("party-0", addr("203.0.113.9:60000"));
         assert!(conference.is_empty());
@@ -5674,8 +5758,12 @@ mod tests {
     fn an_ice_pending_seat_gets_no_rtcp_sender_report() {
         // There is no agreed path to send one on yet, and the signalled address may be unreachable.
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
-        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference
+            .add_participant(ice_config_pending(0, "10.0.0.1:4000"))
+            .is_ok());
+        assert!(conference
+            .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
+            .is_ok());
 
         let mut out = Vec::new();
         // The per-participant SR goes out every RTCP_INTERVAL_TICKS ticks; drive well past one.
@@ -5692,10 +5780,87 @@ mod tests {
     #[test]
     fn duplicate_tag_is_rejected() {
         let mut conference = Conference::new("room".into(), 0);
-        assert!(conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")));
+        assert!(conference
+            .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
+            .is_ok());
         let mut duplicate = ulaw_config(9, "10.0.0.9", "10.0.0.9:4000");
         duplicate.tag = "party-0".into();
-        assert!(!conference.add_participant(duplicate), "tag already seated");
+        assert_eq!(
+            conference.add_participant(duplicate),
+            Err(SeatRefusal::DuplicateTag("party-0".into())),
+            "tag already seated"
+        );
+    }
+
+    #[test]
+    fn a_seat_beyond_the_room_cap_is_refused_as_full() {
+        let mut conference = Conference::new("room".into(), 0);
+        for index in 0..MAX_PARTICIPANTS {
+            conference
+                .add_participant(ulaw_config(index, "192.0.2.1", "192.0.2.1:4000"))
+                .expect("seated");
+        }
+        assert_eq!(
+            conference.add_participant(ulaw_config(
+                MAX_PARTICIPANTS,
+                "192.0.2.1",
+                "192.0.2.1:4000"
+            )),
+            Err(SeatRefusal::RoomFull)
+        );
+        assert_eq!(conference.participant_count(), MAX_PARTICIPANTS);
+    }
+
+    /// The registry answers a join with the room actor's verdict. A seat the room refuses leaves no
+    /// member, no route and, when it was the room's first, no room behind; a second join under a
+    /// seated tag is refused without disturbing the first.
+    #[tokio::test]
+    async fn the_registry_answers_a_join_with_the_rooms_verdict() {
+        use siphon_rtp_codec::l16::L16;
+
+        let registry = ConferenceRegistry::default();
+        let datapath = siphon_rtp_datapath::udp::UdpLoopbackDatapath::new();
+        let mismatched = ParticipantConfig {
+            decoder: Box::new(L16::new(16_000, 20)),
+            encoder: Box::new(L16::new(16_000, 40)),
+            ..ulaw_config(0, "192.0.2.1", "192.0.2.1:4000")
+        };
+        let refused = registry
+            .join("room", mismatched, 0, false, datapath.clone(), None)
+            .await;
+        assert!(
+            matches!(refused, Err(SeatRefusal::Mismatch { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            !registry.contains("room"),
+            "a refused first seat leaves no room"
+        );
+        assert!(!registry.owns(EndpointId(1)), "nor a route");
+
+        let seated = ulaw_config(0, "192.0.2.1", "192.0.2.1:4000");
+        registry
+            .join("room", seated, 0, false, datapath.clone(), None)
+            .await
+            .expect("seated");
+        let mut duplicate = ulaw_config(1, "192.0.2.2", "192.0.2.2:4000");
+        duplicate.tag = "party-0".into();
+        assert_eq!(
+            registry
+                .join("room", duplicate, 0, false, datapath.clone(), None)
+                .await,
+            Err(SeatRefusal::DuplicateTag("party-0".into()))
+        );
+        assert_eq!(registry.participant_count(), 1);
+        assert_eq!(
+            registry.participant_at_tag("room", "party-0"),
+            Some(EndpointId(1)),
+            "the first seat keeps its endpoint"
+        );
+        assert!(
+            !registry.owns(EndpointId(2)),
+            "the refused seat is not routed"
+        );
     }
 
     proptest::proptest! {
@@ -5715,10 +5880,10 @@ mod tests {
             let local = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("local");
             let remote = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("remote");
             let mut conference = Conference::new("fuzz".into(), 0);
-            conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")); // plain (endpoint 1)
+            conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")).expect("seated"); // plain (endpoint 1)
             let mut secure = ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"); // SRTP (endpoint 2)
             secure.secure = Some(SecureLeg::new(&local.key, &remote.key));
-            conference.add_participant(secure);
+            conference.add_participant(secure).expect("seated");
 
             let mut out = Vec::new();
             for (endpoint, data) in packets {
