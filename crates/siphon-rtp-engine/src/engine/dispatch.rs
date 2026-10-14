@@ -310,6 +310,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sdp,
                 profile,
             } => {
+                // A far leg `offer_far` offered has no party behind it yet, and the caller already
+                // holds the answer the local pipeline gave it; there is nothing to renegotiate toward.
+                if self.owned_call(client, &call_id, super::Call::far_offer_pending) == Some(true) {
+                    return CmdResult::Error {
+                        reason: "reoffer: far-offer-pending: the far leg offer_far offered is not \
+                                 answered yet; answer it or delete it first"
+                            .to_string(),
+                    };
+                }
                 self.reoffer(client, &call_id, &from_tag, &sdp, &profile)
                     .await
             }
@@ -356,7 +365,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 profile,
             } => {
                 let result = self
-                    .answer(client, &call_id, &from_tag, to_tag, &sdp, &profile)
+                    .answer_or_complete_far(client, &call_id, &from_tag, to_tag, &sdp, &profile)
                     .await;
                 self.apply_profile_ws_tee(&call_id, &profile, result).await
             }
@@ -371,6 +380,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .await;
                 self.apply_profile_ws_tee(&call_id, &profile, result).await
             }
+            Command::OfferFar {
+                call_id,
+                from_tag,
+                profile,
+            } => self.offer_far(client, &call_id, &from_tag, &profile).await,
+            Command::Delete {
+                call_id,
+                to_tag: Some(to_tag),
+                ..
+            } => match self.delete_far_leg(client, &call_id, &to_tag).await {
+                Some(result) => result,
+                None => self.delete(client, &call_id).await,
+            },
             Command::Delete { call_id, .. } => self.delete(client, &call_id).await,
             Command::Query { call_id, .. } => self.query(client, &call_id),
             Command::BlockMedia { call_id, .. } => self.set_block(client, &call_id, true).await,
@@ -731,6 +753,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::IceCandidate { .. } => "ice_candidate",
         Command::Answer { .. } => "answer",
         Command::AnswerLocal { .. } => "answer_local",
+        Command::OfferFar { .. } => "offer_far",
         Command::Delete { .. } => "delete",
         Command::Query { .. } => "query",
         Command::Ping => "ping",
@@ -792,6 +815,7 @@ pub(super) fn command_call_id(command: &Command) -> Option<&str> {
         | Command::IceCandidate { call_id, .. }
         | Command::Answer { call_id, .. }
         | Command::AnswerLocal { call_id, .. }
+        | Command::OfferFar { call_id, .. }
         | Command::Delete { call_id, .. }
         | Command::Query { call_id, .. }
         | Command::Checkpoint { call_id, .. }

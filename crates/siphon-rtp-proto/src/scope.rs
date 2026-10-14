@@ -118,6 +118,7 @@ impl Command {
             | Command::IceCandidate { call_id, .. }
             | Command::Answer { call_id, .. }
             | Command::AnswerLocal { call_id, .. }
+            | Command::OfferFar { call_id, .. }
             | Command::Delete { call_id, .. }
             | Command::Query { call_id, .. }
             | Command::Checkpoint { call_id, .. }

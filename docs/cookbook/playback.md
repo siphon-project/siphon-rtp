@@ -6,6 +6,7 @@ mixed underneath it, a music bed that ducks when the announcement starts. One ve
 
 - [Supersede or overlay](#supersede-or-overlay)
 - [Playing an announcement](#playing-an-announcement)
+- [An announcement, then the callee](#an-announcement-then-the-callee)
 - [Ringback while a leg rings](#ringback-while-a-leg-rings)
 - [Hold music, ducked under a prompt](#hold-music-ducked-under-a-prompt)
 - [Where the audio comes from](#where-the-audio-comes-from)
@@ -66,6 +67,31 @@ The classic: answer locally, say something, then act on the completion.
 Only `completed` means it played out in full. `stopped`, `superseded` and `error` all
 resolve an await as *not* completed, so a script never runs its next step on a prompt that
 never finished.
+
+## An announcement, then the callee
+
+A caller hears a prompt in early media (a 183 carrying the engine's `answer_local` answer)
+and is then put through to the callee. The caller already holds an answer, and it may not be
+given another for the same INVITE (RFC 3261 §13.2.1, RFC 3264 §8), so the callee is connected
+behind the answer the caller has rather than through a new one:
+
+1. `answer_local` on the caller's offer; send its SDP in the 183, then `play_media`.
+2. `offer_far` on the same call: the SDP it returns is the offer for the INVITE to the callee.
+   The prompt keeps playing.
+3. The callee's first SDP (18x or 2xx) goes to `answer` with the callee's `to_tag`. The prompt
+   stops, the two legs are relayed on the caller's own port (transcoded when the callee picked
+   another codec), and the SDP returned is the caller's 183 answer, byte for byte. Send that, or no
+   body at all, in the caller's 2xx.
+4. If the callee refuses, `delete` with its `to_tag`: the far leg goes and the caller is back on
+   the local pipeline, ready for another prompt or another `offer_far`.
+
+```json
+{"id": 20, "command": "offer_far", "call_id": "7f9a2b1c@198.51.100.20", "from_tag": "a7c31f"}
+```
+
+The callee is offered the caller's codec first, so an answer on it is a plain relay. A callee that
+picks a codec the offer did not list is refused (`codec-not-offered`) and left for the controller to
+release with a 488.
 
 ## Ringback while a leg rings
 

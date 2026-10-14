@@ -32,6 +32,7 @@ mod negotiate;
 
 pub(crate) use media_started::MEDIA_STARTED_POLL_MS;
 mod offer;
+mod offer_far;
 mod play;
 mod promote;
 mod record;
@@ -612,6 +613,9 @@ struct Call {
     /// `None` for a plaintext / audio-only call. (HA follow-up: the HA `CallSnapshot` does not yet carry
     /// this — secure-text HA restore is deferred.)
     near_text_local_crypto: Option<CryptoAttribute>,
+    /// What an `answer_local` call keeps so `offer_far` can grow a far leg on it and a `delete` with a
+    /// `to_tag` can take it back (see [`offer_far`]). `None` on every other call.
+    local_answer: Option<Box<offer_far::LocalAnswer>>,
 }
 
 /// A DTLS-SRTP offerer the engine terminates (RFC 5764): A's keying from its offer, and what the
@@ -862,6 +866,11 @@ impl Call {
     /// would "restore" into a two-party relay that never existed — the caller is told plainly instead.
     fn to_snapshot(&self) -> Option<crate::ha::CallSnapshot> {
         use crate::ha;
+        // A far leg `offer_far` offered is not a second party yet: the caller is still on the local
+        // pipeline, which the two-leg record cannot describe.
+        if self.far_offer_pending() {
+            return None;
+        }
         let far = self.far.as_ref()?;
         let flows = self
             .relay_flows
