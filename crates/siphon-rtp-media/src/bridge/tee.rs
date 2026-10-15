@@ -172,6 +172,10 @@ pub struct TeeMixer {
     callee_only: bool,
     /// Channels whose sink has been dropped: nothing more will arrive, so nothing waits for it.
     closed: [bool; 2],
+    /// Live sinks per channel. A renegotiation replaces a party's sink with one built for the new
+    /// media path, and the old one may be dropped before or after the new one attaches; a channel
+    /// is closed only when its *last* sink goes, and reopened when a sink attaches again.
+    sinks: [u32; 2],
     /// Samples **per channel** in one wire frame.
     frame_samples: usize,
     /// Scratch for one ring read (preallocated).
@@ -226,6 +230,7 @@ impl TeeMixer {
             stereo_source,
             callee_only,
             closed: [false; 2],
+            sinks: [0; 2],
             frame_samples,
             channel_scratch: vec![0i16; frame_samples],
             wire_scratch: vec![0i16; frame_samples * usize::from(channels)],
@@ -313,14 +318,23 @@ impl TeeMixer {
         }
     }
 
+    /// A sink for `channel` attached: the party is (again) one a frame waits for.
+    fn open(&mut self, channel: TeeChannel) {
+        let index = channel.index();
+        self.sinks[index] = self.sinks[index].saturating_add(1);
+        self.closed[index] = false;
+    }
+
     /// `channel`'s sink is gone, so nothing more arrives on it. Whatever the other party still has
     /// waiting goes out against silence instead of waiting for audio that will never come — the
     /// tail of a recording is not lost because one side stopped first.
     fn close(&mut self, channel: TeeChannel) {
-        if !self.stereo_source {
+        let index = channel.index();
+        self.sinks[index] = self.sinks[index].saturating_sub(1);
+        if !self.stereo_source || self.sinks[index] > 0 {
             return;
         }
-        self.closed[channel.index()] = true;
+        self.closed[index] = true;
         while self.frame_ready() {
             self.emit();
         }
@@ -413,6 +427,9 @@ impl WsTeeSink {
             ),
             None => Vec::new(),
         };
+        if let Ok(mut guard) = mixer.lock() {
+            guard.open(channel);
+        }
         Self {
             channel,
             mixer,
@@ -799,6 +816,43 @@ mod tests {
             plan.frames.try_recv().is_err(),
             "nothing is invented at the end"
         );
+    }
+
+    #[test]
+    fn a_partys_replacement_sink_keeps_the_frame_waiting_for_it() {
+        // A renegotiation re-taps the call: each party's sink is replaced by one built for the new
+        // media path. Whichever order the old sink goes and the new one arrives in, the party is
+        // still there, so a frame keeps waiting for its side instead of going out half silent.
+        let plan = plan_ws_tee(format(8000, 2), true, false);
+        let mut caller = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee-1", None);
+        let old_callee = WsTeeSink::new(TeeChannel::Callee, plan.mixer.clone(), "tee-1", None);
+        let mut new_callee = WsTeeSink::new(TeeChannel::Callee, plan.mixer.clone(), "tee-2", None);
+        drop(old_callee);
+        caller.write_pcm(&[9i16; 160]);
+        assert!(
+            plan.frames.try_recv().is_err(),
+            "the callee's new sink is attached, so the frame waits for it"
+        );
+        new_callee.write_pcm(&[7i16; 160]);
+        let frame = samples(&plan.frames.try_recv().expect("a full stereo frame"));
+        assert!(frame.iter().step_by(2).all(|&sample| sample == 9));
+        assert!(frame.iter().skip(1).step_by(2).all(|&sample| sample == 7));
+
+        // The other order: the old sink is dropped first, then its replacement arrives.
+        drop(new_callee);
+        caller.write_pcm(&[9i16; 160]);
+        assert!(
+            plan.frames.try_recv().is_ok(),
+            "nothing waits while the callee has no sink"
+        );
+        let mut replacement = WsTeeSink::new(TeeChannel::Callee, plan.mixer.clone(), "tee-3", None);
+        caller.write_pcm(&[9i16; 160]);
+        assert!(
+            plan.frames.try_recv().is_err(),
+            "a re-attached party is waited for again"
+        );
+        replacement.write_pcm(&[7i16; 160]);
+        assert!(plan.frames.try_recv().is_ok());
     }
 
     #[test]

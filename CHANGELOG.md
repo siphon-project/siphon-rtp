@@ -25,6 +25,18 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **A WebSocket tee and a SIPREC fork keep streaming after a re-offer.** The answer that completes
+  a re-offer (a hold, a resume, a codec change) re-installs the call's media path. On a plain relay
+  that wrote the in-kernel `Forward` rule over the `Redirect` the tee's promotion had taken, so the
+  promoted actor stayed registered with the tee's sinks and the SRS raw tee on it and was never fed
+  again: the tee kept its socket open, `frames_sent` stopped and no `ws_tee_ended` came. On a path
+  that now transcodes, the answer's fresh actor replaced the old one and everything attached to it.
+  The answer now retires a stranded actor, holds the relay in userspace again as its holds require,
+  re-attaches every answered subscription's raw tee, and re-taps the tee from the codecs the legs
+  carry now, converted into the rate and channel layout it announced in `start`. A tee that cannot
+  follow the new path is ended with `call_ended` so the controller can re-attach it. Not yet carried
+  across a re-offer: a pcap or decoded recording, a DTMF block and an X3 interception.
+
 - **`conference_join` seats a participant in a codec the room can bridge, and refuses a seat it
   cannot hold.** A join took the offer's first audio codec and nothing else, and never read the
   profile's codec flags, so a VoLTE terminal whose offer lists EVS first was refused although it
