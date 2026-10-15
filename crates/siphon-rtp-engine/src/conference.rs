@@ -52,7 +52,9 @@ use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::media_pipeline::{Outbound, PlayRequest};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 
+mod bridge;
 pub mod seat;
+pub use bridge::UnbridgeRefusal;
 pub use seat::{SeatRefusal, SEAT_VERDICT_TIMEOUT};
 
 /// The narrowband fast-path room rate (all-G.711/G.726/PSTN, unbridged).
@@ -400,9 +402,10 @@ pub struct Conference {
     /// Room bridges (live-configurable, plan §7): each tick this room feeds its participant mix to
     /// every `bridge_out` and hears every `bridge_in` as an extra contributor. A bridged room is
     /// forced to [`BRIDGE_RATE_HZ`], so both ends of a bridge share the rate and no inter-room
-    /// resampling is needed.
-    bridge_in: Vec<flume::Receiver<Vec<i16>>>,
-    bridge_out: Vec<flume::Sender<Vec<i16>>>,
+    /// resampling is needed. Each channel is keyed by the room on its other end, which is what
+    /// `conference_unbridge` removes it by.
+    bridge_in: Vec<(String, flume::Receiver<Vec<i16>>)>,
+    bridge_out: Vec<(String, flume::Sender<Vec<i16>>)>,
     /// Playbacks mixed **into** the room as a non-participant source: an entry tone, a
     /// "this conference is being recorded" announcement, hold music for a lone participant. Up to
     /// [`siphon_rtp_media::playback::MAX_OVERLAY_SLOTS`] at once, exactly as a leg's overlays.
@@ -1685,7 +1688,7 @@ impl Conference {
             *slot = 0;
         }
         let mut have = false;
-        for receiver in &self.bridge_in {
+        for (_, receiver) in &self.bridge_in {
             let mut latest = None;
             while let Ok(frame) = receiver.try_recv() {
                 latest = Some(frame); // keep only the newest (one-frame latency)
@@ -1881,21 +1884,21 @@ impl Conference {
             return;
         }
         let mix = self.mixer.participant_mix();
-        for sender in &self.bridge_out {
+        for (_, sender) in &self.bridge_out {
             let _ = sender.try_send(mix.to_vec());
         }
     }
 
     /// Attach an inbound bridge channel (this room will hear the room on the other end). Bridging
     /// forces the room to the wideband rate so both ends share it (no inter-room resampling).
-    pub fn add_bridge_in(&mut self, receiver: flume::Receiver<Vec<i16>>) {
-        self.bridge_in.push(receiver);
+    pub fn add_bridge_in(&mut self, peer: String, receiver: flume::Receiver<Vec<i16>>) {
+        self.bridge_in.push((peer, receiver));
         self.recompute_room_rate();
     }
 
     /// Attach an outbound bridge channel (this room feeds its participant mix to the other end).
-    pub fn add_bridge_out(&mut self, sender: flume::Sender<Vec<i16>>) {
-        self.bridge_out.push(sender);
+    pub fn add_bridge_out(&mut self, peer: String, sender: flume::Sender<Vec<i16>>) {
+        self.bridge_out.push((peer, sender));
         self.recompute_room_rate();
     }
 
@@ -2049,10 +2052,12 @@ pub enum ConferenceControl {
     Route(String, Routing),
     /// Set the active-speaker cap.
     SetTopM(usize),
-    /// Attach an inbound bridge channel — hear another room (plan §7 room bridging).
-    AddBridgeIn(flume::Receiver<BridgeFrame>),
-    /// Attach an outbound bridge channel — feed this room's participant mix to another room.
-    AddBridgeOut(flume::Sender<BridgeFrame>),
+    /// Attach an inbound bridge channel — hear the named room (plan §7 room bridging).
+    AddBridgeIn(String, flume::Receiver<BridgeFrame>),
+    /// Attach an outbound bridge channel — feed this room's participant mix to the named room.
+    AddBridgeOut(String, flume::Sender<BridgeFrame>),
+    /// Drop every bridge channel to or from the named room, in both directions.
+    RemoveBridge(String),
     /// Start a playback into the room. `reply` carries the actor's verdict, so a slot cap or a rate
     /// the engine cannot serve is answered as an error rather than as a hollow success.
     StartPlay {
@@ -2181,11 +2186,14 @@ async fn run_conference<D>(
                     ConferenceInput::Control(ConferenceControl::RemoveRoomTapTagged { tag }) => {
                         conference.remove_room_taps_tagged(&tag);
                     }
-                    ConferenceInput::Control(ConferenceControl::AddBridgeIn(receiver)) => {
-                        conference.add_bridge_in(receiver);
+                    ConferenceInput::Control(ConferenceControl::AddBridgeIn(peer, receiver)) => {
+                        conference.add_bridge_in(peer, receiver);
                     }
-                    ConferenceInput::Control(ConferenceControl::AddBridgeOut(sender)) => {
-                        conference.add_bridge_out(sender);
+                    ConferenceInput::Control(ConferenceControl::AddBridgeOut(peer, sender)) => {
+                        conference.add_bridge_out(peer, sender);
+                    }
+                    ConferenceInput::Control(ConferenceControl::RemoveBridge(peer)) => {
+                        conference.remove_bridges_with(&peer);
                     }
                     ConferenceInput::Control(ConferenceControl::AttachSecureLeg { tag, leg }) => {
                         conference.attach_secure_leg(&tag, *leg);
@@ -2352,6 +2360,8 @@ struct ConferenceMember {
 struct ConferenceHandle {
     mailbox: flume::Sender<ConferenceInput>,
     members: Vec<ConferenceMember>,
+    /// The rooms this one is bridged with, in either direction ([`ConferenceRegistry::bridge`]).
+    bridged_with: Vec<String>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -2448,6 +2458,7 @@ impl ConferenceRegistry {
                     ConferenceHandle {
                         mailbox,
                         members: Vec::new(),
+                        bridged_with: Vec::new(),
                         task,
                     }
                 });
@@ -2555,6 +2566,7 @@ impl ConferenceRegistry {
                     .mailbox
                     .try_send(ConferenceInput::Control(ConferenceControl::Stop));
                 handle.task.abort();
+                self.forget_bridges(conference_id, &handle.bridged_with);
             }
         }
         endpoints
@@ -2628,20 +2640,27 @@ impl ConferenceRegistry {
         if a_to_b {
             let (sender, receiver) = flume::bounded(2);
             let _ = mailbox_a.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeOut(
+                room_b.to_string(),
                 sender,
             )));
             let _ = mailbox_b.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeIn(
+                room_a.to_string(),
                 receiver,
             )));
         }
         if b_to_a {
             let (sender, receiver) = flume::bounded(2);
             let _ = mailbox_b.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeOut(
+                room_a.to_string(),
                 sender,
             )));
             let _ = mailbox_a.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeIn(
+                room_b.to_string(),
                 receiver,
             )));
+        }
+        if a_to_b || b_to_a {
+            self.record_bridge(room_a, room_b);
         }
         true
     }
@@ -2664,6 +2683,7 @@ impl ConferenceRegistry {
             self.routes.remove(endpoint);
         }
         handle.task.abort();
+        self.forget_bridges(conference_id, &handle.bridged_with);
         endpoints
     }
 
@@ -2734,6 +2754,7 @@ impl ConferenceRegistry {
                     .mailbox
                     .try_send(ConferenceInput::Control(ConferenceControl::Stop));
                 handle.task.abort();
+                self.forget_bridges(&conference_id, &handle.bridged_with);
             }
         }
         freed
@@ -4362,13 +4383,13 @@ mod tests {
         room_a
             .add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"))
             .expect("seated");
-        room_a.add_bridge_out(bridge_sender);
+        room_a.add_bridge_out("b".into(), bridge_sender);
 
         let mut room_b = Conference::new("b".into(), 0);
         room_b
             .add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"))
             .expect("seated");
-        room_b.add_bridge_in(bridge_receiver);
+        room_b.add_bridge_in("a".into(), bridge_receiver);
 
         let loud = [6000i16; 160];
         for sequence in 0..10 {
@@ -4443,7 +4464,7 @@ mod tests {
 
         // Bridging forces the wideband rate even for an all-narrowband room.
         let (sender, _receiver) = flume::bounded(2);
-        conference.add_bridge_out(sender);
+        conference.add_bridge_out("other".into(), sender);
         assert_eq!(conference.room_rate(), 16_000, "a bridge forces 16 kHz");
     }
 
@@ -4591,7 +4612,7 @@ mod tests {
         );
 
         let (sender, _receiver) = flume::bounded(2);
-        conference.add_bridge_out(sender);
+        conference.add_bridge_out("other".into(), sender);
         assert_eq!(
             conference.room_rate(),
             BRIDGE_RATE_HZ,

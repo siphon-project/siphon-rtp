@@ -286,16 +286,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"could not mint ICE credentials (OS RNG unavailable)",
             );
         }
+        // A tag the room has offered a seat to is that seat's until it is answered, left or expired.
+        if self.has_pending_seat(conference_id, &from_tag) {
+            return error_result(
+                "conference_join",
+                &format!("from-tag {from_tag} has a conference_offer awaiting its answer"),
+            );
+        }
         // The participant's codec, chosen before anything is allocated, so a seat the room could not
         // hold is refused here with the reason for each offered codec.
-        let SeatCodec {
-            spec: codec,
-            decoder,
-            encoder,
-        } = match seat_codec(&info, profile) {
+        let seat = match seat_codec(&info, profile) {
             Ok(seat) => seat,
             Err(reason) => return error_result("conference_join", &reason),
         };
+        let codec = seat.spec.clone();
         let telephone_event =
             sdp::TelephoneEvent::accompanying(&info.telephone_events(), Some(&codec));
         // One engine endpoint in the offer's address family, redirected to the conference actor. A
@@ -447,62 +451,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(text) => text,
             Err(result) => return *result,
         };
-        let config = ParticipantConfig {
-            tag: from_tag.clone(),
-            decoder,
-            encoder,
-            ingress_endpoint: endpoint.id,
-            egress_endpoint: endpoint.id,
-            egress_dst: info.remote_rtp,
-            accepted_source,
-            latch: true,
-            egress_ssrc: random_ssrc(),
-            egress_payload_type: codec.payload_type,
-            secure_pending: dtls_leg,
-            ice_pending,
-            mos_codec: crate::conference::hep_codec_for_name(&codec.encoding_name),
-            telephone_event_in: telephone_event.map(|event| event.payload_type),
-            secure,
-            text: text_config,
-            routing: routing_of(role),
-            telemetry: crate::conference::SeatTelemetry {
-                local: Some(endpoint.local_addr),
-                sip_call_id: profile.sip_call_id.clone(),
-            },
-        };
-        let events = self.event_sink(client);
-        let joined_tick = self.datapath.now_ticks();
-        // A seat that offered `a=recvonly` / `a=inactive` told us it will not send (RFC 4566 §6), so
-        // the idle sweep must not read its silence as a dead path — a held seat and a listen-only
-        // attendee are both legitimately quiet for the whole conference.
-        let held = !info.direction.peer_sends();
-        if let Err(refusal) = self
-            .conference
-            .join(
+        let seated = self
+            .seat_participant(
+                client,
                 conference_id,
-                config,
-                joined_tick,
-                held,
-                self.datapath.clone(),
-                events,
+                SeatRequest {
+                    tag: from_tag.clone(),
+                    codec: seat,
+                    telephone_event,
+                    endpoint,
+                    remote_rtp: info.remote_rtp,
+                    accepted_source,
+                    secure,
+                    secure_pending: dtls_leg,
+                    ice_pending,
+                    text: text_config,
+                    text_endpoint,
+                    role,
+                    sip_call_id: profile.sip_call_id.clone(),
+                    // A seat that offered `a=recvonly` / `a=inactive` told us it will not send (RFC
+                    // 4566 §6).
+                    held: !info.direction.peer_sends(),
+                },
             )
-            .await
-        {
-            let mut to_free = vec![endpoint];
-            to_free.extend(text_endpoint);
-            self.free(&to_free).await;
+            .await;
+        if let Err(refusal) = seated {
             return error_result("conference_join", &refusal);
-        }
-        // Seated: aim the room's egress at whatever ICE validates for this seat, for as long as it is
-        // seated. A no-op on a seat without ICE.
-        self.follow_seat_ice(endpoint.id);
-        self.endpoint_calls
-            .insert(endpoint.id, conference_id.to_string());
-        // The text endpoint is correlated to the same conference, so RTCP telemetry / reap accounting
-        // and teardown treat it as this room's (RFC 9071).
-        if let Some(text_endpoint) = text_endpoint {
-            self.endpoint_calls
-                .insert(text_endpoint.id, conference_id.to_string());
         }
 
         // A DTLS seat needs the handshake in front of its endpoint: the bridge keeps the RFC 7983
@@ -627,6 +601,90 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Seat a participant whose media is already negotiated, whichever verb negotiated it:
+    /// `conference_join` answering the participant's offer, or `conference_answer` taking the
+    /// participant's answer to the engine's own. Creates the room on its first seat, waits for the
+    /// room's verdict, and on a refusal frees the seat's endpoints before returning the reason.
+    pub(super) async fn seat_participant(
+        &self,
+        client: ClientId,
+        conference_id: &str,
+        request: SeatRequest,
+    ) -> Result<(), crate::conference::SeatRefusal> {
+        let SeatRequest {
+            tag,
+            codec,
+            telephone_event,
+            endpoint,
+            remote_rtp,
+            accepted_source,
+            secure,
+            secure_pending,
+            ice_pending,
+            text,
+            text_endpoint,
+            role,
+            sip_call_id,
+            held,
+        } = request;
+        let config = ParticipantConfig {
+            tag,
+            decoder: codec.decoder,
+            encoder: codec.encoder,
+            ingress_endpoint: endpoint.id,
+            egress_endpoint: endpoint.id,
+            egress_dst: remote_rtp,
+            accepted_source,
+            latch: true,
+            egress_ssrc: random_ssrc(),
+            egress_payload_type: codec.spec.payload_type,
+            secure_pending,
+            ice_pending,
+            mos_codec: crate::conference::hep_codec_for_name(&codec.spec.encoding_name),
+            telephone_event_in: telephone_event.map(|event| event.payload_type),
+            secure,
+            text,
+            routing: routing_of(role),
+            telemetry: crate::conference::SeatTelemetry {
+                local: Some(endpoint.local_addr),
+                sip_call_id,
+            },
+        };
+        let events = self.event_sink(client);
+        let joined_tick = self.datapath.now_ticks();
+        // A held seat and a listen-only attendee are both legitimately quiet for the whole
+        // conference, so the idle sweep must not read their silence as a dead path.
+        if let Err(refusal) = self
+            .conference
+            .join(
+                conference_id,
+                config,
+                joined_tick,
+                held,
+                self.datapath.clone(),
+                events,
+            )
+            .await
+        {
+            let mut to_free = vec![endpoint];
+            to_free.extend(text_endpoint);
+            self.free(&to_free).await;
+            return Err(refusal);
+        }
+        // Seated: aim the room's egress at whatever ICE validates for this seat, for as long as it is
+        // seated. A no-op on a seat without ICE.
+        self.follow_seat_ice(endpoint.id);
+        self.endpoint_calls
+            .insert(endpoint.id, conference_id.to_string());
+        // The text endpoint is correlated to the same conference, so RTCP telemetry / reap accounting
+        // and teardown treat it as this room's (RFC 9071).
+        if let Some(text_endpoint) = text_endpoint {
+            self.endpoint_calls
+                .insert(text_endpoint.id, conference_id.to_string());
+        }
+        Ok(())
+    }
+
     /// Follow a seat's ICE-validated source into the room's egress (RFC 8445 §12.1.1: data goes to the
     /// valid pair's remote candidate), by handing the room the same `IceSelected` a full agent's
     /// selection does.
@@ -674,6 +732,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Remove a participant from a conference ([`Command::ConferenceLeave`]), freeing its endpoints —
     /// audio plus its text endpoint when it had one (RFC 9071) — and tearing the room down once empty.
     pub(super) async fn conference_leave(&self, conference_id: &str, from_tag: &str) -> CmdResult {
+        // A seat offered by `conference_offer` and not yet answered is not in the room: dropping it
+        // frees its endpoint and is all there is to leaving.
+        if self.drop_pending_seat(conference_id, from_tag).await {
+            return ok_empty();
+        }
         let endpoints = self.conference.leave(conference_id, from_tag);
         if endpoints.is_empty() {
             return error_result("conference_leave", &"no such conference participant");
@@ -725,6 +788,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ok_empty()
         } else {
             error_result("conference_bridge", &"one or both conferences do not exist")
+        }
+    }
+
+    /// Undo a bridge between two rooms ([`Command::ConferenceUnbridge`]), in both directions whichever
+    /// way [`Command::ConferenceBridge`] created it.
+    pub(super) fn conference_unbridge(
+        &self,
+        conference_id_a: &str,
+        conference_id_b: &str,
+    ) -> CmdResult {
+        match self.conference.unbridge(conference_id_a, conference_id_b) {
+            Ok(()) => ok_empty(),
+            Err(refusal) => error_result("conference_unbridge", &refusal),
         }
     }
 
@@ -1118,10 +1194,45 @@ fn routing_of(role: ConferenceRole) -> Routing {
 }
 
 /// The codec a participant is seated in, with both halves of its leg built.
-struct SeatCodec {
-    spec: CodecSpec,
+pub(super) struct SeatCodec {
+    pub(super) spec: CodecSpec,
     decoder: Box<dyn Decoder>,
     encoder: Box<dyn Encoder>,
+}
+
+/// What [`Engine::seat_participant`] seats: one participant whose media is already negotiated.
+pub(super) struct SeatRequest {
+    pub(super) tag: String,
+    pub(super) codec: SeatCodec,
+    /// The telephone-event format the participant sends, filtered out of the mix (RFC 4733).
+    pub(super) telephone_event: Option<sdp::TelephoneEvent>,
+    pub(super) endpoint: siphon_rtp_datapath::Endpoint,
+    /// Where the room sends the participant its mix, until a gated source latches.
+    pub(super) remote_rtp: std::net::SocketAddr,
+    pub(super) accepted_source: SourceFilter,
+    pub(super) secure: Option<SecureLeg>,
+    pub(super) secure_pending: bool,
+    pub(super) ice_pending: bool,
+    pub(super) text: Option<ParticipantTextConfig>,
+    pub(super) text_endpoint: Option<siphon_rtp_datapath::Endpoint>,
+    pub(super) role: ConferenceRole,
+    pub(super) sip_call_id: Option<String>,
+    /// Whether the participant said it will not send (`a=recvonly` / `a=inactive`, RFC 4566 §6).
+    pub(super) held: bool,
+}
+
+/// Build both halves of a seat in `spec` and check the room can hold its frame ([`seat::fit`]) — the
+/// test every codec a room seats or offers has to pass.
+pub(super) fn build_seat_codec(spec: CodecSpec) -> Result<SeatCodec, String> {
+    let decoder = factory::decoder_for(&spec).map_err(|error| format!("no decoder: {error}"))?;
+    let encoder = factory::encoder_for(&spec).map_err(|error| format!("no encoder: {error}"))?;
+    seat::fit(&*decoder, &*encoder)
+        .map_err(|refusal| format!("the room cannot hold it: {refusal}"))?;
+    Ok(SeatCodec {
+        spec,
+        decoder,
+        encoder,
+    })
 }
 
 /// Choose a participant's codec the way [`Engine::answer_local`] chooses a single leg's: the offer's
@@ -1136,26 +1247,10 @@ fn seat_codec(info: &sdp::MediaInfo, profile: &ProfileFlags) -> Result<SeatCodec
     }
     let mut passed_over = Vec::new();
     for spec in answer_codec_candidates(info, &parse_codec_flags(&profile.flags)) {
-        let built = factory::decoder_for(&spec)
-            .map_err(|error| format!("no decoder: {error}"))
-            .and_then(|decoder| {
-                factory::encoder_for(&spec)
-                    .map(|encoder| (decoder, encoder))
-                    .map_err(|error| format!("no encoder: {error}"))
-            })
-            .and_then(|(decoder, encoder)| match seat::fit(&*decoder, &*encoder) {
-                Ok(_) => Ok((decoder, encoder)),
-                Err(refusal) => Err(format!("the room cannot hold it: {refusal}")),
-            });
-        match built {
-            Ok((decoder, encoder)) => {
-                return Ok(SeatCodec {
-                    spec,
-                    decoder,
-                    encoder,
-                })
-            }
-            Err(reason) => passed_over.push((spec.payload_type, reason)),
+        let payload_type = spec.payload_type;
+        match build_seat_codec(spec) {
+            Ok(seat) => return Ok(seat),
+            Err(reason) => passed_over.push((payload_type, reason)),
         }
     }
     let reasons: Vec<String> = offered

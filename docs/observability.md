@@ -19,6 +19,8 @@ per connection, never blocking the engine. Routes: `GET /metrics`, `GET /healthz
 | `siphon_rtp_answers_total` | counter | control `answer` commands accepted |
 | `siphon_rtp_deletes_total` | counter | control `delete` commands accepted |
 | `siphon_rtp_conference_joins_total` | counter | conference `join` commands accepted |
+| `siphon_rtp_conference_offers_total` | counter | conference `offer` commands accepted (a seat the room dials out) |
+| `siphon_rtp_conference_answers_total` | counter | conference `answer` commands accepted (the answer to an offered seat) |
 | `siphon_rtp_conference_leaves_total` | counter | conference `leave` commands accepted |
 | `siphon_rtp_scoped_offers_total` | counter | `offer` / `answer_local` commands accepted that named a call scope |
 | `siphon_rtp_control_errors_total` | counter | control commands that returned an error |

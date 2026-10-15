@@ -154,9 +154,12 @@ impl Command {
             | Command::Restore { .. }
             | Command::Authenticate { .. }
             | Command::ConferenceJoin { .. }
+            | Command::ConferenceOffer { .. }
+            | Command::ConferenceAnswer { .. }
             | Command::ConferenceLeave { .. }
             | Command::ConferenceRoute { .. }
             | Command::ConferenceBridge { .. }
+            | Command::ConferenceUnbridge { .. }
             | Command::ConferencePlay { .. }
             | Command::ConferenceStopPlay { .. }
             | Command::ConferenceSetPlayGain { .. }
@@ -170,9 +173,12 @@ impl Command {
         matches!(
             self,
             Command::ConferenceJoin { .. }
+                | Command::ConferenceOffer { .. }
+                | Command::ConferenceAnswer { .. }
                 | Command::ConferenceLeave { .. }
                 | Command::ConferenceRoute { .. }
                 | Command::ConferenceBridge { .. }
+                | Command::ConferenceUnbridge { .. }
                 | Command::ConferencePlay { .. }
                 | Command::ConferenceStopPlay { .. }
                 | Command::ConferenceSetPlayGain { .. }

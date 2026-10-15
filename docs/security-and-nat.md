@@ -894,6 +894,13 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
     address that never asked for it. The follower is aborted on every path that drops the seat —
     `conference_leave`, a failed checklist, and the idle reap — so it never outlives it. Proven by
     `an_ice_lite_conference_seat_is_sent_the_mix_at_the_source_its_check_validated`.
+  - **A seat the room dials out gets the same gate from the answer.** `conference_offer` allocates the
+    endpoint but installs no redirect and seats nothing, so a datagram reaching it before the answer
+    enters no room. `conference_answer` then seats the participant through the same
+    `Engine::seat_participant` a join uses, with the gate built from the **answer's** `c=`/`m=`
+    (`SourceFilter::Exact`, or `Any` only for an offer whose profile carried `symmetric`) and the same
+    constrained latch. An offered seat is never ICE or SRTP (the verb refuses a profile asking for
+    either), so the plain RTPBleed gate is the whole of its layer 2.
   - **A failed checklist removes the seat** (§8.1.2). A participant has no `MediaCall` for the
     2-party `ice_failed` teardown to reap, so `drive_ice_agents` drops it from the room (and tears the
     room down if it was the last member) rather than leaving it seated behind a gate that can never

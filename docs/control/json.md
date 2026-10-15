@@ -264,7 +264,7 @@ bridge a T.38 leg to a G.711 one.
 |---|---|---|
 | `load` | none | Live load snapshot for a dispatcher: `node_id`, `sessions`, `max_sessions`, `load_permille` (0..=1000), `transcode_sessions`, `cpu_permille?`, `jemalloc_allocated_bytes`, `draining`. |
 | `node_info` | none | Static identity: `node_id`, `version`, `media_addresses`, `codecs`, `features`, `max_sessions`, `draining`. Read once and cache; poll `load` instead. `codecs` names what this build transcodes in both directions, the licensed codecs (`G729`, `AMR`, `AMR-WB`) included when it was built with them; match on the names, not on their order. `features` includes `scope` on an engine that keys calls by [scope](#call-scope). |
-| `drain` | none | Stop admitting new sessions (`offer` and `conference_join` are rejected); live calls run to completion. Idempotent. |
+| `drain` | none | Stop admitting new sessions (`offer`, `answer_local`, `conference_join` and `conference_offer` are rejected); live calls run to completion. Idempotent. |
 | `undrain` | none | Resume admitting new sessions. |
 
 ### High availability
@@ -492,9 +492,12 @@ before recording is a follow-up.
 | Verb | Fields | Purpose |
 |---|---|---|
 | `conference_join` | `conference_id`, `from_tag`, `sdp`, `role`, `profile` | Join (or lazily create) a mixing conference. The engine answers the SDP in one codec, the first offered one it can decode, encode and hold in the room after the profile's codec flags (as `answer_local` chooses); the participant hears the room mixed-minus-self. `ok` means the room seated the participant: a refused seat (no codec qualifies, a from-tag already seated, a full room) is an error naming the reason, see [Conferencing](../cookbook/conferencing.md#which-codec-a-seat-gets). Beside the audio stream and a text stream the room anchors, every other stream in the offer is declined with port 0 (RFC 3264 §6). |
-| `conference_leave` | `conference_id`, `from_tag` | Leave; the room tears down when the last participant leaves. |
+| `conference_offer` | `conference_id`, `from_tag`, `role?`, `profile?` | Offer a **new seat** for a participant the room calls out to (RFC 4579 §5.5 dial-out). Answers `ok` with an SDP **offer** (RFC 3264 §5) and `to_tag` = `from_tag`: one engine endpoint, plain `RTP/AVP`, `a=sendrecv`, `a=rtcp-mux`, listing every codec this build can mix (Opus, AMR-WB with `amr`, G.722, AMR with `amr`, PCMU, PCMA, G.729 with `g729`, G.726-32, GSM) edited by the profile's codec flags, plus telephone-event per clock rate. The seat is pending, outside the room, until `conference_answer`. IPv4 unless `profile.address_family` is `IP6`; the near `direction` interface. A profile asking for SDES/DTLS (`transport_protocol` other than `RTP/AVP`, `dtls` other than `off`) or `ice: force` is refused. A from-tag already pending or seated is refused. |
+| `conference_answer` | `conference_id`, `from_tag`, `sdp` | The participant's answer to a `conference_offer`; seats it exactly as `conference_join` would (same source gate and latch, `a=recvonly`/`a=inactive` seats it held). The seat's codec is the answer's first audio format, which must be a payload type the offer listed. Answers `ok` with no SDP. No pending offer, an un-offered codec, a rejected stream (port 0), a secure answer or a seat the room refuses is an error, and the offered seat's endpoint is freed. |
+| `conference_leave` | `conference_id`, `from_tag` | Leave; the room tears down when the last participant leaves. On a seat offered and not yet answered it frees the seat. |
 | `conference_route` | `conference_id`, `from_tag`, `role` | Live-update a participant's routing role. |
 | `conference_bridge` | `conference_id_a`, `conference_id_b`, `direction` | Bridge two rooms (`both`, `a_to_b`, `b_to_a`). |
+| `conference_unbridge` | `conference_id_a`, `conference_id_b` | Undo a bridge between two rooms, in both directions whichever way it was made. An error when either room does not exist or the two are not bridged. |
 | `conference_play` | `conference_id`, `source`, `repeat_times?`, `start_pos_ms?`, `duration_ms?`, `gain_decibels?` | Play audio **into a room** — an entry tone, a "this conference is being recorded" announcement, music for a lone participant. Mixed as a non-participant source: everyone hears it and nobody is mixed-minus-self against it. Up to four at once, each with its own `play_id`, accepting with that id and ending with a `play_finished` carrying `conference_id` (and an empty `call_id`). `play_media` cannot do this — it resolves through the call registry, which a conference never enters. |
 | `conference_stop_play` | `conference_id`, `play_id?` | Stop one room playback, or all of them when no `play_id` is given. An id that is not running is an error, not a hollow success. |
 | `conference_set_play_gain` | `conference_id`, `play_id`, `gain_decibels` | Retune a running room playback's gain, −60…+12 dB — how an announcement ducks under a conversation rather than burying it. |
@@ -505,6 +508,10 @@ before recording is a follow-up.
 `{"role": "whisper", "target": "..."}` (supervisor coaching, excluded from the room mix),
 or `{"role": "monitor", "target": "...", "whisper_target": "..."}` (listen to one
 participant, optionally whispering to another). Rooms are capped at 64 participants.
+
+An offered seat (`conference_offer`) that is never answered expires on the media-timeout sweep
+after `--setup-timeout-secs` (the ceiling an offered call awaiting its answer gets), or after
+`--media-timeout-secs` when the setup timeout is disabled, so it never holds its port forever.
 
 Conference legs accept plain `RTP/AVP` and SDES `RTP/SAVP` offers. An ICE or DTLS-SRTP
 (WebRTC) conference leg is accepted and seated *pending*: the seat opens only once the DTLS

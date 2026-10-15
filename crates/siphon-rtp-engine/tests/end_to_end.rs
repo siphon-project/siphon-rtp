@@ -2715,3 +2715,89 @@ async fn a_controller_identity_cannot_be_claimed_over_live_calls_or_swapped_mid_
         "the refused claim left the connection on its own identity, calls intact"
     );
 }
+
+/// A room calls a participant out over the real control connection, the verbs written as raw JSON
+/// frames exactly as a focus sends them: `conference_offer` returns an SDP offer naming an engine
+/// port, `conference_answer` seats the participant, and the room's mix then reaches it from that
+/// port. `conference_unbridge` on rooms that were never bridged is an error naming why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conference_dial_out_over_tcp_control() {
+    use siphon_rtp_media::rtp::RtpPacket;
+
+    let control_addr = spawn_control_server_with_dispatcher().await;
+    let mut control = Control::connect(control_addr).await;
+    let (_alice, alice_addr) = phone().await;
+    let (carol, carol_addr) = phone().await;
+
+    let joined = control
+        .request(Command::ConferenceJoin {
+            conference_id: "room-1".into(),
+            from_tag: "alice".into(),
+            sdp: sdp_for(alice_addr),
+            role: ConferenceRole::Talker,
+            profile: Default::default(),
+        })
+        .await;
+    let _ = engine_addr(&joined);
+
+    let offered = control
+        .request_raw(
+            r#"{"command":"conference_offer","conference_id":"room-1","from_tag":"carol"}"#,
+        )
+        .await;
+    let offer = sdp_text(&offered);
+    assert!(
+        matches!(&offered, CmdResult::Ok { to_tag: Some(tag), .. } if tag == "carol"),
+        "{offered:?}"
+    );
+    assert!(
+        offer.contains("a=sendrecv\r\n") && offer.contains(" RTP/AVP "),
+        "{offer}"
+    );
+    let carol_engine = sdp::parse(&offer).expect("offer parses").remote_rtp;
+
+    let answer = format!(
+        "v=0\\r\\no=- 7 1 IN IP4 {ip}\\r\\ns=-\\r\\nc=IN IP4 {ip}\\r\\nt=0 0\\r\\nm=audio {port} RTP/AVP 0\\r\\na=rtpmap:0 PCMU/8000\\r\\n",
+        ip = carol_addr.ip(),
+        port = carol_addr.port(),
+    );
+    let answered = control
+        .request_raw(&format!(
+            r#"{{"command":"conference_answer","conference_id":"room-1","from_tag":"carol","sdp":"{answer}"}}"#
+        ))
+        .await;
+    assert!(
+        matches!(answered, CmdResult::Ok { sdp: None, .. }),
+        "{answered:?}"
+    );
+
+    // The room ticks every 20 ms and sends each seat its mix, in the seat's codec, from its port.
+    let (mix, from) = recv(&carol).await;
+    assert_eq!(
+        from, carol_engine,
+        "carol hears the room from the offered port"
+    );
+    assert_eq!(RtpPacket::parse(&mix).expect("RTP").payload_type, 0);
+
+    let unbridged = control
+        .request_raw(
+            r#"{"command":"conference_unbridge","conference_id_a":"room-1","conference_id_b":"room-2"}"#,
+        )
+        .await;
+    assert_eq!(
+        unbridged,
+        CmdResult::Error {
+            reason: "conference_unbridge: unknown conference: room-2".into()
+        }
+    );
+
+    for tag in ["alice", "carol"] {
+        let left = control
+            .request(Command::ConferenceLeave {
+                conference_id: "room-1".into(),
+                from_tag: tag.into(),
+            })
+            .await;
+        assert!(matches!(left, CmdResult::Ok { .. }), "{tag}: {left:?}");
+    }
+}

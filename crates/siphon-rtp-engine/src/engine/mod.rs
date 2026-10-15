@@ -20,6 +20,7 @@ mod admin;
 mod answer;
 mod answer_local;
 mod configure;
+mod dial_out;
 mod dispatch;
 mod fax;
 mod fork;
@@ -1108,6 +1109,9 @@ pub struct Engine<D: Datapath> {
     /// an ICE seat has one, and it is aborted wherever the seat is dropped (leave, ICE failure, idle
     /// reap), so it never outlives the participant.
     seat_ice_followers: DashMap<EndpointId, tokio::task::JoinHandle<()>>,
+    /// Conference seats the engine offered (`conference_offer`) and the participant has not yet
+    /// answered, by room and from-tag. Each holds one endpoint until it is answered, left or expired.
+    pending_seats: DashMap<(String, String), dial_out::PendingSeat>,
     /// The RFC 4103 Real-Time Text observability slow path: per-call text processors that RED/T.140
     /// observe a promoted `m=text` stream (recording / `text_events`) then forward it verbatim. Shared
     /// with the redirect dispatcher, which routes text-owned endpoints' datagrams here (see

@@ -63,6 +63,8 @@ pub struct Metrics {
     control_errors_total: AtomicU64,
     control_rate_limited_total: AtomicU64,
     conference_joins_total: AtomicU64,
+    conference_offers_total: AtomicU64,
+    conference_answers_total: AtomicU64,
     conference_leaves_total: AtomicU64,
     scoped_offers_total: AtomicU64,
     /// WebSocket dials that failed, by [`WsDialFailure`] class: timeout, connect, TLS, handshake.
@@ -166,6 +168,17 @@ impl Metrics {
         self.scoped_offers_total.load(Ordering::Relaxed)
     }
 
+    /// Count a `conference offer` command (a seat the room calls out to).
+    pub fn record_conference_offer(&self) {
+        self.conference_offers_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a `conference answer` command (the answer to a seat the room offered).
+    pub fn record_conference_answer(&self) {
+        self.conference_answers_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Count an accepted `conference leave` command.
     pub fn record_conference_leave(&self) {
         self.conference_leaves_total.fetch_add(1, Ordering::Relaxed);
@@ -202,6 +215,8 @@ impl Metrics {
         let errors = self.control_errors_total.load(Ordering::Relaxed);
         let rate_limited = self.control_rate_limited_total.load(Ordering::Relaxed);
         let conference_joins = self.conference_joins_total.load(Ordering::Relaxed);
+        let conference_offers = self.conference_offers_total.load(Ordering::Relaxed);
+        let conference_answers = self.conference_answers_total.load(Ordering::Relaxed);
         let conference_leaves = self.conference_leaves_total.load(Ordering::Relaxed);
         let scoped_offers = self.scoped_offers_total.load(Ordering::Relaxed);
 
@@ -326,6 +341,20 @@ impl Metrics {
             "Conference join commands accepted.",
             "counter",
             conference_joins,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_conference_offers_total",
+            "Conference offer commands accepted.",
+            "counter",
+            conference_offers,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_conference_answers_total",
+            "Conference answer commands accepted.",
+            "counter",
+            conference_answers,
         );
         metric(
             &mut output,
@@ -678,6 +707,9 @@ mod tests {
         metrics.record_conference_join();
         metrics.record_conference_join();
         metrics.record_conference_join();
+        metrics.record_conference_offer();
+        metrics.record_conference_offer();
+        metrics.record_conference_answer();
         metrics.record_conference_leave();
 
         let body = metrics.render(
@@ -719,6 +751,8 @@ mod tests {
         assert!(body.contains("siphon_rtp_control_rate_limited_total 1\n"));
         assert!(body.contains("siphon_rtp_conference_joins_total 3\n"));
         assert!(body.contains("siphon_rtp_conference_leaves_total 1\n"));
+        assert!(body.contains("siphon_rtp_conference_offers_total 2\n"));
+        assert!(body.contains("siphon_rtp_conference_answers_total 1\n"));
         assert!(body.contains(
             "# TYPE siphon_rtp_jemalloc_allocated_bytes gauge\nsiphon_rtp_jemalloc_allocated_bytes 4096\n"
         ));
@@ -754,9 +788,9 @@ mod tests {
         }
         assert!(body.contains("# TYPE siphon_rtp_scoped_offers_total counter\n"));
         assert!(body.contains("siphon_rtp_scoped_offers_total 0\n"));
-        // Every series carries a HELP + TYPE line (29 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 29);
-        assert_eq!(body.matches("# TYPE ").count(), 29);
+        // Every series carries a HELP + TYPE line (31 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 31);
+        assert_eq!(body.matches("# TYPE ").count(), 31);
     }
 
     #[test]
@@ -778,8 +812,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (28 vs 29).
-        assert_eq!(body.matches("# TYPE ").count(), 28);
+        // One fewer series than the CPU-present case (30 vs 31).
+        assert_eq!(body.matches("# TYPE ").count(), 30);
     }
 
     #[test]

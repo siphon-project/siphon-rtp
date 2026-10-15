@@ -23,6 +23,21 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   followed by another prompt or another dial. Plain RTP callers only for now; an SRTP or ICE caller
   is refused. The NG front-end has no `answer_local`, so this is a native-protocol verb.
 
+- **A room can call a participant out, and two bridged rooms can be unlinked.** `conference_join`
+  only answers a participant's offer, so a conference focus that dials a user into a room (RFC 4579
+  §5.5, 3GPP TS 24.605 CONF) had no SDP to put in its INVITE. `conference_offer` allocates a new
+  seat's endpoint and answers with an SDP offer listing every codec the room can mix in this build,
+  widest band first, with telephone-event per clock rate; `conference_answer` takes the
+  participant's answer and seats it through the same code a join uses, in the answer's first
+  audio format, which must be one the offer listed. Until then the seat is pending: it is freed by
+  `conference_leave`, by a refused answer, or by the sweep after `--setup-timeout-secs`. An offered
+  seat is plain `RTP/AVP` (a profile asking for SDES, DTLS-SRTP or ICE is refused), and a draining
+  node refuses `conference_offer` as it refuses `conference_join`. `conference_unbridge` undoes a
+  `conference_bridge` in both directions, whichever way it was made, and a room that is torn down
+  is now dropped from the room it was bridged with, which returns to its own rate instead of
+  staying pinned at 16 kHz. New counters `siphon_rtp_conference_offers_total` and
+  `siphon_rtp_conference_answers_total`.
+
 ### Fixed
 
 - **`conference_join` seats a participant in a codec the room can bridge, and refuses a seat it

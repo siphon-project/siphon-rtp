@@ -322,10 +322,10 @@ pub enum Command {
     /// advertised media addresses, supported codecs and features, session capacity, and version. It
     /// changes rarely, so a dispatcher reads it once and caches it (unlike [`Command::Load`]).
     NodeInfo,
-    /// Enter drain mode: stop admitting **new** sessions ([`Command::Offer`] / [`Command::ConferenceJoin`]
-    /// are rejected) while every live call runs to completion untouched — the primitive behind a
-    /// zero-downtime rolling upgrade. Idempotent; answered with [`CmdResult::Ok`]. Reversed by
-    /// [`Command::Undrain`].
+    /// Enter drain mode: stop admitting **new** sessions ([`Command::Offer`] /
+    /// [`Command::ConferenceJoin`] / [`Command::ConferenceOffer`] are rejected) while every live call
+    /// runs to completion untouched — the primitive behind a zero-downtime rolling upgrade.
+    /// Idempotent; answered with [`CmdResult::Ok`]. Reversed by [`Command::Undrain`].
     Drain,
     /// Leave drain mode: resume admitting new sessions. Idempotent; answered with [`CmdResult::Ok`].
     Undrain,
@@ -582,6 +582,25 @@ pub enum Command {
         #[serde(default)]
         profile: ProfileFlags,
     },
+    /// Offer a **new seat** for a participant the room calls out to (RFC 4579 §5.5 dial-out): the
+    /// engine allocates the seat's endpoint and answers with an SDP offer (RFC 3264 §5) listing the
+    /// codecs the room can mix. The seat stays pending, outside the room, until
+    /// [`Command::ConferenceAnswer`] hands the engine the participant's answer.
+    ConferenceOffer {
+        conference_id: String,
+        from_tag: String,
+        #[serde(default)]
+        role: ConferenceRole,
+        #[serde(default)]
+        profile: ProfileFlags,
+    },
+    /// The participant's answer to a [`Command::ConferenceOffer`]: seats it in the room exactly as
+    /// [`Command::ConferenceJoin`] would have.
+    ConferenceAnswer {
+        conference_id: String,
+        from_tag: String,
+        sdp: String,
+    },
     /// Leave a conference (by participant `from_tag`). The room is torn down when its last participant
     /// leaves.
     ConferenceLeave {
@@ -601,6 +620,12 @@ pub enum Command {
         conference_id_b: String,
         #[serde(default)]
         direction: BridgeDirection,
+    },
+    /// Undo a [`Command::ConferenceBridge`] between two rooms, in both directions whichever way it
+    /// was created.
+    ConferenceUnbridge {
+        conference_id_a: String,
+        conference_id_b: String,
     },
     /// Play audio **into a conference room** — an entry tone, a "this conference is being recorded"
     /// announcement, hold music for a lone participant.
@@ -3318,12 +3343,132 @@ mod tests {
                 token: "s3cret".into(),
                 controller_id: Some("sbc-1".into()),
             },
+            Command::ConferenceOffer {
+                conference_id: "room".into(),
+                from_tag: "f".into(),
+                role: ConferenceRole::Listener,
+                profile: ProfileFlags::default(),
+            },
+            Command::ConferenceAnswer {
+                conference_id: "room".into(),
+                from_tag: "f".into(),
+                sdp: "v=0".into(),
+            },
+            Command::ConferenceUnbridge {
+                conference_id_a: "a".into(),
+                conference_id_b: "b".into(),
+            },
         ];
         for command in &commands {
             roundtrip(&Request {
                 id: 1,
                 command: command.clone(),
             });
+        }
+    }
+
+    #[test]
+    fn conference_offer_wire_shape_and_defaults() {
+        let json = r#"{"command":"conference_offer","conference_id":"room-1","from_tag":"carol"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::ConferenceOffer {
+                conference_id,
+                from_tag,
+                role,
+                profile,
+            } => {
+                assert_eq!(conference_id, "room-1");
+                assert_eq!(from_tag, "carol");
+                assert_eq!(role, ConferenceRole::Talker, "role defaults to talker");
+                assert_eq!(
+                    profile,
+                    ProfileFlags::default(),
+                    "profile defaults to empty"
+                );
+            }
+            other => panic!("expected conference_offer, got {other:?}"),
+        }
+        let request = Request {
+            id: 4,
+            command: Command::ConferenceOffer {
+                conference_id: "room-1".into(),
+                from_tag: "carol".into(),
+                role: ConferenceRole::Muted,
+                profile: ProfileFlags {
+                    flags: vec!["codec-strip-OPUS".into()],
+                    ..Default::default()
+                },
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&request).expect("serialize"),
+            r#"{"id":4,"command":"conference_offer","conference_id":"room-1","from_tag":"carol","role":{"role":"muted"},"profile":{"flags":["codec-strip-OPUS"]}}"#
+        );
+    }
+
+    #[test]
+    fn conference_answer_wire_shape() {
+        let request = Request {
+            id: 5,
+            command: Command::ConferenceAnswer {
+                conference_id: "room-1".into(),
+                from_tag: "carol".into(),
+                sdp: "v=0\r\n".into(),
+            },
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"id":5,"command":"conference_answer","conference_id":"room-1","from_tag":"carol","sdp":"v=0\r\n"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(&json).expect("deserialize"),
+            request
+        );
+    }
+
+    #[test]
+    fn conference_unbridge_wire_shape() {
+        let request = Request {
+            id: 6,
+            command: Command::ConferenceUnbridge {
+                conference_id_a: "room-1".into(),
+                conference_id_b: "room-2".into(),
+            },
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"id":6,"command":"conference_unbridge","conference_id_a":"room-1","conference_id_b":"room-2"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(&json).expect("deserialize"),
+            request
+        );
+    }
+
+    #[test]
+    fn the_dial_out_and_unbridge_verbs_name_a_room_not_a_call() {
+        let mut commands = [
+            Command::ConferenceOffer {
+                conference_id: "room".into(),
+                from_tag: "f".into(),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+            Command::ConferenceAnswer {
+                conference_id: "room".into(),
+                from_tag: "f".into(),
+                sdp: "v=0".into(),
+            },
+            Command::ConferenceUnbridge {
+                conference_id_a: "a".into(),
+                conference_id_b: "b".into(),
+            },
+        ];
+        for command in &mut commands {
+            assert!(command.is_conference(), "{command:?}");
+            assert!(command.call_id_mut().is_none(), "{command:?}");
         }
     }
 
