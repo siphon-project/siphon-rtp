@@ -854,6 +854,111 @@ async fn conference_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usiz
     }
 }
 
+/// Churn the conference dial-out verbs through every way an offered seat ends: answered and seated
+/// beside a joined participant, bridged to a second room and unbridged, then left; left while still
+/// pending; and refused on its answer. The pending-seat store, the bridge records and the rooms must
+/// all drain to nothing.
+async fn conference_dial_out(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let room = format!("soak-dial-{index}");
+    let other_room = format!("soak-dial-other-{index}");
+    let offer = |conference_id: &str, from_tag: &str| Command::ConferenceOffer {
+        conference_id: conference_id.to_string(),
+        from_tag: from_tag.to_string(),
+        role: ConferenceRole::Talker,
+        profile: Default::default(),
+    };
+    let leave = |conference_id: &str, from_tag: &str| Command::ConferenceLeave {
+        conference_id: conference_id.to_string(),
+        from_tag: from_tag.to_string(),
+    };
+    for (conference_id, tag, port) in [(&room, "joined", 41_000), (&other_room, "other", 41_001)] {
+        let join = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: conference_id.clone(),
+                    from_tag: tag.into(),
+                    sdp: sdp_for("198.51.100.1", port),
+                    role: ConferenceRole::Talker,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert_ok(&join, "conference_join");
+    }
+    assert_ok(
+        &engine.handle(CLIENT, offer(&room, "dialled")).await,
+        "conference_offer",
+    );
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceAnswer {
+                conference_id: room.clone(),
+                from_tag: "dialled".into(),
+                sdp: sdp_for("198.51.100.2", 41_002),
+            },
+        )
+        .await;
+    assert_ok(&answer, "conference_answer");
+    let bridge = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceBridge {
+                conference_id_a: room.clone(),
+                conference_id_b: other_room.clone(),
+                direction: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&bridge, "conference_bridge");
+    let unbridge = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceUnbridge {
+                conference_id_a: other_room.clone(),
+                conference_id_b: room.clone(),
+            },
+        )
+        .await;
+    assert_ok(&unbridge, "conference_unbridge");
+
+    assert_ok(
+        &engine.handle(CLIENT, offer(&room, "pending")).await,
+        "conference_offer",
+    );
+    assert_ok(
+        &engine.handle(CLIENT, leave(&room, "pending")).await,
+        "leave pending",
+    );
+    assert_ok(
+        &engine.handle(CLIENT, offer(&room, "refused")).await,
+        "conference_offer",
+    );
+    let refused = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceAnswer {
+                conference_id: room.clone(),
+                from_tag: "refused".into(),
+                sdp: "not sdp".into(),
+            },
+        )
+        .await;
+    assert!(matches!(refused, CmdResult::Error { .. }), "{refused:?}");
+
+    for (conference_id, tag) in [
+        (&room, "joined"),
+        (&room, "dialled"),
+        (&other_room, "other"),
+    ] {
+        assert_ok(
+            &engine.handle(CLIENT, leave(conference_id, tag)).await,
+            "conference_leave",
+        );
+    }
+}
+
 /// Churn one relay through `offer → answer → start recording → stop recording → delete`. Each cycle
 /// promotes the passthrough relay to a userspace media actor (spawning the pcap drain task), then
 /// demotes it back on stop and tears the whole call down on delete — so the promotion reason set, the
@@ -1091,6 +1196,26 @@ async fn conference_join_leave_does_not_leak() {
             0,
             "rooms drained after every segment"
         );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conference_dial_out_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    let mut gate = LeakGate::new("conference dial-out", 60, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            conference_dial_out(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(engine.pending_seat_count(), 0, "pending seats drained");
+        assert_eq!(engine.conference().room_count(), 0, "rooms drained");
         gate.sample().await;
     }
     gate.assert_no_leak();

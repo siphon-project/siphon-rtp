@@ -243,6 +243,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Command::Answer { .. } => self.metrics.record_answer(),
             Command::Delete { .. } => self.metrics.record_delete(),
             Command::ConferenceJoin { .. } => self.metrics.record_conference_join(),
+            Command::ConferenceOffer { .. } => self.metrics.record_conference_offer(),
+            Command::ConferenceAnswer { .. } => self.metrics.record_conference_answer(),
             Command::ConferenceLeave { .. } => self.metrics.record_conference_leave(),
             _ => {}
         }
@@ -288,7 +290,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// in the call's key; it is passed on only for `list`, which names none.
     async fn dispatch(&self, client: ClientId, scope: Option<&str>, command: Command) -> CmdResult {
         // Drain gate: a draining node runs its live calls to completion but admits no new session, so
-        // it can be taken out of a rolling upgrade cleanly. Reject the two session-creating verbs;
+        // it can be taken out of a rolling upgrade cleanly. Reject the session-creating verbs (an
+        // offered conference seat is one; its `conference_answer` completes a setup already admitted);
         // everything else — query/delete/media-control on existing calls, and the cluster/census
         // verbs — still works. (Matching without binding does not move `command`.)
         if self.cluster.is_draining()
@@ -297,6 +300,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 Command::Offer { .. }
                     | Command::AnswerLocal { .. }
                     | Command::ConferenceJoin { .. }
+                    | Command::ConferenceOffer { .. }
             )
         {
             return CmdResult::Error {
@@ -426,9 +430,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             | Command::StartRecording { .. }
             | Command::StopRecording { .. }) => self.dispatch_call_media(client, command).await,
             command @ (Command::ConferenceJoin { .. }
+            | Command::ConferenceOffer { .. }
+            | Command::ConferenceAnswer { .. }
             | Command::ConferenceLeave { .. }
             | Command::ConferenceRoute { .. }
             | Command::ConferenceBridge { .. }
+            | Command::ConferenceUnbridge { .. }
             | Command::ConferencePlay { .. }
             | Command::ConferenceStopPlay { .. }
             | Command::ConferenceSetPlayGain { .. }
@@ -639,6 +646,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.conference_join(client, &conference_id, from_tag, &sdp, role, &profile)
                     .await
             }
+            Command::ConferenceOffer {
+                conference_id,
+                from_tag,
+                role,
+                profile,
+            } => {
+                self.conference_offer(&conference_id, from_tag, role, profile)
+                    .await
+            }
+            Command::ConferenceAnswer {
+                conference_id,
+                from_tag,
+                sdp,
+            } => {
+                self.conference_answer(client, &conference_id, &from_tag, &sdp)
+                    .await
+            }
             Command::ConferenceLeave {
                 conference_id,
                 from_tag,
@@ -653,6 +677,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 conference_id_b,
                 direction,
             } => self.conference_bridge(&conference_id_a, &conference_id_b, direction),
+            Command::ConferenceUnbridge {
+                conference_id_a,
+                conference_id_b,
+            } => self.conference_unbridge(&conference_id_a, &conference_id_b),
             Command::ConferencePlay {
                 conference_id,
                 source,
@@ -782,9 +810,12 @@ fn command_name(command: &Command) -> &'static str {
         Command::SubscribeAnswer { .. } => "subscribe_answer",
         Command::Unsubscribe { .. } => "unsubscribe",
         Command::ConferenceJoin { .. } => "conference_join",
+        Command::ConferenceOffer { .. } => "conference_offer",
+        Command::ConferenceAnswer { .. } => "conference_answer",
         Command::ConferenceLeave { .. } => "conference_leave",
         Command::ConferenceRoute { .. } => "conference_route",
         Command::ConferenceBridge { .. } => "conference_bridge",
+        Command::ConferenceUnbridge { .. } => "conference_unbridge",
         Command::ConferencePlay { .. } => "conference_play",
         Command::ConferenceStopPlay { .. } => "conference_stop_play",
         Command::ConferenceSetPlayGain { .. } => "conference_set_play_gain",
@@ -842,9 +873,14 @@ pub(super) fn command_call_id(command: &Command) -> Option<&str> {
         | Command::AttachX3 { call_id, .. }
         | Command::DetachX3 { call_id, .. } => Some(call_id),
         Command::ConferenceJoin { conference_id, .. }
+        | Command::ConferenceOffer { conference_id, .. }
+        | Command::ConferenceAnswer { conference_id, .. }
         | Command::ConferenceLeave { conference_id, .. }
         | Command::ConferenceRoute { conference_id, .. } => Some(conference_id),
         Command::ConferenceBridge {
+            conference_id_a, ..
+        }
+        | Command::ConferenceUnbridge {
             conference_id_a, ..
         } => Some(conference_id_a),
         Command::Ping

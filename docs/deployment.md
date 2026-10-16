@@ -254,7 +254,7 @@ Two honest caveats:
 Two mechanisms, used in sequence:
 
 1. **The `drain` control verb** (native JSON and NG; `undrain` reverses it). A draining node
-   refuses the two session-creating verbs, `offer` and `conference_join`, with
+   refuses the session-creating verbs, `offer`, `conference_join` and `conference_offer`, with
    `"node is draining; not accepting new sessions"`. Everything else keeps working: `answer` for
    calls already in setup, `delete`, `query`, media control on live calls, and the census verbs.
    `/readyz` flips to `503` and the `siphon_rtp_draining` gauge goes to `1`, so dispatchers and

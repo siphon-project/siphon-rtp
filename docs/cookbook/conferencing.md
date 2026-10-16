@@ -2,8 +2,9 @@
 
 siphon-rtp ships a built-in N-party audio conference: a clock-driven mixer (MCU) that seats up to
 64 participants per room, mixes them every 20 ms, and hands each participant its own
-mixed-minus-self stream. You drive it with four native-JSON control verbs: `conference_join`,
-`conference_leave`, `conference_route`, and `conference_bridge`.
+mixed-minus-self stream. You drive it with native-JSON control verbs: `conference_join` (a
+participant calls in), `conference_offer` and `conference_answer` (the room calls a participant
+out), `conference_leave`, `conference_route`, and `conference_bridge` / `conference_unbridge`.
 
 These verbs exist only on the native JSON-over-TCP control channel. The rtpengine NG/bencode
 front-end does not expose `conference_*` (stock rtpengine has no MCU), so a Kamailio/OpenSIPS
@@ -91,7 +92,8 @@ Honest limits first:
   nothing else is refused. With `amr`, an AMR seat's mix is encoded in the payload format and
   `mode-set` it offered.
 - 64 participants per room, hard cap (the active-speaker set is a u64 bitmask).
-- A node in drain mode rejects `conference_join` like it rejects `offer`.
+- A node in drain mode rejects `conference_join` and `conference_offer` like it rejects `offer`.
+  An offer made before the drain can still be answered.
 
 ### Which codec a seat gets
 
@@ -113,6 +115,7 @@ that says why, before any media is set up:
 | The from-tag is already seated | `conference_join: from-tag <tag> is already seated in this room` |
 | The room holds 64 seats | `conference_join: the room is full (64 seats)` |
 | The room did not answer within 1 s | `conference_join: the room did not seat the participant within 1000 ms` |
+| The from-tag has an offered seat awaiting its answer | `conference_join: from-tag <tag> has a conference_offer awaiting its answer` |
 
 Every participant endpoint is a full inbound surface, so the same RTPBleed defence as the relay
 applies: ingress is gated to the SDP-signalled source address (or opened with the `symmetric`
@@ -156,6 +159,77 @@ Leaving frees the participant's endpoint; the room dies with its last member:
 
 Participants that go silent past the media timeout (`--media-timeout-secs`) are reaped
 automatically, and a room left empty is torn down, so an abandoned leg never leaks a room.
+
+## Calling a participant out
+
+`conference_join` answers a participant who called the room. When the room calls someone instead
+(RFC 4579 §5.5: a REFER to the focus naming the user, or 3GPP TS 24.605 CONF's ad-hoc conference),
+the focus sends the INVITE, so it needs an **offer** from the engine rather than an answer. That is
+two verbs. `conference_offer` allocates the seat's endpoint and returns the offer:
+
+```json
+{ "id": 7, "command": "conference_offer", "conference_id": "room-1", "from_tag": "carol",
+  "role": { "role": "talker" } }
+```
+
+```json
+{ "id": 7, "result": "ok", "to_tag": "carol",
+  "sdp": "v=0\r\no=- 3141592653 1 IN IP4 203.0.113.5\r\ns=-\r\nc=IN IP4 203.0.113.5\r\nt=0 0\r\nm=audio 30212 RTP/AVP 111 9 0 8 102 3 110 101\r\na=rtpmap:111 OPUS/48000/2\r\n... a=sendrecv\r\na=rtcp-mux\r\n" }
+```
+
+Put that SDP in the INVITE. When the participant answers, hand the engine its answer:
+
+```json
+{ "id": 8, "command": "conference_answer", "conference_id": "room-1", "from_tag": "carol",
+  "sdp": "v=0\r\no=- 7 1 IN IP4 198.51.100.30\r\ns=-\r\nc=IN IP4 198.51.100.30\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n" }
+```
+
+```json
+{ "id": 8, "result": "ok" }
+```
+
+From here the seat is exactly a joined one: same source gate and latch, same roles, same events,
+left with `conference_leave`. The room is created on its first seat, whichever verb seated it.
+
+What the offer contains:
+
+- One `RTP/AVP` audio stream, `a=sendrecv`, `a=rtcp-mux` (a seat is one muxed endpoint, and the room
+  sends its RTCP there whatever the answer says), `a=ptime:20` and `a=maxptime:120`.
+- Every codec this build can seat, widest band first: Opus (111), AMR-WB (96 bandwidth-efficient, 97
+  octet-aligned) with `amr`, G.722 (9), AMR (98, 99) with `amr`, PCMU (0), PCMA (8), G.729 (18) with
+  `g729`, G.726-32 (102), GSM (3). It is the same test a join's codec passes, so nothing is offered
+  that the answer could then fail to seat in. The profile's codec flags edit the list with the rules
+  a join uses (`codec-strip-X` / `codec-mask-X` remove, `codec-except-X` keeps only, `codec-offer-X`
+  moves to the front).
+- telephone-event once per clock rate the codecs use: 101 at 8 kHz, 100 at 16 kHz, 110 at 48 kHz.
+- The near `direction` interface, IPv4 unless `profile.address_family` is `IP6` (there is no peer
+  address yet to take the family from).
+
+What the answer has to be. The seat's codec is the answer's **first** audio format (RFC 3264 §6.1),
+and it must be a payload type the offer listed, under the same encoding and clock rate (and, for
+AMR, the same `octet-align`). Its telephone-event is used when it is one the offer listed. An
+`a=recvonly` or `a=inactive` answer seats the participant held, so the idle sweep does not reap its
+silence. A refused answer frees the seat's port:
+
+| Refusal | `reason` |
+|---|---|
+| No offer is pending for the tag | `conference_answer: no conference_offer for from-tag <tag> awaits an answer in this room` |
+| The first audio format was not offered | `conference_answer: the answer chose payload type <n>, which was not offered` |
+| The audio stream was rejected | `conference_answer: the answer rejected the audio stream (port 0)` |
+| The answer is `RTP/SAVP` or DTLS | `conference_answer: the answer is secure, but the offer was RTP/AVP` |
+| The room refuses the seat | as for `conference_join`, under `conference_answer:` |
+
+Limits of an offered seat: it is plain RTP only. SDES and DTLS-SRTP keying and ICE are built around
+answering a peer's offer, so a `conference_offer` whose profile asks for them (`transport_protocol`
+other than `RTP/AVP`, `dtls` other than `off`, `ice: force`) is refused rather than offered without
+anything behind it. A secure or WebRTC participant has to call in with `conference_join`. The offered
+seat carries no RFC 9071 text stream either.
+
+A seat that is offered and never answered is not in the room and holds only its port. It ends with
+`conference_leave`, or expires on the sweep after `--setup-timeout-secs` (the ceiling an offered
+call awaiting its answer gets; the media timeout bounds it when the setup timeout is `0`). A second
+`conference_offer` for a tag already pending or seated is refused, and so is a `conference_join` for
+a tag whose offer is pending.
 
 ## Roles: mute, whisper, monitor
 
@@ -213,6 +287,20 @@ never echo a room's own audio back to itself. Bridged audio is heard by everyone
 the receiving room but is not a participant: no one is mixed-minus-self against it. Bridging
 forces both rooms to 16 kHz.
 
+`conference_unbridge` undoes it, in both directions whichever way the bridge was made, and in
+either order of the two ids:
+
+```json
+{ "id": 9, "command": "conference_unbridge", "conference_id_a": "room-2",
+  "conference_id_b": "room-1" }
+```
+
+Each room stops hearing the other and returns to the rate its own membership calls for. Unbridging
+two rooms that are not bridged, or naming a room that does not exist, is an error
+(`conference_unbridge: the two conferences are not bridged`, `conference_unbridge: unknown
+conference: <id>`). A bridge also ends when either room is torn down: the surviving room drops it
+the same way.
+
 ## Events the room pushes
 
 The engine pushes these asynchronously on the same control connection (no `id`):
@@ -245,8 +333,8 @@ reception report block (RFC 3550 §6.4.1) on the same muxed endpoint (RFC 5761).
 ## How to verify
 
 - `siphon_rtp_conference_rooms` and `siphon_rtp_conference_participants` gauges on `/metrics`
-  track live rooms and seats; `siphon_rtp_conference_joins_total` / `_leaves_total` count the
-  verbs. See [Monitoring & QoS](monitoring.md).
+  track live rooms and seats; `siphon_rtp_conference_joins_total`, `_offers_total`,
+  `_answers_total` and `_leaves_total` count the verbs. See [Monitoring & QoS](monitoring.md).
 - Join two G.711 legs as talkers and send audio into one: the other's socket receives a mixed
   RTP stream from the engine's answered port within a few 20 ms frames, with the engine's own
   SSRC.

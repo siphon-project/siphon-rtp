@@ -1047,8 +1047,9 @@ where
             {
                 tracing::warn!(target: "siphon_rtp::media", %call_id, idle_secs = timeout_ticks, held_idle_secs = held_timeout_ticks, setup_idle_secs = setup_timeout_ticks, "media timeout — call reaped");
             }
-            // Conference seats keep the two-ceiling rule: a controller only seats a leg it has already
-            // answered, so a seat is never in setup and has no third ceiling to pick from.
+            // Conference seats keep the two-ceiling rule: a seat is only in the room once its media is
+            // negotiated, so it is never in setup. A seat still waiting for its answer is not in the
+            // room at all, and is expired on its own below.
             let reaped = sweeper
                 .reap_idle_conferences(timeout_ticks, held_timeout_ticks)
                 .await;
@@ -1059,6 +1060,13 @@ where
                     idle_secs = timeout_ticks,
                     "media timeout — conference participants reaped"
                 );
+            }
+            // A seat the room offered and nobody answered is in setup, so it takes the setup ceiling.
+            let expired = sweeper
+                .reap_pending_seats(setup_timeout_ticks, timeout_ticks)
+                .await;
+            if expired > 0 {
+                tracing::warn!(target: "siphon_rtp::media", seats = expired, setup_idle_secs = setup_timeout_ticks, "setup timeout — unanswered conference offers expired");
             }
             if let Some(turn) = &turn_sweeper {
                 turn.reap();

@@ -32,6 +32,8 @@ The full series set:
 | `siphon_rtp_control_errors_total` | counter | control commands that returned an error |
 | `siphon_rtp_control_rate_limited_total` | counter | control commands rejected by the per-connection rate limiter |
 | `siphon_rtp_conference_joins_total` | counter | `conference_join` commands accepted |
+| `siphon_rtp_conference_offers_total` | counter | `conference_offer` commands accepted |
+| `siphon_rtp_conference_answers_total` | counter | `conference_answer` commands accepted |
 | `siphon_rtp_conference_leaves_total` | counter | `conference_leave` commands accepted |
 | `siphon_rtp_scoped_offers_total` | counter | `offer` / `answer_local` commands accepted that named a call scope |
 | `siphon_rtp_jemalloc_allocated_bytes` | gauge | live heap, jemalloc `stats.allocated` |

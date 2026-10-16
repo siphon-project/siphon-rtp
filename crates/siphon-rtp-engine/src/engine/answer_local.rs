@@ -1054,7 +1054,17 @@ pub(super) fn answer_codec_candidates(
     policy: &sdp::CodecPolicy,
 ) -> Vec<CodecSpec> {
     // The offerer's own audio codecs, in offer order, telephone-event already excluded.
-    let mut candidates = info.audio_codecs();
+    order_codec_candidates(info.audio_codecs(), policy)
+}
+
+/// Edit `candidates` by the profile's codec flags, as [`answer_codec_candidates`] describes: drop the
+/// removed codecs, keep only a keep-list when there is one, then float `offer`-ordered codecs and
+/// `transcode` preferences forward without reordering the rest. Shared with the conference seat the
+/// engine offers itself, which edits its own codec list by the same rules.
+pub(super) fn order_codec_candidates(
+    mut candidates: Vec<CodecSpec>,
+    policy: &sdp::CodecPolicy,
+) -> Vec<CodecSpec> {
     // `strip`/`mask`/`consume-X`: drop the named codec from the answer candidate set.
     if !policy.remove.is_empty() {
         candidates.retain(|spec| !policy.remove.contains(&spec.encoding_name));

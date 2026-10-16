@@ -80,9 +80,10 @@ sampled), and `siphon_rtp_draining`. See
 
 `drain` puts a node into a refuse-new-work mode without touching live calls:
 
-- `offer` and `conference_join` are rejected with
+- `offer`, `conference_join` and `conference_offer` are rejected with
   `"node is draining; not accepting new sessions"`,
-- everything else keeps working: `answer` for calls mid-setup, `delete`, `query`, media control,
+- everything else keeps working: `answer` for calls mid-setup (and `conference_answer` for a
+  seat offered before the drain), `delete`, `query`, media control,
   the census and cluster verbs,
 - `/readyz` answers `503` (liveness `/healthz` stays `200`), and `siphon_rtp_draining` goes to 1,
 - `undrain` reverses it.

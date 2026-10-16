@@ -20,6 +20,7 @@
 use std::net::SocketAddr;
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_engine::sdp::{self, EngineMedia, IceAdvertisement, IceRewrite, TextRewrite};
 use siphon_rtp_ice::{Candidate, CandidateKind, GatherConfig, Gatherer};
 
@@ -198,6 +199,38 @@ fn sdp_rewrite(criterion: &mut Criterion) {
             |answer| sdp::decline_unanswered_media(black_box(answer), false),
             BatchSize::SmallInput,
         );
+    });
+
+    // The offer a room writes whole for a seat it calls out to (`conference_offer`): no peer SDP to
+    // rewrite, so this is the whole SDP cost of that verb. Listed as an always-built room offers it.
+    let seat_codecs = [
+        CodecSpec::new(111, "opus", 48_000, 2, 20),
+        CodecSpec::new(9, "G722", 8000, 1, 20),
+        CodecSpec::new(0, "PCMU", 8000, 1, 20),
+        CodecSpec::new(8, "PCMA", 8000, 1, 20),
+        CodecSpec::new(102, "G726-32", 8000, 1, 20),
+        CodecSpec::new(3, "GSM", 8000, 1, 20),
+    ];
+    let seat_events = [
+        sdp::TelephoneEvent {
+            payload_type: 110,
+            clock_rate_hz: 48_000,
+        },
+        sdp::TelephoneEvent {
+            payload_type: 101,
+            clock_rate_hz: 8000,
+        },
+    ];
+    group.bench_function("writes_a_conference_seat_offer", |bencher| {
+        bencher.iter(|| {
+            sdp::conference_seat_offer(
+                black_box(addr("198.51.100.20:30168")),
+                black_box(addr("198.51.100.20:30168").ip()),
+                42,
+                black_box(&seat_codecs),
+                black_box(&seat_events),
+            )
+        });
     });
 
     group.finish();

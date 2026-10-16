@@ -19,6 +19,8 @@ use siphon_rtp_srtp::sdes::CryptoAttribute;
 
 mod amr;
 mod decline;
+mod offer;
+pub use offer::conference_seat_offer;
 
 pub(crate) use amr::offered as offered_amr;
 pub use amr::{set_policy as set_amr_policy, AmrFmtp, AmrPolicy};
