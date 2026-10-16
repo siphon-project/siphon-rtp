@@ -861,6 +861,7 @@ async fn a_recording_of_a_scoped_call_has_its_own_file() {
                     max_duration_ms: None,
                     silence_ms: None,
                     path: None,
+                    bitrate_bps: None,
                 },
             )
             .await;

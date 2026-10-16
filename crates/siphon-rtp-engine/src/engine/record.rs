@@ -1,10 +1,12 @@
-//! Runtime recording: raw-RTP pcap and decoded-audio WAV.
+//! Runtime recording: raw-RTP pcap, and decoded audio as WAV or Ogg Opus.
 
 use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_datapath::{Datapath, EndpointId};
 use siphon_rtp_media::pcap::{self, CapturedPacket};
 use siphon_rtp_proto::{
-    CmdResult, Event, RecordingChannels, RecordingDirection, RecordingEndReason,
+    CmdResult, Event, RecordingChannels, RecordingDirection, RecordingEndReason, RecordingFormat,
+    RECORDING_OPUS_BITRATE_BPS_MAX, RECORDING_OPUS_BITRATE_BPS_MIN,
+    RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT,
 };
 use std::sync::Arc;
 
@@ -49,8 +51,9 @@ pub(super) struct AudioRecording {
     /// detaches; left at `CallEnded` otherwise, because a writer cannot tell a stop from a hangup —
     /// both are just "the sinks are gone" — and guessing would report one as the other.
     pub(super) source_reason: Arc<std::sync::Mutex<RecordingEndReason>>,
-    /// The writer task. **Never aborted**: aborting it would skip the header finalize and leave a
-    /// file declaring zero samples. It is ended by closing its input, and then awaited.
+    /// The writer task. **Never aborted**: aborting it would skip the close and leave a WAV
+    /// declaring zero samples, or an Ogg file missing its last page. It is ended by closing its
+    /// input, and then awaited.
     pub(super) writer: tokio::task::JoinHandle<()>,
 }
 
@@ -73,14 +76,116 @@ struct RecordingWriter {
     file: tokio::fs::File,
     rate: u32,
     channels: u8,
+    encoding: crate::recording::RecordingEncoding,
     limits: crate::recording::RecordingLimits,
     frames: flume::Receiver<Vec<u8>>,
     recycle: flume::Sender<Vec<u8>>,
     source_reason: Arc<std::sync::Mutex<RecordingEndReason>>,
 }
 
+/// How a decoded recording stores its audio, as validated from the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DecodedFormat {
+    Wav,
+    /// `bitrate_bps` absent ⇒ the per-channel default, resolved once the channel count is known.
+    OggOpus {
+        bitrate_bps: Option<u32>,
+    },
+}
+
+/// Opus' input rates (RFC 6716 §2). A recording at any other rate is refused, never resampled.
+const OPUS_INPUT_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+
+impl DecodedFormat {
+    /// The generated file name's extension: RFC 7845 §9 registers `.opus` for Ogg Opus.
+    fn extension(self) -> &'static str {
+        match self {
+            DecodedFormat::Wav => "wav",
+            DecodedFormat::OggOpus { .. } => "opus",
+        }
+    }
+
+    /// Build the sink's encoding for a recording at `rate` with `channels`. Runs before anything on
+    /// the call is touched, so a rate Opus cannot take fails the verb with the call as it was.
+    fn encoding(
+        self,
+        rate: u32,
+        channels: u8,
+    ) -> Result<crate::recording::RecordingEncoding, String> {
+        use crate::recording::RecordingEncoding;
+        use siphon_rtp_media::ogg_opus::{OggOpusConfig, OggOpusWriter};
+        let DecodedFormat::OggOpus { bitrate_bps } = self else {
+            return Ok(RecordingEncoding::Wav);
+        };
+        if !OPUS_INPUT_RATES.contains(&rate) {
+            return Err(format!(
+                "an ogg_opus recording needs an Opus input rate (8, 12, 16, 24 or 48 kHz), and \
+                 this call decodes at {rate} Hz"
+            ));
+        }
+        let bitrate_bps = bitrate_bps
+            .unwrap_or(RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT * u32::from(channels));
+        // RFC 3533 §6: the serial number tells logical streams apart, so it is random rather than
+        // a counter that would repeat across engines and restarts.
+        let mut serial = [0u8; 4];
+        getrandom::fill(&mut serial)
+            .map_err(|error| format!("no randomness for the Ogg stream serial: {error}"))?;
+        let writer = OggOpusWriter::new(OggOpusConfig {
+            sample_rate_hz: rate,
+            channels,
+            bitrate_bps,
+            serial: u32::from_le_bytes(serial),
+            vendor: OGG_OPUS_VENDOR,
+        })
+        .map_err(|error| format!("ogg_opus: {error}"))?;
+        Ok(RecordingEncoding::OggOpus(Box::new(writer)))
+    }
+}
+
+/// Validate a `start_recording`'s format against its `bitrate_bps`: `None` for a pcap recording,
+/// the decoded format otherwise.
+///
+/// A bitrate is meaningful only to `ogg_opus`. Given with any other format it is refused rather
+/// than ignored — the controller asked for something it will not get — and outside Opus' own range
+/// (RFC 6716 §2.1.1) it is refused rather than clamped, for the same reason.
+pub(super) fn decoded_format(
+    format: RecordingFormat,
+    bitrate_bps: Option<u32>,
+) -> Result<Option<DecodedFormat>, String> {
+    match (format, bitrate_bps) {
+        (RecordingFormat::OggOpus, bitrate_bps) => {
+            if let Some(bitrate) = bitrate_bps {
+                if !(RECORDING_OPUS_BITRATE_BPS_MIN..=RECORDING_OPUS_BITRATE_BPS_MAX)
+                    .contains(&bitrate)
+                {
+                    return Err(format!(
+                        "bitrate_bps {bitrate} is outside \
+                         {RECORDING_OPUS_BITRATE_BPS_MIN}..={RECORDING_OPUS_BITRATE_BPS_MAX}"
+                    ));
+                }
+            }
+            Ok(Some(DecodedFormat::OggOpus { bitrate_bps }))
+        }
+        (other, Some(_)) => Err(format!(
+            "bitrate_bps applies only to an ogg_opus recording, not {}",
+            match other {
+                RecordingFormat::Pcap => "pcap",
+                RecordingFormat::Wav => "wav",
+                RecordingFormat::OggOpus => "ogg_opus",
+            }
+        )),
+        (RecordingFormat::Pcap, None) => Ok(None),
+        (RecordingFormat::Wav, None) => Ok(Some(DecodedFormat::Wav)),
+    }
+}
+
+/// The `OpusTags` vendor string (RFC 7845 §5.2). Deliberately nothing else: the call's identifiers
+/// stay out of a file that may travel, and the controller has them from the event anyway.
+const OGG_OPUS_VENDOR: &str = concat!("siphon-rtp ", env!("CARGO_PKG_VERSION"));
+
 /// The decoded-recording knobs, grouped so the start path takes one parameter rather than six.
-pub(super) struct WavRecordingRequest {
+pub(super) struct DecodedRecordingRequest {
+    pub(super) format: DecodedFormat,
     pub(super) direction: RecordingDirection,
     pub(super) channels: RecordingChannels,
     pub(super) limits: crate::recording::RecordingLimits,
@@ -272,7 +377,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Begin a runtime **decoded-audio** recording ([`Command::StartRecording`] with
-    /// `format: "wav"`).
+    /// `format: "wav"` or `format: "ogg_opus"`).
     ///
     /// The point of the verb: a voicemail box answers locally, plays a greeting and a beep, and only
     /// *then* records the caller — so recording has to start at a moment the controller picks, capture
@@ -281,16 +386,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// (offer/answer-time, two legs, buffered in RAM, flushed at teardown) or the pcap recorder (raw
     /// wire bytes) does any of that.
     ///
-    /// It attaches the **same** sinks a WebSocket tee does, onto the same post-decode fan-out, feeding
-    /// the same shared frame assembler — which already interleaves two legs, hands off over a bounded
-    /// channel and recycles its buffers with no per-frame allocation. Its wire frames are little-endian
-    /// 16-bit PCM, i.e. exactly a WAV `data` payload, so the writer appends them verbatim.
+    /// It attaches the **same** sinks a WebSocket tee does, onto the same post-decode fan-out,
+    /// feeding the same shared frame assembler — which already interleaves two legs, hands off over
+    /// a bounded channel and recycles its buffers with no per-frame allocation. Its wire frames are
+    /// little-endian 16-bit PCM, i.e. exactly a WAV `data` payload, so a WAV writer appends them
+    /// verbatim and an Ogg Opus writer encodes them in its own task.
     pub(super) async fn start_wav_recording(
         &self,
         client: ClientId,
         call_id: &str,
         from_tag: &str,
-        request: WavRecordingRequest,
+        request: DecodedRecordingRequest,
     ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
@@ -315,7 +421,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         call_id: &str,
         from_tag: &str,
-        request: WavRecordingRequest,
+        request: DecodedRecordingRequest,
     ) -> Result<String, String> {
         use siphon_rtp_media::bridge::protocol::{Encoding, Endianness, MediaFormat};
         use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
@@ -436,11 +542,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             endianness: Endianness::Little,
             ptime,
         };
+        let encoding = request.format.encoding(rate, channels)?;
 
         let recording_id = self.next_recording_id();
-        let (path, file) =
-            open_recording_output(call_id, &recording_id, request.path, request.recording_dir)
-                .await?;
+        let (path, file) = open_recording_output(
+            call_id,
+            &recording_id,
+            request.format.extension(),
+            request.path,
+            request.recording_dir,
+        )
+        .await?;
 
         // A relay-only actor (a pcap recording, a DTMF block) forwards RTP verbatim and never decodes,
         // so the fan-out this taps would stay dry. Rebuild it as a processing actor, then hold it for
@@ -501,6 +613,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             file,
             rate,
             channels,
+            encoding,
             limits: request.limits,
             frames: plan.frames,
             recycle: plan.recycle,
@@ -541,7 +654,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         call_id: &str,
         from_tag: &str,
-        request: WavRecordingRequest,
+        request: DecodedRecordingRequest,
     ) -> Result<String, String> {
         use siphon_rtp_media::bridge::protocol::{Encoding, Endianness, MediaFormat};
         use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
@@ -615,11 +728,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             endianness: Endianness::Little,
             ptime,
         };
+        let encoding = request.format.encoding(rate, channels)?;
 
         let recording_id = self.next_recording_id();
-        let (path, file) =
-            open_recording_output(call_id, &recording_id, request.path, request.recording_dir)
-                .await?;
+        let (path, file) = open_recording_output(
+            call_id,
+            &recording_id,
+            request.format.extension(),
+            request.path,
+            request.recording_dir,
+        )
+        .await?;
 
         let plan = plan_ws_tee(format, two_parties, !record_caller);
         let mut bridge_taps = Vec::new();
@@ -650,6 +769,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             file,
             rate,
             channels,
+            encoding,
             limits: request.limits,
             frames: plan.frames,
             recycle: plan.recycle,
@@ -707,11 +827,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     fn spawn_recording_writer(&self, writer: RecordingWriter) -> tokio::task::JoinHandle<()> {
         let events = self.event_sink(writer.owner);
         tokio::spawn(async move {
-            let outcome = crate::recording::run_wav_recorder(
-                writer.file,
-                writer.path.clone(),
-                writer.rate,
-                u16::from(writer.channels),
+            let outcome = crate::recording::run_recorder(
+                crate::recording::RecordingOutput {
+                    file: writer.file,
+                    path: writer.path.clone(),
+                    sample_rate: writer.rate,
+                    channels: u16::from(writer.channels),
+                    encoding: writer.encoding,
+                },
                 writer.limits,
                 writer.frames,
                 writer.recycle,
@@ -723,9 +846,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .map(|reason| *reason)
                 .unwrap_or(RecordingEndReason::CallEnded);
             let reason = outcome.end.into_reason(source_reason);
-            // Emitted only now — after the header has been finalized and the file flushed — so a
-            // consumer that acts on this event never opens a half-written file. That is the whole
-            // reason the event exists.
+            // Emitted only now — after the file has been closed and synced — so a consumer that
+            // acts on this event never opens a half-written file. That is the whole reason the
+            // event exists.
             if let Some(events) = events {
                 let _ = events.try_send(Event::RecordingFinished {
                     conference_id: None,
@@ -774,7 +897,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// The stop **is** the detach: dropping the sinks drops the last reference to the shared frame
     /// assembler, which closes the writer's input, which makes it finalize the header and emit
     /// [`Event::RecordingFinished`]. The writer is never aborted — that would skip the finalize and
-    /// leave a valid-but-empty WAV — and awaiting it is what makes the event ordering a guarantee
+    /// leave a valid-but-empty WAV, or an Ogg file without its last second and end-of-stream page —
+    /// and awaiting it is what makes the event ordering a guarantee
     /// rather than a race for a controller that stops a recording and immediately reads the file.
     pub(super) async fn stop_wav_recording(&self, recording_id: &str, reason: RecordingEndReason) {
         let Some((_, recording)) = self.recordings.remove(recording_id) else {
@@ -853,7 +977,7 @@ fn new_source_reason() -> Arc<std::sync::Mutex<RecordingEndReason>> {
 }
 
 /// Resolve and open a call recording's output file: `path` exactly, or a generated name under
-/// `recording_dir`.
+/// `recording_dir` ending in `extension`.
 ///
 /// Opened up front, exactly as the pcap path does: a bad path must fail the verb with the call
 /// untouched — nothing promoted, no sink attached — rather than being reported minutes later as a
@@ -861,6 +985,7 @@ fn new_source_reason() -> Arc<std::sync::Mutex<RecordingEndReason>> {
 async fn open_recording_output(
     call_id: &str,
     recording_id: &str,
+    extension: &str,
     path: Option<String>,
     recording_dir: Option<String>,
 ) -> Result<(std::path::PathBuf, tokio::fs::File), String> {
@@ -870,7 +995,7 @@ async fn open_recording_output(
             let directory = recording_dir
                 .ok_or_else(|| "no output location (set `path`, or `recording_dir`)".to_string())?;
             let stem = super::scope::external(call_id);
-            std::path::PathBuf::from(directory).join(format!("{stem}-{recording_id}.wav"))
+            std::path::PathBuf::from(directory).join(format!("{stem}-{recording_id}.{extension}"))
         }
     };
     let file = tokio::fs::File::create(&path)
@@ -918,5 +1043,98 @@ async fn run_pcap_recorder(
         tracing::warn!(%error, path, "pcap recorder: final flush failed");
     } else {
         tracing::info!(path, "pcap recording finalized");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bitrate_is_accepted_only_with_ogg_opus_and_only_in_range() {
+        assert_eq!(decoded_format(RecordingFormat::Pcap, None), Ok(None));
+        assert_eq!(
+            decoded_format(RecordingFormat::Wav, None),
+            Ok(Some(DecodedFormat::Wav))
+        );
+        assert_eq!(
+            decoded_format(RecordingFormat::OggOpus, None),
+            Ok(Some(DecodedFormat::OggOpus { bitrate_bps: None }))
+        );
+        for bitrate in [
+            RECORDING_OPUS_BITRATE_BPS_MIN,
+            RECORDING_OPUS_BITRATE_BPS_MAX,
+        ] {
+            assert_eq!(
+                decoded_format(RecordingFormat::OggOpus, Some(bitrate)),
+                Ok(Some(DecodedFormat::OggOpus {
+                    bitrate_bps: Some(bitrate)
+                }))
+            );
+        }
+        for bitrate in [
+            0,
+            RECORDING_OPUS_BITRATE_BPS_MIN - 1,
+            RECORDING_OPUS_BITRATE_BPS_MAX + 1,
+            u32::MAX,
+        ] {
+            let refused = decoded_format(RecordingFormat::OggOpus, Some(bitrate))
+                .expect_err("out of range is refused, not clamped");
+            assert_eq!(
+                refused,
+                format!("bitrate_bps {bitrate} is outside 6000..=510000")
+            );
+        }
+        assert_eq!(
+            decoded_format(RecordingFormat::Wav, Some(16_000)),
+            Err("bitrate_bps applies only to an ogg_opus recording, not wav".to_string())
+        );
+        assert_eq!(
+            decoded_format(RecordingFormat::Pcap, Some(16_000)),
+            Err("bitrate_bps applies only to an ogg_opus recording, not pcap".to_string())
+        );
+    }
+
+    #[test]
+    fn a_generated_name_carries_the_format_extension() {
+        assert_eq!(DecodedFormat::Wav.extension(), "wav");
+        assert_eq!(
+            DecodedFormat::OggOpus { bitrate_bps: None }.extension(),
+            "opus"
+        );
+    }
+
+    #[test]
+    fn the_encoding_is_built_before_the_call_is_touched_and_refuses_non_opus_rates() {
+        assert!(matches!(
+            DecodedFormat::Wav.encoding(11_025, 1),
+            Ok(crate::recording::RecordingEncoding::Wav)
+        ));
+        for rate in OPUS_INPUT_RATES {
+            assert!(
+                matches!(
+                    DecodedFormat::OggOpus { bitrate_bps: None }.encoding(rate, 2),
+                    Ok(crate::recording::RecordingEncoding::OggOpus(_))
+                ),
+                "{rate} Hz"
+            );
+        }
+        for rate in [11_025, 22_050, 32_000, 44_100] {
+            let refused = DecodedFormat::OggOpus { bitrate_bps: None }
+                .encoding(rate, 1)
+                .expect_err("not an Opus input rate");
+            assert!(
+                refused.contains(&format!("decodes at {rate} Hz")),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_vendor_string_names_the_engine_and_nothing_about_the_call() {
+        assert_eq!(
+            OGG_OPUS_VENDOR,
+            concat!("siphon-rtp ", env!("CARGO_PKG_VERSION"))
+        );
     }
 }

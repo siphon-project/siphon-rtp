@@ -145,6 +145,27 @@ const _: () = assert!(ECHO_DELAY_SEARCH_MS_MIN < ECHO_DELAY_SEARCH_MS_MAX);
 /// See the assert above.
 const _: () = assert!(ECHO_LONG_TAIL_MS_MIN < ECHO_LONG_TAIL_MS_MAX);
 
+/// Smallest [`Command::StartRecording`] `bitrate_bps` the engine accepts for an
+/// [`RecordingFormat::OggOpus`] recording: the bottom of Opus' own range (RFC 6716 §2.1.1).
+///
+/// Exported for the same reason as the echo bounds: a controller validating at config load must
+/// read the engine's range, not restate it.
+pub const RECORDING_OPUS_BITRATE_BPS_MIN: u32 = 6_000;
+/// Largest [`Command::StartRecording`] `bitrate_bps` the engine accepts: the top of Opus' range
+/// (RFC 6716 §2.1.1). See [`RECORDING_OPUS_BITRATE_BPS_MIN`].
+pub const RECORDING_OPUS_BITRATE_BPS_MAX: u32 = 510_000;
+/// The bitrate an [`RecordingFormat::OggOpus`] recording gets per channel when `bitrate_bps` is
+/// absent: 16 kbit/s for mono, 32 kbit/s for stereo. Transparent for narrowband speech and
+/// comfortable for wideband.
+pub const RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT: u32 = 16_000;
+
+/// See the echo-bound asserts above.
+const _: () = assert!(RECORDING_OPUS_BITRATE_BPS_MIN < RECORDING_OPUS_BITRATE_BPS_MAX);
+const _: () = assert!(
+    RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT >= RECORDING_OPUS_BITRATE_BPS_MIN
+        && 2 * RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT <= RECORDING_OPUS_BITRATE_BPS_MAX
+);
+
 /// serde `default` for a `bool` field that should default to `true`.
 fn default_true() -> bool {
     true
@@ -492,7 +513,7 @@ pub enum Command {
     /// offer/answer `record_call` flag, this toggles recording on a **live** call, at a point in it
     /// the controller chooses.
     ///
-    /// Two formats, and they record different things:
+    /// Three formats, and they record different things:
     ///
     /// * [`RecordingFormat::Pcap`] (the default, and what this verb has always done) captures each
     ///   accepted RTP/RTCP datagram verbatim — raw wire bytes, any codec — to
@@ -502,6 +523,9 @@ pub enum Command {
     ///   completes with an [`Event::RecordingFinished`] naming the finished file. A product artefact:
     ///   a voicemail message to be emailed, transcribed and played back. It works on a single-leg
     ///   (`answer_local`) call — which is what a voicemail box is — as well as a two-party one.
+    /// * [`RecordingFormat::OggOpus`] records exactly what `wav` does — same taps, same limits,
+    ///   same event — and compresses it into an Ogg Opus file (RFC 7845). About an eighth of the
+    ///   size of an 8 kHz WAV at the default bitrate, for a recording that has to leave the node.
     ///
     /// The accept carries a `recording_id`; [`Command::StopRecording`] takes it, and the
     /// [`Event::RecordingFinished`] echoes it.
@@ -514,11 +538,12 @@ pub enum Command {
         /// What to write. Absent ⇒ [`RecordingFormat::Pcap`], so an existing caller is unmoved.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         format: Option<RecordingFormat>,
-        /// Which audio a `wav` recording captures. Absent ⇒ [`RecordingDirection::Ingress`] — the
-        /// audio the parties *sent*, which is what a voicemail message is.
+        /// Which audio a decoded (`wav` or `ogg_opus`) recording captures. Absent ⇒
+        /// [`RecordingDirection::Ingress`] — the audio the parties *sent*, which is what a
+        /// voicemail message is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direction: Option<RecordingDirection>,
-        /// Whether a `wav` recording is one mixed track or two separated ones. Absent ⇒ mono.
+        /// Whether a decoded recording is one mixed track or two separated ones. Absent ⇒ mono.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         channels: Option<RecordingChannels>,
         /// Stop after this many milliseconds of audio and report
@@ -534,6 +559,14 @@ pub enum Command {
         /// directory must already exist.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        /// Target Opus bitrate for an `ogg_opus` recording, in bit/s, between
+        /// [`RECORDING_OPUS_BITRATE_BPS_MIN`] and [`RECORDING_OPUS_BITRATE_BPS_MAX`]. Absent ⇒
+        /// [`RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT`] per recorded channel.
+        ///
+        /// Given with any other format, the verb fails rather than ignoring it: a controller that
+        /// asked for a bitrate has not got the artefact it thinks it has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bitrate_bps: Option<u32>,
     },
     /// Stop a runtime recording started with [`Command::StartRecording`] (rtpengine
     /// `stop recording`): finalize the file and demote the relay back to the fast path if nothing
@@ -1076,8 +1109,10 @@ pub enum BridgeDirection {
 ///
 /// Deliberately **not** `#[non_exhaustive]`: a controller that asks for a format the engine answers
 /// with something else has been silently given a different artefact, and the two here are not
-/// substitutes — one is raw wire bytes for an audit, the other decoded audio for a person to listen
-/// to. Losing compilation on a new format is the feature.
+/// substitutes — one is raw wire bytes for an audit, the others decoded audio for a person to
+/// listen to. Losing compilation on a new format is the feature, and so is an engine that predates
+/// a format refusing it: an unknown variant fails to deserialize, so the command fails instead of
+/// falling back to the default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingFormat {
@@ -1086,9 +1121,13 @@ pub enum RecordingFormat {
     Pcap,
     /// Decoded 16-bit linear PCM, streamed to a RIFF/WAVE file as it arrives.
     Wav,
+    /// The same decoded audio, Opus-encoded into an Ogg file (RFC 7845) as it arrives. On the wire
+    /// as `"ogg_opus"`; a generated file name ends `.opus`.
+    OggOpus,
 }
 
-/// Which audio a [`RecordingFormat::Wav`] recording captures.
+/// Which audio a decoded ([`RecordingFormat::Wav`] or [`RecordingFormat::OggOpus`]) recording
+/// captures.
 ///
 /// "Ingress" and "egress" are relative to the **engine**: ingress is what the parties sent *to* it
 /// (a voicemail message, a call recording), egress is what the engine sent *to* them (its prompts,
@@ -1108,7 +1147,7 @@ pub enum RecordingDirection {
     Both,
 }
 
-/// Whether a [`RecordingFormat::Wav`] recording is one mixed track or two separated ones.
+/// Whether a decoded recording is one mixed track or two separated ones.
 ///
 /// Exhaustive for the same reason as [`RecordingFormat`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1122,7 +1161,7 @@ pub enum RecordingChannels {
     Stereo,
 }
 
-/// How a [`RecordingFormat::Wav`] recording ended ([`Event::RecordingFinished`]).
+/// How a decoded recording ended ([`Event::RecordingFinished`]).
 ///
 /// `#[non_exhaustive]`: engine-emitted and informational. A consumer that does not recognise a reason
 /// still has the finished file, which is the part it acts on.
@@ -1612,9 +1651,10 @@ pub enum CmdResult {
         /// controller correlates the completion with the accept it awaited.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         play_id: Option<u64>,
-        /// The accepted recording's identifier (`start_recording` with `format: "wav"`). The matching
-        /// [`Event::RecordingFinished`] carries the same value, and [`Command::StopRecording`] takes
-        /// it to stop this recording without disturbing another on the same call.
+        /// The accepted recording's identifier (`start_recording` with a decoded format, `wav` or
+        /// `ogg_opus`). The matching [`Event::RecordingFinished`] carries the same value, and
+        /// [`Command::StopRecording`] takes it to stop this recording without disturbing another on
+        /// the same call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recording_id: Option<String>,
         /// UAS To-tag (subscribe_request / siprec).
@@ -1973,10 +2013,11 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         played_ms: Option<u64>,
     },
-    /// A [`RecordingFormat::Wav`] recording ended and its file is **closed**.
+    /// A decoded ([`RecordingFormat::Wav`] or [`RecordingFormat::OggOpus`]) recording ended and its
+    /// file is **closed**.
     ///
-    /// Emitted after the WAV header has been finalized and the file flushed, so a consumer that acts
-    /// on this event never reads a half-written file — which is the whole reason the event exists.
+    /// Emitted after the file has been closed and synced to disk, so a consumer that acts on this
+    /// event never reads a half-written file — which is the whole reason the event exists.
     /// `recording_id` is the one the [`Command::StartRecording`] accept returned.
     RecordingFinished {
         /// The call the recording ran on. Empty for a room recording, which names `conference_id`.
@@ -2306,6 +2347,74 @@ mod tests {
         let json = serde_json::to_string(value).expect("serialize");
         let back: T = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(value, &back, "roundtrip mismatch via {json}");
+    }
+
+    #[test]
+    fn an_ogg_opus_recording_is_spelled_ogg_opus_and_carries_its_bitrate() {
+        let wire = concat!(
+            r#"{"command":"start_recording","call_id":"c1","from_tag":"t1","#,
+            r#""format":"ogg_opus","channels":"stereo","bitrate_bps":24000}"#
+        );
+        let command: Command = serde_json::from_str(wire).expect("parse");
+        match &command {
+            Command::StartRecording {
+                format,
+                bitrate_bps,
+                channels,
+                ..
+            } => {
+                assert_eq!(*format, Some(RecordingFormat::OggOpus));
+                assert_eq!(*bitrate_bps, Some(24_000));
+                assert_eq!(*channels, Some(RecordingChannels::Stereo));
+            }
+            other => panic!("expected start_recording, got {other:?}"),
+        }
+        roundtrip(&command);
+        assert_eq!(
+            serde_json::to_value(RecordingFormat::OggOpus).expect("serialize"),
+            serde_json::json!("ogg_opus")
+        );
+    }
+
+    #[test]
+    fn a_start_recording_without_a_bitrate_keeps_its_old_wire_form() {
+        // Additive on the wire: an existing `wav` caller sends and receives exactly what it did.
+        let command = Command::StartRecording {
+            call_id: "c1".into(),
+            from_tag: "t1".into(),
+            recording_dir: None,
+            format: Some(RecordingFormat::Wav),
+            direction: None,
+            channels: None,
+            max_duration_ms: None,
+            silence_ms: None,
+            path: None,
+            bitrate_bps: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&command).expect("serialize"),
+            r#"{"command":"start_recording","call_id":"c1","from_tag":"t1","format":"wav"}"#
+        );
+    }
+
+    #[test]
+    fn an_unknown_recording_format_is_refused_not_defaulted() {
+        // What an engine that predates a format sees: the variant does not deserialize, so the
+        // command fails as a whole. It must never come out as a `pcap` recording because `format`
+        // is optional and defaults to it.
+        let wire = concat!(
+            r#"{"command":"start_recording","call_id":"c1","from_tag":"t1","#,
+            r#""format":"mp3"}"#
+        );
+        let error = serde_json::from_str::<Command>(wire).expect_err("an unknown format refuses");
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn the_exported_opus_bitrate_bounds_are_the_rfc_6716_range() {
+        assert_eq!(RECORDING_OPUS_BITRATE_BPS_MIN, 6_000);
+        assert_eq!(RECORDING_OPUS_BITRATE_BPS_MAX, 510_000);
+        assert_eq!(RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT, 16_000);
     }
 
     #[test]

@@ -1,14 +1,14 @@
 //! The control entry point: client registration, event delivery, and routing commands to verbs.
 
 use siphon_rtp_datapath::Datapath;
-use siphon_rtp_proto::{CmdResult, Command, Event, RecordingFormat};
+use siphon_rtp_proto::{CmdResult, Command, Event};
 use std::sync::Arc;
 
 use super::play::PlayOptions;
-use super::record::WavRecordingRequest;
+use super::record::{decoded_format, DecodedRecordingRequest};
 use super::{
-    ok_empty, ClientGeneration, ClientId, ClientSink, ControllerAttachError, ControllerAttachment,
-    ControllerIdentity, Engine,
+    error_result, ok_empty, ClientGeneration, ClientId, ClientSink, ControllerAttachError,
+    ControllerAttachment, ControllerIdentity, Engine,
 };
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -595,29 +595,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 max_duration_ms,
                 silence_ms,
                 path,
-            } => match format.unwrap_or_default() {
-                RecordingFormat::Pcap => {
-                    self.start_recording(client, &call_id, recording_dir).await
-                }
-                RecordingFormat::Wav => {
-                    self.start_wav_recording(
-                        client,
-                        &call_id,
-                        &from_tag,
-                        WavRecordingRequest {
-                            direction: direction.unwrap_or_default(),
-                            channels: channels.unwrap_or_default(),
-                            limits: crate::recording::RecordingLimits {
-                                max_duration_ms,
-                                silence_ms,
+                bitrate_bps,
+            } => {
+                let format = format.unwrap_or_default();
+                let decoded = match decoded_format(format, bitrate_bps) {
+                    Ok(decoded) => decoded,
+                    Err(reason) => return error_result("start_recording", &reason),
+                };
+                match decoded {
+                    None => self.start_recording(client, &call_id, recording_dir).await,
+                    Some(decoded) => {
+                        self.start_wav_recording(
+                            client,
+                            &call_id,
+                            &from_tag,
+                            DecodedRecordingRequest {
+                                format: decoded,
+                                direction: direction.unwrap_or_default(),
+                                channels: channels.unwrap_or_default(),
+                                limits: crate::recording::RecordingLimits {
+                                    max_duration_ms,
+                                    silence_ms,
+                                },
+                                path,
+                                recording_dir,
                             },
-                            path,
-                            recording_dir,
-                        },
-                    )
-                    .await
+                        )
+                        .await
+                    }
                 }
-            },
+            }
             Command::StopRecording {
                 call_id,
                 recording_id,

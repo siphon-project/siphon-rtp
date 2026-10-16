@@ -378,6 +378,21 @@ impl OpusEncoder {
         self.final_range
     }
 
+    /// The encoder's algorithmic delay in samples per channel at the input rate
+    /// (`OPUS_GET_LOOKAHEAD`, `opus_encoder.c`): 2.5 ms of CELT overlap plus, outside restricted
+    /// low-delay, the 4 ms delay compensation the encode path buffers. At 48 kHz that is 312, the
+    /// pre-skip an Ogg Opus muxer declares (RFC 7845 §4.2).
+    #[must_use]
+    pub fn lookahead(&self) -> usize {
+        let rate = self.sample_rate_hz as usize;
+        let overlap = rate / 400;
+        if self.application == Application::RestrictedLowdelay {
+            overlap
+        } else {
+            overlap + rate / 250
+        }
+    }
+
     /// Whether the frame size is one Opus can carry: 2.5/5/10/20/40/60/80/100/120 ms
     /// (`frame_size_select`, `opus_encoder.c:704-727`).
     #[must_use]
@@ -1940,6 +1955,29 @@ mod tests {
         forced.set_bandwidth(Some(Bandwidth::Wideband));
         let results = run(&mut forced, &source, 960, 6);
         assert!(results.iter().all(|(result, _)| result.mode == Mode::Silk));
+    }
+
+    /// `OPUS_GET_LOOKAHEAD` as libopus reports it: 312 at 48 kHz, which is the pre-skip `opusenc`
+    /// writes for every input rate, and 120 (overlap only) under restricted low-delay.
+    #[test]
+    fn the_lookahead_matches_libopus() {
+        for (rate, expected) in [
+            (48_000, 312),
+            (24_000, 156),
+            (16_000, 104),
+            (12_000, 78),
+            (8_000, 52),
+        ] {
+            let encoder = OpusEncoder::new(rate, 1, Application::Voip).expect("new");
+            assert_eq!(encoder.lookahead(), expected, "{rate} Hz");
+            assert_eq!(
+                encoder.lookahead() * (48_000 / rate as usize),
+                312,
+                "the same 6.5 ms at every rate"
+            );
+        }
+        let low_delay = OpusEncoder::new(48_000, 2, Application::RestrictedLowdelay).expect("new");
+        assert_eq!(low_delay.lookahead(), 120);
     }
 
     /// The bandwidth must climb with the rate and must honour both the cap and the override.

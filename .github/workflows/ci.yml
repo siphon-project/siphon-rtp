@@ -51,6 +51,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The Ogg Opus recording tests decode our output with opusinfo/opusdec, an independent decoder;
+      # without opus-tools they skip, and a container bug would pass unnoticed.
+      - name: Install opus-tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends opus-tools
       # Default features = UDP-loopback datapath (NIC-free); integration tests are NOT #[ignore]d,
       # so they run here too. --locked keeps the build reproducible against the committed lockfile.
       - run: cargo test --workspace --all-features --locked

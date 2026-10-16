@@ -49,6 +49,7 @@ const CLIENT: ClientId = ClientId(1);
 mod conference_dial_out;
 mod conference_seat;
 mod offer_far;
+mod ogg_opus_recording;
 mod transcode_offer;
 
 #[test]
@@ -8277,6 +8278,7 @@ async fn every_egress_on_a_secure_takeover_leg_is_encrypted() {
                         max_duration_ms: None,
                         silence_ms: None,
                         path: None,
+                        bitrate_bps: None,
                     },
                 )
                 .await,
@@ -9328,6 +9330,7 @@ async fn a_fax_pinned_call_refuses_every_verb_that_would_decode_it() {
                     max_duration_ms: None,
                     silence_ms: None,
                     path: None,
+                    bitrate_bps: None,
                 },
             ),
         ]
@@ -9395,6 +9398,7 @@ async fn a_fax_pinned_call_still_allows_the_verbatim_relay_verbs() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -10296,6 +10300,7 @@ async fn start_recording_promotes_a_relay_and_captures_both_legs_to_pcap() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -10430,6 +10435,7 @@ async fn start_recording_rejects_a_secure_call_and_unknown_call() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -10451,6 +10457,7 @@ async fn start_recording_rejects_a_secure_call_and_unknown_call() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -11060,6 +11067,7 @@ async fn a_voicemail_records_the_caller_and_reports_the_finished_file() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -11149,6 +11157,7 @@ async fn a_recording_is_finalized_when_the_call_ends_under_it() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -11260,6 +11269,7 @@ async fn a_recording_is_finalized_when_the_media_timeout_reaps_the_call() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -11328,6 +11338,7 @@ async fn an_explicit_path_is_honoured_and_an_unknown_recording_id_is_refused() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: Some(wanted.to_string_lossy().into_owned()),
+                bitrate_bps: None,
             },
         )
         .await;
@@ -11385,6 +11396,7 @@ async fn an_unwritable_recording_path_fails_the_verb_with_the_call_untouched() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: Some(unwritable.to_string_lossy().into_owned()),
+                bitrate_bps: None,
             },
         )
         .await;
@@ -11445,6 +11457,7 @@ async fn a_pcap_recording_is_unchanged_by_the_wav_form() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -12632,6 +12645,7 @@ async fn recording_and_block_dtmf_reason_set_holds_the_relay_until_both_release(
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -14465,6 +14479,7 @@ async fn a_bridge_facing_a_secure_offerer_refuses_every_verb_that_needs_decoded_
             max_duration_ms: None,
             silence_ms: None,
             path: None,
+            bitrate_bps: None,
         };
         let verbs = [
             (
@@ -23944,6 +23959,7 @@ async fn a_ws_tee_is_refused_while_a_pcap_recording_holds_the_relay_forward_only
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -25529,6 +25545,7 @@ async fn record_caller_while<F: std::future::Future<Output = ()>>(
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -27567,6 +27584,7 @@ async fn start_decoded_recording(
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -28852,6 +28870,7 @@ async fn a_voicemail_records_an_opus_caller() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -29509,6 +29528,7 @@ async fn a_bot_is_refused_while_something_else_runs_on_the_anchor() {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;

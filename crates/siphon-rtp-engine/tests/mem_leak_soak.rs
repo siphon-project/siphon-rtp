@@ -1003,6 +1003,7 @@ async fn record_start_stop(engine: &Engine<UdpLoopbackDatapath>, dir: &str, inde
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             },
         )
         .await;
@@ -1621,6 +1622,7 @@ async fn bridged_tee_attach_detach_does_not_leak() {
 /// decoders and the writer must all go with the stop.
 async fn bridged_recording_start_stop(
     engine: &Engine<UdpLoopbackDatapath>,
+    format: siphon_rtp_proto::RecordingFormat,
     path: &str,
     index: usize,
 ) {
@@ -1633,12 +1635,13 @@ async fn bridged_recording_start_stop(
                 call_id: call_id.clone(),
                 from_tag: "tag-a".into(),
                 recording_dir: None,
-                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                format: Some(format),
                 direction: None,
                 channels: Some(siphon_rtp_proto::RecordingChannels::Stereo),
                 max_duration_ms: None,
                 silence_ms: None,
                 path: Some(path.to_string()),
+                bitrate_bps: None,
             },
         )
         .await;
@@ -1671,18 +1674,22 @@ async fn bridged_recording_start_stop(
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bridged_recording_start_stop_does_not_leak() {
+/// Churn decoded recordings in `format` on SRTP bridges until the leak gate is satisfied.
+async fn soak_bridged_recordings(
+    name: &'static str,
+    format: siphon_rtp_proto::RecordingFormat,
+    file: &str,
+) {
     let _serialized = SOAK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     // One file, rewritten every cycle, so the soak measures the engine and not the directory.
-    let path = dir.path().join("soak.wav").to_string_lossy().into_owned();
+    let path = dir.path().join(file).to_string_lossy().into_owned();
     let engine = Engine::new(UdpLoopbackDatapath::new());
-    let mut gate = LeakGate::new("bridged recording", 100, 40).await;
+    let mut gate = LeakGate::new(name, 100, 40).await;
     let mut index = 0;
     while gate.needs_more_churn() {
         for _ in 0..gate.cycles_per_segment() {
-            bridged_recording_start_stop(&engine, &path, index).await;
+            bridged_recording_start_stop(&engine, format, &path, index).await;
             index += 1;
         }
         assert_eq!(
@@ -1693,6 +1700,28 @@ async fn bridged_recording_start_stop_does_not_leak() {
         gate.sample().await;
     }
     gate.assert_no_leak();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridged_recording_start_stop_does_not_leak() {
+    soak_bridged_recordings(
+        "bridged recording",
+        siphon_rtp_proto::RecordingFormat::Wav,
+        "soak.wav",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridged_ogg_opus_recording_start_stop_does_not_leak() {
+    // The Ogg Opus writer owns an encoder, a staging frame and a page buffer per recording; all of
+    // it must go with the writer task.
+    soak_bridged_recordings(
+        "bridged ogg_opus recording",
+        siphon_rtp_proto::RecordingFormat::OggOpus,
+        "soak.opus",
+    )
+    .await;
 }
 
 /// One detach-to-anchor cycle: `answer_local` with `ws_uri` (a bot answers), `detach_ws_bridge`
