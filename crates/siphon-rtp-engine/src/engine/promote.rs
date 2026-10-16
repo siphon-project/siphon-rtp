@@ -431,6 +431,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Ok(())
     }
 
+    /// What follows an installed answer's media path, once the call records it.
+    ///
+    /// An answer that completes a renegotiation (`answered_before`) re-installed the path, so what was
+    /// attached to the one it replaced — a tee, a SIPREC fork, echo — is carried onto this one
+    /// ([`Self::carry_holds_across_answer`]).
+    ///
+    /// Text observability trigger: if the controller asked for control-plane text events and a
+    /// plaintext text stream was negotiated, promote ONLY the text stream to the userspace text
+    /// processor now (the audio relay/transcode/SRTP path is untouched). Recording promotes text
+    /// independently at `start recording`. Best-effort — a promotion failure is logged and the call
+    /// still relays text in-kernel (PR-1 behaviour).
+    pub(super) async fn settle_answered_media(&self, call_id: &str, answered_before: bool) {
+        if answered_before {
+            self.carry_holds_across_answer(call_id).await;
+        }
+        self.maybe_promote_text_for_events(call_id).await;
+    }
+
     /// Carry what holds a call in userspace across an answer that **re-installed** its media path —
     /// the answer to a re-offer (RFC 3264 §8), a hold, a resume, a codec change.
     ///
