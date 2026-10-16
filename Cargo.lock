@@ -2200,6 +2200,7 @@ dependencies = [
  "serde_json",
  "siphon-rtp-codec",
  "siphon-rtp-dsp",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",

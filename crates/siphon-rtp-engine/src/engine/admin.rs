@@ -147,5 +147,9 @@ fn supported_features() -> Vec<String> {
         // A controller can tell, before it relies on it, whether this node keys a call by
         // `(scope, call_id)`. A node without the feature reads a scoped frame as an unscoped one.
         "scope".to_string(),
+        // A controller can tell, before asking, whether this node writes `format: "ogg_opus"`. A
+        // node without it cannot deserialize the variant, and fails the whole control frame rather
+        // than recording anything.
+        "record_ogg_opus".to_string(),
     ]
 }

@@ -15,6 +15,8 @@ pub mod ingress;
 pub mod jitter;
 pub mod leg;
 pub mod mixer;
+pub mod ogg;
+pub mod ogg_opus;
 pub mod pcap;
 pub mod playback;
 pub mod player;

@@ -350,3 +350,64 @@ async fn a_second_unscoped_pass_replaces_the_first() {
         "the first pass no longer relays toward the caller"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recording_format_the_engine_does_not_know_never_starts_a_recording() {
+    // A controller built against a later contract asks for a format this engine predates. `format`
+    // is optional and defaults to pcap, so the danger is a quiet fallback: a raw-packet capture the
+    // controller never asked for, reported as success. The unknown variant must fail the frame as a
+    // whole instead. Whatever comes back is not an `ok`, and nothing is written.
+    let (engine, control_addr) = serve().await;
+    let mut control = RawControl::connect(control_addr).await;
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let offer = control
+        .request(&format!(
+            r#"{{"id":1,"command":"offer","call_id":"fmt@192.0.2.20","from_tag":"a","sdp":"{}","profile":{{}}}}"#,
+            sdp_json(addr_a)
+        ))
+        .await;
+    engine_addr(&offer);
+    let answer = control
+        .request(&format!(
+            r#"{{"id":2,"command":"answer","call_id":"fmt@192.0.2.20","from_tag":"a","to_tag":"b","sdp":"{}"}}"#,
+            sdp_json(addr_b)
+        ))
+        .await;
+    engine_addr(&answer);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let directory = dir.path().to_string_lossy().replace('\\', "\\\\");
+    control
+        .send(&format!(
+            r#"{{"id":3,"command":"start_recording","call_id":"fmt@192.0.2.20","from_tag":"a","recording_dir":"{directory}","format":"not_a_format"}}"#
+        ))
+        .await;
+    let mut chunk = [0u8; 4096];
+    let mut reply = Vec::new();
+    while let Ok(Ok(read)) =
+        timeout(Duration::from_millis(500), control.stream.read(&mut chunk)).await
+    {
+        if read == 0 {
+            break; // the connection was closed on the frame
+        }
+        reply.extend_from_slice(&chunk[..read]);
+    }
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(
+        !reply.contains(r#""id":3,"result":"ok""#),
+        "an unknown format was accepted: {reply}"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("dir").count(),
+        0,
+        "no pcap (or anything else) was written"
+    );
+
+    // The call itself is untouched: a closed control connection does not end the calls it owns.
+    assert_eq!(
+        engine.session_count(),
+        1,
+        "the call survives the refused frame"
+    );
+}

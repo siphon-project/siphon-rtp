@@ -30,6 +30,7 @@ flume = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 iai-callgrind = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "relay_bench"
@@ -78,3 +79,8 @@ harness = false
 
 [lints]
 workspace = true
+
+# Per-20 ms-frame cost of an `ogg_opus` recording: Opus encode plus Ogg paging.
+[[bench]]
+name = "ogg_opus_bench"
+harness = false

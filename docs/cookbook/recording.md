@@ -12,6 +12,8 @@ Three independent ways to get a call's media out of the engine:
    `recording_finished` event naming the finished file. A *product* artefact:
    a voicemail message to be emailed, transcribed and played back. See
    [Recording a voicemail message](#recording-a-voicemail-message).
+   `format: "ogg_opus"` records the same audio compressed, about an eighth of
+   the size; see [Compressed recordings: Ogg Opus](#compressed-recordings-ogg-opus).
 3. **SIPREC-style media forking**: `subscribe_request` / `subscribe_answer` /
    `unsubscribe` tees a leg's RTP in real time to a Session Recording Server
    (the media half of SIPREC, RFC 7866). The recorder is another RTP endpoint,
@@ -269,7 +271,7 @@ To end it yourself, name the recording so anything else on the call keeps runnin
 | `channels` | `mono` (default) sums the sources sample for sample; `stereo` puts the caller left and the other side right. A single source is mono whatever is asked (`egress` alone, or a single-leg call). |
 | silence | A party that sends nothing (a hold, a phone that suppresses silence, a prompt that has ended) is recorded as silence. The other party is never held back by more than 160 ms and nothing it says is dropped to wait. |
 | rate | The caller leg's decoded PCM rate — **not** its RTP clock, which for G.722 is half of it (RFC 3551 §4.5.2) and would replay the file at the wrong pitch. A second leg at another rate is resampled into it. |
-| where | `path` names the file exactly; otherwise `recording_dir` plus a generated `{call_id}-{recording_id}.wav`. A path that cannot be opened fails the verb immediately, with the call untouched. |
+| where | `path` names the file exactly; otherwise `recording_dir` plus a generated `{call_id}-{recording_id}.wav` (`.opus` for `ogg_opus`). A path that cannot be opened fails the verb immediately, with the call untouched. |
 
 Unlike the pcap form, a decoded recording works on a **secure** call. On a
 transcoded one it taps the audio after decryption and decode, so there is nothing
@@ -291,6 +293,74 @@ independently. Two things differ from a call on the media path:
   concealed frame.
 
 A WebSocket-takeover call still has no relayed audio to tap, and is refused.
+
+### Compressed recordings: Ogg Opus
+
+A WAV is the right file for a voicemail box on the same node, and the wrong one for
+a call recording that has to leave it. Its size is fixed by the format: 16 kB/s per
+channel at 8 kHz, 32 kB/s at 16 kHz.
+
+| one hour | mono | stereo | stereo, base64 |
+|---|--:|--:|--:|
+| `wav`, 8 kHz | 57.6 MB | 115 MB | 154 MB |
+| `wav`, 16 kHz | 115 MB | 230 MB | 307 MB |
+| `ogg_opus`, default bitrate | ~7.5 MB | ~14.7 MB | ~19.6 MB |
+
+A collector behind a proxy that caps request bodies at 100 MB cannot take a stereo
+8 kHz WAV much past half an hour. Ask for `ogg_opus` instead:
+
+```json
+{
+  "id": 42,
+  "command": "start_recording",
+  "call_id": "7f9a2b1c@198.51.100.20",
+  "from_tag": "a7c31f",
+  "format": "ogg_opus",
+  "channels": "stereo",
+  "recording_dir": "/var/spool/siphon-rtp/recordings"
+}
+```
+
+Everything else is the `wav` recording: the same taps, `direction`, `channels`,
+`max_duration_ms`, `silence_ms` and `path`, the same `recording_id`, and the same
+`recording_finished` once the file is closed. The limits are measured on the
+decoded audio before it is encoded, so `duration_ms` means the same thing in both
+formats, and the file decodes to exactly that much audio.
+
+The file is Ogg Opus (RFC 7845), mapping family 0, so anything that plays `.opus`
+plays it: `opusdec`, ffmpeg, browsers, and the transcription services that take
+Ogg Opus. Encoder settings are fixed, apart from the bitrate:
+
+| | |
+|---|---|
+| `bitrate_bps` | Optional. Default 16 000 per channel (16 kbit/s mono, 32 kbit/s stereo), transparent for narrowband speech and comfortable for wideband. Accepted range 6 000 to 510 000 (RFC 6716 §2.1.1), exported as `RECORDING_OPUS_BITRATE_BPS_MIN` / `_MAX` from `siphon-rtp-proto`. Outside it, or given with `wav` or `pcap`, the verb fails rather than clamping or ignoring it. |
+| rate | The recording's rate, chosen exactly as for `wav`, and declared as the file's input rate. Opus takes 8, 12, 16, 24 and 48 kHz. Anything else (an `L16/11025` leg, say) fails the verb rather than being resampled behind your back. |
+| frames | 20 ms, VBR, voice-tuned. |
+| FEC, DTX | **Off.** In-band FEC spends bits protecting against packet loss a file never has. DTX packets decode as gaps, and would tie the file's timing to the encoder's speech decision instead of to the audio recorded. |
+| metadata | The vendor string only. No Call-ID or tag goes into a file that may travel; you have them from the event. |
+
+**Stereo at the default bitrate is not fully separated.** Opus codes stereo jointly,
+and at 16 kbit/s per channel the difference between the channels gets few bits, so
+each party is audible in the other's channel at roughly 30 dB down (measured on test
+tones through G.711; the reference libopus encoder does the same or worse). Fine for
+listening and for most transcription. If you separate speakers by channel and need
+the other party gone, raise `bitrate_bps`: about 40 dB at 64 000, over 80 dB at
+128 000.
+
+**An interrupted writer still leaves a playable file.** Pages of about one second
+each are written and flushed as they complete, and each decodes on its own. If the
+engine dies mid-recording, the file plays up to the last whole second; it only lacks
+the end-of-stream flag. As with WAV, act on `recording_finished` and you never see
+that case.
+
+**Before you send it, check the engine has it.** `node_info` lists
+`record_ogg_opus` in `features`. An engine from before the format cannot parse
+`"ogg_opus"`, and refuses the whole control frame: no recording is started (it does
+not fall back to `pcap`), but it closes the control connection instead of answering
+with an error.
+
+Cost is an Opus encode per 20 ms, in the recording's own task, off the media path.
+See [Capacity](../capacity.md#recording-to-ogg-opus) for the numbers.
 
 ### Why not the `record_call` offer flag
 

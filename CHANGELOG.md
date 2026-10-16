@@ -9,6 +9,32 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **Decoded recordings can be written as Ogg Opus.** `start_recording` takes `format: "ogg_opus"`,
+  which records exactly what `wav` does (same taps, `direction`, `channels`, limits, path and
+  `recording_finished` event) and Opus-encodes it into an Ogg file (RFC 7845 over RFC 3533) instead
+  of writing linear PCM. An hour of a stereo 8 kHz call is ~14.7 MB rather than 115 MB, small enough
+  to hand to an HTTP collector. A new optional `bitrate_bps` sets the target (6000 to 510000, RFC
+  6716 §2.1.1; default 16000 per channel) and is refused with any other format rather than ignored.
+  The encoder is fixed at 20 ms VBR voice frames with in-band FEC and DTX off: FEC protects against
+  loss a file never has, and DTX would make the file's timing depend on the encoder's speech
+  decision. Pre-skip comes from the encoder's own lookahead (exposed as `OpusEncoder::lookahead`)
+  and the last page trims the final frame's padding, so the file decodes to exactly `duration_ms`
+  of audio. Pages of about a second are flushed as they complete, so a writer killed mid-recording
+  leaves a file that plays up to its last page. A recording rate Opus cannot take is refused, not
+  resampled. `node_info` advertises `record_ogg_opus` in `features`. The Ogg page writer is std-only
+  and uses the Ogg CRC (polynomial 0x04C11DB7, unreflected), checked against an opusenc-written
+  fixture; the output is validated with opusinfo, opusdec and ffprobe. Cost is one Opus encode per
+  20 ms in the recording's writer task, 74 µs at 8 kHz mono to ~300 µs at 16 kHz stereo
+  (docs/capacity.md).
+
+  **Breaking (Rust API).** `RecordingFormat` is exhaustive on purpose and gained a variant, and
+  `Command::StartRecording` gained a field, so code matching the enum or building the command by
+  struct literal must handle `OggOpus` and name `bitrate_bps` (`None` reproduces the old behaviour).
+  The JSON wire is additive: a frame without `bitrate_bps` is unchanged. An engine from before this
+  release cannot parse `"ogg_opus"` and fails the whole control frame (closing the connection; no
+  recording is started and the call is unaffected), which is why a controller should check the
+  `record_ogg_opus` feature first.
+
 - **`offer_far`: dial a callee after an announcement without changing the caller's answer.** A
   controller that answered the caller in early media with `answer_local` (an announcement before
   the callee is rung) had no way to connect a callee afterwards: `answer` refused a call with no far

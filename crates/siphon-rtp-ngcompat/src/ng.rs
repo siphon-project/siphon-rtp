@@ -141,6 +141,7 @@ pub fn parse_command(request: &Value) -> Result<Command, NgError> {
             max_duration_ms: None,
             silence_ms: None,
             path: None,
+            bitrate_bps: None,
         }),
         "stop recording" => Ok(Command::StopRecording {
             call_id: required_str(request, "call-id")?,
@@ -643,6 +644,7 @@ mod tests {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             }
         );
     }
@@ -671,6 +673,7 @@ mod tests {
                 max_duration_ms: None,
                 silence_ms: None,
                 path: None,
+                bitrate_bps: None,
             }
         );
     }

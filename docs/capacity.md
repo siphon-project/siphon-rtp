@@ -15,6 +15,7 @@ as a CPU graph.
 - [Sizing a node from those numbers](#sizing-a-node-from-those-numbers)
 - [The limits that bite before CPU](#the-limits-that-bite-before-cpu)
 - [Deriving an honest `--max-sessions`](#deriving-an-honest-max-sessions)
+- [Recording to Ogg Opus](#recording-to-ogg-opus)
 - [What these numbers do not tell you](#what-these-numbers-do-not-tell-you)
 
 ---
@@ -255,6 +256,32 @@ from whichever limit is lowest on your node, not from CPU alone:
 If the descriptor ceiling is the lower one, raise the limit rather than advertising the smaller
 number — it is [a one-line fix](performance.md#host-file-descriptors), and CPU is the limit you
 actually want to be sized against.
+
+## Recording to Ogg Opus
+
+Not a relay cost, but the one recording format that spends real CPU: a `start_recording` with
+`format: "ogg_opus"` runs an Opus encoder for every 20 ms of recorded audio. It runs in the
+recording's writer task, off the media path, and allocates nothing per frame. A `wav` or `pcap`
+recording costs a file write and nothing comparable.
+
+Criterion bench `ogg_opus_bench` (Opus encode plus Ogg paging, default bitrate, a speech-like
+signal; Ryzen AI 9 HX 370, one core, box under load so read ±10 %):
+
+| Recording | Per 20 ms frame | Concurrent recordings per core |
+|---|--:|--:|
+| 8 kHz mono (a G.711 voicemail) | 74 µs | ~270 |
+| 8 kHz stereo (a G.711 call, one party per channel) | 151 µs | ~130 |
+| 16 kHz mono | 141–154 µs | ~130 |
+| 16 kHz stereo (an AMR-WB or G.722 call) | 280–306 µs | ~65 |
+
+The per-core figure is `20 ms / per-frame cost`, with zero headroom. A recording is one encode per
+20 ms however many legs feed it, so the cost scales with recordings, not with calls.
+
+The encode stays inline in the writer task rather than moving to a blocking pool. One frame costs
+well under a millisecond, the task yields between frames, and the transcoding pipelines already run
+an Opus encoder on the same runtime for every Opus leg. What it does compete for is the same worker
+threads the media actors use, so count recording cores into the budget alongside transcoding: a node
+recording 100 stereo G.711 calls spends about 0.75 of a core on it.
 
 ## What these numbers do not tell you
 
