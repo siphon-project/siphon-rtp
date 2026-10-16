@@ -30713,3 +30713,511 @@ fn supported_codecs_lists_g729_and_amr_exactly_when_the_build_transcodes_them() 
     unique.dedup();
     assert_eq!(unique.len(), codecs.len(), "{codecs:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// A tee and a SIPREC fork survive a renegotiation (RFC 3264 §8 re-offer + answer)
+// ---------------------------------------------------------------------------------------------
+
+/// An SDP at `rtp` listing `codecs` (`(payload type, rtpmap name)`, all on an 8 kHz RTP clock) with
+/// the media direction `direction` (`sendrecv`, `sendonly`, `recvonly`), rtcp-mux.
+fn sdp_codecs_direction(rtp: SocketAddr, codecs: &[(u8, &str)], direction: &str) -> String {
+    let payload_types: Vec<String> = codecs.iter().map(|(pt, _)| pt.to_string()).collect();
+    let rtpmaps: String = codecs
+        .iter()
+        .map(|(pt, name)| format!("a=rtpmap:{pt} {name}/8000\r\n"))
+        .collect();
+    format!(
+        "v=0\r\no=- 1 2 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP {list}\r\n{rtpmaps}a={direction}\r\na=rtcp-mux\r\n",
+        ip = rtp.ip(),
+        port = rtp.port(),
+        list = payload_types.join(" "),
+    )
+}
+
+/// Re-offer from A and complete it with B's answer, asserting both succeed.
+async fn renegotiate(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+    offer: String,
+    answer: String,
+) {
+    let reoffered = engine
+        .handle(
+            CLIENT,
+            Command::Reoffer {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                sdp: offer,
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(reoffered, CmdResult::Ok { .. }),
+        "re-offer: {reoffered:?}"
+    );
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: answer,
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(answered, CmdResult::Ok { .. }),
+        "answer: {answered:?}"
+    );
+}
+
+/// Attach a stereo 16 kHz tee (caller left, callee right) — the live-transcription shape.
+async fn attach_transcription_tee(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+) -> flume::Receiver<tokio_tungstenite::tungstenite::Message> {
+    let (uri, frames) = tee_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsTee {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                ws_uri: uri,
+                direction: WsTeeDirection::Both,
+                channels: Some(2),
+                sample_rate: Some(16_000),
+            },
+        )
+        .await;
+    assert!(
+        matches!(attached, CmdResult::Ok { .. }),
+        "attach: {attached:?}"
+    );
+    let start = expect_tee_start(&frames).await;
+    assert_eq!(start.media.channels, 2);
+    assert_eq!(start.media.sample_rate, 16_000);
+    frames
+}
+
+/// Have both parties talk — A sends `a_packet(sequence)`, B `b_packet(sequence)` — until the tee
+/// delivers a stereo frame with audio on both channels, and return it as interleaved samples.
+/// Panics if none arrives: a tee that went dry is exactly the defect under test.
+async fn talk_until_stereo_frame(
+    (phone_a, near_addr): (&UdpSocket, SocketAddr),
+    (phone_b, far_addr): (&UdpSocket, SocketAddr),
+    frames: &flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+    first_sequence: u16,
+    packet: impl Fn(bool, u16) -> Vec<u8>,
+    when: &str,
+) -> Vec<i16> {
+    use tokio_tungstenite::tungstenite::Message;
+    for sequence in first_sequence..first_sequence + 50 {
+        phone_a
+            .send_to(&packet(true, sequence), near_addr)
+            .await
+            .expect("a send");
+        phone_b
+            .send_to(&packet(false, sequence), far_addr)
+            .await
+            .expect("b send");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        while let Ok(message) = frames.try_recv() {
+            let Message::Binary(bytes) = message else {
+                continue;
+            };
+            let samples: Vec<i16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| i16::from_le_bytes(*pair))
+                .collect();
+            let both_talking = samples.iter().step_by(2).any(|&sample| sample != 0)
+                && samples.iter().skip(1).step_by(2).any(|&sample| sample != 0);
+            if both_talking {
+                return samples;
+            }
+        }
+    }
+    panic!("{when}: the tee delivered no stereo frame with both parties in it");
+}
+
+/// The caller (left, even slots) is loud-negative and the callee (right, odd slots) loud-positive:
+/// the channel mapping the tee announced is the one it still streams.
+fn assert_caller_left_callee_right(samples: &[i16], when: &str) {
+    let mean = |offset: usize| {
+        let channel: Vec<i64> = samples
+            .iter()
+            .skip(offset)
+            .step_by(2)
+            .map(|&sample| i64::from(sample))
+            .collect();
+        channel.iter().sum::<i64>() / channel.len().max(1) as i64
+    };
+    assert!(
+        mean(0) < -1000,
+        "{when}: the caller stays on the left channel"
+    );
+    assert!(
+        mean(1) > 1000,
+        "{when}: the callee stays on the right channel"
+    );
+}
+
+/// μ-law `0x00` decodes to the most negative level and `0x80` to the most positive (ITU-T G.711),
+/// so the caller and callee are told apart by sign on the tee.
+fn g711_party_packet(payload_type: u8, caller: bool, sequence: u16) -> Vec<u8> {
+    let (ssrc, byte) = match (payload_type, caller) {
+        (0, true) => (0x0A0A_0A0A, 0x00),
+        (0, false) => (0x0B0B_0B0B, 0x80),
+        // A-law: 0x2A is a large negative, 0xAA a large positive (bit 7 is the sign, even bits
+        // inverted).
+        (_, true) => (0x0A0A_0A0A, 0x2A),
+        (_, false) => (0x0B0B_0B0B, 0xAA),
+    };
+    g711_rtp(payload_type, sequence, ssrc, byte)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ws_tee_keeps_streaming_after_the_call_is_held_and_resumed() {
+    // A transcription tee on a plain relay, then a hold and a resume — each a re-offer from A and
+    // B's answer. The answer re-installs the relay; the tee must keep receiving both parties on the
+    // channels it announced, not sit attached to a pipeline nothing feeds any more.
+    let (engine, (phone_a, near_addr), (phone_b, far_addr)) = two_party_relay("tee-hold").await;
+    let addr_a = phone_a.local_addr().expect("a addr");
+    let addr_b = phone_b.local_addr().expect("b addr");
+    let frames = attach_transcription_tee(&engine, "tee-hold").await;
+    let pcmu = |caller, sequence| g711_party_packet(0, caller, sequence);
+
+    let before = talk_until_stereo_frame(
+        (&phone_a, near_addr),
+        (&phone_b, far_addr),
+        &frames,
+        0,
+        pcmu,
+        "before the hold",
+    )
+    .await;
+    assert_eq!(before.len(), 640, "16 kHz / 20 ms stereo");
+    assert_caller_left_callee_right(&before, "before the hold");
+
+    let codecs = [(0, "PCMU"), (8, "PCMA")];
+    renegotiate(
+        &engine,
+        "tee-hold",
+        sdp_codecs_direction(addr_a, &codecs, "sendonly"),
+        sdp_codecs_direction(addr_b, &[(0, "PCMU")], "recvonly"),
+    )
+    .await;
+    renegotiate(
+        &engine,
+        "tee-hold",
+        sdp_codecs_direction(addr_a, &codecs, "sendrecv"),
+        sdp_codecs_direction(addr_b, &[(0, "PCMU")], "sendrecv"),
+    )
+    .await;
+    while frames.try_recv().is_ok() {}
+    let sent_before_resume = engine.ws_tee_frames_sent();
+
+    let after = talk_until_stereo_frame(
+        (&phone_a, near_addr),
+        (&phone_b, far_addr),
+        &frames,
+        100,
+        pcmu,
+        "after the resume",
+    )
+    .await;
+    assert_eq!(after.len(), 640, "the tee keeps its announced format");
+    assert_caller_left_callee_right(&after, "after the resume");
+    assert!(
+        engine.ws_tee_frames_sent() > sent_before_resume,
+        "frames_sent keeps rising after the renegotiation"
+    );
+    assert_eq!(engine.ws_tee_count(), 1, "still exactly one tee");
+
+    // The relay itself still carries both parties.
+    phone_a
+        .send_to(&pcmu(true, 200), near_addr)
+        .await
+        .expect("a send");
+    let (to_b, _) = recv(&phone_b).await;
+    assert!(!to_b.is_empty(), "B still hears A after the resume");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ws_tee_follows_a_codec_change_on_a_renegotiation() {
+    // B's answer to a re-offer settles on another codec A listed (RFC 3264 §8): the relay moves to
+    // PCMA, and the tee has to decode PCMA from then on, on the same channels.
+    let (engine, (phone_a, near_addr), (phone_b, far_addr)) = two_party_relay("tee-codec").await;
+    let addr_a = phone_a.local_addr().expect("a addr");
+    let addr_b = phone_b.local_addr().expect("b addr");
+    let frames = attach_transcription_tee(&engine, "tee-codec").await;
+
+    let before = talk_until_stereo_frame(
+        (&phone_a, near_addr),
+        (&phone_b, far_addr),
+        &frames,
+        0,
+        |caller, sequence| g711_party_packet(0, caller, sequence),
+        "on PCMU",
+    )
+    .await;
+    assert_caller_left_callee_right(&before, "on PCMU");
+
+    renegotiate(
+        &engine,
+        "tee-codec",
+        sdp_codecs_direction(addr_a, &[(0, "PCMU"), (8, "PCMA")], "sendrecv"),
+        sdp_codecs_direction(addr_b, &[(8, "PCMA")], "sendrecv"),
+    )
+    .await;
+    while frames.try_recv().is_ok() {}
+
+    let after = talk_until_stereo_frame(
+        (&phone_a, near_addr),
+        (&phone_b, far_addr),
+        &frames,
+        100,
+        |caller, sequence| g711_party_packet(8, caller, sequence),
+        "after the switch to PCMA",
+    )
+    .await;
+    assert_eq!(after.len(), 640);
+    assert_caller_left_callee_right(&after, "after the switch to PCMA");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ws_tee_survives_a_renegotiation_that_makes_the_call_transcode() {
+    // A re-offers PCMU only and B answers PCMA: the call now transcodes, so the answer stands up a
+    // fresh media actor. The tee must be carried onto it, each party on its own decoder.
+    let (engine, (phone_a, near_addr), (phone_b, far_addr)) = two_party_relay("tee-xcode").await;
+    let addr_a = phone_a.local_addr().expect("a addr");
+    let addr_b = phone_b.local_addr().expect("b addr");
+    let frames = attach_transcription_tee(&engine, "tee-xcode").await;
+    talk_until_stereo_frame(
+        (&phone_a, near_addr),
+        (&phone_b, far_addr),
+        &frames,
+        0,
+        |caller, sequence| g711_party_packet(0, caller, sequence),
+        "before the transcode",
+    )
+    .await;
+
+    renegotiate(
+        &engine,
+        "tee-xcode",
+        sdp_codecs_direction(addr_a, &[(0, "PCMU")], "sendrecv"),
+        sdp_codecs_direction(addr_b, &[(8, "PCMA")], "sendrecv"),
+    )
+    .await;
+    while frames.try_recv().is_ok() {}
+
+    let after = talk_until_stereo_frame(
+        (&phone_a, near_addr),
+        (&phone_b, far_addr),
+        &frames,
+        100,
+        |caller, sequence| g711_party_packet(if caller { 0 } else { 8 }, caller, sequence),
+        "on the transcoding call",
+    )
+    .await;
+    assert_caller_left_callee_right(&after, "on the transcoding call");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_siprec_fork_keeps_reaching_the_srs_after_a_renegotiation() {
+    // The same path for the raw RTP fork: a subscription holds the relay in userspace, and a
+    // re-offer's answer re-installing the relay must not leave the SRS with nothing.
+    let (engine, (phone_a, near_addr), (phone_b, _far_addr)) = two_party_relay("fork-hold").await;
+    let addr_a = phone_a.local_addr().expect("a addr");
+    let addr_b = phone_b.local_addr().expect("b addr");
+    let (srs, srs_addr) = phone().await;
+    let subscribe = engine
+        .handle(
+            CLIENT,
+            Command::SubscribeRequest {
+                call_id: "fork-hold".into(),
+                from_tags: vec!["tag-a".into()],
+                sdp: None,
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let subscription_tag = match subscribe {
+        CmdResult::Ok {
+            to_tag: Some(to_tag),
+            ..
+        } => to_tag,
+        other => panic!("expected a subscription to_tag, got {other:?}"),
+    };
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::SubscribeAnswer {
+                call_id: "fork-hold".into(),
+                from_tag: "tag-a".into(),
+                to_tag: subscription_tag,
+                sdp: sdp_single_codec(srs_addr, 0, "PCMU"),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
+    phone_a
+        .send_to(&g711_party_packet(0, true, 0), near_addr)
+        .await
+        .expect("a send");
+    let (forked, _) = recv(&srs).await;
+    assert!(!forked.is_empty(), "the SRS receives the fork");
+
+    let codecs = [(0, "PCMU"), (8, "PCMA")];
+    renegotiate(
+        &engine,
+        "fork-hold",
+        sdp_codecs_direction(addr_a, &codecs, "sendonly"),
+        sdp_codecs_direction(addr_b, &[(0, "PCMU")], "recvonly"),
+    )
+    .await;
+    renegotiate(
+        &engine,
+        "fork-hold",
+        sdp_codecs_direction(addr_a, &codecs, "sendrecv"),
+        sdp_codecs_direction(addr_b, &[(0, "PCMU")], "sendrecv"),
+    )
+    .await;
+    let mut scratch = [0u8; 2048];
+    while timeout(Duration::from_millis(50), srs.recv_from(&mut scratch))
+        .await
+        .is_ok()
+    {}
+
+    for sequence in 10..16u16 {
+        phone_a
+            .send_to(&g711_party_packet(0, true, sequence), near_addr)
+            .await
+            .expect("a send");
+    }
+    let (still_forked, _) = recv(&srs).await;
+    assert!(
+        !still_forked.is_empty(),
+        "the SRS keeps receiving the fork after the renegotiation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ws_tee_on_a_secure_bridge_keeps_hearing_the_callee_after_a_renegotiation() {
+    // The bridge twin: the tee decodes the SDES bridge's plaintext in a task of its own. A
+    // renegotiation re-registers the bridge's flows; the tee is re-tapped with a decoder for what the
+    // leg carries now, and keeps hearing B.
+    use crate::srtp_bridge::run_redirect_dispatcher;
+    use siphon_rtp_srtp::SrtpContext;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (_phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let savp = || ProfileFlags {
+        transport_protocol: Some("RTP/SAVP".into()),
+        ..Default::default()
+    };
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "bridge-retee".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: savp(),
+            },
+        )
+        .await;
+    let far_addr = sdp::parse(&ok_sdp_text(&offer)).expect("offer").remote_rtp;
+    let callee_key =
+        CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "bridge-retee".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let (uri, frames) = tee_server().await;
+    let attached = engine
+        .handle(
+            CLIENT,
+            Command::AttachWsTee {
+                call_id: "bridge-retee".into(),
+                from_tag: "tag-a".into(),
+                ws_uri: uri,
+                direction: WsTeeDirection::Callee,
+                channels: None,
+                sample_rate: None,
+            },
+        )
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    expect_tee_start(&frames).await;
+
+    let reoffered = engine
+        .handle(
+            CLIENT,
+            Command::Reoffer {
+                call_id: "bridge-retee".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: savp(),
+            },
+        )
+        .await;
+    assert!(matches!(reoffered, CmdResult::Ok { .. }), "{reoffered:?}");
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "bridge-retee".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &callee_key),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
+    assert_eq!(
+        engine.calls.get("bridge-retee").expect("call").pipeline,
+        PipelineKind::Srtp,
+        "still a bridge"
+    );
+
+    let mut seal = SrtpContext::from_key_material(&callee_key.key);
+    for sequence in 0..6u16 {
+        let mut sealed = Vec::new();
+        seal.protect(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x20), &mut sealed)
+            .expect("B encrypts");
+        phone_b.send_to(&sealed, far_addr).await.expect("b send");
+    }
+    let audio = next_tee_audio(&frames).await;
+    assert_eq!(audio.len(), 320);
+    assert!(
+        audio.iter().any(|&byte| byte != 0),
+        "the tee still hears the callee after the renegotiation"
+    );
+    assert_eq!(engine.ws_tee_count(), 1);
+}

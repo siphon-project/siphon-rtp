@@ -431,6 +431,79 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Ok(())
     }
 
+    /// What follows an installed answer's media path, once the call records it.
+    ///
+    /// An answer that completes a renegotiation (`answered_before`) re-installed the path, so what was
+    /// attached to the one it replaced — a tee, a SIPREC fork, echo — is carried onto this one
+    /// ([`Self::carry_holds_across_answer`]).
+    ///
+    /// Text observability trigger: if the controller asked for control-plane text events and a
+    /// plaintext text stream was negotiated, promote ONLY the text stream to the userspace text
+    /// processor now (the audio relay/transcode/SRTP path is untouched). Recording promotes text
+    /// independently at `start recording`. Best-effort — a promotion failure is logged and the call
+    /// still relays text in-kernel (PR-1 behaviour).
+    pub(super) async fn settle_answered_media(&self, call_id: &str, answered_before: bool) {
+        if answered_before {
+            self.carry_holds_across_answer(call_id).await;
+        }
+        self.maybe_promote_text_for_events(call_id).await;
+    }
+
+    /// Carry what holds a call in userspace across an answer that **re-installed** its media path —
+    /// the answer to a re-offer (RFC 3264 §8), a hold, a resume, a codec change.
+    ///
+    /// The answer installs the path the new SDP calls for from scratch. On a plain relay that is the
+    /// in-kernel `Forward` rule, written over the `Redirect` an earlier promotion took, so the media
+    /// actor that promotion stood up stays registered and is never fed again: every tee, fork and
+    /// echo on it goes silent while it still looks attached. On a transcoding path the answer
+    /// registers a fresh actor, which replaces the old one and everything attached to it. Either way
+    /// the features the controller attached are still asked for, so they are put back here: a
+    /// stranded actor is retired and the relay promoted again (processing or relay-only, as the
+    /// holds require), every answered SIPREC subscription's raw tee is re-attached to the actor now
+    /// carrying the call, and the WebSocket tee is re-tapped onto the new path.
+    pub(super) async fn carry_holds_across_answer(&self, call_id: &str) {
+        let Some((pipeline, reasons)) = self.owned_call_internal(call_id, |call| {
+            (call.pipeline, call.promotion_reasons.clone())
+        }) else {
+            return;
+        };
+        if pipeline == PipelineKind::Passthrough && self.media.is_media_call(call_id) {
+            // Nothing reaches this actor any more: the answer's `Forward` rule took its endpoints.
+            self.media.deregister(call_id);
+            if self.call_has_userspace_hold(call_id) {
+                let processing = reasons.iter().any(|reason| {
+                    matches!(
+                        reason,
+                        PromotionReason::WsTee
+                            | PromotionReason::Echo
+                            | PromotionReason::AudioRecording
+                            | PromotionReason::MediaOp
+                    )
+                });
+                let promoted = if processing {
+                    self.promote_to_processing(call_id, reasons.contains(&PromotionReason::Echo))
+                        .await
+                } else {
+                    self.promote_passthrough(call_id).await
+                };
+                if let Err(reason) = promoted {
+                    tracing::warn!(
+                        target: "siphon_rtp::media",
+                        call_id,
+                        reason,
+                        "renegotiated relay could not be held in userspace again"
+                    );
+                }
+            }
+        }
+        if self.media.is_media_call(call_id) {
+            self.reattach_subscription_raw_tees(call_id);
+        }
+        if self.ws_tees.contains_key(call_id) {
+            self.retap_ws_tee(call_id).await;
+        }
+    }
+
     /// Release a userspace hold taken by [`Self::hold_in_userspace`] and demote the relay back to the
     /// `Forward` fast path if nothing else holds it up. Safe on a genuine Media call: demotion is gated
     /// on the presence of stored `relay_flows`, so only a promoted passthrough relay is ever demoted.

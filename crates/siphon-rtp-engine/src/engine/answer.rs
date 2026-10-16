@@ -575,6 +575,9 @@ fn answer_dtls_role(reversed: Option<&ReversedAnswer>, setup: Option<sdp::Setup>
 
 /// What an answer reads from the stored call, snapshotted under the registry guard and released.
 struct AnswerState {
+    /// The call was answered before, so this answer completes a renegotiation (RFC 3264 §8) and
+    /// re-installs a media path its features are attached to.
+    answered_before: bool,
     near: Leg,
     far: Leg,
     ice_creds: Option<IceCredentials>,
@@ -787,6 +790,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     text_t140_payload_type: call.text_t140_payload_type,
                     text_red_payload_type: call.text_red_payload_type,
                     text_events: call.text_events,
+                    answered_before: call.to_tag.is_some(),
                 })
             }
             _ => Err(Box::new(unknown_call(call_id))),
@@ -1008,6 +1012,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text_t140_payload_type,
             text_red_payload_type,
             text_events,
+            answered_before,
         } = match self.answer_state(client, call_id) {
             Ok(state) => state,
             Err(result) => return *result,
@@ -1318,12 +1323,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         );
 
-        // Text observability trigger: if the controller asked for control-plane text events and a
-        // plaintext text stream was negotiated, promote ONLY the text stream to the userspace text
-        // processor now (the audio relay/transcode/SRTP path is untouched). Recording promotes text
-        // independently at `start recording`. Best-effort — a promotion failure is logged and the call
-        // still relays text in-kernel (PR-1 behaviour).
-        self.maybe_promote_text_for_events(call_id).await;
+        self.settle_answered_media(call_id, answered_before).await;
         log_answer_applied(
             call_id,
             &to_tag,
