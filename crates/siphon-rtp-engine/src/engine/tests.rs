@@ -47,6 +47,7 @@ use super::*;
 const CLIENT: ClientId = ClientId(1);
 
 mod conference_seat;
+mod offer_far;
 mod transcode_offer;
 
 #[test]

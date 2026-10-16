@@ -671,6 +671,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_text_remote_crypto: None,
                 far_text_local_crypto: None,
                 near_text_local_crypto: None,
+                local_answer: None,
             },
         );
         // Register the reconstructed call under the requesting (standby) client.

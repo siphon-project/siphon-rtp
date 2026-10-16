@@ -236,6 +236,10 @@ pub enum Command {
     /// A's answer to a [`Command::Reoffer`] from B is sent with the tags reversed — `from_tag` is B's,
     /// `to_tag` is A's — and is accepted only while that re-offer is outstanding. Its SDP is A's and is
     /// returned rewritten for B.
+    ///
+    /// On a call grown by [`Command::OfferFar`] it answers the far leg: the local pipeline stops, the
+    /// caller and the far party are relayed (transcoded when they use different codecs), and the SDP
+    /// returned is the caller's original `answer_local` answer, unchanged.
     Answer {
         call_id: String,
         from_tag: String,
@@ -260,7 +264,30 @@ pub enum Command {
         #[serde(default)]
         profile: ProfileFlags,
     },
-    /// Tear down a session (or one leg when `to_tag` is given).
+    /// Grow a single-leg [`Command::AnswerLocal`] call into a relay toward a far party: allocate the
+    /// far leg and return an SDP **offer** for it, to put in the INVITE to the callee. The caller's
+    /// leg is untouched (its socket, the answer it already holds, and the local pipeline, which keeps
+    /// playing until the far party answers), so a controller can play an announcement in early media
+    /// and then dial without the caller's negotiated session ever changing (RFC 3261 §13.2.1,
+    /// RFC 3264 §8: an answer once given stands until a new offer).
+    ///
+    /// The offer leads with the codec the caller was answered with, then the caller's other offered
+    /// codecs the engine can transcode it to, then the profile's `codec-transcode-X` additions, then
+    /// telephone-event. The caller stays on its codec whatever the far party picks, as `codec-mask`
+    /// holds a near codec. [`Command::Answer`] with the far party's `to_tag` completes it and returns
+    /// the caller's original `answer_local` SDP unchanged; [`Command::Delete`] with a `to_tag` drops
+    /// the far leg again and returns the call to single-leg. Refused on a call that is not a plain
+    /// RTP `answer_local` call (a WebSocket takeover, or a caller on SRTP or ICE), and on one that
+    /// already has a far leg.
+    OfferFar {
+        call_id: String,
+        from_tag: String,
+        #[serde(default)]
+        profile: ProfileFlags,
+    },
+    /// Tear down a session. With a `to_tag` on a call grown by [`Command::OfferFar`], only the far leg
+    /// goes and the caller returns to the single-leg local pipeline (another prompt, or another
+    /// `offer_far`); on any other call a `to_tag` changes nothing and the whole call is torn down.
     Delete {
         call_id: String,
         from_tag: String,
@@ -3413,6 +3440,41 @@ mod tests {
             value.get("to_tag").is_none(),
             "answer_local carries no to_tag"
         );
+    }
+
+    #[test]
+    fn offer_far_wire_shape_carries_no_sdp_and_no_to_tag() {
+        let json = r#"{"command":"offer_far","call_id":"c","from_tag":"f"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::OfferFar {
+                call_id,
+                from_tag,
+                profile,
+            } => {
+                assert_eq!(call_id, "c");
+                assert_eq!(from_tag, "f");
+                assert_eq!(profile, ProfileFlags::default());
+            }
+            other => panic!("expected offer_far, got {other:?}"),
+        }
+
+        let request = Request {
+            id: 12,
+            command: Command::OfferFar {
+                call_id: "abc@host".into(),
+                from_tag: "ft".into(),
+                profile: ProfileFlags {
+                    flags: vec!["codec-transcode-PCMA".into()],
+                    ..Default::default()
+                },
+            },
+        };
+        roundtrip(&request);
+        let value = serde_json::to_value(&request).expect("to_value");
+        assert_eq!(value["command"], "offer_far");
+        assert_eq!(value["profile"]["flags"][0], "codec-transcode-PCMA");
+        assert!(value.get("sdp").is_none(), "offer_far carries no sdp");
+        assert!(value.get("to_tag").is_none(), "offer_far carries no to_tag");
     }
 
     #[test]

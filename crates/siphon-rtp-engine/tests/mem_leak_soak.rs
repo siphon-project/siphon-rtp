@@ -615,6 +615,98 @@ async fn answer_local_replace_and_refusal_do_not_leak() {
     gate.assert_no_leak();
 }
 
+/// Churn one announcement call through `answer_local → offer_far → delete (far leg) → offer_far →
+/// answer → delete (far leg) → delete`: the far leg grown and released twice, once unanswered and
+/// once answered, must give back its ports and endpoint index entries each time.
+async fn offer_far_grow_and_release(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let call_id = format!("soak-far-{index}");
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for("198.51.100.1", 40_000),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&answer, "answer_local");
+    for answered in [false, true] {
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::OfferFar {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert_ok(&offer, "offer_far");
+        if answered {
+            let answer = engine
+                .handle(
+                    CLIENT,
+                    Command::Answer {
+                        call_id: call_id.clone(),
+                        from_tag: "tag-a".into(),
+                        to_tag: "tag-b".into(),
+                        sdp: sdp_for("203.0.113.1", 41_000),
+                        profile: Default::default(),
+                    },
+                )
+                .await;
+            assert_ok(&answer, "answer the far leg");
+        }
+        let release = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    to_tag: Some("tag-b".into()),
+                },
+            )
+            .await;
+        assert_ok(&release, "delete the far leg");
+    }
+    let delete = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id,
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert_ok(&delete, "delete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offer_far_grow_and_release_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    let mut gate = LeakGate::new("offer_far grow/release", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            offer_far_grow_and_release(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// Let aborted receive tasks actually drop (freeing their socket + recv buffer) so a measurement
 /// reflects quiesced steady state, not in-flight teardown.
 async fn quiesce() {

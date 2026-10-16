@@ -237,6 +237,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_text_remote_crypto: None,
                 far_text_local_crypto: None,
                 near_text_local_crypto: None,
+                // Set once the local answer is complete (see the end of `answer_local`).
+                local_answer: None,
             },
         );
         self.index_new_call(call_id, client);
@@ -995,6 +997,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.far_codec = Some(chosen);
             call.pipeline = PipelineKind::Media;
+            // Kept so `offer_far` can grow the call into a relay behind this very answer.
+            call.keep_local_answer(sdp, &answer_sdp);
         }
 
         let ice_running = ice_config.is_some();

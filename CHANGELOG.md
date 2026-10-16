@@ -7,6 +7,22 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **`offer_far`: dial a callee after an announcement without changing the caller's answer.** A
+  controller that answered the caller in early media with `answer_local` (an announcement before
+  the callee is rung) had no way to connect a callee afterwards: `answer` refused a call with no far
+  leg, and the caller already held an answer it may not be sent again in another form (RFC 3261
+  §13.2.1, RFC 3264 §8). `offer_far` binds a far leg on such a call and returns the offer for the
+  callee, leading with the codec the caller was answered with, then the caller's other codecs the
+  engine can transcode it to, then the profile's `codec-transcode-X` additions, then
+  telephone-event. The prompt keeps playing. The callee's `answer` stops it and relays the two legs
+  (a plain relay when they share the caller's codec, the transcoder otherwise) on the caller's own
+  port, and returns the caller's original answer byte for byte. A `delete` with a `to_tag` now drops
+  just that far leg and puts the caller back on the local pipeline, so a busy callee can be
+  followed by another prompt or another dial. Plain RTP callers only for now; an SRTP or ICE caller
+  is refused. The NG front-end has no `answer_local`, so this is a native-protocol verb.
+
 ### Fixed
 
 - **`conference_join` seats a participant in a codec the room can bridge, and refuses a seat it

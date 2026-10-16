@@ -76,6 +76,10 @@ behind the same dispatcher will reject these, so gate them on the node type:
 | `checkpoint` | `checkpoint` | HA snapshot; the opaque blob comes back under `snapshot`. |
 | `restore` | `restore` | Rebuild a checkpointed call on a standby. Same limits as native: passthrough, SDES-SRTP bridge, plaintext transcode, and secure transcode calls (WebSocket-bridged restore still unsupported). |
 
+`answer_local` and `offer_far` (an announcement in early media, then the callee) have no NG
+spelling: NG has no verb for the engine answering a caller itself, so a call can only be grown
+toward a far party over the [native JSON front-end](json.md#session-lifecycle).
+
 ## Codec directives
 
 Transcoding is driven the same two ways rtpengine accepts, and both normalize to one
