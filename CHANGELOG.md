@@ -5,7 +5,7 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.15.0] — 2026-10-17
 
 ### Added
 
@@ -94,6 +94,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   answers a refusal as an error naming it, leaving no member, route or empty room behind. The
   conferencing cookbook said Opus is refused in a room, which has not been true since Opus gained
   an encoder, and its room `play_finished` example left out `from_tag`, which is always sent.
+
+### Security
+
+- **rustls 0.23.46, for RUSTSEC-2026-0346, -0347, -0348 and -0349.** rustls carries the engine's
+  TLS on the shipped path: the `wss://` bridge and tee, `play_media` over https, TURN over TLS and
+  DTLS. Updated in all three lockfiles (workspace, `fuzz/`, `crates/siphon-rtp-xdp/`).
+  `siphon-rtp-proto` does not depend on rustls.
 
 ## [0.14.0] — 2026-10-13
 
