@@ -44,8 +44,8 @@ pub struct LiveGauges {
     pub ws_bridges: u64,
     /// Wire frames handed to the WS-tee transports over this process's lifetime.
     pub ws_tee_frames_sent: u64,
-    /// WS-tee frames dropped because a consumer stalled (bounded queue full) or a channel ring
-    /// overflowed. Non-zero means a tee consumer could not keep up — the calls themselves are never
+    /// WS-tee frames dropped because a consumer stalled (bounded queue full), a channel ring
+    /// overflowed, or a leg frame could not be decoded for the tee — the calls themselves are never
     /// affected, so this is the metric that distinguishes "the stream is thin" from "the call is bad".
     pub ws_tee_frames_dropped: u64,
 }
@@ -266,7 +266,8 @@ impl Metrics {
         metric(
             &mut output,
             "siphon_rtp_ws_tee_frames_dropped_total",
-            "WebSocket tee frames dropped because the consumer stalled (the call is unaffected).",
+            "WebSocket tee frames dropped because the consumer stalled or a frame could not be decoded \
+             for the tee (the call is unaffected).",
             "counter",
             live.ws_tee_frames_dropped,
         );

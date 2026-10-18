@@ -9,6 +9,10 @@ pub trait MediaSink: Send {
     /// Receive one decoded PCM frame (native rate, mono unless the sink negotiated otherwise).
     fn write_pcm(&mut self, pcm: &[i16]);
 
+    /// One frame of the stream could not be decoded, so no PCM arrives for it. The default ignores
+    /// it; a sink that reports what it missed (a WS tee's `frames_dropped`) counts it here.
+    fn frame_undecodable(&mut self) {}
+
     /// Flush/finalize the sink at end of stream (close a file, send a final WS frame, …).
     fn finish(&mut self) {}
 

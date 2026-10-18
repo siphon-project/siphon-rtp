@@ -53,8 +53,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// uses, so one decode of each stream feeds the peer, the recorder, any SIPREC fork **and** the WS
     /// consumer — never a second [`siphon_rtp_media::leg::MediaLeg`] (two jitter buffers on one stream
     /// make two different concealment decisions, and the consumer would hear artefacts the call never
-    /// had). A plain in-kernel relay is promoted to a **processing** media call for the tee's lifetime
-    /// (a relay-only promotion never decodes, so it would tee nothing) and demoted again on detach.
+    /// had). A plain in-kernel relay is promoted to a **relay-only** media call for the tee's
+    /// lifetime and demoted again on detach: it forwards every packet exactly as it arrived and
+    /// decodes a copy for the tee beside the forward, so the tee never changes what the far party
+    /// receives, and a frame it cannot decode is counted in its `frames_dropped` instead of being
+    /// dropped from the call.
     ///
     /// This is *not* `ProfileFlags::ws_uri`: takeover makes the WS server leg A's far side and leaves
     /// A↔B unwired, while a tee is send-only and additive. A takeover call therefore cannot be teed —
@@ -271,7 +274,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 None => None,
             };
             // On a bridge, each tapped leg is decoded here, so its decoder has to exist before
-            // anything is attached — a codec this build cannot decode is a clean refusal.
+            // anything is attached — a codec this build cannot decode is a clean refusal. (A relay
+            // or transcode leg was already proven decodable by `pcm_rate_of` above.)
             if bridged {
                 let (Some(codec), Some(endpoint)) = (codec, endpoint) else {
                     return Err("a tapped leg has no negotiated codec".to_string());
@@ -308,10 +312,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let mut bridge_taps = Vec::new();
         let mut tapped_legs = Vec::new();
         if !bridged {
-            // A SIPREC subscription (or a pcap recording / DTMF block) may already hold this relay
-            // in userspace with a **relay-only** actor, which forwards RTP verbatim and never
-            // decodes — the post-decode fan-out a tee taps would stay dry. `attach_pipeline_tee`
-            // rebuilds it as a processing actor first.
+            // A SIPREC subscription (or a pcap recording / DTMF block / interception) may already
+            // hold this relay in userspace with a **relay-only** actor; the tee's sinks attach to it
+            // and it decodes a copy for them, still forwarding every packet untouched.
             self.attach_pipeline_tee(call_id, tap_tag, mixer, plan, &mut tapped_legs)
                 .await?;
             return Ok((tapped_legs, bridge_taps));
@@ -416,8 +419,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
-    /// Attach a tee's sinks to the call's media actor, holding the call in a processing pipeline for
-    /// the tee's lifetime.
+    /// Attach a tee's sinks to the call's media actor, holding the call in userspace for the tee's
+    /// lifetime.
     async fn attach_pipeline_tee(
         &self,
         call_id: &str,
@@ -427,11 +430,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         tapped_legs: &mut Vec<bool>,
     ) -> Result<(), String> {
         use siphon_rtp_media::bridge::tee::WsTeeSink;
-        if self.media.is_relay_call(call_id) {
-            self.upgrade_relay_to_processing(call_id).await?;
-        }
-        // Hold the call in a *processing* media pipeline for the tee's lifetime.
-        self.hold_in_userspace(call_id, PromotionReason::WsTee, PromoteMode::Processing)
+        // Hold the call in userspace for the tee's lifetime. A plain relay is promoted
+        // **relay-only**: it keeps forwarding every packet as it arrived, and decodes a copy for the
+        // tee beside the forward, so a frame the tee cannot decode costs the tee and not the call.
+        // A call that already decodes (a transcode, a prompt, echo) feeds the tee from its own decode.
+        self.hold_in_userspace(call_id, PromotionReason::WsTee, PromoteMode::RelayOnly)
             .await?;
 
         // Attach one sink per tapped leg, carrying the conversion into the wire rate built above.
@@ -578,46 +581,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             sample_rate = wire_rate,
             "ws tee attached"
         );
-        Ok(())
-    }
-
-    /// Rebuild a **relay-only** promoted call as a **processing** one, keeping every SIPREC raw tee it
-    /// carries. A relay-only actor (the promotion `start recording` / `block DTMF` / `subscribe_request`
-    /// take) forwards ingress RTP verbatim and never decodes, so nothing reaches the post-decode
-    /// fan-out a WS tee taps; a processing actor decodes and re-encodes, and still copies each raw tee
-    /// **before** the relay/transcode split, so the SRS keeps receiving the leg's original bytes.
-    ///
-    /// The old actor is deregistered first so its task is aborted rather than orphaned, and each
-    /// answered subscription's tee is re-installed on the new one. The call stays processing for the
-    /// rest of its life (a detach releases the tee's hold but does not rebuild the cheaper relay-only
-    /// actor) — the extra decode is the price of having asked for both features at once.
-    pub(super) async fn upgrade_relay_to_processing(&self, call_id: &str) -> Result<(), String> {
-        // Rebuilding the actor rebuilds its *state*, and only the SIPREC raw tees can be reconstructed
-        // from what the engine still holds. A live pcap capture's channel (whose drain task owns the
-        // file) and a per-direction `block DTMF` gate would both be silently lost, so refuse instead of
-        // quietly turning either off — the same posture `echo` already takes on a relay-only promotion.
-        let blocking = self
-            .owned_call_internal(call_id, |call| {
-                let mut blocking = Vec::new();
-                if call.promotion_reasons.contains(&PromotionReason::Recording) {
-                    blocking.push("a pcap recording");
-                }
-                if call.promotion_reasons.contains(&PromotionReason::DtmfBlock) {
-                    blocking.push("a DTMF block");
-                }
-                blocking
-            })
-            .ok_or_else(|| "call no longer exists".to_string())?;
-        if !blocking.is_empty() {
-            return Err(format!(
-                "a WebSocket tee needs the call decoded, but {} holds this relay in a \
-                 forward-only pipeline; stop it first",
-                blocking.join(" and ")
-            ));
-        }
-        self.media.deregister(call_id);
-        self.promote_to_processing(call_id, false).await?;
-        self.reattach_subscription_raw_tees(call_id);
         Ok(())
     }
 
@@ -825,6 +788,7 @@ pub(super) async fn run_bridge_tap_decoder(
             }
             Err(error) => {
                 tracing::debug!(%error, "bridged tap dropped an undecodable frame");
+                sink.frame_undecodable();
             }
         }
     }

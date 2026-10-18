@@ -691,11 +691,10 @@ enum PromotionReason {
     /// A raw-RTP pcap recording is active (`start recording`).
     Recording,
     /// A **decoded-audio** recording is active (`start_recording` with `format: "wav"`). Distinct
-    /// from `Recording` because that one is a *relay-only* hold — a pcap forwards RTP verbatim and
-    /// never decodes — while this one taps the post-decode fan-out and so needs a **processing**
-    /// pipeline. Sharing the variant would let stopping one demote the other's pipeline out from
-    /// under it, and would make `upgrade_relay_to_processing` refuse over a hold that does not
-    /// conflict with it.
+    /// from `Recording` (a pcap, which never decodes) because this one needs the leg's audio
+    /// decoded: on a plain relay a relay-only actor decodes a copy beside the verbatim forward, and
+    /// on any other call the call's own decode feeds it. Sharing the variant would let stopping one
+    /// demote the other's pipeline out from under it.
     AudioRecording,
     /// A per-leg RFC 4733 telephone-event (DTMF) relay block is active (`block DTMF`) — the relay is
     /// held in userspace so the actor can gate the telephone-event PT per direction.
@@ -713,9 +712,9 @@ enum PromotionReason {
     /// actor can decode each party's ingress and re-emit it back to the sender (a relay-only promotion
     /// forwards opaque payloads to the peer and cannot loop them home).
     Echo,
-    /// A WebSocket **tee** is streaming this call's audio (`attach_ws_tee`). The tee taps the
-    /// post-decode fan-out, so a plain relay must be held in a **processing** MediaCall — a relay-only
-    /// promotion forwards RTP verbatim and never decodes, which would leave the tee with nothing.
+    /// A WebSocket **tee** is streaming this call's audio (`attach_ws_tee`). A plain relay is held
+    /// **relay-only**: it forwards every packet verbatim and decodes a copy for the tee beside the
+    /// forward, so the tee never changes what the far party receives.
     WsTee,
     /// Lawful-interception content delivery is active on this call (`attach_x3`). The X3 tap sits in
     /// `Direction::handle` on the decrypted ingress, *before* the relay/transcode split, so a
@@ -736,7 +735,8 @@ enum PromotionReason {
 /// echo needs to reflect audio back to the sender.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PromoteMode {
-    /// Forward ingress RTP verbatim to the peer (recording / DTMF-block / SIPREC tee).
+    /// Forward ingress RTP verbatim to the peer (recording / DTMF-block / SIPREC tee / WS tee / X3),
+    /// decoding a copy beside the forward for any sink that wants PCM.
     RelayOnly,
     /// Decode ingress → re-encode (echo reflects each party's audio back to itself).
     Processing,

@@ -554,16 +554,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         )
         .await?;
 
-        // A relay-only actor (a pcap recording, a DTMF block) forwards RTP verbatim and never decodes,
-        // so the fan-out this taps would stay dry. Rebuild it as a processing actor, then hold it for
-        // the recording's lifetime.
-        if self.media.is_relay_call(call_id) {
-            self.upgrade_relay_to_processing(call_id).await?;
-        }
+        // Hold the call in userspace for the recording's lifetime. A plain relay is promoted
+        // **relay-only**, like a tee: every packet is still forwarded as it arrived, and a copy is
+        // decoded for the recording beside the forward, so a frame the recording cannot decode is
+        // missing from the file and not from the call.
         self.hold_in_userspace(
             call_id,
             PromotionReason::AudioRecording,
-            PromoteMode::Processing,
+            PromoteMode::RelayOnly,
         )
         .await?;
 

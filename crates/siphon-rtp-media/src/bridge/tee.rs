@@ -251,10 +251,16 @@ impl TeeMixer {
     }
 
     /// Frames dropped because the outbound channel was full or closed, plus samples overwritten in a
-    /// channel ring by a single write larger than the ring. Never a reason to stall the call.
+    /// channel ring by a single write larger than the ring, plus leg frames the engine could not
+    /// decode for the tee. Never a reason to stall the call.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// Count one leg frame that never reached the tee because it could not be decoded.
+    pub fn note_undecodable(&mut self) {
+        self.dropped += 1;
     }
 
     /// Take a wire buffer from the pool, recycling anything the transport returned. Allocates only if
@@ -465,6 +471,14 @@ impl MediaSink for WsTeeSink {
         // section is a copy plus a `try_send` — never an `.await`, never a blocking call.
         if let Ok(mut mixer) = self.mixer.lock() {
             mixer.push(self.channel, frame);
+        }
+    }
+
+    /// The leg's frame could not be decoded: the stream goes without it, and it is counted in the
+    /// tee's `dropped` (the call itself still carried the packet).
+    fn frame_undecodable(&mut self) {
+        if let Ok(mut mixer) = self.mixer.lock() {
+            mixer.note_undecodable();
         }
     }
 
