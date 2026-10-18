@@ -32,7 +32,7 @@ per connection, never blocking the engine. Routes: `GET /metrics`, `GET /healthz
 | `siphon_rtp_draining` | gauge | 1 when the node is draining (rejecting new sessions), else 0 |
 | `siphon_rtp_ws_tees` | gauge | live WebSocket tees (send-only copies of a relaying call) |
 | `siphon_rtp_ws_tee_frames_sent_total` | counter | audio frames handed to a tee transport |
-| `siphon_rtp_ws_tee_frames_dropped_total` | counter | tee frames dropped because the consumer stalled (the call is unaffected) |
+| `siphon_rtp_ws_tee_frames_dropped_total` | counter | tee frames dropped because the consumer stalled or a leg frame could not be decoded for the tee (the call is unaffected) |
 | `siphon_rtp_ws_dial_timeouts_total` | counter | WebSocket dials given up at `--ws-connect-timeout-ms`: the endpoint accepted the connection and never finished TLS or the upgrade |
 | `siphon_rtp_ws_dial_connect_failures_total` | counter | WebSocket dials whose TCP connection was refused, reset or unroutable |
 | `siphon_rtp_ws_dial_tls_failures_total` | counter | WebSocket dials whose TLS handshake was refused |

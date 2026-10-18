@@ -27,6 +27,7 @@ use dashmap::DashMap;
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use siphon_rtp_codec::cn::{Cn, COMFORT_NOISE_LEVEL_DBOV};
+use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_codec::{Decoder, Encoder, NO_MODE_REQUEST};
 use siphon_rtp_datapath::{
     rtp_media_ssrc, Datapath, EndpointId, ObservedRtcp, RxPacket, SourceFilter,
@@ -51,6 +52,10 @@ use crate::engine::scope;
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
+
+mod relay_tap;
+pub use relay_tap::CarriedAttachments;
+use relay_tap::TapDecode;
 
 /// The playout-clock tick driving injected media (PlayMedia / PlayDtmf): one egress packet per
 /// 20 ms, the telephony default ptime (RFC 3551).
@@ -700,6 +705,9 @@ pub struct Direction {
     /// When `true`, forward the ingress RTP verbatim to the peer (no transcode) — a promoted
     /// passthrough relay. The codec fields below are unused in this mode.
     relay_only: bool,
+    /// On a relay-only direction, the decode that feeds `forks` and `egress_taps` without touching
+    /// the forwarded packet. `None` on a transcoding direction, whose own decode feeds them.
+    tap: Option<TapDecode>,
     /// SIPREC / monitor raw-RTP tee targets: each receives the **original ingress RTP** byte-for-byte
     /// (RFC 7866 §6). Independent of transcode/relay — added/removed by `subscribe_answer`/`unsubscribe`.
     raw_tee: Vec<RawTee>,
@@ -1175,6 +1183,10 @@ pub struct RelayConfig {
     /// can drop the verbatim relay of that PT even on a plain (untranscoded) relay. `None` when the
     /// leg negotiated no telephone-event or its PT could not be resolved — DTMF cannot be gated then.
     pub telephone_event: Option<u8>,
+    /// This leg's negotiated audio codec, decoded **for the direction's sinks only** (a WS tee, a
+    /// decoded recording) while one is attached. The relay itself never reads it: every packet is
+    /// still forwarded as it arrived. `None` when the leg has no codec to decode (offer-only).
+    pub tap_codec: Option<CodecSpec>,
 }
 
 /// A companion **RTCP** relay for a *non-muxed* secure-transcode (`SrtpMedia`) leg. RTCP is never
@@ -1488,6 +1500,7 @@ impl Direction {
             egress_endpoint: config.egress_endpoint,
             egress_dst: config.egress_dst,
             relay_only: false,
+            tap: None,
             raw_tee: Vec::new(),
             x3: None,
             decoder: config.decoder,
@@ -1566,6 +1579,7 @@ impl Direction {
             egress_endpoint: config.egress_endpoint,
             egress_dst: config.egress_dst,
             relay_only: true,
+            tap: config.tap_codec.map(TapDecode::new),
             raw_tee: Vec::new(),
             x3: None,
             decoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
@@ -2154,6 +2168,9 @@ impl Direction {
                     dst: self.egress_dst,
                     data: Bytes::copy_from_slice(data),
                 });
+                // The packet is on its way, exactly as it arrived. Only now is a copy decoded for
+                // the sinks, so nothing the decode does can reach the forward above.
+                self.feed_relay_sinks(data, leg_meta);
             }
             // A promoted-passthrough leg latches the reply symmetrically too; `admitted` says where.
             return Ok(admitted);
@@ -2361,6 +2378,10 @@ impl Direction {
                         decode_errors = self.decode_errors,
                         "ingress frame failed to decode — audio dropped"
                     );
+                }
+                // The forks missed this frame too; a WS tee counts it in its `frames_dropped`.
+                for fork in &mut self.forks {
+                    fork.frame_undecodable();
                 }
                 return;
             }
@@ -3747,13 +3768,17 @@ impl MediaCall {
     /// `false` ⇒ leg B's. The sink (an [`super::engine`]-built `RtpForkSink`) re-encodes each decoded
     /// frame toward the subscriber; the engine drains its output channel to the datapath.
     pub fn add_fork(&mut self, source_a: bool, sink: Box<dyn MediaSink>) {
-        self.ingress_direction(source_a).forks.push(sink);
+        let direction = self.ingress_direction(source_a);
+        direction.prepare_relay_tap();
+        direction.forks.push(sink);
     }
 
     /// Attach a sink to a party's **egress** audio — what that party hears, rather than what it sent.
     /// `toward_a` selects the direction the way every other egress op does.
     pub fn add_egress_fork(&mut self, toward_a: bool, sink: Box<dyn MediaSink>) {
-        self.direction_toward(toward_a).egress_taps.push(sink);
+        let direction = self.direction_toward(toward_a);
+        direction.prepare_relay_tap();
+        direction.egress_taps.push(sink);
     }
 
     /// Detach the egress taps a direction carries under `tag`, leaving any others attached — the
@@ -3976,6 +4001,11 @@ pub enum PlayDtmfOutcome {
 
 /// A control message to a running [`MediaCall`] actor.
 pub enum MediaControl {
+    /// Move every attachment out of this actor, for an engine that is about to replace it with a
+    /// processing one. The actor keeps relaying, with nothing attached, until it is deregistered.
+    TakeAttachments {
+        reply: tokio::sync::oneshot::Sender<CarriedAttachments>,
+    },
     /// Replace egress audio with silence (`true`) or resume (`false`).
     Silence(bool),
     /// Drop egress audio (`true`) or resume (`false`).
@@ -4533,6 +4563,9 @@ async fn run_media_call<D>(
                     }
                     MediaInput::Control(MediaControl::AddFork { source_a, sink }) => {
                         call.add_fork(source_a, sink);
+                    }
+                    MediaInput::Control(MediaControl::TakeAttachments { reply }) => {
+                        let _ = reply.send(call.take_attachments());
                     }
                     MediaInput::Control(MediaControl::RemoveFork { source_a }) => {
                         call.remove_forks(source_a);
@@ -8846,12 +8879,18 @@ mod tests {
 
     /// A relay-only call (a promoted passthrough leg): both directions forward verbatim, no codecs.
     fn relay_call() -> MediaCall {
+        relay_call_on(CodecSpec::new(0, "PCMU", 8000, 1, 20))
+    }
+
+    /// A relay-only call whose legs both negotiated `codec`, which the sinks decode.
+    fn relay_call_on(codec: CodecSpec) -> MediaCall {
         let a_to_b = RelayConfig {
             ingress_endpoint: endpoint(1),
             accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
             egress_endpoint: endpoint(2),
             egress_dst: addr(B_ADDR),
             telephone_event: Some(101),
+            tap_codec: Some(codec.clone()),
         };
         let b_to_a = RelayConfig {
             ingress_endpoint: endpoint(2),
@@ -8859,8 +8898,155 @@ mod tests {
             egress_endpoint: endpoint(1),
             egress_dst: addr(A_ADDR),
             telephone_event: Some(101),
+            tap_codec: Some(codec),
         };
         MediaCall::new_relay("relay", "tag-a", Some("tag-b".into()), a_to_b, b_to_a, true)
+    }
+
+    /// What a sink was given: decoded frames (their lengths and whether any sample was not zero)
+    /// and frames it was told it missed.
+    #[derive(Default)]
+    struct SinkLog {
+        frames: Vec<(usize, bool)>,
+        undecodable: u64,
+    }
+
+    struct LoggingSink(Arc<Mutex<SinkLog>>);
+
+    impl MediaSink for LoggingSink {
+        fn write_pcm(&mut self, pcm: &[i16]) {
+            let mut log = self.0.lock().expect("sink log");
+            log.frames
+                .push((pcm.len(), pcm.iter().any(|&sample| sample != 0)));
+        }
+        fn frame_undecodable(&mut self) {
+            self.0.lock().expect("sink log").undecodable += 1;
+        }
+    }
+
+    fn logging_sink() -> (Box<dyn MediaSink>, Arc<Mutex<SinkLog>>) {
+        let log = Arc::new(Mutex::new(SinkLog::default()));
+        (Box::new(LoggingSink(log.clone())), log)
+    }
+
+    /// An RTP packet from A with `payload` under `payload_type`.
+    fn rtp_with(payload_type: u8, sequence: u16, payload: &[u8]) -> Vec<u8> {
+        let header = RtpHeader {
+            marker: false,
+            payload_type,
+            sequence,
+            timestamp: u32::from(sequence) * 160,
+            ssrc: 0x0C0C_0C0C,
+        };
+        let mut buffer = vec![0u8; 12 + payload.len()];
+        let len = write_packet(&header, payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    #[test]
+    fn a_relay_with_a_sink_forwards_a_frame_its_sink_cannot_decode() {
+        // GSM 06.10 frames are 33 octets (RFC 3551 §4.5.8). A 32-octet payload is not one: the sink
+        // is told it missed a frame, and the far party still gets the packet as A sent it.
+        let mut call = relay_call_on(CodecSpec::new(3, "GSM", 8000, 1, 20));
+        let (sink, log) = logging_sink();
+        call.add_fork(true, sink);
+        let mut good = [0u8; 33];
+        good[0] = 0xD0;
+        for (sequence, payload) in [(1u16, &good[..]), (2, &[0xD0; 32][..]), (3, &good[..])] {
+            let packet = rtp_with(3, sequence, payload);
+            let mut out = Vec::new();
+            call.process(&rx(1, A_ADDR, packet.clone()), &mut out, &mut Vec::new());
+            assert_eq!(out.len(), 1, "packet {sequence} forwarded");
+            assert_eq!(&out[0].data[..], &packet[..], "packet {sequence} verbatim");
+        }
+        let log = log.lock().expect("sink log");
+        assert_eq!(
+            log.frames.len(),
+            2,
+            "both decodable frames reached the sink"
+        );
+        assert!(log.frames.iter().all(|(samples, _)| *samples == 160));
+        assert_eq!(log.undecodable, 1);
+        assert_eq!(call.a_to_b.tap.as_ref().map(|tap| tap.undecodable), Some(1));
+    }
+
+    #[test]
+    fn a_relay_sink_hears_the_decoded_leg_and_the_egress_tap_hears_the_same() {
+        let mut call = relay_call();
+        let (fork, fork_log) = logging_sink();
+        let (egress, egress_log) = logging_sink();
+        call.add_fork(true, fork);
+        // What B hears on a relay is what A sent.
+        call.add_egress_fork(false, egress);
+        let packet = ulaw_rtp(4, 0x10);
+        let mut out = Vec::new();
+        call.process(&rx(1, A_ADDR, packet.clone()), &mut out, &mut Vec::new());
+        assert_eq!(&out[0].data[..], &packet[..]);
+        for log in [fork_log, egress_log] {
+            let log = log.lock().expect("sink log");
+            assert_eq!(log.frames, vec![(160, true)]);
+            assert_eq!(log.undecodable, 0);
+        }
+    }
+
+    #[test]
+    fn a_relay_sink_is_not_fed_telephone_events_or_rtcp() {
+        let mut call = relay_call();
+        let (sink, log) = logging_sink();
+        call.add_fork(true, sink);
+        let event = rtp_with(101, 9, &[1, 0x0A, 0x00, 0xA0]);
+        let rtcp = vec![0x80, 200, 0x00, 0x01, 0x12, 0x34, 0x56, 0x78];
+        for datagram in [event, rtcp] {
+            let mut out = Vec::new();
+            call.process(&rx(1, A_ADDR, datagram.clone()), &mut out, &mut Vec::new());
+            assert_eq!(&out[0].data[..], &datagram[..], "relayed untouched");
+        }
+        let log = log.lock().expect("sink log");
+        assert!(log.frames.is_empty(), "nothing but the audio PT is decoded");
+        assert_eq!(log.undecodable, 0, "nor counted as undecodable");
+    }
+
+    #[test]
+    fn a_relay_without_a_sink_runs_no_codec() {
+        // A relay promoted for a raw tee, a pcap or an X3 tap never builds a decoder.
+        let mut call = relay_call();
+        call.process(
+            &rx(1, A_ADDR, ulaw_rtp(1, 0x10)),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(call
+            .a_to_b
+            .tap
+            .as_ref()
+            .is_some_and(|tap| tap.decoder.is_none()));
+    }
+
+    #[test]
+    fn taking_the_attachments_leaves_a_bare_relay_and_hands_over_each_one() {
+        let mut call = relay_call();
+        let (fork, _) = logging_sink();
+        let (egress, _) = logging_sink();
+        call.add_fork(false, fork);
+        call.add_egress_fork(true, egress);
+        call.set_dtmf_blocked(true, true);
+        let (sender, _capture) = flume::bounded(4);
+        call.start_recording(PcapCapture {
+            sender,
+            a_local: addr(A_ADDR),
+            b_local: addr(B_ADDR),
+        });
+        let taken = call.take_attachments();
+        assert_eq!(taken.forks[0].len(), 0);
+        assert_eq!(taken.forks[1].len(), 1, "leg B's fork");
+        assert_eq!(taken.egress_taps[0].len(), 1, "the tap on what A hears");
+        assert_eq!(taken.egress_taps[1].len(), 0);
+        assert_eq!(taken.dtmf_blocked, [true, false]);
+        assert!(taken.capture.is_some());
+        assert!(taken.x3.is_none());
+        assert_eq!(call.fork_count(false), 0);
+        assert!(!call.is_recording());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, ForwardRule, LatchPolicy};
 
-use crate::media_pipeline::{MediaCall, RelayConfig};
+use crate::media_pipeline::{CarriedAttachments, MediaCall, MediaControl, RelayConfig};
 use crate::text_pipeline::{TextCall, TextDirectionConfig};
 
 use super::negotiate::{apply_received_from, build_direction};
@@ -22,16 +22,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Also carry each leg's negotiated telephone-event PT so a later `block DTMF` can gate it on
         // this promoted (still untranscoded) relay: leg A's ingress uses `near_telephone_event`, leg
         // B's uses `far_telephone_event`.
-        let Some((from_tag, to_tag, relay_flows, near_telephone_event, far_telephone_event)) = self
-            .owned_call_internal(call_id, |call| {
-                (
-                    call.from_tag.clone(),
-                    call.to_tag.clone(),
-                    call.relay_flows.clone(),
-                    call.near_telephone_event.map(|event| event.payload_type),
-                    call.far_telephone_event,
-                )
-            })
+        let Some((
+            from_tag,
+            to_tag,
+            relay_flows,
+            near_telephone_event,
+            far_telephone_event,
+            near_codec,
+            far_codec,
+        )) = self.owned_call_internal(call_id, |call| {
+            (
+                call.from_tag.clone(),
+                call.to_tag.clone(),
+                call.relay_flows.clone(),
+                call.near_telephone_event.map(|event| event.payload_type),
+                call.far_telephone_event,
+                call.near_codec.clone(),
+                call.far_codec.clone(),
+            )
+        })
         else {
             return Err("call no longer exists".to_string());
         };
@@ -46,6 +55,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             egress_endpoint: layout.near_rule.out_endpoint,
             egress_dst: layout.b_dst,
             telephone_event: near_telephone_event, // leg A's ingress
+            tap_codec: near_codec,
         };
         let b_to_a = RelayConfig {
             ingress_endpoint: layout.far_endpoint,
@@ -53,6 +63,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             egress_endpoint: layout.far_rule.out_endpoint,
             egress_dst: layout.a_dst,
             telephone_event: far_telephone_event, // leg B's ingress
+            tap_codec: far_codec,
         };
 
         // Switch both RTP endpoints to Redirect so the dispatcher routes them to the media actor.
@@ -397,7 +408,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // rule, and it has to live here rather than in each verb because every one of them funnels
         // through this function. `PromoteMode::RelayOnly` — pcap recording, `block DTMF`, X3 — stays
         // allowed: it forwards the payload verbatim, which is exactly what the pin asserts.
-        if fax_passthrough && mode == PromoteMode::Processing {
+        // A tee and a decoded recording decode a copy beside a relay-only actor, which leaves the
+        // payload as it arrived, but they are still features that decode the call: the pin keeps
+        // refusing them, as it refuses them in the profile.
+        let decodes = mode == PromoteMode::Processing
+            || matches!(
+                reason,
+                PromotionReason::WsTee | PromotionReason::AudioRecording
+            );
+        if fax_passthrough && decodes {
             return Err(
                 "fax-passthrough-needs-decoded-audio: this call is pinned to opaque relay \
                  (fax_passthrough), so it cannot be promoted to the processing pipeline — a fax \
@@ -416,19 +435,102 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
         } else if mode == PromoteMode::Processing && self.media.is_relay_call(call_id) {
-            // A relay-only promotion (recording / DTMF-block on a plain relay) is already up, but echo
-            // needs a decode → re-encode path a relay-only actor cannot provide. Reject clearly rather
-            // than silently apply an Echo control that would forward opaque payloads to the peer.
-            return Err(
-                "echo is unsupported while a plain relay is held in userspace for recording or a \
-                 DTMF block; stop those first"
-                    .to_string(),
-            );
+            // A relay-only actor is already up (a tee, a recording, a SIPREC fork, a DTMF block, an
+            // interception), but echo and a prompt need a decode → re-encode path it cannot provide.
+            // Rebuild it as a processing actor, carrying everything attached to it.
+            self.upgrade_relay_to_processing(call_id, matches!(reason, PromotionReason::Echo))
+                .await?;
         }
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.promotion_reasons.insert(reason);
         }
         Ok(())
+    }
+
+    /// Rebuild a **relay-only** promoted call as a **processing** one (decode → re-encode), for echo
+    /// or a prompt, carrying everything attached to the old actor: the tee and recording sinks, an
+    /// interception's X3 taps, a pcap capture, a DTMF block, and every answered SIPREC
+    /// subscription's raw tee. Nothing a controller attached is lost to the rebuild.
+    ///
+    /// If the processing actor cannot be built, the relay-only one is put back with its
+    /// attachments, so a refused prompt leaves the call as it was.
+    pub(super) async fn upgrade_relay_to_processing(
+        &self,
+        call_id: &str,
+        echo: bool,
+    ) -> Result<(), String> {
+        let (reply, carried) = tokio::sync::oneshot::channel();
+        if !self
+            .media
+            .control(call_id, MediaControl::TakeAttachments { reply })
+        {
+            return Err("media actor unavailable".to_string());
+        }
+        let attachments = carried
+            .await
+            .map_err(|_| "media actor unavailable".to_string())?;
+        self.media.deregister(call_id);
+        let rebuilt = match self.promote_to_processing(call_id, echo).await {
+            Ok(()) => Ok(()),
+            Err(reason) => match self.promote_passthrough(call_id).await {
+                Ok(()) => Err(reason),
+                Err(restore) => {
+                    tracing::error!(
+                        target: "siphon_rtp::media",
+                        call_id,
+                        reason,
+                        restore,
+                        "relay could not be rebuilt for processing nor restored"
+                    );
+                    return Err(reason);
+                }
+            },
+        };
+        self.restore_attachments(call_id, attachments);
+        self.reattach_subscription_raw_tees(call_id);
+        rebuilt
+    }
+
+    /// Put what [`MediaControl::TakeAttachments`] moved out of an actor onto the call's new one.
+    fn restore_attachments(&self, call_id: &str, attachments: CarriedAttachments) {
+        let CarriedAttachments {
+            forks,
+            egress_taps,
+            x3,
+            capture,
+            dtmf_blocked,
+        } = attachments;
+        for (leg_a, sinks) in [true, false].into_iter().zip(forks) {
+            for sink in sinks {
+                self.media.control(
+                    call_id,
+                    MediaControl::AddFork {
+                        source_a: leg_a,
+                        sink,
+                    },
+                );
+            }
+        }
+        for (toward_a, sinks) in [true, false].into_iter().zip(egress_taps) {
+            for sink in sinks {
+                self.media
+                    .control(call_id, MediaControl::AddEgressFork { toward_a, sink });
+            }
+        }
+        if let Some(taps) = x3 {
+            self.media
+                .control(call_id, MediaControl::StartX3(Box::new(taps)));
+        }
+        if let Some(capture) = capture {
+            self.media
+                .control(call_id, MediaControl::StartRecording { capture });
+        }
+        for (source_a, blocked) in [true, false].into_iter().zip(dtmf_blocked) {
+            if blocked {
+                self.media
+                    .control(call_id, MediaControl::BlockDtmf { source_a, blocked });
+            }
+        }
     }
 
     /// What follows an installed answer's media path, once the call records it.
@@ -471,14 +573,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // Nothing reaches this actor any more: the answer's `Forward` rule took its endpoints.
             self.media.deregister(call_id);
             if self.call_has_userspace_hold(call_id) {
+                // A tee and a decoded recording decode beside a relay-only actor; only echo and a
+                // prompt need the call itself decoded and re-encoded.
                 let processing = reasons.iter().any(|reason| {
-                    matches!(
-                        reason,
-                        PromotionReason::WsTee
-                            | PromotionReason::Echo
-                            | PromotionReason::AudioRecording
-                            | PromotionReason::MediaOp
-                    )
+                    matches!(reason, PromotionReason::Echo | PromotionReason::MediaOp)
                 });
                 let promoted = if processing {
                     self.promote_to_processing(call_id, reasons.contains(&PromotionReason::Echo))

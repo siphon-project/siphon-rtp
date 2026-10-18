@@ -349,8 +349,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .sum()
     }
 
-    /// Frames the live tees dropped because a consumer stalled. Non-zero means a WS server could not
-    /// keep up — by design that costs tee frames and never the call.
+    /// Frames the live tees dropped because a consumer stalled, or because a leg frame could not be
+    /// decoded for the tee. Either way, by design, it costs tee frames and never the call.
     #[must_use]
     pub fn ws_tee_frames_dropped(&self) -> u64 {
         self.ws_tees

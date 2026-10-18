@@ -1113,8 +1113,8 @@ pub(super) fn resolve_pipeline_kind(
         || profile.echo_cancellation
         || profile.beep_detection;
     // A tee streams the decoded audio too, so it is the same kind of reason — but only the plain relay
-    // can meet it later: `start_ws_tee` promotes a relay to the processing pipeline for the tee's
-    // lifetime and demotes it on detach. A crypto bridge has no such promotion (it relays ciphertext
+    // can meet it later: `start_ws_tee` promotes a relay to userspace for the tee's lifetime (relay-
+    // only, decoding a copy for the tee beside the verbatim forward) and demotes it on detach. A crypto bridge has no such promotion (it relays ciphertext
     // and holds no media actor to fan out from), so a bridge chosen here is a tee refused there. The
     // plain arm at the bottom therefore tests `decodes_for_the_whole_call`, every other arm this.
     let needs_decoded_audio = decodes_for_the_whole_call || profile.ws_tee.is_some();
@@ -1228,7 +1228,7 @@ mod tests {
     /// Every crypto bridge that has a decoding twin resolves to it once a tee is named on the answer —
     /// the bridge relays ciphertext and has no post-decode fan-out to tap, and it cannot be converted
     /// mid-call, so the choice has to be made here. A plain relay is the exception: it can be promoted
-    /// to the processing pipeline for the tee's lifetime and demoted on detach, so the answer keeps
+    /// to userspace for the tee's lifetime and demoted on detach, so the answer keeps
     /// it on the kernel fast path and leaves the promotion to the tee.
     #[test]
     fn a_ws_tee_decodes_every_bridge_that_has_a_decoding_twin() {

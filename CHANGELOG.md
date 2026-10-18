@@ -5,6 +5,24 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **A WebSocket tee or a decoded recording no longer changes the call it copies.** On a plain
+  relay, attaching either promoted the call to the processing pipeline, which decoded and
+  re-encoded every packet: the far party got the engine's own stream (new SSRC, sequence and
+  timestamps, AMR re-encoded at the engine's mode, SID and DTX lost), and a frame the decoder
+  rejected was dropped from the call, so a UE sending payloads the decoder refused went silent
+  for the other party the moment transcription started. The relay is now promoted relay-only and
+  forwards every packet byte for byte; the tee or recording decodes a copy beside the forward. A
+  frame it cannot decode is skipped on the copy, counted in the tee's `frames_dropped` (and so in
+  `siphon_rtp_ws_tee_frames_dropped_total`), and logged once at `warn` per direction, then at `debug`.
+  A prompt or echo on such a call rebuilds it as a processing actor and now carries every
+  attachment across (tee and recording sinks, X3 taps, a pcap capture, a DTMF block), so a tee
+  attached alongside a pcap recording or a DTMF block is no longer refused. A call pinned with
+  `fax_passthrough` still refuses both.
+
 ## [0.15.0] — 2026-10-17
 
 ### Added

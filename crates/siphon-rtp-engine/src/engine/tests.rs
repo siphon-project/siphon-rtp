@@ -50,6 +50,7 @@ mod conference_dial_out;
 mod conference_seat;
 mod offer_far;
 mod ogg_opus_recording;
+mod tee_undecodable;
 mod transcode_offer;
 
 #[test]
@@ -23939,13 +23940,12 @@ async fn attaching_a_ws_tee_to_a_websocket_takeover_call_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_ws_tee_is_refused_while_a_pcap_recording_holds_the_relay_forward_only() {
-    // A pcap recording promotes the relay *forward-only* (no decode). Attaching a tee would have to
-    // rebuild the actor, which cannot carry the live capture channel across — so refuse rather than
-    // silently stop recording. (Attaching the tee first works: `start_recording` then reuses the
-    // already-decoding actor.)
+async fn a_ws_tee_joins_a_pcap_recording_on_the_same_forward_only_relay() {
+    // A pcap recording promotes the relay *forward-only*. A tee needs no more than that: it decodes
+    // a copy of each forwarded packet for itself, so it attaches to the same actor, the capture
+    // keeps running, and the far party still receives the caller's packets as they were sent.
     let directory = tempfile::tempdir().expect("tempdir");
-    let (engine, (_phone_a, _near), _b) = two_party_relay("tee-vs-pcap").await;
+    let (engine, (phone_a, near_addr), (phone_b, _far)) = two_party_relay("tee-vs-pcap").await;
     let started = engine
         .handle(
             CLIENT,
@@ -23968,7 +23968,7 @@ async fn a_ws_tee_is_refused_while_a_pcap_recording_holds_the_relay_forward_only
         "start_recording: {started:?}"
     );
 
-    let (uri, _frames) = tee_server().await;
+    let (uri, frames) = tee_server().await;
     let attached = engine
         .handle(
             CLIENT,
@@ -23982,22 +23982,20 @@ async fn a_ws_tee_is_refused_while_a_pcap_recording_holds_the_relay_forward_only
             },
         )
         .await;
-    match attached {
-        CmdResult::Error { reason } => assert!(
-            reason.contains("pcap recording"),
-            "expected the recording conflict to be named, got {reason}"
-        ),
-        other => panic!("expected an error, got {other:?}"),
-    }
-    assert_eq!(
-        engine.ws_tee_count(),
-        0,
-        "the refused attach left no tee behind"
+    assert!(
+        matches!(attached, CmdResult::Ok { .. }),
+        "attach: {attached:?}"
     );
     assert!(
         engine.media().is_relay_call("tee-vs-pcap"),
-        "the recording's forward-only actor is untouched by the refusal"
+        "the recording's forward-only actor carries the tee as it is"
     );
+    expect_tee_start(&frames).await;
+    let packet = g711_rtp(0, 77, 0x0A0A_0A0A, 0x22);
+    phone_a.send_to(&packet, near_addr).await.expect("a send");
+    let (received, _) = recv(&phone_b).await;
+    assert_eq!(received, packet, "relayed verbatim");
+    assert_eq!(next_tee_audio(&frames).await.len(), 320);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
