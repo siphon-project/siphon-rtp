@@ -47,6 +47,9 @@ pub struct Peers {
     pub attacker: UdpSocket,
     /// The party the backend forwards toward.
     pub callee: UdpSocket,
+    /// The callee after a re-answer moved its media to another address: a new signalled peer with
+    /// its own RTP stream, not a NAT rebind of the old one.
+    pub moved_callee: UdpSocket,
 }
 
 impl Peers {
@@ -57,6 +60,7 @@ impl Peers {
             rebound_caller: bind(Ipv4Addr::new(127, 0, 0, 5)).await,
             attacker: bind(Ipv4Addr::new(127, 0, 0, 6)).await,
             callee: bind(Ipv4Addr::new(127, 0, 0, 4)).await,
+            moved_callee: bind(Ipv4Addr::new(127, 0, 0, 7)).await,
         }
     }
 }
@@ -187,6 +191,82 @@ pub async fn a_non_media_datagram_is_dropped_without_latching<D: Datapath>(
 
     datapath.remove_endpoint(leg_a.id).await;
     datapath.remove_endpoint(leg_b.id).await;
+}
+
+/// Layers 2 and 3 across a re-answer: an early answer signals one far address, its media latches,
+/// then the final answer signals a **different** far address carrying a new SSRC (early media from
+/// one media server, the answer from another). The re-answer is the signalling moving the peer, so
+/// the stale latch must not outlive it: the new peer's media flows, the near party's media goes to
+/// the new peer rather than the stale latched source, and the gate still holds against everyone
+/// else, the old peer and an off-path source spoofing the new SSRC included
+/// (docs/security-and-nat.md §4 layers 2 and 3; RFC 3264 §8).
+pub async fn a_re_answer_that_moves_the_peer_drops_the_stale_latch<D: Datapath>(
+    datapath: &D,
+    peers: &Peers,
+) {
+    let near = datapath.alloc_endpoint().await.expect("alloc near leg");
+    let far = datapath.alloc_endpoint().await.expect("alloc far leg");
+    let answer = |far_peer: SocketAddr| {
+        datapath
+            .install_flow(
+                near.id,
+                FlowAction::Forward(ForwardRule::signalled(
+                    far.id,
+                    Some(far_peer),
+                    address(&peers.caller).ip(),
+                )),
+            )
+            .expect("install near flow");
+        datapath
+            .install_flow(
+                far.id,
+                FlowAction::Forward(ForwardRule::signalled(
+                    near.id,
+                    Some(address(&peers.caller)),
+                    far_peer.ip(),
+                )),
+            )
+            .expect("install far flow");
+    };
+
+    // Early answer: the far peer is the callee. Its media latches the far leg and flows.
+    answer(address(&peers.callee));
+    send(&peers.callee, &rtp(0xEA51_0001, 1), far.local_addr).await;
+    let (data, _) = receive(&peers.caller).await;
+    assert_eq!(data, rtp(0xEA51_0001, 1));
+
+    // Final answer: the far side moved its media to another address, with a new stream.
+    answer(address(&peers.moved_callee));
+
+    // The new peer's media flows, although its source and SSRC both differ from the stale latch.
+    send(&peers.moved_callee, &rtp(0xF1A1_0002, 1), far.local_addr).await;
+    let (data, from) = receive(&peers.caller).await;
+    assert_eq!(data, rtp(0xF1A1_0002, 1));
+    assert_eq!(from, near.local_addr);
+
+    // The near party's media goes to the new peer, not to the stale latched source.
+    send(&peers.caller, &rtp(0x0EA2_0003, 1), near.local_addr).await;
+    let (data, from) = receive(&peers.moved_callee).await;
+    assert_eq!(data, rtp(0x0EA2_0003, 1));
+    assert_eq!(from, far.local_addr);
+    assert_not_delivered(
+        &peers.callee,
+        "near media must not go to the peer the re-answer replaced",
+    )
+    .await;
+
+    // The gate still holds: neither the replaced peer nor an off-path source carrying the new
+    // stream's SSRC can drive the far leg.
+    send(&peers.callee, &rtp(0xEA51_0001, 2), far.local_addr).await;
+    send(&peers.attacker, &rtp(0xF1A1_0002, 2), far.local_addr).await;
+    assert_not_delivered(
+        &peers.caller,
+        "an unsignalled source must stay gated out after a re-answer",
+    )
+    .await;
+
+    datapath.remove_endpoint(near.id).await;
+    datapath.remove_endpoint(far.id).await;
 }
 
 async fn bind(ip: Ipv4Addr) -> UdpSocket {

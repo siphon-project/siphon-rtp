@@ -285,6 +285,24 @@ Latch state machine, per direction:
   shares the kernel adapter's one restriction: a datagram with no SSRC (RTCP) never aims the reply
   before a stream is latched, and once one is, such a datagram is accepted only from the latched
   source.
+- **A re-answer that moves the peer forgets the replaced peer's latch.** An early answer (183) from
+  one transport and a final answer, or a re-offer, that moves the far party to another (early media
+  from one media server, the answer from another) reinstalls the call's rules. The latch the first
+  peer taught belongs to the party the signalling just replaced: kept, it rejects every packet the new
+  peer sends (a new source with a new SSRC is exactly what this layer refuses), and it keeps steering
+  the reply to the old transport, so audio dies at the answer. The reinstall drops it, by one rule set
+  shared through `signalled_peer_moved` in `siphon-rtp-datapath`: an endpoint's latch goes when the
+  new rule's source gate (layer 2) no longer admits it, and a peer endpoint's latch goes when the rule
+  toward it moved to a **different** signalled destination, which also catches a move to another port
+  on the same address that an address-only gate cannot see. The UDP backend applies it in
+  `install_flow` (`Inner::forget_stale_latches`), the SRTP bridge in `SrtpBridge::register`. This is
+  never a blind re-latch: the new peer latches only through the new rule's gate, so the replaced peer
+  and an off-path source carrying the new stream's SSRC both stay out. A reinstall that names the same
+  destination (a hold or refresh re-INVITE), or a first destination after an unanswered offer, is not a
+  move, so a NATed peer's learned source survives it. An ICE endpoint is exempt: its latch is the
+  check-validated path, which only a connectivity check moves (layer 4). The XDP backend has no stale
+  state to drop: `install_flow` writes a freshly built kernel action whose latch is empty, and the
+  kernel re-learns through the new gate.
 - **Effect on A1:** even inside the learning window, a hijack must reproduce the victim's live SSRC,
   which the blind attacker does not know.
 
@@ -1492,8 +1510,11 @@ inspection:
 - **Mid-call hijack:** mid-stream spray from a new source with a *wrong* SSRC is rejected; a new source
   with the *correct* SSRC (simulated NAT rebind) re-latches. One check, opposite verdicts.
 - **Demux:** STUN/DTLS/garbage to a media port never moves the media latch (layer 1).
-- **Every backend, not only UDP-loopback:** the RTPBleed race, the hijack-versus-rebind check and the
-  demux check are written against the `Datapath` trait (`siphon_rtp_datapath::conformance`, behind
+- **Re-answer:** an early answer latches one far peer, the final answer moves it to another address
+  with a new SSRC; the new peer's media flows, the near party's goes to the new peer, and the replaced
+  peer and an off-path source spoofing the new SSRC stay gated out (layer 3, "re-answer").
+- **Every backend, not only UDP-loopback:** the RTPBleed race, the hijack-versus-rebind check, the
+  re-answer check and the demux check are written against the `Datapath` trait (`siphon_rtp_datapath::conformance`, behind
   the `conformance` feature), so another backend runs the same adversarial tests instead of
   inheriting none of their cover.
 - **Source gate:** `SignalledOnly` rejects an off-address source; `Symmetric` (opt-in) accepts it.

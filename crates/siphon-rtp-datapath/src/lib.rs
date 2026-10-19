@@ -148,6 +148,24 @@ impl SourceFilter {
     }
 }
 
+/// Whether reinstalling a flow re-points it at a **different signalled peer**: a re-answer or
+/// re-offer that moved the far party's media to another transport (early media from one media
+/// server, the final answer from another). `previous` and `next` are the old and new
+/// [`ForwardRule::out_dst`] of a rule toward the same peer endpoint.
+///
+/// The source that peer endpoint latched belongs to the party the signalling just replaced, so a
+/// backend that keeps a latch forgets it on a move: otherwise the stale latch keeps steering the
+/// reply to the old transport and, the new peer carrying its own SSRC, rejects every packet the new
+/// peer sends (docs/security-and-nat.md §4 layer 3). Forgetting the latch never opens the gate: the
+/// new peer still latches only through the rule's signalled-source gate (layer 2).
+///
+/// A first destination (`None` to `Some`) or an unchanged one is not a move, so a hold or refresh
+/// re-INVITE keeps a NATed peer's learned source.
+#[must_use]
+pub fn signalled_peer_moved(previous: Option<SocketAddr>, next: Option<SocketAddr>) -> bool {
+    matches!((previous, next), (Some(previous), Some(next)) if previous != next)
+}
+
 /// How (and whether) an endpoint learns its peer's real source — the latch lifecycle that follows a
 /// genuine NAT rebind but resists a hijack spray.
 /// See [`docs/security-and-nat.md`](../../../docs/security-and-nat.md) §4 layer 3.
@@ -827,6 +845,19 @@ mod tests {
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn signalled_peer_moved_only_when_a_known_destination_changes() {
+        let early = SocketAddr::new(ip(192, 0, 2, 10), 37322);
+        let answer = SocketAddr::new(ip(198, 51, 100, 20), 21818);
+        let same_box_new_port = SocketAddr::new(ip(192, 0, 2, 10), 37324);
+        assert!(signalled_peer_moved(Some(early), Some(answer)));
+        assert!(signalled_peer_moved(Some(early), Some(same_box_new_port)));
+        assert!(!signalled_peer_moved(Some(early), Some(early)));
+        assert!(!signalled_peer_moved(None, Some(answer)));
+        assert!(!signalled_peer_moved(Some(early), None));
+        assert!(!signalled_peer_moved(None, None));
     }
 
     #[test]

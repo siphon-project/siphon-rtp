@@ -21,7 +21,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
-use siphon_rtp_datapath::{Datapath, EndpointId, ObservedRtcp, RxPacket, SourceFilter};
+use siphon_rtp_datapath::{
+    signalled_peer_moved, Datapath, EndpointId, ObservedRtcp, RxPacket, SourceFilter,
+};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use crate::dtls_bridge::DtlsBridge;
@@ -216,6 +218,27 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             };
             resolved.push((flow.endpoint, ingress_leg, egress_leg, flow));
         }
+        // A re-registration that moves a peer (a re-answer from another transport) makes the source
+        // that peer's endpoint latched stale: it would keep steering the reply to the replaced party
+        // until the new one happened to send. Decided against the outgoing flows, applied once the
+        // new ones are in place, by the same rules the datapath's `Forward` reinstall follows
+        // (docs/security-and-nat.md §4 layer 3, "re-answer").
+        let mut stale = Vec::new();
+        for (endpoint, _, _, flow) in &resolved {
+            if self
+                .latched
+                .get(endpoint)
+                .is_some_and(|latched| !flow.accepted_source.accepts(latched.ip()))
+            {
+                stale.push(*endpoint);
+            }
+            if self.flows.get(endpoint).is_some_and(|previous| {
+                previous.out_endpoint == flow.out_endpoint
+                    && signalled_peer_moved(Some(previous.out_dst), Some(flow.out_dst))
+            }) {
+                stale.push(flow.out_endpoint);
+            }
+        }
         for (endpoint, ingress_leg, egress_leg, flow) in resolved {
             // A renegotiation re-registers a live call's flows. Whatever is listening to the call
             // was attached to the call, not to one negotiation of it, so its taps move to the
@@ -246,6 +269,9 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     plain_taps,
                 },
             );
+        }
+        for endpoint in stale {
+            self.latched.remove(&endpoint);
         }
     }
 
@@ -1212,6 +1238,100 @@ mod tests {
             plaintext,
             "the reply reaches the phone at its real source, not the address it signalled"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_re_registration_that_moves_the_peer_forgets_its_stale_latch() {
+        // Early media from one transport latches the plain leg; the final answer re-registers the
+        // call with the plain peer on another address. Until the new peer sends, the reply must go
+        // to where it was signalled, not to the source the replaced peer latched; an unchanged
+        // re-registration (hold, refresh) must keep the learned source.
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        let (early_peer, addr_early) = phone(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (answer_peer, addr_answer) = phone(Ipv4Addr::new(127, 0, 0, 4)).await;
+        let (_phone_b, addr_b) = phone(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let local = key(0xAA);
+        let remote = key(0xBB);
+        let bridge = SrtpBridge::new(datapath.clone());
+        let register = |plain_peer: SocketAddr| {
+            bridge.register(BridgeCallPlan {
+                near_leg: None,
+                far_leg: Some(SecureLeg::new(&local, &remote)),
+                flows: vec![
+                    BridgeFlowPlan {
+                        endpoint: plain.id,
+                        ingress_leg: None,
+                        egress_leg: Some(BridgeLeg::Far),
+                        accepted_source: SourceFilter::Exact(plain_peer.ip()),
+                        latch: true,
+                        out_endpoint: secure.id,
+                        out_dst: addr_b,
+                    },
+                    BridgeFlowPlan {
+                        endpoint: secure.id,
+                        ingress_leg: Some(BridgeLeg::Far),
+                        egress_leg: None,
+                        accepted_source: SourceFilter::Exact(addr_b.ip()),
+                        latch: true,
+                        out_endpoint: plain.id,
+                        out_dst: plain_peer,
+                    },
+                ],
+            });
+        };
+        let from_plain = |source: SocketAddr, sequence: u16| RxPacket {
+            endpoint: plain.id,
+            source,
+            arrival: 0,
+            data: bytes::Bytes::from(rtp(sequence, 0x4444_4444)),
+        };
+
+        register(addr_early);
+        bridge.handle(from_plain(addr_early, 1)).await;
+        assert_eq!(bridge.latched_source(plain.id), Some(addr_early));
+
+        register(addr_answer);
+        assert_eq!(
+            bridge.latched_source(plain.id),
+            None,
+            "the re-registration replaced the peer that latch belongs to"
+        );
+
+        // B's reply goes to the new peer's signalled address, not the stale latched source.
+        let plaintext = rtp(2000, 0x5555_5555);
+        let mut encrypt = SrtpContext::from_key_material(&remote);
+        let mut srtp = Vec::new();
+        encrypt
+            .protect(&plaintext, &mut srtp)
+            .expect("peer encrypt");
+        bridge
+            .handle(RxPacket {
+                endpoint: secure.id,
+                source: addr_b,
+                arrival: 0,
+                data: bytes::Bytes::from(srtp),
+            })
+            .await;
+        assert_eq!(recv(&answer_peer).await, plaintext);
+        let mut scratch = [0u8; 2048];
+        assert!(
+            timeout(NEGATIVE, early_peer.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "the reply must not go to the peer the re-registration replaced"
+        );
+
+        // The replaced peer is gated out and cannot re-latch.
+        bridge.handle(from_plain(addr_early, 2)).await;
+        assert_eq!(bridge.latched_source(plain.id), None);
+
+        // The new peer latches; an unchanged re-registration keeps it.
+        bridge.handle(from_plain(addr_answer, 3)).await;
+        assert_eq!(bridge.latched_source(plain.id), Some(addr_answer));
+        register(addr_answer);
+        assert_eq!(bridge.latched_source(plain.id), Some(addr_answer));
     }
 
     /// The peer's answered key, by value — `SrtpContext::from_key_material` takes a reference and the

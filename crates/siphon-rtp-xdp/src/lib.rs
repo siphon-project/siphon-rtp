@@ -2129,6 +2129,31 @@ mod tests {
     }
 
     #[test]
+    fn a_reinstalled_forward_flow_starts_with_no_media_latch() {
+        // `install_flow` writes a freshly built action over the kernel's, so a re-answer that moves
+        // the far peer never inherits the source the replaced peer latched: the kernel re-learns
+        // through the new rule's source gate (docs/security-and-nat.md §4 layer 3, "re-answer").
+        let moved_peer: SocketAddr = "198.51.100.20:21818".parse().expect("addr");
+        let rule = ForwardRule::signalled(
+            EndpointId(1),
+            Some("203.0.113.5:6000".parse().expect("addr")),
+            moved_peer.ip(),
+        );
+        let mut kernel = to_kernel_action(
+            DpFlowAction::Forward(rule),
+            &empty_endpoints(),
+            Ipv4Addr::new(198, 51, 100, 1),
+            0,
+        );
+        apply_ice_posture(&mut kernel, false, None);
+        assert_eq!(kernel.latch_valid, 0);
+        assert_eq!(kernel.latched_ipv4, 0);
+        assert_eq!(kernel.latched_port, 0);
+        assert_eq!(kernel.latched_ssrc, 0);
+        assert_eq!(kernel.source_ipv4, u32::from_be_bytes([198, 51, 100, 20]));
+    }
+
+    #[test]
     fn a_non_ice_flow_keeps_its_kernel_owned_media_latch() {
         // `apply_ice_posture` runs on every flow install, so it must leave a plain relay's
         // symmetric-RTP latch — which the kernel owns and updates — completely alone.

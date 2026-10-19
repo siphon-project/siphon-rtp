@@ -17,9 +17,10 @@ use tokio::task::JoinHandle;
 
 use crate::dscp::Dscp;
 use crate::{
-    classify, rtp_media_ssrc, source_latch_verdict, AddressFamily, Datapath, DatapathError,
-    Endpoint, EndpointId, EndpointStats, FlowAction, IceAgentMode, IceConfig, IceDatapathEvent,
-    LatchPolicy, ObservedRtcp, PacketClass, RxPacket, SourceLatch, SourceLatchVerdict,
+    classify, rtp_media_ssrc, signalled_peer_moved, source_latch_verdict, AddressFamily, Datapath,
+    DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction, ForwardRule, IceAgentMode,
+    IceConfig, IceDatapathEvent, LatchPolicy, ObservedRtcp, PacketClass, RxPacket, SourceLatch,
+    SourceLatchVerdict,
 };
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
@@ -429,6 +430,43 @@ impl Inner {
                 *published = validated;
                 true
             });
+        }
+    }
+
+    /// Forget the latches a reinstalled `rule` on `endpoint` has made stale, after the rule is in
+    /// place (so its gate already applies to whatever latches next). A re-answer that moves the far
+    /// party re-points both directions: the rule on `endpoint` gates a new source, and the rule
+    /// toward `rule.out_endpoint` names a new destination. A latch left over from the replaced peer
+    /// would reject the new peer's stream (a new source with a new SSRC is exactly what layer 3
+    /// refuses) and keep steering the reply to the old transport, so the new peer is let in through
+    /// the gate instead (docs/security-and-nat.md §4 layer 3, "re-answer").
+    ///
+    /// - `endpoint`'s own latch goes when the new gate no longer admits its source: forwarding to a
+    ///   source the gate refuses to hear from is never right.
+    /// - The peer endpoint's latch goes when the rule toward it moved to a different signalled
+    ///   destination ([`signalled_peer_moved`]), which also covers a move to another port on the same
+    ///   address that an address-only gate cannot see.
+    ///
+    /// An ICE endpoint is left alone: there `latched` is the check-validated path, which only a
+    /// connectivity check moves (layer 4).
+    fn forget_stale_latches(
+        &self,
+        endpoint: EndpointId,
+        previous: Option<FlowAction>,
+        rule: &ForwardRule,
+    ) {
+        if !self.ice.contains_key(&endpoint) {
+            self.latched.remove_if(&endpoint, |_, latch| {
+                !rule.accepted_source.accepts(latch.source.ip())
+            });
+        }
+        if let Some(FlowAction::Forward(previous)) = previous {
+            if previous.out_endpoint == rule.out_endpoint
+                && signalled_peer_moved(previous.out_dst, rule.out_dst)
+                && !self.ice.contains_key(&rule.out_endpoint)
+            {
+                self.latched.remove(&rule.out_endpoint);
+            }
         }
     }
 
@@ -1050,7 +1088,10 @@ impl Datapath for UdpLoopbackDatapath {
         if !self.inner.endpoints.contains_key(&endpoint) {
             return Err(DatapathError::UnknownEndpoint(endpoint));
         }
-        self.inner.flows.insert(endpoint, action);
+        let previous = self.inner.flows.insert(endpoint, action);
+        if let FlowAction::Forward(rule) = action {
+            self.inner.forget_stale_latches(endpoint, previous, &rule);
+        }
         Ok(())
     }
 
@@ -2047,6 +2088,127 @@ mod tests {
             &crate::conformance::Peers::loopback().await,
         )
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_answer_to_a_new_peer_drops_the_stale_latch() {
+        crate::conformance::a_re_answer_that_moves_the_peer_drops_the_stale_latch(
+            &UdpLoopbackDatapath::new(),
+            &crate::conformance::Peers::loopback().await,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_answer_to_another_port_on_the_same_address_drops_the_stale_latch() {
+        // The far side moves its media to another port on the same box. The address-only gate admits
+        // both, so only the moved destination can tell the latch is stale.
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (phone_near, addr_near) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (early_peer, addr_early) = phone_at(Ipv4Addr::new(127, 0, 0, 8)).await;
+        let (answer_peer, addr_answer) = phone_at(Ipv4Addr::new(127, 0, 0, 8)).await;
+        let answer = |far_peer: SocketAddr| {
+            datapath
+                .install_flow(
+                    near.id,
+                    FlowAction::Forward(ForwardRule::signalled(
+                        far.id,
+                        Some(far_peer),
+                        addr_near.ip(),
+                    )),
+                )
+                .expect("near flow");
+            datapath
+                .install_flow(
+                    far.id,
+                    FlowAction::Forward(ForwardRule::signalled(
+                        near.id,
+                        Some(addr_near),
+                        far_peer.ip(),
+                    )),
+                )
+                .expect("far flow");
+        };
+
+        answer(addr_early);
+        early_peer
+            .send_to(&rtp(0xEA51_0001, 1), far.local_addr)
+            .await
+            .expect("send early");
+        assert_eq!(recv(&phone_near).await.0, rtp(0xEA51_0001, 1));
+
+        answer(addr_answer);
+        answer_peer
+            .send_to(&rtp(0xF1A1_0002, 1), far.local_addr)
+            .await
+            .expect("send answer");
+        assert_eq!(recv(&phone_near).await.0, rtp(0xF1A1_0002, 1));
+        phone_near
+            .send_to(&rtp(0x0EA2_0003, 1), near.local_addr)
+            .await
+            .expect("send near");
+        assert_eq!(recv(&answer_peer).await.0, rtp(0x0EA2_0003, 1));
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, early_peer.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "near media must not go to the port the re-answer replaced"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reinstalling_an_unchanged_answer_keeps_a_natted_latch() {
+        // A hold or refresh re-INVITE reinstalls the same rules. A NATed far peer signalled an
+        // address it does not send from; its learned source must survive, or the reply falls back
+        // to the unroutable signalled address until the peer happens to send again.
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (phone_near, addr_near) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (natted_peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let (signalled_peer, addr_signalled) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
+        let install = || {
+            datapath
+                .install_flow(
+                    near.id,
+                    FlowAction::Forward(ForwardRule::signalled(
+                        far.id,
+                        Some(addr_signalled),
+                        addr_near.ip(),
+                    )),
+                )
+                .expect("near flow");
+            datapath
+                .install_flow(
+                    far.id,
+                    FlowAction::Forward(ForwardRule::symmetric(near.id, Some(addr_near))),
+                )
+                .expect("far flow");
+        };
+
+        install();
+        natted_peer
+            .send_to(&rtp(0x0A7E_0001, 1), far.local_addr)
+            .await
+            .expect("send natted");
+        assert_eq!(recv(&phone_near).await.0, rtp(0x0A7E_0001, 1));
+
+        install();
+        phone_near
+            .send_to(&rtp(0x0EA2_0002, 1), near.local_addr)
+            .await
+            .expect("send near");
+        assert_eq!(recv(&natted_peer).await.0, rtp(0x0EA2_0002, 1));
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, signalled_peer.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "an unchanged reinstall must keep replying to the learned source"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
