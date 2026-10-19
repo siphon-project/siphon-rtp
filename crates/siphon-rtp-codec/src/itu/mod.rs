@@ -17,4 +17,5 @@
 
 pub mod basic_ops;
 pub mod oper_32b;
+pub mod stl2009;
 pub mod tables;

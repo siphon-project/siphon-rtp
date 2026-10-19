@@ -1,0 +1,8 @@
+*
+!.gitignore
+!fetch.sh
+!README.md
+!remote_zip.py
+!oracle/
+!oracle/build.sh
+!oracle/basop_oracle.c
