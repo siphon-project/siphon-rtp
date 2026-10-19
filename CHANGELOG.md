@@ -5,6 +5,19 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [0.15.2] — 2026-10-19
+
+### Fixed
+
+- **A re-answer that moves the far peer no longer keeps the old latch.** When a 183 came from one
+  address and the 200 from another (with a new SSRC), the latch on the first stayed in place, so the
+  new peer's packets were dropped as a hijack and media toward it kept going to the old address:
+  one-way or no audio from the answer on. Installing a flow (UDP) and registering an SRTP bridge
+  endpoint now forget the endpoint's latch when the new gate no longer admits it, or when the rule
+  toward it moves to a different signalled destination. The new gate still applies, an unchanged
+  reinstall keeps a NATed latch, and ICE endpoints are untouched. XDP already rebuilt the kernel
+  latch on install; a test now pins that.
+
 ## [0.15.1] — 2026-10-18
 
 ### Fixed
