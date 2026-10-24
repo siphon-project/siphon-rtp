@@ -47,9 +47,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.offer_received_from,
                     call.caller_source_posture,
                     (call.near_secure, call.near_secure_key.is_some()),
-                    call.promotion_reasons
-                        .iter()
-                        .any(|reason| *reason != PromotionReason::MediaOp),
+                    // A decoded recording moves with the leg (below), so it is not a reason to
+                    // refuse; anything else on the pipeline would be stopped silently.
+                    call.promotion_reasons.iter().any(|reason| {
+                        !matches!(
+                            reason,
+                            PromotionReason::MediaOp | PromotionReason::AudioRecording
+                        )
+                    }),
                 )
             })
         else {
@@ -69,9 +74,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .is_some_and(|list| !list.is_empty())
         {
             return Err(
-                "ws-takeover-anchor-busy: a recording, WebSocket tee, SIPREC subscription, DTMF \
-                 block, echo or lawful-interception delivery runs on the engine's pipeline for this \
-                 call, and handing the leg to a bot would stop it; stop it first"
+                "ws-takeover-anchor-busy: a pcap recording, WebSocket tee, SIPREC subscription, \
+                 DTMF block, echo or lawful-interception delivery runs on the engine's pipeline for \
+                 this call, and handing the leg to a bot would stop it; stop it first"
                     .to_string(),
             );
         }
@@ -104,6 +109,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Nothing has changed yet, so a dial failure is a clean refusal on a call still anchored.
         let socket = self.dial_ws(call_id, ws_uri).await?;
 
+        // A decoded recording's sinks come off the actor before it stops — taken, not dropped, so
+        // the file stays open — and go onto the bridge once it is up: one recording across the
+        // hand-over, with only the frames in flight during the swap missing from it.
+        let recordings = self.take_pipeline_recordings(call_id).await;
         self.media.stop(call_id).await;
         // Taken, not cloned, and only now: with the actor gone the call's handle is the last one, so
         // the leg can be unwrapped rather than shared between two owners. A DTLS leg's is the copy
@@ -124,16 +133,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     Ok(leg) => Some(Arc::new(crate::ws_bridge::WsSecureLeg::keyed(leg))),
                     Err(_) => {
                         return self
-                            .reanchor(call_id, None, "the secure leg's mutex is poisoned")
+                            .reanchor_carrying(
+                                call_id,
+                                None,
+                                "the secure leg's mutex is poisoned",
+                                recordings,
+                            )
                             .await;
                     }
                 },
                 Err(still_shared) => {
                     return self
-                        .reanchor(
+                        .reanchor_carrying(
                             call_id,
                             Some(still_shared),
                             "the secure leg is still held elsewhere",
+                            recordings,
                         )
                         .await;
                 }
@@ -182,8 +197,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let key = secure
                 .and_then(|secure| secure.take_leg())
                 .map(|leg| Arc::new(std::sync::Mutex::new(leg)));
-            return self.reanchor(call_id, key, &reason).await;
+            return self
+                .reanchor_carrying(call_id, key, &reason, recordings)
+                .await;
         }
+        self.give_bridge_recordings(call_id, recordings).await;
         // Read again now the route exists: a selection landing while neither the pipeline nor the
         // bridge had a route reached neither through the sweep.
         if has_ice {
@@ -203,6 +221,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             "ws bridge attached to the engine's own leg"
         );
         Ok(())
+    }
+
+    /// [`Self::reanchor`], then put back the recordings taken off the stopped pipeline, so a takeover
+    /// that did not happen leaves a recording running exactly as it found it.
+    async fn reanchor_carrying(
+        &self,
+        call_id: &str,
+        key: Option<Arc<std::sync::Mutex<siphon_rtp_srtp::leg::SecureLeg>>>,
+        reason: &str,
+        recordings: siphon_rtp_media::bridge::taps::TakenRecordingTaps,
+    ) -> Result<(), String> {
+        let outcome = self.reanchor(call_id, key, reason).await;
+        self.give_pipeline_recordings(call_id, recordings);
+        outcome
     }
 
     /// Put a call whose pipeline was stopped for a takeover back on it, keyed with `key` when the
@@ -302,6 +334,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
         let secure = self.ws.route_state(call_id).and_then(|state| state.secure);
+        // Off the bridge before it stops, onto the anchor once it is up — the same move as an
+        // attach, the other way.
+        let recordings = self.take_bridge_recordings(call_id).await;
         self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
             .await;
         // After the stop: the bridge and its drain have been joined, so nothing crypts with it any
@@ -341,6 +376,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.far_codec = call.near_codec.clone();
             call.pipeline = PipelineKind::Media;
         }
+        self.give_pipeline_recordings(call_id, recordings);
         if let Some(key) = key {
             let leg = Arc::new(std::sync::Mutex::new(key));
             self.key_anchor(call_id, endpoint, leg)
