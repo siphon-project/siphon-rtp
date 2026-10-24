@@ -5,7 +5,16 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.15.3] — 2026-10-24
+
+### Security
+
+- **rustls-webpki 0.103.16, webpki-roots 1.0.11 and tokio 1.53.3, for RUSTSEC-2026-0382, -0381
+  and -0386.** The first two cover certificate verification on the engine's TLS paths (the `wss://`
+  bridge and tee, `play_media` over https, TURN over TLS): webpki could accept a chain through a
+  distrusted intermediate, and the bundled roots still trusted distrusted emSign intermediates.
+  tokio's `AsyncFd` constructors were unsound under I/O safety. Updated in all three lockfiles
+  (workspace, `fuzz/`, `crates/siphon-rtp-xdp/`).
 
 ### Fixed
 
