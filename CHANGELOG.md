@@ -18,6 +18,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   refuses it (`recording-needs-an-anchored-takeover`), since giving that leg back restores a relay
   with no decoded audio to carry the recording on. An idle bridge pays nothing per tick; a stereo
   recording of one costs about 15k instructions per 20 ms tick.
+- **One recording across a hand-over to a bot and back.** A decoded recording on an engine-answered
+  call used to refuse `attach_ws_bridge` (`ws-takeover-anchor-busy`), so a PBX recording from answer
+  could not hand the caller to a bot at all. The recording's sinks now move with the leg: off the
+  pipeline before it stops and onto the bot's bridge, across a re-point to another bot, and back on
+  a detach. The call is one file and one `recording_finished` whoever has the leg; only the frames
+  in flight during each swap are missing. A takeover that does not happen leaves the recording
+  running. A pcap recording, which copies wire bytes on the pipeline, still refuses the hand-over.
 
 ### Changed
 

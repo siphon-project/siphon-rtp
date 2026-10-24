@@ -1606,6 +1606,133 @@ async fn ws_bridge_attach_repoint_detach_does_not_leak() {
     gate.assert_no_leak();
 }
 
+/// One decoded recording carried across every hand-over a call can make: answered by the engine,
+/// recorded, handed to a bot, re-pointed to a second, handed back, stopped, deleted. The recording's
+/// sinks move between the pipeline and two bridge sessions without ever being dropped, so this is
+/// where a sink stranded on a stopped actor or an aborted bridge would accumulate.
+async fn recording_handover_cycle(
+    engine: &Engine<UdpLoopbackDatapath>,
+    uri: &str,
+    dir: &str,
+    index: usize,
+) {
+    let call_id = format!("handover-soak-{index}");
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for("198.51.100.1", 40_000),
+                    profile: Default::default(),
+                },
+            )
+            .await,
+        "answer_local",
+    );
+    let started = engine
+        .handle(
+            CLIENT,
+            Command::StartRecording {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                recording_dir: Some(dir.to_string()),
+                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                direction: Some(siphon_rtp_proto::RecordingDirection::Both),
+                channels: Some(siphon_rtp_proto::RecordingChannels::Stereo),
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
+                bitrate_bps: None,
+            },
+        )
+        .await;
+    assert_ok(&started, "start_recording");
+    for what in ["attach_ws_bridge", "re-point"] {
+        assert_ok(
+            &engine
+                .handle(
+                    CLIENT,
+                    Command::AttachWsBridge {
+                        call_id: call_id.clone(),
+                        from_tag: "tag-a".into(),
+                        ws_uri: uri.to_string(),
+                        profile: None,
+                    },
+                )
+                .await,
+            what,
+        );
+    }
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::DetachWsBridge {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await,
+        "detach_ws_bridge",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::StopRecording {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    recording_id: None,
+                },
+            )
+            .await,
+        "stop_recording",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id,
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recording_carried_across_hand_overs_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let (uri, live) = tee_sink_server().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_string_lossy().into_owned();
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let mut gate = LeakGate::new("recording hand-over", 100, 40).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            recording_handover_cycle(&engine, &uri, &path, index).await;
+            index += 1;
+        }
+        drain_tee_server(&live).await;
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(engine.recording_count(), 0, "every recording finished");
+        assert_eq!(engine.ws_bridge_count(), 0, "no bridge left behind");
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// Stand up a plain caller toward an SDES callee on a shared codec: the SRTP crypto bridge.
 async fn secure_bridge_call(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) {
     assert_ok(
