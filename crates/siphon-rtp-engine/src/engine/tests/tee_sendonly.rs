@@ -97,3 +97,22 @@ async fn a_tee_on_a_call_that_answered_a_sendonly_offer_streams_it_and_sends_not
         );
     }
 }
+
+#[tokio::test]
+async fn node_info_advertises_that_answer_local_honours_the_offered_direction() {
+    // The behaviour above is the engine's, not the contract crate's, so a controller cannot require
+    // it through a dependency version; it checks this before answering a SIPREC stream locally.
+    let cluster = std::sync::Arc::new(crate::cluster::ClusterState::new(
+        "rtp-test-direction".to_string(),
+        100,
+        vec!["203.0.113.12".to_string()],
+    ));
+    let engine = Engine::new(UdpLoopbackDatapath::new()).with_cluster(cluster);
+    let CmdResult::NodeInfo { node } = engine.handle(CLIENT, Command::NodeInfo).await else {
+        panic!("expected node_info result");
+    };
+    assert!(node
+        .features
+        .iter()
+        .any(|feature| feature == "answer_local_direction"));
+}

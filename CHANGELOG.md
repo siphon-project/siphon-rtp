@@ -15,7 +15,9 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   sending idle comfort noise to a party that had said it would not receive. That is exactly one
   stream of a SIPREC session (RFC 7866 §6) answered as its own call. The answer now carries the
   complement, and a caller that offered `sendonly` or `inactive` gets no RTP; its audio is still
-  decoded, so a WebSocket tee or a recording on the call works as on any other.
+  decoded, so a WebSocket tee or a recording on the call works as on any other. `node_info`
+  advertises `answer_local_direction` so a controller can require it, since the behaviour is the
+  engine's and no version of the contract crate implies it.
 
 ## [0.15.3] — 2026-10-24
 
