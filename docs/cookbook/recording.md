@@ -23,8 +23,8 @@ Both work on plain relays and on transcoding calls. Neither works on a plain
 SRTP bridge or a WebSocket-bridged call (details below, the engine refuses
 rather than recording ciphertext).
 
-There is also a third, smaller thing: the `record_call` flag on offer/answer,
-which writes decoded WAV audio. Covered at the end.
+There is also a third, smaller thing: the `record_call` flag on the answer,
+which records one decoded WAV per party from the answer on. Covered at the end.
 
 ## Runtime pcap recording
 
@@ -185,16 +185,34 @@ call. Compare SSRCs against a capture of the call legs to confirm which leg is
 which. `query` on the call keeps counting the primary legs; the fork does not
 alter A-B media.
 
-## The `record_call` offer flag (decoded WAV)
+## The `record_call` answer flag (one WAV per party)
 
-For completeness: setting `"record_call": true` (NG `record call: yes`) with
-`record_path` (NG `recording-dir`) on the **answer** forces the call through
-the transcoding pipeline and writes each direction's *decoded* audio as mono
-WAV at the codec's native rate, `{record_path}/{call_id}-a.wav` and `-b.wav`,
-when the call ends. Because it decodes, it needs codecs the engine can decode
-and encode (unlike the pcap and SIPREC paths), and it costs a transcode
-session. Prefer `start_recording` unless you specifically want ready-to-play
-decoded audio.
+Setting `"record_call": true` (NG `record call: yes`) with `record_path` (NG
+`recording-dir`) on the **answer** forces the call through the transcoding
+pipeline and records each party's *decoded* audio as mono WAV at the codec's
+native rate: `{record_path}/{call_id}-a.wav` (the offerer) and `-b.wav` (the
+answerer). This is the shape a SIPREC recording server or a per-party
+transcription wants.
+
+Each party is an ordinary decoded recording, streamed to disk as the call runs
+(bounded memory, nothing lost if the engine is stopped hard), written as
+`{name}.partial` and renamed into place when the call ends. Each then ends
+with its own `recording_finished`, with the predictable `recording_id`
+`{call_id}-a` / `{call_id}-b`:
+
+```json
+{"event":"recording_finished","call_id":"call-7","from_tag":"tag-a","to_tag":"tag-b","recording_id":"call-7-a","path":"/var/spool/rec/call-7-a.wav","duration_ms":61240,"reason":"call_ended"}
+{"event":"recording_finished","call_id":"call-7","from_tag":"tag-a","to_tag":"tag-b","recording_id":"call-7-b","duration_ms":0,"reason":"no_audio"}
+```
+
+Exactly one event per party, so a consumer never has to guess with a timeout:
+`no_audio` means that party sent nothing and no file will appear. The streams
+carry across a re-offer and its answer (hold, resume, a codec change), so a
+call keeps one file per party however often it is renegotiated, and the
+answer to the re-offer does not need to repeat the flag. `stop_recording`
+with the id ends one party early. Because it decodes, it needs codecs the
+engine can decode and encode (unlike the pcap and SIPREC paths), and it costs
+a transcode session.
 
 ## See also
 
@@ -364,8 +382,7 @@ See [Capacity](../capacity.md#recording-to-ogg-opus) for the numbers.
 
 ### Why not the `record_call` offer flag
 
-`record_call` writes decoded WAV too, but it is set at offer/answer time rather
-than at a point in the call you choose, it needs two legs (it never reaches an
-`answer_local` call at all), it accumulates the whole call in memory and flushes
-once at teardown, and it emits no event. It stays as it was for calls recorded
-from setup; a voicemail needs the runtime form.
+`record_call` writes decoded WAV too, but it starts at the answer rather than
+at a point in the call you choose, it records one file per party rather than
+the caller alone, and it needs two legs (it never reaches an `answer_local`
+call at all). A voicemail needs the runtime form.

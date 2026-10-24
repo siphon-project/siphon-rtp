@@ -5,6 +5,33 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Changed
+
+- **`record_call` streams one file per party and reports each one.** The answer's `record_call`
+  used to keep both directions of the call in memory (~115 MB per direction for an hour at 16 kHz)
+  and write `{call}-a.wav` / `-b.wav` from the media actor's teardown with no event, so a recording
+  server watching the directory could not tell a file still being written from a party that never
+  spoke, and a file the 2 s teardown grace cut short was simply never written. Each party is now an
+  ordinary decoded recording: streamed to `{name}.partial` as the call runs, renamed into place when
+  the call ends, then reported by its own `recording_finished` with the id `{call}-a` / `{call}-b`.
+  A party that never sent audio gets `reason: no_audio` with no `path`, and no file. File names,
+  directory, format (mono WAV at each party's decoded rate) and the decode `record_call` forces are
+  unchanged. `RecordingEndReason` gains `no_audio`.
+
+### Fixed
+
+- **A decoded recording survives the answer to a re-offer.** The re-answer stood up a fresh media
+  actor, which replaced the one holding the recording's sinks, so a `start_recording` (and the
+  `record_call` streams) ended at the first re-INVITE with a short file and a `call_ended` nobody
+  asked for. Recordings are now carried onto the new path like a tee is, decoding from each leg's
+  codec as it now is and resampled into the file's rate: one file across hold, resume and codec
+  changes.
+- **Stopping one recording no longer ends another on the same call.** The userspace hold is one
+  reason per call, and the first recording to stop released it, demoting a promoted relay under
+  any other recording on it, which then ended as `call_ended`.
+
 ## [0.15.3] — 2026-10-24
 
 ### Security

@@ -1,17 +1,17 @@
 //! Runtime **decoded-audio** recording: the streaming writer behind `start_recording` with
-//! `format: "wav"` or `format: "ogg_opus"`.
+//! `format: "wav"` or `format: "ogg_opus"`, and behind the `record_call` profile flag's one file per
+//! party.
 //!
-//! # Why this exists alongside the two recorders that already did
+//! # Why this exists alongside the pcap recorder
 //!
-//! The engine had two recording mechanisms and neither is a voicemail message:
+//! `start_recording` with `format: "pcap"` writes the **raw wire packets** — any codec, undecoded,
+//! and refused outright on a secure or WebSocket-bridged call. An audit artefact, and not a
+//! voicemail message.
 //!
-//! * `start_recording` with `format: "pcap"` writes the **raw wire packets** — any codec, undecoded,
-//!   and refused outright on a secure or WebSocket-bridged call. An audit artefact.
-//! * The offer/answer `record_call` flag writes decoded WAV per direction, but it is set at
-//!   offer/answer time (not at a point in the call a controller chooses), it needs two legs, and it
-//!   accumulates the whole call in memory ([`siphon_rtp_media::wav::WavRecorder`]'s `Vec<i16>`),
-//!   flushing once at teardown with no event. A one-hour 16 kHz call is ~115 MB per direction, and a
-//!   hard task abort loses the file entirely.
+//! (`record_call` used to be a third mechanism: it accumulated the whole call in memory and wrote
+//! each direction once at teardown with no event, ~115 MB per direction for a one-hour 16 kHz call,
+//! lost entirely to a hard task abort. Each party is now an ordinary recording through this
+//! writer.)
 //!
 //! A voicemail box needs neither: it answers locally, plays a greeting and a beep, and then records
 //! the *caller* from a point the controller picks, into decoded audio it will email, transcribe and

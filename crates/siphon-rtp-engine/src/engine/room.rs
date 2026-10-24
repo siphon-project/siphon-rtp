@@ -1115,6 +1115,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 path,
                 ingress_legs: Vec::new(),
                 egress_legs: Vec::new(),
+                retap: None,
                 room: Some(conference_id.to_string()),
                 bridge_taps: Vec::new(),
                 source_reason,
