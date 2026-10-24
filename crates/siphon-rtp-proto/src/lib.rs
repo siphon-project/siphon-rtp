@@ -1180,6 +1180,10 @@ pub enum RecordingEndReason {
     /// The recording aborted — a write failed, or the file could not be finalized. The file may be
     /// truncated or missing; its `duration_ms` is what had been written when the error hit.
     Error,
+    /// The recorded party never sent audio, so no file was kept: `path` is absent and `duration_ms`
+    /// is 0. Reported by a `record_call` stream (one per party), so a consumer waiting on every
+    /// party's file can tell "this one will never come" from "still being written".
+    NoAudio,
 }
 
 /// How many times a [`Command::PlayMedia`] plays its source.

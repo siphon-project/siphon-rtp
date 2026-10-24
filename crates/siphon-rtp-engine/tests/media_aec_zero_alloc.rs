@@ -81,7 +81,6 @@ fn ulaw_call(aec: bool) -> MediaCall {
         egress_payload_type: 0,
         telephone_event_in: None,
         telephone_event_out: None,
-        recorder: None,
         ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         noise_suppression: false,
         echo: siphon_rtp_engine::media_pipeline::EchoProfile {
@@ -99,7 +98,6 @@ fn ulaw_call(aec: bool) -> MediaCall {
         make(1, A_ADDR, 2, B_ADDR, 0xB000_0001),
         make(2, B_ADDR, 1, A_ADDR, 0xA000_0001),
         true,
-        None,
     )
 }
 

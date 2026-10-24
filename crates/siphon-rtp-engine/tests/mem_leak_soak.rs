@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_engine::{ClientId, Engine};
-use siphon_rtp_proto::{CmdResult, Command, ConferenceRole, WsTeeDirection};
+use siphon_rtp_proto::{CmdResult, Command, ConferenceRole, ProfileFlags, WsTeeDirection};
 
 /// The soak drives the engine as a single control client.
 const CLIENT: ClientId = ClientId(1);
@@ -1057,6 +1057,114 @@ async fn record_start_stop_does_not_leak() {
         gate.sample().await;
     }
     gate.assert_no_leak();
+}
+
+/// One `record_call` call: answered with the profile flag (two streamed recordings, one per party),
+/// renegotiated (which pins, re-installs and re-taps both), then deleted. Nothing is sent, so each
+/// stream ends as `no_audio` and removes its own file — the directory must stay empty too.
+async fn record_call_cycle(engine: &Engine<UdpLoopbackDatapath>, dir: &str, index: usize) {
+    let call_id = format!("soak-record-call-{index}");
+    let offer = |sdp: String| Command::Offer {
+        call_id: call_id.clone(),
+        from_tag: "tag-a".into(),
+        sdp,
+        profile: Default::default(),
+    };
+    let answer = |profile: ProfileFlags| Command::Answer {
+        call_id: call_id.clone(),
+        from_tag: "tag-a".into(),
+        to_tag: "tag-b".into(),
+        sdp: sdp_for("203.0.113.1", 41_000),
+        profile,
+    };
+    assert_ok(
+        &engine
+            .handle(CLIENT, offer(sdp_for("198.51.100.1", 40_000)))
+            .await,
+        "offer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                answer(ProfileFlags {
+                    record_call: true,
+                    record_path: Some(dir.to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        "answer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for("198.51.100.1", 40_000),
+                    profile: Default::default(),
+                },
+            )
+            .await,
+        "re-offer",
+    );
+    assert_ok(
+        &engine.handle(CLIENT, answer(Default::default())).await,
+        "re-answer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_call_streams_do_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_string_lossy().into_owned();
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let mut gate = LeakGate::new("record_call", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            record_call_cycle(&engine, &path, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(
+            engine.recording_count(),
+            0,
+            "every record_call stream finished with its call"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "no file outlives a stream with no audio: {left:?}"
+    );
 }
 
 /// One overlay-playback cycle on a fresh call: promote by starting four tone overlays (the slot
