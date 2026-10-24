@@ -943,6 +943,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.near_telephone_event = telephone_event;
         }
         let mut answer_sdp = sdp::force_answer_codec(&rewritten.sdp, &chosen, telephone_event);
+        answer_sdp = sdp::answer_direction(&answer_sdp, info.direction);
 
         if let Some(ws_uri) = profile.ws_uri.clone() {
             return self
@@ -1000,6 +1001,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // Kept so `offer_far` can grow the call into a relay behind this very answer.
             call.keep_local_answer(sdp, &answer_sdp);
         }
+        self.withhold_egress_unless_received(call_id, info.direction);
 
         let ice_running = ice_config.is_some();
         if let Some(config) = ice_config {
@@ -1153,4 +1155,19 @@ pub(super) fn resolve_offerer_security(
         );
     };
     Ok(WsTakeoverSecurity::Sdes { peer_key })
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Send nothing to a caller that offered `sendonly` or `inactive` (RFC 3264 §6.1): not the
+    /// single-leg pipeline's idle comfort noise, not a prompt. One stream of a SIPREC session is the
+    /// common case (RFC 7866 §6: the SRC sends, the SRS only receives). The decode, and so a tee or a
+    /// recording on the call, runs as usual; only the send is withheld.
+    fn withhold_egress_unless_received(&self, call_id: &str, offered: sdp::MediaDirection) {
+        if !offered.receives() {
+            self.media.control(
+                call_id,
+                crate::media_pipeline::MediaControl::PeerReceives(false),
+            );
+        }
+    }
 }

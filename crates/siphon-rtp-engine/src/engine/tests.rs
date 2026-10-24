@@ -50,6 +50,7 @@ mod conference_dial_out;
 mod conference_seat;
 mod offer_far;
 mod ogg_opus_recording;
+mod tee_sendonly;
 mod tee_undecodable;
 mod transcode_offer;
 
