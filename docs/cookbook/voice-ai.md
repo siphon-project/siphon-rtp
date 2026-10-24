@@ -386,10 +386,11 @@ To check rather than guess, watch the engine:
 RUST_LOG=siphon_rtp::media=debug
 ```
 
-Each leg logs the delay it located and the window it found it in once the estimate locks, and warns
-when the lock is too flat to be an echo — which is what "the echo path is longer than the window"
-looks like from inside. Fleet-wide, alert on
-`siphon_rtp_aec_delay_weak_locks_total / siphon_rtp_aec_delay_locks_total`; see
+Each leg logs the delay it located and the window it found it in once the estimate locks. A leg
+whose search finds nothing commits nothing and passes the uplink through uncancelled, and logs that
+it found no echo. That is correct on a line with none, and it is also what "the echo path is longer
+than the window" looks like from inside. Fleet-wide, compare
+`siphon_rtp_aec_delay_weak_locks_total` against `siphon_rtp_aec_delay_locks_total`; see
 [Observability](../observability.md#is-the-echo-canceller-actually-cancelling-anything).
 
 Widening is not free, so it is a knob rather than a bigger default. The estimation FFT is sized at

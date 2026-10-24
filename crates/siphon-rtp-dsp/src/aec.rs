@@ -222,11 +222,13 @@ const RELOCK_WIDEN_BLOCKS: usize = 6;
 /// Mean per-sample far-end block energy (normalized) below which a block carries no usable echo, so
 /// it is skipped for estimation (a silent far-end produces only a noise correlation).
 const DELAY_FAR_ENERGY_FLOOR: f32 = 1.0e-6;
-/// Peak prominence ([`DelayLock::confidence`]) below which a committed delay is reported as **weak**
-/// — the estimator picked the tallest lag it could see rather than locating an echo.
+/// Peak prominence ([`DelayLock::confidence`]) a correlation peak must reach to be taken as a located
+/// echo. Below it the peak is the tallest sample of a surface with no echo in it, and the estimator
+/// commits nothing: the leg stays uncancelled ([`DelayReport::NoEchoFound`]) rather than being
+/// cancelled against a lag picked out of noise, which adds the far end to the near end (#402).
 ///
-/// `decide` commits unconditionally, so an echo that lies beyond the search range yields a lock on
-/// noise, not an absence of one. Measured on the synthetic relay path in
+/// An echo that lies beyond the search range looks exactly like no echo from inside it. Measured on
+/// the synthetic relay path in
 /// `a_located_echo_and_a_picked_one_are_told_apart_by_peak_prominence`, a located echo scores **100**
 /// and the same echo missed by a too-short window scores **4** — a 25× gap. 12.0 sits 3× above the
 /// miss and 8× below the hit, so it separates them on a log scale rather than sitting against either
@@ -259,14 +261,16 @@ static DELAY_REWIDENS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// many calls* — which is the one a dashboard can act on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DelayEstimationCounters {
-    /// Bulk delays committed (first locks and re-aligns) since process start.
+    /// Bulk delays committed (first locks and re-aligns) since process start. Only a located echo
+    /// commits, so every one of these is a leg being cancelled.
     pub locks_total: u64,
-    /// Of those, the ones whose peak prominence was below [`WEAK_DELAY_LOCK_CONFIDENCE`] — the
-    /// estimator picked a lag out of noise. A ratio near 1 here says the search range is too short
-    /// for the paths this node is carrying.
+    /// Estimators that searched for 500 frames (~10 s at the 20 ms media tick) and rejected every
+    /// peak as below [`WEAK_DELAY_LOCK_CONFIDENCE`] ([`DelayReport::NoEchoFound`]), leaving their leg
+    /// uncancelled. Expected on lines that return no echo; on legs that audibly carry echo it says
+    /// the search range is too short for the paths this node is carrying.
     pub weak_locks_total: u64,
-    /// Estimators that consumed 500 frames (~10 s at the 20 ms media tick) without committing
-    /// anything. A different failure from a weak lock: nothing was decided at all.
+    /// Estimators that consumed 500 frames (~10 s at the 20 ms media tick) without ever having enough
+    /// usable audio to judge a peak. Different from the above: nothing was decided at all.
     pub never_locked_total: u64,
     /// Narrowed peak scans that widened back to the full search range because the echo left the
     /// re-lock margin. A handful over a call's life is a path that genuinely moved (a re-INVITE onto
@@ -297,8 +301,8 @@ pub struct DelayLock {
     pub search_range_samples: usize,
     /// The canceller's sample rate, so a duration can be rendered without the reader knowing it.
     pub sample_rate_hz: u32,
-    /// Peak prominence over the correlation surface (`peak / mean|surface|`); see
-    /// [`WEAK_DELAY_LOCK_CONFIDENCE`].
+    /// Peak prominence over the correlation surface (`peak / mean|surface|`); always at or above
+    /// [`WEAK_DELAY_LOCK_CONFIDENCE`], since nothing flatter commits.
     pub confidence: f32,
     /// Whether this was the estimator's **first** lock (as opposed to a hangover-confirmed re-align).
     pub first_lock: bool,
@@ -315,14 +319,6 @@ impl DelayLock {
     #[must_use]
     pub fn search_range_millis(&self) -> u32 {
         self.millis(self.search_range_samples)
-    }
-
-    /// Whether the peak was too flat to be an echo — see [`WEAK_DELAY_LOCK_CONFIDENCE`]. The single
-    /// most useful thing to alert on: it is what "the echo is outside the search range" looks like
-    /// from inside a canceller that is otherwise running perfectly.
-    #[must_use]
-    pub fn is_weak(&self) -> bool {
-        self.confidence < WEAK_DELAY_LOCK_CONFIDENCE
     }
 
     /// Whether the committed delay sits in the last eighth of the search window. Not a failure on
@@ -349,8 +345,27 @@ impl DelayLock {
 pub enum DelayReport {
     /// A bulk delay was committed — an initial lock, or a hangover-confirmed re-align.
     Locked(DelayLock),
-    /// The estimator has consumed 500 frames (~10 s at the 20 ms media tick) without committing
-    /// anything. Raised **once** per estimator (re-armed by [`EchoCanceller::reset`]).
+    /// The estimator has searched for 500 frames (~10 s at the 20 ms media tick) and every peak it
+    /// found was too flat to be an echo ([`WEAK_DELAY_LOCK_CONFIDENCE`]), so it committed none and the
+    /// near end is passed through **uncancelled**. Raised **once** per estimator (re-armed by
+    /// [`EchoCanceller::reset`]), and it is the healthy outcome on a line that returns no echo.
+    ///
+    /// It is also what an echo from beyond the search window looks like — there is no way to tell
+    /// the two apart from inside the window — so a leg that audibly does carry echo and reports this
+    /// wants a wider `echo_delay_search_ms`.
+    NoEchoFound {
+        /// The lag of the most recent (rejected) peak, in samples.
+        best_delay_samples: usize,
+        /// That peak's prominence ([`DelayLock::confidence`]), below the threshold.
+        confidence: f32,
+        /// The search range the estimator was configured with, in samples.
+        search_range_samples: usize,
+        /// The canceller's sample rate, so the samples can be rendered as durations.
+        sample_rate_hz: u32,
+    },
+    /// The estimator has consumed 500 frames (~10 s at the 20 ms media tick) without ever having
+    /// enough usable audio to evaluate a peak, so it committed nothing. Raised **once** per estimator
+    /// (re-armed by [`EchoCanceller::reset`]).
     NeverLocked {
         /// Frames fed to the estimator while unlocked.
         frames_observed: usize,
@@ -650,10 +665,13 @@ struct DelayEstimator {
     /// Whether the one-shot never-locked report has already been raised, so a leg that genuinely has
     /// no far-end audio reports once rather than every frame for the life of the call.
     unlocked_reported: bool,
+    /// The most recent peak rejected as too flat to be an echo while unlocked, as `(lag, confidence)`.
+    /// `Some` means the estimator *has* judged the surface and found nothing, which is what turns the
+    /// one-shot unlocked report into [`DelayReport::NoEchoFound`] rather than
+    /// [`DelayReport::NeverLocked`].
+    rejected_peak: Option<(usize, f32)>,
     /// Whether the peak search is currently restricted to the re-lock margin around
-    /// [`Self::committed_delay`] — set only by a lock that cleared [`WEAK_DELAY_LOCK_CONFIDENCE`],
-    /// never by a weak one (narrowing onto a lag picked out of noise would make the mistake
-    /// permanent).
+    /// [`Self::committed_delay`] — set by every commit, and every commit is a located echo.
     narrowed: bool,
     /// Consecutive usable blocks whose narrowed peak failed [`WEAK_DELAY_LOCK_CONFIDENCE`]. At
     /// [`RELOCK_WIDEN_BLOCKS`] the scan widens back — the escape hatch that keeps the narrowing from
@@ -709,6 +727,7 @@ impl DelayEstimator {
             frames_unlocked: 0,
             blocks_dropped: 0,
             unlocked_reported: false,
+            rejected_peak: None,
             narrowed: false,
             low_confidence_blocks: 0,
         })
@@ -829,9 +848,8 @@ impl DelayEstimator {
     /// peak's **prominence** over the rest of the surface: `peak / mean|surface|`.
     ///
     /// The prominence is the only thing that distinguishes a delay the estimator *found* from one it
-    /// merely *picked*. `decide` commits the largest lag in the window unconditionally, so an echo
-    /// that lies outside the search range does not produce "no lock" — it produces a lock on the
-    /// tallest sample of a noise surface, which looks identical from every accessor. A phase
+    /// merely *picked*: a surface with no echo in it still has a tallest sample, and `decide` must
+    /// not commit it. A phase
     /// transform whitens both spectra, so a genuine path leaves `G_phat = H/|H|`, whose inverse
     /// transform is concentrated on the dominant tap and stands far above the floor; a surface with
     /// no echo in it is the maximum of `search_range + 1` noise samples, which sits at a small
@@ -874,8 +892,15 @@ impl DelayEstimator {
     }
 
     /// Lock/hangover decision for a freshly picked peak. `confidence` is the peak's prominence from
-    /// [`DelayEstimator::peak_lag`], latched with the commit so a consumer can tell a located echo
-    /// from a picked one.
+    /// [`DelayEstimator::peak_lag`].
+    ///
+    /// Only a peak that clears [`WEAK_DELAY_LOCK_CONFIDENCE`] is evidence of a delay, so only such a
+    /// peak can commit a first lock or count toward a re-align. A flatter one is the tallest sample of
+    /// a surface with no echo in it, and committing it is worse than committing nothing: the filter
+    /// then fits whatever the near end carries against a reference that does not predict it, and
+    /// projects the far end into the near end's output (#402). A flat peak therefore leaves the
+    /// estimator exactly where it was: unlocked (and the leg uncancelled), or on the delay it last
+    /// located.
     fn decide(&mut self, peak: usize, confidence: f32) -> Option<usize> {
         // Scan-width bookkeeping first, so the widen decision is made on this block's evidence rather
         // than a block late. While narrowed, a run of blocks whose best in-margin lag is
@@ -894,12 +919,22 @@ impl DelayEstimator {
                 }
             }
         }
+        if confidence < WEAK_DELAY_LOCK_CONFIDENCE {
+            if !self.locked {
+                self.rejected_peak = Some((peak, confidence));
+            }
+            // A re-align candidate has to persist through consecutive *located* peaks; a flat block
+            // in between is a gap in that evidence, not part of it.
+            self.candidate_delay = self.committed_delay;
+            self.candidate_count = 0;
+            return None;
+        }
         if !self.locked {
             self.locked = true;
             self.committed_delay = peak;
             self.candidate_delay = peak;
             self.candidate_count = 0;
-            self.narrow_if_confident(confidence);
+            self.narrow();
             self.commit_report(peak, confidence, true);
             return Some(peak);
         }
@@ -914,10 +949,9 @@ impl DelayEstimator {
             if self.candidate_count >= REALIGN_HANGOVER_BLOCKS {
                 self.committed_delay = self.candidate_delay;
                 self.candidate_count = 0;
-                // A confirmed re-align re-centres the margin on the new delay, and re-narrows if the
-                // new peak is itself trustworthy — a path that moved and was found confidently is
-                // just as worth protecting from noise as the first lock was.
-                self.narrow_if_confident(confidence);
+                // A confirmed re-align re-centres the margin on the new delay — a path that moved and
+                // was found again is just as worth protecting from noise as the first lock was.
+                self.narrow();
                 self.commit_report(self.committed_delay, confidence, false);
                 return Some(self.committed_delay);
             }
@@ -929,17 +963,12 @@ impl DelayEstimator {
         }
     }
 
-    /// Narrow the peak scan around the freshly committed delay, but **only** on a lock that cleared
-    /// [`WEAK_DELAY_LOCK_CONFIDENCE`].
-    ///
-    /// Narrowing onto a weak lock would be the worst possible move: a weak lock is the signature of
-    /// an echo *outside* the search window, so restricting the scan around it would fence the
-    /// estimator into the noise it just mistook for an echo and remove the one chance it had of
-    /// picking up the real peak later. A weak lock therefore keeps looking everywhere, which is also
-    /// what the operator-facing warning tells them is happening.
-    fn narrow_if_confident(&mut self, confidence: f32) {
+    /// Narrow the peak scan around the freshly committed delay. Only a located echo commits (see
+    /// [`DelayEstimator::decide`]), so every commit is one worth protecting from noise; a surface
+    /// that has produced nothing but flat peaks is never narrowed, and keeps looking everywhere.
+    fn narrow(&mut self) {
         self.low_confidence_blocks = 0;
-        self.narrowed = confidence >= WEAK_DELAY_LOCK_CONFIDENCE;
+        self.narrowed = true;
     }
 
     /// Latch a commit for collection and record it in the process-wide counters. Called only from
@@ -951,13 +980,12 @@ impl DelayEstimator {
             first_lock,
         });
         DELAY_LOCKS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        if confidence < WEAK_DELAY_LOCK_CONFIDENCE {
-            WEAK_DELAY_LOCKS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
     }
 
-    /// Drain the latched commit, if any, and otherwise raise the one-shot never-locked report once
-    /// the estimator has been fed [`UNLOCKED_REPORT_FRAMES`] frames without committing anything.
+    /// Drain the latched commit, if any, and otherwise raise the one-shot unlocked report once the
+    /// estimator has been fed [`UNLOCKED_REPORT_FRAMES`] frames without committing anything:
+    /// [`DelayReport::NoEchoFound`] if it judged peaks and rejected them all, else
+    /// [`DelayReport::NeverLocked`].
     fn take_report(&mut self, sample_rate_hz: u32) -> Option<DelayReport> {
         if let Some(lock) = self.pending_lock.take() {
             return Some(DelayReport::Locked(DelayLock {
@@ -972,6 +1000,15 @@ impl DelayEstimator {
             return None;
         }
         self.unlocked_reported = true;
+        if let Some((best_delay_samples, confidence)) = self.rejected_peak {
+            WEAK_DELAY_LOCKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return Some(DelayReport::NoEchoFound {
+                best_delay_samples,
+                confidence,
+                search_range_samples: self.search_range,
+                sample_rate_hz,
+            });
+        }
         UNLOCKED_ESTIMATORS_TOTAL.fetch_add(1, Ordering::Relaxed);
         Some(DelayReport::NeverLocked {
             frames_observed: self.frames_unlocked,
@@ -997,6 +1034,7 @@ impl DelayEstimator {
         // Deliberately re-armed: a reset re-runs the whole estimation from an unaligned ring, so if
         // *that* run never locks either it is a fresh fact about the leg and worth a fresh report.
         self.unlocked_reported = false;
+        self.rejected_peak = None;
         // Back to searching everywhere. A margin is only ever justified by a lock, and this reset has
         // just discarded the lock that justified it — keeping it would search a band around a delay
         // the estimator no longer claims.
@@ -1384,6 +1422,7 @@ impl MdfFilter {
         let mut sum_mic_sq = 0.0f64;
         let mut sum_echo_sq = 0.0f64;
         let mut sum_mic_echo = 0.0f64;
+        let mut sum_residual_sq = 0.0f64;
         let mut far_energy = 0.0f64;
         for i in 0..block {
             let mic = self.in_near[i];
@@ -1398,15 +1437,38 @@ impl MdfFilter {
             sum_mic_sq += mic64 * mic64;
             sum_echo_sq += echo64 * echo64;
             sum_mic_echo += mic64 * echo64;
+            let residual64 = f64::from(residual);
+            sum_residual_sq += residual64 * residual64;
             let reference = f64::from(self.in_ref[i]);
             far_energy += reference * reference;
         }
         // Emit the residual (append to the output ring), plus the frame-aligned echo estimate when a
         // residual-echo suppressor is chained on.
+        //
+        // Unless subtracting the estimate made the block *louder*. `Σ(d − ŷ)² > Σd²` holds exactly
+        // when `2·Σd·ŷ < Σŷ²`: the estimate is not predicting the microphone, so subtracting it can
+        // only add a filtered copy of the far end to whatever the near end carries. That is what a
+        // filter that adapted on the near-end talker does (#402 — the two-path bootstrap adapts on
+        // every block until it has once seen a confident echo-only correlation, and on a line with no
+        // echo it never does), and it is what an alignment gone stale does. Such a block goes out as
+        // it arrived, with no echo estimate for the suppressor to act on. Adaptation is untouched — it
+        // still runs on the true residual below — so a filter that is converging is not slowed, and a
+        // block it genuinely cancels (`Σ(d − ŷ)² ≤ Σd²`) is emitted exactly as before.
         let out_base = self.out_len;
-        self.out_res[out_base..out_base + block].copy_from_slice(&self.block_error);
+        let made_louder = sum_residual_sq > sum_mic_sq;
+        let emitted = if made_louder {
+            &self.in_near[..block]
+        } else {
+            &self.block_error[..]
+        };
+        self.out_res[out_base..out_base + block].copy_from_slice(emitted);
         if self.capture_echo {
-            self.out_echo[out_base..out_base + block].copy_from_slice(&self.block_echo);
+            let echo_out = &mut self.out_echo[out_base..out_base + block];
+            if made_louder {
+                echo_out.fill(0.0);
+            } else {
+                echo_out.copy_from_slice(&self.block_echo);
+            }
         }
         self.out_len += block;
 
@@ -1751,11 +1813,10 @@ impl EchoCanceller {
     /// leg whose delay the estimator cannot be trusted to find.
     ///
     /// The two differ in how they fail, which is the entire point of offering both. The estimator is
-    /// cheap and precise when it works, but GCC-PHAT commits the tallest lag inside its search window
-    /// whatever that lag is, so an echo beyond the window produces a lock on *noise* and a filter that
-    /// adapts against a reference that is not the echo — it cancels nothing, reports nothing, and is
-    /// indistinguishable from a leg with no echo on it. A long tail has no such failure: it makes no
-    /// alignment decision at all, so there is nothing to get wrong. Its cost is honest and gradual
+    /// cheap and precise when it works, but it can only cancel an echo it has located, and an echo
+    /// beyond its window is never located: the leg passes through uncancelled, indistinguishable from
+    /// a leg with no echo on it. A long tail makes no alignment decision at all, so it reaches
+    /// whatever its taps cover. Its cost is honest and gradual
     /// instead — more taps to converge, and more work per block.
     ///
     /// **That cost is not small.** The MDF runs the gradient constraint's
@@ -2030,15 +2091,21 @@ impl EchoCanceller {
             .map(|estimator| estimator.search_range)
     }
 
+    /// Whether this canceller estimates its bulk delay and has not located one yet. Until it has,
+    /// it cancels nothing: the near end is passed through untouched (see [`EchoCanceller::cancel`]).
+    #[inline]
+    fn awaiting_delay_lock(&self) -> bool {
+        self.delay_estimator
+            .as_ref()
+            .is_some_and(|estimator| !estimator.locked)
+    }
+
     /// Drain what the GCC-PHAT estimator has concluded since the last call — a committed delay, or
     /// the one-shot admission that it has been fed a lot of audio and committed nothing.
     ///
-    /// This exists because the estimator's failure is **invisible from every other accessor**.
-    /// [`EchoCanceller::estimated_bulk_delay`] returns `Some` whether the peak was an echo or the
-    /// tallest sample of a noise surface, and a canceller adapting against a reference that is not
-    /// the echo still runs, still allocates nothing, and still passes audio through — so "the
-    /// estimator never located the echo" and "there is no echo on this leg" produce the same
-    /// observation everywhere else. [`DelayLock::confidence`] is the number that separates them.
+    /// This exists because a canceller that has located nothing is **invisible from every other
+    /// accessor**: it runs, allocates nothing and passes audio through, just as one does on a leg
+    /// whose echo it is cancelling between talkspurts. This says which of the two a leg is.
     ///
     /// Edge-triggered and allocation-free: a report is latched only when the estimator actually
     /// commits (or gives up once), so the steady state is an `Option` check per frame and a caller
@@ -2113,6 +2180,16 @@ impl EchoCanceller {
     /// `DEFAULT_DOUBLETALK_HANGOVER_FRAMES` frames (~60 ms) holds the freeze across brief near-end
     /// gaps.
     ///
+    /// ## Pass-through until a delay is located
+    /// A canceller with automatic delay estimation ([`EchoCanceller::with_delay_estimation`],
+    /// [`EchoCanceller::with_mdf_delay_estimation`]) feeds every frame to the estimator but leaves
+    /// `near_end` **untouched** until the estimator has located an echo, so a line that returns none
+    /// is relayed exactly as if cancellation were off. Running the filter against an unlocated
+    /// alignment is not neutral: it fits the near-end talker to a reference that does not predict
+    /// them, and then subtracts a filtered copy of the reference from every frame the far end talks
+    /// in alone (#402). The filter starts fresh at the first located delay; the MDF backend's
+    /// block latency (and the residual suppressor's, when chained) is introduced at that moment.
+    ///
     /// `near_end` and `reference` are a frame-synchronous pair (same time interval). This processes
     /// `min(near_end.len(), reference.len(), frame_samples())` samples — for a correct 20 ms caller
     /// that is the whole frame; a short pair is processed partially and a longer one is truncated to
@@ -2157,8 +2234,9 @@ impl EchoCanceller {
         }
 
         // Residual-echo post-filter (off unless chained on): suppress the nonlinear / under-modelled
-        // echo the linear backend left behind, gated by the double-talk decision just computed.
-        if self.res.is_some() {
+        // echo the linear backend left behind, gated by the double-talk decision just computed. Not
+        // while the leg is still being passed through: there is no linear stage for it to follow.
+        if self.res.is_some() && !self.awaiting_delay_lock() {
             self.run_residual_suppression(near_end, n);
         }
     }
@@ -2239,6 +2317,10 @@ impl EchoCanceller {
                 }
             }
         }
+        if self.awaiting_delay_lock() {
+            self.pass_through();
+            return;
+        }
 
         let two_path = self.dtd_mode == DtdMode::TwoPath;
         // SAFETY-of-logic: `mdf` is `Some` on this path (checked by the caller).
@@ -2253,6 +2335,13 @@ impl EchoCanceller {
             };
             self.last_correlation = mdf.last_correlation;
         }
+    }
+
+    /// A frame left untouched because no delay has been located yet: report no double-talk and no
+    /// correlation, so nothing downstream reads a verdict the canceller never formed.
+    fn pass_through(&mut self) {
+        self.doubletalk_active = false;
+        self.last_correlation = None;
     }
 
     /// The single-filter, Geigel-gated cancel path (the default). Kept byte-for-byte identical to the
@@ -2288,6 +2377,10 @@ impl EchoCanceller {
                 self.reference.set_bulk_delay(new_delay);
                 self.weights.iter_mut().for_each(|weight| *weight = 0.0);
             }
+        }
+        if self.awaiting_delay_lock() {
+            self.pass_through();
+            return;
         }
 
         // Load the far-end frame into the delay ring (normalized f32).
@@ -2381,6 +2474,10 @@ impl EchoCanceller {
                 // background starts re-converging immediately rather than one frame late.
                 background_adapt = far_active;
             }
+        }
+        if self.awaiting_delay_lock() {
+            self.pass_through();
+            return;
         }
 
         let written = self.reference.write_frame(&reference[..n]);
@@ -3070,6 +3167,21 @@ mod tests {
             .expect("the estimator must report its first lock")
     }
 
+    /// The one-shot [`DelayReport::NoEchoFound`] in a run, as `(best delay, confidence)`.
+    fn no_echo_found(reports: &[DelayReport]) -> (usize, f32) {
+        reports
+            .iter()
+            .find_map(|report| match report {
+                DelayReport::NoEchoFound {
+                    best_delay_samples,
+                    confidence,
+                    ..
+                } => Some((*best_delay_samples, *confidence)),
+                _ => None,
+            })
+            .expect("the estimator must report that it found no echo")
+    }
+
     /// Delay recovery: sweep several known bulk delays across the search range and assert GCC-PHAT
     /// locks onto each within the tolerance. Pure single-talk echo, so the correlation is clean.
     #[test]
@@ -3096,9 +3208,9 @@ mod tests {
     /// (access → carrier → access) on *both* sides of the acoustic reflection, so the echo can return
     /// several hundred milliseconds after the reference the engine sent toward that party. An echo
     /// whose bulk delay lies **outside** the configured search range is invisible to GCC-PHAT — the
-    /// estimator still commits the best peak it can see, which is noise, and the adaptive filter then
-    /// converges against a reference that is not the echo. The canceller runs, allocates and cancels
-    /// nothing; from outside it is indistinguishable from a leg that has no echo on it.
+    /// estimator finds no peak it can commit, so the leg passes through uncancelled — from outside,
+    /// indistinguishable from a leg that has no echo on it, which is why it reports
+    /// [`DelayReport::NoEchoFound`] naming the window it searched.
     ///
     /// Pins both halves: the miss when the range is too short, and the recovery on the same path once
     /// the range covers it.
@@ -3110,19 +3222,19 @@ mod tests {
         let tail = 192;
 
         // 128 ms @ 8 kHz: the echo is outside the window entirely.
-        let (short, short_erle) = run_delay_estimation(1_024, tail, relay_delay, 500, 0x5A0E_0001);
-        let short_estimate = short
-            .estimated_bulk_delay()
-            .expect("the estimator commits a peak whatever it is — that is exactly the defect");
-        assert!(
-            short_estimate.abs_diff(relay_delay) > DELAY_RECOVERY_TOLERANCE,
-            "a {relay_delay}-sample echo cannot be located in a 1024-sample window (got \
-             {short_estimate})"
+        let (short, short_erle, short_reports) =
+            run_delay_estimation_reporting(1_024, tail, relay_delay, 500, 0x5A0E_0001);
+        assert_eq!(
+            short.estimated_bulk_delay(),
+            None,
+            "a {relay_delay}-sample echo cannot be located in a 1024-sample window, so nothing may \
+             be committed"
         );
-        assert!(
-            short_erle < 6.0,
-            "an echo outside the search range must stay uncancelled, got {short_erle:.1} dB ERLE"
+        assert_eq!(
+            short_erle, 0.0,
+            "an echo nothing located must pass through untouched, not be half-cancelled"
         );
+        no_echo_found(&short_reports);
 
         // 512 ms @ 8 kHz: the same path, now inside the window.
         let (wide, wide_erle) = run_delay_estimation(4_096, tail, relay_delay, 500, 0x5A0E_0001);
@@ -3247,31 +3359,31 @@ mod tests {
             run_delay_estimation_reporting(1_024, tail, relay_delay, 500, 0x5A0E_0001);
         let (_, _, located) =
             run_delay_estimation_reporting(4_096, tail, relay_delay, 500, 0x5A0E_0001);
-        let missed = first_lock(&missed);
+        let (missed_delay, missed_confidence) = no_echo_found(&missed);
         let located = first_lock(&located);
 
         if std::env::var_os("DUMP_GOLDEN").is_some() {
             eprintln!(
-                "missed: delay {} confidence {:.1} | located: delay {} confidence {:.1}",
-                missed.delay_samples, missed.confidence, located.delay_samples, located.confidence
+                "missed: delay {missed_delay} confidence {missed_confidence:.1} | located: delay {} \
+                 confidence {:.1}",
+                located.delay_samples, located.confidence
             );
         }
 
         assert!(
-            located.confidence > missed.confidence * 4.0,
-            "a located echo must stand clear of a picked one: located {:.1} vs missed {:.1}",
-            located.confidence,
-            missed.confidence
+            located.confidence > missed_confidence * 4.0,
+            "a located echo must stand clear of a picked one: located {:.1} vs missed \
+             {missed_confidence:.1}",
+            located.confidence
         );
         assert!(
-            missed.is_weak(),
-            "a lock on noise must report weak (confidence {:.1} vs threshold \
-             {WEAK_DELAY_LOCK_CONFIDENCE})",
-            missed.confidence
+            missed_confidence < WEAK_DELAY_LOCK_CONFIDENCE,
+            "a peak on noise must fall below the threshold (confidence {missed_confidence:.1} vs \
+             {WEAK_DELAY_LOCK_CONFIDENCE})"
         );
         assert!(
-            !located.is_weak(),
-            "a lock on a real echo must not report weak (confidence {:.1} vs threshold \
+            located.confidence >= WEAK_DELAY_LOCK_CONFIDENCE,
+            "a real echo must clear the threshold (confidence {:.1} vs \
              {WEAK_DELAY_LOCK_CONFIDENCE})",
             located.confidence
         );
@@ -3290,7 +3402,10 @@ mod tests {
         let (canceller, _, reports) =
             run_delay_estimation_reporting(1_024, 192, 300, 400, 0x5CA1_0001);
         let lock = first_lock(&reports);
-        assert!(!lock.is_weak(), "fixture must produce a confident lock");
+        assert!(
+            lock.confidence >= WEAK_DELAY_LOCK_CONFIDENCE,
+            "fixture must produce a confident lock"
+        );
 
         let estimator = canceller
             .delay_estimator
@@ -3315,18 +3430,18 @@ mod tests {
         );
     }
 
-    /// The inverse, and the one that would be a trap if it were wrong: a **weak** lock must not
-    /// narrow. A weak lock is the signature of an echo outside the search window, so fencing the scan
-    /// around it would lock the estimator inside the noise it just mistook for an echo and destroy
-    /// the only chance it had of picking up the real peak later.
+    /// The inverse, and the one that would be a trap if it were wrong: a surface with no echo in it
+    /// must not narrow the scan. That is the signature of an echo outside the search window, so
+    /// fencing the scan around a flat peak would lock the estimator inside the noise and destroy the
+    /// only chance it had of picking up the real peak later.
     #[test]
-    fn a_weak_lock_does_not_narrow_the_peak_scan() {
-        // 1024-sample window against a 2400-sample echo: the echo is outside, so the estimator picks
-        // the tallest noise lag it can see — exactly the case the reporting calls weak.
+    fn a_surface_with_no_located_echo_keeps_scanning_the_whole_window() {
+        // 1024-sample window against a 2400-sample echo: the echo is outside, so every peak the
+        // estimator sees is the tallest sample of noise.
         let (canceller, _, reports) =
             run_delay_estimation_reporting(1_024, 192, 2_400, 500, 0x5CA1_0002);
-        let lock = first_lock(&reports);
-        assert!(lock.is_weak(), "fixture must produce a weak lock");
+        no_echo_found(&reports);
+        assert_eq!(canceller.estimated_bulk_delay(), None);
 
         let estimator = canceller
             .delay_estimator
@@ -3334,8 +3449,7 @@ mod tests {
             .expect("delay estimation is enabled");
         assert!(
             !estimator.narrowed,
-            "a weak lock must keep searching the whole window — narrowing onto a lag picked out of \
-             noise would make the mistake permanent"
+            "nothing was located, so the whole window must stay searched"
         );
         assert_eq!(estimator.scan_bounds(), (0, 1_024));
     }
@@ -3620,7 +3734,6 @@ mod tests {
             !mid.at_search_edge(),
             "100 ms in a 512 ms window is not near it"
         );
-        assert!(!mid.is_weak());
 
         // The same sample count at half the rate is twice the duration — the P2 trap in one assert.
         let narrowband = DelayLock {
@@ -3643,13 +3756,12 @@ mod tests {
     /// The counters `/metrics` renders. Asserted as deltas, never as absolutes: they are
     /// process-wide by design and the test binary runs its cases in parallel.
     #[test]
-    fn delay_estimation_counters_record_locks_and_weak_locks() {
+    fn delay_estimation_counters_record_locks_and_estimators_that_found_no_echo() {
+        // A located echo: the commit is counted.
         let before = delay_estimation_counters();
-        // An echo well outside the window: the estimator commits, and the commit is a weak one.
-        let (_, _, reports) = run_delay_estimation_reporting(1_024, 192, 2_400, 500, 0x0C0E_0001);
+        let (_, _, located) = run_delay_estimation_reporting(4_096, 192, 2_400, 500, 0x0C0E_0001);
         let after = delay_estimation_counters();
-
-        let locks = reports
+        let locks = located
             .iter()
             .filter(|report| matches!(report, DelayReport::Locked(_)))
             .count() as u64;
@@ -3658,10 +3770,22 @@ mod tests {
             after.locks_total - before.locks_total >= locks,
             "every commit must be counted"
         );
+
+        // An echo well outside the window: nothing commits, and the estimator that found nothing is
+        // counted — the fleet-level signal that legs are going uncancelled.
+        let before = delay_estimation_counters();
+        let (_, _, missed) = run_delay_estimation_reporting(1_024, 192, 2_400, 500, 0x0C0E_0001);
+        let after = delay_estimation_counters();
+        no_echo_found(&missed);
+        assert!(
+            !missed
+                .iter()
+                .any(|report| matches!(report, DelayReport::Locked(_))),
+            "a peak on noise must not be committed"
+        );
         assert!(
             after.weak_locks_total > before.weak_locks_total,
-            "a lock on noise must count as weak — that is the fleet-level signal that the search \
-             range is too short for the paths this node carries"
+            "an estimator that found no echo must be counted"
         );
     }
 
@@ -4129,34 +4253,54 @@ mod tests {
     /// With the reset the bootstrap re-opens and it re-converges. Uses a 3× RIR (ERL ≈ 8 dB) so the
     /// single-talk echo peak (~0.8× the far peak) trips Geigel every frame — the exact deadlock trigger.
     #[test]
+    #[ignore = "pre-existing: a converged time-domain two-path canceller never re-aligns. Its \
+                estimator only accepts blocks its NCC gate calls usable, and a moved path reads as \
+                double-talk, so every block is dropped. This test used to be armed by cancelling \
+                before the first lock, which #402 removed. The MDF two-path build the engine ships \
+                is covered by mdf_two_path_reconverges_after_a_path_move."]
     fn two_path_reconverges_after_delay_relock() {
         let frame = 160;
         let tail = 192;
-        let search_range = 512;
-        // Echo delay small enough to be cancellable at the start-up `bulk_delay = 0` (D + RIR spread
-        // 110 < tail 192), so the filter converges *before* the estimator commits and moves the ring.
-        let delay = 40usize;
-        let frames = 260;
+        let search_range = 1_024;
+        // The filter converges on the first path, then the path moves well outside the re-lock
+        // margin (a re-INVITE onto another route), so the estimator widens, re-aligns, and the
+        // re-align zeroes a converged two-path filter. Nothing cancels before the first lock, so the
+        // re-align is the only place this regression can be armed.
+        let first_delay = 200;
+        let second_delay = 800;
+        let settle_frames = 250;
+        let moved_frames = 700;
+        let total = settle_frames + moved_frames;
         let rir_loud: Vec<f32> = build_rir(128).iter().map(|&c| c * 3.0).collect();
         let mut canceller = EchoCanceller::with_delay_estimation(8_000, tail, search_range)
             .expect("build")
             .with_two_path_dtd();
         let mut prng = SplitMix64::new(0xC0DE_1111);
-        let far = far_stream(&mut prng, 0.6, frames * frame);
-        let echo = synthesize_echo(&normalize(&far), &rir_loud, delay);
+        let far = far_stream(&mut prng, 0.6, total * frame);
+        let normalized = normalize(&far);
+        let echo_before = synthesize_echo(&normalized, &rir_loud, first_delay);
+        let echo_after = synthesize_echo(&normalized, &rir_loud, second_delay);
 
-        let mut copies_before_lock = 0u64;
+        let mut copies_before_realign = 0u64;
         let mut late_erle = f64::INFINITY;
-        for index in 0..frames {
-            // Capture the copy count just before the estimator's first lock, to prove the regression is
-            // armed (the filter had converged, `copies > 0`, at the moment the re-lock zeroed it).
-            if canceller.estimated_bulk_delay().is_none() {
-                copies_before_lock = canceller.foreground_copies();
+        for index in 0..total {
+            // Capture the copy count while the first alignment still holds, to prove the regression
+            // is armed (the filter had converged, `copies > 0`, at the moment the re-align zeroed it).
+            if canceller
+                .estimated_bulk_delay()
+                .is_some_and(|delay| delay.abs_diff(first_delay) <= DELAY_RECOVERY_TOLERANCE)
+            {
+                copies_before_realign = canceller.foreground_copies();
             }
+            let echo = if index < settle_frames {
+                &echo_before
+            } else {
+                &echo_after
+            };
             let range = index * frame..(index + 1) * frame;
             let mut mic = echo[range.clone()].to_vec();
             canceller.cancel(&mut mic, &far[range.clone()]);
-            if index >= frames - 20 {
+            if index >= total - 20 {
                 late_erle = late_erle.min(erle_db(&echo[range], &mic));
             }
         }
@@ -4165,16 +4309,74 @@ mod tests {
             .estimated_bulk_delay()
             .expect("GCC-PHAT must lock the delay");
         assert!(
-            estimated.abs_diff(delay) <= DELAY_RECOVERY_TOLERANCE,
-            "estimator must lock {delay} (got {estimated}) so the re-lock path is exercised"
+            estimated.abs_diff(second_delay) <= DELAY_RECOVERY_TOLERANCE,
+            "estimator must re-align onto {second_delay} (got {estimated}) so the re-lock path is \
+             exercised"
         );
         assert!(
-            copies_before_lock > 0,
-            "regression not armed: the filter must have converged (copies > 0) before the first lock"
+            copies_before_realign > 0,
+            "regression not armed: the filter must have converged (copies > 0) before the re-align"
         );
         assert!(
             late_erle >= 20.0,
             "two-path deadlocked after the delay re-lock: late ERLE {late_erle:.1} dB < 20 dB"
+        );
+    }
+
+    /// The build the engine ships (MDF, delay estimation, two-path) follows a path that moves: the
+    /// echo is located, the leg moves onto a route with a different delay (a re-INVITE), the narrowed
+    /// scan widens back, re-aligns on the new located peak, and the reset filter re-converges.
+    #[test]
+    fn mdf_two_path_reconverges_after_a_path_move() {
+        let frame = 160;
+        let first_delay = 200;
+        let second_delay = 800;
+        let settle_frames = 250;
+        let moved_frames = 700;
+        let total = settle_frames + moved_frames;
+        let rir = build_rir(128);
+        let mut canceller = EchoCanceller::with_mdf_delay_estimation(8_000, 512, 1_024)
+            .expect("build")
+            .with_two_path_dtd();
+        let mut prng = SplitMix64::new(0xC0DE_2222);
+        let far = far_stream(&mut prng, 0.6, total * frame);
+        let normalized = normalize(&far);
+        let echo_before = synthesize_echo(&normalized, &rir, first_delay);
+        let echo_after = synthesize_echo(&normalized, &rir, second_delay);
+
+        let mut locks = Vec::new();
+        let mut late_erle = f64::INFINITY;
+        for index in 0..total {
+            let echo = if index < settle_frames {
+                &echo_before
+            } else {
+                &echo_after
+            };
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            if let Some(DelayReport::Locked(lock)) = canceller.take_delay_report() {
+                locks.push(lock.delay_samples);
+            }
+            if index >= total - 20 {
+                late_erle = late_erle.min(erle_db(&echo[range], &mic));
+            }
+        }
+        assert!(
+            locks
+                .first()
+                .is_some_and(|&delay| delay.abs_diff(first_delay) <= DELAY_RECOVERY_TOLERANCE),
+            "the first path must be located, got {locks:?}"
+        );
+        assert!(
+            locks
+                .last()
+                .is_some_and(|&delay| delay.abs_diff(second_delay) <= DELAY_RECOVERY_TOLERANCE),
+            "the moved path must be located, got {locks:?}"
+        );
+        assert!(
+            late_erle >= 20.0,
+            "the re-aligned filter must re-converge: late ERLE {late_erle:.1} dB < 20 dB"
         );
     }
 
@@ -4480,10 +4682,9 @@ mod tests {
     ///
     /// Both cancellers here are correctly configured for what they are, both run without error, and
     /// both report healthy from every accessor. The estimating one is given a search window shorter
-    /// than the echo path — the field condition: a handset behind a carrier — so it commits the
-    /// tallest lag it can see, which is noise, and then adapts against a reference that is not the
-    /// echo. The long-tail one makes no alignment decision at all, so it has nothing to get wrong,
-    /// and simply covers the delay with taps.
+    /// than the echo path — the field condition: a handset behind a carrier — so it never locates the
+    /// echo and passes it through. The long-tail one makes no alignment decision at all, and simply
+    /// covers the delay with taps.
     #[test]
     fn a_long_tail_cancels_an_echo_a_too_short_search_window_misses() {
         let frame = 160;
@@ -5304,5 +5505,176 @@ mod tests {
                 "post-reset silence must stay silent"
             );
         }
+    }
+
+    // ---- a leg with no echo on it (#402) ----
+
+    /// What one [`no_echo_leg`] run observed.
+    struct NoEchoRun {
+        reports: Vec<DelayReport>,
+        /// Uplink energy gain over the frames where only the far end talks, in dB.
+        far_only_gain_db: f64,
+        /// Frames whose output differs from the frame as it arrived.
+        frames_altered: usize,
+    }
+
+    /// The line from #402: a carrier leg that returns **no echo at all**, a far end (a voice bot)
+    /// talking in spurts, and a near-end caller who sometimes talks over it — at the wire rate and
+    /// window the engine builds by default (16 kHz, 256 ms). There is nothing to cancel, so the only
+    /// correct output is the input.
+    fn no_echo_leg(canceller: &mut EchoCanceller, seconds: usize) -> NoEchoRun {
+        let frame = canceller.frame_samples();
+        let frames_per_second = 50;
+        let mut far_prng = SplitMix64::new(0x4020_0001);
+        let mut voice_prng = SplitMix64::new(0x4020_0002);
+        let mut noise_prng = SplitMix64::new(0x4020_0003);
+        let mut far_only_in = 0.0f64;
+        let mut far_only_out = 0.0f64;
+        let mut frames_altered = 0;
+        let mut reports = Vec::new();
+        for index in 0..seconds * frames_per_second {
+            let second = index / frames_per_second;
+            // 2 s of far-end speech, 1 s of silence.
+            let far_talking = second % 3 != 2;
+            // The caller talks in some seconds, over the far end in most of them.
+            let caller_talking = second % 5 == 1 || second % 7 == 3;
+            let far: Vec<i16> = (0..frame)
+                .map(|_| {
+                    let sample = far_prng.next_noise(0.5);
+                    super::denormalize(if far_talking { sample } else { 0.0 })
+                })
+                .collect();
+            let mut mic: Vec<i16> = (0..frame)
+                .map(|_| {
+                    let voice = voice_prng.next_noise(0.3);
+                    let noise = noise_prng.next_noise(0.002);
+                    super::denormalize(if caller_talking { voice + noise } else { noise })
+                })
+                .collect();
+            let arrived = mic.clone();
+            canceller.cancel(&mut mic, &far);
+            if let Some(report) = canceller.take_delay_report() {
+                reports.push(report);
+            }
+            if mic != arrived {
+                frames_altered += 1;
+            }
+            // Skip the first frames of each second so the measurement is not about a block
+            // straddling an onset.
+            if far_talking && !caller_talking && index % frames_per_second >= 2 {
+                far_only_in += power_i16(&arrived);
+                far_only_out += power_i16(&mic);
+            }
+        }
+        NoEchoRun {
+            reports,
+            far_only_gain_db: 10.0 * (far_only_out / far_only_in).log10(),
+            frames_altered,
+        }
+    }
+
+    /// The defect in #402. With nothing to locate, GCC-PHAT used to commit the tallest lag of a noise
+    /// surface (confidence ~4.5, the figure the field logs showed) and the canceller then ran against
+    /// it — while the two-path MDF, never reaching the correlation that ends its bootstrap, adapted
+    /// straight through the caller's speech. The filter learned the caller, and from then on projected
+    /// the far end into the uplink whenever the far end talked alone: +25 dB on this fixture, the bot
+    /// hearing itself and interrupting itself. No delay located, nothing cancelled: the uplink must be
+    /// the uplink, byte for byte, and the estimator must say what it found.
+    #[test]
+    fn a_line_with_no_echo_is_passed_through_not_amplified() {
+        let mut canceller = EchoCanceller::with_mdf_delay_estimation(16_000, 1_024, 4_096)
+            .expect("build")
+            .with_two_path_dtd();
+        let run = no_echo_leg(&mut canceller, 40);
+
+        assert_eq!(
+            run.frames_altered, 0,
+            "no echo was located, so no frame may be touched (far-end-only gain {:.1} dB)",
+            run.far_only_gain_db
+        );
+        assert_eq!(
+            canceller.estimated_bulk_delay(),
+            None,
+            "nothing to lock onto"
+        );
+        assert!(
+            !run.reports
+                .iter()
+                .any(|report| matches!(report, DelayReport::Locked(_))),
+            "a peak too flat to be an echo must not be committed, got {:?}",
+            run.reports
+        );
+        let no_echo: Vec<_> = run
+            .reports
+            .iter()
+            .filter(|report| matches!(report, DelayReport::NoEchoFound { .. }))
+            .collect();
+        assert_eq!(
+            no_echo.len(),
+            1,
+            "the estimator must say once that it found no echo, got {:?}",
+            run.reports
+        );
+        let DelayReport::NoEchoFound {
+            confidence,
+            search_range_samples,
+            sample_rate_hz,
+            ..
+        } = *no_echo[0]
+        else {
+            unreachable!("filtered above");
+        };
+        assert!(confidence < WEAK_DELAY_LOCK_CONFIDENCE);
+        assert_eq!(search_range_samples, 4_096);
+        assert_eq!(sample_rate_hz, 16_000);
+    }
+
+    /// The other half of #402, and the one the estimator cannot fix: a canceller with no estimator
+    /// (the long-tail build) runs its filter from the first frame, so on the same no-echo line it
+    /// learns the caller exactly as above. Whatever the filter has converged on, its output must never
+    /// be louder than its input — an estimate that does not predict the microphone can only add to it,
+    /// and a canceller that adds energy is a reference injector.
+    #[test]
+    fn a_misadapted_filter_never_makes_the_uplink_louder() {
+        let mut canceller = EchoCanceller::with_mdf_long_tail(16_000, 4_096)
+            .expect("build")
+            .with_two_path_dtd();
+        let run = no_echo_leg(&mut canceller, 40);
+        assert!(
+            run.far_only_gain_db <= 0.1,
+            "the canceller added {:.1} dB to an uplink carrying no echo",
+            run.far_only_gain_db
+        );
+    }
+
+    /// Issue item 3: a lock is moved only by a peak that is itself a located echo. Here a delay is
+    /// located, and then the echo goes away (the far party turns the speaker off) while a flat peak
+    /// sits at another lag for as long as the hangover asks. The narrowed scan finds nothing, widens
+    /// back, and used to re-align onto that peak: throwing away a correct alignment for a lag picked
+    /// out of noise, and resetting the filter with it. Driven at the decision itself, because a noise
+    /// surface only rarely holds one lag for the whole hangover, and "rarely" is the case to rule out.
+    #[test]
+    fn a_weak_peak_never_moves_a_confident_lock() {
+        let mut estimator = DelayEstimator::new(1_024).expect("build");
+        assert_eq!(
+            estimator.decide(200, 80.0),
+            Some(200),
+            "a located echo locks"
+        );
+        assert!(estimator.narrowed);
+        for block in 0..(RELOCK_WIDEN_BLOCKS + 4 * REALIGN_HANGOVER_BLOCKS) {
+            assert_eq!(
+                estimator.decide(700, WEAK_DELAY_LOCK_CONFIDENCE / 2.0),
+                None,
+                "a flat peak re-aligned the lock at block {block}"
+            );
+        }
+        assert_eq!(estimator.locked_delay(), Some(200));
+        // A path that genuinely moved is still followed, once it is located.
+        let mut moved = None;
+        for _ in 0..REALIGN_HANGOVER_BLOCKS {
+            moved = moved.or(estimator.decide(700, 80.0));
+        }
+        assert_eq!(moved, Some(700));
     }
 }

@@ -1236,7 +1236,13 @@ mod tests {
     /// reorder, i.e. every non-barge-in tick is byte-identical. The uplink, downlink and control
     /// counts below are unchanged, so the turn signalling itself is untouched on this vector (its
     /// uplink is independent noise, not an echo, so the veto correctly never fires).
-    const GOLDEN_DIGEST: u64 = 5_785_162_948_345_231_211;
+    ///
+    /// Moved again for #402. That independent noise means the canceller never locates an echo here,
+    /// and it now passes the uplink through until it does, where it used to adapt against an
+    /// unlocated alignment and rewrite every frame. The new digest is the bridge with no canceller at
+    /// all, byte for byte, which `a_canceller_that_located_no_echo_leaves_the_bridge_byte_identical`
+    /// asserts directly; the counts are unchanged.
+    const GOLDEN_DIGEST: u64 = 15_085_887_301_078_152_745;
     const GOLDEN_UPLINK_FRAMES: usize = 60;
     /// 57, not 60: three downlink frames were dropped by the local barge-in on a speech edge.
     const GOLDEN_DOWNLINK_FRAMES: usize = 57;
@@ -1257,7 +1263,7 @@ mod tests {
     /// produced: the uplink L16 bytes, the rendered downlink RTP packets, and the control messages.
     /// Every audio stage is engaged (VAD + barge-in, noise suppression, echo cancellation) so the
     /// digest covers the whole per-tick order of operations, not just the framing.
-    fn takeover_golden_digest() -> (u64, usize, usize, usize) {
+    fn takeover_golden_digest(echo_cancellation: bool) -> (u64, usize, usize, usize) {
         const FRAMES: usize = 60;
         const N: usize = 160; // 20 ms @ 8 kHz
 
@@ -1278,11 +1284,11 @@ mod tests {
         )
         .with_noise_suppression(true)
         .with_vad(1_000_000, 3, true)
-        .with_echo_canceller(Some(
+        .with_echo_canceller(echo_cancellation.then(|| {
             EchoCanceller::with_mdf_delay_estimation(8_000, 512, 1_024)
                 .expect("build 8k aec")
-                .with_two_path_dtd(),
-        ));
+                .with_two_path_dtd()
+        }));
 
         // Committed pseudo-random uplink and downlink streams (fixed seeds — never `rand`/wall clock).
         let mut uplink_rng = Lcg(0x1234_5678);
@@ -1332,7 +1338,10 @@ mod tests {
     /// the shipped voice-AI bridge, not a refactor.
     #[test]
     fn takeover_path_matches_the_pre_refactor_golden_vector() {
-        let (digest, uplink_frames, downlink_frames, controls) = takeover_golden_digest();
+        let (digest, uplink_frames, downlink_frames, controls) = takeover_golden_digest(true);
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!("takeover golden digest {digest}");
+        }
         assert_eq!(uplink_frames, GOLDEN_UPLINK_FRAMES, "uplink frame count");
         assert_eq!(
             downlink_frames, GOLDEN_DOWNLINK_FRAMES,
@@ -1343,6 +1352,15 @@ mod tests {
             digest, GOLDEN_DIGEST,
             "takeover-mode output changed — this is a behaviour change, not a refactor"
         );
+    }
+
+    /// The golden fixture's uplink and downlink are independent streams, so it carries no echo at
+    /// all, and a canceller that has located none must leave the bridge exactly as if it were not
+    /// there: same uplink bytes, same rendered downlink, same turn signals. Before #402 it ran
+    /// against an unlocated alignment and rewrote the uplink.
+    #[test]
+    fn a_canceller_that_located_no_echo_leaves_the_bridge_byte_identical() {
+        assert_eq!(takeover_golden_digest(true), takeover_golden_digest(false));
     }
 
     /// A bridge session over an `L16/<rate>` leg at `a=ptime:<ptime_ms>` — the cheapest fixture for a

@@ -494,11 +494,10 @@ pub(crate) fn build_echo_canceller(
 /// The long-tail posture: no bulk-delay estimator, and a filter long enough to span the whole echo
 /// path (`ProfileFlags::echo_long_tail`).
 ///
-/// Chosen per leg because it trades cost for a failure mode. The estimating build is cheap and exact
-/// when it works, but it commits the tallest lag inside its window whatever that lag is, so an echo
-/// beyond the window leaves it adapting against a reference that is not the echo — cancelling nothing
-/// while every accessor reads healthy. This build makes no alignment decision, so it has nothing to
-/// get wrong; it simply pays for the taps, at roughly 6× the per-frame cost at 512 ms and 11.5× at
+/// Chosen per leg because it trades cost for reach. The estimating build is cheap and exact when it
+/// works, but it can only cancel an echo it has located, so an echo beyond its window is never
+/// found and the leg passes through uncancelled. This build makes no alignment decision, so it reaches
+/// whatever the tail covers; it simply pays for the taps, at roughly 6× the per-frame cost at 512 ms and 11.5× at
 /// the 1 s ceiling, because the MDF runs its gradient constraint's transform pair inside the
 /// per-partition loop. At the worst corner — 1 s at a 16 kHz rate — that is ~463 µs per 20 ms frame,
 /// about 2.3 % of a core per call, so a box sizing concurrency for long-tail legs should measure
