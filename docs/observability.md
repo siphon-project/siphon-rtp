@@ -38,9 +38,9 @@ per connection, never blocking the engine. Routes: `GET /metrics`, `GET /healthz
 | `siphon_rtp_ws_dial_tls_failures_total` | counter | WebSocket dials whose TLS handshake was refused |
 | `siphon_rtp_ws_dial_handshake_failures_total` | counter | WebSocket dials answered with something other than an upgrade |
 | `siphon_rtp_ws_bridges` | gauge | live WebSocket **takeover** bridges (the WS server is one party's far side) |
-| `siphon_rtp_aec_delay_locks_total` | counter | echo-canceller bulk delays committed by GCC-PHAT (first locks and re-aligns) |
-| `siphon_rtp_aec_delay_weak_locks_total` | counter | of those, the ones whose correlation peak was too flat to be an echo |
-| `siphon_rtp_aec_delay_never_locked_total` | counter | echo cancellers that consumed ~10 s of audio without committing any delay |
+| `siphon_rtp_aec_delay_locks_total` | counter | echo-canceller bulk delays committed by GCC-PHAT (first locks and re-aligns); only a located echo commits |
+| `siphon_rtp_aec_delay_weak_locks_total` | counter | echo cancellers that searched ~10 s and found only peaks too flat to be an echo, so committed nothing and passed the leg through uncancelled |
+| `siphon_rtp_aec_delay_never_locked_total` | counter | echo cancellers that consumed ~10 s of audio without ever having enough usable audio to evaluate a peak |
 | `siphon_rtp_aec_delay_rewidens_total` | counter | narrowed delay scans that widened back because the echo left the re-lock margin |
 | `siphon_rtp_jemalloc_allocated_bytes` | gauge | live heap (jemalloc `stats.allocated`) |
 
@@ -51,27 +51,31 @@ the leak signal — in production alert on `rate(siphon_rtp_jemalloc_allocated_b
 
 ### Is the echo canceller actually cancelling anything?
 
-`echo_cancellation` has no success signal of its own, and its failure mode is that it does not look
-like one. The canceller's delay estimator commits the tallest correlation peak inside its search
-window whatever that peak is, so an echo that returns from further away than the window reaches does
-not produce an error, a missing canceller, or an absent estimate — it produces a **lock on noise**,
-after which the adaptive filter converges against a reference that is not the echo. The leg keeps
-relaying, the counters stay healthy, and nothing distinguishes "the estimator never found the echo"
-from "there is no echo on this leg". On a voice-AI bridge the only visible symptom is in a different
-component entirely: an agent that hears its own voice come back, and barges in on itself.
+`echo_cancellation` has no success signal of its own. The canceller's delay estimator looks for
+the correlation peak an echo leaves inside its search window, and only a peak that stands well clear
+of the correlation floor is committed. Until one is, the canceller does nothing: the near end passes
+through byte for byte, exactly as if cancellation were off. A canceller running against a lag picked
+out of noise is worse than none. Its filter fits whatever the near end carries, and on a voice-AI
+bridge that projects the agent's own voice into the uplink.
 
-The ratio is the signal:
+So a leg that never finds a peak is not a failure in itself. A line that returns no echo (a
+four-wire carrier leg, most digital endpoints) is supposed to end up there. But an echo that returns
+from further away than the window reaches looks exactly the same from inside the window. The ratio
+says which one a node is mostly seeing:
 
 ```promql
-rate(siphon_rtp_aec_delay_weak_locks_total[15m]) / rate(siphon_rtp_aec_delay_locks_total[15m])
+rate(siphon_rtp_aec_delay_weak_locks_total[15m])
+  / (rate(siphon_rtp_aec_delay_weak_locks_total[15m]) + rate(siphon_rtp_aec_delay_locks_total[15m]))
 ```
 
-Near zero is healthy. Near one means the estimator is picking lags out of noise on most legs, which
-almost always means the echo path is longer than the configured search window — raise
+`weak_locks_total` counts cancellers that searched for ~10 s and found nothing they could commit.
+A high ratio on legs that audibly carry echo (callers hear themselves, an agent barges in on its own
+voice) means the echo path is longer than the configured search window, so raise
 `echo_delay_search_ms` on those legs (see the [control reference](control/json.md) and the
-[voice-AI cookbook](cookbook/voice-ai.md)). `siphon_rtp_aec_delay_never_locked_total` is the
-different failure where nothing was committed at all: a far end that never played enough audio to
-correlate against, or a leg whose every block was unusable.
+[voice-AI cookbook](cookbook/voice-ai.md)). A high ratio on legs without audible echo is just those
+legs. `siphon_rtp_aec_delay_never_locked_total` is the different case where nothing could be judged
+at all: a far end that never played enough audio to correlate against, or a leg whose every block
+was unusable.
 
 Once a leg's echo is located confidently the estimator narrows its peak search to a margin around
 that delay, so lags the echo demonstrably does not occupy stop competing for the pick. It widens back

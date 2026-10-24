@@ -1,13 +1,12 @@
 //! Reporting what the echo canceller's bulk-delay estimator concluded.
 //!
-//! The echo canceller's failure mode is that it does not have one. GCC-PHAT commits the tallest lag
-//! inside its search window whatever that lag is, so an echo that returns from further away than the
-//! window reaches does not produce an error, a missing canceller, or an absent estimate — it
-//! produces a *lock on noise*, after which the adaptive filter converges against a reference that is
-//! not the echo. The canceller keeps running, keeps allocating nothing, and keeps passing audio
-//! through, so from the outside "the estimator never located the echo" and "there is no echo on this
-//! leg" are the same observation. On a voice-AI bridge the only visible symptom is several layers
-//! away and in a different component: an agent that hears itself and barges in on its own voice.
+//! The echo canceller only cancels against a delay it has located: GCC-PHAT commits a peak only when
+//! it stands clear of the correlation floor, and until one does the leg passes through uncancelled.
+//! From the outside that makes "there is no echo on this leg" and "the echo returns from beyond the
+//! search window" the same observation, so the estimator's own account of what it found is the only
+//! way to tell a leg that is being cancelled from one that is not. On a voice-AI bridge the visible
+//! symptom of a window that is too short is several layers away and in a different component: an
+//! agent that hears itself and barges in on its own voice.
 //!
 //! [`EchoCanceller::take_delay_report`](siphon_rtp_dsp::EchoCanceller::take_delay_report) is the
 //! estimator's own account of what it decided; this module turns one into a log line. It lives here
@@ -19,7 +18,7 @@
 //! Edge-triggered at the source: the report is `None` on every frame that did not commit anything,
 //! so calling this per frame from the media path costs an `Option` check.
 
-use siphon_rtp_dsp::{DelayLock, DelayReport, WEAK_DELAY_LOCK_CONFIDENCE};
+use siphon_rtp_dsp::{DelayReport, WEAK_DELAY_LOCK_CONFIDENCE};
 
 /// Log one [`DelayReport`] against the call and leg it belongs to.
 ///
@@ -31,17 +30,16 @@ use siphon_rtp_dsp::{DelayLock, DelayReport, WEAK_DELAY_LOCK_CONFIDENCE};
 /// * `debug` for a normal lock. The two numbers that matter are the delay *and* the window it was
 ///   found in — either alone is unactionable, because the question is always whether the window has
 ///   room left.
-/// * `warn` for a lock too flat to be an echo ([`DelayLock::is_weak`]). This is the one that would
-///   have turned a day of eliminating the VAD, the prompt, the model and the codec into a first
-///   look at the right component, so it names the remedy.
-/// * `warn` for an estimator that never committed anything at all, distinguishing a far end that
-///   never spoke from one whose audio was never usable.
+/// * `debug` for a search that found no echo ([`DelayReport::NoEchoFound`]). That is the healthy
+///   outcome on a line that returns none, so it must not warn on every such call; it still names
+///   the window, which is the remedy when the leg does audibly carry echo.
+/// * `warn` for an estimator that never had enough usable audio to judge anything, distinguishing
+///   a far end that never spoke from one whose audio was never usable.
 ///
 /// A re-align that stays confident is `debug` like any other lock; a path that genuinely moves
 /// (a re-INVITE onto a different carrier route) is normal operation, not a fault.
 pub fn log_delay_report(report: &DelayReport, call_id: &str, leg: &str) {
     match report {
-        DelayReport::Locked(lock) if lock.is_weak() => log_weak_lock(lock, call_id, leg),
         DelayReport::Locked(lock) => {
             tracing::debug!(
                 target: "siphon_rtp::media",
@@ -72,6 +70,26 @@ pub fn log_delay_report(report: &DelayReport, call_id: &str, leg: &str) {
                 );
             }
         }
+        DelayReport::NoEchoFound {
+            best_delay_samples,
+            confidence,
+            search_range_samples,
+            sample_rate_hz,
+        } => {
+            let rate = u64::from((*sample_rate_hz).max(1));
+            tracing::debug!(
+                target: "siphon_rtp::media",
+                %call_id,
+                leg,
+                search_range_ms = *search_range_samples as u64 * 1000 / rate,
+                best_delay_ms = *best_delay_samples as u64 * 1000 / rate,
+                confidence,
+                threshold = WEAK_DELAY_LOCK_CONFIDENCE,
+                "echo canceller found no echo within its search window, so this leg passes through \
+                 uncancelled. Expected on a line that returns no echo; if this leg audibly does carry \
+                 echo, its path is longer than the window and echo_delay_search_ms needs raising"
+            );
+        }
         DelayReport::NeverLocked {
             frames_observed,
             blocks_dropped,
@@ -97,53 +115,10 @@ pub fn log_delay_report(report: &DelayReport, call_id: &str, leg: &str) {
     }
 }
 
-/// The weak-lock warning — split out only because it is the one line in this module an operator is
-/// most likely to read, and it earns its own explanation.
-fn log_weak_lock(lock: &DelayLock, call_id: &str, leg: &str) {
-    tracing::warn!(
-        target: "siphon_rtp::media",
-        %call_id,
-        leg,
-        delay_ms = lock.delay_millis(),
-        delay_samples = lock.delay_samples,
-        search_range_ms = lock.search_range_millis(),
-        confidence = lock.confidence,
-        threshold = WEAK_DELAY_LOCK_CONFIDENCE,
-        first_lock = lock.first_lock,
-        "echo canceller locked on a weak peak: the correlation is too flat to be an echo, so this \
-         leg is almost certainly being cancelled against the wrong alignment and the echo is \
-         passing through. The usual cause is an echo path longer than the search window — a party \
-         behind a carrier or a mobile network puts the whole media path in the loop twice — so \
-         raise echo_delay_search_ms on these legs. The alternative reading is that there is genuinely \
-         no echo on this leg, in which case the canceller has nothing to do and this is harmless"
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A lock is classified by its confidence, and only by that — the delay itself carries no
-    /// information about whether it is real. Pins the two sides of the threshold, since the whole
-    /// reporting surface is worthless if it cannot tell them apart.
-    #[test]
-    fn a_flat_peak_is_weak_and_a_sharp_one_is_not() {
-        let sharp = DelayLock {
-            delay_samples: 2_400,
-            search_range_samples: 4_096,
-            sample_rate_hz: 8_000,
-            confidence: 100.0,
-            first_lock: true,
-        };
-        let flat = DelayLock {
-            confidence: 4.0,
-            ..sharp
-        };
-        assert!(!sharp.is_weak());
-        assert!(flat.is_weak());
-        // Same delay, opposite verdicts: confidence is doing all the work.
-        assert_eq!(sharp.delay_samples, flat.delay_samples);
-    }
+    use siphon_rtp_dsp::DelayLock;
 
     /// The logging entry point must accept every variant without panicking, including with no
     /// subscriber installed (which is how it runs under the zero-allocation gates).
@@ -158,14 +133,27 @@ mod tests {
         };
         log_delay_report(&DelayReport::Locked(lock), "call-1", "a");
         log_delay_report(
-            &DelayReport::Locked(DelayLock {
-                confidence: 2.0,
-                ..lock
-            }),
+            &DelayReport::NoEchoFound {
+                best_delay_samples: 3_721,
+                confidence: 4.5,
+                search_range_samples: 4_096,
+                sample_rate_hz: 16_000,
+            },
             "call-1",
             "a",
         );
-        // In the last eighth of the window: the margin warning, not the weak one.
+        // A zero rate must not divide by zero while rendering the durations.
+        log_delay_report(
+            &DelayReport::NoEchoFound {
+                best_delay_samples: 1,
+                confidence: 1.0,
+                search_range_samples: 1,
+                sample_rate_hz: 0,
+            },
+            "call-1",
+            "a",
+        );
+        // In the last eighth of the window: the margin warning.
         log_delay_report(
             &DelayReport::Locked(DelayLock {
                 delay_samples: 4_000,
