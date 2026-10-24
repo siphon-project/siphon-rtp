@@ -476,18 +476,35 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         use siphon_rtp_media::bridge::tee::TeeChannel;
         use siphon_rtp_media::bridge::wire_rate::wire_resampler;
 
-        // The same exclusion the tee has, and for the same reason: a WS-takeover call's media never
-        // reaches the pipeline. A secure call that runs through the media pipeline (`SrtpMedia` /
-        // `DtlsMedia`) decodes like any other and records fine — which is the case the pcap recorder
-        // has to refuse and this one does not.
+        // A secure call that runs through the media pipeline (`SrtpMedia` / `DtlsMedia`) decodes
+        // like any other and records fine — which is the case the pcap recorder has to refuse and
+        // this one does not.
         let pipeline = self
             .owned_call_internal(call_id, |call| call.pipeline)
             .ok_or_else(|| "call no longer exists".to_string())?;
-        if self.ws.is_ws_call(call_id) || pipeline == PipelineKind::Ws {
-            return Err(
-                "a WebSocket-takeover call (ws_uri) has no relay path to record".to_string(),
-            );
-        }
+        // A takeover call's media never reaches the pipeline — the WS server is the caller's far
+        // side — so the recording taps the bridge session instead, which decodes the caller and
+        // renders the bot in one task (see `siphon_rtp_media::bridge::taps`).
+        let bridge = if self.ws.is_ws_call(call_id) || pipeline == PipelineKind::Ws {
+            let bridge = self.bridge_recording_target(call_id).ok_or_else(|| {
+                "the call's WebSocket bridge is not running, so there is no audio to record"
+                    .to_string()
+            })?;
+            if bridge.relay_takeover {
+                // Giving the leg back restores an in-kernel relay, which has no decoded audio to
+                // carry the recording on, so it could only end at the hand-over.
+                return Err(
+                    "recording-needs-an-anchored-takeover: this bot took over a relayed \
+                            two-party call, and handing the leg back would end the recording; \
+                            record a call the engine answered (answer_local) or one negotiated \
+                            with ws_uri"
+                        .to_string(),
+                );
+            }
+            Some(bridge)
+        } else {
+            None
+        };
         // A crypto *bridge* relays without decoding, so it has no post-decode fan-out to tap. It
         // does hold each party's plaintext between its two transforms — where the tee and lawful
         // interception tap too — so the recording decodes a copy of that instead.
@@ -497,7 +514,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .await;
         }
 
-        let (near_codec, far_codec, two_leg, to_tag, owner) = self
+        let (mut near_codec, mut far_codec, mut two_leg, to_tag, owner) = self
             .owned_call_internal(call_id, |call| {
                 (
                     call.near_codec.clone(),
@@ -510,6 +527,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 )
             })
             .ok_or_else(|| "call no longer exists".to_string())?;
+        if let Some(bridge) = bridge {
+            // One party, in the codec the bridge decodes; the bot is what that party hears.
+            near_codec = Some(bridge.codec);
+            far_codec = None;
+            two_leg = false;
+        }
 
         let caller_rate = near_codec.as_ref().map(pcm_rate_of).transpose()?;
         let callee_rate = far_codec.as_ref().map(pcm_rate_of).transpose()?;
@@ -546,9 +569,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             TeeChannel,
             Option<siphon_rtp_dsp::resample::Resampler>,
         )> = Vec::new();
+        // What is sent *toward the caller* is `b_to_a`'s egress on a two-party call, but on a
+        // single-leg call both directions face the caller and the one whose egress reaches it is
+        // `a_to_b` — where `play_media` injects its prompts on such a call too. Tapping `b_to_a`
+        // there recorded nothing the caller heard.
+        let toward_caller = two_leg;
         for (is_ingress, source_a, channel, leg_rate, wanted) in [
             (true, true, TeeChannel::Caller, caller_rate, want_ingress),
-            (false, true, TeeChannel::Callee, caller_rate, want_egress),
+            (
+                false,
+                toward_caller,
+                TeeChannel::Callee,
+                caller_rate,
+                want_egress,
+            ),
             (
                 true,
                 false,
@@ -571,16 +605,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if taps.is_empty() {
             return Err("the call has no leg matching the requested direction".to_string());
         }
-        // Two sources are summed into a mono file, or laid out caller-left / other-right on a
-        // two-party call that asked for stereo. One source is mono whatever was asked for, and so
-        // is a single-leg call: its second source is the engine's own prompts, not a party.
+        // Two sources are summed into a mono file, or laid out caller-left / other-right when stereo
+        // was asked for. One source is mono whatever was asked for. On a single-leg call the right
+        // channel is what the caller heard: the engine's prompts, or the bot once one has taken the
+        // leg over — it has to be honoured there too, because a recording started before the
+        // hand-over cannot change its channel count halfway through the file.
         let two_sources = taps.len() == 2;
-        let channels: u8 =
-            if two_sources && two_leg && matches!(request.channels, RecordingChannels::Stereo) {
-                2
-            } else {
-                1
-            };
+        let channels: u8 = if two_sources && matches!(request.channels, RecordingChannels::Stereo) {
+            2
+        } else {
+            1
+        };
 
         let encoding = request.format.encoding(rate, channels)?;
         let recording_id = self.next_recording_id();
@@ -657,13 +692,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Hold the call in userspace for the recording's lifetime. A plain relay is promoted
         // **relay-only**, like a tee: every packet is still forwarded as it arrived, and a copy is
         // decoded for the recording beside the forward, so a frame the recording cannot decode is
-        // missing from the file and not from the call.
-        self.hold_in_userspace(
-            call_id,
-            PromotionReason::AudioRecording,
-            PromoteMode::RelayOnly,
-        )
-        .await?;
+        // missing from the file and not from the call. A takeover call is already decoded, by its
+        // bridge; the reason is still recorded, so a hand-back to the engine rebuilds an actor that
+        // keeps decoding for it.
+        if self.bridge_recording_target(call_id).is_some() {
+            if let Some(mut call) = self.calls.get_mut(call_id) {
+                call.promotion_reasons
+                    .insert(PromotionReason::AudioRecording);
+            }
+        } else {
+            self.hold_in_userspace(
+                call_id,
+                PromotionReason::AudioRecording,
+                PromoteMode::RelayOnly,
+            )
+            .await?;
+        }
 
         let plan = plan_ws_tee(format, two_sources, callee_only);
         let mut ingress_legs = Vec::new();
@@ -671,8 +715,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let mut retap_taps = Vec::new();
         for (is_ingress, source_a, channel, resampler) in taps {
             let sink = WsTeeSink::new(channel, plan.mixer.clone(), recording_id.clone(), resampler);
-            if !self.attach_recording_sink(call_id, is_ingress, source_a, Box::new(sink)) {
-                self.detach_recording_sinks(call_id, &recording_id, &ingress_legs, &egress_legs);
+            if !self
+                .attach_recording_sink(call_id, is_ingress, source_a, Box::new(sink))
+                .await
+            {
+                self.detach_recording_sinks(call_id, &recording_id, &ingress_legs, &egress_legs)
+                    .await;
                 self.release_userspace_hold(call_id, PromotionReason::AudioRecording)
                     .await;
                 return Err("media actor unavailable".to_string());
@@ -729,15 +777,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Ok(())
     }
 
-    /// Hand one recording sink to the call's media actor: on the source leg's post-decode fan-out
-    /// (`is_ingress`), or on what the engine sends toward a leg. `false` when the actor is gone.
-    pub(super) fn attach_recording_sink(
+    /// Hand one recording sink to whatever decodes the call: on the source leg's post-decode
+    /// fan-out (`is_ingress`), or on what the engine sends toward a leg. On a takeover call that is
+    /// the bridge session — the caller's ingress is its `Caller` tap and what is sent toward the
+    /// caller its `Heard` one, which is why a recording's taps mean the same thing on either path.
+    /// `false` when neither is there to take it.
+    pub(super) async fn attach_recording_sink(
         &self,
         call_id: &str,
         is_ingress: bool,
         source_a: bool,
         sink: Box<dyn siphon_rtp_media::fanout::MediaSink>,
     ) -> bool {
+        use siphon_rtp_media::bridge::taps::TapSide;
+        use siphon_rtp_media::bridge::ws::BridgeControl;
+        if let Some(bridge) = self.bridge_recording_target(call_id) {
+            let side = if is_ingress {
+                TapSide::Caller
+            } else {
+                TapSide::Heard
+            };
+            return bridge
+                .control
+                .send_async(BridgeControl::AddRecordingTap { side, sink })
+                .await
+                .is_ok();
+        }
         if is_ingress {
             self.media
                 .control(call_id, MediaControl::AddFork { source_a, sink })
@@ -985,14 +1050,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         })
     }
 
-    /// Detach every sink a recording attached, without touching anything else on the same legs.
-    pub(super) fn detach_recording_sinks(
+    /// Detach every sink a recording attached, without touching anything else on the same legs —
+    /// from the call's bridge when a bot has the leg, from its media actor otherwise. Returns once a
+    /// bridge has let go of them, so the writer's input is known to be closing.
+    pub(super) async fn detach_recording_sinks(
         &self,
         call_id: &str,
         recording_id: &str,
         ingress_legs: &[bool],
         egress_legs: &[bool],
     ) {
+        use siphon_rtp_media::bridge::ws::BridgeControl;
+        if let Some(bridge) = self.bridge_recording_target(call_id) {
+            let (done, removed) = tokio::sync::oneshot::channel();
+            let sent = bridge
+                .control
+                .send_async(BridgeControl::RemoveRecordingTaps {
+                    tag: recording_id.to_string(),
+                    done,
+                })
+                .await;
+            if sent.is_ok() {
+                // A bridge that ends first drops `done`, and its sinks with it: either way they
+                // are gone.
+                let _ = removed.await;
+            }
+            return;
+        }
         for source_a in ingress_legs {
             self.media.control(
                 call_id,
@@ -1051,7 +1135,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &recording.recording_id,
                     &recording.ingress_legs,
                     &recording.egress_legs,
-                );
+                )
+                .await;
                 let _ = recording.writer.await;
                 // The hold is one reason per call, not per recording. Released while another
                 // recording still taps the call, a promoted relay would be demoted under it and that
