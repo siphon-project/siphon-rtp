@@ -310,7 +310,28 @@ independently. Two things differ from a call on the media path:
   concealment in front of the file, so a lost packet is a gap rather than a
   concealed frame.
 
-A WebSocket-takeover call still has no relayed audio to tap, and is refused.
+### Recording a call a voice bot has taken over
+
+A call the engine answered and handed to a bot (`ws_uri` on `answer_local`, or
+`attach_ws_bridge` on an engine-answered call) records with the same
+`start_recording`. Nothing on the relay carries that audio, so the recording
+taps the bridge session, which decodes the caller and renders the bot in one
+place:
+
+- **Caller (left):** the uplink as decoded, before the noise suppression, echo
+  cancellation and turn-taking the bot is given. The file holds what the
+  caller said, not the bot's input.
+- **Bot (right):** the downlink as rendered toward the caller, resampled from
+  the WS wire rate into the caller leg's. A frame flushed by a barge-in was
+  never played, so it is not recorded.
+
+```json
+{"cmd":"start_recording","call_id":"call-7","from_tag":"tag-a","format":"ogg_opus","direction":"both","channels":"stereo"}
+```
+
+A bot that displaced one party of a **relayed** two-party call refuses it
+(`recording-needs-an-anchored-takeover`): handing that leg back restores an
+in-kernel relay, which has no decoded audio to carry the recording on.
 
 ### Compressed recordings: Ogg Opus
 

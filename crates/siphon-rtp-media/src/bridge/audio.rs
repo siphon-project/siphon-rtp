@@ -483,6 +483,16 @@ impl BridgeCore {
         self.uplink_samples = Some(samples.min(MAX_FRAME_SAMPLES));
     }
 
+    /// The uplink frame staged for the next [`BridgeCore::tick`] (mono, as staged), or empty when
+    /// nothing is staged. Read **before** the tick runs it through noise suppression and echo
+    /// cancellation in place, which is what lets a recording tap hold what the caller said rather
+    /// than what the server was given.
+    #[must_use]
+    pub fn staged_uplink(&self) -> &[i16] {
+        self.uplink_samples
+            .map_or(&[][..], |samples| &self.uplink[..samples])
+    }
+
     /// Feed an inbound binary WS frame (downlink playout audio, L16 little-endian).
     pub fn on_ws_binary(&mut self, bytes: &[u8]) {
         // Decoded one ptime at a time into a fixed scratch, so a frame of any size — the 40 ms a

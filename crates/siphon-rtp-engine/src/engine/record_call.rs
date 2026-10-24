@@ -219,6 +219,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some(mixer) = mixer else {
             return Ok(());
         };
+        // A bot has the leg: the recording's sinks are on its bridge session, which an answer does
+        // not replace, so they are still where they were.
+        if self.bridge_recording_target(call_id).is_some() {
+            return Ok(());
+        }
         let (pipeline, near_codec, far_codec) = self
             .owned_call_internal(call_id, |call| {
                 (
@@ -245,7 +250,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Off whichever actor still holds them first — the answer may have kept the old one — so
         // a re-tap never leaves two sinks on one ring (the mailbox keeps the order).
-        self.detach_recording_sinks(call_id, recording_id, &ingress_legs, &egress_legs);
+        self.detach_recording_sinks(call_id, recording_id, &ingress_legs, &egress_legs)
+            .await;
         for (is_ingress, source_a, channel) in taps {
             // The callee's own ingress is the only tap fed at the callee's rate; the caller's
             // ingress and everything sent toward the caller run at the caller's.
@@ -258,7 +264,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .ok_or_else(|| "a recorded leg has no negotiated codec any more".to_string())?;
             let resampler = wire_resampler(leg_rate, rate).map_err(|error| error.to_string())?;
             let sink = WsTeeSink::new(channel, mixer.clone(), recording_id.to_string(), resampler);
-            if !self.attach_recording_sink(call_id, is_ingress, source_a, Box::new(sink)) {
+            if !self
+                .attach_recording_sink(call_id, is_ingress, source_a, Box::new(sink))
+                .await
+            {
                 return Err("media actor unavailable".to_string());
             }
         }

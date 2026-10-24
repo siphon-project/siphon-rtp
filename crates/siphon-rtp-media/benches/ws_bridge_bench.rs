@@ -415,8 +415,74 @@ fn bench_long_ptime_tee(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// A takeover recording: the tick with no tap (control), the caller tap alone, and both the caller
+/// and the heard tap on a stereo assembler — the whole per-tick cost of recording a bot call.
+/// Comfort idle is on, so the downlink renders (and the heard tap is fed) every tick.
+fn bench_recording_taps(criterion: &mut Criterion) {
+    use siphon_rtp_media::bridge::taps::TapSide;
+    use siphon_rtp_media::bridge::{plan_ws_tee, TeeChannel, WsTeeSink};
+    let mut group = criterion.benchmark_group("ws_bridge_tick_recording");
+    let loud = [4000i16; FRAME_SAMPLES];
+    for (label, taps) in [("no_tap", 0usize), ("caller", 1), ("caller_and_heard", 2)] {
+        group.bench_function(label, |bencher| {
+            let mut session = session(false).with_comfort_idle(true);
+            let plan = plan_ws_tee(
+                MediaFormat {
+                    encoding: Encoding::L16,
+                    sample_rate: 8_000,
+                    channels: if taps == 2 { 2 } else { 1 },
+                    bit_depth: 16,
+                    endianness: Endianness::Little,
+                    ptime: 20,
+                },
+                taps == 2,
+                false,
+            );
+            if taps >= 1 {
+                session.add_recording_tap(
+                    TapSide::Caller,
+                    Box::new(WsTeeSink::new(
+                        TeeChannel::Caller,
+                        plan.mixer.clone(),
+                        "rec",
+                        None,
+                    )),
+                );
+            }
+            if taps == 2 {
+                session.add_recording_tap(
+                    TapSide::Heard,
+                    Box::new(WsTeeSink::new(
+                        TeeChannel::Callee,
+                        plan.mixer.clone(),
+                        "rec",
+                        None,
+                    )),
+                );
+            }
+            let mut packet = ulaw_packet(0, &loud);
+            let mut sequence: u16 = 0;
+            let mut uplink = [0u8; 1024];
+            let mut downlink = [0u8; 1024];
+            bencher.iter(|| {
+                sequence = sequence.wrapping_add(1);
+                packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+                session.on_rtp(&packet);
+                let result = session.tick(&mut uplink, &mut downlink);
+                // The writer task's half: hand each finished frame back to the pool.
+                while let Ok(buffer) = plan.frames.try_recv() {
+                    let _ = plan.recycle.send(buffer);
+                }
+                black_box(result)
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_recording_taps,
     bench_tick,
     bench_tick_with_echo_canceller,
     bench_long_ptime_tick,
