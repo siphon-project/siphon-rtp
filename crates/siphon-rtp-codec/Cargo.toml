@@ -18,9 +18,10 @@ default = []
 # always available and carries no patent exposure — the codec is never executed, packets are
 # forwarded byte-for-byte (rtpengine's default posture). Enabling a feature below is an explicit
 # statement that YOU, the operator, hold the necessary patent licence for that codec in your
-# jurisdiction. See docs/codec-licensing.md. (evs added when that codec lands.)
+# jurisdiction. See docs/codec-licensing.md.
 amr = [] # AMR-NB / AMR-WB (3GPP TS 26.071 / 26.171) — the VoLTE codecs.
 g729 = [] # G.729 (ITU-T G.729) — 8 kbit/s CS-ACELP. Annex B (VAD/DTX/CNG) is not implemented.
+evs = [] # EVS (3GPP TS 26.441 family) — the VoLTE successor to AMR-WB. In progress: no factory arm yet.
 
 [dependencies]
 thiserror = { workspace = true }

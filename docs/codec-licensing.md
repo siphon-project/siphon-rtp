@@ -34,7 +34,7 @@ default binary.
 |---|---|---|
 | `amr` | AMR-NB (TS 26.071), AMR-WB / G.722.2 (TS 26.171) | implemented, bit-exact (AMR-WB decode + encode, all 9 modes; AMR-NB decode + encode, all 8 speech modes) |
 | `g729` | G.729, G.729A, G.729B | decoder **and** encoder implemented, bit-exact against the ITU-T Release 3 sequences in both directions, Annex B (VAD/DTX/CNG) included |
-| `evs` *(planned)* | EVS (TS 26.441…) | not yet implemented (largest effort; post-Opus) |
+| `evs` | EVS (TS 26.441…) | **in progress, not usable yet**: the port of the TS 26.442 fixed-point reference has begun (operators, G.192 reader, conformance harness), but there is no decoder or encoder, so the factory still reports EVS as unsupported with or without the feature |
 
 **Enabling any feature above is an explicit statement that you, the operator, hold the necessary
 patent licence(s) for that codec in your jurisdiction.** Build with e.g. `--features amr`.
