@@ -334,3 +334,101 @@ fn a_wire_rate_converting_bridge_ticks_without_per_frame_allocation() {
         after - before
     );
 }
+
+/// A takeover recording taps the bridge tick on both sides: the caller's decoded uplink and the
+/// downlink it renders. With both sinks attached the steady-state tick must still allocate nothing —
+/// the sinks write into the shared assembler's preallocated rings, and its finished frames are
+/// recycled here exactly as the recording's writer task recycles them.
+#[test]
+fn recording_taps_add_no_per_frame_allocation() {
+    use siphon_rtp_media::bridge::protocol::{Encoding, Endianness};
+    use siphon_rtp_media::bridge::taps::TapSide;
+    use siphon_rtp_media::bridge::{plan_ws_tee, TeeChannel, WsTeeSink};
+
+    const MEASURED: usize = 1000;
+    const PREFILL: usize = MEASURED + 64;
+    let loud = [4000i16; 160];
+    let leg = MediaLeg::new(
+        Box::new(G711::ulaw()),
+        Box::new(G711::ulaw()),
+        JitterBuffer::new(1, PREFILL + 16),
+        0x5555_6666,
+        0,
+    );
+    // Comfort idle renders a downlink frame every tick, so the heard tap is fed every tick too.
+    let mut session = BridgeSession::new(
+        leg,
+        MediaFormat::telephony_default(),
+        "str_1",
+        "call_1",
+        Direction::Duplex,
+        8,
+    )
+    .with_comfort_idle(true);
+    let plan = plan_ws_tee(
+        MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: 8_000,
+            channels: 2,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime: 20,
+        },
+        true,
+        false,
+    );
+    session.add_recording_tap(
+        TapSide::Caller,
+        Box::new(WsTeeSink::new(
+            TeeChannel::Caller,
+            plan.mixer.clone(),
+            "rec-1",
+            None,
+        )),
+    );
+    session.add_recording_tap(
+        TapSide::Heard,
+        Box::new(WsTeeSink::new(
+            TeeChannel::Callee,
+            plan.mixer.clone(),
+            "rec-1",
+            None,
+        )),
+    );
+    for sequence in 0..PREFILL {
+        session.on_rtp(&ulaw_packet(sequence as u16, &loud));
+    }
+    let mut uplink = [0u8; 1024];
+    let mut downlink = [0u8; 1024];
+    // Warm up until the assembler has cycled its buffer pool, so the measured window recycles.
+    for _ in 0..40 {
+        session.tick(&mut uplink, &mut downlink);
+        while let Ok(frame) = plan.frames.try_recv() {
+            let _ = plan.recycle.send(frame);
+        }
+    }
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut frames_out = 0usize;
+    for _ in 0..MEASURED {
+        let result = session.tick(&mut uplink, &mut downlink);
+        std::hint::black_box(result);
+        while let Ok(frame) = plan.frames.try_recv() {
+            frames_out += 1;
+            let _ = plan.recycle.send(frame);
+        }
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert!(
+        frames_out >= MEASURED - 10,
+        "the recording got a frame per tick ({frames_out})"
+    );
+    assert_eq!(
+        after - before,
+        0,
+        "recording taps allocated on the per-frame path"
+    );
+}

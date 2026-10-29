@@ -1156,8 +1156,10 @@ pub enum RecordingChannels {
     /// One track. Sources selected by [`RecordingDirection`] are summed (saturating).
     #[default]
     Mono,
-    /// Two tracks, interleaved: the caller's audio left, the callee's right. Needs two sources — a
-    /// single-leg call has only one, so it records mono whatever is asked for.
+    /// Two tracks, interleaved: the caller's audio left, the other side right. Needs two sources
+    /// ([`RecordingDirection::Both`] on a single-leg call, or two parties). On a single-leg call the
+    /// right channel is what the caller heard: the engine's prompts, or the voice bot that has taken
+    /// the leg over. With one source the recording is mono whatever is asked for.
     Stereo,
 }
 

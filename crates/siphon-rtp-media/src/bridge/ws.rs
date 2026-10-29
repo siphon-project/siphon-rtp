@@ -18,6 +18,8 @@ use tokio_tungstenite::WebSocketStream;
 use crate::bridge::audio::MAX_FRAME_SAMPLES;
 use crate::bridge::protocol::ControlMessage;
 use crate::bridge::session::BridgeSession;
+use crate::bridge::taps::{TakenRecordingTaps, TapSide};
+use crate::fanout::MediaSink;
 use crate::leg::MAX_RTP_PACKET;
 
 /// Uplink scratch: the longest L16 frame [`BridgeSession::tick`] can emit. The core folds a
@@ -56,10 +58,37 @@ pub enum BridgeEndReason {
     CallEnded,
 }
 
+/// Bound on a bridge's control mailbox. Control is a handful of messages per recording's
+/// lifetime, never per frame, so this only has to absorb a burst.
+pub const BRIDGE_CONTROL_QUEUE: usize = 16;
+
+/// What the engine asks of a running bridge. The session is owned by [`run_bridge`]'s task, so this
+/// mailbox is the only way to reach it — no shared state, no lock across the tick.
+pub enum BridgeControl {
+    /// Attach a recording sink to one party — see [`crate::bridge::taps`].
+    AddRecordingTap {
+        side: TapSide,
+        sink: Box<dyn MediaSink>,
+    },
+    /// Detach and finish every recording sink tagged `tag`; `done` fires once they are gone, so a
+    /// stop can wait for the file to close.
+    RemoveRecordingTaps {
+        tag: String,
+        done: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Hand every recording sink back, unfinished, to move it onto another media path.
+    TakeRecordingTaps {
+        reply: tokio::sync::oneshot::Sender<TakenRecordingTaps>,
+    },
+}
+
 /// Run the bridge until the peer closes, a `stop` is received, or the RTP source ends.
 ///
 /// `rtp_in` carries packets from the call (redirected by the datapath); `rtp_out` carries packets
 /// the bridge renders back toward the call. `ptime` is the audio frame interval (e.g. 20 ms).
+///
+/// `control` is the engine's mailbox into the running session ([`BridgeControl`]); the bridge runs
+/// on without it once every sender is gone.
 ///
 /// The [`BridgeEndReason`] names which end ended it, so the engine can raise a `ws_bridge_ended`
 /// that distinguishes "the controller detached it" from "the media server went away".
@@ -68,6 +97,7 @@ pub async fn run_bridge<S>(
     mut session: BridgeSession,
     rtp_in: flume::Receiver<Bytes>,
     rtp_out: flume::Sender<Bytes>,
+    control: flume::Receiver<BridgeControl>,
     ptime: Duration,
 ) -> Result<BridgeEndReason, BridgeError>
 where
@@ -82,6 +112,9 @@ where
     let mut ticker = interval(ptime);
     let mut uplink = vec![0u8; UPLINK_CAP];
     let mut downlink = vec![0u8; DOWNLINK_CAP];
+    // A closed mailbox completes `recv_async` immediately, every time; polled after that it would
+    // spin the task. Once the engine has dropped its sender there is nothing more to hear.
+    let mut control_open = true;
 
     let reason = loop {
         if session.is_stopped() {
@@ -102,6 +135,21 @@ where
                 Some(Ok(Message::Close(_))) | None => break BridgeEndReason::ServerClosed,
                 Some(Ok(_)) => {} // ping/pong/raw frames: handled by tungstenite or ignored
                 Some(Err(error)) => return Err(error.into()),
+            },
+            message = control.recv_async(), if control_open => match message {
+                Ok(BridgeControl::AddRecordingTap { side, sink }) => {
+                    session.add_recording_tap(side, sink);
+                }
+                Ok(BridgeControl::RemoveRecordingTaps { tag, done }) => {
+                    session.remove_recording_taps(&tag);
+                    let _ = done.send(());
+                }
+                Ok(BridgeControl::TakeRecordingTaps { reply }) => {
+                    // A requester that went away drops the sinks, which ends their recordings —
+                    // the same outcome as a call ending under them.
+                    let _ = reply.send(session.take_recording_taps());
+                }
+                Err(_) => control_open = false,
             },
             received = rtp_in.recv_async() => match received {
                 Ok(packet) => session.on_rtp(&packet),
@@ -186,6 +234,7 @@ mod tests {
             session_fixture(),
             rtp_in_rx,
             rtp_out_tx,
+            flume::bounded(1).1,
             Duration::from_millis(10),
         ));
 
@@ -269,6 +318,7 @@ mod tests {
             session_fixture(),
             rtp_in_rx,
             rtp_out_tx,
+            flume::bounded(1).1,
             Duration::from_millis(10),
         ));
 
@@ -298,6 +348,7 @@ mod tests {
             session_fixture(),
             rtp_in_rx,
             rtp_out_tx,
+            flume::bounded(1).1,
             Duration::from_millis(10),
         ));
 
@@ -359,6 +410,7 @@ mod tests {
             session_fixture_vad(),
             rtp_in_rx,
             rtp_out_tx,
+            flume::bounded(1).1,
             Duration::from_millis(10),
         ));
 
@@ -401,5 +453,125 @@ mod tests {
 
         drop(rtp_in_tx); // ends the bridge (RTP source gone)
         let _ = timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    /// A recording sink that counts the non-silent frames it hears and whether it was finished.
+    struct CountingSink {
+        loud_frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl MediaSink for CountingSink {
+        fn write_pcm(&mut self, pcm: &[i16]) {
+            if pcm.iter().any(|&sample| sample.unsigned_abs() > 500) {
+                self.loud_frames
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn finish(&mut self) {
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn tag(&self) -> Option<&str> {
+            Some("rec-1")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recording_tap_sent_to_a_running_bridge_hears_both_parties() {
+        use std::sync::atomic::Ordering;
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let (rtp_in_tx, rtp_in_rx) = flume::unbounded::<Bytes>();
+        let (rtp_out_tx, _rtp_out_rx) = flume::unbounded::<Bytes>();
+        let (control_tx, control_rx) = flume::bounded(BRIDGE_CONTROL_QUEUE);
+        let bridge = tokio::spawn(run_bridge(
+            server_ws,
+            session_fixture(),
+            rtp_in_rx,
+            rtp_out_tx,
+            control_rx,
+            Duration::from_millis(10),
+        ));
+
+        let counters = |side| {
+            let loud = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            control_tx
+                .send(BridgeControl::AddRecordingTap {
+                    side,
+                    sink: Box::new(CountingSink {
+                        loud_frames: loud.clone(),
+                        finished: finished.clone(),
+                    }),
+                })
+                .expect("control");
+            (loud, finished)
+        };
+        let (caller_loud, caller_finished) = counters(TapSide::Caller);
+        let (heard_loud, heard_finished) = counters(TapSide::Heard);
+
+        let (mut client_tx, _client_rx) = client_ws.split();
+        let mut l16 = [0u8; 320];
+        pcm_to_l16_le(&[1000i16; 160], &mut l16);
+        for sequence in 0..5u16 {
+            // µ-law 0x00 is the loudest negative level (ITU-T G.711).
+            rtp_in_tx
+                .send(Bytes::from(ulaw_packet(sequence, 0x00)))
+                .expect("feed rtp");
+            client_tx
+                .send(Message::binary(l16.to_vec()))
+                .await
+                .expect("downlink");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert!(
+            caller_loud.load(Ordering::SeqCst) > 0,
+            "the caller tap hears the caller"
+        );
+        assert!(
+            heard_loud.load(Ordering::SeqCst) > 0,
+            "the heard tap hears the bot"
+        );
+
+        let (done, finished) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(BridgeControl::RemoveRecordingTaps {
+                tag: "rec-1".into(),
+                done,
+            })
+            .expect("control");
+        timeout(Duration::from_secs(2), finished)
+            .await
+            .expect("no timeout")
+            .expect("removed");
+        assert!(caller_finished.load(Ordering::SeqCst));
+        assert!(heard_finished.load(Ordering::SeqCst));
+
+        let (reply, taken) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(BridgeControl::TakeRecordingTaps { reply })
+            .expect("control");
+        let (callers, heards) = timeout(Duration::from_secs(2), taken)
+            .await
+            .expect("no timeout")
+            .expect("taken");
+        assert!(
+            callers.is_empty() && heards.is_empty(),
+            "nothing left after the removal"
+        );
+
+        // Dropping the engine's sender must not spin or end the bridge: RTP still flows.
+        drop(control_tx);
+        rtp_in_tx
+            .send(Bytes::from(ulaw_packet(9, 0x00)))
+            .expect("bridge still running");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !bridge.is_finished(),
+            "a closed control mailbox does not end the bridge"
+        );
+        bridge.abort();
     }
 }

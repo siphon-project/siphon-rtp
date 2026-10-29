@@ -18,6 +18,7 @@
 pub mod audio;
 pub mod protocol;
 pub mod session;
+pub mod taps;
 pub mod tee;
 pub mod wire_rate;
 pub mod ws;
