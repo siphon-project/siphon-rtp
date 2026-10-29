@@ -1180,6 +1180,10 @@ pub enum RecordingEndReason {
     /// The recording aborted — a write failed, or the file could not be finalized. The file may be
     /// truncated or missing; its `duration_ms` is what had been written when the error hit.
     Error,
+    /// The recorded party never sent audio, so no file was kept: `path` is absent and `duration_ms`
+    /// is 0. Reported by a `record_call` stream (one per party), so a consumer waiting on every
+    /// party's file can tell "this one will never come" from "still being written".
+    NoAudio,
 }
 
 /// How many times a [`Command::PlayMedia`] plays its source.
@@ -1382,14 +1386,14 @@ pub struct ProfileFlags {
     /// 100–200 ms *each way* before the acoustic path is reached at all. Where the far party is, is
     /// a property of the deployment, which is why this is a knob and not a constant.
     ///
-    /// **An echo outside the window is not found, and the failure is quiet.** The estimator commits
-    /// the tallest lag inside its window whatever that lag is, so a too-narrow window does not
-    /// produce an error or an absent canceller — it produces a lock on noise, after which the filter
-    /// adapts against a reference that is not the echo and cancels nothing, while every counter and
-    /// status field still reads healthy. The engine logs the committed delay and the window it was
-    /// found in on the `siphon_rtp::media` target, warns when the lock is too weak to be an echo, and
-    /// exports `siphon_rtp_aec_delay_weak_locks_total`; on a voice-AI bridge the visible symptom of
-    /// getting this wrong is an agent that barges in on its own voice.
+    /// **An echo outside the window is not found.** The estimator commits only a peak that stands
+    /// clear of the correlation floor, and until it has one the leg passes through uncancelled. So a
+    /// too-narrow window looks exactly like a line with no echo on it: no lock, nothing cancelled.
+    /// The engine logs the committed delay and the window it was found in on the
+    /// `siphon_rtp::media` target, logs when a search found no echo, and exports
+    /// `siphon_rtp_aec_delay_weak_locks_total` (cancellers that found nothing to commit); on a
+    /// voice-AI bridge the visible symptom of a window that is too short is an agent that barges in
+    /// on its own voice.
     ///
     /// Accepted range [`ECHO_DELAY_SEARCH_MS_MIN`]–[`ECHO_DELAY_SEARCH_MS_MAX`] (16–1000 ms) as a
     /// search window, and [`ECHO_LONG_TAIL_MS_MIN`]–[`ECHO_LONG_TAIL_MS_MAX`] when `echo_long_tail`

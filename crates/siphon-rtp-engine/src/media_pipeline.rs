@@ -45,10 +45,8 @@ use siphon_rtp_media::player::PcmPlayer;
 use siphon_rtp_media::repacketize::Repacketizer;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
 use siphon_rtp_media::tone::{ToneGenerator, ToneSpec};
-use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{Event, PlayEndReason, ProfileFlags};
 
-use crate::engine::scope;
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
@@ -494,11 +492,10 @@ pub(crate) fn build_echo_canceller(
 /// The long-tail posture: no bulk-delay estimator, and a filter long enough to span the whole echo
 /// path (`ProfileFlags::echo_long_tail`).
 ///
-/// Chosen per leg because it trades cost for a failure mode. The estimating build is cheap and exact
-/// when it works, but it commits the tallest lag inside its window whatever that lag is, so an echo
-/// beyond the window leaves it adapting against a reference that is not the echo — cancelling nothing
-/// while every accessor reads healthy. This build makes no alignment decision, so it has nothing to
-/// get wrong; it simply pays for the taps, at roughly 6× the per-frame cost at 512 ms and 11.5× at
+/// Chosen per leg because it trades cost for reach. The estimating build is cheap and exact when it
+/// works, but it can only cancel an echo it has located, so an echo beyond its window is never
+/// found and the leg passes through uncancelled. This build makes no alignment decision, so it reaches
+/// whatever the tail covers; it simply pays for the taps, at roughly 6× the per-frame cost at 512 ms and 11.5× at
 /// the 1 s ceiling, because the MDF runs its gradient constraint's transform pair inside the
 /// per-partition loop. At the worst corner — 1 s at a 16 kHz rate — that is ~463 µs per 20 ms frame,
 /// about 2.3 % of a core per call, so a box sizing concurrency for long-tail legs should measure
@@ -728,7 +725,7 @@ pub struct Direction {
     /// telephony codec, 2 for a stereo Opus ingress (RFC 7587 §6.1 `sprop-stereo=1`). When > 1 the
     /// decoded interleaved frame is folded to mono right after decode
     /// ([`siphon_rtp_codec::downmix_to_mono`]) so the rest of this direction — noise suppression, echo
-    /// cancellation, recorder, forks, resampler, repacketizer, encoder — stays single-channel. Driven
+    /// cancellation, forks, resampler, repacketizer, encoder — stays single-channel. Driven
     /// by the channel count, not by the codec's identity.
     ingress_channels: u8,
     /// Ingress frames this direction's decoder rejected. Counted so a persistently undecodable stream
@@ -776,7 +773,7 @@ pub struct Direction {
     /// captures nothing.
     echo_reference: Option<EchoReference>,
     /// Answering-machine record-tone ("voicemail beep") detector over this direction's decoded
-    /// ingress audio, fed post-decode / post-NS / post-AEC — the same PCM the recorder and the SIPREC
+    /// ingress audio, fed post-decode / post-NS / post-AEC — the same PCM the SIPREC and recording
     /// forks see, so what it judges is what the leg actually sent. `Some` only when the control armed
     /// `beep_detection` *and* the ingress rate is 8/16 kHz (built and rate-gated in `Direction::new`).
     /// **Taken (set to `None`) the moment it fires**: that is the once-per-leg latch, and it frees the
@@ -806,11 +803,9 @@ pub struct Direction {
     /// Egress RFC 4733 telephone-event payload type (what the receiving party expects).
     telephone_event_out: Option<u8>,
     dtmf: DtmfDetector,
-    /// Records the decoded ingress audio when the call is recorded.
-    recorder: Option<WavRecorder>,
-    /// SIPREC / monitor fork sinks fed the decoded ingress audio (post-decode, pre-encode — the same
-    /// PCM the recorder sees). Each re-encodes for a send-only subscriber (a Session Recording Server,
-    /// RFC 7866 §6). Empty unless a `subscribe_request`/`subscribe_answer` attached one.
+    /// Fork sinks fed the decoded ingress audio (post-decode, pre-encode): SIPREC / monitor
+    /// subscribers, each re-encoding for a send-only Session Recording Server (RFC 7866 §6), and the
+    /// decoded recordings. Empty unless something attached one.
     forks: Vec<Box<dyn MediaSink>>,
     /// Sinks fed the **egress** PCM — what this party actually hears, overlay and injected prompt
     /// included, immediately before it is encoded. The mirror of `forks`, and fed from exactly the
@@ -1144,8 +1139,6 @@ pub struct DirectionConfig {
     pub egress_payload_type: u8,
     pub telephone_event_in: Option<u8>,
     pub telephone_event_out: Option<u8>,
-    /// `Some(WavRecorder)` to record this direction's decoded audio.
-    pub recorder: Option<WavRecorder>,
     /// Request noise suppression on this direction's decoded ingress audio. Built and rate-gated (to
     /// 8/16 kHz) in `Direction::new`; inert on an unsupported ingress rate.
     pub noise_suppression: bool,
@@ -1535,7 +1528,6 @@ impl Direction {
             telephone_event_in: config.telephone_event_in,
             telephone_event_out: config.telephone_event_out,
             dtmf: DtmfDetector::new(),
-            recorder: config.recorder,
             forks: Vec::new(),
             egress_taps: Vec::new(),
             silenced: false,
@@ -1616,7 +1608,6 @@ impl Direction {
             telephone_event_in: config.telephone_event,
             telephone_event_out: None,
             dtmf: DtmfDetector::new(),
-            recorder: None,
             forks: Vec::new(),
             egress_taps: Vec::new(),
             silenced: false,
@@ -2393,7 +2384,7 @@ impl Direction {
         // `siphon_rtp_codec`.
         let samples =
             siphon_rtp_codec::downmix_to_mono(&mut decoded[..samples], self.ingress_channels);
-        // Suppress noise in place first, so the recorder, SIPREC forks, and the peer all receive the
+        // Suppress noise in place first, so the forks (SIPREC, recordings) and the peer all receive the
         // cleaned audio. Streaming/WOLA — one ingress frame in, the same count out (delayed).
         if let Some(suppressor) = self.noise_suppressor.as_mut() {
             suppressor.process(&mut decoded[..samples]);
@@ -2430,16 +2421,14 @@ impl Direction {
             }
         }
         // Answering-machine record-tone detection, on the same post-decode / post-NS / post-AEC PCM
-        // the recorder and the SIPREC forks are about to see — i.e. what this leg actually said, and
+        // the forks (SIPREC, recordings) are about to see — i.e. what this leg actually said, and
         // pre-silence/hold so a `block`ed egress does not blind the detector. It reads the frame and
         // never modifies it, so nothing downstream changes when a leg is armed.
         self.detect_record_tone(&decoded[..samples], leg_meta, events);
         let decoded = &decoded[..samples];
-        if let Some(recorder) = self.recorder.as_mut() {
-            recorder.write_pcm(decoded);
-        }
-        // SIPREC / monitor fork: re-encode the decoded ingress PCM toward each subscriber. Fed the
-        // same raw decoded audio as the recorder (pre-silence, pre-resample) so a fork captures what
+        // Fork sinks: SIPREC / monitor subscribers re-encoding toward their SRS, and the decoded
+        // recordings (`start_recording`, `record_call`). Fed the raw decoded audio (pre-silence,
+        // pre-resample) so a fork captures what
         // the leg actually said, independent of hold/mute state on the A↔B path (RFC 7866 §6). A full
         // or disconnected subscriber drops the frame inside the sink — it never stalls the transcode.
         for fork in &mut self.forks {
@@ -2448,7 +2437,7 @@ impl Direction {
 
         // Single-leg local-answer / IVR leg (RFC 3264 §6.1 single m-line): both directions face the
         // caller, so re-encoding the decoded ingress back out this egress would loop the caller's own
-        // audio to it (self-echo). The decode above still fed the recorder / SIPREC forks / DTMF
+        // audio to it (self-echo). The decode above still fed the forks (SIPREC, recordings) / DTMF
         // detector / reception stats, and the stream still latches (`Some(stream_ssrc)`); the idle
         // egress is a continuous comfort-noise stream driven by the playout tick instead (see
         // `tick_egress`). A player overrides it; the `echo` verb reflects via `echo_into`.
@@ -2769,8 +2758,6 @@ pub struct MediaCall {
     /// Echo-test mode: reflect each party's ingress audio straight back to itself instead of
     /// forwarding it to the peer ([`MediaControl::Echo`]). Off for normal calls.
     echo: bool,
-    /// Where to write the recorded WAV on teardown, when recording.
-    record_path: Option<String>,
     /// Companion (non-muxed) RTCP relays, for a secure-transcode leg whose RTCP rides its own port
     /// (RFC 5761). Empty for a muxed call — muxed RTCP is (de)crypted/relayed inside [`Direction::handle`].
     rtcp: Vec<RtcpRelay>,
@@ -3027,7 +3014,6 @@ impl MediaCall {
         a_to_b: DirectionConfig,
         b_to_a: DirectionConfig,
         latch: bool,
-        record_path: Option<String>,
     ) -> Self {
         Self {
             call_id: call_id.into(),
@@ -3038,7 +3024,6 @@ impl MediaCall {
             b_to_a: Direction::new(b_to_a),
             latch,
             echo: false,
-            record_path,
             rtcp: Vec::new(),
             capture: None,
         }
@@ -3087,7 +3072,6 @@ impl MediaCall {
             b_to_a: Direction::new_relay(b_to_a),
             latch,
             echo: false,
-            record_path: None,
             rtcp: Vec::new(),
             capture: None,
         }
@@ -3953,32 +3937,6 @@ impl MediaCall {
         self.a_to_b.enable_comfort_idle(cn_pt);
         self
     }
-
-    /// Take the recorded WAV bytes for both directions (mixed into a 2-channel-ish concatenation is
-    /// out of scope; we write each direction sequentially as mono), draining the recorders.
-    fn take_recordings(&mut self) -> Vec<(String, Vec<u8>)> {
-        let mut files = Vec::new();
-        let Some(base) = self.record_path.clone() else {
-            return files;
-        };
-        if let Some(recorder) = self.a_to_b.recorder.take() {
-            if recorder.sample_count() > 0 {
-                files.push((
-                    format!("{base}/{}-a.wav", scope::external(&self.call_id)),
-                    recorder.into_wav(),
-                ));
-            }
-        }
-        if let Some(recorder) = self.b_to_a.recorder.take() {
-            if recorder.sample_count() > 0 {
-                files.push((
-                    format!("{base}/{}-b.wav", scope::external(&self.call_id)),
-                    recorder.into_wav(),
-                ));
-            }
-        }
-        files
-    }
 }
 
 /// What a [`MediaControl::PlayDtmf`] did, reported back to the control plane.
@@ -4237,8 +4195,7 @@ impl MediaRegistry {
         // Re-registering a call id **replaces** its actor, so retire the displaced one first: a
         // `DashMap::insert` would only drop its `CallHandle`, and dropping a `JoinHandle` *detaches*
         // the task rather than aborting it — the old actor would keep running forever, unreachable but
-        // still holding its codec state, jitter buffers, recorders and fork sinks. Stop it (flushing
-        // recordings) and drop its routes before the new ones go in, so an overlapping endpoint is
+        // still holding its codec state, jitter buffers and fork sinks. Stop it and drop its routes before the new ones go in, so an overlapping endpoint is
         // re-pointed rather than orphaned.
         self.deregister(&call_id);
         let (mailbox, inbox) = flume::bounded(1024);
@@ -4375,10 +4332,9 @@ impl MediaRegistry {
     /// The grace period is the whole point. This used to send `Stop` and call `abort()` on the very
     /// next line, which is a race the abort essentially always wins: the actor is parked on its
     /// mailbox, the abort drops that future, and **everything after the actor's loop never runs**.
-    /// That teardown is where a `record_call` profile recording is written to disk, so a call asking
-    /// for one answered `ok`, carried the audio, and produced no file — on every pipeline, secure or
-    /// not. (`start_recording` is a different mechanism and was unaffected: the engine stops those
-    /// from its own registry before getting here.)
+    /// That teardown is where a prompt still in flight is reported finished, so a controller
+    /// awaiting it was never released. (Recordings stream to disk from their own writer tasks and
+    /// are ended from the engine's registry, so they do not depend on it.)
     ///
     /// The wait runs on a detached task so this stays synchronous for its callers, and falls back to
     /// an immediate abort when there is no runtime to spawn on.
@@ -4442,9 +4398,8 @@ impl MediaRegistry {
     }
 }
 
-/// How long a stopped media actor is given to run its teardown — flush a `record_call` recording,
-/// report any prompt still in flight — before it is aborted. The work is a couple of buffered file
-/// writes, so this is an upper bound on a wedged actor, not an expected wait.
+/// How long a stopped media actor is given to run its teardown — report any prompt still in flight —
+/// before it is aborted. An upper bound on a wedged actor, not an expected wait.
 const ACTOR_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The async actor for one media-processing call: drain its mailbox, run [`MediaCall::process`], and
@@ -4647,27 +4602,6 @@ async fn run_media_call<D>(
     emitted.clear();
     call.finish_pending_plays(&mut emitted);
     emit_events(&mut emitted, &events);
-    // Flush recordings on teardown (one-shot; tokio::fs keeps the runtime non-blocking).
-    for (path, bytes) in call.take_recordings() {
-        if let Err(error) = write_whole_file(&path, &bytes).await {
-            tracing::warn!(%error, path, "media-pipeline failed to write recording");
-        } else {
-            tracing::info!(path, "media-pipeline wrote recording");
-        }
-    }
-}
-
-/// Write `bytes` to `path` so the file never exists half-written: into a sibling temporary name,
-/// then renamed over `path`, which is atomic within one filesystem. A `record_call` recording has no
-/// completion event, so whatever collects it watches for the file — and a plain write creates the
-/// file before it fills it, which such a reader can observe as an empty or truncated WAV.
-async fn write_whole_file(path: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let partial = format!("{path}.partial");
-    if let Err(error) = tokio::fs::write(&partial, bytes).await {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(error);
-    }
-    tokio::fs::rename(&partial, path).await
 }
 
 /// RFC 5761 demux: a datagram whose second byte's payload-type field is in `64..=95` is RTCP (never a
@@ -4705,31 +4639,11 @@ async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use siphon_rtp_media::wav::WavRecorder;
 
-    #[tokio::test]
-    async fn a_teardown_recording_appears_whole_or_not_at_all() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("call-a.wav");
-        let path = path.to_string_lossy().into_owned();
-        let bytes = vec![0x5A_u8; 4096];
-        write_whole_file(&path, &bytes).await.expect("write");
-        assert_eq!(std::fs::read(&path).expect("read"), bytes);
-        assert!(
-            !std::path::Path::new(&format!("{path}.partial")).exists(),
-            "the temporary is renamed away, never left beside the recording"
-        );
-
-        // A write that cannot happen leaves nothing behind under either name.
-        let missing = directory.path().join("no-such-dir").join("call-b.wav");
-        let missing = missing.to_string_lossy().into_owned();
-        assert!(write_whole_file(&missing, &bytes).await.is_err());
-        assert!(!std::path::Path::new(&missing).exists());
-        assert!(!std::path::Path::new(&format!("{missing}.partial")).exists());
-    }
     use siphon_rtp_codec::g711::G711;
     use siphon_rtp_codec::g722::G722;
     use siphon_rtp_codec::l16::L16;
-    use std::net::{IpAddr, Ipv4Addr};
 
     const A_ADDR: &str = "127.0.0.2:5000";
     const B_ADDR: &str = "127.0.0.3:6000";
@@ -4783,7 +4697,6 @@ mod tests {
             egress_payload_type: 8,
             telephone_event_in: Some(101),
             telephone_event_out: Some(101),
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -4802,7 +4715,6 @@ mod tests {
             egress_payload_type: 0,
             telephone_event_in: Some(101),
             telephone_event_out: Some(101),
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -4817,7 +4729,6 @@ mod tests {
             a_to_b,
             b_to_a,
             true,
-            None,
         )
     }
 
@@ -4966,7 +4877,7 @@ mod tests {
     /// Re-registering a call id must **retire** the displaced actor, not detach it. Dropping a
     /// `JoinHandle` leaves the task running, so without the explicit retire an actor rebuilt in place
     /// (`upgrade_relay_to_processing`, a re-answer) would keep a whole second pipeline alive forever —
-    /// unreachable, but still holding its codec state, jitter buffers, recorders and fork sinks.
+    /// unreachable, but still holding its codec state, jitter buffers and fork sinks.
     #[tokio::test]
     async fn re_registering_a_call_id_retires_the_displaced_actor() {
         use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
@@ -5170,7 +5081,6 @@ mod tests {
             egress_payload_type: 111,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -5189,7 +5099,6 @@ mod tests {
             egress_payload_type: 111,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -5204,7 +5113,6 @@ mod tests {
             a_to_b,
             b_to_a,
             true,
-            None,
         );
         (call, encoded)
     }
@@ -5465,7 +5373,6 @@ mod tests {
                 egress_payload_type: 0,
                 telephone_event_in: None,
                 telephone_event_out: None,
-                recorder: None,
                 noise_suppression: false,
                 echo: EchoProfile::default(),
                 beep_detection: false,
@@ -5480,7 +5387,6 @@ mod tests {
             direction(1, A_ADDR, 2, B_ADDR, 0xB000_0001),
             direction(2, B_ADDR, 1, A_ADDR, 0xA000_0001),
             true,
-            None,
         )
         .with_far_secure_leg(actor_leg.clone());
         let mut out = Vec::new();
@@ -5956,7 +5862,6 @@ mod tests {
             egress_payload_type: 8,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -5975,7 +5880,6 @@ mod tests {
             egress_payload_type: 0,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -5990,7 +5894,6 @@ mod tests {
             a_to_b,
             b_to_a,
             true,
-            None,
         )
     }
 
@@ -6138,7 +6041,6 @@ mod tests {
             egress_payload_type: 9,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -6157,7 +6059,6 @@ mod tests {
             egress_payload_type: 9,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -6172,7 +6073,6 @@ mod tests {
             a_to_b,
             b_to_a,
             true,
-            None,
         )
     }
 
@@ -6335,7 +6235,6 @@ mod tests {
             egress_payload_type: 8,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -6355,7 +6254,6 @@ mod tests {
             egress_payload_type: 96,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -6370,7 +6268,6 @@ mod tests {
             a_to_b,
             b_to_a,
             true,
-            None,
         );
         let mut out = Vec::new();
         let mut events = Vec::new();
@@ -6425,7 +6322,6 @@ mod tests {
             egress_payload_type: 18,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -6444,7 +6340,6 @@ mod tests {
             egress_payload_type: 0,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -6459,7 +6354,6 @@ mod tests {
             a_to_b,
             b_to_a,
             true,
-            None,
         );
 
         // A µ-law packet carrying `samples` of the given PCM, so the test can send real silence and
@@ -6586,7 +6480,6 @@ mod tests {
                 egress_payload_type: 96,
                 telephone_event_in: None,
                 telephone_event_out: None,
-                recorder: None,
                 noise_suppression: false,
                 echo: EchoProfile::default(),
                 beep_detection: false,
@@ -6616,7 +6509,6 @@ mod tests {
             amr_dir(1, A_ADDR, 2, B_ADDR, 0xB000_0060),
             amr_dir(2, B_ADDR, 1, A_ADDR, 0xA000_0060),
             true,
-            None,
         );
         let mut out = Vec::new();
         let mut events = Vec::new();
@@ -6707,7 +6599,6 @@ mod tests {
             egress_payload_type: 8,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -6729,7 +6620,6 @@ mod tests {
             egress_payload_type: OPUS_PT,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -6744,7 +6634,6 @@ mod tests {
             a_to_b,
             b_to_a,
             true,
-            None,
         )
     }
 
@@ -7099,7 +6988,6 @@ mod tests {
             egress_payload_type: OPUS_PT,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -7120,7 +7008,6 @@ mod tests {
             egress_payload_type: 96,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -7135,7 +7022,6 @@ mod tests {
             a_to_b,
             b_to_a,
             true,
-            None,
         );
         let mut out = Vec::new();
         let mut events = Vec::new();
@@ -7201,7 +7087,6 @@ mod tests {
             egress_payload_type: 0,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -7236,7 +7121,6 @@ mod tests {
             g711(1, A_ADDR, 2, B_ADDR),
             g711(2, B_ADDR, 1, A_ADDR),
             true,
-            None,
         )
         .with_far_secure_leg(actor_leg.clone())
         .with_rtcp_relays(relays);
@@ -7300,7 +7184,6 @@ mod tests {
             egress_payload_type: 0,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -7319,7 +7202,6 @@ mod tests {
             g711(1, A_ADDR, 2, B_ADDR),
             g711(2, B_ADDR, 1, A_ADDR),
             true,
-            None,
         );
         assert!(
             plain.far_secure_leg().is_none(),
@@ -7338,7 +7220,6 @@ mod tests {
             g711(1, A_ADDR, 2, B_ADDR),
             g711(2, B_ADDR, 1, A_ADDR),
             true,
-            None,
         )
         .with_far_secure_leg(leg.clone());
         let exposed = secure.far_secure_leg().expect("secure leg exposed");
@@ -7371,7 +7252,6 @@ mod tests {
                 egress_payload_type: 0,
                 telephone_event_in: Some(101),
                 telephone_event_out: Some(101),
-                recorder: None,
                 noise_suppression: false,
                 echo: EchoProfile::default(),
                 beep_detection: false,
@@ -7386,7 +7266,6 @@ mod tests {
             direction(1, A_ADDR, 2, B_ADDR, 0xB000_0101), // A→B: plaintext in, secure egress
             direction(2, B_ADDR, 1, A_ADDR, 0xA000_0101),
             true,
-            None,
         )
         .with_far_secure_leg(leg);
 
@@ -7443,7 +7322,6 @@ mod tests {
                 egress_payload_type: 0,
                 telephone_event_in: None,
                 telephone_event_out: None,
-                recorder: None,
                 noise_suppression: false,
                 echo: EchoProfile::default(),
                 beep_detection: true,
@@ -7458,7 +7336,6 @@ mod tests {
             direction(1, A_ADDR, 2, B_ADDR),
             direction(2, B_ADDR, 1, A_ADDR),
             true,
-            None,
         )
     }
 
@@ -7740,7 +7617,6 @@ mod tests {
             egress_payload_type: 9,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -7759,7 +7635,6 @@ mod tests {
             egress_payload_type: 9,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -7767,15 +7642,7 @@ mod tests {
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
-        let mut call = MediaCall::new(
-            "g722",
-            "tag-a",
-            Some("tag-b".into()),
-            a_to_b,
-            b_to_a,
-            true,
-            None,
-        );
+        let mut call = MediaCall::new("g722", "tag-a", Some("tag-b".into()), a_to_b, b_to_a, true);
         let mut out = Vec::new();
         let mut events = Vec::new();
         call.process(&rx(1, A_ADDR, g722_rtp(1)), &mut out, &mut events);
@@ -8025,7 +7892,6 @@ mod tests {
             egress_payload_type: 0,
             telephone_event_in: Some(101),
             telephone_event_out: Some(101),
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -8033,7 +7899,7 @@ mod tests {
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
-        MediaCall::new("ivr", "tag-a", None, direction(), direction(), true, None)
+        MediaCall::new("ivr", "tag-a", None, direction(), direction(), true)
             .with_comfort_idle(cn_pt)
     }
 
@@ -8517,7 +8383,6 @@ mod tests {
             egress_payload_type: 0,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -8536,7 +8401,6 @@ mod tests {
             egress_payload_type: 0,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -8544,7 +8408,7 @@ mod tests {
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
-        let mut call = MediaCall::new("c", "a", None, a_to_b, b_to_a, true, None);
+        let mut call = MediaCall::new("c", "a", None, a_to_b, b_to_a, true);
         assert_eq!(
             call.start_play_dtmf(true, "5", 100, 10, 40),
             PlayDtmfOutcome::NoTelephoneEvent,
@@ -9221,65 +9085,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn records_decoded_audio_when_configured() {
-        // A recorder on the A→B direction captures A's decoded audio.
-        let a_to_b = DirectionConfig {
-            ingress_endpoint: endpoint(1),
-            accepted_source: SourceFilter::Exact(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
-            egress_endpoint: endpoint(2),
-            egress_dst: addr(B_ADDR),
-            decoder: Box::new(G711::ulaw()),
-            encoder: Box::new(L16::new(8000, 20)),
-            egress_ssrc: 1,
-            egress_payload_type: 11,
-            telephone_event_in: None,
-            telephone_event_out: None,
-            recorder: Some(WavRecorder::new(8000, 1)),
-            noise_suppression: false,
-            echo: EchoProfile::default(),
-            beep_detection: false,
-            beep_cadence_guard_ms: None,
-            produce_echo_reference: false,
-            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
-        };
-        let b_to_a = DirectionConfig {
-            ingress_endpoint: endpoint(2),
-            accepted_source: SourceFilter::Any,
-            egress_endpoint: endpoint(1),
-            egress_dst: addr(A_ADDR),
-            decoder: Box::new(L16::new(8000, 20)),
-            encoder: Box::new(G711::ulaw()),
-            egress_ssrc: 2,
-            egress_payload_type: 0,
-            telephone_event_in: None,
-            telephone_event_out: None,
-            recorder: None,
-            noise_suppression: false,
-            echo: EchoProfile::default(),
-            beep_detection: false,
-            beep_cadence_guard_ms: None,
-            produce_echo_reference: false,
-            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
-        };
-        let mut call = MediaCall::new(
-            "rec-call",
-            "a",
-            None,
-            a_to_b,
-            b_to_a,
-            true,
-            Some("/tmp".to_string()),
-        );
-        let mut out = Vec::new();
-        let mut events = Vec::new();
-        call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0xFF)), &mut out, &mut events);
-        let files = call.take_recordings();
-        assert_eq!(files.len(), 1, "one direction recorded");
-        assert!(files[0].0.ends_with("rec-call-a.wav"));
-        assert!(files[0].1.starts_with(b"RIFF"), "valid WAV header");
-    }
-
     /// An L16↔L16 (lossless) 8 kHz call with noise suppression on the A→B direction only, so an
     /// NS-off run is an exact passthrough and the egress energy comparison isolates the suppressor.
     fn ns_l16_call(noise_suppression: bool) -> MediaCall {
@@ -9294,7 +9099,6 @@ mod tests {
             egress_payload_type: 11,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -9313,7 +9117,6 @@ mod tests {
             egress_payload_type: 11,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -9321,7 +9124,7 @@ mod tests {
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
-        MediaCall::new("ns-call", "a", None, a_to_b, b_to_a, false, None)
+        MediaCall::new("ns-call", "a", None, a_to_b, b_to_a, false)
     }
 
     /// An L16 RTP packet (PT 11) carrying one 20 ms PCM frame.
@@ -9433,7 +9236,6 @@ mod tests {
             egress_payload_type: 11,
             telephone_event_in: None,
             telephone_event_out: None,
-            recorder: None,
             noise_suppression: false,
             echo: EchoProfile {
                 enabled: cancel,
@@ -9453,7 +9255,6 @@ mod tests {
             direction(1, A_ADDR, 2, B_ADDR, 0xB000_0003, aec, false),
             direction(2, B_ADDR, 1, A_ADDR, 0xA000_0003, false, aec),
             true,
-            None,
         )
     }
 

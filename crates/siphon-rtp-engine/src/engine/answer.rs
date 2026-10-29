@@ -1251,6 +1251,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_dtls: near_dtls_settled.as_ref().map(NearDtlsAnswer::wiring),
             agent_endpoints: &agent_endpoints,
         };
+        let pinned = self.pin_call_recordings(call_id, answered_before);
         // For a passthrough relay, remember the installed forward actions so `block` can flip the
         // endpoints to `Drop` and `unblock` can restore them.
         let relay_flows = match self.install_answer_pipeline(
@@ -1323,7 +1324,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         );
 
-        self.settle_answered_media(call_id, answered_before).await;
+        self.settle_answered_media(call_id, pinned, profile).await;
         log_answer_applied(
             call_id,
             &to_tag,

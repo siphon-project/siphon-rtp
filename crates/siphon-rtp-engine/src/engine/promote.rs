@@ -195,7 +195,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &far_codec,
                     near_te,
                     far_te,
-                    None,
                     // Echo promotion is a runtime control action, not an offer/answer profile, so
                     // neither NS nor beep detection is armed here. An already-armed *transcoding* call
                     // switched into echo mode with `MediaControl::Echo` keeps its detector — that path
@@ -214,7 +213,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &near_codec,
                     far_te,
                     near_te,
-                    None,
                     false,                                         // noise_suppression
                     crate::media_pipeline::EchoProfile::default(), // echo (a reflect path wants the echo)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
@@ -262,7 +260,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &near_codec,
                     near_te,
                     near_te,
-                    None,
                     false,                                         // noise_suppression
                     crate::media_pipeline::EchoProfile::default(), // echo (a reflect path wants the echo)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
@@ -277,7 +274,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &near_codec,
                     near_te,
                     near_te,
-                    None,
                     false,                                         // noise_suppression
                     crate::media_pipeline::EchoProfile::default(), // echo (a reflect path wants the echo)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
@@ -300,15 +296,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .map_err(|error| format!("install processing redirect: {error}"))?;
         }
         let owner_events = self.event_sink(owner);
-        let call = MediaCall::new(
-            call_id.to_string(),
-            from_tag,
-            to_tag,
-            a_to_b,
-            b_to_a,
-            latch,
-            None,
-        );
+        let call = MediaCall::new(call_id.to_string(), from_tag, to_tag, a_to_b, b_to_a, latch);
         // Single-leg local answer / IVR (`offer_only_restore.is_some()` is the single-leg discriminator
         // — the 2-leg echo arm leaves it `None`): its idle egress is a continuous comfort-noise stream,
         // never the caller's own audio looped back (self-echo). CN packets on the negotiated PT when
@@ -544,10 +532,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// processor now (the audio relay/transcode/SRTP path is untouched). Recording promotes text
     /// independently at `start recording`. Best-effort — a promotion failure is logged and the call
     /// still relays text in-kernel (PR-1 behaviour).
-    pub(super) async fn settle_answered_media(&self, call_id: &str, answered_before: bool) {
-        if answered_before {
+    ///
+    /// `pinned` is `Some` for the answer to a re-offer, holding the call's running recordings open
+    /// across the install (see [`Self::pin_call_recordings`]); they are re-tapped onto the new path
+    /// here and released once they are. The `record_call` streams start here too, once the media
+    /// actor is up.
+    pub(super) async fn settle_answered_media(
+        &self,
+        call_id: &str,
+        pinned: Option<super::record_call::PinnedRecordings>,
+        profile: &siphon_rtp_proto::ProfileFlags,
+    ) {
+        if let Some(pinned) = pinned {
             self.carry_holds_across_answer(call_id).await;
+            drop(pinned);
         }
+        self.start_record_call_streams(call_id, profile).await;
         self.maybe_promote_text_for_events(call_id).await;
     }
 
@@ -600,6 +600,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if self.ws_tees.contains_key(call_id) {
             self.retap_ws_tee(call_id).await;
         }
+        // Decoded recordings, the same way: their sinks lived on the actor the answer replaced.
+        // `answer` pinned their assemblers before it installed, so the files are still open here.
+        self.retap_call_recordings(call_id).await;
     }
 
     /// Release a userspace hold taken by [`Self::hold_in_userspace`] and demote the relay back to the

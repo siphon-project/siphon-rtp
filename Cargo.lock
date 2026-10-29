@@ -698,7 +698,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1138,7 +1138,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1181,9 +1181,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "linux-raw-sys"
@@ -1846,7 +1846,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1875,9 +1875,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -2041,7 +2041,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "siphon-rtp"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "bytes",
  "clap",
@@ -2082,12 +2082,12 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
 name = "siphon-rtp-codec"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "criterion",
  "iai-callgrind",
@@ -2100,7 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-datapath"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "bytes",
  "criterion",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-dsp"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "criterion",
  "proptest",
@@ -2126,7 +2126,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-dtls"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "bytes",
  "rtc-dtls",
@@ -2139,21 +2139,21 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-ebpf-common"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "siphon-rtp-hep"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "siphon-rtp-ice"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "criterion",
  "proptest",
@@ -2163,7 +2163,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-li"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "criterion",
  "tempfile",
@@ -2171,7 +2171,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-loadgen"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "clap",
  "futures-util",
@@ -2188,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-media"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "bytes",
  "criterion",
@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-ngcompat"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "siphon-rtp-proto",
  "thiserror 2.0.21",
@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "proptest",
  "serde",
@@ -2229,14 +2229,14 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-simd"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "siphon-rtp-srtp"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "aes",
  "base64 0.23.1",
@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-stun"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "criterion",
  "getrandom 0.3.4",
@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-turn"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "bytes",
  "criterion",
@@ -2395,7 +2395,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2536,9 +2536,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -2903,14 +2903,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -2937,7 +2937,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
