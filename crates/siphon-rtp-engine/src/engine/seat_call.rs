@@ -25,9 +25,7 @@ use siphon_rtp_proto::{CmdResult, ConferenceRole, Event, MediaTimeoutReason};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
-use crate::conference::{
-    ConferenceControl, ParticipantConfig, SeatActivation, SeatTelemetry, SeatedCall,
-};
+use crate::conference::{ParticipantConfig, SeatActivation, SeatTelemetry, SeatedCall};
 use crate::dtls_bridge::PipelineTarget;
 use crate::sdp;
 use crate::srtp_bridge::BridgeLeg;
@@ -598,11 +596,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             for (egress, sink) in sinks {
                 let attached = self
                     .conference
-                    .ask(conference_id, |reply| ConferenceControl::AddSeatTap {
-                        tag: tag.to_string(),
-                        egress,
-                        sink,
-                        reply,
+                    .ask(conference_id, |reply| {
+                        crate::conference::SeatControl::AddSeatTap {
+                            tag: tag.to_string(),
+                            egress,
+                            sink,
+                            reply,
+                        }
                     })
                     .await;
                 if attached != Some(true) {

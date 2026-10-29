@@ -7,7 +7,7 @@ use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_proto::{CmdResult, Event, PlayEndReason, PlayMediaSource, PlayRepeat};
 use std::sync::Arc;
 
-use crate::conference::{ConferenceControl, ConferenceRegistry};
+use crate::conference::ConferenceRegistry;
 use crate::media_fetch::{self, MediaFetchLimits};
 use crate::media_pipeline::{MediaControl, MediaRegistry, PlayRequest};
 
@@ -178,14 +178,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // The seat's own prompt, mixed into what it hears; its end is reported for the call.
             let started = self
                 .conference
-                .ask(&conference_id, |reply| ConferenceControl::SeatPlay {
-                    tag,
-                    request: Box::new(request),
-                    overlay: options.overlay,
-                    gain,
-                    play_id,
-                    duration_cap_ms: options.duration_ms,
-                    reply,
+                .ask(&conference_id, |reply| {
+                    crate::conference::SeatControl::SeatPlay {
+                        tag,
+                        request: Box::new(request),
+                        overlay: options.overlay,
+                        gain,
+                        play_id,
+                        duration_cap_ms: options.duration_ms,
+                        reply,
+                    }
                 })
                 .await;
             return match started {
@@ -389,10 +391,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
             let stopped = self
                 .conference
-                .ask(&conference_id, |reply| ConferenceControl::SeatStopPlay {
-                    tag,
-                    play_id,
-                    reply,
+                .ask(&conference_id, |reply| {
+                    crate::conference::SeatControl::SeatStopPlay {
+                        tag,
+                        play_id,
+                        reply,
+                    }
                 })
                 .await
                 == Some(true);
@@ -461,11 +465,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let gain = Gain::from_decibels(gain_decibels);
             return if self
                 .conference
-                .ask(&conference_id, |reply| ConferenceControl::SeatPlayGain {
-                    tag,
-                    play_id,
-                    gain,
-                    reply,
+                .ask(&conference_id, |reply| {
+                    crate::conference::SeatControl::SeatPlayGain {
+                        tag,
+                        play_id,
+                        gain,
+                        reply,
+                    }
                 })
                 .await
                 == Some(true)
@@ -613,14 +619,16 @@ async fn fetch_and_start(
 
     if let Some((conference_id, tag)) = request.seat.clone() {
         return match conference
-            .ask(&conference_id, |reply| ConferenceControl::SeatPlay {
-                tag,
-                request: Box::new(PlayRequest::Pcm(Box::new(player))),
-                overlay: request.options.overlay,
-                gain,
-                play_id: request.play_id,
-                duration_cap_ms: request.options.duration_ms,
-                reply,
+            .ask(&conference_id, |reply| {
+                crate::conference::SeatControl::SeatPlay {
+                    tag,
+                    request: Box::new(PlayRequest::Pcm(Box::new(player))),
+                    overlay: request.options.overlay,
+                    gain,
+                    play_id: request.play_id,
+                    duration_cap_ms: request.options.duration_ms,
+                    reply,
+                }
             })
             .await
         {

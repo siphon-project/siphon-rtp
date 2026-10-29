@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! `conference_seat`: a live call's leg seated in a room where it stands — a subscriber merging two
 //! calls into a three-way call, each far party staying on the engine port it already uses.
 //!

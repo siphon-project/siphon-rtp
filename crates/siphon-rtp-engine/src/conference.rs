@@ -54,8 +54,10 @@ use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 
 mod bridge;
 pub mod seat;
+mod seating;
 pub use bridge::UnbridgeRefusal;
 pub use seat::{SeatRefusal, SEAT_VERDICT_TIMEOUT};
+pub use seating::{ReleasedSeat, SeatActivation, SeatControl, SeatedCall};
 
 /// The narrowband fast-path room rate (all-G.711/G.726/PSTN, unbridged).
 pub const NARROWBAND_RATE_HZ: u32 = 8_000;
@@ -198,34 +200,6 @@ pub struct ParticipantTextConfig {
 pub struct SeatTelemetry {
     pub local: Option<SocketAddr>,
     pub sip_call_id: Option<String>,
-}
-
-/// What a seat carries when it is a leg of a **live call** moved into the room by
-/// `conference_seat`, rather than a participant that joined: the call it still belongs to, where that
-/// call's events go, and whether the leg multiplexes RTCP onto its RTP port.
-#[derive(Clone, Debug)]
-pub struct SeatedCall {
-    /// The engine key of the call the seated leg belongs to. Events the seat raises name this call,
-    /// with the room beside it, so the controller's correlation keeps working across the move.
-    pub call_id: String,
-    /// The call owner's event sink. A seated leg's events go to the client that owns its call, which
-    /// need not be the client whose join created the room.
-    pub events: Option<flume::Sender<Event>>,
-    /// Whether the room may send this leg RTCP on its RTP port. `false` for a leg whose call never
-    /// negotiated `a=rtcp-mux` (RFC 5761 §5.1.1): such a peer expects RTCP on its RTCP port only.
-    pub rtcp_mux: bool,
-}
-
-/// What opens a live call's pending seat ([`Conference::activate_participant`]): what the engine read
-/// off the call's previous media owner once it had stopped, so the seat carries on exactly where the
-/// call left off.
-pub struct SeatActivation {
-    /// The leg's SRTP contexts, rollover and replay state included, when the leg is secure.
-    pub secure: Option<SecureLeg>,
-    /// The source gate that was in force on the leg (RTPBleed defence, docs/security-and-nat.md §4).
-    pub accepted_source: SourceFilter,
-    /// Where the leg's party receives: the latched source when one was, else the signalled address.
-    pub egress_dst: SocketAddr,
 }
 
 /// Everything the engine resolves from a participant's SDP offer/answer to seat them in a room.
@@ -391,37 +365,8 @@ struct Participant {
     routing: Routing,
     /// Whether the first egress packet has been emitted (sets the RTP marker bit, RFC 3550 §5.1).
     started: bool,
-    /// The call this seat is a leg of, when `conference_seat` moved it in.
-    call: Option<SeatedCall>,
-    /// `silence_media` on a seated call: the seat hears encoded silence instead of the mix.
-    egress_silenced: bool,
-    /// `block_media` on a seated call: the room sends the seat nothing (its egress clock still runs,
-    /// so the stream resumes with a timestamp jump rather than a rewound clock, RFC 3550 §5.1).
-    egress_blocked: bool,
-    /// A seated call's recording taps on what the party sends, at its native rate.
-    ingress_taps: Vec<Box<dyn MediaSink>>,
-    /// A seated call's recording taps on what the room sends the party, after its own playback.
-    egress_taps: Vec<Box<dyn MediaSink>>,
-    /// A seated call's own prompts (`play_media` on the call), mixed into what it hears.
-    playback: Option<Box<SeatPlayback>>,
-}
-
-/// Prompts played to one seat (`play_media` on a seated call): an overlay bus at the seat's native
-/// rate, one tick a frame. A non-overlay prompt *replaces* the room's mix while it plays, as a
-/// superseding prompt replaces a call's egress; overlays mix under it.
-struct SeatPlayback {
-    bus: OverlayBus,
-    finished: Vec<FinishedPlayback>,
-    /// The superseding prompt playing now, if any.
-    replacing: Option<u64>,
-}
-
-/// What a seated participant hands back when it leaves the room ([`Conference::take_participant`]).
-pub struct ReleasedSeat {
-    /// Its SRTP contexts, rollover and replay state included; `None` for a plaintext seat.
-    pub secure: Option<SecureLeg>,
-    /// Its recording taps, `true` for one on what it hears, so its call can keep the recordings.
-    pub taps: Vec<(bool, Box<dyn MediaSink>)>,
+    /// What a live call's seated leg carries besides its media ([`seating::CallSeatState`]).
+    call_seat: seating::CallSeatState,
 }
 
 /// What [`Conference::tick`] reports about the active (dominant) speaker.
@@ -750,12 +695,7 @@ impl Conference {
             ice_pending: config.ice_pending,
             routing: config.routing,
             started: false,
-            call: config.call,
-            egress_silenced: false,
-            egress_blocked: false,
-            ingress_taps: Vec::new(),
-            egress_taps: Vec::new(),
-            playback: None,
+            call_seat: seating::CallSeatState::new(config.call),
         });
         self.recompute_room_rate();
         Ok(())
@@ -764,251 +704,6 @@ impl Conference {
     /// Remove a participant by tag. Returns `true` if it was seated.
     pub fn remove_participant(&mut self, tag: &str) -> bool {
         self.take_participant(tag).is_some()
-    }
-
-    /// Tap one seat: `egress` taps what the room sends it, otherwise what it sends. Returns whether
-    /// the tag was seated.
-    pub fn add_seat_tap(&mut self, tag: &str, egress: bool, sink: Box<dyn MediaSink>) -> bool {
-        let Some(participant) = self.participants.iter_mut().find(|seat| seat.tag == tag) else {
-            return false;
-        };
-        if egress {
-            participant.egress_taps.push(sink);
-        } else {
-            participant.ingress_taps.push(sink);
-        }
-        true
-    }
-
-    /// Detach every tap labelled `label` from one seat (a recording stopping).
-    pub fn remove_seat_taps_tagged(&mut self, tag: &str, label: &str) {
-        if let Some(participant) = self.participants.iter_mut().find(|seat| seat.tag == tag) {
-            participant
-                .ingress_taps
-                .retain(|sink| sink.tag() != Some(label));
-            participant
-                .egress_taps
-                .retain(|sink| sink.tag() != Some(label));
-        }
-    }
-
-    /// Start a prompt toward one seat at its own rate. A non-overlay prompt supersedes the one
-    /// replacing the mix now (reported `superseded`, as on a call); an overlay is refused when every
-    /// slot is taken.
-    pub fn start_seat_playback(
-        &mut self,
-        tag: &str,
-        request: PlayRequest,
-        overlay: bool,
-        gain: Gain,
-        play_id: u64,
-        duration_cap_ms: Option<u64>,
-    ) -> Result<(), String> {
-        let Some(index) = self.participants.iter().position(|seat| seat.tag == tag) else {
-            return Err("the seat has left the room".to_string());
-        };
-        let participant = &mut self.participants[index];
-        let playback = request
-            .into_playback_at(
-                participant.native_rate,
-                ROOM_TICK_MS as u32,
-                gain,
-                play_id,
-                duration_cap_ms,
-            )
-            .map_err(|error| error.to_string())?;
-        let tick_samples = participant.tick_samples;
-        let seat = participant.playback.get_or_insert_with(|| {
-            Box::new(SeatPlayback {
-                bus: OverlayBus::new(tick_samples),
-                finished: Vec::with_capacity(MAX_OVERLAY_SLOTS),
-                replacing: None,
-            })
-        });
-        if !overlay {
-            if let Some(previous) = seat.replacing.take() {
-                if let Some(finished) = seat.bus.stop(previous) {
-                    seat.finished.push(finished);
-                }
-            }
-        }
-        let started = seat.bus.start(playback).map_err(|error| error.to_string());
-        if started.is_ok() && !overlay {
-            seat.replacing = Some(play_id);
-        }
-        self.report_seat_playbacks(index, PlayEndReason::Superseded);
-        started
-    }
-
-    /// Stop one of a seat's prompts, or all of them; each reports `stopped`. Returns whether anything
-    /// was stopped.
-    pub fn stop_seat_playback(&mut self, tag: &str, play_id: Option<u64>) -> bool {
-        let Some(index) = self.participants.iter().position(|seat| seat.tag == tag) else {
-            return false;
-        };
-        let Some(seat) = self.participants[index].playback.as_mut() else {
-            return false;
-        };
-        let stopped = match play_id {
-            Some(play_id) => match seat.bus.stop(play_id) {
-                Some(finished) => {
-                    seat.finished.push(finished);
-                    true
-                }
-                None => false,
-            },
-            None => {
-                let before = seat.finished.len();
-                seat.bus.stop_all(&mut seat.finished);
-                seat.finished.len() > before
-            }
-        };
-        if seat
-            .replacing
-            .is_some_and(|replacing| !seat.bus.contains(replacing))
-        {
-            seat.replacing = None;
-        }
-        self.report_seat_playbacks(index, PlayEndReason::Stopped);
-        stopped
-    }
-
-    /// Retune one of a seat's prompts. Returns whether that prompt is playing.
-    pub fn set_seat_play_gain(&mut self, tag: &str, play_id: u64, gain: Gain) -> bool {
-        self.participants
-            .iter_mut()
-            .find(|seat| seat.tag == tag)
-            .and_then(|participant| participant.playback.as_mut())
-            .is_some_and(|seat| seat.bus.set_gain(play_id, gain))
-    }
-
-    /// Report a seat's ended prompts as [`Event::PlayFinished`] for its call, with `reason`.
-    fn report_seat_playbacks(&mut self, index: usize, reason: PlayEndReason) {
-        let participant = &mut self.participants[index];
-        let Some(seat) = participant.playback.as_mut() else {
-            return;
-        };
-        for finished in seat.finished.drain(..) {
-            let event = Event::PlayFinished {
-                call_id: participant
-                    .call
-                    .as_ref()
-                    .map_or_else(|| self.conference_id.clone(), |call| call.call_id.clone()),
-                conference_id: None,
-                from_tag: participant.tag.clone(),
-                to_tag: None,
-                play_id: finished.play_id,
-                reason,
-                played_ms: Some(finished.played_ms),
-            };
-            route_seat_event(&mut self.pending_events, participant.call.as_ref(), event);
-        }
-    }
-
-    /// What a seat hears this tick, finished in `native_out[..tick_samples]`: its own prompts mixed
-    /// in (a superseding one in place of the room's mix), then handed to its recording taps.
-    fn finish_seat_egress(&mut self, index: usize, tick_samples: usize) {
-        let mut ended = false;
-        if let Some(seat) = self.participants[index].playback.as_mut() {
-            if seat.bus.is_active() {
-                if seat.replacing.is_some() {
-                    self.native_out[..tick_samples].fill(0);
-                }
-                seat.bus
-                    .mix_into(&mut self.native_out[..tick_samples], &mut seat.finished);
-                if seat
-                    .replacing
-                    .is_some_and(|replacing| !seat.bus.contains(replacing))
-                {
-                    seat.replacing = None;
-                }
-                ended = !seat.finished.is_empty();
-            }
-        }
-        if ended {
-            self.report_seat_playbacks(index, PlayEndReason::Completed);
-        }
-        let participant = &mut self.participants[index];
-        if participant.egress_taps.is_empty() {
-            return;
-        }
-        // A blocked seat hears nothing, and that is what its recording holds.
-        let heard: &[i16] = if participant.egress_blocked {
-            &self.tap_silence[..tick_samples]
-        } else {
-            &self.native_out[..tick_samples]
-        };
-        for tap in &mut participant.egress_taps {
-            tap.write_pcm(heard);
-        }
-    }
-
-    /// Remove a participant by tag and hand back its SRTP state: `Some(leg)` for a seated
-    /// participant, whose `leg` is its [`SecureLeg`] (`None` for a plaintext seat). A seated call leg
-    /// leaving the room keeps its SRTP contexts this way, so a later seat or a renegotiation does not
-    /// restart its rollover counter while the peer's keeps counting (RFC 3711 §3.3.1).
-    pub fn take_participant(&mut self, tag: &str) -> Option<ReleasedSeat> {
-        let position = self
-            .participants
-            .iter()
-            .position(|participant| participant.tag == tag)?;
-        // Prompts still playing to the seat end with it, reported as a leg torn down mid-play.
-        if let Some(seat) = self.participants[position].playback.as_mut() {
-            seat.bus.stop_all(&mut seat.finished);
-        }
-        self.report_seat_playbacks(position, PlayEndReason::Error);
-        let participant = self.participants.remove(position);
-        // Keep the text mixer index-aligned with `participants` (removed at the same position).
-        self.text_mixer.remove_participant(position);
-        self.recompute_room_rate();
-        let taps = participant
-            .ingress_taps
-            .into_iter()
-            .map(|sink| (false, sink))
-            .chain(participant.egress_taps.into_iter().map(|sink| (true, sink)))
-            .collect();
-        Some(ReleasedSeat {
-            secure: participant.secure,
-            taps,
-        })
-    }
-
-    /// Open a seat that was taken **pending** (a live call's leg, `conference_seat`): install the
-    /// leg's SRTP state when it has one and let its audio into the mix and the mix out to it. The
-    /// engine activates a seat only once the call's previous media owner has stopped, so two owners
-    /// never send toward the party at once (RFC 3550 §5.1) nor encrypt under one key (RFC 3711 §9.1).
-    /// Returns whether the tag was seated.
-    pub fn activate_participant(&mut self, tag: &str, activation: SeatActivation) -> bool {
-        let Some(participant) = self.participants.iter_mut().find(|seat| seat.tag == tag) else {
-            return false;
-        };
-        if activation.secure.is_some() {
-            participant.secure = activation.secure;
-        }
-        participant.accepted_source = activation.accepted_source;
-        participant.egress_dst = activation.egress_dst;
-        participant.secure_pending = false;
-        true
-    }
-
-    /// Gate what the room sends one seat: `silenced` replaces the mix with encoded silence, `blocked`
-    /// sends nothing. `None` leaves that gate as it is. Returns whether the tag was seated.
-    pub fn set_egress_gate(
-        &mut self,
-        tag: &str,
-        silenced: Option<bool>,
-        blocked: Option<bool>,
-    ) -> bool {
-        let Some(participant) = self.participants.iter_mut().find(|seat| seat.tag == tag) else {
-            return false;
-        };
-        if let Some(silenced) = silenced {
-            participant.egress_silenced = silenced;
-        }
-        if let Some(blocked) = blocked {
-            participant.egress_blocked = blocked;
-        }
-        true
     }
 
     /// Live-update a participant's role / routing. Returns `true` if it was seated.
@@ -1224,10 +919,7 @@ impl Conference {
                 // A seated call leg's digit names its call (the controller's correlation key), with
                 // the room beside it; a joined seat's names the room, as it always has.
                 let digit = Event::Dtmf {
-                    call_id: participant
-                        .call
-                        .as_ref()
-                        .map_or_else(|| conference_id.to_string(), |call| call.call_id.clone()),
+                    call_id: participant.call_seat.event_call_id(conference_id),
                     from_tag: participant.tag.clone(),
                     to_tag: None,
                     conference_id: Some(conference_id.to_string()),
@@ -1237,7 +929,7 @@ impl Conference {
                     volume: -i32::from(event.volume),
                     source: None,
                 };
-                route_seat_event(&mut self.pending_events, participant.call.as_ref(), digit);
+                participant.call_seat.route(&mut self.pending_events, digit);
             }
             return Ingress::Accepted;
         }
@@ -1464,13 +1156,13 @@ impl Conference {
             };
             let quality = Event::CallQuality {
                 conference_id: Some(self.conference_id().to_string()),
-                call_id: participant.call.as_ref().map(|call| call.call_id.clone()),
+                call_id: participant.call_seat.call_id(),
                 from_tag: participant.tag.clone(),
                 jitter_ms: impairments.jitter_ms,
                 loss_percent: impairments.loss_percent,
                 mos: siphon_rtp_hep::mos::estimate_mos(participant.mos_codec, impairments),
             };
-            route_seat_event(out, participant.call.as_ref(), quality);
+            participant.call_seat.route(out, quality);
         }
     }
 
@@ -1537,13 +1229,8 @@ impl Conference {
             if self.participants[index].secure_pending || self.participants[index].ice_pending {
                 continue;
             }
-            // A seated call leg that never negotiated `a=rtcp-mux` gets no report on its RTP port
-            // (RFC 5761 §5.1.1: such a peer expects RTCP on its RTCP port alone).
-            if self.participants[index]
-                .call
-                .as_ref()
-                .is_some_and(|call| !call.rtcp_mux)
-            {
+            // RFC 5761 §5.1.1: a seated leg without `a=rtcp-mux` takes RTCP on its RTCP port only.
+            if !self.participants[index].call_seat.reports_on_rtp_port() {
                 continue;
             }
             // SRTCP-encrypt the report for a secure participant; plain legs send it as is.
@@ -1585,21 +1272,7 @@ impl Conference {
         for index in 0..count {
             self.roles[index] = self.participants[index].routing.role;
             let produced = self.next_tick_pcm(index);
-            // A seated call's recording hears what its party sent, or a tick of silence when it sent
-            // nothing — never while the seat is still pending (nothing of its is in the room yet).
-            if !self.participants[index].ingress_taps.is_empty()
-                && !self.participants[index].secure_pending
-            {
-                let tick_samples = self.participants[index].tick_samples;
-                let participant = &mut self.participants[index];
-                let said: &[i16] = match produced {
-                    Some(samples) => &self.native_in[..samples],
-                    None => &self.tap_silence[..tick_samples],
-                };
-                for tap in &mut participant.ingress_taps {
-                    tap.write_pcm(said);
-                }
-            }
+            self.tap_seat_ingress(index, produced);
             match produced {
                 Some(samples) => {
                     let room_frame = self.room_frame;
@@ -1695,11 +1368,10 @@ impl Conference {
             // listener mix, and such a leg's frames straddle tick boundaries at its own phase.
             let native_rate = self.participants[index].native_rate;
             // A silenced seat encodes silence of its own rather than sharing the listener mix.
-            let silenced = self.participants[index].egress_silenced;
+            let silenced = self.participants[index].call_seat.silenced;
             // So does a seat with a recording on what it hears or a prompt of its own.
             let shareable = !silenced
-                && self.participants[index].egress_taps.is_empty()
-                && self.participants[index].playback.is_none()
+                && !self.participants[index].call_seat.shapes_egress()
                 && !self.mixer.has_distinct_output(index)
                 && self.participants[index].stateless
                 && native_frame == tick_samples
@@ -1725,9 +1397,7 @@ impl Conference {
                 let output = self.mixer.output_for(index);
                 fill_padded(&mut self.native_out[..tick_samples], output);
             }
-            if self.participants[index].playback.is_some()
-                || !self.participants[index].egress_taps.is_empty()
-            {
+            if self.participants[index].call_seat.shapes_egress() {
                 self.finish_seat_egress(index, tick_samples);
             }
 
@@ -1807,7 +1477,7 @@ impl Conference {
         }
         // `block_media` on a seated call: nothing goes out, but the egress clock keeps running so the
         // stream resumes in step with the room (RFC 3550 §5.1).
-        if self.participants[index].egress_blocked {
+        if self.participants[index].call_seat.blocked {
             self.participants[index].leg.skip_egress_frame();
             return;
         }
@@ -2444,58 +2114,8 @@ pub enum ConferenceControl {
     /// A participant's ICE agent selected a candidate pair (RFC 8445 §8.1.1): open its media path on
     /// that pair, re-pointing egress and narrowing the source gate to the selected remote transport.
     IceSelected { tag: String, remote: SocketAddr },
-    /// Open a pending seat (a live call's leg, `conference_seat`), keying it with the leg's SRTP state
-    /// when it has one ([`Conference::activate_participant`]).
-    Activate {
-        tag: String,
-        activation: Box<SeatActivation>,
-    },
-    /// Remove a participant and hand its SRTP state back ([`Conference::take_participant`]), so a
-    /// seated call leg leaving the room keeps its contexts. `reply` carries `None` for an unknown tag.
-    Release {
-        tag: String,
-        reply: tokio::sync::oneshot::Sender<Option<ReleasedSeat>>,
-    },
-    /// Tap one seat for a recording ([`Conference::add_seat_tap`]).
-    AddSeatTap {
-        tag: String,
-        egress: bool,
-        sink: Box<dyn MediaSink>,
-        reply: tokio::sync::oneshot::Sender<bool>,
-    },
-    /// Detach a recording's taps from one seat ([`Conference::remove_seat_taps_tagged`]).
-    RemoveSeatTapsTagged { tag: String, label: String },
-    /// Play a prompt to one seat ([`Conference::start_seat_playback`]).
-    SeatPlay {
-        tag: String,
-        request: Box<PlayRequest>,
-        overlay: bool,
-        gain: Gain,
-        play_id: u64,
-        duration_cap_ms: Option<u64>,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
-    },
-    /// Stop one seat's prompt, or all of them ([`Conference::stop_seat_playback`]).
-    SeatStopPlay {
-        tag: String,
-        play_id: Option<u64>,
-        reply: tokio::sync::oneshot::Sender<bool>,
-    },
-    /// Retune one seat's prompt ([`Conference::set_seat_play_gain`]).
-    SeatPlayGain {
-        tag: String,
-        play_id: u64,
-        gain: Gain,
-        reply: tokio::sync::oneshot::Sender<bool>,
-    },
-    /// Gate what the room sends one seat ([`Conference::set_egress_gate`]). `reply` carries whether
-    /// the tag was seated.
-    EgressGate {
-        tag: String,
-        silenced: Option<bool>,
-        blocked: Option<bool>,
-        reply: tokio::sync::oneshot::Sender<bool>,
-    },
+    /// A seat operation on a live call's leg or its prompts and recording taps ([`SeatControl`]).
+    Seat(SeatControl),
     /// Tear the room down.
     Stop,
 }
@@ -2608,70 +2228,11 @@ async fn run_conference<D>(
                     ConferenceInput::Control(ConferenceControl::IceSelected { tag, remote }) => {
                         conference.ice_selected(&tag, remote);
                     }
-                    ConferenceInput::Control(ConferenceControl::Activate { tag, activation }) => {
-                        conference.activate_participant(&tag, *activation);
-                    }
-                    ConferenceInput::Control(ConferenceControl::Release { tag, reply }) => {
-                        let released = conference.take_participant(&tag);
-                        let _ = reply.send(released);
-                        if conference.is_empty() {
-                            break; // the last seat out tears the room down, as a leave does
+                    ConferenceInput::Control(ConferenceControl::Seat(control)) => {
+                        // A release that empties the room tears it down, as a leave does.
+                        if conference.apply_seat_control(control) {
+                            break;
                         }
-                    }
-                    ConferenceInput::Control(ConferenceControl::AddSeatTap {
-                        tag,
-                        egress,
-                        sink,
-                        reply,
-                    }) => {
-                        let _ = reply.send(conference.add_seat_tap(&tag, egress, sink));
-                    }
-                    ConferenceInput::Control(ConferenceControl::RemoveSeatTapsTagged {
-                        tag,
-                        label,
-                    }) => {
-                        conference.remove_seat_taps_tagged(&tag, &label);
-                    }
-                    ConferenceInput::Control(ConferenceControl::SeatPlay {
-                        tag,
-                        request,
-                        overlay,
-                        gain,
-                        play_id,
-                        duration_cap_ms,
-                        reply,
-                    }) => {
-                        let _ = reply.send(conference.start_seat_playback(
-                            &tag,
-                            *request,
-                            overlay,
-                            gain,
-                            play_id,
-                            duration_cap_ms,
-                        ));
-                    }
-                    ConferenceInput::Control(ConferenceControl::SeatStopPlay {
-                        tag,
-                        play_id,
-                        reply,
-                    }) => {
-                        let _ = reply.send(conference.stop_seat_playback(&tag, play_id));
-                    }
-                    ConferenceInput::Control(ConferenceControl::SeatPlayGain {
-                        tag,
-                        play_id,
-                        gain,
-                        reply,
-                    }) => {
-                        let _ = reply.send(conference.set_seat_play_gain(&tag, play_id, gain));
-                    }
-                    ConferenceInput::Control(ConferenceControl::EgressGate {
-                        tag,
-                        silenced,
-                        blocked,
-                        reply,
-                    }) => {
-                        let _ = reply.send(conference.set_egress_gate(&tag, silenced, blocked));
                     }
                     ConferenceInput::Control(ConferenceControl::Stop) => break,
                 }
@@ -2740,21 +2301,6 @@ async fn run_conference<D>(
                 send_all(&datapath, &mut outbound).await;
             }
         }
-    }
-}
-
-/// Deliver an event a seat raised: straight to its call owner's sink for a seated call leg, so it
-/// reaches the client that owns the call whoever created the room; staged for the room's sink for a
-/// joined participant. A full or closed sink drops it, as every event path does — late events are
-/// worthless and the room never blocks on a slow consumer.
-fn route_seat_event(staged: &mut Vec<Event>, call: Option<&SeatedCall>, event: Event) {
-    match call.and_then(|call| call.events.as_ref()) {
-        Some(sink) => {
-            if sink.try_send(event).is_err() {
-                tracing::debug!("seated call event dropped (sink full or closed)");
-            }
-        }
-        None => staged.push(event),
     }
 }
 
@@ -2908,288 +2454,6 @@ impl ConferenceRegistry {
             .iter()
             .map(|room| room.value().members.len())
             .sum()
-    }
-
-    /// Seat a participant, creating the room actor (over `datapath`, pushing events to `events`) if it
-    /// does not yet exist, and wait for the room's verdict (at most [`SEAT_VERDICT_TIMEOUT`]). A
-    /// refused participant leaves no member, route or empty room behind.
-    pub async fn join<D>(
-        &self,
-        conference_id: &str,
-        config: ParticipantConfig,
-        joined_tick: u64,
-        held: bool,
-        datapath: D,
-        events: Option<flume::Sender<Event>>,
-    ) -> Result<(), SeatRefusal>
-    where
-        D: Datapath + Clone + Send + 'static,
-    {
-        self.seat(
-            conference_id,
-            config,
-            joined_tick,
-            held,
-            datapath,
-            events,
-            true,
-        )
-        .await
-    }
-
-    /// Seat a live call's leg **pending** (`conference_seat`): the room takes the seat and answers
-    /// its verdict exactly as for a join, so every refusal is known before the call is touched, but
-    /// no datagram is routed to it and the room sends it nothing until [`Self::activate_call_seat`].
-    /// `config.secure_pending` must be set, which is what holds the seat shut in the actor.
-    pub async fn seat_call<D>(
-        &self,
-        conference_id: &str,
-        config: ParticipantConfig,
-        joined_tick: u64,
-        held: bool,
-        datapath: D,
-        events: Option<flume::Sender<Event>>,
-    ) -> Result<(), SeatRefusal>
-    where
-        D: Datapath + Clone + Send + 'static,
-    {
-        self.seat(
-            conference_id,
-            config,
-            joined_tick,
-            held,
-            datapath,
-            events,
-            false,
-        )
-        .await
-    }
-
-    /// Open a seat [`Self::seat_call`] took with the leg's SRTP state, source gate and destination,
-    /// then route its endpoint to the room. The activation is queued ahead of the first datagram the new
-    /// route delivers, so the seat is never handed media it is not yet keyed for. Returns `false`
-    /// when the seat or its room is gone, or the room's mailbox would not take the activation.
-    pub fn activate_call_seat(
-        &self,
-        conference_id: &str,
-        tag: &str,
-        activation: SeatActivation,
-    ) -> bool {
-        let Some((mailbox, endpoint)) = self.rooms.get(conference_id).and_then(|room| {
-            let endpoint = room
-                .members
-                .iter()
-                .find(|member| member.tag == tag)?
-                .endpoint;
-            Some((room.mailbox.clone(), endpoint))
-        }) else {
-            return false;
-        };
-        let activate = ConferenceControl::Activate {
-            tag: tag.to_string(),
-            activation: Box::new(activation),
-        };
-        if mailbox
-            .try_send(ConferenceInput::Control(activate))
-            .is_err()
-        {
-            return false;
-        }
-        self.routes.insert(endpoint, mailbox);
-        true
-    }
-
-    /// Take a seated call leg back out of the room (`conference_leave` on it, or the call's
-    /// `delete`), handing back its SRTP state so the call keeps its contexts. Unlike
-    /// [`Self::leave`] it returns no endpoint to free: the leg is still its call's. `None` when no
-    /// such seat exists. Tears the room down once its last seat is out.
-    pub async fn release_call_seat(&self, conference_id: &str, tag: &str) -> Option<ReleasedSeat> {
-        let (mailbox, endpoints, empty) = {
-            let mut handle = self.rooms.get_mut(conference_id)?;
-            let position = handle.members.iter().position(|member| member.tag == tag)?;
-            let member = handle.members.remove(position);
-            let mut endpoints = vec![member.endpoint];
-            endpoints.extend(member.text_endpoint);
-            (handle.mailbox.clone(), endpoints, handle.members.is_empty())
-        };
-        // Routes first, so nothing more reaches the seat while it is handed back.
-        for endpoint in &endpoints {
-            self.routes.remove(endpoint);
-        }
-        let (reply, released) = tokio::sync::oneshot::channel();
-        let released =
-            match mailbox.try_send(ConferenceInput::Control(ConferenceControl::Release {
-                tag: tag.to_string(),
-                reply,
-            })) {
-                Ok(()) => match tokio::time::timeout(SEAT_VERDICT_TIMEOUT, released).await {
-                    Ok(Ok(Some(released))) => Some(released),
-                    _ => None,
-                },
-                Err(_) => None,
-            };
-        let released = released.unwrap_or_else(|| {
-            tracing::warn!(
-                conference = %conference_id,
-                tag,
-                "conference did not hand back a released seat's SRTP state and taps"
-            );
-            ReleasedSeat {
-                secure: None,
-                taps: Vec::new(),
-            }
-        });
-        if empty {
-            if let Some((_, handle)) = self.rooms.remove(conference_id) {
-                let _ = handle
-                    .mailbox
-                    .try_send(ConferenceInput::Control(ConferenceControl::Stop));
-                handle.task.abort();
-                self.forget_bridges(conference_id, &handle.bridged_with);
-            }
-        }
-        Some(released)
-    }
-
-    /// The engine key of the call whose leg is seated as `tag` in `conference_id`, if that seat is a
-    /// `conference_seat` leg.
-    #[must_use]
-    pub fn seated_call(&self, conference_id: &str, tag: &str) -> Option<String> {
-        self.rooms.get(conference_id).and_then(|room| {
-            room.members
-                .iter()
-                .find(|member| member.tag == tag)
-                .and_then(|member| member.call_id.clone())
-        })
-    }
-
-    /// Send a control op that answers on `reply` to a room and wait for the answer (at most
-    /// [`SEAT_VERDICT_TIMEOUT`]). `None` when the room is gone or did not answer.
-    pub async fn ask<T>(
-        &self,
-        conference_id: &str,
-        control: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> ConferenceControl,
-    ) -> Option<T> {
-        let (reply, answer) = tokio::sync::oneshot::channel();
-        if !self.control(conference_id, control(reply)) {
-            return None;
-        }
-        tokio::time::timeout(SEAT_VERDICT_TIMEOUT, answer)
-            .await
-            .ok()?
-            .ok()
-    }
-
-    /// Gate what the room sends one seat (`silence_media` / `block_media` on a seated call), waiting
-    /// for the room to apply it. Returns whether the seat exists.
-    pub async fn set_egress_gate(
-        &self,
-        conference_id: &str,
-        tag: &str,
-        silenced: Option<bool>,
-        blocked: Option<bool>,
-    ) -> bool {
-        let (reply, applied) = tokio::sync::oneshot::channel();
-        if !self.control(
-            conference_id,
-            ConferenceControl::EgressGate {
-                tag: tag.to_string(),
-                silenced,
-                blocked,
-                reply,
-            },
-        ) {
-            return false;
-        }
-        matches!(
-            tokio::time::timeout(SEAT_VERDICT_TIMEOUT, applied).await,
-            Ok(Ok(true))
-        )
-    }
-
-    /// Seat a participant (see [`Self::join`]); `route` says whether its endpoints are routed to the
-    /// room now (a join) or only on activation (a live call's leg, [`Self::seat_call`]).
-    #[allow(clippy::too_many_arguments)]
-    async fn seat<D>(
-        &self,
-        conference_id: &str,
-        config: ParticipantConfig,
-        joined_tick: u64,
-        held: bool,
-        datapath: D,
-        events: Option<flume::Sender<Event>>,
-        route: bool,
-    ) -> Result<(), SeatRefusal>
-    where
-        D: Datapath + Clone + Send + 'static,
-    {
-        let endpoint = config.ingress_endpoint;
-        // A text leg's endpoint is routed to the same room actor (RFC 9071 multiparty text), so a
-        // T.140/RED datagram redirected for it reaches this room's `ingest`.
-        let text_endpoint = config.text.as_ref().map(|text| text.ingress_endpoint);
-        let tag = config.tag.clone();
-        let member = ConferenceMember {
-            tag: tag.clone(),
-            endpoint,
-            text_endpoint,
-            joined_tick,
-            held,
-            sip_call_id: config.telemetry.sip_call_id.clone(),
-            qos_codec: (config.mos_codec, config.decoder.rtp_clock_rate_hz().max(1)),
-            call_id: config.call.as_ref().map(|call| call.call_id.clone()),
-            events: events.clone(),
-        };
-        let mailbox = {
-            let mut handle = self
-                .rooms
-                .entry(conference_id.to_string())
-                .or_insert_with(|| {
-                    let (mailbox, inbox) = flume::bounded(1024);
-                    let mut conference = Conference::new(conference_id.to_string(), DEFAULT_TOP_M);
-                    conference.rtcp_tap = datapath.rtcp_tap();
-                    let task = tokio::spawn(run_conference(conference, inbox, datapath, events));
-                    ConferenceHandle {
-                        mailbox,
-                        members: Vec::new(),
-                        bridged_with: Vec::new(),
-                        task,
-                    }
-                });
-            // Refused before the room is asked, so a second join under a seated tag (or one still
-            // waiting for its verdict) cannot take the first one's member entry with it.
-            if handle.members.iter().any(|seated| seated.tag == tag) {
-                return Err(SeatRefusal::DuplicateTag(tag));
-            }
-            handle.members.push(member);
-            handle.mailbox.clone()
-        };
-        let (reply, verdict) = tokio::sync::oneshot::channel();
-        let add = ConferenceControl::Add {
-            config: Box::new(config),
-            reply,
-        };
-        // No verdict means the actor is gone, or still has not answered.
-        let seated = match mailbox.try_send(ConferenceInput::Control(add)) {
-            Ok(()) => match tokio::time::timeout(SEAT_VERDICT_TIMEOUT, verdict).await {
-                Ok(Ok(outcome)) => outcome,
-                Ok(Err(_)) | Err(_) => Err(SeatRefusal::NoVerdict),
-            },
-            Err(_) => Err(SeatRefusal::NoVerdict),
-        };
-        if let Err(refusal) = seated {
-            // `leave` also asks the actor to remove the tag, so a seat it takes after the timeout
-            // does not outlive the refused join, and it tears down a room this join created.
-            self.leave(conference_id, &tag);
-            return Err(refusal);
-        }
-        if !route {
-            return Ok(());
-        }
-        self.routes.insert(endpoint, mailbox.clone());
-        if let Some(text_endpoint) = text_endpoint {
-            self.routes.insert(text_endpoint, mailbox);
-        }
-        Ok(())
     }
 
     /// The dialog `Call-ID` a seat named when it joined, and its G.107 codec with the RTP clock rate —

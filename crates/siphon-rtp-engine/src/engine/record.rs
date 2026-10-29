@@ -967,20 +967,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let egress = !source.is_voice_of(true);
             let attached = self
                 .conference
-                .ask(&conference_id, |reply| ConferenceControl::AddSeatTap {
-                    tag: tag.clone(),
-                    egress,
-                    sink: Box::new(sink),
-                    reply,
+                .ask(&conference_id, |reply| {
+                    crate::conference::SeatControl::AddSeatTap {
+                        tag: tag.clone(),
+                        egress,
+                        sink: Box::new(sink),
+                        reply,
+                    }
                 })
                 .await;
             if attached != Some(true) {
                 self.conference.control(
                     &conference_id,
-                    ConferenceControl::RemoveSeatTapsTagged {
+                    ConferenceControl::Seat(crate::conference::SeatControl::RemoveSeatTapsTagged {
                         tag: tag.clone(),
                         label: recording_id.clone(),
-                    },
+                    }),
                 );
                 // The file was created for nothing: remove it so a refusal leaves no trace.
                 let _ = tokio::fs::remove_file(&path).await;
@@ -1137,10 +1139,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some((conference_id, tag)) = recording.seat.take() {
             self.conference.control(
                 &conference_id,
-                ConferenceControl::RemoveSeatTapsTagged {
+                ConferenceControl::Seat(crate::conference::SeatControl::RemoveSeatTapsTagged {
                     tag,
                     label: recording.recording_id.clone(),
-                },
+                }),
             );
         }
         if let Ok(mut parked) = recording.parked.lock() {
