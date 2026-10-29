@@ -274,7 +274,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 wiring.rtcp_relays(near_rtcp.id, far_rtcp.id, a_rtcp, &RtcpKeying::Pending);
         }
         let call = wiring
-            .media_call(directions, inputs.record_path)
+            .media_call(directions)
             .with_far_secure_pending()
             .with_rtcp_relays(rtcp_relays);
         self.media
@@ -343,9 +343,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             [near.rtp.id, far.rtp.id],
             "install DTLS offerer transcode redirect",
         )?;
-        let call = wiring
-            .media_call(directions, inputs.record_path)
-            .with_caller_secure_pending();
+        let call = wiring.media_call(directions).with_caller_secure_pending();
         self.media
             .register(call, self.datapath.clone(), owner_events);
         let plan = wiring.offerer_dtls_call_plan(

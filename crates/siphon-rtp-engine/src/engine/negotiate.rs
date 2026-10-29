@@ -2,7 +2,6 @@
 
 use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_datapath::{EndpointId, SourceFilter};
-use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::ProfileFlags;
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
@@ -640,7 +639,6 @@ pub(super) fn build_direction(
     egress_codec: &CodecSpec,
     telephone_event_in: Option<u8>,
     telephone_event_out: Option<u8>,
-    record_path: Option<&str>,
     noise_suppression: bool,
     echo: crate::media_pipeline::EchoProfile,
     beep_detection: bool,
@@ -661,15 +659,6 @@ pub(super) fn build_direction(
             describe_codec(egress_codec)
         )
     })?;
-    // Record at the codec's *native* PCM rate (what the decoder emits), not the RTP clock — they
-    // differ for G.722 (16 kHz audio, 8 kHz RTP clock; RFC 3551 §4.5.2), and a clock-rate WAV header
-    // would replay the recording at the wrong pitch.
-    //
-    // One channel, and that stays right even for a stereo ingress: the media path folds a
-    // multi-channel decoded frame to mono at the codec trait boundary (`downmix_to_mono`) *before*
-    // the recorder sees it, so the PCM written here is always single-channel. Only a genuinely
-    // multi-channel media path would change this, not a multi-channel codec.
-    let recorder = record_path.map(|_| WavRecorder::new(decoder.params().sample_rate_hz, 1));
     Ok(DirectionConfig {
         ingress_endpoint,
         accepted_source,
@@ -681,7 +670,6 @@ pub(super) fn build_direction(
         egress_payload_type: egress_codec.payload_type,
         telephone_event_in,
         telephone_event_out,
-        recorder,
         // The suppressor is built (and rate-gated) inside `Direction::new` from the decoder's native
         // rate; carry only the request here. Inert unless the ingress rate is 8/16 kHz.
         noise_suppression,
@@ -717,7 +705,6 @@ pub(super) struct TranscodePair<'a> {
     pub(super) far_codec: &'a CodecSpec,
     pub(super) near_telephone_event: Option<u8>,
     pub(super) far_telephone_event: Option<u8>,
-    pub(super) record_path: Option<&'a str>,
     pub(super) noise_suppression: bool,
     pub(super) echo: crate::media_pipeline::EchoProfile,
     pub(super) beep_detection: bool,
@@ -738,7 +725,6 @@ pub(super) fn build_transcode_pair(
         pair.far_codec,
         pair.near_telephone_event,
         pair.far_telephone_event,
-        pair.record_path,
         pair.noise_suppression,
         pair.echo,
         pair.beep_detection,
@@ -754,7 +740,6 @@ pub(super) fn build_transcode_pair(
         pair.near_codec,
         pair.far_telephone_event,
         pair.near_telephone_event,
-        pair.record_path,
         pair.noise_suppression,
         pair.echo,
         pair.beep_detection,
@@ -1103,8 +1088,8 @@ pub(super) fn resolve_pipeline_kind(
     // tests exactly this, and that is the point: each used to spell the list out for itself, and one
     // of them — the secure far leg — spelled a shorter one, checking only `transcode ||
     // beep_detection`. A recorded `RTP/AVP` ↔ `RTP/SAVP` call on a shared codec therefore resolved to
-    // the crypto bridge, which registers no media actor, holds no `WavRecorder` and drops
-    // `record_path`: the answer said `ok`, the audio crossed, and the recording never existed. Noise
+    // the crypto bridge, which registers no media actor and so has no decoded audio for the
+    // `record_call` streams: the answer said `ok`, the audio crossed, and the recording never existed. Noise
     // suppression and echo cancellation were inert on the same calls for the same reason. A new flag
     // is added here and nowhere else.
     let decodes_for_the_whole_call = transcode

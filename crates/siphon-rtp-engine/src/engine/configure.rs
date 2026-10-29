@@ -331,6 +331,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.ws_tees.len()
     }
 
+    /// Live decoded recordings — `start_recording` with a decoded format, room recordings, and each
+    /// party of a `record_call` recording. Drains to zero once every one has finished.
+    #[must_use]
+    pub fn recording_count(&self) -> usize {
+        self.recordings.len()
+    }
+
     /// Live WebSocket **takeover** bridges — one per bridged call (the `siphon_rtp_ws_bridges`
     /// gauge). Distinct from `ws_tee_count`, and worth watching separately: a tee is a copy of a
     /// call, a takeover bridge *is* one party's far side.

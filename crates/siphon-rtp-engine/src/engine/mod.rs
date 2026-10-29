@@ -37,6 +37,7 @@ mod offer_far;
 mod play;
 mod promote;
 mod record;
+mod record_call;
 mod reoffer;
 mod room;
 pub mod scope;
