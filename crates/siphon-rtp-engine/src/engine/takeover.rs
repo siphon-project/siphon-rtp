@@ -677,6 +677,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // the new consumer must be a clean refusal on a call that is still up, not a call left
             // redirected into nothing with its relay-restore plan already dropped.
             let socket = self.dial_ws(call_id, ws_uri).await?;
+            // A recording follows the leg to the new consumer, as it follows it onto a bot from the
+            // anchor: off the outgoing bridge before it stops, onto the new one once it is up.
+            let recordings = self.take_bridge_recordings(call_id).await;
             self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
                 .await;
             let result = self
@@ -698,6 +701,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 })
                 .await;
             if result.is_ok() {
+                self.give_bridge_recordings(call_id, recordings).await;
                 tracing::info!(
                     target: "siphon_rtp::media",
                     call_id,

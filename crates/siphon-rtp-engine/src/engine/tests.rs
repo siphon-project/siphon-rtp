@@ -51,6 +51,7 @@ mod conference_seat;
 mod offer_far;
 mod ogg_opus_recording;
 mod record_call_streams;
+mod record_handover;
 mod record_takeover;
 mod tee_undecodable;
 mod transcode_offer;
@@ -29499,8 +29500,9 @@ async fn a_bot_taking_over_a_secure_anchor_continues_its_srtp_context() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bot_is_refused_while_something_else_runs_on_the_anchor() {
-    // Stopping the pipeline would stop a running recording without a word. Refused, and the
-    // recording carries on.
+    // Stopping the pipeline would stop a pcap capture without a word: it copies the wire bytes on
+    // the actor and has nothing to follow the leg onto a bot with. Refused, and the capture carries
+    // on. (A decoded recording is carried across instead; see `record_handover`.)
     use crate::srtp_bridge::run_redirect_dispatcher;
     let engine = Engine::new(UdpLoopbackDatapath::new());
     tokio::spawn(run_redirect_dispatcher(
@@ -29531,7 +29533,7 @@ async fn a_bot_is_refused_while_something_else_runs_on_the_anchor() {
                 call_id: "busy-anchor".into(),
                 from_tag: "tag-a".into(),
                 recording_dir: Some(dir.path().to_string_lossy().into_owned()),
-                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                format: Some(siphon_rtp_proto::RecordingFormat::Pcap),
                 direction: None,
                 channels: None,
                 max_duration_ms: None,

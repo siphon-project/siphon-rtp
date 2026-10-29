@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use siphon_rtp_datapath::Datapath;
+use siphon_rtp_media::bridge::taps::TakenRecordingTaps;
 use siphon_rtp_media::bridge::tee::{TeeChannel, TeeMixer, WsTeeSink};
 use siphon_rtp_media::bridge::wire_rate::wire_resampler;
 use siphon_rtp_proto::RecordingEndReason;
@@ -278,5 +279,114 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             "recording re-tapped after renegotiation"
         );
         Ok(())
+    }
+}
+
+// ---- carrying recordings across a hand-over to and from a voice bot ----
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Whether any decoded recording is running on `call_id`.
+    fn records(&self, call_id: &str) -> bool {
+        self.recordings
+            .iter()
+            .any(|entry| entry.value().call_id == call_id && entry.value().room.is_none())
+    }
+
+    /// Take every recording sink off `call_id`'s media actor, **unfinished**, so the recording can
+    /// move with the leg instead of ending with the actor. Empty when nothing records the call.
+    ///
+    /// Only recording sinks can be there: an anchor carrying a tee, a subscription, an interception
+    /// or a pcap capture refuses the hand-over before this runs.
+    pub(super) async fn take_pipeline_recordings(&self, call_id: &str) -> TakenRecordingTaps {
+        if !self.records(call_id) {
+            return TakenRecordingTaps::default();
+        }
+        let (reply, taken) = tokio::sync::oneshot::channel();
+        if !self.media.control(
+            call_id,
+            crate::media_pipeline::MediaControl::TakeAttachments { reply },
+        ) {
+            return TakenRecordingTaps::default();
+        }
+        let Ok(carried) = taken.await else {
+            return TakenRecordingTaps::default();
+        };
+        // On a single-leg anchor the caller's audio is leg A's ingress and what the caller hears
+        // goes out on `a_to_b`; whichever slot a sink came from, it is one of those two.
+        let [forks_a, forks_b] = carried.forks;
+        let [egress_toward_a, egress_toward_b] = carried.egress_taps;
+        (
+            forks_a.into_iter().chain(forks_b).collect(),
+            egress_toward_b.into_iter().chain(egress_toward_a).collect(),
+        )
+    }
+
+    /// Put recording sinks taken from a pipeline or a bridge onto `call_id`'s single-leg media
+    /// actor: the caller's on leg A's ingress, what the caller heard on the egress that reaches it.
+    /// A sink that finds no actor is dropped, which ends its recording as the call ending would.
+    pub(super) fn give_pipeline_recordings(&self, call_id: &str, taps: TakenRecordingTaps) {
+        use crate::media_pipeline::MediaControl;
+        let (caller, heard) = taps;
+        for sink in caller {
+            self.media.control(
+                call_id,
+                MediaControl::AddFork {
+                    source_a: true,
+                    sink,
+                },
+            );
+        }
+        for sink in heard {
+            self.media.control(
+                call_id,
+                MediaControl::AddEgressFork {
+                    toward_a: false,
+                    sink,
+                },
+            );
+        }
+    }
+
+    /// Take every recording sink off `call_id`'s running bridge, unfinished. Empty when it has none
+    /// or there is no bridge.
+    pub(super) async fn take_bridge_recordings(&self, call_id: &str) -> TakenRecordingTaps {
+        use siphon_rtp_media::bridge::ws::BridgeControl;
+        if !self.records(call_id) {
+            return TakenRecordingTaps::default();
+        }
+        let Some(bridge) = self.bridge_recording_target(call_id) else {
+            return TakenRecordingTaps::default();
+        };
+        let (reply, taken) = tokio::sync::oneshot::channel();
+        if bridge
+            .control
+            .send_async(BridgeControl::TakeRecordingTaps { reply })
+            .await
+            .is_err()
+        {
+            return TakenRecordingTaps::default();
+        }
+        taken.await.unwrap_or_default()
+    }
+
+    /// Put recording sinks onto `call_id`'s running bridge. A sink with no bridge to take it is
+    /// dropped, which ends its recording.
+    pub(super) async fn give_bridge_recordings(&self, call_id: &str, taps: TakenRecordingTaps) {
+        use siphon_rtp_media::bridge::taps::TapSide;
+        use siphon_rtp_media::bridge::ws::BridgeControl;
+        let (caller, heard) = taps;
+        let Some(bridge) = self.bridge_recording_target(call_id) else {
+            return;
+        };
+        let sides = caller
+            .into_iter()
+            .map(|sink| (TapSide::Caller, sink))
+            .chain(heard.into_iter().map(|sink| (TapSide::Heard, sink)));
+        for (side, sink) in sides {
+            let _ = bridge
+                .control
+                .send_async(BridgeControl::AddRecordingTap { side, sink })
+                .await;
+        }
     }
 }
