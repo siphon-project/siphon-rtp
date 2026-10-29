@@ -897,6 +897,7 @@ async fn conference_dial_out(engine: &Engine<UdpLoopbackDatapath>, index: usize)
                 conference_id: room.clone(),
                 from_tag: "dialled".into(),
                 sdp: sdp_for("198.51.100.2", 41_002),
+                received_from: None,
             },
         )
         .await;
@@ -942,6 +943,7 @@ async fn conference_dial_out(engine: &Engine<UdpLoopbackDatapath>, index: usize)
                 conference_id: room.clone(),
                 from_tag: "refused".into(),
                 sdp: "not sdp".into(),
+                received_from: None,
             },
         )
         .await;

@@ -50,6 +50,7 @@ async fn answer_seat(
                 conference_id: conference_id.into(),
                 from_tag: from_tag.into(),
                 sdp,
+                received_from: None,
             },
         )
         .await
