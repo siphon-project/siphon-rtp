@@ -21,6 +21,14 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   raises `media_timeout` for the call without being freed. `conference_leave` hands the leg back to
   its call on the same endpoint. The room marks its first packet toward the seat and sends an RTCP
   `BYE` for the stream it replaces. Advertised as `conference_seat` in `node_info` features.
+- **A recorded call can be merged.** A decoded `wav` or `ogg_opus` recording running on a call
+  carries over when its leg is seated: same `recording_id`, same file, no gap. It keeps recording
+  that party, its voice on its own channel and what the room sends it on the other, survives a
+  `conference_leave`, and `recording_finished` fires once, when it is stopped or the call deleted,
+  with a duration spanning the move. On a seated call `start_recording`, `stop_recording`,
+  `play_media`, `stop_media` and `set_play_gain` act on the seat. A pcap recording, tee, WebSocket
+  bridge, interception, subscription, DTMF block or echo mode still refuses the seat, and the reason
+  names which.
 - **A joined conference seat the idle sweep reaps is now reported**, as a `media_timeout` with an
   empty `call_id`, the room's `conference_id` and the seat's tag, to the client whose join seated it.
   It used to vanish with no event at all.

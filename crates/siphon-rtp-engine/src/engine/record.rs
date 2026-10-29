@@ -55,6 +55,52 @@ pub(super) struct AudioRecording {
     /// declaring zero samples, or an Ogg file missing its last page. It is ended by closing its
     /// input, and then awaited.
     pub(super) writer: tokio::task::JoinHandle<()>,
+    /// How a call recording is fed: what lets `conference_seat` rebuild its sinks on a room seat
+    /// when the leg moves, so the same file goes on. `None` for a room recording.
+    pub(super) taps: Option<RecordingTaps>,
+    /// The room seat (`conference_id`, tag) carrying this recording's sinks, once its call's leg was
+    /// seated.
+    pub(super) seat: Option<(String, String)>,
+    /// The recording's sinks while its leg is out of a room again (`conference_leave`): held here so
+    /// the file stays open, and dropped when the recording stops.
+    /// Behind a mutex only because a sink is `Send` but not `Sync`, and the registry is shared.
+    pub(super) parked: std::sync::Mutex<Vec<Box<dyn siphon_rtp_media::fanout::MediaSink>>>,
+}
+
+/// What a call recording taps and into what, so its sinks can be rebuilt on another owner of the
+/// same leg without closing the file.
+///
+/// The frame assembler is held **weakly**: only the sinks keep it alive, which is what stops a
+/// recording (dropping them closes the writer's input). A rebuilt sink upgrades it while the old
+/// sinks still hold it, and the assembler counts sinks per channel, so the handover never closes a
+/// channel and the file has neither a gap nor a second header.
+pub(super) struct RecordingTaps {
+    pub(super) mixer: std::sync::Weak<std::sync::Mutex<siphon_rtp_media::bridge::tee::TeeMixer>>,
+    /// The recording's PCM rate: a rebuilt sink converts the leg's native rate into it.
+    pub(super) rate: u32,
+    /// Each sink: what it taps, and the file channel it writes.
+    pub(super) layout: Vec<(TapSource, siphon_rtp_media::bridge::tee::TeeChannel)>,
+}
+
+/// What one recording sink taps, in the call's terms (`a` is the near party, the caller).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TapSource {
+    /// What party A (`true`) or B sent.
+    Ingress { source_a: bool },
+    /// What the engine sent toward party A (`true`) or B.
+    Egress { toward_a: bool },
+}
+
+impl TapSource {
+    /// Whether this sink carries the voice of the party `party_is_a` names (rather than what it
+    /// hears). On a two-party call what one party hears is what the other said, so "what B was sent"
+    /// is A's voice, and "what B said" is what A hears.
+    pub(super) fn is_voice_of(self, party_is_a: bool) -> bool {
+        match self {
+            TapSource::Ingress { source_a } => source_a == party_is_a,
+            TapSource::Egress { toward_a } => toward_a != party_is_a,
+        }
+    }
 }
 
 impl AudioRecording {
@@ -242,6 +288,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         // Every crypto bridge carries ciphertext on the wire (the SDES and DTLS bridges, facing either
         // party), as does a secure transcode, and a WS-bridged call carries no two-party media at all.
+        if pipeline == PipelineKind::Seated {
+            return error_result(
+                "start_recording",
+                &"a seated call leg is recorded decoded (format wav or ogg_opus); its packets are \
+                  the room's, not a relay a pcap can capture",
+            );
+        }
         if pipeline.is_crypto_bridge()
             || matches!(pipeline, PipelineKind::SrtpMedia | PipelineKind::Ws)
         {
@@ -447,6 +500,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .begin_bridged_wav_recording(call_id, from_tag, request)
                 .await;
         }
+        // A seated leg's media is the room's: the recording taps the seat.
+        if pipeline == PipelineKind::Seated {
+            return self.begin_seat_recording(call_id, from_tag, request).await;
+        }
 
         let (near_codec, far_codec, two_leg, to_tag, owner) = self
             .owned_call_internal(call_id, |call| {
@@ -566,6 +623,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         .await?;
 
         let plan = plan_ws_tee(format, two_sources, callee_only);
+        let layout: Vec<(TapSource, TeeChannel)> = taps
+            .iter()
+            .map(|(is_ingress, source_a, channel, _)| {
+                let source = if *is_ingress {
+                    TapSource::Ingress {
+                        source_a: *source_a,
+                    }
+                } else {
+                    TapSource::Egress {
+                        toward_a: *source_a,
+                    }
+                };
+                (source, *channel)
+            })
+            .collect();
+        let mixer = Arc::downgrade(&plan.mixer);
         let mut ingress_legs = Vec::new();
         let mut egress_legs = Vec::new();
         for (is_ingress, source_a, channel, resampler) in taps {
@@ -631,6 +704,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 bridge_taps: Vec::new(),
                 source_reason,
                 writer,
+                taps: Some(RecordingTaps {
+                    mixer,
+                    rate,
+                    layout,
+                }),
+                seat: None,
+                parked: std::sync::Mutex::new(Vec::new()),
             },
         );
         Ok(recording_id)
@@ -739,6 +819,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         .await?;
 
         let plan = plan_ws_tee(format, two_parties, !record_caller);
+        let layout: Vec<(TapSource, TeeChannel)> = taps
+            .iter()
+            .map(|(channel, ..)| {
+                (
+                    TapSource::Ingress {
+                        source_a: *channel == TeeChannel::Caller,
+                    },
+                    *channel,
+                )
+            })
+            .collect();
+        let mixer = Arc::downgrade(&plan.mixer);
         let mut bridge_taps = Vec::new();
         for (channel, endpoint, decoder, payload_type, resampler) in taps {
             let sink = WsTeeSink::new(channel, plan.mixer.clone(), recording_id.clone(), resampler);
@@ -786,6 +878,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 bridge_taps,
                 source_reason,
                 writer,
+                taps: Some(RecordingTaps {
+                    mixer,
+                    rate,
+                    layout,
+                }),
+                seat: None,
+                parked: std::sync::Mutex::new(Vec::new()),
             },
         );
         tracing::info!(
@@ -795,6 +894,137 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             channels,
             sample_rate = rate,
             "decoded recording started on a crypto bridge"
+        );
+        Ok(recording_id)
+    }
+
+    /// Stand a decoded recording up on a call whose leg is **seated** in a room: its sinks tap the
+    /// seat in the room actor — what the party sends, and what the room sends it (its own prompts
+    /// included). In the call's terms the seated party is the caller (its one, near, leg), so a
+    /// stereo file puts its voice left and what it hears right, exactly as on a single-party call.
+    async fn begin_seat_recording(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        request: DecodedRecordingRequest,
+    ) -> Result<String, String> {
+        use siphon_rtp_media::bridge::protocol::{Encoding, Endianness, MediaFormat};
+        use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
+
+        let (conference_id, tag) = self
+            .seated_room(call_id)
+            .ok_or_else(|| "the call's leg is not seated in a room".to_string())?;
+        let (codec, to_tag, owner) = self
+            .owned_call_internal(call_id, |call| {
+                (call.near_codec.clone(), call.to_tag.clone(), call.owner)
+            })
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        let codec = codec.ok_or_else(|| "the seat has no negotiated codec".to_string())?;
+        let rate = pcm_rate_of(&codec)?;
+        let layout: Vec<(TapSource, TeeChannel)> = match request.direction {
+            RecordingDirection::Ingress => {
+                vec![(TapSource::Ingress { source_a: true }, TeeChannel::Caller)]
+            }
+            RecordingDirection::Egress => {
+                vec![(TapSource::Egress { toward_a: true }, TeeChannel::Callee)]
+            }
+            RecordingDirection::Both => vec![
+                (TapSource::Ingress { source_a: true }, TeeChannel::Caller),
+                (TapSource::Egress { toward_a: true }, TeeChannel::Callee),
+            ],
+        };
+        let two_sources = layout.len() == 2;
+        let callee_only = !two_sources && layout[0].1 == TeeChannel::Callee;
+        // The party and the room are the two sides of the conversation, so a stereo file of both is
+        // honoured as on a two-party call.
+        let channels: u8 = if two_sources && matches!(request.channels, RecordingChannels::Stereo) {
+            2
+        } else {
+            1
+        };
+        let format = MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: rate,
+            channels,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime: 20,
+        };
+        let encoding = request.format.encoding(rate, channels)?;
+        let recording_id = self.next_recording_id();
+        let (path, file) = open_recording_output(
+            call_id,
+            &recording_id,
+            request.format.extension(),
+            request.path,
+            request.recording_dir,
+        )
+        .await?;
+        let plan = plan_ws_tee(format, two_sources, callee_only);
+        let mixer = Arc::downgrade(&plan.mixer);
+        for (source, channel) in &layout {
+            let sink = WsTeeSink::new(*channel, plan.mixer.clone(), recording_id.clone(), None);
+            let egress = !source.is_voice_of(true);
+            let attached = self
+                .conference
+                .ask(&conference_id, |reply| ConferenceControl::AddSeatTap {
+                    tag: tag.clone(),
+                    egress,
+                    sink: Box::new(sink),
+                    reply,
+                })
+                .await;
+            if attached != Some(true) {
+                self.conference.control(
+                    &conference_id,
+                    ConferenceControl::RemoveSeatTapsTagged {
+                        tag: tag.clone(),
+                        label: recording_id.clone(),
+                    },
+                );
+                // The file was created for nothing: remove it so a refusal leaves no trace.
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err("the seat's room did not take the recording".to_string());
+            }
+        }
+        let source_reason = new_source_reason();
+        let writer = self.spawn_recording_writer(RecordingWriter {
+            owner,
+            call_id: call_id.to_string(),
+            from_tag: from_tag.to_string(),
+            to_tag,
+            recording_id: recording_id.clone(),
+            path: path.clone(),
+            file,
+            rate,
+            channels,
+            encoding,
+            limits: request.limits,
+            frames: plan.frames,
+            recycle: plan.recycle,
+            source_reason: source_reason.clone(),
+        });
+        self.recordings.insert(
+            recording_id.clone(),
+            AudioRecording {
+                recording_id: recording_id.clone(),
+                call_id: call_id.to_string(),
+                owner,
+                path,
+                ingress_legs: Vec::new(),
+                egress_legs: Vec::new(),
+                room: None,
+                bridge_taps: Vec::new(),
+                source_reason,
+                writer,
+                taps: Some(RecordingTaps {
+                    mixer,
+                    rate,
+                    layout,
+                }),
+                seat: Some((conference_id, tag)),
+                parked: std::sync::Mutex::new(Vec::new()),
+            },
         );
         Ok(recording_id)
     }
@@ -899,9 +1129,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// and awaiting it is what makes the event ordering a guarantee
     /// rather than a race for a controller that stops a recording and immediately reads the file.
     pub(super) async fn stop_wav_recording(&self, recording_id: &str, reason: RecordingEndReason) {
-        let Some((_, recording)) = self.recordings.remove(recording_id) else {
+        let Some((_, mut recording)) = self.recordings.remove(recording_id) else {
             return;
         };
+        // Sinks a seated leg carried (or parked when it left its room) are this recording's to
+        // release: off the seat, out of the call, before the writer is awaited.
+        if let Some((conference_id, tag)) = recording.seat.take() {
+            self.conference.control(
+                &conference_id,
+                ConferenceControl::RemoveSeatTapsTagged {
+                    tag,
+                    label: recording.recording_id.clone(),
+                },
+            );
+        }
+        if let Ok(mut parked) = recording.parked.lock() {
+            parked.clear();
+        }
         if let Ok(mut stored) = recording.source_reason.lock() {
             *stored = reason;
         }

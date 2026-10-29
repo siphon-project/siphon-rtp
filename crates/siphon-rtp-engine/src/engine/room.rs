@@ -1130,6 +1130,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 bridge_taps: Vec::new(),
                 source_reason,
                 writer,
+                taps: None,
+                seat: None,
+                parked: std::sync::Mutex::new(Vec::new()),
             },
         );
         CmdResult::Ok {

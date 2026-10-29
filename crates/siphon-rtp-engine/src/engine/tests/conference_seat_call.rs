@@ -1011,3 +1011,593 @@ async fn a_dtls_srtp_leg_is_seated_with_its_association_intact() {
         "the far party decrypts the mix with the same association"
     );
 }
+
+// ---- Recording and playback across the seat -------------------------------------------------
+
+/// A decoded `start_recording` on `call_id`, labelled with the leg `from_tag`.
+fn start_recording_command(
+    call_id: &str,
+    from_tag: &str,
+    directory: &std::path::Path,
+    format: RecordingFormat,
+    direction: siphon_rtp_proto::RecordingDirection,
+    channels: siphon_rtp_proto::RecordingChannels,
+) -> Command {
+    Command::StartRecording {
+        call_id: call_id.into(),
+        from_tag: from_tag.into(),
+        recording_dir: Some(directory.to_string_lossy().into_owned()),
+        format: Some(format),
+        direction: Some(direction),
+        channels: Some(channels),
+        max_duration_ms: None,
+        silence_ms: None,
+        path: None,
+        bitrate_bps: None,
+    }
+}
+
+fn recording_id_of(result: &CmdResult) -> String {
+    match result {
+        CmdResult::Ok {
+            recording_id: Some(id),
+            ..
+        } => id.clone(),
+        other => panic!("expected a recording id, got {other:?}"),
+    }
+}
+
+/// Every `recording_finished` that arrives on `events` within `window`.
+async fn recordings_finished(
+    events: &flume::Receiver<Event>,
+    window: Duration,
+) -> Vec<(
+    String,
+    String,
+    Option<String>,
+    u64,
+    siphon_rtp_proto::RecordingEndReason,
+)> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut finished = Vec::new();
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv_async()).await {
+        if let Event::RecordingFinished {
+            call_id,
+            recording_id,
+            path,
+            duration_ms,
+            reason,
+            ..
+        } = event
+        {
+            finished.push((call_id, recording_id, path, duration_ms, reason));
+        }
+    }
+    finished
+}
+
+/// Send one 20 ms frame from each of `senders`, paced in real time, `frames` times.
+async fn paced(senders: &[(&UdpSocket, SocketAddr, u32, u8)], first_sequence: u16, frames: u16) {
+    for frame in 0..frames {
+        let sequence = first_sequence.wrapping_add(frame);
+        for (socket, to, ssrc, level) in senders {
+            socket
+                .send_to(&g711_rtp(0, sequence, *ssrc, *level), *to)
+                .await
+                .expect("send");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A WAV file's channel count and interleaved samples.
+fn read_wav(path: &str) -> (u16, Vec<i16>) {
+    let bytes = std::fs::read(path).expect("read wav");
+    assert_eq!(&bytes[0..4], b"RIFF");
+    let channels = u16::from_le_bytes([bytes[22], bytes[23]]);
+    let mut offset = 12;
+    while offset + 8 <= bytes.len() {
+        let id = &bytes[offset..offset + 4];
+        let len = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        if id == b"data" {
+            let data = &bytes[offset + 8..(offset + 8 + len).min(bytes.len())];
+            let samples = data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| i16::from_le_bytes(*pair))
+                .collect();
+            return (channels, samples);
+        }
+        offset += 8 + len;
+    }
+    panic!("no data chunk in {path}");
+}
+
+/// Per 20 ms window of an 8 kHz stereo file: (left energy, right energy).
+fn stereo_windows(samples: &[i16]) -> Vec<(i64, i64)> {
+    samples
+        .as_chunks::<320>()
+        .0
+        .iter()
+        .map(|window| {
+            let (mut left, mut right) = (0i64, 0i64);
+            for pair in window.as_chunks::<2>().0 {
+                left += i64::from(pair[0]) * i64::from(pair[0]);
+                right += i64::from(pair[1]) * i64::from(pair[1]);
+            }
+            (left, right)
+        })
+        .collect()
+}
+
+/// A both-direction stereo recording of a two-party call carries over when the far leg is seated:
+/// same recording id, one file, a duration spanning the move. After it, the far party's own voice
+/// stays on its (right) channel and what the room sends it lands on the other (left), and
+/// `recording_finished` fires once, when the recording is stopped.
+async fn a_recording_carries_over_a_seat(format: RecordingFormat) {
+    let engine = engine_with_dispatcher();
+    let events = engine.register_client(CLIENT);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let x = plain_call(&engine, "call-x", |addr| sdp_for(addr, true)).await;
+    let recording = recording_id_of(
+        &engine
+            .handle(
+                CLIENT,
+                start_recording_command(
+                    "call-x",
+                    "call-x-near",
+                    directory.path(),
+                    format,
+                    siphon_rtp_proto::RecordingDirection::Both,
+                    siphon_rtp_proto::RecordingChannels::Stereo,
+                ),
+            )
+            .await,
+    );
+    // Before the move: the subscriber talks, the far party is quiet.
+    paced(
+        &[
+            (&x.near_phone, x.engine_near, 0x0A0A_0001, LOUD),
+            (&x.far_phone, x.engine_far, 0x0B0B_0001, QUIET),
+        ],
+        0,
+        25,
+    )
+    .await;
+
+    let seated = seat(&engine, "call-x", "call-x-far", "room-1").await;
+    assert!(matches!(seated, CmdResult::Ok { .. }), "{seated:?}");
+    let (z_phone, engine_z) = join_third_party(&engine, "room-1", "joiner").await;
+    assert!(
+        recordings_finished(&events, Duration::from_millis(50))
+            .await
+            .is_empty(),
+        "the seat does not end the recording"
+    );
+    // The far party talks alone, then the joiner talks alone.
+    paced(
+        &[
+            (&x.far_phone, x.engine_far, 0x0B0B_0001, LOUD),
+            (&z_phone, engine_z, 0x0C0C_0001, QUIET),
+        ],
+        25,
+        40,
+    )
+    .await;
+    paced(
+        &[
+            (&x.far_phone, x.engine_far, 0x0B0B_0001, QUIET),
+            (&z_phone, engine_z, 0x0C0C_0001, LOUD),
+        ],
+        65,
+        40,
+    )
+    .await;
+
+    let stopped = engine
+        .handle(
+            CLIENT,
+            Command::StopRecording {
+                call_id: "call-x".into(),
+                from_tag: "call-x-far".into(),
+                recording_id: Some(recording.clone()),
+            },
+        )
+        .await;
+    assert!(matches!(stopped, CmdResult::Ok { .. }), "{stopped:?}");
+    let finished = recordings_finished(&events, Duration::from_millis(300)).await;
+    assert_eq!(finished.len(), 1, "one recording_finished: {finished:?}");
+    let (call_id, recording_id, path, duration_ms, reason) = finished[0].clone();
+    assert_eq!(call_id, "call-x");
+    assert_eq!(recording_id, recording);
+    assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::Stopped);
+    assert!(
+        duration_ms >= 1_600,
+        "the duration spans the move (0.5 s before, 1.6 s after): {duration_ms} ms"
+    );
+    let files: Vec<_> = std::fs::read_dir(directory.path())
+        .expect("dir")
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(files.len(), 1, "one file, no second one for the seat");
+    let path = path.expect("a path");
+    if format == RecordingFormat::Wav {
+        let (channels, samples) = read_wav(&path);
+        assert_eq!(channels, 2, "still stereo");
+        let windows = stereo_windows(&samples);
+        let loud = 1_000_000_i64 * 160;
+        let quiet = loud / 100;
+        let far_alone = windows
+            .iter()
+            .position(|(left, right)| *right > loud && *left < quiet)
+            .expect("the far party's voice on its own (right) channel after the move");
+        assert!(
+            windows[far_alone..]
+                .iter()
+                .any(|(left, right)| *left > loud && *right < quiet),
+            "and then the room's mix (the joiner) on the other (left) channel"
+        );
+    } else {
+        let bytes = std::fs::read(&path).expect("read");
+        assert_eq!(&bytes[..4], b"OggS", "a valid Ogg stream");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wav_recording_carries_over_a_seat() {
+    a_recording_carries_over_a_seat(RecordingFormat::Wav).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ogg_opus_recording_carries_over_a_seat() {
+    a_recording_carries_over_a_seat(RecordingFormat::OggOpus).await;
+}
+
+/// `start_recording`, `play_media`, `stop_media` and `stop_recording` addressed to a seated call act
+/// on its seat: the party hears the prompt from its own port, `play_finished` names the call, and the
+/// recording captures what the seat heard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seated_call_records_and_plays_on_its_seat() {
+    let engine = engine_with_dispatcher();
+    let events = engine.register_client(CLIENT);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let x = plain_call(&engine, "call-x", |addr| sdp_for(addr, true)).await;
+    assert!(matches!(
+        seat(&engine, "call-x", "call-x-far", "room-1").await,
+        CmdResult::Ok { .. }
+    ));
+    let recording = recording_id_of(
+        &engine
+            .handle(
+                CLIENT,
+                start_recording_command(
+                    "call-x",
+                    "call-x-far",
+                    directory.path(),
+                    RecordingFormat::Wav,
+                    siphon_rtp_proto::RecordingDirection::Egress,
+                    siphon_rtp_proto::RecordingChannels::Mono,
+                ),
+            )
+            .await,
+    );
+    let play = |overlay: bool, repeat: Option<PlayRepeat>| Command::PlayMedia {
+        call_id: "call-x".into(),
+        from_tag: "call-x-far".into(),
+        source: PlayMediaSource::Blob {
+            data: prompt_blob(8000, 12_000),
+        },
+        repeat_times: repeat,
+        start_pos_ms: None,
+        duration_ms: None,
+        overlay,
+        gain_decibels: None,
+        to_tag: None,
+    };
+    let played = engine.handle(CLIENT, play(false, None)).await;
+    let play_id = match played {
+        CmdResult::Ok {
+            play_id: Some(id),
+            duration_ms: Some(1000),
+            ..
+        } => id,
+        other => panic!("play accepted with its duration: {other:?}"),
+    };
+    // The seated party hears the prompt from its own engine port.
+    let heard = talk_and_listen(
+        &[],
+        &[(&x.far_phone, x.engine_far, 0x0B0B_0001)],
+        &[(&x.far_phone, x.engine_far)],
+        0,
+    )
+    .await;
+    assert_eq!(heard, vec![true], "the seat hears the prompt");
+    let mut completed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv_async()).await {
+        if let Event::PlayFinished {
+            call_id,
+            play_id: finished,
+            reason,
+            ..
+        } = event
+        {
+            assert_eq!(call_id, "call-x", "named by its call");
+            assert_eq!(finished, play_id);
+            assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Completed);
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "play_finished fires as for a call");
+
+    // An endless overlay, stopped by id.
+    let overlay_id = match engine
+        .handle(CLIENT, play(true, Some(PlayRepeat::Forever)))
+        .await
+    {
+        CmdResult::Ok {
+            play_id: Some(id), ..
+        } => id,
+        other => panic!("overlay accepted: {other:?}"),
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stopped = engine
+        .handle(
+            CLIENT,
+            Command::StopMedia {
+                call_id: "call-x".into(),
+                from_tag: "call-x-far".into(),
+                play_id: Some(overlay_id),
+            },
+        )
+        .await;
+    assert!(matches!(stopped, CmdResult::Ok { .. }), "{stopped:?}");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+            event,
+            Event::PlayFinished { play_id, reason: siphon_rtp_proto::PlayEndReason::Stopped, .. }
+                if play_id == overlay_id
+        )),
+        "the stopped overlay reports stopped"
+    );
+
+    let stopped = engine
+        .handle(
+            CLIENT,
+            Command::StopRecording {
+                call_id: "call-x".into(),
+                from_tag: "call-x-far".into(),
+                recording_id: None,
+            },
+        )
+        .await;
+    assert!(matches!(stopped, CmdResult::Ok { .. }), "{stopped:?}");
+    let finished = recordings_finished(&events, Duration::from_millis(300)).await;
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert_eq!(finished[0].1, recording);
+    let (channels, samples) = read_wav(finished[0].2.as_deref().expect("path"));
+    assert_eq!(channels, 1);
+    assert!(
+        samples.iter().any(|sample| sample.unsigned_abs() > 8_000),
+        "the recording captured the prompt the seat heard"
+    );
+}
+
+/// `conference_leave` does not end a recording running on the seated leg: it keeps going on the
+/// one-legged call, and ends once, when the call is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leaving_keeps_a_recording_running_until_delete() {
+    let engine = engine_with_dispatcher();
+    let events = engine.register_client(CLIENT);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let x = plain_call(&engine, "call-x", |addr| sdp_for(addr, true)).await;
+    let recording = recording_id_of(
+        &engine
+            .handle(
+                CLIENT,
+                start_recording_command(
+                    "call-x",
+                    "call-x-near",
+                    directory.path(),
+                    RecordingFormat::OggOpus,
+                    siphon_rtp_proto::RecordingDirection::Ingress,
+                    siphon_rtp_proto::RecordingChannels::Mono,
+                ),
+            )
+            .await,
+    );
+    paced(&[(&x.far_phone, x.engine_far, 0x0B0B_0001, LOUD)], 0, 10).await;
+    assert!(matches!(
+        seat(&engine, "call-x", "call-x-far", "room-1").await,
+        CmdResult::Ok { .. }
+    ));
+    let left = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceLeave {
+                conference_id: "room-1".into(),
+                from_tag: "call-x-far".into(),
+            },
+        )
+        .await;
+    assert!(matches!(left, CmdResult::Ok { .. }), "{left:?}");
+    assert!(
+        recordings_finished(&events, Duration::from_millis(200))
+            .await
+            .is_empty(),
+        "leaving does not end the recording"
+    );
+    let deleted = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "call-x".into(),
+                from_tag: "call-x-far".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert!(matches!(deleted, CmdResult::Ok { .. }));
+    let finished = recordings_finished(&events, Duration::from_millis(300)).await;
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert_eq!(finished[0].1, recording);
+    assert_eq!(
+        finished[0].4,
+        siphon_rtp_proto::RecordingEndReason::CallEnded
+    );
+}
+
+/// An attachment the seat cannot carry is named in the refusal, and the call is left as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_refusal_names_the_attachment_in_the_way() {
+    let engine = engine_with_dispatcher();
+    let x = plain_call(&engine, "call-x", |addr| sdp_for(addr, true)).await;
+    let blocked = engine
+        .handle(
+            CLIENT,
+            Command::BlockDtmf {
+                call_id: "call-x".into(),
+                from_tag: "call-x-near".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert!(matches!(blocked, CmdResult::Ok { .. }), "{blocked:?}");
+    let refused = seat(&engine, "call-x", "call-x-far", "room-1").await;
+    assert!(
+        matches!(&refused, CmdResult::Error { reason } if reason.contains("a DTMF block (block_dtmf)")),
+        "{refused:?}"
+    );
+    assert_relays(&engine, "call-x", &x).await;
+}
+
+/// A recording on an SDES crypto-bridge call — whose taps sit on the bridge rather than a media
+/// actor — carries over too, and ends once, with the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recording_on_a_secure_bridge_carries_over_a_seat() {
+    use siphon_rtp_srtp::SrtpContext;
+
+    let engine = engine_with_dispatcher();
+    let events = engine.register_client(CLIENT);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (near_phone, near_addr) = phone().await;
+    let (far_phone, far_addr) = phone().await;
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "call-s".into(),
+                from_tag: "call-s-near".into(),
+                sdp: sdp_for(near_addr, true),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/SAVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let engine_far = sdp::parse(&ok_sdp_text(&offer))
+        .expect("offer reply")
+        .remote_rtp;
+    let far_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("key");
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "call-s".into(),
+                from_tag: "call-s-near".into(),
+                to_tag: "call-s-far".into(),
+                sdp: savp_answer_sdp(far_addr, &far_key),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    assert!(matches!(answer, CmdResult::Ok { .. }));
+    let recording = recording_id_of(
+        &engine
+            .handle(
+                CLIENT,
+                start_recording_command(
+                    "call-s",
+                    "call-s-near",
+                    directory.path(),
+                    RecordingFormat::Wav,
+                    siphon_rtp_proto::RecordingDirection::Ingress,
+                    siphon_rtp_proto::RecordingChannels::Stereo,
+                ),
+            )
+            .await,
+    );
+    let mut far_encrypt = SrtpContext::from_key_material(&far_key.key);
+    for sequence in 0..10 {
+        let mut sealed = Vec::new();
+        far_encrypt
+            .protect(&g711_rtp(0, sequence, 0x0A0A_0A0A, LOUD), &mut sealed)
+            .expect("protect");
+        far_phone.send_to(&sealed, engine_far).await.expect("send");
+        let _ = recv(&near_phone).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let seated = seat(&engine, "call-s", "call-s-far", "room-1").await;
+    assert!(matches!(seated, CmdResult::Ok { .. }), "{seated:?}");
+    for sequence in 10..30 {
+        let mut sealed = Vec::new();
+        far_encrypt
+            .protect(&g711_rtp(0, sequence, 0x0A0A_0A0A, LOUD), &mut sealed)
+            .expect("protect");
+        far_phone.send_to(&sealed, engine_far).await.expect("send");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        recordings_finished(&events, Duration::from_millis(50))
+            .await
+            .is_empty(),
+        "still recording after the seat"
+    );
+    let deleted = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "call-s".into(),
+                from_tag: "call-s-far".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert!(matches!(deleted, CmdResult::Ok { .. }));
+    let finished = recordings_finished(&events, Duration::from_millis(300)).await;
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert_eq!(finished[0].1, recording);
+    assert_eq!(
+        finished[0].4,
+        siphon_rtp_proto::RecordingEndReason::CallEnded
+    );
+    assert!(
+        finished[0].3 >= 500,
+        "the duration spans the move: {} ms",
+        finished[0].3
+    );
+    let (channels, samples) = read_wav(finished[0].2.as_deref().expect("path"));
+    assert_eq!(channels, 2);
+    let windows = stereo_windows(&samples);
+    assert!(
+        windows.len() >= 25,
+        "frames from before and after the move: {}",
+        windows.len()
+    );
+    assert!(
+        windows
+            .iter()
+            .skip(12)
+            .any(|(_, right)| *right > 1_000_000 * 160),
+        "the far party's voice keeps reaching its (right) channel after the move"
+    );
+}

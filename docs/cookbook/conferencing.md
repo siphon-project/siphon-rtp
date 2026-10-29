@@ -299,7 +299,7 @@ A refusal leaves the call relaying exactly as it was:
 | The call is unanswered, single-leg, a WebSocket takeover, `fax_passthrough`, or carries text or fax | named in the reason |
 | The call's SRTP runs end to end and the engine holds no key | `the engine holds no key to decrypt the leg` |
 | A DTLS leg whose handshake has not completed | `the leg's DTLS-SRTP handshake has not completed` |
-| A recording, tee, interception, subscription or other per-call feature is attached | `<feature> is attached to the call; stop it first` |
+| A pcap recording, WebSocket tee or bridge, interception, subscription, DTMF block or echo mode is attached | `<feature> is attached to the call; stop it first`, naming it |
 
 ### The call while it is seated
 
@@ -313,8 +313,20 @@ The call stays in the registry with the seated leg as its one leg, so your view 
   the call.
 - `silence_media` gives the seat encoded silence instead of the mix; `block_media` stops the room
   sending it anything (the egress clock keeps running, so it resumes cleanly). Both are undone by
-  their reverses. Room-wide playback and recording stay on the `conference_*` verbs; the other call
-  verbs are refused with a reason naming the room.
+  their reverses.
+- `play_media` plays to that seat alone, at its own rate: a plain prompt replaces the mix while it
+  plays (a newer one supersedes it), an `overlay` mixes under it. `stop_media` and `set_play_gain`
+  work by `play_id`, and each prompt ends with a `play_finished` naming the call, as on a call.
+- Recording. A decoded (`wav` or `ogg_opus`) recording that was running on the call when it was
+  seated **carries over**: the same `recording_id`, the same file, no gap and no second file. It goes
+  on recording that leg's party — what it says, and what the room sends it — so a stereo file stays
+  caller-left / callee-right, with the party on its own side and the room's mix on the other.
+  `start_recording` on a seated call records the seat the same way (the party left, what it hears
+  right). `recording_finished` fires once, when the recording is stopped or the call deleted, with a
+  duration spanning the move. A pcap recording is the exception: a seat's packets are the room's, so
+  it refuses the seat (and `start_recording` with `pcap` on a seated call).
+- Room-wide playback and recording stay on the `conference_*` verbs; the other call verbs are
+  refused with a reason naming the room.
 - A seated leg that goes silent raises `media_timeout` **for its call**, with the room's
   `conference_id`, under the same reasons and budgets a two-party leg has, measured on that leg's own
   ingress (and on consent or ICE failure, as for a call). The engine does **not** free it: end the
@@ -326,7 +338,9 @@ The call stays in the registry with the seated leg as its one leg, so your view 
 `conference_leave` on a seated leg does not free it. The leg goes back to its call as a one-legged
 call on the same endpoint, relaying nothing (its media is dropped and counted, and it is judged by
 the media-timeout sweep like any call). It keeps its SRTP contexts and DTLS association, so it can
-be seated again with `conference_seat`, or deleted. Pairing it back to a new far party (turning the
+be seated again with `conference_seat`, or deleted. A recording running on it keeps going: the file
+stays open (gaining nothing while the leg relays nothing), carries on from the new seat when the leg
+is seated again, and ends when it is stopped or the call is deleted. Pairing it back to a new far party (turning the
 room back into an ordinary call) has no verb yet.
 
 ## Roles: mute, whisper, monitor

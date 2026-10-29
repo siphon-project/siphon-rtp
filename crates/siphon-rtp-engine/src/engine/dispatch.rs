@@ -208,8 +208,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// The refusal for a verb a seated (or seated-then-left) call cannot take, or `None` when the
     /// command is not addressed to such a call or is one it answers: `delete`, `query`, a further
-    /// `conference_seat`, and — while seated — `silence_media` / `block_media` and their reverses,
-    /// which gate what the room sends the leg.
+    /// `conference_seat`, `stop_recording`, and — while seated — `silence_media` / `block_media` and
+    /// their reverses, `play_media` / `stop_media` / `set_play_gain` and `start_recording`, which
+    /// act on the seat.
     fn seated_call_refusal(&self, client: ClientId, command: &Command) -> Option<CmdResult> {
         let call_id = command_call_id(command)?;
         if command.is_conference() {
@@ -227,7 +228,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Command::SilenceMedia { .. }
             | Command::UnsilenceMedia { .. }
             | Command::BlockMedia { .. }
-            | Command::UnblockMedia { .. } => seated,
+            | Command::UnblockMedia { .. }
+            | Command::PlayMedia { .. }
+            | Command::StopMedia { .. }
+            | Command::SetPlayGain { .. }
+            | Command::StartRecording { .. } => seated,
+            // A recording kept running across a leave can still be stopped.
+            Command::StopRecording { .. } => true,
             _ => false,
         };
         if allowed {

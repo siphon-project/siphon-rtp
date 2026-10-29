@@ -1226,7 +1226,11 @@ async fn conference_dial_out_does_not_leak() {
 /// `seat → delete`, `seat → leave → delete`, `seat → leave → seat → delete` — with a joined
 /// participant leaving the room before or after the call, so the room is torn down by either side.
 /// Each cycle moves a leg into a room and frees its peer leg, then frees the leg and the room.
-async fn conference_seat_leave_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+async fn conference_seat_leave_delete(
+    engine: &Engine<UdpLoopbackDatapath>,
+    index: usize,
+    recordings: &std::path::Path,
+) {
     let call_id = format!("seat-soak-{index}");
     let room = format!("seat-soak-room-{index}");
     let seat = || Command::ConferenceSeat {
@@ -1272,6 +1276,35 @@ async fn conference_seat_leave_delete(engine: &Engine<UdpLoopbackDatapath>, inde
     ] {
         assert_ok(&engine.handle(CLIENT, command).await, what);
     }
+    // A decoded recording runs across the seat, the leave and the re-seat on two cycles in three,
+    // alternating WAV and Ogg Opus, and ends with the call.
+    let format = match index % 3 {
+        0 => Some(siphon_rtp_proto::RecordingFormat::Wav),
+        1 => Some(siphon_rtp_proto::RecordingFormat::OggOpus),
+        _ => None,
+    };
+    if let Some(format) = format {
+        assert_ok(
+            &engine
+                .handle(
+                    CLIENT,
+                    Command::StartRecording {
+                        call_id: call_id.clone(),
+                        from_tag: "tag-a".into(),
+                        recording_dir: Some(recordings.to_string_lossy().into_owned()),
+                        format: Some(format),
+                        direction: Some(siphon_rtp_proto::RecordingDirection::Both),
+                        channels: Some(siphon_rtp_proto::RecordingChannels::Stereo),
+                        max_duration_ms: None,
+                        silence_ms: None,
+                        path: None,
+                        bitrate_bps: None,
+                    },
+                )
+                .await,
+            "start_recording",
+        );
+    }
     let mut steps = vec![(seat(), "conference_seat")];
     match index % 3 {
         0 => {}
@@ -1308,15 +1341,17 @@ async fn conference_seat_leave_delete_does_not_leak() {
     let engine = Engine::new(UdpLoopbackDatapath::new());
 
     // Six cycles cover every seat/leave/delete order against both room-teardown orders.
+    let recordings = tempfile::tempdir().expect("recording directory");
     let mut gate = LeakGate::new("conference seat", 120, 50).await;
     let mut index = 0;
     while gate.needs_more_churn() {
         for _ in 0..gate.cycles_per_segment() {
-            conference_seat_leave_delete(&engine, index).await;
+            conference_seat_leave_delete(&engine, index, recordings.path()).await;
             index += 1;
         }
         quiesce().await;
         assert_eq!(engine.session_count(), 0, "calls drained");
+        assert_eq!(engine.recording_count(), 0, "recordings drained");
         assert_eq!(engine.conference().room_count(), 0, "rooms drained");
         assert_eq!(engine.conference().participant_count(), 0, "seats drained");
         gate.sample().await;

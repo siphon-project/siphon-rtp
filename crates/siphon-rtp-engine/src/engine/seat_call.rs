@@ -25,10 +25,13 @@ use siphon_rtp_proto::{CmdResult, ConferenceRole, Event, MediaTimeoutReason};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
-use crate::conference::{ParticipantConfig, SeatActivation, SeatTelemetry, SeatedCall};
+use crate::conference::{
+    ConferenceControl, ParticipantConfig, SeatActivation, SeatTelemetry, SeatedCall,
+};
 use crate::dtls_bridge::PipelineTarget;
 use crate::sdp;
 use crate::srtp_bridge::BridgeLeg;
+use siphon_rtp_media::fanout::MediaSink;
 
 use super::negotiate::random_ssrc;
 use super::room::{build_seat_codec, routing_of};
@@ -160,6 +163,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some(remote) = remote else {
             return error_result("conference_seat", &"the leg has no known peer address");
         };
+        // A decoded recording running on the call carries over: its sinks are rebuilt here, for the
+        // seat, before anything moves — they hold the recording's file open across the handover,
+        // and a rate this build cannot convert refuses the seat with the call untouched.
+        let party_is_a = plan.party == Party::Near;
+        let carried = match self.carried_recording_sinks(call_id, party_is_a, &plan.codec) {
+            Ok(carried) => carried,
+            Err(reason) => return error_result("conference_seat", &reason),
+        };
 
         // The seat goes in pending: the room answers its verdict now — full, tag taken, a frame it
         // cannot hold — while the call still relays exactly as before, and it routes nothing to the
@@ -290,6 +301,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         // A seat on an ICE leg keeps following the pair ICE validates.
         self.follow_seat_ice(plan.leg.rtp.id);
+        // The recordings go on from the seat, into the same files.
+        self.attach_carried_recordings(conference_id, from_tag, party_is_a, carried)
+            .await;
 
         // Only now, with the seat in, is the former peer released.
         if let Some(peer) = plan.peer {
@@ -492,14 +506,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         call_id: &str,
         promotion_reasons: &std::collections::HashSet<super::PromotionReason>,
     ) -> Option<&'static str> {
+        use super::PromotionReason;
+        // A decoded recording carries over to the seat, and a prompt hold only says the call once
+        // played one (a prompt still playing ends, reported `stopped`). What is left is named.
+        let blocking = |reason: &PromotionReason| match reason {
+            PromotionReason::AudioRecording | PromotionReason::MediaOp => None,
+            PromotionReason::Recording => Some("a pcap recording (start_recording format pcap)"),
+            PromotionReason::DtmfBlock => Some("a DTMF block (block_dtmf)"),
+            PromotionReason::Echo => Some("echo mode (echo)"),
+            PromotionReason::WsTee => Some("a WebSocket tee (attach_ws_tee)"),
+            PromotionReason::X3 => Some("a lawful interception (attach_x3)"),
+            PromotionReason::TextEvents | PromotionReason::Secure => {
+                Some("a text stream (text_events)")
+            }
+        };
         if self.x3_sessions.contains_key(call_id) {
             Some("a lawful interception (attach_x3)")
-        } else if self
-            .recordings
-            .iter()
-            .any(|recording| recording.call_id == call_id)
-        {
-            Some("a recording (start_recording)")
         } else if self.ws_tees.contains_key(call_id) {
             Some("a WebSocket tee (attach_ws_tee)")
         } else if self.ws_bridges.contains_key(call_id) {
@@ -510,10 +532,108 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .is_some_and(|subscriptions| !subscriptions.is_empty())
         {
             Some("a media subscription (subscribe_request)")
-        } else if !promotion_reasons.is_empty() {
-            Some("a per-call media feature (recording, DTMF block, echo or a prompt)")
         } else {
-            None
+            promotion_reasons.iter().find_map(blocking)
+        }
+    }
+
+    /// For each decoded recording running on the call, sinks rebuilt for the seat of the party
+    /// `party_is_a` names, converting its native rate into the recording's. What the party says goes
+    /// to the channel that carried its voice; what the room sends it, to the channel that carried
+    /// what it heard — so a stereo file keeps the party on its own side and the mix on the other.
+    #[allow(clippy::type_complexity)]
+    fn carried_recording_sinks(
+        &self,
+        call_id: &str,
+        party_is_a: bool,
+        codec: &CodecSpec,
+    ) -> Result<Vec<(String, Vec<(bool, Box<dyn MediaSink>)>)>, String> {
+        use siphon_rtp_media::bridge::tee::WsTeeSink;
+        use siphon_rtp_media::bridge::wire_rate::wire_resampler;
+
+        let mut carried = Vec::new();
+        for entry in self.recordings.iter() {
+            let recording = entry.value();
+            if recording.call_id != call_id {
+                continue;
+            }
+            let Some(taps) = recording.taps.as_ref() else {
+                continue;
+            };
+            // Gone: the recording is finishing on its own (a duration or silence limit fired).
+            let Some(mixer) = taps.mixer.upgrade() else {
+                continue;
+            };
+            let party_rate = super::record::pcm_rate_of(codec)?;
+            let mut sinks: Vec<(bool, Box<dyn MediaSink>)> = Vec::new();
+            for (source, channel) in &taps.layout {
+                let resampler =
+                    wire_resampler(party_rate, taps.rate).map_err(|error| error.to_string())?;
+                let sink = WsTeeSink::new(
+                    *channel,
+                    mixer.clone(),
+                    recording.recording_id.clone(),
+                    resampler,
+                );
+                sinks.push((!source.is_voice_of(party_is_a), Box::new(sink)));
+            }
+            carried.push((recording.recording_id.clone(), sinks));
+        }
+        Ok(carried)
+    }
+
+    /// Put the rebuilt recording sinks on the open seat and record where each recording now lives.
+    /// The sinks they replace (on the stopped actor or bridge, or parked on the call) are dropped
+    /// here or already were; the file's frame assembler counted the new ones in first, so no channel
+    /// closed in between.
+    #[allow(clippy::type_complexity)]
+    async fn attach_carried_recordings(
+        &self,
+        conference_id: &str,
+        tag: &str,
+        party_is_a: bool,
+        carried: Vec<(String, Vec<(bool, Box<dyn MediaSink>)>)>,
+    ) {
+        for (recording_id, sinks) in carried {
+            for (egress, sink) in sinks {
+                let attached = self
+                    .conference
+                    .ask(conference_id, |reply| ConferenceControl::AddSeatTap {
+                        tag: tag.to_string(),
+                        egress,
+                        sink,
+                        reply,
+                    })
+                    .await;
+                if attached != Some(true) {
+                    tracing::error!(
+                        target: "siphon_rtp::media",
+                        conference = conference_id,
+                        recording_id,
+                        "a carried recording's sink did not reach the seat"
+                    );
+                }
+            }
+            if let Some(mut recording) = self.recordings.get_mut(&recording_id) {
+                recording.ingress_legs.clear();
+                recording.egress_legs.clear();
+                // A bridged call's tap decoders end with the flows the seat removed.
+                recording.bridge_taps.clear();
+                if let Ok(mut parked) = recording.parked.lock() {
+                    parked.clear();
+                }
+                recording.seat = Some((conference_id.to_string(), tag.to_string()));
+                // From here on the seated party is the call's one (near) leg.
+                if let Some(taps) = recording.taps.as_mut() {
+                    for (source, _) in &mut taps.layout {
+                        *source = if source.is_voice_of(party_is_a) {
+                            super::record::TapSource::Ingress { source_a: true }
+                        } else {
+                            super::record::TapSource::Egress { toward_a: true }
+                        };
+                    }
+                }
+            }
         }
     }
 
@@ -575,6 +695,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if self.media.is_media_call(call_id) {
             // The userspace pipeline: a transcode, a secure transcode, a DTLS media leg, or a relay
             // promoted for a feature. It hands each party's SRTP contexts back as it stops.
+            // A prompt still playing on the actor ends here, reported as stopped, rather than
+            // vanishing with it.
+            self.media
+                .control(call_id, crate::media_pipeline::MediaControl::StopPlay);
             let surrendered = self.media.surrender(call_id).await.ok_or_else(|| {
                 "the call's media pipeline did not hand its legs over".to_string()
             })?;
@@ -758,10 +882,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             seat.seated = false;
             seat.timeout_reported_at = None;
         }
-        if let Some(Some(leg)) = released {
-            call.near_secure_key = Some(NearSecureKey(Arc::new(Mutex::new(leg))));
-        }
+        let taps = match released {
+            Some(released) => {
+                if let Some(leg) = released.secure {
+                    call.near_secure_key = Some(NearSecureKey(Arc::new(Mutex::new(leg))));
+                }
+                released.taps
+            }
+            None => Vec::new(),
+        };
         drop(call);
+        // A recording running on the seat keeps going on the one-legged call: its sinks are parked
+        // with it, holding the file open, until it stops, the call ends or the leg is seated again.
+        for (_, sink) in taps {
+            let Some(label) = sink.tag().map(str::to_string) else {
+                continue;
+            };
+            if let Some(mut recording) = self.recordings.get_mut(&label) {
+                recording.seat = None;
+                if let Ok(mut parked) = recording.parked.lock() {
+                    parked.push(sink);
+                }
+            }
+        }
         self.stop_seat_ice_follow(&[endpoint]);
         // Nothing owns the leg's media now: it is dropped, counted, and judged by the call sweep. A
         // DTLS leg's endpoint stays with its bridge, which keeps the association for a later seat.
