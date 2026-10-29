@@ -51,6 +51,8 @@ mod conference_seat;
 mod offer_far;
 mod ogg_opus_recording;
 mod record_call_streams;
+mod record_handover;
+mod record_takeover;
 mod tee_sendonly;
 mod tee_undecodable;
 mod transcode_offer;
@@ -28229,8 +28231,8 @@ async fn a_recording_keeps_the_party_that_talks_while_the_other_is_silent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_voicemail_recorded_in_both_directions_is_not_doubled() {
     // A single-leg call recorded with `both`: the caller, plus whatever the engine plays to it.
-    // The two shared a ring, so any prompt audio was appended to the caller's instead of mixed
-    // under it. With no prompt playing the file is exactly the caller.
+    // The two shared a ring, so any prompt audio was appended to the caller's instead of laid
+    // beside it. With no prompt playing the file is exactly as long as the caller spoke.
     use crate::srtp_bridge::run_redirect_dispatcher;
     use siphon_rtp_proto::{RecordingChannels, RecordingDirection};
     let engine = Engine::new(UdpLoopbackDatapath::new());
@@ -28263,17 +28265,26 @@ async fn a_voicemail_recorded_in_both_directions_is_not_doubled() {
     }
     tokio::time::sleep(Duration::from_millis(120)).await;
     let (samples, _, channels) = stop_and_read_recording(&engine, &events, "vm-both", &id).await;
-    assert_eq!(
-        channels, 1,
-        "a single-leg call records mono whatever is asked"
-    );
-    assert!(samples.len() >= 14 * 160, "got {} samples", samples.len());
+    // Stereo was asked for and is honoured on a single-leg call too: the caller on the left, what
+    // the caller heard (here, nothing but the engine's idle egress) on the right. It has to be,
+    // because a recording started before a bot takes the leg cannot change its channel count.
+    assert_eq!(channels, 2, "stereo is honoured on a single-leg call");
+    // The right channel runs for the whole recording (the engine's idle egress is continuous), so
+    // the caller's own samples are what must not be doubled: 15 frames of a constant level.
+    let caller_level = siphon_rtp_codec::g711::ulaw_to_linear(0x20);
+    let caller_samples = samples
+        .iter()
+        .step_by(2)
+        .filter(|&&sample| sample == caller_level)
+        .count();
     assert!(
-        samples.len() <= 15 * 160 + 160,
-        "got {} samples",
-        samples.len()
+        caller_samples >= 14 * 160,
+        "the caller is on the left, got {caller_samples} of its samples"
     );
-    assert!(samples.iter().any(|&sample| sample != 0));
+    assert!(
+        caller_samples <= 15 * 160 + 160,
+        "not doubled: one sample per caller sample, got {caller_samples}"
+    );
 }
 
 /// Attach a WebSocket tee of the callee's audio and wait for its `start`.
@@ -29490,8 +29501,9 @@ async fn a_bot_taking_over_a_secure_anchor_continues_its_srtp_context() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bot_is_refused_while_something_else_runs_on_the_anchor() {
-    // Stopping the pipeline would stop a running recording without a word. Refused, and the
-    // recording carries on.
+    // Stopping the pipeline would stop a pcap capture without a word: it copies the wire bytes on
+    // the actor and has nothing to follow the leg onto a bot with. Refused, and the capture carries
+    // on. (A decoded recording is carried across instead; see `record_handover`.)
     use crate::srtp_bridge::run_redirect_dispatcher;
     let engine = Engine::new(UdpLoopbackDatapath::new());
     tokio::spawn(run_redirect_dispatcher(
@@ -29522,7 +29534,7 @@ async fn a_bot_is_refused_while_something_else_runs_on_the_anchor() {
                 call_id: "busy-anchor".into(),
                 from_tag: "tag-a".into(),
                 recording_dir: Some(dir.path().to_string_lossy().into_owned()),
-                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                format: Some(siphon_rtp_proto::RecordingFormat::Pcap),
                 direction: None,
                 channels: None,
                 max_duration_ms: None,

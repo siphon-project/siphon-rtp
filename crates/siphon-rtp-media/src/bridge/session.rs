@@ -23,6 +23,8 @@
 
 use crate::bridge::audio::{BridgeCore, MAX_FRAME_SAMPLES, MAX_FRAME_VALUES, MAX_PTIME_MS};
 use crate::bridge::protocol::{ControlMessage, Direction, MediaFormat};
+use crate::bridge::taps::{RecordingTaps, TakenRecordingTaps, TapSide};
+use crate::fanout::MediaSink;
 use crate::leg::{MediaLeg, PcmFrame};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_dsp::{EchoCanceller, VoiceDetector};
@@ -75,6 +77,9 @@ pub struct BridgeSession {
     /// Converted downlink frame handed to the encoder. Same reservation contract as above, sized from
     /// the **leg** rate (the conversion's output).
     downlink_converted: Vec<i16>,
+    /// Decoded recordings tapping this call — see [`crate::bridge::taps`]. Empty unless a
+    /// recording is running, and an empty set costs the tick two empty loops.
+    recording_taps: RecordingTaps,
 }
 
 /// The longest frame at `rate_hz` the ptime ceiling allows, in samples.
@@ -114,7 +119,24 @@ impl BridgeSession {
             uplink_scratch: Vec::new(),
             uplink_converted: Vec::new(),
             downlink_converted: Vec::new(),
+            recording_taps: RecordingTaps::default(),
         }
+    }
+
+    /// Attach a decoded recording's sink to one party of this call — see [`TapSide`].
+    pub fn add_recording_tap(&mut self, side: TapSide, sink: Box<dyn MediaSink>) {
+        self.recording_taps.add(side, sink);
+    }
+
+    /// Detach and finish every recording sink tagged `tag` (a recording id).
+    pub fn remove_recording_taps(&mut self, tag: &str) {
+        self.recording_taps.remove_tagged(tag);
+    }
+
+    /// Detach every recording sink, unfinished, to move them onto another media path:
+    /// `(caller, heard)`.
+    pub fn take_recording_taps(&mut self) -> TakenRecordingTaps {
+        self.recording_taps.take_all()
     }
 
     /// Convert between the leg's codec rate and the negotiated **wire** rate in both directions —
@@ -317,6 +339,10 @@ impl BridgeSession {
                     // Clamp the conversion's input to one ptime-ceiling frame at the *leg's* rate, so
                     // the output can never exceed the capacity reserved for it — the same truncation
                     // `commit_uplink` applies at `MAX_FRAME_SAMPLES` on the non-converting path.
+                    // The caller as decoded, at the leg's rate: before the conversion and before any
+                    // of the bot-facing processing the core is about to apply.
+                    self.recording_taps
+                        .write_caller(&self.uplink_scratch[..samples]);
                     let feed = samples
                         .min(MAX_FRAME_SAMPLES)
                         .min(ceiling_frame_samples(resampler.input_rate()));
@@ -325,6 +351,9 @@ impl BridgeSession {
                     self.core.on_pcm_uplink(&self.uplink_converted);
                 } else {
                     self.core.commit_uplink(written, self.decode_channels);
+                    // Same tap, zero-copy path: the staged frame is still exactly what was decoded
+                    // (leg rate == wire rate here); the core only processes it on its own tick.
+                    self.recording_taps.write_caller(self.core.staged_uplink());
                 }
             }
             Ok(PcmFrame::Starved) => {} // nothing to play this tick — not a failure
@@ -390,6 +419,9 @@ impl BridgeSession {
                 // there is simply nothing to render this tick, which is not an encode failure.
                 return result;
             }
+            // What the caller hears, at the leg's rate. Taken only from a frame the core actually
+            // renders: one a barge-in flushed never gets here.
+            self.recording_taps.write_heard(rendered);
             match self.leg.encode_rtp(rendered, downlink_rtp_out) {
                 Ok(len) => result.downlink_bytes = len,
                 Err(error) => {
@@ -1823,5 +1855,86 @@ mod tests {
             "uplink echo not cancelled: {cancelled_energy:.1} vs plain {plain_energy:.1} \
              (canceller did not run on the bridge datapath)"
         );
+    }
+
+    /// A recording sink that keeps every frame it is handed, one `Vec` per frame.
+    struct FrameProbe(std::sync::Arc<std::sync::Mutex<Vec<Vec<i16>>>>);
+
+    impl MediaSink for FrameProbe {
+        fn write_pcm(&mut self, pcm: &[i16]) {
+            if let Ok(mut frames) = self.0.lock() {
+                frames.push(pcm.to_vec());
+            }
+        }
+        fn tag(&self) -> Option<&str> {
+            Some("rec-1")
+        }
+    }
+
+    type Frames = std::sync::Arc<std::sync::Mutex<Vec<Vec<i16>>>>;
+
+    fn probe() -> (Box<dyn MediaSink>, Frames) {
+        let frames = Frames::default();
+        (Box::new(FrameProbe(frames.clone())), frames)
+    }
+
+    #[test]
+    fn a_recording_tap_holds_the_caller_before_the_bot_facing_processing() {
+        // Noise suppression on: the uplink the server gets is processed, and the caller tap must
+        // still see the frame exactly as decoded.
+        let mut session = ulaw_session().with_noise_suppression(true);
+        let (caller, frames) = probe();
+        session.add_recording_tap(TapSide::Caller, caller);
+        let spoken = [4000i16; 160];
+        step(&mut session, 0, &spoken);
+        let frames = frames.lock().expect("lock");
+        assert_eq!(frames.len(), 1, "one decoded frame per tick");
+        let decoded =
+            siphon_rtp_codec::g711::ulaw_to_linear(siphon_rtp_codec::g711::linear_to_ulaw(4000));
+        assert!(
+            frames[0].iter().all(|&sample| sample == decoded),
+            "the caller as decoded, not as the noise suppressor left it"
+        );
+    }
+
+    #[test]
+    fn a_recording_tap_hears_only_the_bot_audio_the_caller_was_played() {
+        // Two bot frames are queued; the caller barges in on the first tick, which flushes both.
+        // The recording must not hold audio the caller never heard.
+        let mut session = vad_session(1_000_000, 3, true);
+        let (heard, frames) = probe();
+        session.add_recording_tap(TapSide::Heard, heard);
+        let mut l16 = [0u8; 320];
+        pcm_to_l16_le(&[1000i16; 160], &mut l16);
+        session.on_ws_binary(&l16);
+        session.on_ws_binary(&l16);
+        step(&mut session, 0, &[4000i16; 160]);
+        step(&mut session, 1, &[0i16; 160]);
+        assert!(
+            frames.lock().expect("lock").is_empty(),
+            "a frame flushed by the barge-in is never recorded"
+        );
+
+        // Without an interruption, what is rendered is what is recorded.
+        session.on_ws_binary(&l16);
+        step(&mut session, 2, &[0i16; 160]);
+        let frames = frames.lock().expect("lock");
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].iter().all(|&sample| sample == 1000));
+    }
+
+    #[test]
+    fn removing_a_recording_tap_stops_it_and_taking_them_moves_them() {
+        let mut session = ulaw_session();
+        let (caller, caller_frames) = probe();
+        session.add_recording_tap(TapSide::Caller, caller);
+        session.remove_recording_taps("rec-1");
+        step(&mut session, 0, &[4000i16; 160]);
+        assert!(caller_frames.lock().expect("lock").is_empty());
+
+        let (heard, _) = probe();
+        session.add_recording_tap(TapSide::Heard, heard);
+        let (callers, heards) = session.take_recording_taps();
+        assert_eq!((callers.len(), heards.len()), (0, 1));
     }
 }

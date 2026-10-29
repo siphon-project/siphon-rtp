@@ -127,7 +127,7 @@ fn hash_certificate(hash_function: &str, certificate_der: &[u8]) -> Option<Vec<u
         "sha-256" => Some(Sha256::digest(certificate_der).to_vec()),
         "sha-384" => Some(Sha384::digest(certificate_der).to_vec()),
         "sha-512" => Some(Sha512::digest(certificate_der).to_vec()),
-        "sha-1" => Some(Sha1::digest(certificate_der).to_vec()),
+        "sha-1" => Some(<Sha1 as sha1::Digest>::digest(certificate_der).to_vec()),
         _ => None,
     }
 }
@@ -135,6 +135,38 @@ fn hash_certificate(hash_function: &str, certificate_der: &[u8]) -> Option<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each fingerprint hash against the FIPS 180-2 known answer for `"abc"`
+    /// (Appendix A.1 / B.1 / C.1 / D.1), not a round trip: a hashing bug
+    /// shared by fingerprinting and verifying would pass a round trip.
+    #[test]
+    fn fingerprint_hashes_match_the_fips_180_known_answers() {
+        fn hex(digest: &[u8]) -> String {
+            digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+        let cases = [
+            ("sha-1", "a9993e364706816aba3e25717850c26c9cd0d89d"),
+            (
+                "sha-256",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "sha-384",
+                "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed\
+                 8086072ba1e7cc2358baeca134c825a7",
+            ),
+            (
+                "sha-512",
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+                 2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+            ),
+        ];
+        for (hash_function, expected) in cases {
+            let digest = hash_certificate(hash_function, b"abc").expect("a supported hash");
+            assert_eq!(hex(&digest), expected, "{hash_function}");
+        }
+        assert!(hash_certificate("md5", b"abc").is_none());
+    }
 
     #[test]
     fn generated_certificate_has_a_32_byte_sha256_fingerprint() {

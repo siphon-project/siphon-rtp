@@ -582,12 +582,15 @@ stopped, the bot gets the caller, and a later `detach_ws_bridge` gives the leg b
 pipeline. An SDES-SRTP caller keeps its SRTP context through both hand-overs, a DTLS-SRTP caller
 keeps its association (no new handshake), and an ICE caller keeps its agent and selected pair. A
 prompt still playing
-when the bot joins ends with `play_finished` (`error`). Refused while something else runs on the
-pipeline, since stopping it would stop that silently:
+when the bot joins ends with `play_finished` (`error`). A decoded recording (`wav` / `ogg_opus`)
+moves with the leg: onto the bot, across a re-point to another bot, and back on a detach, so the
+call is one file and one `recording_finished` however often it changes hands, caller on the left and
+whoever the caller heard on the right. Refused while anything else runs on the pipeline, since
+stopping it would stop that silently:
 
 | Shape | Reason token |
 |---|---|
-| Recording, WS tee, SIPREC subscription, DTMF block, echo or X3 interception on the leg | `ws-takeover-anchor-busy` |
+| pcap recording, WS tee, SIPREC subscription, DTMF block, echo or X3 interception on the leg | `ws-takeover-anchor-busy` |
 
 The first two are the same structural refusals `offer` and `answer` make for `ws_uri`, for the same
 reasons: on a two-leg call the engine is not the offerer's cryptographic far side, and no ICE agent

@@ -4,6 +4,7 @@ use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, SourceFilter};
 use siphon_rtp_dsp::VoiceDetector;
 use siphon_rtp_media::bridge::protocol::{Direction as WsDirection, MediaFormat};
+use siphon_rtp_media::bridge::ws::{BridgeControl, BRIDGE_CONTROL_QUEUE};
 use siphon_rtp_media::bridge::{run_bridge, BridgeEndReason, BridgeSession};
 use siphon_rtp_media::jitter::JitterBuffer;
 use siphon_rtp_media::leg::MediaLeg;
@@ -188,6 +189,18 @@ pub(super) struct WsBridge {
     /// path (`ProfileFlags::ws_uri`). This is exactly what makes a detach possible or not — see
     /// [`Engine::detach_ws_bridge`].
     takeover: Option<WsRelayTakeover>,
+    /// The mailbox into the running bridge task — the only way to reach its session, which that
+    /// task owns. Used to attach and detach decoded-recording taps.
+    control: flume::Sender<BridgeControl>,
+}
+
+/// What a decoded recording needs to know about a call's running takeover bridge.
+pub(super) struct BridgeRecordingTarget {
+    pub(super) control: flume::Sender<BridgeControl>,
+    /// The leg's codec, which the bridge decodes and encodes in.
+    pub(super) codec: CodecSpec,
+    /// The bridge displaced a two-leg relay rather than being the call's own media path.
+    pub(super) relay_takeover: bool,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -416,6 +429,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The bridge: pump A's RTP (rtp_in) ↔ WS, render WS downlink to RTP (rtp_out). Whichever way
         // it ends, say so once — a detach that beat it to the latch has already reported `Detached`.
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (control, control_rx) = flume::bounded(BRIDGE_CONTROL_QUEUE);
         let bridge_task = {
             let events = self.event_sink(owner);
             let call_id = call_id.to_string();
@@ -423,7 +437,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let stream_id = stream_id.clone();
             let ended = ended.clone();
             tokio::spawn(async move {
-                let reason = match run_bridge(socket, session, rtp_in_rx, rtp_out_tx, ptime).await {
+                let bridge = run_bridge(socket, session, rtp_in_rx, rtp_out_tx, control_rx, ptime);
+                let reason = match bridge.await {
                     Ok(BridgeEndReason::ServerClosed) => WsBridgeEndReason::ServerClosed,
                     Ok(BridgeEndReason::ServerStopped) => WsBridgeEndReason::ServerStopped,
                     Ok(BridgeEndReason::CallEnded) => WsBridgeEndReason::CallEnded,
@@ -524,6 +539,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 a_rtp,
                 processing,
                 takeover,
+                control,
             },
         );
         tracing::info!(
@@ -661,6 +677,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // the new consumer must be a clean refusal on a call that is still up, not a call left
             // redirected into nothing with its relay-restore plan already dropped.
             let socket = self.dial_ws(call_id, ws_uri).await?;
+            // A recording follows the leg to the new consumer, as it follows it onto a bot from the
+            // anchor: off the outgoing bridge before it stops, onto the new one once it is up.
+            let recordings = self.take_bridge_recordings(call_id).await;
             self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
                 .await;
             let result = self
@@ -682,6 +701,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 })
                 .await;
             if result.is_ok() {
+                self.give_bridge_recordings(call_id, recordings).await;
                 tracing::info!(
                     target: "siphon_rtp::media",
                     call_id,
@@ -907,6 +927,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ///
     /// This does **not** restore anything. Detach owns that decision (see [`Self::detach_ws_bridge`])
     /// because the other callers are call teardown, where the endpoints are being freed anyway.
+    /// The running takeover bridge on `call_id`, for a decoded recording to tap; `None` when the
+    /// call has none.
+    pub(super) fn bridge_recording_target(&self, call_id: &str) -> Option<BridgeRecordingTarget> {
+        self.ws_bridges
+            .get(call_id)
+            .map(|bridge| BridgeRecordingTarget {
+                control: bridge.control.clone(),
+                codec: bridge.codec.clone(),
+                relay_takeover: bridge.takeover.is_some(),
+            })
+    }
+
     pub(super) async fn stop_ws_bridge(&self, call_id: &str, reason: WsBridgeEndReason) {
         let Some((_, bridge)) = self.ws_bridges.remove(call_id) else {
             return;
