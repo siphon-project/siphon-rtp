@@ -819,6 +819,11 @@ pub struct Direction {
     silenced: bool,
     /// Drop egress audio entirely (not even silence).
     blocked: bool,
+    /// Whether the party this direction's egress faces said it will receive media at all. `false`
+    /// for a caller that offered `sendonly` or `inactive` (RFC 3264 §6.1), which is sent nothing —
+    /// enforced in [`Direction::push_egress`], the choke point every egress datagram passes, so the
+    /// decode, the forks and every recording run as usual and only the send is withheld.
+    peer_receives: bool,
     /// Suppress relaying this leg's RFC 4733 telephone-event (DTMF) packets to the peer while still
     /// detecting them (`block DTMF`). When set, an ingress telephone-event still fires the control
     /// plane's `Event::Dtmf` (observability) but is not repacketized toward the peer — the digit is
@@ -1532,6 +1537,7 @@ impl Direction {
             egress_taps: Vec::new(),
             silenced: false,
             blocked: false,
+            peer_receives: true,
             dtmf_blocked: false,
             egress_sample_rate: egress_rate,
             injection: None,
@@ -1612,6 +1618,7 @@ impl Direction {
             egress_taps: Vec::new(),
             silenced: false,
             blocked: false,
+            peer_receives: true,
             dtmf_blocked: false,
             egress_sample_rate: 0,
             injection: None,
@@ -2509,7 +2516,7 @@ impl Direction {
         // Unkeyed secure peer: emit nothing rather than send it cleartext. This is the one choke point
         // every egress datagram passes through — transcode, injected prompt, comfort noise, relayed
         // telephone-event and echo reflect alike — so the guard cannot be bypassed by a new caller.
-        if self.secure_pending || self.awaiting_ice {
+        if self.secure_pending || self.awaiting_ice || !self.peer_receives {
             return;
         }
         let data = if let Some(leg) = self.secure_egress.as_ref() {
@@ -3395,6 +3402,14 @@ impl MediaCall {
         self.b_to_a.silenced = silenced;
     }
 
+    /// Whether the party faced by both egress directions will receive media at all; when not, every
+    /// egress datagram is withheld at the send while the decode carries on. Set on a single-leg call, where both directions face the one
+    /// caller; a two-party call never changes it.
+    pub fn set_peer_receives(&mut self, receives: bool) {
+        self.a_to_b.peer_receives = receives;
+        self.b_to_a.peer_receives = receives;
+    }
+
     /// Toggle full egress blocking on both directions (`Command::BlockMedia`).
     pub fn set_blocked(&mut self, blocked: bool) {
         self.a_to_b.blocked = blocked;
@@ -3968,6 +3983,9 @@ pub enum MediaControl {
     Silence(bool),
     /// Drop egress audio (`true`) or resume (`false`).
     Block(bool),
+    /// Whether the single-leg caller will receive media at all (`false` for a `sendonly` or
+    /// `inactive` offer) — see [`MediaCall::set_peer_receives`].
+    PeerReceives(bool),
     /// Echo each party's ingress audio back to itself (`true`) or resume normal forwarding (`false`).
     Echo(bool),
     /// Block (`blocked = true`) or resume (`false`) relaying one leg's RFC 4733 telephone-events
@@ -4447,6 +4465,9 @@ async fn run_media_call<D>(
                     }
                     MediaInput::Control(MediaControl::Silence(on)) => call.set_silenced(on),
                     MediaInput::Control(MediaControl::Block(on)) => call.set_blocked(on),
+                    MediaInput::Control(MediaControl::PeerReceives(receives)) => {
+                        call.set_peer_receives(receives);
+                    }
                     MediaInput::Control(MediaControl::Echo(on)) => call.set_echo(on),
                     MediaInput::Control(MediaControl::BlockDtmf { source_a, blocked }) => {
                         call.set_dtmf_blocked(source_a, blocked);

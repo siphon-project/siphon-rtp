@@ -47,6 +47,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **`answer_local` answers a `sendonly` offer with `recvonly`, and sends that party nothing.** The
+  engine-written answer passed the offer's own direction attribute back, so a `sendonly` stream was
+  answered `sendonly` (RFC 3264 §6.1 requires the complement), and the single-leg pipeline went on
+  sending idle comfort noise to a party that had said it would not receive. That is exactly one
+  stream of a SIPREC session (RFC 7866 §6) answered as its own call. The answer now carries the
+  complement, and a caller that offered `sendonly` or `inactive` gets no RTP; its audio is still
+  decoded, so a WebSocket tee or a recording on the call works as on any other. `node_info`
+  advertises `answer_local_direction` so a controller can require it, since the behaviour is the
+  engine's and no version of the contract crate implies it.
+
 - **An egress recording of an engine-answered call holds the engine's prompts.** On a single-leg
   call the direction whose egress reaches the caller is the one prompts are played on, and the
   recording tapped the other one, so `direction: egress` (and the prompt side of `both`) recorded

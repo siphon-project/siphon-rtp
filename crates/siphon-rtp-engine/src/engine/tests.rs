@@ -53,6 +53,7 @@ mod ogg_opus_recording;
 mod record_call_streams;
 mod record_handover;
 mod record_takeover;
+mod tee_sendonly;
 mod tee_undecodable;
 mod transcode_offer;
 
