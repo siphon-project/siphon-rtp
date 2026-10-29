@@ -82,11 +82,10 @@ struct TranscodeInputs {
     near_codec: CodecSpec,
     /// B's codec, with the `ptime=<N>` override applied.
     far_codec: CodecSpec,
-    record_path: Option<String>,
 }
 
 impl AnswerWiring<'_> {
-    /// A's signalled address, both codecs and the recording path, or the refusal under `context`.
+    /// A's signalled address and both codecs, or the refusal under `context`.
     fn transcode_inputs(&self, context: &str) -> Result<TranscodeInputs, Box<CmdResult>> {
         let Some(a_rtp) = self.near.remote_rtp else {
             return Err(boxed_error_result(
@@ -110,16 +109,10 @@ impl AnswerWiring<'_> {
                 &"answer carried no usable audio codec",
             ));
         };
-        let record_path = self
-            .profile
-            .record_call
-            .then(|| self.profile.record_path.clone())
-            .flatten();
         Ok(TranscodeInputs {
             a_rtp,
             near_codec,
             far_codec,
-            record_path,
         })
     }
 
@@ -144,7 +137,6 @@ impl AnswerWiring<'_> {
                 .info
                 .primary_telephone_event()
                 .map(|event| event.payload_type),
-            record_path: inputs.record_path.as_deref(),
             noise_suppression: self.profile.noise_suppression,
             echo: EchoProfile::from_profile(self.profile),
             beep_detection: self.profile.beep_detection,
@@ -153,11 +145,7 @@ impl AnswerWiring<'_> {
     }
 
     /// The transcoding actor for this answer's two directions, latching unless `no-latch` is set.
-    fn media_call(
-        &self,
-        (a_to_b, b_to_a): (DirectionConfig, DirectionConfig),
-        record_path: Option<String>,
-    ) -> MediaCall {
+    fn media_call(&self, (a_to_b, b_to_a): (DirectionConfig, DirectionConfig)) -> MediaCall {
         let latch = !self.profile.flags.iter().any(|flag| flag == "no-latch");
         MediaCall::new(
             self.call_id.to_string(),
@@ -166,7 +154,6 @@ impl AnswerWiring<'_> {
             a_to_b,
             b_to_a,
             latch,
-            record_path,
         )
     }
 
@@ -529,7 +516,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
         let call = wiring
-            .media_call(directions, inputs.record_path)
+            .media_call(directions)
             .with_far_secure_leg(leg)
             .with_rtcp_relays(rtcp_relays);
         self.media
@@ -615,7 +602,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
             rtcp_relays = wiring.rtcp_relays(near_rtcp.id, far_rtcp.id, a_rtcp, &keying);
         }
-        let call = wiring.media_call(directions, inputs.record_path);
+        let call = wiring.media_call(directions);
         let call = match far_leg {
             Some(far_leg) => call.with_both_secure_legs(near_leg, far_leg),
             None => call.with_near_secure_leg(near_leg),
@@ -678,7 +665,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 )),
             );
         }
-        let call = wiring.media_call(directions, inputs.record_path);
+        let call = wiring.media_call(directions);
         self.media
             .register(call, self.datapath.clone(), owner_events);
         Ok(())

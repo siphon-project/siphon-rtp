@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, SourceFilter};
-use siphon_rtp_proto::{CmdResult, ConferenceRole, Event, MediaTimeoutReason};
+use siphon_rtp_proto::{CmdResult, ConferenceRole, Event, MediaTimeoutReason, RecordingEndReason};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
@@ -562,6 +562,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let Some(mixer) = taps.mixer.upgrade() else {
                 continue;
             };
+            // A recording of the released party alone (a `record_call` stream of its side) has
+            // nothing left to record: it ends with that leg, as it would at a hangup. No sinks marks
+            // it for that.
+            if let [(source, _)] = taps.layout.as_slice() {
+                if source.party_is_a() != party_is_a {
+                    carried.push((recording.recording_id.clone(), Vec::new()));
+                    continue;
+                }
+            }
             let party_rate = super::record::pcm_rate_of(codec)?;
             let mut sinks: Vec<(bool, Box<dyn MediaSink>)> = Vec::new();
             for (source, channel) in &taps.layout {
@@ -593,6 +602,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         carried: Vec<(String, Vec<(bool, Box<dyn MediaSink>)>)>,
     ) {
         for (recording_id, sinks) in carried {
+            if sinks.is_empty() {
+                self.stop_wav_recording(&recording_id, RecordingEndReason::CallEnded)
+                    .await;
+                continue;
+            }
             for (egress, sink) in sinks {
                 let attached = self
                     .conference

@@ -331,8 +331,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.ws_tees.len()
     }
 
-    /// Live decoded recordings (`start_recording` wav / ogg_opus, on a call or a room) — what a
-    /// soak checks drains to zero.
+    /// Live decoded recordings — `start_recording` with a decoded format (on a call, a seated call
+    /// leg or a room) and each party of a `record_call` recording. Drains to zero once every one has
+    /// finished, which is what a soak checks.
     #[must_use]
     pub fn recording_count(&self) -> usize {
         self.recordings.len()

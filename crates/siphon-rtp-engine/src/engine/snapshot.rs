@@ -855,10 +855,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_codec: &far_codec,
             near_telephone_event: snapshot.near_telephone_event,
             far_telephone_event: None,
-            record_path: None,
             // Noise suppression, echo cancellation and record-tone detection are not carried in the
-            // checkpoint snapshot, so a cold restore resumes without them — matching how recording
-            // (`record_path`) is not restored. The controller re-arms them by re-issuing the profile.
+            // checkpoint snapshot, so a cold restore resumes without them — matching how a
+            // recording is not restored. The controller re-arms them by re-issuing the profile.
             noise_suppression: false,
             echo: EchoProfile::default(),
             beep_detection: false,
@@ -912,7 +911,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             a_to_b,
             b_to_a,
             true, // relay latch (the `no-latch` flag is not carried in the snapshot)
-            None, // recording restarts on the new node if the proxy re-issues it
         );
         let (media_call, far_local_crypto, far_remote_crypto) = match secure_parts {
             Some((far_local, far_remote, leg, rtcp_relays)) => (

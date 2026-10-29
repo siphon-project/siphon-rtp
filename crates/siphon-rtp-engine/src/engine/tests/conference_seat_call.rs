@@ -1603,3 +1603,101 @@ async fn a_recording_on_a_secure_bridge_carries_over_a_seat() {
         "the far party's voice keeps reaching its (right) channel after the move"
     );
 }
+
+/// A `record_call` call records one file per party. Seating the far leg ends the near party's file
+/// with that leg — its party is gone — and keeps the far party's going into the same file until the
+/// call is deleted: one `recording_finished` each, no second file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_call_stream_follows_its_own_party_across_a_seat() {
+    let engine = engine_with_dispatcher();
+    let events = engine.register_client(CLIENT);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (near_phone, near_addr) = phone().await;
+    let (far_phone, far_addr) = phone().await;
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "call-r".into(),
+                from_tag: "call-r-near".into(),
+                sdp: sdp_for(near_addr, true),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let engine_far = sdp::parse(&ok_sdp_text(&offered))
+        .expect("offer")
+        .remote_rtp;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "call-r".into(),
+                from_tag: "call-r-near".into(),
+                to_tag: "call-r-far".into(),
+                sdp: sdp_for(far_addr, true),
+                profile: ProfileFlags {
+                    record_call: true,
+                    record_path: Some(directory.path().to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let engine_near = sdp::parse(&ok_sdp_text(&answered))
+        .expect("answer")
+        .remote_rtp;
+    paced(
+        &[
+            (&near_phone, engine_near, 0x0A0A_0001, LOUD),
+            (&far_phone, engine_far, 0x0B0B_0001, LOUD),
+        ],
+        0,
+        15,
+    )
+    .await;
+    let seated = seat(&engine, "call-r", "call-r-far", "room-1").await;
+    assert!(matches!(seated, CmdResult::Ok { .. }), "{seated:?}");
+    let ended = recordings_finished(&events, Duration::from_millis(500)).await;
+    assert_eq!(
+        ended.len(),
+        1,
+        "only the released party's file ends: {ended:?}"
+    );
+    assert_eq!(ended[0].1, "call-r-a");
+    assert_eq!(ended[0].4, siphon_rtp_proto::RecordingEndReason::CallEnded);
+    paced(&[(&far_phone, engine_far, 0x0B0B_0001, LOUD)], 15, 25).await;
+    let deleted = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "call-r".into(),
+                from_tag: "call-r-far".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert!(matches!(deleted, CmdResult::Ok { .. }));
+    let finished = recordings_finished(&events, Duration::from_secs(1)).await;
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert_eq!(finished[0].1, "call-r-b");
+    assert_eq!(
+        finished[0].4,
+        siphon_rtp_proto::RecordingEndReason::CallEnded
+    );
+    assert!(
+        finished[0].3 >= 600,
+        "the far party's file spans the move: {} ms",
+        finished[0].3
+    );
+    let files: Vec<_> = std::fs::read_dir(directory.path())
+        .expect("dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        files.len(),
+        2,
+        "one file per party, no second one: {files:?}"
+    );
+}

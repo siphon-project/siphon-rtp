@@ -67,7 +67,6 @@ fn direction(
         egress_payload_type: egress_codec.payload_type,
         telephone_event_in: None,
         telephone_event_out: None,
-        recorder: None,
         noise_suppression: false,
         echo: siphon_rtp_engine::media_pipeline::EchoProfile::default(),
         beep_detection: false,
@@ -83,15 +82,7 @@ fn call(secure: Secure) -> MediaCall {
     let alaw = spec(8, "PCMA");
     let a_to_b = direction(1, 2, B_ADDR, A_ADDR, &ulaw, &alaw, 0xB000_0001);
     let b_to_a = direction(2, 1, A_ADDR, B_ADDR, &alaw, &ulaw, 0xA000_0001);
-    let call = MediaCall::new(
-        "bench",
-        "tag-a",
-        Some("tag-b".into()),
-        a_to_b,
-        b_to_a,
-        true,
-        None,
-    );
+    let call = MediaCall::new("bench", "tag-a", Some("tag-b".into()), a_to_b, b_to_a, true);
     match secure {
         Secure::None => call,
         Secure::Keyed => {

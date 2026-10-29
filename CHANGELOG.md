@@ -34,6 +34,57 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   It used to vanish with no event at all.
 - `media_timeout`, `dtmf` and `media_started` carry an optional `conference_id`; `call_quality`
   carries both `call_id` and `conference_id` for a seated call leg.
+- **A call handed to a voice bot can be recorded.** `start_recording` with `wav` or `ogg_opus` on
+  a takeover call (`ws_uri` at answer, or `attach_ws_bridge` on an engine-answered call) used to be
+  refused, because nothing on the relay carries that audio. It now taps the bridge session: the
+  caller as decoded, before the bot-facing noise suppression, echo cancellation and turn-taking,
+  and the bot as rendered toward the caller, so a frame a barge-in flushed is not in the file. Same
+  command, fields, event and stop. A bot that displaced one party of a relayed two-party call
+  refuses it (`recording-needs-an-anchored-takeover`), since giving that leg back restores a relay
+  with no decoded audio to carry the recording on. An idle bridge pays nothing per tick; a stereo
+  recording of one costs about 15k instructions per 20 ms tick.
+- **One recording across a hand-over to a bot and back.** A decoded recording on an engine-answered
+  call used to refuse `attach_ws_bridge` (`ws-takeover-anchor-busy`), so a PBX recording from answer
+  could not hand the caller to a bot at all. The recording's sinks now move with the leg: off the
+  pipeline before it stops and onto the bot's bridge, across a re-point to another bot, and back on
+  a detach. The call is one file and one `recording_finished` whoever has the leg; only the frames
+  in flight during each swap are missing. A takeover that does not happen leaves the recording
+  running. A pcap recording, which copies wire bytes on the pipeline, still refuses the hand-over.
+
+### Changed
+
+- **`channels: stereo` is honoured on a single-leg call.** With `direction: both`, the caller is on
+  the left and what the caller heard on the right: the engine's prompts, or the voice bot that has
+  taken the leg. It used to record mono whatever was asked, which would have folded a bot call's two
+  parties into one channel, and a recording started before a hand-over cannot change its channel
+  count halfway through the file.
+
+- **`record_call` streams one file per party and reports each one.** The answer's `record_call`
+  used to keep both directions of the call in memory (~115 MB per direction for an hour at 16 kHz)
+  and write `{call}-a.wav` / `-b.wav` from the media actor's teardown with no event, so a recording
+  server watching the directory could not tell a file still being written from a party that never
+  spoke, and a file the 2 s teardown grace cut short was simply never written. Each party is now an
+  ordinary decoded recording: streamed to `{name}.partial` as the call runs, renamed into place when
+  the call ends, then reported by its own `recording_finished` with the id `{call}-a` / `{call}-b`.
+  A party that never sent audio gets `reason: no_audio` with no `path`, and no file. File names,
+  directory, format (mono WAV at each party's decoded rate) and the decode `record_call` forces are
+  unchanged. `RecordingEndReason` gains `no_audio`.
+
+### Fixed
+
+- **An egress recording of an engine-answered call holds the engine's prompts.** On a single-leg
+  call the direction whose egress reaches the caller is the one prompts are played on, and the
+  recording tapped the other one, so `direction: egress` (and the prompt side of `both`) recorded
+  nothing the caller heard.
+- **A decoded recording survives the answer to a re-offer.** The re-answer stood up a fresh media
+  actor, which replaced the one holding the recording's sinks, so a `start_recording` (and the
+  `record_call` streams) ended at the first re-INVITE with a short file and a `call_ended` nobody
+  asked for. Recordings are now carried onto the new path like a tee is, decoding from each leg's
+  codec as it now is and resampled into the file's rate: one file across hold, resume and codec
+  changes.
+- **Stopping one recording no longer ends another on the same call.** The userspace hold is one
+  reason per call, and the first recording to stop released it, demoting a promoted relay under
+  any other recording on it, which then ended as `call_ended`.
 
 ## [0.15.3] — 2026-10-24
 
