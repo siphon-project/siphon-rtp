@@ -48,6 +48,7 @@ const CLIENT: ClientId = ClientId(1);
 
 mod conference_dial_out;
 mod conference_seat;
+mod conference_seat_call;
 mod offer_far;
 mod ogg_opus_recording;
 mod record_call_streams;
@@ -16841,6 +16842,7 @@ async fn reaping_pushes_a_media_timeout_event_to_the_owner() {
                 call_id,
                 from_tag,
                 reason,
+                ..
             } => {
                 assert_eq!(call_id, "gone");
                 assert_eq!(from_tag, "ft");
@@ -26601,6 +26603,7 @@ async fn an_evicted_connection_cannot_release_its_successors_sink() {
         Event::MediaTimeout {
             call_id: "probe".into(),
             from_tag: "a".into(),
+            conference_id: None,
             reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
         },
     );
@@ -26650,6 +26653,7 @@ async fn events_emitted_while_no_connection_is_attached_arrive_on_the_reconnect(
             .send(Event::MediaTimeout {
                 call_id: "probe".into(),
                 from_tag: "a".into(),
+                conference_id: None,
                 reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
             })
             .is_ok(),
@@ -29718,6 +29722,7 @@ async fn each_leg_reports_its_first_packet_once() {
             from_tag: "tag-a".into(),
             to_tag: Some("tag-b".into()),
             leg: LegSide::Near,
+            conference_id: None,
             source: Some(natted_addr),
             signalled: Some(addr_a),
         }],

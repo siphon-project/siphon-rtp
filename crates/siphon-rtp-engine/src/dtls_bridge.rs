@@ -854,6 +854,91 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         }
     }
 
+    /// The signalled-source gate installed on `endpoint`'s flow.
+    #[must_use]
+    pub fn accepted_source(&self, endpoint: EndpointId) -> Option<SourceFilter> {
+        self.flows.get(&endpoint).map(|flow| flow.accepted_source)
+    }
+
+    /// Whether `endpoint` is the DTLS-facing side of a flow whose handshake has keyed it, whichever
+    /// owner holds the key — the check [`Self::hand_to_conference`] would make, without moving
+    /// anything.
+    #[must_use]
+    pub fn has_key(&self, endpoint: EndpointId) -> bool {
+        self.flows
+            .get(&endpoint)
+            .is_some_and(|flow| match &flow.direction {
+                Direction::Pipeline { keyed, .. } => {
+                    keyed.load(std::sync::atomic::Ordering::Acquire)
+                }
+                Direction::Decrypt { .. } => flow
+                    .secure
+                    .lock()
+                    .map(|guard| guard.is_some())
+                    .unwrap_or(false),
+                Direction::Encrypt => false,
+            })
+    }
+
+    /// Hand a **keyed** DTLS leg's media to a conference seat (`conference_seat`), keeping its
+    /// association: the peer sees no new handshake (RFC 8842 §5.5) and the session keeps answering
+    /// its retransmitted flights (RFC 6347 §4.2.4).
+    ///
+    /// A relaying flow (the crypto bridge, `PipelineKind::Dtls` / `DtlsOfferer`) holds the key itself:
+    /// it is moved out and returned, and the flow becomes a pipeline flow feeding `target` still
+    /// encrypted, which the seat decrypts with the returned leg. A pipeline flow already feeding an
+    /// owner is re-pointed at `target` and returns `None`; its key is wherever that owner left it
+    /// (the retained copy [`Self::take_retained`] returns, or the call's own record).
+    ///
+    /// Refused, with nothing changed, while the handshake has not keyed the leg, and for the plain
+    /// side of a bridge (an encrypting flow) — that leg is not the DTLS one.
+    pub fn hand_to_conference(
+        &self,
+        endpoint: EndpointId,
+        target: PipelineTarget,
+    ) -> Result<Option<SecureLeg>, &'static str> {
+        let Some(mut flow) = self.flows.get_mut(&endpoint) else {
+            return Err("no DTLS flow on the endpoint");
+        };
+        match &mut flow.direction {
+            Direction::Pipeline {
+                target: current,
+                keyed,
+                ..
+            } => {
+                if !keyed.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err("the DTLS handshake has not completed");
+                }
+                *current = target;
+                drop(flow);
+                self.pipeline_keys.remove(&endpoint);
+                Ok(None)
+            }
+            Direction::Decrypt { dtls_in } => {
+                let dtls_in = dtls_in.clone();
+                let leg = match flow.secure.lock() {
+                    Ok(mut guard) => guard.take(),
+                    Err(_) => return Err("the DTLS leg's key is poisoned"),
+                };
+                let Some(leg) = leg else {
+                    return Err("the DTLS handshake has not completed");
+                };
+                flow.direction = Direction::Pipeline {
+                    dtls_in,
+                    target,
+                    keyed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                };
+                flow.out_dst = None;
+                flow.rtcp_out = None;
+                flow.rtcp_only = false;
+                flow.x3 = None;
+                flow.plain_taps = PlainTaps::default();
+                Ok(Some(leg))
+            }
+            Direction::Encrypt => Err("the endpoint faces the plain party, not the DTLS one"),
+        }
+    }
+
     /// Install a lawful-interception content tap on one bridged endpoint's ingress, replacing any
     /// tap already there. Returns whether this bridge owns the endpoint.
     ///

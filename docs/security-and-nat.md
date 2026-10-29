@@ -912,6 +912,18 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
     address that never asked for it. The follower is aborted on every path that drops the seat —
     `conference_leave`, a failed checklist, and the idle reap — so it never outlives it. Proven by
     `an_ice_lite_conference_seat_is_sent_the_mix_at_the_source_its_check_validated`.
+  - **A live call's leg seated in place (`conference_seat`) keeps the gate it already had.** The
+    seat is taken **pending** (`secure_pending`), so the room neither mixes nor sends while the call's
+    previous owner — the in-kernel `Forward` rule, the SRTP/DTLS bridge, or the media actor — is still
+    carrying it. Once that owner has stopped, `ConferenceControl::Activate` hands the room the gate
+    that owner had **in force** (the `Forward` rule's `accepted_source`, the bridge flow's, or the
+    actor's per-direction gate as an ICE selection may have narrowed it), the destination it had
+    latched, and the leg's own `SecureLeg` with its rollover and replay state (RFC 3711 §3.3.1). Only
+    then is the endpoint routed to the room. The gate is never re-derived from the signalling and
+    never widened by the move, the room's symmetric latch starts afresh, and two owners never send
+    toward the party at once. A DTLS leg's association stays with its bridge, now feeding the room,
+    so the handshake is not repeated. A call whose SRTP the engine relays end to end without a key
+    is refused rather than mixed as ciphertext.
   - **A seat the room dials out gets the same gate from the answer.** `conference_offer` allocates the
     endpoint but installs no redirect and seats nothing, so a datagram reaching it before the answer
     enters no room. `conference_answer` then seats the participant through the same

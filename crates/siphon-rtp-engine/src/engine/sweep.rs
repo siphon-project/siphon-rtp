@@ -69,6 +69,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             if held && held_idle_ticks == 0 {
                 continue;
             }
+            // A call whose leg was taken back out of a room (`conference_leave`) relays nothing and
+            // is judged like any call. One still seated is judged too, but reported rather than freed
+            // (below).
             // Measured exactly as before — the latest accepted packet across every endpoint, text
             // included (RFC 4103 text is media too, and a text-only exchange is not a dead path). `0`
             // is the datapath's documented "no accepted packet yet" sentinel ([`Datapath::
@@ -103,9 +106,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
         // Second pass: tear each idle call down (no map guard held across the awaits). Shared with
-        // consent failure — both are dead-path detections and must free identical state.
+        // consent failure — both are dead-path detections and must free identical state. A seated
+        // call leg is the exception `reap_call` makes: reported against its call, never freed.
         let mut reaped = Vec::new();
         for (call_id, reason) in stale {
+            // Reported, not reaped: the call is still there for its controller to delete.
+            if self.seated_room(&call_id).is_some() {
+                let last_activity = self.call_last_activity(&call_id);
+                self.report_seat_timeout(&call_id, reason, last_activity);
+                continue;
+            }
             let cdr_reason = match reason {
                 MediaTimeoutReason::HeldTooLong => "held_timeout",
                 MediaTimeoutReason::SetupTimeout => "setup_timeout",
@@ -199,7 +209,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // A conference seat is dropped rather than reaped as a call: it has no `MediaCall`
                     // to tear down, and leaving it seated would hold a room open around a participant
                     // that can never be reached — its gate would stay pending forever.
-                    if let Some((conference_id, tag)) = self.conference.participant_at(endpoint) {
+                    // A live call's seated leg is its call's, not the room's: it falls through to the
+                    // call path below, which reports it against the call.
+                    if let Some((conference_id, tag)) = self
+                        .conference
+                        .participant_at(endpoint)
+                        .filter(|(room, tag)| self.conference.seated_call(room, tag).is_none())
+                    {
                         // A seat can own more than one endpoint (audio plus an RFC 9071 text leg),
                         // so free every one `leave` hands back — not just the ICE one that failed.
                         for seat_endpoint in self.conference.leave(&conference_id, &tag) {
@@ -411,6 +427,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         reason: &str,
         timeout_reason: MediaTimeoutReason,
     ) -> bool {
+        // A call leg seated in a conference room is not freed by the engine: the controller hears
+        // `media_timeout` for its call, naming the room, and ends the dialog with its own `delete`
+        // (the dialog and any charging on it are the controller's to end). Reported once per
+        // silence, so a sweep that finds it still silent says nothing more.
+        if self.seated_room(call_id).is_some() {
+            let last_activity = self.call_last_activity(call_id);
+            return self.report_seat_timeout(call_id, timeout_reason, last_activity);
+        }
         let Some((_, call)) = self.calls.remove(call_id) else {
             return false;
         };
@@ -420,10 +444,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Event::MediaTimeout {
                 call_id: call_id.to_string(),
                 from_tag: call.from_tag,
+                conference_id: None,
                 reason: timeout_reason,
             },
         );
         true
+    }
+
+    /// The latest accepted-packet tick across a call's endpoints (`0` when none has carried media).
+    fn call_last_activity(&self, call_id: &str) -> u64 {
+        let endpoints: Vec<EndpointId> = self
+            .calls
+            .get(call_id)
+            .map(|call| call.all_endpoint_ids().collect())
+            .unwrap_or_default();
+        endpoints
+            .into_iter()
+            .filter_map(|endpoint| self.datapath.last_activity(endpoint))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Propagate each in-kernel-learned peer source into the sibling leg's forward destination — the

@@ -9,6 +9,31 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **`conference_seat`: seat a live call's leg in a conference room where it stands.** Merging two
+  calls into a three-way call no longer means re-INVITEing each far party to move its media a few
+  ports along. The leg keeps its endpoint, latched peer, codec, SDES-SRTP contexts or DTLS
+  association and ICE pair, so the far party is told nothing. A leg on the in-kernel relay is moved
+  onto the decoding path by the same command. The leg's former peer is released only once the seat
+  is in, so a refusal (no encoder, a frame the room cannot hold, a full room, a tag already seated,
+  a draining node) leaves the call relaying as it was. The call stays registered with the seated leg
+  as its one leg: `delete` returns its summary with counters spanning the move, its `dtmf`,
+  `call_quality` and `media_started` name the call with `conference_id` beside it, and a silent seat
+  raises `media_timeout` for the call without being freed. `conference_leave` hands the leg back to
+  its call on the same endpoint. The room marks its first packet toward the seat and sends an RTCP
+  `BYE` for the stream it replaces. Advertised as `conference_seat` in `node_info` features.
+- **A recorded call can be merged.** A decoded `wav` or `ogg_opus` recording running on a call
+  carries over when its leg is seated: same `recording_id`, same file, no gap. It keeps recording
+  that party, its voice on its own channel and what the room sends it on the other, survives a
+  `conference_leave`, and `recording_finished` fires once, when it is stopped or the call deleted,
+  with a duration spanning the move. On a seated call `start_recording`, `stop_recording`,
+  `play_media`, `stop_media` and `set_play_gain` act on the seat. A pcap recording, tee, WebSocket
+  bridge, interception, subscription, DTMF block or echo mode still refuses the seat, and the reason
+  names which.
+- **A joined conference seat the idle sweep reaps is now reported**, as a `media_timeout` with an
+  empty `call_id`, the room's `conference_id` and the seat's tag, to the client whose join seated it.
+  It used to vanish with no event at all.
+- `media_timeout`, `dtmf` and `media_started` carry an optional `conference_id`; `call_quality`
+  carries both `call_id` and `conference_id` for a seated call leg.
 - **A call handed to a voice bot can be recorded.** `start_recording` with `wav` or `ogg_opus` on
   a takeover call (`ws_uri` at answer, or `attach_ws_bridge` on an engine-answered call) used to be
   refused, because nothing on the relay carries that audio. It now taps the bridge session: the

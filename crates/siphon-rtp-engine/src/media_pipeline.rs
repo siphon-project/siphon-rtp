@@ -52,8 +52,10 @@ use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
 
 mod relay_tap;
+mod surrender;
 pub use relay_tap::CarriedAttachments;
 use relay_tap::TapDecode;
+pub use surrender::SurrenderedCall;
 
 /// The playout-clock tick driving injected media (PlayMedia / PlayDtmf): one egress packet per
 /// 20 ms, the telephony default ptime (RFC 3551).
@@ -2150,6 +2152,7 @@ impl Direction {
                                 call_id: leg_meta.call_id.to_string(),
                                 from_tag: leg_meta.from_tag.to_string(),
                                 to_tag: leg_meta.to_tag.map(str::to_string),
+                                conference_id: None,
                                 digit: event.digit.to_string(),
                                 duration_ms: u32::from(event.duration) / 8,
                                 volume: -i32::from(event.volume),
@@ -2229,6 +2232,7 @@ impl Direction {
                     call_id: leg_meta.call_id.to_string(),
                     from_tag: leg_meta.from_tag.to_string(),
                     to_tag: leg_meta.to_tag.map(str::to_string),
+                    conference_id: None,
                     digit: event.digit.to_string(),
                     // RTP timestamp units are samples at the 8 kHz telephone-event clock (RFC 4733).
                     duration_ms: u32::from(event.duration) / 8,
@@ -2650,6 +2654,7 @@ impl Direction {
                     call_id: leg_meta.call_id.to_string(),
                     from_tag: leg_meta.from_tag.to_string(),
                     to_tag: leg_meta.to_tag.map(str::to_string),
+                    conference_id: None,
                     digit: event.digit.to_string(),
                     duration_ms: u32::from(event.duration) / 8,
                     volume: -i32::from(event.volume),
@@ -4086,6 +4091,12 @@ pub enum MediaControl {
     Report {
         reply: tokio::sync::oneshot::Sender<FinalCallQuality>,
     },
+    /// Hand the call's legs to another owner and stop ([`MediaCall::surrender`]): reply with each
+    /// party's SRTP contexts, the source gate in force on each ingress and the call's final quality,
+    /// then exit. Sent by `conference_seat`, which seats one party in a room.
+    Surrender {
+        reply: tokio::sync::oneshot::Sender<SurrenderedCall>,
+    },
     /// Deliver the far (B) leg's [`SecureLeg`] once its DTLS handshake completed (RFC 5764), keying
     /// the directions that face B and clearing the pending gate so media starts flowing. Sent by the
     /// handshake task, which cannot key the pipeline at answer time because no key exists yet.
@@ -4583,6 +4594,10 @@ async fn run_media_call<D>(
                     MediaInput::Control(MediaControl::AttachSecureLeg { leg }) => {
                         call.attach_secure_leg(leg);
                         tracing::debug!(target: "siphon_rtp::media", "DTLS-SRTP key installed on the media pipeline");
+                    }
+                    MediaInput::Control(MediaControl::Surrender { reply }) => {
+                        let _ = reply.send(call.surrender());
+                        break;
                     }
                     MediaInput::Control(MediaControl::Report { reply }) => {
                         // Read-only snapshot for the engine's CDR; the actor keeps running.

@@ -161,12 +161,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.recordings
                 .iter()
                 .filter(|entry| entry.value().call_id == call_id)
+                .filter(|entry| entry.value().on_media_actor())
                 .filter_map(|entry| {
                     entry
                         .value()
-                        .retap
+                        .taps
                         .as_ref()
-                        .and_then(|retap| retap.mixer.upgrade())
+                        .and_then(|taps| taps.mixer.upgrade())
                 })
                 .collect()
         })
@@ -183,7 +184,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let running: Vec<String> = self
             .recordings
             .iter()
-            .filter(|entry| entry.value().call_id == call_id && entry.value().retap.is_some())
+            .filter(|entry| entry.value().call_id == call_id && entry.value().on_media_actor())
             .map(|entry| entry.key().clone())
             .collect();
         for recording_id in running {
@@ -204,11 +205,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     async fn retap_recording(&self, call_id: &str, recording_id: &str) -> Result<(), String> {
         let Some((mixer, rate, taps, ingress_legs, egress_legs)) =
             self.recordings.get(recording_id).and_then(|recording| {
-                let retap = recording.retap.as_ref()?;
+                let taps = recording.taps.as_ref()?;
                 Some((
-                    retap.mixer.upgrade(),
-                    retap.rate,
-                    retap.taps.clone(),
+                    taps.mixer.upgrade(),
+                    taps.rate,
+                    taps.layout.clone(),
                     recording.ingress_legs.clone(),
                     recording.egress_legs.clone(),
                 ))
@@ -253,7 +254,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // a re-tap never leaves two sinks on one ring (the mailbox keeps the order).
         self.detach_recording_sinks(call_id, recording_id, &ingress_legs, &egress_legs)
             .await;
-        for (is_ingress, source_a, channel) in taps {
+        for (source, channel) in taps {
+            let (is_ingress, source_a) = source.parts();
             // The callee's own ingress is the only tap fed at the callee's rate; the caller's
             // ingress and everything sent toward the caller run at the caller's.
             let leg_rate = if is_ingress && !source_a {

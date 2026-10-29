@@ -7,6 +7,7 @@ use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_proto::{CmdResult, Event, PlayEndReason, PlayMediaSource, PlayRepeat};
 use std::sync::Arc;
 
+use crate::conference::ConferenceRegistry;
 use crate::media_fetch::{self, MediaFetchLimits};
 use crate::media_pipeline::{MediaControl, MediaRegistry, PlayRequest};
 
@@ -45,11 +46,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some(call_to) = self.owned_call(client, call_id, |call| call.to_tag.clone()) else {
             return Err(Box::new(unknown_call(call_id)));
         };
+        // A leg seated in a room hears its prompts from its seat: nothing to promote.
+        let seat = self.seated_room(call_id);
         // Promote an offer-only single-leg IVR call (or a plain relay) to a processing MediaCall so a
         // prompt can play with no B leg — the same promote `set_echo` uses. Idempotent on an
         // already-transcoding call. Rejected only when a relay is held for recording / a DTMF block
         // (a relay-only actor cannot synthesize decoded audio — same guard as echo).
-        if !self.media.is_transcoding_call(call_id) {
+        if seat.is_none() && !self.media.is_transcoding_call(call_id) {
             if let Err(reason) = self
                 .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
                 .await
@@ -118,6 +121,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     repeat,
                     start_pos_ms: start,
                     play_id,
+                    seat: seat.clone(),
                 });
                 // The length is not known until the body has arrived, so the accept reports none.
                 return Ok((None, play_id));
@@ -170,6 +174,31 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let play_id = self.next_play_id();
         let gain = Gain::from_decibels(options.gain_decibels.unwrap_or(0));
+        if let Some((conference_id, tag)) = seat {
+            // The seat's own prompt, mixed into what it hears; its end is reported for the call.
+            let started = self
+                .conference
+                .ask(&conference_id, |reply| {
+                    crate::conference::SeatControl::SeatPlay {
+                        tag,
+                        request: Box::new(request),
+                        overlay: options.overlay,
+                        gain,
+                        play_id,
+                        duration_cap_ms: options.duration_ms,
+                        reply,
+                    }
+                })
+                .await;
+            return match started {
+                Some(Ok(())) => Ok((duration_ms, play_id)),
+                Some(Err(error)) => Err(Box::new(error_result("play_media", &error))),
+                None => Err(Box::new(error_result(
+                    "play_media",
+                    &"the seat's room did not start the playback",
+                ))),
+            };
+        }
         // An overlay start can be rejected (all four slots busy), and that rejection has to reach the
         // controller — so it waits for the actor's answer. A superseding start cannot be rejected on
         // capacity grounds, so it stays fire-and-forget exactly as it always was.
@@ -230,6 +259,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// awaiting it is never left hanging.
     fn spawn_media_fetch(&self, request: MediaFetchRequest) {
         let media = self.media.clone();
+        let conference = self.conference.clone();
         let limits = self.media_fetch_limits.clone();
         let tls = self.ws_tls_client_config();
         let events = self.event_sink(request.client);
@@ -246,7 +276,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let pending_key = self.pending_fetches.clone();
 
         let task = tokio::spawn(async move {
-            let outcome = fetch_and_start(&media, &limits, tls, &request).await;
+            let outcome = fetch_and_start(&media, &conference, &limits, tls, &request).await;
             // The entry is consumed either way: a completed fetch is no longer cancellable, and a
             // failed one has just reported. Removing it here is what keeps the map bounded.
             pending_key.remove(&play_id);
@@ -354,6 +384,31 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
         }
+        if let Some((conference_id, tag)) = self.seated_room(call_id) {
+            let cancelled = match play_id {
+                Some(play_id) => self.cancel_pending_fetch(play_id, PlayEndReason::Stopped),
+                None => self.cancel_pending_fetches_for_call(call_id, PlayEndReason::Stopped) > 0,
+            };
+            let stopped = self
+                .conference
+                .ask(&conference_id, |reply| {
+                    crate::conference::SeatControl::SeatStopPlay {
+                        tag,
+                        play_id,
+                        reply,
+                    }
+                })
+                .await
+                == Some(true);
+            return match (stopped || cancelled, play_id) {
+                (true, _) => ok_empty(),
+                (false, Some(play_id)) => error_result(
+                    "stop_media",
+                    &format!("no playback {play_id} is running on this call"),
+                ),
+                (false, None) => error_result("stop_media", &"call has no active media playback"),
+            };
+        }
         let Some(play_id) = play_id else {
             // A URL playback whose fetch is still in flight has no actor state to stop, so cancel it
             // here — otherwise it would start playing seconds after the controller stopped the call.
@@ -405,6 +460,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
+        }
+        if let Some((conference_id, tag)) = self.seated_room(call_id) {
+            let gain = Gain::from_decibels(gain_decibels);
+            return if self
+                .conference
+                .ask(&conference_id, |reply| {
+                    crate::conference::SeatControl::SeatPlayGain {
+                        tag,
+                        play_id,
+                        gain,
+                        reply,
+                    }
+                })
+                .await
+                == Some(true)
+            {
+                ok_empty()
+            } else {
+                error_result(
+                    "set_play_gain",
+                    &format!("no playback {play_id} is running on this call"),
+                )
+            };
         }
         let (sender, receiver) = tokio::sync::oneshot::channel();
         if !self.media.control(
@@ -475,6 +553,8 @@ struct MediaFetchRequest {
     /// Seek into the fetched prompt before the first frame.
     start_pos_ms: u32,
     play_id: u64,
+    /// The room seat (`conference_id`, tag) to play to, when the call's leg is seated in one.
+    seat: Option<(String, String)>,
 }
 
 /// A URL playback whose fetch has not finished. Holds what a cancellation needs: the call it
@@ -516,6 +596,7 @@ impl PendingFetch {
 /// for. Runs on its own task — never on the media path, never on a control connection.
 async fn fetch_and_start(
     media: &Arc<MediaRegistry>,
+    conference: &Arc<ConferenceRegistry>,
     limits: &MediaFetchLimits,
     tls: Arc<rustls::ClientConfig>,
     request: &MediaFetchRequest,
@@ -536,6 +617,25 @@ async fn fetch_and_start(
     );
     let gain = Gain::from_decibels(request.options.gain_decibels.unwrap_or(0));
 
+    if let Some((conference_id, tag)) = request.seat.clone() {
+        return match conference
+            .ask(&conference_id, |reply| {
+                crate::conference::SeatControl::SeatPlay {
+                    tag,
+                    request: Box::new(PlayRequest::Pcm(Box::new(player))),
+                    overlay: request.options.overlay,
+                    gain,
+                    play_id: request.play_id,
+                    duration_cap_ms: request.options.duration_ms,
+                    reply,
+                }
+            })
+            .await
+        {
+            Some(outcome) => outcome,
+            None => Err("the seat's room did not start the playback".to_string()),
+        };
+    }
     let (sender, receiver) = tokio::sync::oneshot::channel();
     if !media.control(
         &request.call_id,

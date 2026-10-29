@@ -143,7 +143,9 @@ impl Command {
             | Command::AttachWsBridge { call_id, .. }
             | Command::DetachWsBridge { call_id, .. }
             | Command::AttachX3 { call_id, .. }
-            | Command::DetachX3 { call_id, .. } => Some(call_id),
+            | Command::DetachX3 { call_id, .. }
+            // Names a call (the leg it moves) as well as a room, so the frame's scope keys it.
+            | Command::ConferenceSeat { call_id, .. } => Some(call_id),
             Command::Ping
             | Command::List
             | Command::Statistics
@@ -350,6 +352,7 @@ mod tests {
         let event = Event::MediaTimeout {
             call_id: "7f9a2b1c@192.0.2.20".into(),
             from_tag: "a7c31f".into(),
+            conference_id: None,
             reason: MediaTimeoutReason::NoMedia,
         };
         let body = serde_json::to_string(&Scoped::new(Some("bgcf".into()), event.clone()))

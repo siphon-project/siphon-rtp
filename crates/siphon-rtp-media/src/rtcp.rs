@@ -192,6 +192,30 @@ pub fn write_sender_report(
     Some(total)
 }
 
+/// Length of [`write_goodbye`]'s compound: an empty Receiver Report (8 bytes) and a one-source BYE
+/// (8 bytes).
+pub const GOODBYE_LEN: usize = 16;
+
+/// Write the compound RTCP packet that says `ssrc` is leaving (RFC 3550 §6.6) into `out`, returning
+/// its length — or `None` if `out` is shorter than [`GOODBYE_LEN`].
+///
+/// A compound packet must open with a report (RFC 3550 §6.1), so the BYE is preceded by an empty
+/// Receiver Report (`RC = 0`) from the same SSRC. Reason text is optional and omitted. The engine
+/// sends one when a stream it was relaying to a party is replaced by one it originates, so the party
+/// sees the old source end rather than go silent (RFC 3550 §6.3.7).
+#[must_use]
+pub fn write_goodbye(ssrc: u32, out: &mut [u8]) -> Option<usize> {
+    let compound = out.get_mut(..GOODBYE_LEN)?;
+    let ssrc = ssrc.to_be_bytes();
+    // RR: V=2, P=0, RC=0, PT=201, length 1 (two 32-bit words), sender SSRC.
+    compound[0..4].copy_from_slice(&[0x80, packet_type::RECEIVER_REPORT, 0, 1]);
+    compound[4..8].copy_from_slice(&ssrc);
+    // BYE: V=2, P=0, SC=1, PT=203, length 1, the one source leaving.
+    compound[8..12].copy_from_slice(&[0x81, packet_type::BYE, 0, 1]);
+    compound[12..16].copy_from_slice(&ssrc);
+    Some(GOODBYE_LEN)
+}
+
 fn read_report_blocks(body: &[u8], count: usize) -> Vec<ReportBlock> {
     let mut reports = Vec::with_capacity(count);
     for index in 0..count {
@@ -331,6 +355,43 @@ pub fn demux(datagram: &[u8]) -> Option<MuxKind> {
         Some(MuxKind::Rtcp)
     } else {
         Some(MuxKind::Rtp)
+    }
+}
+
+#[cfg(test)]
+mod goodbye_tests {
+    use super::*;
+
+    #[test]
+    fn a_goodbye_is_an_empty_receiver_report_then_a_one_source_bye() {
+        let mut buffer = [0u8; GOODBYE_LEN];
+        assert_eq!(write_goodbye(0xDEAD_BEEF, &mut buffer), Some(GOODBYE_LEN));
+        assert_eq!(
+            buffer,
+            [
+                0x80, 201, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF, // RR, RC=0
+                0x81, 203, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF, // BYE, SC=1
+            ]
+        );
+        let packets = parse_compound(&buffer).expect("a well-formed compound");
+        assert_eq!(packets.len(), 2, "both sub-packets parse");
+        assert!(matches!(
+            &packets[0],
+            RtcpPacket::ReceiverReport(report) if report.ssrc == 0xDEAD_BEEF && report.reports.is_empty()
+        ));
+        assert!(matches!(
+            &packets[1],
+            RtcpPacket::Other {
+                packet_type: 203,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_goodbye_refuses_a_buffer_too_short_to_hold_it() {
+        let mut buffer = [0u8; GOODBYE_LEN - 1];
+        assert_eq!(write_goodbye(1, &mut buffer), None);
     }
 }
 

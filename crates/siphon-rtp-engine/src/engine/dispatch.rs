@@ -206,6 +206,56 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// The refusal for a verb a seated (or seated-then-left) call cannot take, or `None` when the
+    /// command is not addressed to such a call or is one it answers: `delete`, `query`, a further
+    /// `conference_seat`, `stop_recording`, and — while seated — `silence_media` / `block_media` and
+    /// their reverses, `play_media` / `stop_media` / `set_play_gain` and `start_recording`, which
+    /// act on the seat.
+    fn seated_call_refusal(&self, client: ClientId, command: &Command) -> Option<CmdResult> {
+        let call_id = command_call_id(command)?;
+        if command.is_conference() {
+            return None;
+        }
+        let (conference_id, seated) = self
+            .owned_call(client, call_id, |call| {
+                call.seat
+                    .as_ref()
+                    .map(|seat| (seat.conference_id.clone(), seat.seated))
+            })
+            .flatten()?;
+        let allowed = match command {
+            Command::Delete { .. } | Command::Query { .. } | Command::ConferenceSeat { .. } => true,
+            Command::SilenceMedia { .. }
+            | Command::UnsilenceMedia { .. }
+            | Command::BlockMedia { .. }
+            | Command::UnblockMedia { .. }
+            | Command::PlayMedia { .. }
+            | Command::StopMedia { .. }
+            | Command::SetPlayGain { .. }
+            | Command::StartRecording { .. } => seated,
+            // A recording kept running across a leave can still be stopped.
+            Command::StopRecording { .. } => true,
+            _ => false,
+        };
+        if allowed {
+            return None;
+        }
+        let reason = if seated {
+            format!(
+                "{}: conference-seated: the call's leg is seated in conference {conference_id}; \
+                 address the room with the conference_* verbs, or conference_leave first",
+                command_name(command)
+            )
+        } else {
+            format!(
+                "{}: the call's leg left conference {conference_id} and relays nothing; seat it \
+                 again (conference_seat) or delete it",
+                command_name(command)
+            )
+        };
+        Some(CmdResult::Error { reason })
+    }
+
     /// Push an asynchronous event to whichever client owns `call_id` (a no-op for an unknown call).
     pub(super) fn emit_call_event(&self, call_id: &str, event: Event) {
         if let Some(owner) = self.owned_call_internal(call_id, |call| call.owner) {
@@ -301,13 +351,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     | Command::AnswerLocal { .. }
                     | Command::ConferenceJoin { .. }
                     | Command::ConferenceOffer { .. }
+                    // A seat is a new conference participant, even though its call is not new.
+                    | Command::ConferenceSeat { .. }
             )
         {
             return CmdResult::Error {
                 reason: "node is draining; not accepting new sessions".to_string(),
             };
         }
+        // A call whose leg sits in a room answers only the verbs that mean something for a seat. The
+        // rest would rebuild a media path the room owns now, so each is refused naming the room.
+        if let Some(refusal) = self.seated_call_refusal(client, &command) {
+            return refusal;
+        }
         match command {
+            Command::ConferenceSeat {
+                call_id,
+                from_tag,
+                conference_id,
+                role,
+            } => {
+                self.conference_seat(client, &call_id, &from_tag, &conference_id, role)
+                    .await
+            }
             Command::Reoffer {
                 call_id,
                 from_tag,
@@ -417,8 +483,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.block_dtmf(client, &call_id, &from_tag, to_tag.as_deref(), false)
                     .await
             }
-            Command::SilenceMedia { call_id, .. } => self.set_silence(client, &call_id, true),
-            Command::UnsilenceMedia { call_id, .. } => self.set_silence(client, &call_id, false),
+            Command::SilenceMedia { call_id, .. } => self.set_silence(client, &call_id, true).await,
+            Command::UnsilenceMedia { call_id, .. } => {
+                self.set_silence(client, &call_id, false).await
+            }
             command @ (Command::PlayMedia { .. }
             | Command::StopMedia { .. }
             | Command::SetPlayGain { .. }
@@ -673,7 +741,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Command::ConferenceLeave {
                 conference_id,
                 from_tag,
-            } => self.conference_leave(&conference_id, &from_tag).await,
+            } => {
+                self.conference_leave(client, &conference_id, &from_tag)
+                    .await
+            }
             Command::ConferenceRoute {
                 conference_id,
                 from_tag,
@@ -817,6 +888,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::SubscribeAnswer { .. } => "subscribe_answer",
         Command::Unsubscribe { .. } => "unsubscribe",
         Command::ConferenceJoin { .. } => "conference_join",
+        Command::ConferenceSeat { .. } => "conference_seat",
         Command::ConferenceOffer { .. } => "conference_offer",
         Command::ConferenceAnswer { .. } => "conference_answer",
         Command::ConferenceLeave { .. } => "conference_leave",
@@ -878,7 +950,8 @@ pub(super) fn command_call_id(command: &Command) -> Option<&str> {
         | Command::AttachWsBridge { call_id, .. }
         | Command::DetachWsBridge { call_id, .. }
         | Command::AttachX3 { call_id, .. }
-        | Command::DetachX3 { call_id, .. } => Some(call_id),
+        | Command::DetachX3 { call_id, .. }
+        | Command::ConferenceSeat { call_id, .. } => Some(call_id),
         Command::ConferenceJoin { conference_id, .. }
         | Command::ConferenceOffer { conference_id, .. }
         | Command::ConferenceAnswer { conference_id, .. }

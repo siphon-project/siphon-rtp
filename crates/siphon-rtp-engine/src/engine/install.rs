@@ -191,6 +191,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         owner_events: Option<flume::Sender<Event>>,
     ) -> Result<Vec<(EndpointId, FlowAction)>, Box<CmdResult>> {
         match pipeline {
+            // An answer never resolves to a seat: only `conference_seat` moves a leg into a room.
+            PipelineKind::Seated => {
+                return Err(boxed_error_result(
+                    "answer",
+                    &"the call's leg is seated in a conference room (internal)",
+                ));
+            }
             PipelineKind::Srtp => {
                 // `resolve_pipeline` only yields `Srtp` when `far_local_crypto` is set, so this is an
                 // internal invariant; answer gracefully rather than panic on the control path.

@@ -1264,6 +1264,13 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner.latched.get(&endpoint).map(|latch| latch.source)
     }
 
+    fn latched_ssrc(&self, endpoint: EndpointId) -> Option<u32> {
+        self.inner
+            .latched
+            .get(&endpoint)
+            .and_then(|latch| latch.ssrc)
+    }
+
     fn ice_validated_source(&self, endpoint: EndpointId) -> Option<SocketAddr> {
         // Only an ICE endpoint has a *validated* source. On one, `handle_stun` is the sole writer of
         // `latched` — media never creates or moves it (`Inner::dispatch`, layer 4) — so the latch is
@@ -2019,6 +2026,33 @@ mod tests {
         assert_eq!(data, b"injected");
         assert_eq!(from, leg.local_addr);
         assert_eq!(datapath.stats(leg.id).expect("stats").packets_out, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_latch_reports_the_ssrc_of_the_stream_it_adopted() {
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (phone_a, _) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        datapath
+            .install_flow(
+                near.id,
+                FlowAction::Forward(ForwardRule::symmetric(far.id, Some(addr_b))),
+            )
+            .expect("near flow");
+        assert_eq!(datapath.latched_ssrc(near.id), None, "nothing latched yet");
+        phone_a
+            .send_to(&rtp(0x1234_5678, 1), near.local_addr)
+            .await
+            .expect("send");
+        let _ = recv(&phone_b).await;
+        assert_eq!(datapath.latched_ssrc(near.id), Some(0x1234_5678));
+        assert_eq!(
+            datapath.latched_ssrc(far.id),
+            None,
+            "the far side sent nothing"
+        );
     }
 
     #[tokio::test]

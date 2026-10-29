@@ -158,7 +158,10 @@ Leaving frees the participant's endpoint; the room dies with its last member:
 ```
 
 Participants that go silent past the media timeout (`--media-timeout-secs`) are reaped
-automatically, and a room left empty is torn down, so an abandoned leg never leaks a room.
+automatically, and a room left empty is torn down, so an abandoned leg never leaks a room. The
+client whose join seated the participant is told: a `media_timeout` with an empty `call_id`, the
+room's `conference_id`, and the seat's tag in `from_tag`. (A leg seated with `conference_seat` is
+the exception: see below.)
 
 ## Calling a participant out
 
@@ -230,6 +233,115 @@ A seat that is offered and never answered is not in the room and holds only its 
 call awaiting its answer gets; the media timeout bounds it when the setup timeout is `0`). A second
 `conference_offer` for a tag already pending or seated is refused, and so is a `conference_join` for
 a tag whose offer is pending.
+
+## Seating a live call's leg
+
+The two verbs above both bring a party in with a fresh endpoint and an SDP exchange. A three-way
+call starts from two calls that are already up: a subscriber talks to X, holds, calls Y, and
+merges. X and Y are each anchored on an engine endpoint they already send to; seating either through
+`conference_join` or `conference_offer` would mean re-INVITEing them to move their media a few ports
+along on the same host. `conference_seat` seats the leg where it stands instead:
+
+```json
+{ "id": 9, "command": "conference_seat", "call_id": "c-x@example.com", "from_tag": "x-tag",
+  "conference_id": "merge-1", "role": { "role": "talker" } }
+```
+
+```json
+{ "id": 9, "result": "ok" }
+```
+
+`from_tag` names the leg by its tag in the call (the call's `from_tag` or `to_tag`) and is the
+seat's tag in the room. The leg keeps everything the far party was told: the engine endpoint (same
+local address and port), the latched peer, the negotiated codec and payload types, its SDES-SRTP
+contexts (rollover and replay state included) or its DTLS association (the handshake is not
+repeated), and its ICE pair. No SDP is exchanged and the reply carries none. A leg relayed in the
+kernel (or by XDP) is moved onto the decoding path by the same command; nothing has to be promoted
+first. The frame's `scope` applies as it does to every verb naming a `call_id`.
+
+The leg's former peer in that call — the subscriber's leg — is released by the same command, its
+endpoint freed. You are ending that dialog anyway, and a half-call left allocated would hold a port
+pair until it timed out. The order matters: the seat goes in first, and only then is the peer
+released, so a refusal never drops the call.
+
+```
+subscriber ──(call X)── engine ──── X        subscriber ── (both dialogs ended)
+subscriber ──(call Y)── engine ──── Y   =>   room merge-1: X, Y (+ the subscriber's own join)
+```
+
+Merging, end to end: `conference_seat` the X leg of the first call and the Y leg of the second,
+then bring the subscriber in with `conference_join` (or `conference_offer`) on a new dialog. All
+three hear each other mixed-minus-self.
+
+### What the far party sees
+
+The room originates its own stream toward each seat, so the far party sees a new SSRC, sequence and
+timestamp base with no signalling, which RFC 3550 §8 permits. The engine makes the change as easy
+to follow as it can: the first packet of the mix carries the marker bit (§5.1), and, where the leg
+carries RTCP and the engine knows the SSRC of the stream it had been relaying to the party, an RTCP
+`BYE` for that SSRC goes out first (§6.3.7). The SSRC is known for a userspace leg and for the
+loopback datapath's relay; the XDP kernel latch does not report it, so a leg moved off the XDP relay
+gets no `BYE`. Some border controllers latch on SSRC: that is a property of the far end and has to
+be measured per carrier, not assumed.
+
+### Refusals
+
+A refusal leaves the call relaying exactly as it was:
+
+| Refusal | `reason` contains |
+|---|---|
+| The leg's codec has no encoder (or decoder) in this build | `conference_seat: <codec> payload type <n>: no encoder: …` |
+| Decoder and encoder disagree on rate, interval or channels | `the room cannot hold it: decoder (…) and encoder (…) disagree` |
+| Packetization interval over 120 ms | `packetization interval <n> ms is outside 1..=120 ms` |
+| The room is full | `the room is full (64 seats)` |
+| The tag is already seated in the room | `from-tag <tag> is already seated in this room` |
+| The node is draining | `node is draining; not accepting new sessions` |
+| The call is unanswered, single-leg, a WebSocket takeover, `fax_passthrough`, or carries text or fax | named in the reason |
+| The call's SRTP runs end to end and the engine holds no key | `the engine holds no key to decrypt the leg` |
+| A DTLS leg whose handshake has not completed | `the leg's DTLS-SRTP handshake has not completed` |
+| A pcap recording, WebSocket tee or bridge, interception, subscription, DTMF block or echo mode is attached | `<feature> is attached to the call; stop it first`, naming it |
+
+### The call while it is seated
+
+The call stays in the registry with the seated leg as its one leg, so your view of it holds:
+
+- `delete` takes the seat out of the room, frees the endpoint, and returns the same `call_summary` a
+  call always returns. Its packet and byte counts are the endpoint's own, so they span the time
+  before and after the move. `siphon_rtp_conference_participants` drops by one.
+- Events the seat raises name the call: `dtmf`, `call_quality` and `media_started` carry the
+  original `call_id` and `from_tag`, with `conference_id` beside them, and go to the client that owns
+  the call.
+- `silence_media` gives the seat encoded silence instead of the mix; `block_media` stops the room
+  sending it anything (the egress clock keeps running, so it resumes cleanly). Both are undone by
+  their reverses.
+- `play_media` plays to that seat alone, at its own rate: a plain prompt replaces the mix while it
+  plays (a newer one supersedes it), an `overlay` mixes under it. `stop_media` and `set_play_gain`
+  work by `play_id`, and each prompt ends with a `play_finished` naming the call, as on a call.
+- Recording. A decoded (`wav` or `ogg_opus`) recording that was running on the call when it was
+  seated **carries over**: the same `recording_id`, the same file, no gap and no second file. It goes
+  on recording that leg's party — what it says, and what the room sends it — so a stereo file stays
+  caller-left / callee-right, with the party on its own side and the room's mix on the other.
+  `start_recording` on a seated call records the seat the same way (the party left, what it hears
+  right). `recording_finished` fires once, when the recording is stopped or the call deleted, with a
+  duration spanning the move. A pcap recording is the exception: a seat's packets are the room's, so
+  it refuses the seat (and `start_recording` with `pcap` on a seated call).
+- Room-wide playback and recording stay on the `conference_*` verbs; the other call verbs are
+  refused with a reason naming the room.
+- A seated leg that goes silent raises `media_timeout` **for its call**, with the room's
+  `conference_id`, under the same reasons and budgets a two-party leg has, measured on that leg's own
+  ingress (and on consent or ICE failure, as for a call). The engine does **not** free it: end the
+  dialog, then `delete` the call. It is reported once per silence; fresh media re-arms it. The
+  room's own idle reap leaves it alone.
+
+### Leaving
+
+`conference_leave` on a seated leg does not free it. The leg goes back to its call as a one-legged
+call on the same endpoint, relaying nothing (its media is dropped and counted, and it is judged by
+the media-timeout sweep like any call). It keeps its SRTP contexts and DTLS association, so it can
+be seated again with `conference_seat`, or deleted. A recording running on it keeps going: the file
+stays open (gaining nothing while the leg relays nothing), carries on from the new seat when the leg
+is seated again, and ends when it is stopped or the call is deleted. Pairing it back to a new far party (turning the
+room back into an ordinary call) has no verb yet.
 
 ## Roles: mute, whisper, monitor
 
@@ -317,8 +429,10 @@ goes silent. Drives floor control or speaker highlighting.
   "duration_ms": 120, "volume": -8 }
 ```
 
-One event per completed RFC 4733 key press. Note the conference id arrives in the `call_id`
-field, the same shape as two-party DTMF events.
+One event per completed RFC 4733 key press. For a joined participant the conference id arrives in
+the `call_id` field, the same shape as two-party DTMF events, and again in `conference_id`. For a leg
+seated with `conference_seat`, `call_id` and `from_tag` are its call's own, with `conference_id`
+beside them.
 
 ```json
 { "event": "call_quality", "conference_id": "room-1", "from_tag": "alice",

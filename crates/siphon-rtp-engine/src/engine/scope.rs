@@ -168,6 +168,7 @@ mod tests {
         let timeout = |call_id: String| Event::MediaTimeout {
             call_id,
             from_tag: "a7c31f".into(),
+            conference_id: None,
             reason: MediaTimeoutReason::NoMedia,
         };
         let scoped = scoped_event(timeout(compose(Some("bgcf"), "abc").expect("compose")));
