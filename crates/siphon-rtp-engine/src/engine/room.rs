@@ -29,7 +29,7 @@ use crate::sdp::{self, EngineMedia, IceRewrite, ImageRewrite, SecurityAdvertisem
 use super::answer_local::answer_codec_candidates;
 use super::negotiate::{
     filter_component, ice_directive, ice_tie_breaker, parse_codec_flags, peer_ice_credentials,
-    random_ssrc, IceDirective,
+    peer_media_address, random_ssrc, IceDirective,
 };
 use super::play::{parse_prompt_wav, PlayOptions, ResolvedPlaySource};
 use super::record::AudioRecording;
@@ -331,10 +331,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // the room's `ice_pending` below additionally drops everything until the agent selects, and
         // `ice_selected` then narrows this filter to the selected pair.
         // (docs/security-and-nat.md §4 layer 4; RFC 8445 §7.)
+        //
+        // A NATed participant advertises a private `c=` and sends from its NAT's public address,
+        // which the SIP proxy saw its request arrive from (`profile.received_from`). The gate and
+        // the mix's opening destination follow that hint exactly as a two-party answer's do
+        // ([`peer_media_address`]); an ICE seat keeps the signalled address, since ICE decides its
+        // transport.
+        let seat_remote = if want_ice {
+            info.remote_rtp
+        } else {
+            peer_media_address(info.remote_rtp, profile.received_from)
+        };
         let accepted_source = if want_ice || profile.flags.iter().any(|flag| flag == "symmetric") {
             SourceFilter::Any
         } else {
-            SourceFilter::Exact(info.remote_rtp.ip())
+            SourceFilter::Exact(seat_remote.ip())
         };
 
         // Gather this seat's candidates before the answer is written — the answer *is* the candidate
@@ -460,7 +471,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     codec: seat,
                     telephone_event,
                     endpoint,
-                    remote_rtp: info.remote_rtp,
+                    remote_rtp: seat_remote,
                     accepted_source,
                     secure,
                     secure_pending: dtls_leg,
@@ -511,10 +522,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // pipeline mode (the room owns egress), so it mirrors the secure one.
                     plain_endpoint: endpoint.id,
                     plain_source: accepted_source,
-                    plain_dst: info.remote_rtp,
+                    plain_dst: seat_remote,
                     secure_endpoint: endpoint.id,
                     secure_source: accepted_source,
-                    secure_dst: info.remote_rtp,
+                    secure_dst: seat_remote,
                     secure_local: endpoint.local_addr,
                     certificate,
                     role,

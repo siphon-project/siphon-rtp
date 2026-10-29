@@ -151,6 +151,24 @@ length prefix plus a JSON body; the bodies below omit the prefix.
 `a=crypto` line; the answer comes back `RTP/SAVP` with the engine's own `a=crypto`, and that
 leg's ingress is decrypted and egress encrypted (SRTP and SRTCP, RFC 3711).
 
+### A participant behind a NAT
+
+A NATed client advertises a private `c=` and sends from its NAT's public address. Put the address
+your proxy saw the request arrive from in the join's `profile.received_from` (rtpengine's
+`received-from`; on `conference_answer` it is a field of the command):
+
+```json
+{ "id": 1, "command": "conference_join", "conference_id": "room-1", "from_tag": "alice",
+  "profile": { "received_from": "198.51.100.20" }, "sdp": "... c=IN IP4 10.0.0.7 ... m=audio 30000 ..." }
+```
+
+The seat then admits media from `198.51.100.20` only (the SDP's port is kept) and the room sends the
+mix there from the first tick, not to `10.0.0.7`. Without the hint a participant whose media comes
+from anywhere but its `c=` address is dropped and hears nothing; the alternative is the `symmetric`
+flag, which accepts any source. An ICE seat keeps the signalled address. `conference_offer` takes
+no hint: it has no remote address yet, and the hint is the answerer's, so it travels on
+`conference_answer`. Gate on the `conference_received_from` `node_info` feature.
+
 Leaving frees the participant's endpoint; the room dies with its last member:
 
 ```json

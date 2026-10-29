@@ -889,6 +889,17 @@ pub(super) fn apply_received_from(
     }
 }
 
+/// A peer's media address with its `received-from` hint folded in: the hint IP with the signalled
+/// port, or the signalled address when there is no hint. The one rule every path that gates or
+/// aims at a peer by its SDP uses — the two-party answer (both legs), and a conference seat — so
+/// the gate and the pre-latch destination cannot drift apart between them.
+pub(super) fn peer_media_address(
+    signalled: std::net::SocketAddr,
+    hint: Option<std::net::IpAddr>,
+) -> std::net::SocketAddr {
+    apply_received_from(Some(signalled), hint).unwrap_or(signalled)
+}
+
 /// The source-address gate for an SRTP-bridge leg, mirroring [`ingress_rule`]'s policy: an exact
 /// source-IP gate by default (the tightest RTPBleed defence), the signalled /24 (v4) or /64 (v6)
 /// under `subnet-source`, or any source under `symmetric`. The bridge enforces this itself because
@@ -1009,10 +1020,8 @@ pub(super) fn answer_gate_addresses(
 ) -> AnswerAddresses {
     let near_gate_rtp = apply_received_from(near.remote_rtp, offer_received_from);
     let near_gate_rtcp = apply_received_from(near.remote_rtcp, offer_received_from);
-    let far_gate_rtp =
-        apply_received_from(Some(info.remote_rtp), far_received_from).unwrap_or(info.remote_rtp);
-    let far_gate_rtcp =
-        apply_received_from(Some(info.remote_rtcp), far_received_from).unwrap_or(info.remote_rtcp);
+    let far_gate_rtp = peer_media_address(info.remote_rtp, far_received_from);
+    let far_gate_rtcp = peer_media_address(info.remote_rtcp, far_received_from);
     AnswerAddresses {
         near_gate_rtp,
         near_gate_rtcp,

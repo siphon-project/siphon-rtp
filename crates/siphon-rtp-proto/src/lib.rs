@@ -633,6 +633,14 @@ pub enum Command {
         conference_id: String,
         from_tag: String,
         sdp: String,
+        /// The real post-NAT source IP the SIP proxy saw the participant's answer arrive from
+        /// (rtpengine's `received-from`), as [`ProfileFlags::received_from`] carries it on a
+        /// [`Command::ConferenceJoin`] or an `answer`. A NATed participant advertises a private
+        /// `c=`; its media comes from this address. The seat gates its ingress on it and sends the
+        /// mix there until the participant's own stream latches. Only the IP is carried: the
+        /// answer's port is kept. Absent, the answer's `c=` is used unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        received_from: Option<std::net::IpAddr>,
     },
     /// Move one leg of a **live call** into a conference room, in place: the leg named by `from_tag`
     /// (the call's `from_tag` or `to_tag`) keeps its engine endpoint, its latched peer, its codec and
@@ -3514,6 +3522,7 @@ mod tests {
                 conference_id: "room".into(),
                 from_tag: "f".into(),
                 sdp: "v=0".into(),
+                received_from: Some("198.51.100.7".parse().expect("ip")),
             },
             Command::ConferenceUnbridge {
                 conference_id_a: "a".into(),
@@ -3617,6 +3626,33 @@ mod tests {
     }
 
     #[test]
+    fn conference_answer_carries_an_optional_received_from() {
+        let bare =
+            r#"{"command":"conference_answer","conference_id":"r","from_tag":"f","sdp":"v=0"}"#;
+        assert!(matches!(
+            serde_json::from_str::<Command>(bare).expect("deserialize"),
+            Command::ConferenceAnswer {
+                received_from: None,
+                ..
+            }
+        ));
+        let hinted = Request {
+            id: 3,
+            command: Command::ConferenceAnswer {
+                conference_id: "r".into(),
+                from_tag: "f".into(),
+                sdp: "v=0".into(),
+                received_from: Some("198.51.100.7".parse().expect("ip")),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&hinted).expect("serialize"),
+            r#"{"id":3,"command":"conference_answer","conference_id":"r","from_tag":"f","sdp":"v=0","received_from":"198.51.100.7"}"#
+        );
+        roundtrip(&hinted);
+    }
+
+    #[test]
     fn conference_offer_wire_shape_and_defaults() {
         let json = r#"{"command":"conference_offer","conference_id":"room-1","from_tag":"carol"}"#;
         match serde_json::from_str::<Command>(json).expect("deserialize") {
@@ -3663,6 +3699,7 @@ mod tests {
                 conference_id: "room-1".into(),
                 from_tag: "carol".into(),
                 sdp: "v=0\r\n".into(),
+                received_from: None,
             },
         };
         let json = serde_json::to_string(&request).expect("serialize");
@@ -3709,6 +3746,7 @@ mod tests {
                 conference_id: "room".into(),
                 from_tag: "f".into(),
                 sdp: "v=0".into(),
+                received_from: Some("198.51.100.7".parse().expect("ip")),
             },
             Command::ConferenceUnbridge {
                 conference_id_a: "a".into(),

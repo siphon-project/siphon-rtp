@@ -19,7 +19,8 @@ use crate::sdp::{self, TelephoneEvent};
 
 use super::answer_local::order_codec_candidates;
 use super::negotiate::{
-    ice_directive, parse_codec_flags, random_ssrc, IceDirective, OPUS_DYNAMIC_PAYLOAD_TYPE,
+    ice_directive, parse_codec_flags, peer_media_address, random_ssrc, IceDirective,
+    OPUS_DYNAMIC_PAYLOAD_TYPE,
 };
 use super::offer::far_address_family;
 use super::room::{build_seat_codec, SeatRequest};
@@ -284,6 +285,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         conference_id: &str,
         from_tag: &str,
         answer: &str,
+        received_from: Option<std::net::IpAddr>,
     ) -> CmdResult {
         let Some((_, pending)) = self
             .pending_seats
@@ -297,7 +299,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         };
         let endpoint = pending.endpoint;
-        let request = match self.answered_seat(from_tag, answer, pending) {
+        let request = match self.answered_seat(from_tag, answer, received_from, pending) {
             Ok(request) => request,
             Err(reason) => {
                 self.free(&[endpoint]).await;
@@ -323,6 +325,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         from_tag: &str,
         answer: &str,
+        received_from: Option<std::net::IpAddr>,
         pending: PendingSeat,
     ) -> Result<SeatRequest, String> {
         let info = sdp::parse(answer).map_err(|error| format!("SDP parse: {error}"))?;
@@ -350,17 +353,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .filter(|event| pending.events.contains(event));
         // RTPBleed gate, as on a joined seat: the signalled source only, unless the leg is
         // explicitly symmetric (docs/security-and-nat.md §4).
+        //
+        // The answerer's `received-from` hint moves the gate and the mix's opening destination off
+        // a private `c=` onto its NAT's public address, as on a two-party answer.
+        let remote_rtp = peer_media_address(info.remote_rtp, received_from);
         let accepted_source = if pending.profile.flags.iter().any(|flag| flag == "symmetric") {
             SourceFilter::Any
         } else {
-            SourceFilter::Exact(info.remote_rtp.ip())
+            SourceFilter::Exact(remote_rtp.ip())
         };
         Ok(SeatRequest {
             tag: from_tag.to_string(),
             codec,
             telephone_event,
             endpoint: pending.endpoint,
-            remote_rtp: info.remote_rtp,
+            remote_rtp,
             accepted_source,
             secure: None,
             secure_pending: false,

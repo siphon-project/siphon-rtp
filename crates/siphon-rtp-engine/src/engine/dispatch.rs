@@ -734,8 +734,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 conference_id,
                 from_tag,
                 sdp,
+                received_from,
             } => {
-                self.conference_answer(client, &conference_id, &from_tag, &sdp)
+                self.conference_answer(client, &conference_id, &from_tag, &sdp, received_from)
                     .await
             }
             Command::ConferenceLeave {

@@ -5,6 +5,20 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **A NATed participant's conference seat is no longer silent both ways.** `conference_join` gated a
+  seat's media on the offer's `c=` and aimed the mix there, and never read the `received_from` hint
+  a two-party `answer` honours, so a client advertising a private `c=` and sending from its NAT's
+  public address had every uplink packet dropped and the mix sent to an address nothing could
+  reach. `conference_join` (`profile.received_from`) and `conference_answer` (a new optional
+  `received_from` field) now gate on the hinted IP, keeping the SDP's port, and send the mix there
+  until the participant's own stream latches, through the same rule the two-party path uses. `symmetric` and ICE seats
+  behave as before, and `conference_offer` takes no hint (it has no remote address yet). Advertised
+  as `conference_received_from` in `node_info` features.
+
 ## [0.15.4] — 2026-10-29
 
 ### Added
