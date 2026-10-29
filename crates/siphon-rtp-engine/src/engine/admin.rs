@@ -154,5 +154,12 @@ fn supported_features() -> Vec<String> {
         // node without it cannot deserialize the variant, and fails the whole control frame rather
         // than recording anything.
         "record_ogg_opus".to_string(),
+        // A controller can tell, before relying on it, whether this node answers an `answer_local`
+        // offer with the complement of its direction (RFC 3264 §6.1) and sends nothing to a caller
+        // that offered `sendonly` or `inactive`. A node without it answers `sendonly` with
+        // `sendonly` and sends that caller comfort noise — what a SIPREC stream answered as its own
+        // call must not get — and a controller has no other way to tell, since the behaviour is the
+        // engine's, not the contract crate's.
+        "answer_local_direction".to_string(),
     ]
 }
