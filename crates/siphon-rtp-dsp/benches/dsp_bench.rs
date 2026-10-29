@@ -173,6 +173,73 @@ fn bench_record_tone_detection(criterion: &mut Criterion) {
     });
 }
 
+/// A canceller already holding a **confident** delay lock, plus the frame stream that put it there.
+///
+/// The estimating canceller cancels only once it has located an echo, and a periodic single-frame
+/// fixture never gives it one, so benching it on such a fixture would measure an idle estimator
+/// rather than what a leg with echo pays. This feeds white noise and its echo at a quarter of the
+/// window until the lock lands; the bench then cycles the same frames, so the filter stays converged.
+struct LockedCanceller {
+    canceller: EchoCanceller,
+    far: Vec<Vec<i16>>,
+    near: Vec<Vec<i16>>,
+}
+
+fn locked_canceller(mut canceller: EchoCanceller) -> LockedCanceller {
+    let frame = canceller.frame_samples();
+    let delay = canceller
+        .delay_search_range()
+        .expect("an estimating canceller")
+        / 4;
+    let frames = 400;
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let far_stream: Vec<i16> = (0..frames * frame)
+        .map(|_| {
+            // xorshift64: deterministic white noise without a dependency.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 48) as i16) / 3
+        })
+        .collect();
+    let near_stream: Vec<i16> = (0..frames * frame)
+        .map(|n| {
+            n.checked_sub(delay)
+                .map_or(0, |source| far_stream[source] / 4)
+        })
+        .collect();
+    let far: Vec<Vec<i16>> = far_stream.chunks(frame).map(<[i16]>::to_vec).collect();
+    let near: Vec<Vec<i16>> = near_stream.chunks(frame).map(<[i16]>::to_vec).collect();
+    for (far_frame, near_frame) in far.iter().zip(&near) {
+        let mut mic = near_frame.clone();
+        canceller.cancel(&mut mic, far_frame);
+    }
+    assert!(
+        canceller.estimated_bulk_delay().is_some(),
+        "the bench fixture must reach a confident lock"
+    );
+    LockedCanceller {
+        canceller,
+        far,
+        near,
+    }
+}
+
+/// Bench one locked canceller, cycling its frame stream.
+fn bench_locked(bencher: &mut criterion::Bencher<'_>, locked: &mut LockedCanceller) {
+    let frames = locked.far.len();
+    let mut index = 0;
+    let mut mic = locked.near[0].clone();
+    bencher.iter(|| {
+        mic.copy_from_slice(&locked.near[index]);
+        locked
+            .canceller
+            .cancel(black_box(&mut mic), black_box(&locked.far[index]));
+        index = (index + 1) % frames;
+        black_box(mic[0])
+    });
+}
+
 fn bench_aec(criterion: &mut Criterion) {
     const TAIL: usize = 256;
 
@@ -229,14 +296,10 @@ fn bench_aec(criterion: &mut Criterion) {
     // near/far into the estimation block and, once per `block_size` samples, pays two forward real
     // FFTs + a phase-transformed cross-power + an inverse FFT. Search range 512 → 1024-point blocks
     // (one GCC block every ~6.4 frames at 8 kHz).
+    let mut delay_estimating =
+        locked_canceller(EchoCanceller::with_delay_estimation(8_000, TAIL, 512).expect("build"));
     criterion.bench_function("aec_delayest_8k_20ms", |bencher| {
-        let mut canceller = EchoCanceller::with_delay_estimation(8_000, TAIL, 512).expect("build");
-        let mut near = near_8k.clone();
-        bencher.iter(|| {
-            near.copy_from_slice(&near_8k);
-            canceller.cancel(black_box(&mut near), black_box(&far_8k));
-            black_box(near[0])
-        });
+        bench_locked(bencher, &mut delay_estimating);
     });
 
     // What the search window costs. The estimation FFT is sized at ≥ 2× the range and rounded to a
@@ -261,27 +324,17 @@ fn bench_aec(criterion: &mut Criterion) {
         (16_000, 256),
         (16_000, 512),
     ] {
-        let frame_samples = (rate / 50) as usize;
-        let (far, near_template) = if rate == 8_000 {
-            (&far_8k, &near_8k)
-        } else {
-            (&far_16k, &near_16k)
-        };
         let search_range = (rate * millis / 1000) as usize;
         // The engine's own configuration, so this measures what ships: a 64 ms MDF tail, the MDF
         // backend, and the two-path DTD (`build_echo_canceller`). Only the window varies.
         let tail = (rate * 64 / 1000) as usize;
-        debug_assert_eq!(frame_samples, (rate / 50) as usize);
-        window_group.bench_function(format!("{}k_{millis}ms", rate / 1000), |bencher| {
-            let mut canceller = EchoCanceller::with_mdf_delay_estimation(rate, tail, search_range)
+        let mut locked = locked_canceller(
+            EchoCanceller::with_mdf_delay_estimation(rate, tail, search_range)
                 .expect("build")
-                .with_two_path_dtd();
-            let mut near = near_template.clone();
-            bencher.iter(|| {
-                near.copy_from_slice(near_template);
-                canceller.cancel(black_box(&mut near), black_box(far));
-                black_box(near[0])
-            });
+                .with_two_path_dtd(),
+        );
+        window_group.bench_function(format!("{}k_{millis}ms", rate / 1000), |bencher| {
+            bench_locked(bencher, &mut locked);
         });
     }
     window_group.finish();

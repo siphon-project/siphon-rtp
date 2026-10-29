@@ -5,6 +5,34 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [0.15.3] — 2026-10-24
+
+### Security
+
+- **rustls-webpki 0.103.16, webpki-roots 1.0.11 and tokio 1.53.3, for RUSTSEC-2026-0382, -0381
+  and -0386.** The first two cover certificate verification on the engine's TLS paths (the `wss://`
+  bridge and tee, `play_media` over https, TURN over TLS): webpki could accept a chain through a
+  distrusted intermediate, and the bundled roots still trusted distrusted emSign intermediates.
+  tokio's `AsyncFd` constructors were unsound under I/O safety. Updated in all three lockfiles
+  (workspace, `fuzz/`, `crates/siphon-rtp-xdp/`).
+
+### Fixed
+
+- **The echo canceller no longer injects the far end into a line that has no echo.** On a leg
+  that returns no echo (a carrier line bridged to a voice bot, say), the delay estimator still
+  committed the tallest peak of a noise surface (logged as a weak lock, confidence ~4 to 5), and the
+  filter ran against it. The two-path MDF adapts on every block until it has once seen a confident
+  echo-only correlation, and on such a line it never does, so it went on learning the caller's
+  speech. Afterwards it subtracted a filtered copy of the far end whenever the far end talked alone,
+  up to +25 dB on the uplink, and a bot with its own voice detection interrupted itself 1 to 2 s into
+  every sentence. The estimator now commits only a peak that clears the confidence threshold, and
+  re-aligns only to another such peak. Until one is found the uplink passes through untouched,
+  exactly as with cancellation off. A search that found nothing logs `no echo` once at `debug`
+  instead of the weak-lock `warn`, and `siphon_rtp_aec_delay_weak_locks_total` now counts those
+  cancellers. Separately, the MDF filter never emits a block louder than it arrived. A residual
+  above the microphone means the estimate did not predict it, so that block goes out as it came in.
+  This also covers the long-tail build, which has no estimator.
+
 ## [0.15.2] — 2026-10-19
 
 ### Fixed
