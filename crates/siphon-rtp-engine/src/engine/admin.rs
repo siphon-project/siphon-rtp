@@ -131,6 +131,9 @@ fn supported_features() -> Vec<String> {
         "transcode".to_string(),
         "srtp".to_string(),
         "conference".to_string(),
+        // `conference_seat`: a live call's leg seated in a room in place. A controller gates the
+        // verb on this entry, so it is advertised only where the verb is served.
+        "conference_seat".to_string(),
         "record".to_string(),
         "websocket".to_string(),
         "ng".to_string(),

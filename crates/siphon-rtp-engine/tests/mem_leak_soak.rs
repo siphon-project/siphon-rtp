@@ -1222,6 +1222,108 @@ async fn conference_dial_out_does_not_leak() {
     gate.assert_no_leak();
 }
 
+/// Churn a live call's leg through `conference_seat` and out again in every order the verbs allow —
+/// `seat → delete`, `seat → leave → delete`, `seat → leave → seat → delete` — with a joined
+/// participant leaving the room before or after the call, so the room is torn down by either side.
+/// Each cycle moves a leg into a room and frees its peer leg, then frees the leg and the room.
+async fn conference_seat_leave_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let call_id = format!("seat-soak-{index}");
+    let room = format!("seat-soak-room-{index}");
+    let seat = || Command::ConferenceSeat {
+        call_id: call_id.clone(),
+        from_tag: "tag-b".into(),
+        conference_id: room.clone(),
+        role: ConferenceRole::Talker,
+    };
+    let leave = |tag: &str| Command::ConferenceLeave {
+        conference_id: room.clone(),
+        from_tag: tag.into(),
+    };
+    for (command, what) in [
+        (
+            Command::Offer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for("198.51.100.1", 40_000),
+                profile: Default::default(),
+            },
+            "offer",
+        ),
+        (
+            Command::Answer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for("203.0.113.1", 41_000),
+                profile: Default::default(),
+            },
+            "answer",
+        ),
+        (
+            Command::ConferenceJoin {
+                conference_id: room.clone(),
+                from_tag: "joined".into(),
+                sdp: sdp_for("203.0.113.2", 42_000),
+                role: ConferenceRole::Talker,
+                profile: Default::default(),
+            },
+            "conference_join",
+        ),
+    ] {
+        assert_ok(&engine.handle(CLIENT, command).await, what);
+    }
+    let mut steps = vec![(seat(), "conference_seat")];
+    match index % 3 {
+        0 => {}
+        1 => steps.push((leave("tag-b"), "conference_leave (seated call leg)")),
+        _ => {
+            steps.push((leave("tag-b"), "conference_leave (seated call leg)"));
+            steps.push((seat(), "conference_seat (again)"));
+        }
+    }
+    // The joined participant leaves before the call ends on even cycles, after it on odd ones.
+    let joiner_first = index.is_multiple_of(2);
+    if joiner_first {
+        steps.push((leave("joined"), "conference_leave (joined)"));
+    }
+    steps.push((
+        Command::Delete {
+            call_id: call_id.clone(),
+            from_tag: "tag-b".into(),
+            to_tag: None,
+        },
+        "delete (seated call)",
+    ));
+    if !joiner_first {
+        steps.push((leave("joined"), "conference_leave (joined)"));
+    }
+    for (command, what) in steps {
+        assert_ok(&engine.handle(CLIENT, command).await, what);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conference_seat_leave_delete_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    // Six cycles cover every seat/leave/delete order against both room-teardown orders.
+    let mut gate = LeakGate::new("conference seat", 120, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            conference_seat_leave_delete(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(engine.session_count(), 0, "calls drained");
+        assert_eq!(engine.conference().room_count(), 0, "rooms drained");
+        assert_eq!(engine.conference().participant_count(), 0, "seats drained");
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// A local WebSocket server that accepts connection after connection and drains every frame — the
 /// consumer side of the tee soak. Returns its `ws://` URI; the task lives for the test.
 async fn tee_sink_server() -> (String, Arc<AtomicUsize>) {

@@ -5,6 +5,28 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Added
+
+- **`conference_seat`: seat a live call's leg in a conference room where it stands.** Merging two
+  calls into a three-way call no longer means re-INVITEing each far party to move its media a few
+  ports along. The leg keeps its endpoint, latched peer, codec, SDES-SRTP contexts or DTLS
+  association and ICE pair, so the far party is told nothing. A leg on the in-kernel relay is moved
+  onto the decoding path by the same command. The leg's former peer is released only once the seat
+  is in, so a refusal (no encoder, a frame the room cannot hold, a full room, a tag already seated,
+  a draining node) leaves the call relaying as it was. The call stays registered with the seated leg
+  as its one leg: `delete` returns its summary with counters spanning the move, its `dtmf`,
+  `call_quality` and `media_started` name the call with `conference_id` beside it, and a silent seat
+  raises `media_timeout` for the call without being freed. `conference_leave` hands the leg back to
+  its call on the same endpoint. The room marks its first packet toward the seat and sends an RTCP
+  `BYE` for the stream it replaces. Advertised as `conference_seat` in `node_info` features.
+- **A joined conference seat the idle sweep reaps is now reported**, as a `media_timeout` with an
+  empty `call_id`, the room's `conference_id` and the seat's tag, to the client whose join seated it.
+  It used to vanish with no event at all.
+- `media_timeout`, `dtmf` and `media_started` carry an optional `conference_id`; `call_quality`
+  carries both `call_id` and `conference_id` for a seated call leg.
+
 ## [0.15.3] — 2026-10-24
 
 ### Security

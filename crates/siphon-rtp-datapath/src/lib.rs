@@ -745,6 +745,18 @@ pub trait Datapath: Send + Sync {
         None
     }
 
+    /// The RTP SSRC of the stream `endpoint`'s ingress latch adopted (RFC 3550 §8), when the backend
+    /// keeps one: the stream a `Forward` relay has been carrying from that endpoint's peer.
+    ///
+    /// For continuity only, like [`latched_source`](Self::latched_source). The engine reads it when a
+    /// relayed stream is replaced by one the engine originates (a leg moved into a conference room),
+    /// so it can say `BYE` for the stream the other party was receiving (RFC 3550 §6.6).
+    ///
+    /// Default: `None`, for a backend that keeps no per-endpoint SSRC (the XDP kernel latch).
+    fn latched_ssrc(&self, _endpoint: EndpointId) -> Option<u32> {
+        None
+    }
+
     /// Install (or clear with `None`) the TURN allocation `endpoint` relays through (RFC 5766).
     ///
     /// While installed, traffic to a **bound peer** is wrapped in ChannelData and sent to the TURN

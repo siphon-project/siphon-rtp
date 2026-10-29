@@ -40,6 +40,7 @@ mod record;
 mod reoffer;
 mod room;
 pub mod scope;
+mod seat_call;
 mod snapshot;
 mod sweep;
 mod takeover;
@@ -617,6 +618,12 @@ struct Call {
     /// What an `answer_local` call keeps so `offer_far` can grow a far leg on it and a `delete` with a
     /// `to_tag` can take it back (see [`offer_far`]). `None` on every other call.
     local_answer: Option<Box<offer_far::LocalAnswer>>,
+    /// Set once `conference_seat` has moved this call's one remaining leg into a conference room
+    /// (see [`seat_call::CallSeat`]); `None` on every other call.
+    seat: Option<seat_call::CallSeat>,
+    /// A `conference_seat` is moving this call's leg right now. Held for the whole move so a second
+    /// seat, or anything else that would rebuild the call's media path, cannot interleave with it.
+    seating: bool,
 }
 
 /// A DTLS-SRTP offerer the engine terminates (RFC 5764): A's keying from its offer, and what the
@@ -987,6 +994,11 @@ enum PipelineKind {
     /// endpoint; the [`MediaCall`] actor holds A's leg once the handshake delivers it, and both of its
     /// directions stay pending until then.
     DtlsOffererMedia,
+    /// The call's one remaining leg is a seat in a conference room (`conference_seat`): the room's
+    /// actor owns its media, decrypting and mixing it like any participant's, and the call is kept so
+    /// the controller's view of it — `delete`, the summary, the events, the timeout — survives the
+    /// move. Also the kind of a seated leg the controller has taken back out with `conference_leave`.
+    Seated,
 }
 
 impl PipelineKind {
@@ -1019,6 +1031,10 @@ impl PipelineKind {
             // yields nothing and the single-leg refusal declines it with a more specific reason
             // than this function could give.
             Self::Ws => None,
+            Self::Seated => Some(
+                "the call's leg is seated in a conference room, whose mixer state the snapshot \
+                 record does not carry",
+            ),
         }
     }
 

@@ -634,8 +634,32 @@ pub enum Command {
         from_tag: String,
         sdp: String,
     },
+    /// Move one leg of a **live call** into a conference room, in place: the leg named by `from_tag`
+    /// (the call's `from_tag` or `to_tag`) keeps its engine endpoint, its latched peer, its codec and
+    /// payload types, its SRTP context or DTLS association and its ICE pair, so the far party is
+    /// told nothing and no SDP is exchanged (the reply carries none). The seat's tag in the room is
+    /// `from_tag`.
+    ///
+    /// The leg's former peer in the call is released by the same command, and only once the seat is
+    /// in: a refusal (no encoder for the codec, a frame the room cannot hold, a full room, a tag
+    /// already seated, a draining node) leaves the call relaying exactly as it was.
+    ///
+    /// The call stays in the registry with the seated leg as its one leg. `delete` on it removes the
+    /// seat and returns the usual [`Event::CallSummary`], counters continuous across the move. Events
+    /// the seat raises carry the call's `call_id` and `from_tag` with `conference_id` beside them, and
+    /// a seat that goes silent raises [`Event::MediaTimeout`] for the call without being freed.
+    /// [`Command::ConferenceLeave`] returns the leg to the registry as a one-legged call on the same
+    /// endpoint. Honours the frame's `scope` as every verb naming a `call_id` does.
+    ConferenceSeat {
+        call_id: String,
+        from_tag: String,
+        conference_id: String,
+        #[serde(default)]
+        role: ConferenceRole,
+    },
     /// Leave a conference (by participant `from_tag`). The room is torn down when its last participant
-    /// leaves.
+    /// leaves. A leg seated by [`Command::ConferenceSeat`] is not freed: it returns to its call as a
+    /// one-legged call on the same endpoint, which the controller deletes (or seats again).
     ConferenceLeave {
         conference_id: String,
         from_tag: String,
@@ -1937,6 +1961,11 @@ pub enum Event {
         from_tag: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
+        /// The room the leg that sent the digit is seated in: a [`Command::ConferenceSeat`] leg, whose
+        /// `call_id` and `from_tag` are its call's own, or a joined seat. Absent for a call leg that is
+        /// not in a room.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
         digit: String,
         duration_ms: u32,
         volume: i32,
@@ -1965,9 +1994,18 @@ pub enum Event {
     /// to be sending, [`MediaTimeoutReason::HeldTooLong`] is a call nobody ever took off hold, and
     /// [`MediaTimeoutReason::SetupTimeout`] is a call that never carried media at all — one that
     /// never connected, not one that failed.
+    ///
+    /// With `conference_id` set the silent leg is in that room, and what the engine did depends on
+    /// `call_id`. A non-empty `call_id` names a call whose leg [`Command::ConferenceSeat`] seated: the
+    /// engine raises the event and **keeps the leg allocated**, so the controller ends the dialog and
+    /// then `delete`s the call. An empty `call_id` names a seat a `conference_join` /
+    /// `conference_answer` made, which has no call: the engine has already removed it from the room
+    /// and freed it, and `from_tag` is the seat's tag.
     MediaTimeout {
         call_id: String,
         from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
         reason: MediaTimeoutReason,
     },
     /// The first packet arrived on one of a call's legs and cleared the source gate — media is
@@ -1984,6 +2022,10 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
         leg: LegSide,
+        /// The room the leg is seated in, for a call leg [`Command::ConferenceSeat`] moved into one
+        /// before its first packet arrived. Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
         /// The address the first packet came from, when the engine latched one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<std::net::SocketAddr>,
@@ -2048,18 +2090,20 @@ pub enum Event {
     /// SIPhon surfaces live call quality without parsing RTCP itself. Emitted every few seconds for
     /// every relayed leg — a conference participant, a 2-party plain-relay call, or a transcode call.
     ///
-    /// The event carries **exactly one** stream identifier: `conference_id` for a conference
-    /// participant, or `call_id` for a 2-party (relay/transcode) call — never both, never neither.
-    /// Both are optional and `skip_serializing_if` the absent one, so a conference event's wire form
-    /// stays byte-identical to before this field split (a consumer that ignores the absent field is
+    /// The event carries `conference_id` for a conference participant, `call_id` for a 2-party
+    /// (relay/transcode) call, and **both** for a call leg [`Command::ConferenceSeat`] seated in a
+    /// room (`from_tag` is then the call's own tag for that leg) — never neither. Both are optional
+    /// and `skip_serializing_if` the absent one, so a joined participant's wire form stays
+    /// byte-identical to before this field split (a consumer that ignores the absent field is
     /// unaffected — additive, backward-compatible).
     CallQuality {
         /// The conference this participant belongs to, for a conference-leg quality report. `None`
         /// on a 2-party (relay/transcode) call, where `call_id` identifies the stream instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conference_id: Option<String>,
-        /// The call this leg belongs to, for a 2-party plain-relay or transcode quality report. `None`
-        /// on a conference participant, where `conference_id` identifies the stream instead.
+        /// The call this leg belongs to, for a 2-party plain-relay or transcode quality report, and for
+        /// a call leg seated in a room. `None` on a joined conference participant, where
+        /// `conference_id` identifies the stream instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
         from_tag: String,
@@ -3208,6 +3252,7 @@ mod tests {
             from_tag: "f".into(),
             to_tag: Some("t".into()),
             leg: LegSide::Far,
+            conference_id: None,
             source: Some("203.0.113.7:40000".parse().expect("addr")),
             signalled: Some("192.0.2.10:4000".parse().expect("addr")),
         };
@@ -3227,6 +3272,7 @@ mod tests {
             from_tag: "f".into(),
             to_tag: None,
             leg: LegSide::Near,
+            conference_id: None,
             source: None,
             signalled: None,
         };
@@ -3474,6 +3520,94 @@ mod tests {
                 command: command.clone(),
             });
         }
+    }
+
+    #[test]
+    fn conference_seat_wire_shape_and_defaults() {
+        let json = r#"{"command":"conference_seat","call_id":"c1@example.com","from_tag":"far-1","conference_id":"room-1"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::ConferenceSeat {
+                call_id,
+                from_tag,
+                conference_id,
+                role,
+            } => {
+                assert_eq!(call_id, "c1@example.com");
+                assert_eq!(from_tag, "far-1");
+                assert_eq!(conference_id, "room-1");
+                assert_eq!(role, ConferenceRole::Talker, "role defaults to talker");
+            }
+            other => panic!("expected conference_seat, got {other:?}"),
+        }
+        let request = Request {
+            id: 7,
+            command: Command::ConferenceSeat {
+                call_id: "c1@example.com".into(),
+                from_tag: "far-1".into(),
+                conference_id: "room-1".into(),
+                role: ConferenceRole::Talker,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&request).expect("serialize"),
+            r#"{"id":7,"command":"conference_seat","call_id":"c1@example.com","from_tag":"far-1","conference_id":"room-1","role":{"role":"talker"}}"#
+        );
+        roundtrip(&request);
+    }
+
+    #[test]
+    fn conference_seat_names_a_call_so_a_scope_keys_it() {
+        let mut command = Command::ConferenceSeat {
+            call_id: "c1".into(),
+            from_tag: "f".into(),
+            conference_id: "room".into(),
+            role: ConferenceRole::Talker,
+        };
+        assert!(
+            !command.is_conference(),
+            "a seat names a call, so the frame's scope applies to it"
+        );
+        assert_eq!(command.call_id_mut().map(|id| id.as_str()), Some("c1"));
+    }
+
+    #[test]
+    fn a_seated_legs_events_carry_the_room_beside_the_call() {
+        let timeout = Event::MediaTimeout {
+            call_id: "c1".into(),
+            from_tag: "far-1".into(),
+            conference_id: Some("room-1".into()),
+            reason: MediaTimeoutReason::NoMedia,
+        };
+        roundtrip(&timeout);
+        let value = serde_json::to_value(&timeout).expect("to_value");
+        assert_eq!(value["conference_id"], "room-1");
+        assert_eq!(value["call_id"], "c1");
+        let digit = Event::Dtmf {
+            call_id: "c1".into(),
+            from_tag: "far-1".into(),
+            to_tag: None,
+            conference_id: Some("room-1".into()),
+            digit: "7".into(),
+            duration_ms: 100,
+            volume: -10,
+            source: None,
+        };
+        roundtrip(&digit);
+        assert_eq!(
+            serde_json::to_value(&digit).expect("to_value")["conference_id"],
+            "room-1"
+        );
+        // The pre-seat wire form is unchanged: no `conference_id` key when absent.
+        let plain = Event::MediaTimeout {
+            call_id: "c1".into(),
+            from_tag: "far-1".into(),
+            conference_id: None,
+            reason: MediaTimeoutReason::NoMedia,
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).expect("serialize"),
+            r#"{"event":"media_timeout","call_id":"c1","from_tag":"far-1","reason":"no_media"}"#
+        );
     }
 
     #[test]
@@ -4331,6 +4465,7 @@ mod tests {
             call_id: "c".into(),
             from_tag: "f".into(),
             to_tag: None,
+            conference_id: None,
             digit: "5".into(),
             duration_ms: 120,
             volume: -8,
@@ -4571,6 +4706,7 @@ mod tests {
             roundtrip(&Event::MediaTimeout {
                 call_id: "c".into(),
                 from_tag: "f".into(),
+                conference_id: None,
                 reason,
             });
         }
@@ -4582,6 +4718,7 @@ mod tests {
         let json = serde_json::to_value(Event::MediaTimeout {
             call_id: "c".into(),
             from_tag: "f".into(),
+            conference_id: None,
             reason: MediaTimeoutReason::HeldTooLong,
         })
         .expect("serialize");
@@ -4591,6 +4728,7 @@ mod tests {
         let json = serde_json::to_value(Event::MediaTimeout {
             call_id: "c".into(),
             from_tag: "f".into(),
+            conference_id: None,
             reason: MediaTimeoutReason::SetupTimeout,
         })
         .expect("serialize");

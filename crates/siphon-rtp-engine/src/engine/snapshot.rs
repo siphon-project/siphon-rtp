@@ -162,7 +162,10 @@ pub(super) fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSn
         PipelineKind::SrtpOffererMedia => PipelineSnapshot::SrtpOffererMedia,
         PipelineKind::Media => PipelineSnapshot::Media,
         PipelineKind::SrtpMedia => PipelineSnapshot::SrtpMedia,
-        PipelineKind::Ws => PipelineSnapshot::Ws,
+        // Never reached for a seated leg: it is a call with no far leg, so `to_snapshot` returns
+        // `None` before mapping the kind, and `checkpoint` refuses it by name. Filed with the
+        // takeover, the other kind that has no far party, so it cannot pass for a two-party relay.
+        PipelineKind::Ws | PipelineKind::Seated => PipelineSnapshot::Ws,
         // A terminated DTLS offerer is a DTLS call too, and restore refuses the DTLS kind: an
         // established DTLS association cannot move to a standby.
         PipelineKind::Dtls
@@ -672,6 +675,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_text_local_crypto: None,
                 near_text_local_crypto: None,
                 local_answer: None,
+                seat: None,
+                seating: false,
             },
         );
         // Register the reconstructed call under the requesting (standby) client.

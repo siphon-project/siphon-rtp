@@ -16,6 +16,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// for a half-built call). Frees the sockets and drops any bridge / media / WS registration.
     pub(super) async fn teardown_call(&self, call_id: &str) {
         if let Some((_, call)) = self.calls.remove(call_id) {
+            // A seated leg leaves its room with the call.
+            self.release_seat_of(&call).await;
             let endpoints: Vec<EndpointId> = call.all_endpoint_ids().collect();
             // A URL playback still fetching for this call dies with it: abort the task before the
             // media actor is deregistered, and release the controller awaiting it. Without this the
@@ -95,6 +97,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// ([`CDR_QUALITY_TIMEOUT`]) — the CDR then carries the byte/packet counters only. Counters are
     /// snapshotted, and the actor is queried, **before** the endpoints and actor are torn down below.
     pub(super) async fn finish_call(&self, call_id: &str, call: &Call, reason: &str) {
+        // A seated leg leaves its room first, so the room stops sending from an endpoint about to be
+        // freed and its roster (`siphon_rtp_conference_participants`) drops the seat with the call.
+        // The counters below are the endpoint's own, so they span the time before and after the seat.
+        self.release_seat_of(call).await;
         let near_counters = self.leg_counters(&call.near);
         let far_counters = call
             .far

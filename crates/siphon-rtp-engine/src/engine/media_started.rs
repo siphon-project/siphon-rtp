@@ -57,7 +57,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 continue;
             };
             let now = super::unix_time_ms();
-            let Some((side, leg, from_tag, to_tag)) =
+            let Some((side, leg, from_tag, to_tag, conference_id)) =
                 self.calls.get_mut(&call_id).and_then(|mut call| {
                     let (side, leg) = if call.near.rtp.id == endpoint {
                         call.near_media_started_at_unix_ms = now;
@@ -67,7 +67,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         call.far_media_started_at_unix_ms = now;
                         (LegSide::Far, far)
                     };
-                    Some((side, leg, call.from_tag.clone(), call.to_tag.clone()))
+                    // A leg seated in a room before its first packet names the room beside its call.
+                    let conference_id = call
+                        .seat
+                        .as_ref()
+                        .filter(|seat| seat.seated)
+                        .map(|seat| seat.conference_id.clone());
+                    Some((
+                        side,
+                        leg,
+                        call.from_tag.clone(),
+                        call.to_tag.clone(),
+                        conference_id,
+                    ))
                 })
             else {
                 continue;
@@ -89,6 +101,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     from_tag,
                     to_tag,
                     leg: side,
+                    conference_id,
                     source,
                     signalled: leg.remote_rtp,
                 },

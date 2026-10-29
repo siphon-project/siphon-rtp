@@ -574,6 +574,7 @@ async fn a_media_timeout_names_the_scope_it_happened_in() {
                 call_id,
                 from_tag,
                 reason,
+                ..
             } => {
                 assert_eq!(call_id, CALL_ID, "the call id is the SIP one, not a key");
                 assert_eq!(from_tag, FROM_TAG);

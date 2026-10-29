@@ -239,6 +239,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_text_local_crypto: None,
                 // Set once the local answer is complete (see the end of `answer_local`).
                 local_answer: None,
+                seat: None,
+                seating: false,
             },
         );
         self.index_new_call(call_id, client);

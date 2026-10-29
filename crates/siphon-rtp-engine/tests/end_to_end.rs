@@ -1937,6 +1937,7 @@ async fn media_timeout_event_is_pushed_over_the_control_connection() {
                 call_id,
                 from_tag,
                 reason,
+                ..
             } => {
                 assert_eq!(call_id, "doomed");
                 assert_eq!(from_tag, "ft");

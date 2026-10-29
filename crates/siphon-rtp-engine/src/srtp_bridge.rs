@@ -301,6 +301,41 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         self.latched.get(&endpoint).map(|latched| *latched)
     }
 
+    /// The shared SRTP contexts of `party` as `endpoint`'s flow holds them, on either side of it. What
+    /// a caller handing that party's leg to another owner reads before it deregisters the flows, so
+    /// the leg moves with its rollover and replay state rather than restarting (RFC 3711 §3.3.1).
+    #[must_use]
+    pub fn party_leg(
+        &self,
+        endpoint: EndpointId,
+        party: BridgeLeg,
+    ) -> Option<Arc<Mutex<SecureLeg>>> {
+        let flow = self.flows.get(&endpoint)?;
+        let leg = [flow.ingress_leg.as_ref(), flow.egress_leg.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|side| side.party == party)
+            .map(|side| side.leg.clone());
+        leg
+    }
+
+    /// The signalled-source gate installed on `endpoint`'s flow.
+    #[must_use]
+    pub fn accepted_source(&self, endpoint: EndpointId) -> Option<SourceFilter> {
+        self.flows.get(&endpoint).map(|flow| flow.accepted_source)
+    }
+
+    /// The SSRC of the stream `endpoint`'s symmetric latch adopted from its peer — the stream this
+    /// bridge has been relaying out of the *other* endpoint. `None` before a packet latched, on an
+    /// ICE-managed leg (no latch) and for a poisoned lock.
+    #[must_use]
+    pub fn latched_ssrc(&self, endpoint: EndpointId) -> Option<u32> {
+        let flow = self.flows.get(&endpoint)?;
+        let latch = flow.latch.as_ref()?;
+        let guard = latch.lock().ok()?;
+        guard.ssrc()
+    }
+
     /// Whether this (or the sibling DTLS) bridge owns `endpoint` — the dispatcher's routing predicate.
     #[must_use]
     pub fn owns(&self, endpoint: EndpointId) -> bool {

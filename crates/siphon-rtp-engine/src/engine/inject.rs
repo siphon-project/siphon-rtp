@@ -25,6 +25,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }) else {
             return unknown_call(call_id);
         };
+        // A seated leg's egress is the room's: the room stops sending it the mix (and resumes).
+        if let Some((conference_id, tag)) = self.seated_room(call_id) {
+            return if self
+                .conference
+                .set_egress_gate(&conference_id, &tag, None, Some(block))
+                .await
+            {
+                ok_empty()
+            } else {
+                error_result("block", &"the seat's room did not apply the block")
+            };
+        }
         if pipeline == PipelineKind::Ws {
             // A takeover call's on-the-wire bytes are not the two-party media (the same reason
             // recording, SIPREC and the tee refuse it). It matters doubly once a bridge can be
@@ -133,9 +145,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Replace a call's egress audio with comfort silence (`silence = true`) or resume it. Requires a
     /// media-processing call (decode/re-encode); a plain relay forwards opaque payloads and cannot
     /// synthesize silence. Only the owning client may control the call.
-    pub(super) fn set_silence(&self, client: ClientId, call_id: &str, silence: bool) -> CmdResult {
+    pub(super) async fn set_silence(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        silence: bool,
+    ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
+        }
+        // A seated leg hears the room: silencing it replaces the mix toward it with encoded silence.
+        if let Some((conference_id, tag)) = self.seated_room(call_id) {
+            return if self
+                .conference
+                .set_egress_gate(&conference_id, &tag, Some(silence), None)
+                .await
+            {
+                ok_empty()
+            } else {
+                error_result("silence", &"the seat's room did not apply the silence")
+            };
         }
         // Silence synthesizes comfort noise in the egress codec — a transcoding call only. A promoted
         // relay-only call (SIPREC on a passthrough relay) forwards opaque payloads and cannot.

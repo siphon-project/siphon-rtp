@@ -135,6 +135,7 @@ mod tests {
             ice_pending: false,
             routing: Routing::default(),
             telemetry: SeatTelemetry::default(),
+            call: None,
         }
     }
 

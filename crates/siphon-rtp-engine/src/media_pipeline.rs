@@ -1025,6 +1025,20 @@ pub struct FinalCallQuality {
     pub b_to_a: DirectionQuality,
 }
 
+/// What a media actor hands back when its call's legs move to another owner
+/// ([`MediaControl::Surrender`]).
+pub struct SurrenderedCall {
+    /// A's SRTP contexts — the leg decrypting A's ingress — when A is a secure party.
+    pub near_leg: Option<Arc<Mutex<SecureLeg>>>,
+    /// B's SRTP contexts — the leg decrypting B's ingress — when B is a secure party.
+    pub far_leg: Option<Arc<Mutex<SecureLeg>>>,
+    /// Each party's ingress endpoint and the source gate in force on it: A, then B. Read here rather
+    /// than from the call record because an ICE selection narrows a gate inside the actor.
+    pub gates: [(EndpointId, SourceFilter); 2],
+    /// Per-direction quality, whose SSRCs say which stream each party has been receiving.
+    pub quality: FinalCallQuality,
+}
+
 /// One playout tick's egress action, computed while the injection is borrowed and applied after.
 enum InjectStep {
     /// Encode + send this many samples of the prompt frame already rendered into the direction's
@@ -2151,6 +2165,7 @@ impl Direction {
                                 call_id: leg_meta.call_id.to_string(),
                                 from_tag: leg_meta.from_tag.to_string(),
                                 to_tag: leg_meta.to_tag.map(str::to_string),
+                                conference_id: None,
                                 digit: event.digit.to_string(),
                                 duration_ms: u32::from(event.duration) / 8,
                                 volume: -i32::from(event.volume),
@@ -2230,6 +2245,7 @@ impl Direction {
                     call_id: leg_meta.call_id.to_string(),
                     from_tag: leg_meta.from_tag.to_string(),
                     to_tag: leg_meta.to_tag.map(str::to_string),
+                    conference_id: None,
                     digit: event.digit.to_string(),
                     // RTP timestamp units are samples at the 8 kHz telephone-event clock (RFC 4733).
                     duration_ms: u32::from(event.duration) / 8,
@@ -2653,6 +2669,7 @@ impl Direction {
                     call_id: leg_meta.call_id.to_string(),
                     from_tag: leg_meta.from_tag.to_string(),
                     to_tag: leg_meta.to_tag.map(str::to_string),
+                    conference_id: None,
                     digit: event.digit.to_string(),
                     duration_ms: u32::from(event.duration) / 8,
                     volume: -i32::from(event.volume),
@@ -3901,6 +3918,19 @@ impl MediaCall {
     /// the CDR — `a_to_b` measures what the offerer (`from_tag`) sent, `b_to_a` what the answerer
     /// (`to_tag`) sent. Requested by the engine over the actor mailbox ([`MediaControl::Report`]) at
     /// teardown, before the task is aborted.
+    pub fn surrender(&self) -> SurrenderedCall {
+        SurrenderedCall {
+            near_leg: self.a_to_b.secure_ingress.clone(),
+            far_leg: self.b_to_a.secure_ingress.clone(),
+            gates: [
+                (self.a_to_b.ingress_endpoint, self.a_to_b.accepted_source),
+                (self.b_to_a.ingress_endpoint, self.b_to_a.accepted_source),
+            ],
+            quality: self.final_quality(),
+        }
+    }
+
+    /// The call's end-of-call quality for the CDR (see [`FinalCallQuality`]).
     pub fn final_quality(&self) -> FinalCallQuality {
         FinalCallQuality {
             a_to_b: self.a_to_b.quality_snapshot(),
@@ -4108,6 +4138,12 @@ pub enum MediaControl {
     /// which case the engine logs a counters-only CDR).
     Report {
         reply: tokio::sync::oneshot::Sender<FinalCallQuality>,
+    },
+    /// Hand the call's legs to another owner and stop ([`MediaCall::surrender`]): reply with each
+    /// party's SRTP contexts, the source gate in force on each ingress and the call's final quality,
+    /// then exit. Sent by `conference_seat`, which seats one party in a room.
+    Surrender {
+        reply: tokio::sync::oneshot::Sender<SurrenderedCall>,
     },
     /// Deliver the far (B) leg's [`SecureLeg`] once its DTLS handshake completed (RFC 5764), keying
     /// the directions that face B and clearing the pending gate so media starts flowing. Sent by the
@@ -4418,6 +4454,47 @@ impl MediaRegistry {
         }
     }
 
+    /// Take `call_id`'s actor out of the registry and have it hand its legs over
+    /// ([`MediaControl::Surrender`]), returning only once it has exited, so the caller holds the only
+    /// remaining reference to each party's SRTP contexts. `None` when there is no such call or the
+    /// actor could not answer (its mailbox full, or it did not reply within the teardown grace); the
+    /// actor is stopped either way.
+    pub async fn surrender(&self, call_id: &str) -> Option<SurrenderedCall> {
+        let (_, handle) = self.calls.remove(call_id)?;
+        let CallHandle {
+            mailbox,
+            endpoints,
+            rtcp_endpoints,
+            mut task,
+            ..
+        } = handle;
+        for endpoint in endpoints.iter().chain(rtcp_endpoints.iter()) {
+            self.routes.remove(endpoint);
+            self.observed.remove(endpoint);
+        }
+        let (reply, surrendered) = tokio::sync::oneshot::channel();
+        let answered = if mailbox
+            .try_send(MediaInput::Control(MediaControl::Surrender { reply }))
+            .is_ok()
+        {
+            tokio::time::timeout(ACTOR_TEARDOWN_GRACE, surrendered)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        } else {
+            let _ = mailbox.try_send(MediaInput::Control(MediaControl::Stop));
+            None
+        };
+        if tokio::time::timeout(ACTOR_TEARDOWN_GRACE, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        answered
+    }
+
     /// Remove `call_id`'s actor from the registry and its routes, and tell it to stop; the caller
     /// decides whether to wait for it.
     fn detach_actor(&self, call_id: &str) -> Option<tokio::task::JoinHandle<()>> {
@@ -4606,6 +4683,10 @@ async fn run_media_call<D>(
                     MediaInput::Control(MediaControl::AttachSecureLeg { leg }) => {
                         call.attach_secure_leg(leg);
                         tracing::debug!(target: "siphon_rtp::media", "DTLS-SRTP key installed on the media pipeline");
+                    }
+                    MediaInput::Control(MediaControl::Surrender { reply }) => {
+                        let _ = reply.send(call.surrender());
+                        break;
                     }
                     MediaInput::Control(MediaControl::Report { reply }) => {
                         // Read-only snapshot for the engine's CDR; the actor keeps running.

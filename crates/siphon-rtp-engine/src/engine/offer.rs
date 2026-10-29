@@ -984,6 +984,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // The near text key is minted at answer (advertised to A), not at offer.
                 near_text_local_crypto: None,
                 local_answer: None,
+                seat: None,
+                seating: false,
             },
         );
         self.index_new_call(&call_id, client);

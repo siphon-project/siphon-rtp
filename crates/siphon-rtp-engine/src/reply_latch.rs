@@ -48,6 +48,11 @@ impl SymmetricLatch {
             SourceLatchVerdict::Reject => ReplyLatch::Reject,
         }
     }
+
+    /// The SSRC of the stream this latch adopted, once one has been (RFC 3550 §8).
+    pub(crate) fn ssrc(&self) -> Option<u32> {
+        self.latch.and_then(|latch| latch.ssrc)
+    }
 }
 
 /// The latch for a relayed stream that carries **no SSRC at all** — a T.38 fax over UDPTL.

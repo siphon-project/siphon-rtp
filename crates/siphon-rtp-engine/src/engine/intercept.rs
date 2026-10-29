@@ -153,6 +153,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Install the taps wherever this call's accepted plaintext actually lives.
         let mut bridged_endpoints = Vec::new();
         match pipeline {
+            // The dispatch already refuses this verb on a seated call; said again here so the
+            // interception can never be reported attached to a leg whose media the room owns.
+            PipelineKind::Seated => {
+                return Err(
+                    "the call's leg is seated in a conference room; intercept the room's \
+                     participants instead"
+                        .to_string(),
+                );
+            }
             // A crypto bridge relays without decoding, so its media never reaches the pipeline. This
             // is the ordinary same-codec WebRTC / SDES shape, so it is a tap site rather than a
             // rejection — a warrant has to be servable on any call.

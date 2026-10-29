@@ -633,6 +633,12 @@ impl AgentSupervisor {
         self.agents.retain(|_, entry| entry.call_id != call_id);
     }
 
+    /// Stop the agent on one endpoint, leaving the call's others running — a leg released while its
+    /// call lives on (the peer of a leg moved into a conference room).
+    pub fn unregister(&self, endpoint: EndpointId) {
+        self.agents.remove(&endpoint);
+    }
+
     /// Whether an agent runs on `endpoint`: its transport is the agent's to decide, whoever owns the
     /// media on it.
     #[must_use]

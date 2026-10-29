@@ -649,6 +649,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 local: Some(endpoint.local_addr),
                 sip_call_id,
             },
+            call: None,
         };
         let events = self.event_sink(client);
         let joined_tick = self.datapath.now_ticks();
@@ -696,7 +697,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// nothing, and its mix went to an address that never asked for it.
     ///
     /// A no-op for a seat the datapath does not gate on ICE, whose reply address is the signalled one.
-    fn follow_seat_ice(&self, endpoint: siphon_rtp_datapath::EndpointId) {
+    pub(super) fn follow_seat_ice(&self, endpoint: siphon_rtp_datapath::EndpointId) {
         let Some(mut validated) = self.datapath.watch_ice_validated(endpoint) else {
             return;
         };
@@ -731,7 +732,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// Remove a participant from a conference ([`Command::ConferenceLeave`]), freeing its endpoints —
     /// audio plus its text endpoint when it had one (RFC 9071) — and tearing the room down once empty.
-    pub(super) async fn conference_leave(&self, conference_id: &str, from_tag: &str) -> CmdResult {
+    pub(super) async fn conference_leave(
+        &self,
+        client: ClientId,
+        conference_id: &str,
+        from_tag: &str,
+    ) -> CmdResult {
+        // A live call's leg seated by `conference_seat` is not freed by leaving: it goes back to its
+        // call as a one-legged call on the same endpoint.
+        if let Some(result) = self.unseat_call(client, conference_id, from_tag).await {
+            return result;
+        }
         // A seat offered by `conference_offer` and not yet answered is not in the room: dropping it
         // frees its endpoint and is all there is to leaving.
         if self.drop_pending_seat(conference_id, from_tag).await {
@@ -1160,7 +1171,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 /// Map a control-plane [`ConferenceRole`] to the conference's internal [`Routing`]. A whisperer stays
 /// a talker whose audio is private to one target; a monitor is a listener that hears one target
 /// directly (and may also whisper to it).
-fn routing_of(role: ConferenceRole) -> Routing {
+pub(super) fn routing_of(role: ConferenceRole) -> Routing {
     match role {
         ConferenceRole::Talker => Routing {
             role: Role::Talker,
@@ -1196,8 +1207,8 @@ fn routing_of(role: ConferenceRole) -> Routing {
 /// The codec a participant is seated in, with both halves of its leg built.
 pub(super) struct SeatCodec {
     pub(super) spec: CodecSpec,
-    decoder: Box<dyn Decoder>,
-    encoder: Box<dyn Encoder>,
+    pub(super) decoder: Box<dyn Decoder>,
+    pub(super) encoder: Box<dyn Encoder>,
 }
 
 /// What [`Engine::seat_participant`] seats: one participant whose media is already negotiated.
