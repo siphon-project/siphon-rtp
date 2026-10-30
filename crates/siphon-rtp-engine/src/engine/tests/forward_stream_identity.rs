@@ -82,7 +82,14 @@ async fn a_forward_join_answer_names_the_ssrc_the_room_sends_and_none_of_the_off
             .await
             .expect("listener send");
     }
-    let (forwarded, _) = recv(&listener).await;
+    // The room's Sender Report (RFC 3550 §6.4.1) can arrive first: wait for the RTP itself, whose
+    // payload type is outside the RTCP range (RFC 5761 §4).
+    let forwarded = loop {
+        let (datagram, _) = recv(&listener).await;
+        if !(64..=95).contains(&(datagram[1] & 0x7f)) {
+            break datagram;
+        }
+    };
     let packet = RtpPacket::parse(&forwarded).expect("forwarded RTP");
     assert_eq!(
         packet.ssrc, named[0],
