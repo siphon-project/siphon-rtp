@@ -1,0 +1,314 @@
+//! Forwarding-room verbs: `forward_join`, `forward_leave`, `forward_set_source`.
+//!
+//! A forwarding room is the push-to-talk counterpart of the mixing conference (3GPP TS 24.379): one
+//! chosen seat's RTP is forwarded to every other seat through a per-receiver RTP translator, with no
+//! mixing. A seat is opened the way a conference seat is ([`Engine::open_seat_transport`]); what is
+//! different is the codec rule (the first seat fixes the room codec, later seats must offer it) and
+//! that a seat is never freed for silence.
+
+use siphon_rtp_datapath::{Datapath, Endpoint, FlowAction, SourceFilter};
+use siphon_rtp_proto::{CmdResult, Command, ProfileFlags};
+
+use crate::dtls_bridge::PipelineTarget;
+use crate::forward::{FloorConfig, ForwardSeatConfig, RoomCodec};
+use crate::sdp::{self, EngineMedia, TextRewrite};
+
+use super::answer_local::answer_codec_candidates;
+use super::negotiate::{parse_codec_flags, peer_media_address, random_ssrc};
+use super::seat_transport::SeatTransport;
+use super::{boxed_error_result, error_result, ok_empty, ok_sdp, ClientId, Engine};
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Dispatch a forwarding-room command.
+    pub(super) async fn dispatch_forward(&self, client: ClientId, command: Command) -> CmdResult {
+        match command {
+            Command::ForwardJoin {
+                conference_id,
+                from_tag,
+                sdp,
+                profile,
+            } => {
+                self.forward_join(client, &conference_id, from_tag, &sdp, &profile)
+                    .await
+            }
+            Command::ForwardLeave {
+                conference_id,
+                from_tag,
+            } => self.forward_leave(&conference_id, &from_tag).await,
+            Command::ForwardSetSource {
+                conference_id,
+                from_tag,
+            } => {
+                self.forward_set_source(client, &conference_id, from_tag)
+                    .await
+            }
+            other => CmdResult::Error {
+                reason: format!(
+                    "unsupported command: {}",
+                    super::dispatch::command_name(&other)
+                ),
+            },
+        }
+    }
+
+    /// Seat a member in a forwarding room, creating the room on the first join
+    /// ([`Command::ForwardJoin`]). The first seat fixes the room's codec from its offer in RFC 3264
+    /// order; a later seat must offer that codec in the same payload format and is answered with its
+    /// own payload type for it. Nothing is allocated for a seat the room would refuse.
+    pub(super) async fn forward_join(
+        &self,
+        client: ClientId,
+        room_id: &str,
+        from_tag: String,
+        offer: &str,
+        profile: &ProfileFlags,
+    ) -> CmdResult {
+        if let Err(reason) = super::validate_sip_call_id(profile) {
+            return error_result("forward_join", &reason);
+        }
+        // The controller's floor parameters go into the answer verbatim, so a line break would let
+        // them write SDP lines of their own. Refused before anything is allocated.
+        if let Some(fmtp) = &profile.floor_fmtp {
+            if let Err(error) = sdp::validate_floor_fmtp(fmtp) {
+                return error_result("forward_join", &error);
+            }
+        }
+        let info = match sdp::parse(offer) {
+            Ok(info) => info,
+            Err(error) => return error_result("forward_join: SDP parse", &error),
+        };
+        if self.conference.contains(room_id) {
+            return error_result(
+                "forward_join",
+                &format!("{room_id} is a mixing conference; use conference_join"),
+            );
+        }
+        // The codec, chosen before anything is allocated. A codec needs neither an encoder nor a
+        // decoder here: the room forwards the payload as it came (RFC 3550 §7.1).
+        let offered = answer_codec_candidates(&info, &parse_codec_flags(&profile.flags));
+        let forward = self.conference.forward();
+        let (proposed, spec) = match forward.room_codec(room_id) {
+            Some(room) => match room.admit(&offered) {
+                Ok(spec) => (room, spec),
+                Err(reason) => return error_result("forward_join", &reason),
+            },
+            None => match RoomCodec::from_offer(&offered) {
+                Ok((room, spec)) => (room, spec),
+                Err(reason) => return error_result("forward_join", &reason),
+            },
+        };
+        let telephone_event =
+            sdp::TelephoneEvent::accompanying(&info.telephone_events(), Some(&spec));
+        let mut transport = match self
+            .open_seat_transport("forward_join", room_id, &info, profile)
+            .await
+        {
+            Ok(transport) => transport,
+            Err(refusal) => return *refusal,
+        };
+        let endpoint = transport.endpoint;
+        // The MCPTT floor-control stream (TS 24.380), when the seat offered one: its own endpoint.
+        let floor = match self.open_floor_endpoint(&transport, offer, profile).await {
+            Ok(floor) => floor,
+            Err(refusal) => {
+                self.free(&[endpoint]).await;
+                return *refusal;
+            }
+        };
+        let floor_endpoint = floor.as_ref().map(|(endpoint, _)| *endpoint);
+        let egress_ssrc = random_ssrc();
+        let config = ForwardSeatConfig {
+            tag: from_tag.clone(),
+            endpoint: endpoint.id,
+            egress_destination: transport.seat_remote,
+            accepted_source: transport.accepted_source,
+            latch: true,
+            audio_payload_type: spec.payload_type,
+            telephone_event,
+            secure: transport.secure.take(),
+            secure_pending: transport.dtls_pending(),
+            ice_pending: transport.ice_pending,
+            egress_ssrc,
+            // RFC 3550 §5.1: the initial sequence number and timestamp are random.
+            initial_sequence: random_ssrc() as u16,
+            initial_timestamp: random_ssrc(),
+            floor: floor.map(|(_, config)| config),
+            app_events: self.app_event_queue(client),
+        };
+        let joined_tick = self.datapath.now_ticks();
+        if let Err(refusal) = forward
+            .join(
+                room_id,
+                proposed,
+                &spec,
+                config,
+                joined_tick,
+                self.event_sink(client),
+                self.datapath.clone(),
+            )
+            .await
+        {
+            self.free(&[endpoint]).await;
+            if let Some(floor) = floor_endpoint {
+                self.free(&[floor]).await;
+            }
+            return error_result("forward_join", &refusal);
+        }
+        // Seated: aim the room's egress at whatever ICE validates for this seat.
+        self.follow_seat_ice(endpoint.id);
+        self.endpoint_calls.insert(endpoint.id, room_id.to_string());
+        if let Some(floor) = floor_endpoint {
+            self.endpoint_calls.insert(floor.id, room_id.to_string());
+        }
+
+        let target = PipelineTarget::Forward {
+            forward: forward.clone(),
+            room_id: room_id.to_string(),
+            tag: from_tag.clone(),
+        };
+        if let Err(error) = self.start_seat_dtls(&transport, &info, target) {
+            self.release_forward_seat(room_id, &from_tag).await;
+            return error_result("forward_join: install DTLS redirect", &error);
+        }
+        // Answer in the one codec the seat was built for (RFC 3264 §6.1), and the floor stream on
+        // its own endpoint when it has one (TS 24.380 §14.3.1). Every other stream the offer carries
+        // (video, a second floor section) is declined with port 0.
+        match self.answer_seat_sdp(
+            offer,
+            &mut transport,
+            profile,
+            TextRewrite::None,
+            Some(&sdp::OwnSsrc::with_random_cname(egress_ssrc)),
+        ) {
+            Ok(rewritten) => ok_sdp(
+                sdp::force_answer_codec(
+                    &sdp::decline_unanswered_streams(
+                        match floor_endpoint {
+                            Some(floor) => sdp::anchor_floor(
+                                &rewritten,
+                                EngineMedia {
+                                    rtp: floor.local_addr,
+                                    rtcp: None,
+                                    advertised_ip: transport.advertised,
+                                },
+                                profile.floor_fmtp.as_deref(),
+                            ),
+                            None => rewritten,
+                        },
+                        false,
+                        floor_endpoint.is_some(),
+                    ),
+                    &spec,
+                    telephone_event,
+                ),
+                Some(from_tag),
+            ),
+            Err(error) => {
+                self.release_forward_seat(room_id, &from_tag).await;
+                error_result("forward_join: SDP rewrite", &error)
+            }
+        }
+    }
+
+    /// Allocate the endpoint for the floor-control stream the offer carries, if it carries one the
+    /// seat can take: its own redirected socket, gated by the signalled floor address (or the
+    /// `received_from` hint), with the learn-once latch the room runs on it
+    /// (docs/security-and-nat.md §4 layer 5h). A floor stream in another address family than the
+    /// seat's audio is left to be declined rather than bound on a second interface.
+    async fn open_floor_endpoint(
+        &self,
+        transport: &SeatTransport,
+        offer: &str,
+        profile: &ProfileFlags,
+    ) -> Result<Option<(Endpoint, FloorConfig)>, Box<CmdResult>> {
+        let Some(offered) = sdp::parse_floor(offer) else {
+            return Ok(None);
+        };
+        if siphon_rtp_datapath::AddressFamily::of(offered.remote.ip()) != transport.family {
+            tracing::debug!(
+                "the floor stream is in another address family than the seat; declined"
+            );
+            return Ok(None);
+        }
+        let endpoint = match self
+            .alloc_endpoints(1, transport.family, transport.bind)
+            .await
+        {
+            Ok(mut endpoints) => endpoints.remove(0),
+            Err(reason) => return Err(boxed_error_result("forward_join: floor stream", &reason)),
+        };
+        if let Err(error) = self
+            .datapath
+            .install_flow(endpoint.id, FlowAction::Redirect)
+        {
+            self.free(&[endpoint]).await;
+            return Err(boxed_error_result(
+                "forward_join: install floor redirect",
+                &error,
+            ));
+        }
+        let destination = peer_media_address(offered.remote, profile.received_from);
+        // An ICE seat holds the gate open until its pair is selected, then the room narrows it; a
+        // `symmetric` seat stays open and the learn-once latch is the only constraint.
+        let accepted_source =
+            if transport.ice_pending || profile.flags.iter().any(|flag| flag == "symmetric") {
+                SourceFilter::Any
+            } else {
+                SourceFilter::Exact(destination.ip())
+            };
+        Ok(Some((
+            endpoint,
+            FloorConfig {
+                endpoint: endpoint.id,
+                destination,
+                accepted_source,
+                ice_gated: transport.ice_pending,
+            },
+        )))
+    }
+
+    /// Unseat a member ([`Command::ForwardLeave`]), freeing its endpoint, flows, and DTLS and ICE
+    /// state. The last leave ends the room.
+    pub(super) async fn forward_leave(&self, room_id: &str, from_tag: &str) -> CmdResult {
+        if self.release_forward_seat(room_id, from_tag).await {
+            ok_empty()
+        } else {
+            error_result("forward_leave", &"no such forwarding room seat")
+        }
+    }
+
+    /// Take a seat out of its room and free everything it held. Returns whether it was seated.
+    pub(super) async fn release_forward_seat(&self, room_id: &str, from_tag: &str) -> bool {
+        let endpoints = self.conference.forward().leave(room_id, from_tag);
+        if endpoints.is_empty() {
+            return false;
+        }
+        self.stop_seat_ice_follow(&endpoints);
+        self.retire_dtls_endpoints(&endpoints);
+        for endpoint in endpoints {
+            self.endpoint_calls.remove(&endpoint);
+            self.awaiting_media.remove(&endpoint);
+            self.datapath.remove_endpoint(endpoint).await;
+        }
+        true
+    }
+
+    /// Choose whose audio the room forwards ([`Command::ForwardSetSource`]): the seat `from_tag`, or
+    /// nobody. The asking client receives the room's `forward_source_started` events.
+    pub(super) async fn forward_set_source(
+        &self,
+        client: ClientId,
+        room_id: &str,
+        from_tag: Option<String>,
+    ) -> CmdResult {
+        match self
+            .conference
+            .forward()
+            .set_source(room_id, from_tag, self.event_sink(client))
+            .await
+        {
+            Ok(()) => ok_empty(),
+            Err(refusal) => error_result("forward_set_source", &refusal),
+        }
+    }
+}

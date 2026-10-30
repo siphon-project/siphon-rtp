@@ -24,6 +24,7 @@ mod dial_out;
 mod dispatch;
 mod fax;
 mod fork;
+mod forward;
 mod gather;
 mod inject;
 mod install;
@@ -40,8 +41,10 @@ mod record;
 mod record_call;
 mod reoffer;
 mod room;
+mod rtcp_app;
 pub mod scope;
 mod seat_call;
+mod seat_transport;
 mod snapshot;
 mod sweep;
 mod takeover;
@@ -145,6 +148,8 @@ struct ClientSink {
     generation: ClientGeneration,
     sender: flume::Sender<Event>,
     receiver: flume::Receiver<Event>,
+    /// The client's `rtcp_app` events, which are never shed silently (see [`crate::app_events`]).
+    app: crate::app_events::AppEventQueue,
 }
 
 /// A stable controller identity and the connection currently attached to it.
