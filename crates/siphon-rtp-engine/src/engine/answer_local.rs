@@ -945,7 +945,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.near_telephone_event = telephone_event;
         }
         let mut answer_sdp = sdp::force_answer_codec(&rewritten.sdp, &chosen, telephone_event);
-        answer_sdp = sdp::answer_direction(&answer_sdp, info.direction);
+        answer_sdp = answered_as_the_engine(&answer_sdp, info.direction);
 
         if let Some(ws_uri) = profile.ws_uri.clone() {
             return self
@@ -1172,4 +1172,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
     }
+}
+
+/// The parts of an answer the engine writes from the caller's own offer that have to describe the
+/// engine rather than the caller: the direction is the complement of the offered one (RFC 3264
+/// §6.1), and the caller's own `a=ssrc` / `a=msid` / `a=extmap` lines are dropped (RFC 5576, RFC
+/// 8830, RFC 8285), which would otherwise tell a WebRTC caller the engine sends with its SSRC.
+fn answered_as_the_engine(answer: &str, offered: sdp::MediaDirection) -> String {
+    sdp::own_stream_identity(&sdp::answer_direction(answer, offered), None)
 }
