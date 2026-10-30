@@ -5,6 +5,7 @@
 //! answerer has no far party, so the same copy would hand the offer's own section back as the answer
 //! to it.
 
+use super::floor::is_floor_media_line;
 use super::{parse_media_line, rewrite_media_line, MediaKind, TextRewrite, CRLF};
 
 impl TextRewrite {
@@ -39,8 +40,22 @@ impl TextRewrite {
 /// so they are left in place rather than edited.
 #[must_use]
 pub fn decline_unanswered_media(sdp: String, text_answered: bool) -> String {
+    decline_unanswered_streams(sdp, text_answered, false)
+}
+
+/// [`decline_unanswered_media`] for an answer that may also carry the MCPTT floor-control stream:
+/// with `floor_answered` the first live `m=application … udp MCPTT` section is the one the engine
+/// anchored ([`super::anchor_floor`]) and stays; any further floor section is declined like every
+/// other stream the engine did not answer.
+#[must_use]
+pub fn decline_unanswered_streams(
+    sdp: String,
+    text_answered: bool,
+    floor_answered: bool,
+) -> String {
     let mut audio_seen = false;
     let mut text_seen = false;
+    let mut floor_seen = false;
     // Each line to replace, with its replacement. Empty, and so unallocated, for an audio-only answer.
     let mut declined: Vec<(usize, String)> = Vec::new();
     for (index, raw_line) in sdp.split('\n').enumerate() {
@@ -57,6 +72,11 @@ pub fn decline_unanswered_media(sdp: String, text_answered: bool) -> String {
             MediaKind::Text if !text_seen && port.is_some() => {
                 text_seen = true;
                 text_answered
+            }
+            MediaKind::Other if floor_answered && is_floor_media_line(value) => {
+                let first = !floor_seen && port.is_some_and(|port| port != 0);
+                floor_seen |= first;
+                first
             }
             _ => false,
         };
@@ -255,6 +275,31 @@ mod tests {
         assert!(TextRewrite::AnchorSecure { engine, crypto }.is_anchored());
         assert!(!TextRewrite::Decline.is_anchored());
         assert!(!TextRewrite::None.is_anchored());
+    }
+
+    #[test]
+    fn the_anchored_floor_stream_is_kept_and_any_other_is_declined() {
+        let answer = offer_with_sections(&[
+            "m=application 30002 udp MCPTT\r\na=fmtp:MCPTT mc_granted\r\n",
+            "m=application 30004 udp MCPTT\r\n",
+            "m=application 30006 udp t38\r\n",
+        ]);
+        let kept = decline_unanswered_streams(answer.clone(), false, true);
+        assert_eq!(
+            media_lines(&kept),
+            [
+                "m=audio 20100 RTP/AVP 0",
+                "m=application 30002 udp MCPTT",
+                "m=application 0 udp MCPTT",
+                "m=application 0 udp t38",
+            ]
+        );
+        // Without an anchored floor stream every application section is declined, as before.
+        let declined = decline_unanswered_streams(answer.clone(), false, false);
+        assert_eq!(declined, decline_unanswered_media(answer, false));
+        assert!(media_lines(&declined)[1..]
+            .iter()
+            .all(|line| line.contains(" 0 ")));
     }
 
     #[test]

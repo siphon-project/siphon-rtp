@@ -67,6 +67,8 @@ pub struct Metrics {
     conference_answers_total: AtomicU64,
     conference_leaves_total: AtomicU64,
     scoped_offers_total: AtomicU64,
+    /// RTCP APP events (`rtcp_app`) shed because a controller's APP queue was full.
+    rtcp_app_dropped_total: AtomicU64,
     /// WebSocket dials that failed, by [`WsDialFailure`] class: timeout, connect, TLS, handshake.
     ws_dial_failures_total: [AtomicU64; 4],
 }
@@ -112,6 +114,8 @@ pub struct MetricsSnapshot {
     pub deletes_total: u64,
     /// Total control commands that returned an error result since start.
     pub control_errors_total: u64,
+    /// Total `rtcp_app` events dropped (oldest first) because a controller's APP queue was full.
+    pub rtcp_app_dropped_total: u64,
 }
 
 impl Metrics {
@@ -134,6 +138,11 @@ impl Metrics {
     /// Count an accepted `delete` command.
     pub fn record_delete(&self) {
         self.deletes_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one `rtcp_app` event shed from a full per-client APP queue.
+    pub fn record_rtcp_app_dropped(&self) {
+        self.rtcp_app_dropped_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a control command that produced a [`CmdResult::Error`](siphon_rtp_proto::CmdResult).
@@ -198,6 +207,7 @@ impl Metrics {
             answers_total: self.answers_total.load(Ordering::Relaxed),
             deletes_total: self.deletes_total.load(Ordering::Relaxed),
             control_errors_total: self.control_errors_total.load(Ordering::Relaxed),
+            rtcp_app_dropped_total: self.rtcp_app_dropped_total.load(Ordering::Relaxed),
         }
     }
 
@@ -328,6 +338,13 @@ impl Metrics {
             "Control commands that returned an error result.",
             "counter",
             errors,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_rtcp_app_dropped_total",
+            "RTCP APP events shed from a controller's full APP queue (oldest first).",
+            "counter",
+            self.rtcp_app_dropped_total.load(Ordering::Relaxed),
         );
         metric(
             &mut output,
@@ -789,9 +806,9 @@ mod tests {
         }
         assert!(body.contains("# TYPE siphon_rtp_scoped_offers_total counter\n"));
         assert!(body.contains("siphon_rtp_scoped_offers_total 0\n"));
-        // Every series carries a HELP + TYPE line (31 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 31);
-        assert_eq!(body.matches("# TYPE ").count(), 31);
+        // Every series carries a HELP + TYPE line (32 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 32);
+        assert_eq!(body.matches("# TYPE ").count(), 32);
     }
 
     #[test]
@@ -813,8 +830,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (30 vs 31).
-        assert_eq!(body.matches("# TYPE ").count(), 30);
+        // One fewer series than the CPU-present case (31 vs 32).
+        assert_eq!(body.matches("# TYPE ").count(), 31);
     }
 
     #[test]
@@ -852,6 +869,7 @@ mod tests {
                 answers_total: 1,
                 deletes_total: 3,
                 control_errors_total: 1,
+                rtcp_app_dropped_total: 0,
             }
         );
     }

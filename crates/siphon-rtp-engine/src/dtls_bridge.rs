@@ -108,6 +108,13 @@ pub enum PipelineTarget {
         conference_id: String,
         tag: String,
     },
+    /// A forwarding-room seat: the room actor forwards this member's source once its handshake keys
+    /// the seat.
+    Forward {
+        forward: Arc<crate::forward::ForwardRegistry>,
+        room_id: String,
+        tag: String,
+    },
     /// A WebSocket-**takeover** leg (`PipelineKind::Ws`): the WS media server is this leg's far side,
     /// so the leg's own [`crate::ws_bridge::WsSecureLeg`] decrypts its ingress and encrypts the
     /// bridge's downlink. Until the handshake keys it the registry drops ingress and refuses egress.
@@ -134,6 +141,7 @@ impl PipelineTarget {
         match self {
             Self::Call { media, .. } => media.dispatch(packet),
             Self::Conference { conference, .. } => conference.dispatch(packet),
+            Self::Forward { forward, .. } => forward.dispatch(packet),
             Self::Ws { ws, .. } => ws.dispatch(packet),
         }
     }
@@ -172,6 +180,17 @@ impl PipelineTarget {
                     leg: Box::new(leg),
                 },
             ),
+            Self::Forward {
+                forward,
+                room_id,
+                tag,
+            } => forward.control(
+                room_id,
+                crate::forward::ForwardControl::AttachSecureLeg {
+                    tag: tag.clone(),
+                    leg: Box::new(leg),
+                },
+            ),
             // No mailbox hop: the WS leg's crypto is shared state the registry writes synchronously,
             // so the key is in place before `keyed` is published and therefore before this bridge
             // releases the first media packet.
@@ -190,7 +209,7 @@ impl PipelineTarget {
                 call_id,
                 party,
             } => media.control(call_id, party.attach(leg)),
-            Self::Conference { .. } | Self::Ws { .. } => false,
+            Self::Conference { .. } | Self::Forward { .. } | Self::Ws { .. } => false,
         }
     }
 }

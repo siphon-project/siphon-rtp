@@ -218,6 +218,17 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = DEFAULT_SETUP_TIMEOUT_SECS)]
     pub setup_timeout_secs: u64,
 
+    /// Free a push-to-talk forwarding room after this many seconds in which **every** seat has
+    /// received nothing at all (no RTP, RTCP or floor packet). Each seat is then reported to the
+    /// client that seated it with a `media_timeout` (`reason: no_media`, empty `call_id`, the room
+    /// as `conference_id`), and the room and its sockets are freed. It is a backstop for a room
+    /// nobody ended, deliberately long: a seat is never reaped on its own (a listener sends no
+    /// audio for as long as others talk, `forward_seat_inactive` reports one that went quiet), and a
+    /// live group cannot trip it because every receiver sends RTCP receiver reports (RFC 3550
+    /// §6.2). `0` disables it (such a room is then freed by `forward_leave` alone).
+    #[arg(long, default_value_t = DEFAULT_FORWARD_ROOM_IDLE_SECS)]
+    pub forward_room_idle_secs: u64,
+
     /// Bounded grace period (seconds) to drain live calls on SIGTERM/SIGINT before exiting. The
     /// daemon stops accepting new control connections immediately, then waits up to this long for
     /// the live session count to reach 0.
@@ -366,6 +377,9 @@ pub struct RunConfig {
     /// Reap a call that has never carried a packet — one still in setup — after this many seconds;
     /// `0` disables it.
     pub setup_timeout_secs: u64,
+    /// Free a forwarding room in which no seat has received anything for this many seconds; `0`
+    /// disables it.
+    pub forward_room_idle_secs: u64,
     /// Bounded SIGTERM/SIGINT drain grace period (seconds).
     pub shutdown_grace_secs: u64,
     /// STUN servers asked for a server-reflexive candidate when gathering; empty ⇒ host-only.
@@ -487,6 +501,12 @@ impl RunConfig {
                 explicit("setup_timeout_secs"),
                 file.setup_timeout_secs,
                 DEFAULT_SETUP_TIMEOUT_SECS,
+            ),
+            forward_room_idle_secs: resolve_defaulted(
+                args.forward_room_idle_secs,
+                explicit("forward_room_idle_secs"),
+                file.forward_room_idle_secs,
+                DEFAULT_FORWARD_ROOM_IDLE_SECS,
             ),
             shutdown_grace_secs: resolve_defaulted(
                 args.shutdown_grace_secs,
@@ -755,6 +775,13 @@ const DEFAULT_HELD_MEDIA_TIMEOUT_SECS: u64 = 7200;
 /// no-answer timers in the field sit around three minutes. Five is past all of them, while still
 /// bounding how long an anchor whose controller never came back can hold its ports.
 const DEFAULT_SETUP_TIMEOUT_SECS: u64 = 300;
+/// Built-in default for `--forward-room-idle-secs` (mirrors the clap `default_value_t`): one hour.
+///
+/// A forwarding room is silent for as long as nobody talks, and a group call can be quiet for
+/// minutes, but its members keep sending RTCP receiver reports (RFC 3550 §6.2), so a room that has
+/// heard from none of them for an hour has no members left. It is a backstop against a room nobody
+/// ended, not a dead-path timer.
+const DEFAULT_FORWARD_ROOM_IDLE_SECS: u64 = 3600;
 /// Built-in default for `--shutdown-grace-secs` (mirrors the clap `default_value_t`).
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 25;
 /// The default bound on a WebSocket dial, in the unit the flag takes.
@@ -1021,11 +1048,13 @@ where
     let timeout_ticks = config.media_timeout_secs;
     let held_timeout_ticks = config.held_media_timeout_secs;
     let setup_timeout_ticks = config.setup_timeout_secs;
+    let forward_room_idle_ticks = config.forward_room_idle_secs;
     tracing::info!(
         target: "siphon_rtp::media",
         media_timeout_secs = timeout_ticks,
         held_media_timeout_secs = held_timeout_ticks,
         setup_timeout_secs = setup_timeout_ticks,
+        forward_room_idle_secs = forward_room_idle_ticks,
         "media-timeout sweeper enabled"
     );
     tokio::spawn(async move {
@@ -1060,6 +1089,19 @@ where
                     idle_secs = timeout_ticks,
                     "media timeout — conference participants reaped"
                 );
+            }
+            // Forwarding-room seats are never reaped for silence (a push-to-talk listener sends
+            // nothing for minutes); a seat quiet past the media timeout is reported to the client that
+            // seated it, once, and the controller decides.
+            let _ = sweeper.scan_inactive_forward_seats(timeout_ticks);
+            // A forwarding room that has heard nothing from any seat for the long ceiling has no
+            // members left (a live group's receivers send RTCP reports): free it, telling each seat's
+            // client. The only reaping a forwarding room gets.
+            let rooms = sweeper
+                .reap_idle_forward_rooms(forward_room_idle_ticks)
+                .await;
+            if rooms > 0 {
+                tracing::warn!(target: "siphon_rtp::media", rooms, idle_secs = forward_room_idle_ticks, "media timeout — silent forwarding rooms freed");
             }
             // A seat the room offered and nobody answered is in setup, so it takes the setup ceiling.
             let expired = sweeper
@@ -1584,6 +1626,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_forward_room_ceiling_defaults_to_an_hour_and_is_configurable_both_ways() {
+        let default = resolve_from(&["siphon-rtp"], FileConfig::default());
+        assert_eq!(
+            default.forward_room_idle_secs,
+            super::DEFAULT_FORWARD_ROOM_IDLE_SECS
+        );
+        assert_eq!(default.forward_room_idle_secs, 3600);
+
+        let file = FileConfig {
+            forward_room_idle_secs: Some(120),
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            resolve_from(&["siphon-rtp"], file.clone()).forward_room_idle_secs,
+            120,
+            "the file value applies when the flag is absent"
+        );
+        assert_eq!(
+            resolve_from(&["siphon-rtp", "--forward-room-idle-secs", "0"], file)
+                .forward_room_idle_secs,
+            0,
+            "an explicit flag beats the file, including the `0` that disables the backstop"
+        );
+    }
+
     /// A `FileConfig` naming all three lawful-interception PEM paths.
     fn provisioned_file() -> FileConfig {
         FileConfig {
@@ -1671,6 +1739,7 @@ mod tests {
             media_timeout_secs: 30,
             held_media_timeout_secs: super::DEFAULT_HELD_MEDIA_TIMEOUT_SECS,
             setup_timeout_secs: super::DEFAULT_SETUP_TIMEOUT_SECS,
+            forward_room_idle_secs: super::DEFAULT_FORWARD_ROOM_IDLE_SECS,
             shutdown_grace_secs: 25,
             stun_servers: Vec::new(),
             ice_full: false,

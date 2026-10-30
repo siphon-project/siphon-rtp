@@ -86,6 +86,13 @@ control = "127.0.0.1:8080"
 # (CLI: --held-media-timeout-secs). Default: 7200 (two hours).
 # held_media_timeout_secs = 7200
 
+# Free a push-to-talk forwarding room after this many seconds in which *every* seat has received
+# nothing at all (no RTP, RTCP or floor packet). Each seat is reported to the client that seated it as
+# a media_timeout, then the room is freed. A backstop for a room nobody ended: a seat alone is never
+# reaped, and a live group cannot trip it because its receivers send RTCP reports. 0 disables it.
+# (CLI: --forward-room-idle-secs). Default: 3600.
+# forward_room_idle_secs = 3600
+
 # --- play_media from an http(s) URL --------------------------------------------------------------
 #
 # `play_media` can fetch a WAV prompt from a URL. The fetch runs on its own task (never on the media

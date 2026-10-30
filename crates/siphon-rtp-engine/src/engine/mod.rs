@@ -23,7 +23,10 @@ mod configure;
 mod dial_out;
 mod dispatch;
 mod fax;
+mod floor;
 mod fork;
+mod forward;
+mod forward_dial_out;
 mod gather;
 mod inject;
 mod install;
@@ -40,8 +43,10 @@ mod record;
 mod record_call;
 mod reoffer;
 mod room;
+mod rtcp_app;
 pub mod scope;
 mod seat_call;
+mod seat_transport;
 mod snapshot;
 mod sweep;
 mod takeover;
@@ -145,6 +150,8 @@ struct ClientSink {
     generation: ClientGeneration,
     sender: flume::Sender<Event>,
     receiver: flume::Receiver<Event>,
+    /// The client's `rtcp_app` events, which are never shed silently (see [`crate::app_events`]).
+    app: crate::app_events::AppEventQueue,
 }
 
 /// A stable controller identity and the connection currently attached to it.
@@ -235,6 +242,15 @@ struct Leg {
     /// negotiated — the forward destination and source-gate anchor for the sibling leg's fax relay
     /// (mirrors `remote_rtp`). `None` until known.
     image_remote: Option<std::net::SocketAddr>,
+    /// The engine's endpoint for this leg's MCPTT floor-control stream (`m=application … udp
+    /// MCPTT`, 3GPP TS 24.380), when the party offered or answered one. The engine terminates the
+    /// stream here rather than relaying it ([`crate::call_floor`]); it is a `Redirect` endpoint, so it
+    /// works on a call whose audio rides the in-kernel relay.
+    floor: Option<Endpoint>,
+    /// This party's signalled floor address (the `m=application`/`c=` transport), the gate anchor
+    /// and first destination of its floor leg. `None` until known (the far leg's arrives with its
+    /// answer).
+    floor_remote: Option<std::net::SocketAddr>,
 }
 
 impl Leg {
@@ -252,6 +268,7 @@ impl Leg {
         self.endpoint_ids()
             .chain(self.text.map(|endpoint| endpoint.id))
             .chain(self.image.map(|endpoint| endpoint.id))
+            .chain(self.floor.map(|endpoint| endpoint.id))
     }
 
     /// The engine endpoints this leg presents in SDP: its RTP port, its RTCP port unless muxed, and
@@ -286,6 +303,20 @@ impl Leg {
     /// The decline is the load-bearing case. Leaving an unanchored section alone would present the
     /// party a fax address belonging to the *other* party — its own, often private, one — so the fax
     /// would either bypass the engine or go nowhere. Saying no is honest; saying nothing is not.
+    fn floor_rewrite<'a>(&self, fmtp: Option<&'a str>) -> sdp::FloorRewrite<'a> {
+        match self.floor {
+            Some(endpoint) => sdp::FloorRewrite::Anchor {
+                engine: EngineMedia {
+                    rtp: endpoint.local_addr,
+                    rtcp: None,
+                    advertised_ip: self.advertised_ip,
+                },
+                fmtp,
+            },
+            None => sdp::FloorRewrite::Decline,
+        }
+    }
+
     fn image_rewrite(&self, offered: bool) -> ImageRewrite {
         match self.image {
             Some(endpoint) => ImageRewrite::Anchor(EngineMedia {
@@ -1129,6 +1160,8 @@ pub struct Engine<D: Datapath> {
     /// Conference seats the engine offered (`conference_offer`) and the participant has not yet
     /// answered, by room and from-tag. Each holds one endpoint until it is answered, left or expired.
     pending_seats: DashMap<(String, String), dial_out::PendingSeat>,
+    /// The same for forwarding rooms (`forward_offer`), by room and from-tag.
+    pending_forward_seats: DashMap<(String, String), forward_dial_out::PendingForwardSeat>,
     /// The RFC 4103 Real-Time Text observability slow path: per-call text processors that RED/T.140
     /// observe a promoted `m=text` stream (recording / `text_events`) then forward it verbatim. Shared
     /// with the redirect dispatcher, which routes text-owned endpoints' datagrams here (see

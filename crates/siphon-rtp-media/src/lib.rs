@@ -26,4 +26,5 @@ pub mod rtp;
 pub mod t140;
 pub mod text_mixer;
 pub mod tone;
+pub mod translator;
 pub mod wav;

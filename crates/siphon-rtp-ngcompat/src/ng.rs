@@ -498,6 +498,8 @@ fn parse_profile(request: &Value) -> ProfileFlags {
             }
             mux
         },
+        // MCPTT floor control is a native-protocol feature; rtpengine's NG has no such key.
+        floor_fmtp: None,
     }
 }
 
@@ -1067,6 +1069,7 @@ mod tests {
                 deletes_total: 10,
                 control_errors_total: 2,
                 sessions: 3,
+                rtcp_app_dropped_total: 0,
             },
         });
         assert_eq!(result.get("result").and_then(Value::as_str), Some("ok"));

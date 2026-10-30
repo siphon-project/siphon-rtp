@@ -802,65 +802,27 @@ impl Conference {
         else {
             return Ingress::Refused;
         };
-        let context = RefusalContext {
-            component: "conference",
-            call_id: conference_id,
-            endpoint: packet.endpoint,
-            source: packet.source,
-            expected: participant.accepted_source,
+        // The shared per-seat ingress chain (source gate, DTLS/ICE pending gates, SRTP unprotect,
+        // constrained latch): `crate::seat_gate`, the same one the forwarding room runs.
+        let data = match crate::seat_gate::admit(
+            crate::seat_gate::SeatGate {
+                component: "conference",
+                room_id: conference_id,
+                accepted_source: participant.accepted_source,
+                secure_pending: participant.secure_pending,
+                ice_pending: participant.ice_pending,
+                secure: &mut participant.secure,
+                latch: participant.latch,
+                reverse_latch: &mut participant.reverse_latch,
+                refusals: &participant.refusals,
+                egress_destination: &mut participant.egress_dst,
+            },
+            packet,
+            &mut self.clear_in,
+        ) {
+            Ok(data) => data,
+            Err(refused) => return refused,
         };
-        // Layer 2 — signalled-source gate (docs/security-and-nat.md §4): an unsignalled source never
-        // enters the mix.
-        if !participant.accepted_source.accepts(packet.source.ip()) {
-            participant
-                .refusals
-                .log(Refusal::UnsignalledSource, context);
-            return Ingress::Refused;
-        }
-        // A DTLS seat whose handshake has not keyed it yet: drop. Decoding SRTP as if it were
-        // plaintext would mix noise into the room for every other participant. Not activity: the room
-        // has never had usable media from this seat.
-        if participant.secure_pending {
-            return Ingress::Refused;
-        }
-        // A full-ICE seat before its agent has selected a pair: drop. Media must follow ICE's
-        // decision, not race it — mixing in whatever arrives first is exactly the blind latch the
-        // connectivity check exists to replace (RFC 8445 §7; docs/security-and-nat.md §4 layer 4).
-        // Not counted as activity either: an unselected path is not a live one.
-        if participant.ice_pending {
-            return Ingress::Refused;
-        }
-        // SRTP: decrypt a secure participant's packet first (the auth tag also proves authenticity —
-        // a forged/replayed packet fails here and is dropped). Plain legs pass through untouched.
-        let data: &[u8] = if let Some(secure) = participant.secure.as_mut() {
-            self.clear_in.clear();
-            if secure.unprotect(&packet.data, &mut self.clear_in).is_err() {
-                // Not activity either, as before: a seat whose media never authenticates is not live.
-                participant.refusals.log(Refusal::NotAuthenticated, context);
-                return Ingress::Refused;
-            }
-            &self.clear_in
-        } else {
-            &packet.data
-        };
-        // Layer 3 — constrained, SSRC-consistent latch (docs/security-and-nat.md §4 layer 3; RFC 3550
-        // §8), decided after SRTP unprotect above (a forged packet was already dropped) and before the
-        // packet is consumed: a new source that cannot prove it is this participant's stream is
-        // dropped, never mixed and never counted as activity, exactly as the datapath's `Forward` path
-        // drops it; an accepted stream aims the reply at the latched source.
-        if participant.latch {
-            match participant
-                .reverse_latch
-                .admit(packet.source, rtp_media_ssrc(data))
-            {
-                ReplyLatch::Reject => {
-                    participant.refusals.log(Refusal::NewSource, context);
-                    return Ingress::Refused;
-                }
-                ReplyLatch::Accept(Some(dst)) => participant.egress_dst = dst,
-                ReplyLatch::Accept(None) => {}
-            }
-        }
         if data.len() < 2 {
             return Ingress::Accepted; // gated in; too short to be audio, but the path is alive
         }
@@ -882,31 +844,17 @@ impl Conference {
                     data,
                 );
             }
-            // Sender Report (V=2, PT=200): the 64-bit NTP timestamp sits at offset 8 (after the
-            // 8-byte header), so the packet must hold at least 16 bytes.
-            if data[0] >> 6 == 2 && data[1] == 200 && data.len() >= 16 {
-                if let Ok(ntp_bytes) = <[u8; 8]>::try_from(&data[8..16]) {
-                    participant
-                        .leg
-                        .record_sender_report(u64::from_be_bytes(ntp_bytes), packet.arrival);
+            // Sender Report NTP → our reception report's LSR/DLSR, and every reception report block
+            // about our egress stream → round-trip time (shared with the forwarding room).
+            let leg = &mut participant.leg;
+            crate::seat_gate::consume_rtcp(data, |item| match item {
+                crate::seat_gate::RtcpItem::SenderReportNtp(ntp) => {
+                    leg.record_sender_report(ntp, packet.arrival);
                 }
-            }
-            // Feed every reception report block (in an SR or an RR) to the leg's RTT estimator; it
-            // ignores blocks that report a different SSRC or echo an SR we don't recognise.
-            if let Ok(packets) = rtcp::parse_compound(data) {
-                for rtcp_packet in &packets {
-                    let blocks = match rtcp_packet {
-                        rtcp::RtcpPacket::SenderReport(report) => report.reports.as_slice(),
-                        rtcp::RtcpPacket::ReceiverReport(report) => report.reports.as_slice(),
-                        rtcp::RtcpPacket::Other { .. } => &[],
-                    };
-                    for block in blocks {
-                        participant
-                            .leg
-                            .record_reception_report(block, packet.arrival);
-                    }
+                crate::seat_gate::RtcpItem::Block(block) => {
+                    leg.record_reception_report(block, packet.arrival);
                 }
-            }
+            });
             return Ingress::Accepted;
         }
         let Ok(parsed) = RtpPacket::parse(data) else {
@@ -2046,7 +1994,7 @@ fn destination_usable(dst: SocketAddr) -> bool {
 /// The current time as a 64-bit NTP timestamp (RFC 3550 §4): seconds since 1900 in the high 32 bits,
 /// fractional seconds in the low 32. Wall-clock (RTCP carries real time, unlike the deterministic
 /// mixing clock); `0` if the system clock predates the UNIX epoch.
-fn ntp_now() -> u64 {
+pub(crate) fn ntp_now() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(elapsed) => {
             // UNIX epoch (1970) → NTP epoch (1900) is 2,208,988,800 seconds.
@@ -2322,7 +2270,7 @@ pub(crate) fn hep_codec_for_name(encoding_name: &str) -> siphon_rtp_hep::mos::Co
 }
 
 /// Transmit each queued datagram, draining `outbound`.
-async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
+pub(crate) async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
     for datagram in outbound.drain(..) {
         if let Err(error) = datapath
             .send(datagram.endpoint, datagram.dst, &datagram.data)
@@ -2414,6 +2362,13 @@ pub struct ConferenceRegistry {
     routes: DashMap<EndpointId, flume::Sender<ConferenceInput>>,
     /// Conference id → control handle (mailbox + members + task).
     rooms: DashMap<String, ConferenceHandle>,
+    /// The forwarding rooms (push-to-talk group calls, [`crate::forward`]). They share this
+    /// registry's place in the redirect dispatcher and its ICE seam rather than adding a consumer
+    /// to every dispatcher call site: [`Self::owns`], [`Self::dispatch`] and [`Self::ice_selected`]
+    /// fall through to it.
+    forward: std::sync::Arc<crate::forward::ForwardRegistry>,
+    /// The floor-control streams of two-party calls, which share this registry's dispatcher slot.
+    floors: std::sync::Arc<crate::call_floor::CallFloorRegistry>,
 }
 
 impl ConferenceRegistry {
@@ -2421,6 +2376,20 @@ impl ConferenceRegistry {
     #[must_use]
     pub fn owns(&self, endpoint: EndpointId) -> bool {
         self.routes.contains_key(&endpoint)
+            || self.forward.owns(endpoint)
+            || self.floors.owns(endpoint)
+    }
+
+    /// The two-party calls' floor streams that share this registry's dispatcher slot.
+    #[must_use]
+    pub fn floors(&self) -> &std::sync::Arc<crate::call_floor::CallFloorRegistry> {
+        &self.floors
+    }
+
+    /// The forwarding rooms that share this registry's dispatcher slot.
+    #[must_use]
+    pub fn forward(&self) -> &std::sync::Arc<crate::forward::ForwardRegistry> {
+        &self.forward
     }
 
     /// Route a redirected datagram to its owning room actor (drop on a full or closed mailbox —
@@ -2430,6 +2399,10 @@ impl ConferenceRegistry {
             if mailbox.try_send(ConferenceInput::Packet(packet)).is_err() {
                 tracing::trace!("conference mailbox full or closed; dropping redirected datagram");
             }
+        } else if self.floors.owns(packet.endpoint) {
+            self.floors.dispatch(packet);
+        } else {
+            self.forward.dispatch(packet);
         }
     }
 
@@ -2561,7 +2534,8 @@ impl ConferenceRegistry {
     /// the common case, since most ICE endpoints are 2-party legs.
     pub fn ice_selected(&self, endpoint: EndpointId, remote: SocketAddr) -> bool {
         let Some((conference_id, tag)) = self.participant_at(endpoint) else {
-            return false;
+            // Not a mixing seat: it may be a forwarding seat.
+            return self.forward.ice_selected(endpoint, remote);
         };
         match self.rooms.get(&conference_id) {
             Some(handle) => handle

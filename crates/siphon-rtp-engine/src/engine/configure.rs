@@ -63,6 +63,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             conference: Arc::new(ConferenceRegistry::default()),
             seat_ice_followers: DashMap::new(),
             pending_seats: DashMap::new(),
+            pending_forward_seats: DashMap::new(),
             text: Arc::new(TextRegistry::default()),
             udptl: Arc::new(UdptlRegistry::default()),
             subscriptions: DashMap::new(),
