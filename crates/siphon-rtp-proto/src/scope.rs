@@ -146,6 +146,8 @@ impl Command {
             | Command::DetachX3 { call_id, .. }
             // Names a call (the leg it moves) as well as a room, so the frame's scope keys it.
             | Command::ConferenceSeat { call_id, .. } => Some(call_id),
+            // A two-party send names a call; a room-wide one names a room and has no call.
+            Command::SendRtcpApp { call_id, .. } => call_id.as_mut(),
             Command::Ping
             | Command::List
             | Command::Statistics
@@ -166,7 +168,12 @@ impl Command {
             | Command::ConferenceStopPlay { .. }
             | Command::ConferenceSetPlayGain { .. }
             | Command::ConferenceStartRecording { .. }
-            | Command::ConferenceStopRecording { .. } => None,
+            | Command::ConferenceStopRecording { .. }
+            | Command::ForwardJoin { .. }
+            | Command::ForwardOffer { .. }
+            | Command::ForwardAnswer { .. }
+            | Command::ForwardLeave { .. }
+            | Command::ForwardSetSource { .. } => None,
         }
     }
 
@@ -186,6 +193,15 @@ impl Command {
                 | Command::ConferenceSetPlayGain { .. }
                 | Command::ConferenceStartRecording { .. }
                 | Command::ConferenceStopRecording { .. }
+                | Command::ForwardJoin { .. }
+                | Command::ForwardOffer { .. }
+                | Command::ForwardAnswer { .. }
+                | Command::ForwardLeave { .. }
+                | Command::ForwardSetSource { .. }
+                | Command::SendRtcpApp {
+                    conference_id: Some(_),
+                    ..
+                }
         )
     }
 }
@@ -213,8 +229,11 @@ impl Event {
             | Event::X3Ended { call_id, .. }
             | Event::WsBridgeStarted { call_id, .. }
             | Event::WsBridgeEnded { call_id, .. } => Some(call_id),
-            Event::CallQuality { call_id, .. } => call_id.as_mut(),
-            Event::ActiveSpeaker { .. } | Event::Unknown => None,
+            Event::CallQuality { call_id, .. } | Event::RtcpApp { call_id, .. } => call_id.as_mut(),
+            Event::ActiveSpeaker { .. }
+            | Event::ForwardSourceStarted { .. }
+            | Event::ForwardSeatInactive { .. }
+            | Event::Unknown => None,
         }
     }
 }
@@ -403,5 +422,56 @@ mod tests {
         let mut speaker: Event = serde_json::from_str(RECORDED_EVENTS[3]).expect("decode");
         assert_eq!(speaker.call_id_mut(), None);
         assert_eq!(Event::Unknown.call_id_mut(), None);
+    }
+
+    #[test]
+    fn forward_verbs_are_room_verbs() {
+        for json in [
+            r#"{"command":"forward_join","conference_id":"g","from_tag":"f","sdp":"v=0"}"#,
+            r#"{"command":"forward_offer","conference_id":"g","from_tag":"f"}"#,
+            r#"{"command":"forward_answer","conference_id":"g","from_tag":"f","sdp":"v=0"}"#,
+            r#"{"command":"forward_leave","conference_id":"g","from_tag":"f"}"#,
+            r#"{"command":"forward_set_source","conference_id":"g"}"#,
+        ] {
+            let mut command: Command = serde_json::from_str(json).expect(json);
+            assert!(command.is_conference(), "{json}");
+            assert_eq!(command.call_id_mut(), None, "{json}");
+        }
+    }
+
+    #[test]
+    fn send_rtcp_app_is_scoped_by_its_call_and_unscoped_by_its_room() {
+        let mut to_call: Command = serde_json::from_str(
+            r#"{"command":"send_rtcp_app","call_id":"c1","from_tag":"f","stream":"floor","name":"MCPT","subtype":0,"payload":""}"#,
+        )
+        .expect("decode");
+        assert!(!to_call.is_conference());
+        assert_eq!(to_call.call_id_mut().map(|id| id.as_str()), Some("c1"));
+        let mut to_room: Command = serde_json::from_str(
+            r#"{"command":"send_rtcp_app","conference_id":"g","stream":"floor","name":"MCPT","subtype":0,"payload":""}"#,
+        )
+        .expect("decode");
+        assert!(to_room.is_conference());
+        assert_eq!(to_room.call_id_mut(), None);
+    }
+
+    #[test]
+    fn an_rtcp_app_event_is_scoped_only_when_it_names_a_call() {
+        let mut from_call = Event::RtcpApp {
+            call_id: Some("c1".into()),
+            conference_id: None,
+            from_tag: "f".into(),
+            stream: crate::RtcpAppStream::Floor,
+            ssrc: 1,
+            name: "MCPT".into(),
+            subtype: 0,
+            payload: Vec::new(),
+        };
+        assert_eq!(from_call.call_id_mut().map(|id| id.as_str()), Some("c1"));
+        let mut inactive = Event::ForwardSeatInactive {
+            conference_id: "g".into(),
+            from_tag: "f".into(),
+        };
+        assert_eq!(inactive.call_id_mut(), None);
     }
 }
