@@ -32,6 +32,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   32-bit words is refused rather than padded, because its field coding (§8.1.3) belongs to the
   caller. Nothing is wired to the control protocol yet.
 
+- `siphon-rtp-media::translator::Translator`: a per-receiver RTP translator (RFC 3550 §7.1/§7.2) for
+  one-to-many forwarding. One stable egress SSRC per receiver; sequence numbers and timestamps stay
+  continuous across talker changes, the marker bit is set on the first packet of each run, in-source
+  loss is preserved, late packets of the previous source are dropped. Payload is copied unchanged;
+  CSRCs and the header extension are dropped, padding is kept. Exposes SR counters.
+
 ## [0.15.5] — 2026-10-29
 
 ### Fixed
