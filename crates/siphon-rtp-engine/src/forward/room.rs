@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 
+use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_media::ingress::IngressStats;
 use siphon_rtp_media::rtcp;
@@ -31,6 +32,7 @@ use siphon_rtp_proto::Event;
 use siphon_rtp_srtp::leg::SecureLeg;
 
 use super::codec::RoomCodec;
+use super::transcode::{EventSource, SeatLeg, StreamPoint, TranscodeStats, Transcoder};
 use crate::app_events::AppEventQueue;
 use crate::ingress::{Ingress, RefusalLog};
 use crate::media_pipeline::Outbound;
@@ -64,6 +66,9 @@ pub enum ForwardError {
     /// No seat has this from-tag.
     #[error("no seat {0} in this room")]
     UnknownTag(String),
+    /// The seat's codec cannot be transcoded to and from the room's.
+    #[error("{0}")]
+    Transcode(String),
 }
 
 /// Everything the engine resolves from a seat's SDP to seat it.
@@ -115,6 +120,10 @@ pub struct ForwardSeatStats {
     pub app_events: u64,
     /// Datagrams with APP-bearing RTCP the room could not read to the end: counted, no event.
     pub malformed_app: u64,
+    /// Packets from the seat, while it was the source, that could not be transcoded for the
+    /// cross-codec seats (a payload the decoder refused, or a frame of another length than the
+    /// negotiated one). Same-codec seats were still sent them.
+    pub transcode_dropped: u64,
 }
 
 struct Seat {
@@ -131,6 +140,11 @@ struct Seat {
     reverse_latch: SymmetricLatch,
     refusals: RefusalLog,
     translator: Translator,
+    /// The seat's codec when it is not the room's: its decoder, and the codec group it is sent in.
+    cross: Option<SeatLeg>,
+    /// The RTP clock of the audio the seat sends and is sent: the room codec's, or the cross-codec
+    /// seat's own (RFC 3551 §4.5).
+    clock_rate_hz: u32,
     /// The MCPTT floor-control stream, when the seat has one.
     floor: Option<FloorStream>,
     /// Where this seat's RTCP APP events go.
@@ -170,8 +184,13 @@ enum Port {
 #[derive(Clone, Copy)]
 enum PlanKind {
     Audio,
-    /// A telephone-event packet at this clock rate.
-    TelephoneEvent(u32),
+    /// A telephone-event packet. `original_rate` is the event clock of the source's own packet;
+    /// `domain_rate` that of the room-domain packet, which differs only for a cross-codec source
+    /// (its events are rescaled to the room codec's clock).
+    Event {
+        original_rate: u32,
+        domain_rate: u32,
+    },
 }
 
 /// The fan-out of one inbound packet, walked by [`ForwardRoom::next_datagram`].
@@ -181,10 +200,36 @@ struct Plan {
     kind: PlanKind,
     /// The cleartext packet is in the room's decrypt buffer rather than in the datagram.
     in_clear_buffer: bool,
+    /// The length of the room-domain packet a cross-codec source's packet became, in the
+    /// transcoder's buffer; `None` for a source in the room codec (its own packet is the room-domain
+    /// packet).
+    domain_len: Option<usize>,
+    /// The codec group of a cross-codec source: seats in it are sent the source's packet as it came.
+    source_group: Option<usize>,
+    /// The header of the room-domain packet.
+    point: StreamPoint,
     /// The next seat to consider.
     cursor: usize,
-    /// The arrival, in RTP timestamp units of the room codec.
-    clock: u32,
+    /// The arrival, in microseconds.
+    arrival: u64,
+    /// The transcoder's drop count when the plan was armed, to see whether this packet added one.
+    dropped_before: u64,
+}
+
+/// Which packet a receiver's translator reads.
+#[derive(Clone, Copy)]
+enum Feed {
+    /// The packet as it arrived.
+    Original,
+    /// The cross-codec source's room-domain packet.
+    Domain(usize),
+    /// A packet built for a cross-codec receiver.
+    Synthesized(usize),
+}
+
+/// `micros` of the monotonic clock as ticks of an RTP clock of `rate_hz` (RFC 3550 §5.1).
+fn ticks(micros: u64, rate_hz: u32) -> u32 {
+    ((u128::from(micros) * u128::from(rate_hz)) / 1_000_000) as u32
 }
 
 /// A forwarding room.
@@ -195,6 +240,8 @@ pub struct ForwardRoom {
     by_endpoint: HashMap<EndpointId, (usize, Port)>,
     /// Index of the seat being forwarded, or `None`.
     source: Option<usize>,
+    /// The transcoder, once a seat in another codec than the room's has been seated.
+    transcoder: Option<Transcoder>,
     /// A source change is waiting for its first forwarded packet to be announced.
     announce_pending: bool,
     plan: Option<Plan>,
@@ -217,6 +264,7 @@ impl ForwardRoom {
             seats: Vec::new(),
             by_endpoint: HashMap::new(),
             source: None,
+            transcoder: None,
             announce_pending: false,
             plan: None,
             events: Vec::new(),
@@ -263,16 +311,11 @@ impl ForwardRoom {
         Some(self.seats[index].tag.as_str())
     }
 
-    /// The RTP timestamp-unit reading of a microsecond clock, at the room codec's clock rate.
-    fn rtp_clock(&self, micros: u64) -> u32 {
-        ((u128::from(micros) * u128::from(self.codec.clock_rate_hz())) / 1_000_000) as u32
-    }
-
     fn index_of(&self, tag: &str) -> Option<usize> {
         self.seats.iter().position(|seat| seat.tag == tag)
     }
 
-    /// Seat a member. `now_micros` anchors the seat's egress timestamp line.
+    /// Seat a member in the room's codec. `now_micros` anchors the seat's egress timestamp line.
     ///
     /// # Errors
     /// [`ForwardError::RoomFull`] or [`ForwardError::DuplicateTag`].
@@ -281,13 +324,67 @@ impl ForwardRoom {
         config: ForwardSeatConfig,
         now_micros: u64,
     ) -> Result<(), ForwardError> {
+        self.check_vacancy(&config.tag)?;
+        let clock_rate_hz = self.codec.clock_rate_hz();
+        self.insert_seat(config, None, clock_rate_hz, now_micros);
+        Ok(())
+    }
+
+    /// Seat a member whose codec `spec` is not the room's. The room decodes the source once per
+    /// packet and encodes once per codec group (see [`super::transcode`]); the seat is sent its own
+    /// stream in `spec`, under `config.audio_payload_type`. Nothing is seated when the codec cannot
+    /// be transcoded.
+    ///
+    /// # Errors
+    /// [`ForwardError::RoomFull`], [`ForwardError::DuplicateTag`], or [`ForwardError::Transcode`]
+    /// with the reason the codec cannot be transcoded to and from the room's.
+    pub fn add_cross_codec_seat(
+        &mut self,
+        config: ForwardSeatConfig,
+        spec: CodecSpec,
+        now_micros: u64,
+    ) -> Result<(), ForwardError> {
+        self.check_vacancy(&config.tag)?;
+        let transcoder = match self.transcoder.as_mut() {
+            Some(transcoder) => transcoder,
+            None => self
+                .transcoder
+                .insert(Transcoder::new(self.codec.spec()).map_err(ForwardError::Transcode)?),
+        };
+        let leg = transcoder
+            .seat_leg(&spec)
+            .map_err(ForwardError::Transcode)?;
+        self.insert_seat(config, Some(leg), spec.clock_rate_hz, now_micros);
+        Ok(())
+    }
+
+    /// What the transcoder has done: all zero in a room with no cross-codec seat.
+    #[must_use]
+    pub fn transcode_stats(&self) -> TranscodeStats {
+        self.transcoder
+            .as_ref()
+            .map(Transcoder::stats)
+            .unwrap_or_default()
+    }
+
+    fn check_vacancy(&self, tag: &str) -> Result<(), ForwardError> {
         if self.seats.len() >= MAX_SEATS {
             return Err(ForwardError::RoomFull);
         }
-        if self.index_of(&config.tag).is_some() {
-            return Err(ForwardError::DuplicateTag(config.tag));
+        if self.index_of(tag).is_some() {
+            return Err(ForwardError::DuplicateTag(tag.to_string()));
         }
-        let anchor = self.rtp_clock(now_micros);
+        Ok(())
+    }
+
+    fn insert_seat(
+        &mut self,
+        config: ForwardSeatConfig,
+        cross: Option<SeatLeg>,
+        clock_rate_hz: u32,
+        now_micros: u64,
+    ) {
+        let anchor = ticks(now_micros, clock_rate_hz);
         self.by_endpoint
             .insert(config.endpoint, (self.seats.len(), Port::Audio));
         if let Some(floor) = &config.floor {
@@ -312,15 +409,16 @@ impl ForwardRoom {
                 config.initial_sequence,
                 config.initial_timestamp,
             ),
+            cross,
+            clock_rate_hz,
             floor: config.floor.map(FloorStream::new),
             app_events: config.app_events,
-            stats: IngressStats::new(self.codec.clock_rate_hz()),
+            stats: IngressStats::new(clock_rate_hz),
             last_sender_report_ntp_middle: 0,
             last_sender_report_arrival: None,
             last_forward_clock: anchor,
             counters: ForwardSeatStats::default(),
         });
-        Ok(())
     }
 
     /// Unseat a member. Returns whether it was seated. If it was the source, nothing is forwarded
@@ -354,6 +452,7 @@ impl ForwardRoom {
                 self.source = None;
                 self.announce_pending = false;
                 self.switch_every_translator();
+                self.end_transcode_run();
             }
             Some(source) if source > index => self.source = Some(source - 1),
             _ => {}
@@ -383,7 +482,15 @@ impl ForwardRoom {
         self.announce_pending = chosen.is_some();
         self.plan = None;
         self.switch_every_translator();
+        self.end_transcode_run();
         Ok(())
+    }
+
+    /// A new talker is a new stream to the transcoder: its decoder and resamplers start clean.
+    fn end_transcode_run(&mut self) {
+        if let Some(transcoder) = self.transcoder.as_mut() {
+            transcoder.end_run();
+        }
     }
 
     fn switch_every_translator(&mut self) {
@@ -521,19 +628,70 @@ impl ForwardRoom {
             .telephone_event
             .filter(|event| event.payload_type == parsed.payload_type)
         {
-            PlanKind::TelephoneEvent(event.clock_rate_hz)
+            PlanKind::Event {
+                original_rate: event.clock_rate_hz,
+                domain_rate: event.clock_rate_hz,
+            }
         } else {
             seat.counters.unknown_payload_type += 1;
             return Ingress::DroppedFromPeer;
         };
-        let clock = self.rtp_clock(packet.arrival);
-        self.plan = Some(Plan {
+        let mut plan = Plan {
             source: index,
             kind,
             in_clear_buffer,
+            domain_len: None,
+            source_group: None,
+            point: StreamPoint {
+                ssrc: parsed.ssrc,
+                sequence: parsed.sequence,
+                timestamp: parsed.timestamp,
+                marker: parsed.marker,
+            },
             cursor: 0,
-            clock,
-        });
+            arrival: packet.arrival,
+            dropped_before: 0,
+        };
+        if let Some(transcoder) = self.transcoder.as_mut() {
+            plan.dropped_before = transcoder.stats().dropped;
+            transcoder.begin_packet();
+            let new_run = transcoder.begin_run(parsed.ssrc, parsed.timestamp, seat.cross.is_some());
+            if let Some(leg) = seat.cross.as_mut() {
+                // A source in another codec is brought into the room codec first (see
+                // `transcode`); from here it is forwarded like any other.
+                if new_run {
+                    leg.restart();
+                }
+                let converted = match kind {
+                    PlanKind::Audio => {
+                        transcoder.uplink_audio(leg, plan.point, seat.clock_rate_hz, parsed.payload)
+                    }
+                    PlanKind::Event { original_rate, .. } => transcoder.uplink_event(
+                        plan.point,
+                        seat.clock_rate_hz,
+                        original_rate,
+                        parsed.payload,
+                    ),
+                };
+                let Some(length) = converted else {
+                    seat.counters.transcode_dropped += 1;
+                    return Ingress::Accepted;
+                };
+                let Ok(domain) = RtpPacket::parse(transcoder.domain(length)) else {
+                    return Ingress::Accepted;
+                };
+                plan.point.timestamp = domain.timestamp;
+                plan.domain_len = Some(length);
+                plan.source_group = Some(leg.group());
+                if let PlanKind::Event { original_rate, .. } = kind {
+                    plan.kind = PlanKind::Event {
+                        original_rate,
+                        domain_rate: self.codec.clock_rate_hz(),
+                    };
+                }
+            }
+        }
+        self.plan = Some(plan);
         Ingress::Accepted
     }
 
@@ -543,7 +701,8 @@ impl ForwardRoom {
     ///
     /// A seat is skipped, silently, when it is the source, cannot be reached, has no
     /// telephone-event payload type at the source's clock rate for an event packet (RFC 4733 §2.1),
-    /// or the translator drops the packet as a late one of the previous source.
+    /// cannot be sent the audio in its codec (a drop the source's `transcode_dropped` counts), or the
+    /// translator drops the packet as a late one of the previous source.
     pub fn next_datagram<'a>(
         &'a mut self,
         packet: &'a RxPacket,
@@ -553,6 +712,7 @@ impl ForwardRoom {
             let index = plan.cursor;
             if index >= self.seats.len() {
                 self.plan = None;
+                self.count_transcode_drop(&plan);
                 return None;
             }
             plan.cursor += 1;
@@ -564,35 +724,40 @@ impl ForwardRoom {
             if !receiver.reachable() {
                 continue;
             }
-            let payload_type = match plan.kind {
-                PlanKind::Audio => receiver.audio_payload_type,
-                PlanKind::TelephoneEvent(rate) => match receiver.telephone_event {
-                    Some(event) if event.clock_rate_hz == rate => event.payload_type,
-                    _ => continue,
-                },
-            };
-            let inbound: &[u8] = if plan.in_clear_buffer {
+            let original: &[u8] = if plan.in_clear_buffer {
                 &self.clear_in
             } else {
                 &packet.data
             };
-            let length = match receiver.translator.translate(
-                inbound,
-                payload_type,
-                plan.clock,
-                &mut self.scratch,
-            ) {
-                Ok(Forwarded::Packet { length, .. }) => length,
-                Ok(Forwarded::DroppedStale) => continue,
-                Err(error) => {
-                    tracing::debug!(
-                        target: "siphon_rtp::media", room = %self.room_id, %error,
-                        "forwarding room could not translate a packet"
-                    );
-                    continue;
-                }
+            let Some((feed, payload_type)) =
+                select_feed(&plan, receiver, original, &mut self.transcoder)
+            else {
+                continue;
             };
-            receiver.last_forward_clock = plan.clock;
+            let inbound: &[u8] = match (feed, self.transcoder.as_ref()) {
+                (Feed::Original, _) => original,
+                (Feed::Domain(length), Some(transcoder)) => transcoder.domain(length),
+                (Feed::Synthesized(length), Some(transcoder)) => transcoder.synthesized(length),
+                (_, None) => continue,
+            };
+            // The translator's clock is the receiver's own RTP clock (RFC 3550 §5.1).
+            let clock = ticks(plan.arrival, receiver.clock_rate_hz);
+            let length =
+                match receiver
+                    .translator
+                    .translate(inbound, payload_type, clock, &mut self.scratch)
+                {
+                    Ok(Forwarded::Packet { length, .. }) => length,
+                    Ok(Forwarded::DroppedStale) => continue,
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "siphon_rtp::media", room = %self.room_id, %error,
+                            "forwarding room could not translate a packet"
+                        );
+                        continue;
+                    }
+                };
+            receiver.last_forward_clock = clock;
             if self.announce_pending {
                 self.announce_pending = false;
                 self.events.push(Event::ForwardSourceStarted {
@@ -618,6 +783,14 @@ impl ForwardRoom {
         }
     }
 
+    /// Count, once per inbound packet, that the cross-codec seats could not be sent it.
+    fn count_transcode_drop(&mut self, plan: &Plan) {
+        let dropped = self.transcoder.as_ref().map_or(0, |t| t.stats().dropped);
+        if dropped > plan.dropped_before {
+            self.seats[plan.source].counters.transcode_dropped += 1;
+        }
+    }
+
     /// Build one RTCP Sender Report per reachable seat about the stream it is sent, for NTP
     /// wall-clock `ntp_timestamp` and monotonic `now_micros` (RFC 3550 §6.4.1). The SR carries the
     /// translator's packet and octet counts under its egress SSRC, and an RTP timestamp that sits on
@@ -625,7 +798,6 @@ impl ForwardRoom {
     /// to RTP mapping is consistent. A seat that has sent the room RTP also gets a reception report
     /// block about that stream: loss, jitter, and the LSR/DLSR the seat measures its round trip with.
     pub fn build_reports(&mut self, ntp_timestamp: u64, now_micros: u64, out: &mut Vec<Outbound>) {
-        let now_clock = self.rtp_clock(now_micros);
         let mut buffer = [0u8; rtcp::SENDER_REPORT_LEN + rtcp::RECEPTION_REPORT_LEN];
         for seat in &mut self.seats {
             if !seat.reachable() {
@@ -647,6 +819,8 @@ impl ForwardRoom {
             } else {
                 &[]
             };
+            // On the seat's own RTP clock: a cross-codec seat's differs from the room codec's.
+            let now_clock = ticks(now_micros, seat.clock_rate_hz);
             let rtp_timestamp = seat
                 .translator
                 .last_timestamp()
@@ -690,6 +864,79 @@ impl ForwardRoom {
     #[must_use]
     pub fn round_trip_micros(&self, tag: &str) -> Option<u64> {
         self.seats[self.index_of(tag)?].stats.rtt_micros()
+    }
+}
+
+/// The room-codec payload of an RTP packet, empty when it does not parse.
+fn payload_of(packet: &[u8]) -> &[u8] {
+    RtpPacket::parse(packet).map_or(&[], |parsed| parsed.payload)
+}
+
+/// Decide what `receiver` is sent for the armed `plan`, and under which payload type, preparing the
+/// transcoder's output when the receiver is in another codec group than the source. `None` skips it.
+///
+/// * A seat in the room codec reads the room-domain packet (the source's own, or a cross-codec
+///   source's transcoded one).
+/// * A cross-codec seat in the source's own codec group reads the source's packet as it arrived: the
+///   payload format is the same, so there is nothing to transcode.
+/// * Any other cross-codec seat reads its group's encode of the audio (see [`super::transcode`]).
+fn select_feed(
+    plan: &Plan,
+    receiver: &Seat,
+    original: &[u8],
+    transcoder: &mut Option<Transcoder>,
+) -> Option<(Feed, u8)> {
+    let group = receiver.cross.as_ref().map(SeatLeg::group);
+    let room_codec_feed = match plan.domain_len {
+        Some(length) => Feed::Domain(length),
+        None => Feed::Original,
+    };
+    let Some(group) = group else {
+        return match plan.kind {
+            PlanKind::Audio => Some((room_codec_feed, receiver.audio_payload_type)),
+            PlanKind::Event { domain_rate, .. } => {
+                let event = receiver
+                    .telephone_event
+                    .filter(|event| event.clock_rate_hz == domain_rate)?;
+                Some((room_codec_feed, event.payload_type))
+            }
+        };
+    };
+    if plan.source_group == Some(group) {
+        return match plan.kind {
+            PlanKind::Audio => Some((Feed::Original, receiver.audio_payload_type)),
+            PlanKind::Event { original_rate, .. } => {
+                let event = receiver
+                    .telephone_event
+                    .filter(|event| event.clock_rate_hz == original_rate)?;
+                Some((Feed::Original, event.payload_type))
+            }
+        };
+    }
+    let transcoder = transcoder.as_mut()?;
+    match plan.kind {
+        PlanKind::Audio => {
+            if !transcoder.prepare_group(group, || payload_of(original)) {
+                return None;
+            }
+            let length = transcoder.synthesize_audio(group, plan.point, receiver.clock_rate_hz)?;
+            Some((Feed::Synthesized(length), receiver.audio_payload_type))
+        }
+        PlanKind::Event { domain_rate, .. } => {
+            let event = receiver.telephone_event?;
+            let source = match plan.domain_len {
+                Some(length) => EventSource::Domain(length),
+                None => EventSource::Original(payload_of(original)),
+            };
+            let length = transcoder.synthesize_event(
+                plan.point,
+                source,
+                domain_rate,
+                event.clock_rate_hz,
+                receiver.clock_rate_hz,
+            )?;
+            Some((Feed::Synthesized(length), event.payload_type))
+        }
     }
 }
 

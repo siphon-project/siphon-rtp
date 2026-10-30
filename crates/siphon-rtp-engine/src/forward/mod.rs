@@ -9,12 +9,15 @@
 //!
 //! * [`codec`]: the room's one codec and which offered codecs may join it.
 //! * [`room`]: the synchronous core (seats, source, fan-out, reports). No sockets, no clock.
+//! * [`transcode`]: seats in another codec than the room's (decode once, encode once per codec
+//!   group).
 //! * [`registry`]: the actor that owns a core, its mailbox, and the registry the redirect
 //!   dispatcher and the engine verbs go through.
 
 pub mod codec;
 pub mod registry;
 pub mod room;
+mod transcode;
 
 pub use codec::RoomCodec;
 pub use registry::{ForwardControl, ForwardRefusal, ForwardRegistry};
@@ -22,3 +25,4 @@ pub use room::{
     AppRequest, AppSendError, AppTarget, FloorConfig, ForwardError, ForwardRoom, ForwardSeatConfig,
     ForwardSeatStats, MAX_SEATS,
 };
+pub use transcode::TranscodeStats;
