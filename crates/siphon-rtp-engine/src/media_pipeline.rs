@@ -45,8 +45,9 @@ use siphon_rtp_media::player::PcmPlayer;
 use siphon_rtp_media::repacketize::Repacketizer;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
 use siphon_rtp_media::tone::{ToneGenerator, ToneSpec};
-use siphon_rtp_proto::{Event, PlayEndReason, ProfileFlags};
+use siphon_rtp_proto::{Event, PlayEndReason, ProfileFlags, RtcpAppStream};
 
+use crate::app_events::{surface_app_packets, AppEventQueue, AppScope};
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
@@ -273,7 +274,17 @@ pub(crate) fn validate_echo_delay_search_ms(profile: &ProfileFlags) -> Result<()
 pub(crate) fn validate_profile(profile: &ProfileFlags) -> Result<(), String> {
     validate_echo_delay_search_ms(profile)?;
     crate::engine::validate_sip_call_id(profile)?;
+    validate_floor_fmtp(profile)?;
     validate_fax_passthrough(profile)
+}
+
+/// The controller's `floor_fmtp` is written into an SDP line verbatim, so a line break in it would
+/// write lines of its own: refused before anything is allocated.
+fn validate_floor_fmtp(profile: &ProfileFlags) -> Result<(), String> {
+    match &profile.floor_fmtp {
+        Some(fmtp) => crate::sdp::validate_floor_fmtp(fmtp).map_err(|error| error.to_string()),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn validate_fax_passthrough(profile: &ProfileFlags) -> Result<(), String> {
@@ -2127,6 +2138,18 @@ impl Direction {
                 self.egress_dst,
                 data,
             );
+            // RTCP APP parts (a client's floor control in its audio RTCP, 3GPP TS 24.380 §8) go to
+            // the controller. The compound is then relayed exactly as before: this reads it, it
+            // does not consume it.
+            surface_app_packets(
+                AppScope::Call(leg_meta.call_id),
+                leg_meta.near_tag,
+                RtcpAppStream::Audio,
+                data,
+                &mut 0,
+                &mut 0,
+                |event| events.push(event),
+            );
         }
 
         // Relay-only (promoted passthrough): forward the ingress RTP verbatim to the peer — no
@@ -2779,6 +2802,9 @@ pub struct MediaCall {
     /// bounded `try_send` per captured packet, and dropping under backpressure keeps recording from
     /// ever stalling the media path.
     capture: Option<PcapCapture>,
+    /// The owning controller's `rtcp_app` queue, for APP packets read out of either party's audio
+    /// RTCP. `None` outside the engine (unit tests build a bare `MediaCall`).
+    app_events: Option<AppEventQueue>,
 }
 
 /// The sink + per-leg engine-local addresses for an active raw-RTP pcap capture. The local address
@@ -2794,6 +2820,13 @@ pub struct PcapCapture {
 }
 
 impl MediaCall {
+    /// Deliver the RTCP APP packets of either party's audio RTCP to `queue`.
+    #[must_use]
+    pub fn with_app_events(mut self, queue: Option<AppEventQueue>) -> Self {
+        self.app_events = queue;
+        self
+    }
+
     /// Install the call's shared SDES-SRTP leg for a **secure + transcoding** topology: the *far*
     /// party (B) is the secure (`RTP/SAVP`) peer, A is plaintext. The A→B egress is encrypted and the
     /// B→A ingress is decrypted against the one shared [`SecureLeg`] (single-owner actor ⇒ the `Mutex`
@@ -3038,6 +3071,7 @@ impl MediaCall {
             echo: false,
             rtcp: Vec::new(),
             capture: None,
+            app_events: None,
         }
     }
 
@@ -3086,6 +3120,7 @@ impl MediaCall {
             echo: false,
             rtcp: Vec::new(),
             capture: None,
+            app_events: None,
         }
     }
 
@@ -4441,6 +4476,7 @@ async fn run_media_call<D>(
 ) where
     D: Datapath,
 {
+    let app_events = call.app_events.clone();
     let mut outbound = Vec::new();
     let mut emitted = Vec::new();
     // The playout clock drives injected prompts / DTMF (PlayMedia / PlayDtmf). It runs always but is
@@ -4472,7 +4508,7 @@ async fn run_media_call<D>(
                         call.process(&packet, &mut outbound, &mut emitted)
                             .record(&datapath, packet.endpoint);
                         send_all(&datapath, &mut outbound).await;
-                        emit_events(&mut emitted, &events);
+                        emit_events(&mut emitted, &events, &app_events);
                     }
                     MediaInput::Control(MediaControl::Silence(on)) => call.set_silenced(on),
                     MediaInput::Control(MediaControl::Block(on)) => call.set_blocked(on),
@@ -4527,7 +4563,7 @@ async fn run_media_call<D>(
                         if let Some(reply) = reply {
                             let _ = reply.send(started);
                         }
-                        emit_events(&mut emitted, &events);
+                        emit_events(&mut emitted, &events, &app_events);
                     }
                     MediaInput::Control(MediaControl::PlayDtmf { toward_a, digits, duration_ms, volume, pause_ms, reply }) => {
                         let outcome = call.start_play_dtmf(toward_a, &digits, duration_ms, volume, pause_ms);
@@ -4537,13 +4573,13 @@ async fn run_media_call<D>(
                         // An explicit stop ends every prompt and overlay with `PlayFinished{Stopped}`.
                         emitted.clear();
                         call.stop_play(&mut emitted);
-                        emit_events(&mut emitted, &events);
+                        emit_events(&mut emitted, &events, &app_events);
                     }
                     MediaInput::Control(MediaControl::StopPlayId { play_id, reply }) => {
                         emitted.clear();
                         let stopped = call.stop_play_id(play_id, &mut emitted);
                         let _ = reply.send(stopped);
-                        emit_events(&mut emitted, &events);
+                        emit_events(&mut emitted, &events, &app_events);
                     }
                     MediaInput::Control(MediaControl::SetPlayGain { play_id, gain, reply }) => {
                         let _ = reply.send(call.set_play_gain(play_id, gain));
@@ -4615,7 +4651,7 @@ async fn run_media_call<D>(
                     // comfort-idle single-leg leg emits its continuous comfort-noise frame.
                     call.tick(&mut outbound, &mut emitted);
                     send_all(&datapath, &mut outbound).await;
-                    emit_events(&mut emitted, &events);
+                    emit_events(&mut emitted, &events, &app_events);
                 }
                 // Periodic per-leg quality estimate (jitter/loss/MOS) on the control channel, so SIPhon
                 // sees live 2-party (relay/transcode) call quality without parsing RTCP itself — the
@@ -4627,7 +4663,7 @@ async fn run_media_call<D>(
                     call.accumulate_quality(elapsed_ms);
                     emitted.clear();
                     call.build_quality_events(&mut emitted);
-                    emit_events(&mut emitted, &events);
+                    emit_events(&mut emitted, &events, &app_events);
                 }
             }
         }
@@ -4637,7 +4673,7 @@ async fn run_media_call<D>(
     // its own fallback timeout, since a hard task-abort may pre-empt this teardown.
     emitted.clear();
     call.finish_pending_plays(&mut emitted);
-    emit_events(&mut emitted, &events);
+    emit_events(&mut emitted, &events, &app_events);
 }
 
 /// RFC 5761 demux: a datagram whose second byte's payload-type field is in `64..=95` is RTCP (never a
@@ -4649,8 +4685,22 @@ fn is_rtcp_datagram(data: &[u8]) -> bool {
 /// Push every queued control event to the owner's per-client sink, draining the buffer. A full or
 /// closed sink drops the event (best-effort, never blocks the actor) — the same posture the per-packet
 /// path takes for `Event::Dtmf`.
-fn emit_events(emitted: &mut Vec<Event>, sink: &Option<flume::Sender<Event>>) {
+fn emit_events(
+    emitted: &mut Vec<Event>,
+    sink: &Option<flume::Sender<Event>>,
+    app_events: &Option<AppEventQueue>,
+) {
     for event in emitted.drain(..) {
+        // An RTCP APP event may carry a floor message, so it goes to the controller's APP queue,
+        // which sheds its oldest on overflow loudly, not to the lossy ordinary one.
+        if matches!(event, Event::RtcpApp { .. }) {
+            if let Some(queue) = app_events {
+                queue.push(event);
+            } else {
+                tracing::warn!("RTCP APP event with no controller queue to deliver it to");
+            }
+            continue;
+        }
         if let Some(sink) = sink {
             if sink.try_send(event).is_err() {
                 tracing::debug!("media-pipeline event dropped (sink full or closed)");
@@ -5720,6 +5770,78 @@ mod tests {
             "the relayed SR must arrive under the SSRC A receives media from, not the far party's \
              ({B_SSRC:#010x}) — a conforming A keys LSR per source SSRC, so relaying it verbatim \
              leaves it reporting LSR = 0 for the only stream it actually has"
+        );
+    }
+
+    /// An APP part in a party's audio RTCP compound (3GPP TS 24.380 §8) reaches the controller as
+    /// `rtcp_app` on the audio stream, in order, and the compound is relayed to the other party
+    /// exactly as the SSRC rewrite always left it.
+    #[test]
+    fn app_in_a_relayed_audio_rtcp_compound_is_reported_and_still_relayed() {
+        let mut call = ulaw_alaw_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut compound = [0u8; 128];
+        let mut length = siphon_rtp_media::rtcp::write_sender_report(
+            0xBBBB_BBBB,
+            0xABCD_1234_5678_9ABC,
+            0,
+            0,
+            0,
+            &[],
+            &mut compound,
+        )
+        .expect("write SR");
+        for subtype in [3u8, 4] {
+            length += siphon_rtp_media::rtcp::write_app(
+                subtype,
+                0xBBBB_BBBB,
+                *b"MCPT",
+                &[0, 0, 0, subtype],
+                &mut compound[length..],
+            )
+            .expect("write APP");
+        }
+        call.process(
+            &rx_at(2, B_ADDR, 1_000_000, compound[..length].to_vec()),
+            &mut out,
+            &mut events,
+        );
+        let apps: Vec<(u8, RtcpAppStream)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::RtcpApp {
+                    subtype, stream, ..
+                } => Some((*subtype, *stream)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            apps,
+            [(3, RtcpAppStream::Audio), (4, RtcpAppStream::Audio)],
+            "one event per APP packet, in order"
+        );
+        let Some(Event::RtcpApp {
+            call_id, from_tag, ..
+        }) = events.first()
+        else {
+            panic!("an rtcp_app event");
+        };
+        assert_eq!(call_id.as_deref(), Some(call.call_id.as_str()));
+        assert_eq!(from_tag, call.to_tag.as_deref().unwrap_or(&call.from_tag));
+        let relayed = out
+            .iter()
+            .find(|packet| {
+                siphon_rtp_media::rtcp::demux(&packet.data)
+                    == Some(siphon_rtp_media::rtcp::MuxKind::Rtcp)
+            })
+            .expect("the compound is still relayed to the other party");
+        assert_eq!(
+            siphon_rtp_media::rtcp::app_packets(&relayed.data)
+                .filter(Result::is_ok)
+                .count(),
+            2,
+            "the APP parts travel on with the compound"
         );
     }
 

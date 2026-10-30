@@ -759,6 +759,96 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recording_id: Option<String>,
     },
+    /// Seat a member in a **forwarding room** (or create the room on first join), answering its SDP.
+    ///
+    /// A forwarding room is for push-to-talk (3GPP TS 24.379 group calls): instead of mixing, it
+    /// forwards the one source chosen by [`Command::ForwardSetSource`] to every other seat, its
+    /// payload copied unchanged, each seat on its own SSRC with sequence numbers and timestamps kept
+    /// continuous across source changes (an RTP translator, RFC 3550 §7). The first seat fixes the
+    /// room's codec; a seat that offers neither it nor a codec the engine can transcode it to is
+    /// refused with the reason. An offered `m=application <port> udp MCPTT` floor-control stream
+    /// (TS 24.380) is anchored and its RTCP APP packets go to the controller as
+    /// [`Event::RtcpApp`]; see [`ProfileFlags::floor_fmtp`] for its answer attributes.
+    ///
+    /// A seat is never freed for silence: a listener sends nothing for as long as others talk.
+    /// [`Event::ForwardSeatInactive`] reports one that has gone quiet; the controller decides.
+    /// Like every room verb it takes no `scope`: put the function in the `conference_id`.
+    ForwardJoin {
+        conference_id: String,
+        from_tag: String,
+        sdp: String,
+        #[serde(default)]
+        profile: ProfileFlags,
+    },
+    /// Offer a **new seat** in a forwarding room for a member the room calls out to (a group call's
+    /// fan-out), as [`Command::ConferenceOffer`] does for a mixing room. The engine answers with an
+    /// SDP offer in the room's codec (or, for the first seat, every codec it can forward), plus a
+    /// floor-control stream when [`ProfileFlags::floor_fmtp`] is set. The seat stays pending until
+    /// [`Command::ForwardAnswer`].
+    ForwardOffer {
+        conference_id: String,
+        from_tag: String,
+        #[serde(default)]
+        profile: ProfileFlags,
+    },
+    /// The member's answer to a [`Command::ForwardOffer`]: seats it as [`Command::ForwardJoin`]
+    /// would have. `received_from` is the post-NAT source IP, as on [`Command::ConferenceAnswer`].
+    ForwardAnswer {
+        conference_id: String,
+        from_tag: String,
+        sdp: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        received_from: Option<std::net::IpAddr>,
+    },
+    /// Unseat a member of a forwarding room. The room ends with its last member. If the member was
+    /// the source, the room forwards nothing until the next [`Command::ForwardSetSource`].
+    ForwardLeave {
+        conference_id: String,
+        from_tag: String,
+    },
+    /// Choose whose audio a forwarding room forwards: the seat `from_tag`, or nobody when `None`.
+    /// Takes effect on the next packet received; [`Event::ForwardSourceStarted`] reports the first
+    /// packet the new source sends. Packets from any other seat are counted and dropped.
+    ForwardSetSource {
+        conference_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_tag: Option<String>,
+    },
+    /// Send one RTCP APP packet (RFC 3550 §6.7), such as a TS 24.380 floor control message, to one
+    /// party, or to every seat of a forwarding room.
+    ///
+    /// Address a two-party call with `call_id` + `from_tag` (the leg the packet goes to; `scope`
+    /// applies), or a forwarding room with `conference_id` (no `scope`) and either `from_tag` for one
+    /// seat or no `from_tag` for every seat but those in `except_from_tags`. Naming both or neither
+    /// of `call_id` and `conference_id` is refused. The engine builds the packet from `name`,
+    /// `subtype` and `payload` and replies `ok` once it is on the wire, or once every addressed seat's
+    /// copy is.
+    SendRtcpApp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_tag: Option<String>,
+        /// Seats a room-wide send skips (the talker, for a Floor Taken). Only with `conference_id`
+        /// and no `from_tag`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        except_from_tags: Vec<String>,
+        stream: RtcpAppStream,
+        /// SSRC written into the packet. `None`: the engine's own SSRC toward that party, which
+        /// differs per seat. TS 24.380 §8.1.2 wants the SSRC the receiving party learnt at session
+        /// establishment, which is the engine's unless the controller signalled another.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssrc: Option<u32>,
+        /// Four ASCII characters, e.g. `MCPT` (TS 24.380 §8.1.2).
+        name: String,
+        /// The 5-bit subtype, the TS 24.380 acknowledgement bit included.
+        subtype: u8,
+        /// The application-dependent data after the name, base64 (RFC 4648 §4) on the wire. A
+        /// multiple of four bytes (RFC 3550 §6.7); the engine does not pad it.
+        #[serde(with = "base64::strict")]
+        payload: Vec<u8>,
+    },
     /// Attach a **WebSocket tee** to a live call: stream its decoded audio to `ws_uri` while the call
     /// keeps relaying. Unlike `ProfileFlags::ws_uri` (takeover — the WS server *becomes* leg A's far
     /// side and A↔B is not wired), a tee is send-only and additive: the relay/transcode path, any
@@ -1119,6 +1209,21 @@ pub enum ConferenceRole {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         whisper_target: Option<String>,
     },
+}
+
+/// Which of a party's streams an RTCP APP packet travels on ([`Command::SendRtcpApp`],
+/// [`Event::RtcpApp`]).
+///
+/// Deliberately **not** `#[non_exhaustive]`: a controller sending on a stream the engine reads as
+/// some other stream would put floor control where the client does not listen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RtcpAppStream {
+    /// The floor-control stream: `m=application <port> udp MCPTT` (3GPP TS 24.380), or a WebRTC
+    /// seat's floor data channel.
+    Floor,
+    /// The audio stream's RTCP, which some clients use for APP packets too.
+    Audio,
 }
 
 /// The direction(s) audio flows across a conference bridge ([`Command::ConferenceBridge`]).
@@ -1653,10 +1758,22 @@ pub struct ProfileFlags {
     /// `offer`/`answer` for the per-side resolution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rtcp_mux: Vec<String>,
+    /// The parameters of the `a=fmtp:MCPTT` line the engine puts on an anchored floor-control
+    /// stream (`m=application <port> udp MCPTT`, 3GPP TS 24.380 §14, SDP per TS 24.379), e.g.
+    /// `mc_queueing;mc_priority=5;mc_granted;mc_implicit_request`. Emitted exactly as given, never
+    /// edited: the floor-control server's capabilities are the controller's to declare. `None`
+    /// answers the floor stream with no fmtp line; on a `forward_offer` it also leaves the floor
+    /// stream out of the offer. A line break inside is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_fmtp: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// A response to a [`Request`], correlated by [`Response::id`].
@@ -1735,6 +1852,10 @@ pub struct EngineStatistics {
     pub control_errors_total: u64,
     /// Live calls currently in the session registry (a gauge, not a running total).
     pub sessions: u64,
+    /// `rtcp_app` events dropped (oldest first) because a controller's APP queue was full. Zero
+    /// is omitted from the wire. A floor message lost here is a real loss: alert on any increase.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rtcp_app_dropped_total: u64,
 }
 
 /// This engine's live load, returned by [`Command::Load`] — the cluster-placement view a SIP media
@@ -2099,6 +2220,39 @@ pub enum Event {
         conference_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_tag: Option<String>,
+    },
+    /// One RTCP APP packet (RFC 3550 §6.7) received from a party, such as a TS 24.380 floor
+    /// request. Pushed as soon as it is read, in arrival order per party; a datagram holding several
+    /// APP packets (TS 24.380 §8.1.1) or a compound with APP parts raises one event per APP packet.
+    /// Reports stay with the engine. Carries `call_id` for a two-party call or `conference_id` for a
+    /// forwarding-room seat, never both.
+    RtcpApp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
+        from_tag: String,
+        stream: RtcpAppStream,
+        ssrc: u32,
+        /// The 4-octet name (`MCPT`, `MCPC`, ...). Octets outside ASCII are replaced by `?`.
+        name: String,
+        /// The 5-bit subtype, the TS 24.380 acknowledgement bit included.
+        subtype: u8,
+        /// The application-dependent data after the name, padding removed, base64 on the wire.
+        #[serde(with = "base64::strict")]
+        payload: Vec<u8>,
+    },
+    /// The first packet from a forwarding room's new source after [`Command::ForwardSetSource`]
+    /// arrived and is being forwarded. Once per source change.
+    ForwardSourceStarted {
+        conference_id: String,
+        from_tag: String,
+    },
+    /// A forwarding-room seat has received nothing (no RTP, RTCP or floor control) for the media
+    /// timeout. The seat stays seated; raised again only after it has been heard from in between.
+    ForwardSeatInactive {
+        conference_id: String,
+        from_tag: String,
     },
     /// Periodic per-leg reception-quality estimate (RFC 3550 RTCP statistics + ITU-T G.107 MOS), so
     /// SIPhon surfaces live call quality without parsing RTCP itself. Emitted every few seconds for
@@ -3653,6 +3807,209 @@ mod tests {
     }
 
     #[test]
+    fn forward_join_wire_shape_with_a_floor_fmtp() {
+        let request = Request {
+            id: 11,
+            command: Command::ForwardJoin {
+                conference_id: "group-1".into(),
+                from_tag: "a7c31f".into(),
+                sdp: "v=0\r\n".into(),
+                profile: ProfileFlags {
+                    floor_fmtp: Some("mc_queueing;mc_priority=5;mc_granted".into()),
+                    ..Default::default()
+                },
+            },
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"id":11,"command":"forward_join","conference_id":"group-1","from_tag":"a7c31f","sdp":"v=0\r\n","profile":{"floor_fmtp":"mc_queueing;mc_priority=5;mc_granted"}}"#
+        );
+        roundtrip(&request);
+        let bare = r#"{"command":"forward_join","conference_id":"g","from_tag":"f","sdp":"v=0"}"#;
+        assert!(matches!(
+            serde_json::from_str::<Command>(bare).expect("deserialize"),
+            Command::ForwardJoin { profile, .. } if profile == ProfileFlags::default()
+        ));
+    }
+
+    #[test]
+    fn forward_offer_answer_and_leave_wire_shapes() {
+        let offer = Request {
+            id: 12,
+            command: Command::ForwardOffer {
+                conference_id: "group-1".into(),
+                from_tag: "b19e02".into(),
+                profile: ProfileFlags::default(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&offer).expect("serialize"),
+            r#"{"id":12,"command":"forward_offer","conference_id":"group-1","from_tag":"b19e02","profile":{}}"#
+        );
+        roundtrip(&offer);
+        let answer = Request {
+            id: 13,
+            command: Command::ForwardAnswer {
+                conference_id: "group-1".into(),
+                from_tag: "b19e02".into(),
+                sdp: "v=0\r\n".into(),
+                received_from: Some("203.0.113.9".parse().expect("ip")),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&answer).expect("serialize"),
+            r#"{"id":13,"command":"forward_answer","conference_id":"group-1","from_tag":"b19e02","sdp":"v=0\r\n","received_from":"203.0.113.9"}"#
+        );
+        roundtrip(&answer);
+        let leave = Request {
+            id: 14,
+            command: Command::ForwardLeave {
+                conference_id: "group-1".into(),
+                from_tag: "b19e02".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&leave).expect("serialize"),
+            r#"{"id":14,"command":"forward_leave","conference_id":"group-1","from_tag":"b19e02"}"#
+        );
+        roundtrip(&leave);
+    }
+
+    #[test]
+    fn forward_set_source_names_a_seat_or_nobody() {
+        let set = Request {
+            id: 15,
+            command: Command::ForwardSetSource {
+                conference_id: "group-1".into(),
+                from_tag: Some("a7c31f".into()),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&set).expect("serialize"),
+            r#"{"id":15,"command":"forward_set_source","conference_id":"group-1","from_tag":"a7c31f"}"#
+        );
+        roundtrip(&set);
+        for nobody in [
+            r#"{"command":"forward_set_source","conference_id":"group-1"}"#,
+            r#"{"command":"forward_set_source","conference_id":"group-1","from_tag":null}"#,
+        ] {
+            assert!(matches!(
+                serde_json::from_str::<Command>(nobody).expect("deserialize"),
+                Command::ForwardSetSource { from_tag: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn send_rtcp_app_to_a_room_except_the_talker() {
+        // Floor Taken (TS 24.380 §8.2.9) to every seat but the talker; payload bytes base64.
+        let request = Request {
+            id: 16,
+            command: Command::SendRtcpApp {
+                call_id: None,
+                conference_id: Some("group-1".into()),
+                from_tag: None,
+                except_from_tags: vec!["a7c31f".into()],
+                stream: RtcpAppStream::Floor,
+                ssrc: None,
+                name: "MCPT".into(),
+                subtype: 2,
+                payload: vec![0x00, 0x02, 0x05, 0x00],
+            },
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"id":16,"command":"send_rtcp_app","conference_id":"group-1","except_from_tags":["a7c31f"],"stream":"floor","name":"MCPT","subtype":2,"payload":"AAIFAA=="}"#
+        );
+        roundtrip(&request);
+    }
+
+    #[test]
+    fn send_rtcp_app_to_one_leg_of_a_call() {
+        let request = Request {
+            id: 17,
+            command: Command::SendRtcpApp {
+                call_id: Some("7f9a2b1c@192.0.2.20".into()),
+                conference_id: None,
+                from_tag: Some("a7c31f".into()),
+                except_from_tags: Vec::new(),
+                stream: RtcpAppStream::Audio,
+                ssrc: Some(0xAABB_CCDD),
+                name: "MCPT".into(),
+                subtype: 17,
+                payload: Vec::new(),
+            },
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"id":17,"command":"send_rtcp_app","call_id":"7f9a2b1c@192.0.2.20","from_tag":"a7c31f","stream":"audio","ssrc":2864434397,"name":"MCPT","subtype":17,"payload":""}"#
+        );
+        roundtrip(&request);
+    }
+
+    #[test]
+    fn send_rtcp_app_refuses_a_payload_that_is_not_base64() {
+        for bad in [
+            r#"{"command":"send_rtcp_app","call_id":"c","from_tag":"f","stream":"floor","name":"MCPT","subtype":0,"payload":"AAIFAA"}"#,
+            r#"{"command":"send_rtcp_app","call_id":"c","from_tag":"f","stream":"floor","name":"MCPT","subtype":0,"payload":[0,2,5,0]}"#,
+            r#"{"command":"send_rtcp_app","call_id":"c","from_tag":"f","stream":"video","name":"MCPT","subtype":0,"payload":""}"#,
+        ] {
+            assert!(serde_json::from_str::<Command>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rtcp_app_event_wire_shape() {
+        let event = Event::RtcpApp {
+            call_id: None,
+            conference_id: Some("group-1".into()),
+            from_tag: "a7c31f".into(),
+            stream: RtcpAppStream::Floor,
+            ssrc: 0x1122_3344,
+            name: "MCPT".into(),
+            subtype: 0,
+            payload: vec![0x00, 0x02, 0x05, 0x00],
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"event":"rtcp_app","conference_id":"group-1","from_tag":"a7c31f","stream":"floor","ssrc":287454020,"name":"MCPT","subtype":0,"payload":"AAIFAA=="}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Event>(&json).expect("deserialize"),
+            event
+        );
+    }
+
+    #[test]
+    fn forward_room_events_wire_shapes() {
+        let started = Event::ForwardSourceStarted {
+            conference_id: "group-1".into(),
+            from_tag: "a7c31f".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&started).expect("serialize"),
+            r#"{"event":"forward_source_started","conference_id":"group-1","from_tag":"a7c31f"}"#
+        );
+        let inactive = Event::ForwardSeatInactive {
+            conference_id: "group-1".into(),
+            from_tag: "b19e02".into(),
+        };
+        let json = serde_json::to_string(&inactive).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"event":"forward_seat_inactive","conference_id":"group-1","from_tag":"b19e02"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Event>(&json).expect("deserialize"),
+            inactive
+        );
+    }
+
+    #[test]
     fn conference_offer_wire_shape_and_defaults() {
         let json = r#"{"command":"conference_offer","conference_id":"room-1","from_tag":"carol"}"#;
         match serde_json::from_str::<Command>(json).expect("deserialize") {
@@ -4266,6 +4623,7 @@ mod tests {
                     deletes_total: 8,
                     control_errors_total: 1,
                     sessions: 2,
+                    rtcp_app_dropped_total: 0,
                 },
             },
         });

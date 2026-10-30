@@ -214,6 +214,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text_remote_rtp: None,
             image: None,
             image_remote: None,
+            floor: None,
+            floor_remote: None,
         };
         let far_sdp =
             match far_offer_sdp(&offer_sdp, &info, &far, far_mux, &codec, profile, call_id) {
@@ -479,6 +481,7 @@ fn far_offer_sdp(
         },
         // A plain caller only (`far_offer_refusal`), so the transport passes through as RTP/AVP.
         security: None,
+        floor: far.floor_rewrite(None),
         mux_override: (!profile.rtcp_mux.is_empty()).then_some(far_mux),
         text: if info.text.is_some() {
             TextRewrite::Decline

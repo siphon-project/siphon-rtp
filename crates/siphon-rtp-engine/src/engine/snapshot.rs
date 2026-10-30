@@ -286,7 +286,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // (the peer's SDES key, plus the endpoint roles the bridge query maps its flow ids through).
         let Some((snapshot, secure_ctx, refusal)) = self.owned_call(client, call_id, |call| {
             let snapshot = call.to_snapshot();
-            let refusal = call.pipeline.checkpoint_refusal();
+            // An MCPTT floor stream is terminated on engine endpoints whose gate, learned reply
+            // address and engine SSRC are not in the snapshot record, so a standby would resume the
+            // call with the floor stream silently gone. Refused, named, rather than restored without it.
+            let has_floor =
+                call.near.floor.is_some() || call.far.is_some_and(|far| far.floor.is_some());
+            let refusal = call.pipeline.checkpoint_refusal().or_else(|| {
+                has_floor.then_some(
+                    "the MCPTT floor stream is terminated on the engine and is not carried in \
+                     the snapshot record, so a standby would resume the call without it",
+                )
+            });
             let secure_ctx = call
                 .far_remote_crypto
                 .as_ref()
@@ -517,6 +527,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // that uses it.
             image: None,
             image_remote: None,
+            floor: None,
+            floor_remote: None,
         };
         let far = Leg {
             rtp: far_rtp,
@@ -532,6 +544,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text_remote_rtp: None,
             image: None,
             image_remote: None,
+            floor: None,
+            floor_remote: None,
         };
 
         // Install the datapath flows and resolve the crypto per pipeline.

@@ -33,6 +33,8 @@ pub(super) struct LegPresentation<'a> {
     pub(super) text: TextRewrite,
     /// The leg's T.38 fax stream.
     pub(super) image: ImageRewrite,
+    /// The leg's MCPTT floor-control stream.
+    pub(super) floor: sdp::FloorRewrite<'a>,
     /// Which audio codecs the party is shown.
     pub(super) codec: CodecPresentation<'a>,
 }
@@ -73,6 +75,7 @@ pub(super) fn present_leg(
         presentation.image,
     )?
     .sdp;
+    presented = presentation.floor.apply(&presented);
     match presentation.codec {
         CodecPresentation::AsReceived => {}
         CodecPresentation::Policy(policy) => {

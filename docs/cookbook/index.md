@@ -17,6 +17,7 @@ in the shipped engine.
 | [Voice-AI streaming](voice-ai.md) | Bridge a call leg to a WebSocket media server: decode to L16 uplink, encode the downlink |
 | [Announcements, ringback & hold music](playback.md) | Prompts, call-progress tones and overlay playback: supersede or mix under the live stream, per-playback gain, WAV from a file, a blob or a URL |
 | [Conferencing](conferencing.md) | N-party mixed audio rooms (MCU): roles, active speaker, whisper/monitor, room bridging |
+| [Forwarding rooms](forwarding.md) | Push-to-talk group calls (3GPP TS 24.379): one source forwarded to every seat, no mixing, up to 1000 seats |
 | [NAT traversal & latching](nat.md) | Symmetric RTP done safely: gated latching, `received-from`, SDP address rewrite, hairpinning |
 | [Recording](recording.md) | Runtime pcap recording, `record-call` WAV capture, SIPREC media forking (RFC 7865/7866) |
 | [Monitoring](monitoring.md) | Prometheus `/metrics`, the `statistics`/`load` verbs, RTCP-derived MOS, HEP/Homer export |

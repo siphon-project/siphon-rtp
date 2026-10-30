@@ -854,6 +854,57 @@ async fn conference_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usiz
     }
 }
 
+/// Churn one forwarding room through `join ×3 → set_source → set_source(None) → leave ×3` (the last
+/// leave ends the room actor and frees its endpoints), with the seat codec negotiated from an AMR-WB
+/// offer the build cannot transcode.
+async fn forward_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let conference_id = format!("soak-forward-{index}");
+    let amr_wb_sdp = |port: u16| {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 198.51.100.1\r\ns=-\r\nc=IN IP4 198.51.100.1\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n"
+        )
+    };
+    for participant in 0..3 {
+        let join = engine
+            .handle(
+                CLIENT,
+                Command::ForwardJoin {
+                    conference_id: conference_id.clone(),
+                    from_tag: format!("p{participant}"),
+                    sdp: amr_wb_sdp(40_000 + participant as u16),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert_ok(&join, "forward_join");
+    }
+    for source in [Some("p1".to_string()), None] {
+        let chosen = engine
+            .handle(
+                CLIENT,
+                Command::ForwardSetSource {
+                    conference_id: conference_id.clone(),
+                    from_tag: source,
+                },
+            )
+            .await;
+        assert_ok(&chosen, "forward_set_source");
+    }
+    for participant in 0..3 {
+        let leave = engine
+            .handle(
+                CLIENT,
+                Command::ForwardLeave {
+                    conference_id: conference_id.clone(),
+                    from_tag: format!("p{participant}"),
+                },
+            )
+            .await;
+        assert_ok(&leave, "forward_leave");
+    }
+}
+
 /// Churn the conference dial-out verbs through every way an offered seat ends: answered and seated
 /// beside a joined participant, bridged to a second room and unbridged, then left; left while still
 /// pending; and refused on its answer. The pending-seat store, the bridge records and the rooms must
@@ -1306,6 +1357,36 @@ async fn conference_join_leave_does_not_leak() {
             engine.conference().room_count(),
             0,
             "rooms drained after every segment"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forward_join_leave_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    // Each cycle spawns a forwarding room actor and three seats (a translator and an endpoint each)
+    // and frees them all on leave.
+    let mut gate = LeakGate::new("forwarding rooms", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            forward_join_leave(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.conference().forward().room_count(),
+            0,
+            "forwarding rooms drained after every segment"
+        );
+        assert_eq!(
+            engine.conference().forward().seat_count(),
+            0,
+            "forwarding seats drained"
         );
         gate.sample().await;
     }

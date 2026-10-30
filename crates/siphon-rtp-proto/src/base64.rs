@@ -114,6 +114,23 @@ pub fn decode(input: &str) -> Result<Vec<u8>, Base64Error> {
     Ok(output)
 }
 
+/// Serde for a binary field that is base64 and only base64 on the wire: written as base64, read
+/// from a base64 string, refused otherwise.
+pub(crate) mod strict {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(crate) fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&super::encode(data))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        super::decode(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Serde for [`PlayMediaSource::Blob`]'s bytes: written as base64, read from base64, the legacy array
 /// of byte values, or a native byte string from a binary format.
 pub(crate) mod blob_data {

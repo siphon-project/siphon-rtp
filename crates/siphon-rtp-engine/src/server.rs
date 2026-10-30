@@ -103,10 +103,19 @@ struct ConnectionIdentity<D: Datapath + Clone + Send + 'static> {
     /// The stable identity this connection claimed, if it claimed one.
     controller: Option<String>,
     events: flume::Receiver<Event>,
+    /// The client's `rtcp_app` queue, drained beside `events` (see [`crate::app_events`]).
+    app_events: flume::Receiver<Event>,
     evicted: Shutdown,
 }
 
 impl<D: Datapath + Clone + Send + 'static> ConnectionIdentity<D> {
+    /// Point the APP-event receiver at the queue of the client this connection is now registered as.
+    fn refresh_app_events(&mut self) {
+        if let Some(receiver) = self.engine.app_event_receiver(self.client) {
+            self.app_events = receiver;
+        }
+    }
+
     /// Claim the stable identity `controller_id`, re-keying this connection onto the [`ClientId`]
     /// the engine already minted for it (docs/security-and-nat.md §5).
     ///
@@ -131,12 +140,14 @@ impl<D: Datapath + Clone + Send + 'static> ConnectionIdentity<D> {
                 let (generation, events) = self.engine.register_client_generation(self.client);
                 self.generation = generation;
                 self.events = events;
+                self.refresh_app_events();
                 return Err(error);
             }
         };
         self.client = attachment.client;
         self.generation = attachment.generation;
         self.events = attachment.events;
+        self.refresh_app_events();
         self.evicted = attachment.evicted;
         self.controller = Some(controller_id.to_string());
         Ok(())
@@ -176,12 +187,16 @@ where
     // placeholder flag for its whole life, so the flag neither trips nor resolves on a dropped
     // sender. A successful claim replaces the flag with the registry-backed one.
     let (_never_evicted, evicted) = crate::shutdown::channel();
+    let app_events = engine
+        .app_event_receiver(client)
+        .unwrap_or_else(|| flume::bounded(1).1);
     let mut identity = ConnectionIdentity {
         engine: engine.clone(),
         client,
         generation,
         controller: None,
         events,
+        app_events,
         evicted,
     };
     // Split so the inbound-read future and the event/response writes borrow disjoint halves.
@@ -326,26 +341,40 @@ where
                     }
                 }
             }
-            event = identity.events.recv_async() => {
-                if let Ok(event) = event {
-                    // The engine's actors name a call by its key; the wire names it by `call_id`
-                    // with the scope beside it, and an unscoped event is unchanged by this. A held
-                    // lane is named by the key too, so it is looked up before the key is taken out.
-                    let lane = lanes.held_lane(&event);
-                    match frame::encode(&crate::engine::scope::scoped_event(event)) {
-                        Ok(bytes) => {
-                            if let Some(bytes) = lanes.defer_event(lane, bytes) {
-                                write_half.write_all(&bytes).await?;
-                            }
+            event = next_event(&identity.events, &identity.app_events) => {
+                // The engine's actors name a call by its key; the wire names it by `call_id`
+                // with the scope beside it, and an unscoped event is unchanged by this. A held
+                // lane is named by the key too, so it is looked up before the key is taken out.
+                let lane = lanes.held_lane(&event);
+                match frame::encode(&crate::engine::scope::scoped_event(event)) {
+                    Ok(bytes) => {
+                        if let Some(bytes) = lanes.defer_event(lane, bytes) {
+                            write_half.write_all(&bytes).await?;
                         }
-                        Err(error) => tracing::error!(%error, "failed to encode control event"),
                     }
+                    Err(error) => tracing::error!(%error, "failed to encode control event"),
                 }
             }
             _ = refill.tick() => {
                 rate_limiter.refill(1);
             }
         }
+    }
+}
+
+/// The next event for the wire, from the ordinary queue or the APP queue, whichever has one.
+/// Cancellation-safe: both arms are `recv_async`, and a receive that loses the race consumes nothing.
+async fn next_event(events: &flume::Receiver<Event>, app_events: &flume::Receiver<Event>) -> Event {
+    /// A closed queue never yields again; park it rather than spin the loop on its error.
+    async fn receive(queue: &flume::Receiver<Event>) -> Event {
+        match queue.recv_async().await {
+            Ok(event) => event,
+            Err(_) => std::future::pending().await,
+        }
+    }
+    tokio::select! {
+        event = receive(events) => event,
+        event = receive(app_events) => event,
     }
 }
 
@@ -560,5 +589,70 @@ fn auth_ok() -> CmdResult {
         recording_id: None,
         to_tag: None,
         stats: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ordinary(call: &str) -> Event {
+        Event::MediaTimeout {
+            call_id: call.into(),
+            from_tag: "a".into(),
+            conference_id: None,
+            reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
+        }
+    }
+
+    fn app(subtype: u8) -> Event {
+        Event::RtcpApp {
+            call_id: None,
+            conference_id: Some("room".into()),
+            from_tag: "a".into(),
+            stream: siphon_rtp_proto::RtcpAppStream::Floor,
+            ssrc: 1,
+            name: "MCPT".into(),
+            subtype,
+            payload: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_connection_drains_the_app_queue_beside_the_ordinary_one_in_order() {
+        let (ordinary_tx, events) = flume::bounded(8);
+        let (floor, app_events) = flume::bounded(8);
+        floor.send(app(1)).unwrap();
+        floor.send(app(2)).unwrap();
+        ordinary_tx.send(ordinary("call")).unwrap();
+        let mut heard = Vec::new();
+        for _ in 0..3 {
+            heard.push(next_event(&events, &app_events).await);
+        }
+        let subtypes: Vec<u8> = heard
+            .iter()
+            .filter_map(|event| match event {
+                Event::RtcpApp { subtype, .. } => Some(*subtype),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subtypes, [1, 2], "APP events keep their order");
+        assert_eq!(heard.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_closed_queue_parks_instead_of_spinning() {
+        let (_keep_open, events) = flume::bounded::<Event>(1);
+        let (floor, app_events) = flume::bounded::<Event>(1);
+        drop(floor);
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            next_event(&events, &app_events),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "nothing to deliver, and no busy error loop"
+        );
     }
 }

@@ -80,6 +80,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             b_to_a,
             layout.latch,
         );
+        let call = call.with_app_events(self.call_app_queue(call_id));
         self.media.register(call, self.datapath.clone(), None);
 
         // Record the promotion on the Call so demotion can restore the in-kernel Forward rules.
