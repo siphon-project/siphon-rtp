@@ -146,8 +146,10 @@ impl Translator {
         }
     }
 
-    /// Rewrite `inbound` (an unprotected RTP packet from the current source) into `out`.
-    /// `clock` is the caller's logical arrival clock in RTP timestamp units (wrapping), used only to
+    /// Rewrite `inbound` (an unprotected RTP packet from the current source) into `out`, under
+    /// `payload_type`: the receiver's own number for this format. Payload type numbers are dynamic
+    /// and negotiated per session (RFC 3551 §3, RFC 3264 §6.1), so the source's number means nothing
+    /// to a receiver that answered the same codec as another; the caller maps it. `clock` is the caller's logical arrival clock in RTP timestamp units (wrapping), used only to
     /// size the timestamp gap at a rebase.
     ///
     /// # Errors
@@ -156,6 +158,7 @@ impl Translator {
     pub fn translate(
         &mut self,
         inbound: &[u8],
+        payload_type: u8,
         clock: u32,
         out: &mut [u8],
     ) -> Result<Forwarded, TranslatorError> {
@@ -219,7 +222,7 @@ impl Translator {
 
         let header = RtpHeader {
             marker: rebase || packet.marker,
-            payload_type: packet.payload_type,
+            payload_type,
             sequence: out_sequence,
             timestamp: out_timestamp,
             ssrc: self.egress_ssrc,
@@ -301,7 +304,7 @@ mod tests {
     fn run(translator: &mut Translator, inbound: &[u8], clock: u32) -> (bool, u16, u32, u32) {
         let mut out = [0u8; 512];
         let Forwarded::Packet { length, .. } =
-            translator.translate(inbound, clock, &mut out).unwrap()
+            translator.translate(inbound, 96, clock, &mut out).unwrap()
         else {
             panic!("expected forwarded");
         };
@@ -320,7 +323,8 @@ mod tests {
         let mut translator = Translator::new(EGRESS, 100, 5000);
         let mut out = [0u8; 512];
         let inbound = packet(1, 10, 1000, &payload);
-        let Forwarded::Packet { length, .. } = translator.translate(&inbound, 0, &mut out).unwrap()
+        let Forwarded::Packet { length, .. } =
+            translator.translate(&inbound, 96, 0, &mut out).unwrap()
         else {
             panic!()
         };
@@ -328,6 +332,22 @@ mod tests {
         assert_eq!(parsed.payload, &payload[..]);
         assert_eq!(parsed.payload_type, 96);
         assert_eq!(length, 12 + 160);
+    }
+
+    #[test]
+    fn payload_type_is_the_receivers_own_number() {
+        // The source sent AMR-WB as 96; this receiver answered it as 104.
+        let mut translator = Translator::new(EGRESS, 100, 5000);
+        let mut out = [0u8; 512];
+        let inbound = packet(1, 10, 1000, b"abcd");
+        let Forwarded::Packet { length, .. } =
+            translator.translate(&inbound, 104, 0, &mut out).unwrap()
+        else {
+            panic!()
+        };
+        let parsed = RtpPacket::parse(&out[..length]).unwrap();
+        assert_eq!(parsed.payload_type, 104);
+        assert_eq!(parsed.payload, b"abcd");
     }
 
     #[test]
@@ -441,7 +461,7 @@ mod tests {
         for sequence in [11u16, 10] {
             assert_eq!(
                 translator
-                    .translate(&packet(0xA, sequence, 1000, b"a"), 330, &mut out)
+                    .translate(&packet(0xA, sequence, 1000, b"a"), 96, 330, &mut out)
                     .unwrap(),
                 Forwarded::DroppedStale
             );
@@ -478,7 +498,8 @@ mod tests {
         inbound.extend_from_slice(&[0, 0, 0, 4]);
         let mut translator = Translator::new(EGRESS, 1, 1);
         let mut out = [0u8; 128];
-        let Forwarded::Packet { length, .. } = translator.translate(&inbound, 0, &mut out).unwrap()
+        let Forwarded::Packet { length, .. } =
+            translator.translate(&inbound, 96, 0, &mut out).unwrap()
         else {
             panic!()
         };
@@ -497,7 +518,7 @@ mod tests {
         let inbound = packet(1, 1, 0, &[0u8; 160]);
         let mut small = [0u8; 100];
         assert_eq!(
-            translator.translate(&inbound, 0, &mut small),
+            translator.translate(&inbound, 96, 0, &mut small),
             Err(TranslatorError::Rtp(RtpError::OutputTooSmall {
                 needed: 172,
                 have: 100
@@ -512,18 +533,18 @@ mod tests {
         let mut translator = Translator::new(EGRESS, 1, 1);
         let mut out = [0u8; 64];
         assert_eq!(
-            translator.translate(&[], 0, &mut out),
+            translator.translate(&[], 96, 0, &mut out),
             Err(TranslatorError::Rtp(RtpError::TooShort))
         );
         assert_eq!(
-            translator.translate(&[0x40; 12], 0, &mut out),
+            translator.translate(&[0x40; 12], 96, 0, &mut out),
             Err(TranslatorError::Rtp(RtpError::BadVersion(1)))
         );
         let mut bad_padding = packet(1, 1, 1, b"a");
         bad_padding[0] |= 0x20;
         *bad_padding.last_mut().unwrap() = 0;
         assert_eq!(
-            translator.translate(&bad_padding, 0, &mut out),
+            translator.translate(&bad_padding, 96, 0, &mut out),
             Err(TranslatorError::Rtp(RtpError::BadPadding))
         );
         assert!(TranslatorError::Rtp(RtpError::TooShort)
@@ -549,7 +570,7 @@ mod tests {
                 let (sequence, timestamp) = counters[source as usize];
                 counters[source as usize] = (sequence.wrapping_add(1), timestamp.wrapping_add(160));
                 let inbound = packet(u32::from(source) + 1, sequence, timestamp, b"xy");
-                let outcome = translator.translate(&inbound, clock, &mut out).unwrap();
+                let outcome = translator.translate(&inbound, 96, clock, &mut out).unwrap();
                 if let Forwarded::Packet { length, .. } = outcome {
                     let parsed = RtpPacket::parse(&out[..length]).unwrap();
                     prop_assert_eq!(parsed.ssrc, EGRESS);
@@ -569,9 +590,9 @@ mod tests {
         ) {
             let mut translator = Translator::new(EGRESS, 1, 1);
             let mut out = [0u8; 16];
-            let _ = translator.translate(&data, clock, &mut out);
+            let _ = translator.translate(&data, 96, clock, &mut out);
             translator.switch_source();
-            let _ = translator.translate(&data, clock, &mut out);
+            let _ = translator.translate(&data, 96, clock, &mut out);
         }
     }
 }

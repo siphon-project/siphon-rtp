@@ -38,7 +38,7 @@ fn bench_translate(criterion: &mut Criterion) {
             packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
             black_box(
                 translator
-                    .translate(black_box(&packet), timestamp, &mut out)
+                    .translate(black_box(&packet), 96, timestamp, &mut out)
                     .unwrap(),
             );
         });
@@ -62,7 +62,7 @@ fn bench_fanout(criterion: &mut Criterion) {
             for translator in &mut translators {
                 black_box(
                     translator
-                        .translate(black_box(&packet), timestamp, &mut out)
+                        .translate(black_box(&packet), 96, timestamp, &mut out)
                         .unwrap(),
                 );
             }

@@ -64,7 +64,11 @@ fn translate_makes_no_heap_allocation_including_rebases() {
             &packet_b
         };
         for translator in translators.iter_mut() {
-            std::hint::black_box(translator.translate(packet, timestamp, &mut out).unwrap());
+            std::hint::black_box(
+                translator
+                    .translate(packet, 96, timestamp, &mut out)
+                    .unwrap(),
+            );
         }
     };
 
