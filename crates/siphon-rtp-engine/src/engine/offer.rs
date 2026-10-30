@@ -162,6 +162,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 }
 
+/// A terminated DTLS offerer's WebRTC data channel carries its MCPTT floor; remember its mids.
+fn with_data_channel(near_dtls: Option<super::NearDtls>, offer: &str) -> Option<super::NearDtls> {
+    near_dtls.map(|mut keying| {
+        keying.data_channel =
+            sdp::parse_data_channel(offer).map(|channel| (channel.audio_mid, channel.mid));
+        keying
+    })
+}
+
+/// The data channel of a terminated DTLS offerer is answered to A by the engine (`answer`, when it is
+/// bundled with A's audio); B is a plain party and gets the section declined, never A's address.
+fn decline_terminated_data_channel(offer_to_far: String, terminated: bool) -> String {
+    if terminated {
+        sdp::decline_data_channels(&offer_to_far)
+    } else {
+        offer_to_far
+    }
+}
+
 /// The transport security an offer settles for both legs.
 struct OfferSecurity {
     /// `dtls: off` forced the far leg to plaintext `RTP/AVP`.
@@ -188,6 +207,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         profile: &ProfileFlags,
         info: &sdp::MediaInfo,
+        offer: &str,
     ) -> Result<OfferSecurity, Box<CmdResult>> {
         // Secure far leg: when the control profile asks for a secure far leg, either DTLS-SRTP
         // (`UDP/TLS/RTP/SAVP[F]`, RFC 5764) — advertise the engine's fingerprint + `a=setup` role,
@@ -317,6 +337,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     peer_tls_id: info.tls_id.clone(),
                     role: None,
                     local_tls_id: None,
+                    // Filled in by `offer`, which holds the offer text.
+                    data_channel: None,
                 })
             } else {
                 None
@@ -342,7 +364,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_local_crypto,
             near_remote_crypto,
             far_dtls_presentation,
-            near_dtls,
+            near_dtls: with_data_channel(near_dtls, offer),
         })
     }
 }
@@ -675,7 +697,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_remote_crypto,
             far_dtls_presentation,
             near_dtls,
-        } = match self.offer_security(profile, &info) {
+        } = match self.offer_security(profile, &info, sdp) {
             Ok(security) => security,
             Err(result) => return *result,
         };
@@ -815,7 +837,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &profile.replace,
             &call_id,
         ) {
-            Ok(rewritten) => rewritten,
+            Ok(rewritten) => decline_terminated_data_channel(rewritten, near_dtls.is_some()),
             Err(error) => {
                 self.free(&endpoints).await;
                 return CmdResult::Error {
