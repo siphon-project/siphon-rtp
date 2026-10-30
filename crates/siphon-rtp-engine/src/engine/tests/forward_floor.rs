@@ -380,12 +380,18 @@ async fn send_rtcp_app_on_the_audio_stream_uses_the_audio_endpoint() {
         send_app(&engine, Some("a"), &[], RtcpAppStream::Audio, Some(7)).await,
         ok_empty()
     );
-    let received = recv_datagram(&a.audio, SHORT).await.expect("audio rtcp");
-    let apps: Vec<_> = rtcp::app_packets(&received)
-        .collect::<Result<_, _>>()
-        .expect("app");
-    assert_eq!(apps[0].subtype, 17);
-    assert_eq!(apps[0].ssrc, 7);
+    // The room's report timer fires at once when the room starts, so a Sender Report (RFC 3550
+    // §6.4.1) can reach the seat ahead of the APP packet: skip datagrams that carry none.
+    let (subtype, ssrc) = loop {
+        let received = recv_datagram(&a.audio, SHORT).await.expect("audio rtcp");
+        let mut apps = rtcp::app_packets(&received);
+        if let Some(app) = apps.next() {
+            let app = app.expect("app");
+            break (app.subtype, app.ssrc);
+        }
+    };
+    assert_eq!(subtype, 17);
+    assert_eq!(ssrc, 7);
     assert!(recv_datagram(&a.floor, NEGATIVE).await.is_none());
 }
 
