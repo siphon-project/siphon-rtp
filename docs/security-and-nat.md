@@ -1054,6 +1054,23 @@ the routing order is unchanged: bridge → media → text → udptl → ws → c
   talk): the sweep raises `forward_seat_inactive` once per quiet spell
   (`ForwardRegistry::scan_inactive`) and the controller decides. It is freed by `forward_leave`, by a
   failed ICE checklist, and with its room.
+- **Whole-room backstop.** A room in which *every* seat has received nothing at all (RTP, RTCP or floor
+  packet, which is what the endpoint's activity stamp reads) for `--forward-room-idle-secs` (default
+  3600, `0` off) is freed by `ForwardRegistry::reap_silent_rooms`: each seat's client gets a
+  `media_timeout` (`no_media`), then the room and its endpoints go. Receivers send RTCP receiver reports
+  (RFC 3550 §6.2), so a live group never trips it; seats pending their answer are not measured.
+- **Dial-out seats** (`forward_offer` / `forward_answer`) are plain RTP/AVP with no ICE: the pending seat
+  holds its endpoints outside the room, the answer's `c=` (or `received_from`) is the signalled-source
+  gate, a `symmetric` profile opens it as on a join, and the Redirect flow is installed only when the
+  answer is accepted. Every path out of the pending state frees its endpoints (answer, refusal,
+  `forward_leave`, setup-timeout sweep).
+- **Cross-codec seats put a decoder behind the gate.** A seat whose codec is not the room's has its
+  payload decoded (when it is the source) and re-encoded. That is a new consumer of untrusted bytes, but
+  it sits strictly after the gate above (signalled source, SRTP, the SSRC latch, source selected by the
+  controller), reads only the packet of the one chosen source, and uses the same codec decoders the
+  mixing conference and the transcoding relay already run on peer bytes (all fuzzed). A payload the
+  decoder refuses, or a frame of an unexpected length, is dropped and counted (`transcode_dropped`); it
+  never reaches another seat. Nothing is allocated per packet, so a hostile source cannot grow memory.
 
 ### Layer 5f — The RFC 4103 Real-Time Text (RTT) relay path
 A VoLTE/IMS call may carry a second media stream: an `m=text` line (RFC 4103, T.140 over RTP, usually

@@ -9,6 +9,20 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **Dial-out, transcoding and a whole-room backstop for forwarding rooms (`forward_offer`,
+  `forward_answer`; `node_info` features `forward_dialout`, `forward_transcode`; `--forward-room-idle-secs`).**
+  `forward_offer` offers a pending seat to a member the room calls out to (the room's codec first with its
+  format parameters, then the codecs the engine can transcode to it; every codec a room could carry for a
+  new room; an anchored MCPTT floor section with `floor_fmtp`), and `forward_answer` seats it as
+  `forward_join` does. A seat in another codec than the room's is no longer refused: the room decodes the
+  source once per packet and encodes once per codec group, each seat getting its own SSRC, sequence and
+  timestamps (AMR needs the `amr` feature, and the refusal names the build when it lacks it; the seat's
+  packetization interval must be the room's). A room in which every seat has received nothing for
+  `--forward-room-idle-secs` (default 3600, `0` off) is freed with one `media_timeout` per seat.
+  `conference_offer` and `forward_offer` now refuse an id that names the other kind of room.
+  A 100-seat room over two codec groups costs about 175 µs per inbound packet, allocation-free
+  (`benches/forward_transcode_bench.rs`, `docs/cookbook/forwarding.md`).
+
 - **Forwarding rooms for push-to-talk group calls (`forward_join`, `forward_leave`,
   `forward_set_source`; `node_info` feature `forward_room`).** A room forwards one chosen source seat's
   RTP to every other seat through a per-receiver RTP translator (RFC 3550 §7), payload unchanged: no
