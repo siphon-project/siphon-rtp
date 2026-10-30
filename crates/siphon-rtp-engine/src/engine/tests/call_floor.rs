@@ -554,3 +554,38 @@ async fn a_floor_fmtp_with_a_line_break_refuses_offer_answer_and_answer_local() 
     }
     assert!(engine.endpoint_calls.is_empty(), "nothing was allocated");
 }
+
+#[tokio::test]
+async fn a_single_leg_local_answer_with_a_floor_stream_echoes_no_stream_identity() {
+    use super::stream_identity::{
+        assert_nothing_of_the_offerer, browser_shaped_offer, OFFERER_SSRC,
+    };
+    let engine = engine_with_dispatcher();
+    let a = party().await;
+    // Beside the audio, the floor section carries what a browser would signal, so the answer's
+    // floor section is checked as well as its audio section (RFC 5576, RFC 8830, RFC 8285).
+    let offer = format!(
+        "{}m=application {} udp MCPTT\r\nc=IN IP4 {}\r\na=extmap:5 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
+         a=msid:stream-a track-floor\r\na=ssrc:{OFFERER_SSRC} cname:offerer-cname\r\n",
+        browser_shaped_offer(a.audio_addr),
+        a.floor_addr.port(),
+        a.floor_addr.ip(),
+    );
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "local-identity".into(),
+                from_tag: "tag-a".into(),
+                sdp: offer,
+                profile: profile(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&result);
+    assert_nothing_of_the_offerer(&answer);
+    assert!(
+        sdp::parse_floor(&answer).is_some(),
+        "floor answered:\n{answer}"
+    );
+}
