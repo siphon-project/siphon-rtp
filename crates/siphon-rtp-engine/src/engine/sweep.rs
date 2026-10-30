@@ -234,6 +234,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         failed.push(conference_id);
                         continue;
                     }
+                    // A forwarding-room seat is dropped the same way: no pair means it can never be
+                    // reached, and its gate would stay pending forever.
+                    if let Some((room_id, tag)) = self.conference.forward().seat_at(endpoint) {
+                        self.release_forward_seat(&room_id, &tag).await;
+                        tracing::warn!(
+                            target: "siphon_rtp::media",
+                            room = %room_id, tag, ?endpoint,
+                            "ICE failed for a forwarding seat — no candidate pair succeeded; seat removed"
+                        );
+                        failed.push(room_id);
+                        continue;
+                    }
                     // An ICE failure is a dead path: no candidate pair ever succeeded, so there is no
                     // media path to be held on. `NoMedia`, never the held reason.
                     if self
@@ -541,6 +553,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.awaiting_media.remove(endpoint);
         }
         freed.len()
+    }
+
+    /// Report forwarding-room seats that have received nothing for `idle_ticks` (the media timeout),
+    /// as [`siphon_rtp_proto::Event::ForwardSeatInactive`] to the client that seated them. Never
+    /// frees one: a push-to-talk listener sends nothing for as long as others talk, so a quiet seat
+    /// is the controller's to judge. Driven by the datapath's logical clock, so tests advance it with
+    /// `advance_clock`. Returns how many events were raised.
+    pub fn scan_inactive_forward_seats(&self, idle_ticks: u64) -> usize {
+        let now = self.datapath.now_ticks();
+        self.conference
+            .forward()
+            .scan_inactive(now, idle_ticks, |endpoint| {
+                self.datapath.last_activity(endpoint)
+            })
     }
 
     /// The call-id owning `endpoint`, if any — RTCP-telemetry correlation.

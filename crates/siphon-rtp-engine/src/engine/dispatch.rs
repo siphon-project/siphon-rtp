@@ -350,6 +350,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 Command::Offer { .. }
                     | Command::AnswerLocal { .. }
                     | Command::ConferenceJoin { .. }
+                    | Command::ForwardJoin { .. }
                     | Command::ConferenceOffer { .. }
                     // A seat is a new conference participant, even though its call is not new.
                     | Command::ConferenceSeat { .. }
@@ -511,6 +512,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             | Command::ConferenceStopRecording { .. }) => {
                 self.dispatch_conference(client, command).await
             }
+            command @ (Command::ForwardJoin { .. }
+            | Command::ForwardLeave { .. }
+            | Command::ForwardSetSource { .. }) => self.dispatch_forward(client, command).await,
             Command::AttachWsTee {
                 call_id,
                 ws_uri,
@@ -853,7 +857,7 @@ fn is_error(result: &CmdResult) -> bool {
     matches!(result, CmdResult::Error { .. })
 }
 
-fn command_name(command: &Command) -> &'static str {
+pub(super) fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Offer { .. } => "offer",
         Command::Reoffer { .. } => "reoffer",
@@ -908,6 +912,12 @@ fn command_name(command: &Command) -> &'static str {
         Command::AttachX3 { .. } => "attach_x3",
         Command::DetachX3 { .. } => "detach_x3",
         Command::Authenticate { .. } => "authenticate",
+        Command::ForwardJoin { .. } => "forward_join",
+        Command::ForwardOffer { .. } => "forward_offer",
+        Command::ForwardAnswer { .. } => "forward_answer",
+        Command::ForwardLeave { .. } => "forward_leave",
+        Command::ForwardSetSource { .. } => "forward_set_source",
+        Command::SendRtcpApp { .. } => "send_rtcp_app",
         // [`Command`] is `#[non_exhaustive]`. A verb this engine has no arm for still has to be
         // *named* in the log line and in the `unsupported command: …` error the dispatch returns,
         // so it gets a stable placeholder rather than nothing. The dispatch refuses it; this only
@@ -957,7 +967,17 @@ pub(super) fn command_call_id(command: &Command) -> Option<&str> {
         | Command::ConferenceOffer { conference_id, .. }
         | Command::ConferenceAnswer { conference_id, .. }
         | Command::ConferenceLeave { conference_id, .. }
-        | Command::ConferenceRoute { conference_id, .. } => Some(conference_id),
+        | Command::ConferenceRoute { conference_id, .. }
+        | Command::ForwardJoin { conference_id, .. }
+        | Command::ForwardOffer { conference_id, .. }
+        | Command::ForwardAnswer { conference_id, .. }
+        | Command::ForwardLeave { conference_id, .. }
+        | Command::ForwardSetSource { conference_id, .. } => Some(conference_id),
+        Command::SendRtcpApp {
+            call_id,
+            conference_id,
+            ..
+        } => call_id.as_deref().or(conference_id.as_deref()),
         Command::ConferenceBridge {
             conference_id_a, ..
         }

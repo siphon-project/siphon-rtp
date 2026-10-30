@@ -1,7 +1,8 @@
 //! RTCP compound-packet parsing and construction (RFC 3550 §6), driving relay, statistics, and the
 //! G.107 MOS estimation. Parses Sender Reports, Receiver Reports, and their reception report blocks
 //! (SDES/BYE/APP are recognized and skipped), and builds our own minimal SR/RR for the per-leg
-//! reception reports the engine emits.
+//! reception reports the engine emits. APP packets (RFC 3550 §6.7), which carry MCPTT floor control
+//! (3GPP TS 24.380 §8), have their own zero-copy reader [`app_packets`] and builder [`write_app`].
 
 /// Errors from RTCP parsing.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -15,6 +16,9 @@ pub enum RtcpError {
     /// A sub-packet's length field overran the buffer.
     #[error("RTCP length field overruns buffer")]
     BadLength,
+    /// The padding bit was set but the padding count was zero or longer than the packet's data.
+    #[error("RTCP padding count is invalid")]
+    BadPadding,
 }
 
 /// RTCP packet types (RFC 3550 §6 / 12.1).
@@ -276,6 +280,173 @@ pub fn parse_compound(buffer: &[u8]) -> Result<Vec<RtcpPacket>, RtcpError> {
         offset += packet_len;
     }
     Ok(packets)
+}
+
+/// Length of an APP packet with no application data: header word, SSRC, name (RFC 3550 §6.7).
+pub const APP_HEADER_LEN: usize = 12;
+/// Most application data one APP packet can carry: the 16-bit length field counts the 32-bit words
+/// after the first, so a packet is at most 65536 words, two of which are the SSRC and name.
+pub const APP_MAX_DATA_LEN: usize = (u16::MAX as usize + 1) * 4 - APP_HEADER_LEN;
+
+/// One RTCP APP packet (RFC 3550 §6.7), borrowed from the datagram it was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppPacket<'a> {
+    /// The 5-bit subtype. For MCPTT the top bit is the acknowledgement-required flag
+    /// (3GPP TS 24.380 §8.2.2.1, the 'x' bit), so it is kept rather than masked off.
+    pub subtype: u8,
+    /// SSRC of the sender.
+    pub ssrc: u32,
+    /// The 4-octet name (`MCPT`, `MCPC`, `MCMC`, ... per TS 24.380 §8.1.2). Not checked for ASCII
+    /// on receive; what to do with an unexpected name is the consumer's decision.
+    pub name: [u8; 4],
+    /// The application-dependent data after the name, padding removed.
+    pub data: &'a [u8],
+}
+
+/// Iterator over the APP packets in one datagram, from [`app_packets`].
+#[derive(Debug, Clone)]
+pub struct AppPackets<'a> {
+    buffer: &'a [u8],
+    offset: usize,
+    failed: bool,
+}
+
+/// Walk every RTCP packet in `datagram` and yield the APP packets, skipping the others.
+///
+/// No compound rule is applied (RFC 3550 §6.1 wants an SR or RR first): MCPTT floor messages are
+/// standalone APP packets that "are not to be sent in compound RTCP packets, but more than one media
+/// plane control message can be sent in a single IP packet" (3GPP TS 24.380 §8.1.1). The same walk
+/// reads an APP part out of an ordinary audio RTCP compound.
+///
+/// A malformed packet yields one `Err` and ends the walk: its length cannot be trusted, so nothing
+/// after it can be located.
+#[must_use]
+pub fn app_packets(datagram: &[u8]) -> AppPackets<'_> {
+    AppPackets {
+        buffer: datagram,
+        offset: 0,
+        failed: false,
+    }
+}
+
+impl<'a> Iterator for AppPackets<'a> {
+    type Item = Result<AppPacket<'a>, RtcpError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.failed && self.offset < self.buffer.len() {
+            let result = self.read_one();
+            if result.is_err() {
+                self.failed = true;
+            }
+            match result {
+                Ok(None) => continue,
+                Ok(Some(app)) => return Some(Ok(app)),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        None
+    }
+}
+
+impl<'a> AppPackets<'a> {
+    /// Read the packet at `offset` and step past it: `Ok(None)` for a packet that is not APP.
+    fn read_one(&mut self) -> Result<Option<AppPacket<'a>>, RtcpError> {
+        let rest = &self.buffer[self.offset..];
+        let header = rest.get(..4).ok_or(RtcpError::TooShort)?;
+        let version = header[0] >> 6;
+        if version != 2 {
+            return Err(RtcpError::BadVersion(version));
+        }
+        let padded = header[0] & 0x20 != 0;
+        let subtype = header[0] & 0x1F;
+        let packet_type = header[1];
+        let packet_len = (usize::from(u16::from_be_bytes([header[2], header[3]])) + 1) * 4;
+        let packet = rest.get(..packet_len).ok_or(RtcpError::BadLength)?;
+        self.offset += packet_len;
+        if packet_type != packet_type::APP {
+            return Ok(None);
+        }
+        if packet.len() < APP_HEADER_LEN {
+            return Err(RtcpError::TooShort);
+        }
+        let mut data = &packet[APP_HEADER_LEN..];
+        if padded {
+            // RFC 3550 §6.4.1: the last octet counts the padding octets, itself included.
+            let count = usize::from(*data.last().ok_or(RtcpError::BadPadding)?);
+            if count == 0 || count > data.len() {
+                return Err(RtcpError::BadPadding);
+            }
+            data = &data[..data.len() - count];
+        }
+        Ok(Some(AppPacket {
+            subtype,
+            ssrc: be32(&packet[4..8]),
+            name: [packet[8], packet[9], packet[10], packet[11]],
+            data,
+        }))
+    }
+}
+
+/// Why [`write_app`] refused to build a packet.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AppWriteError {
+    /// The subtype field is 5 bits (RFC 3550 §6.7).
+    #[error("RTCP APP subtype {0} does not fit in 5 bits")]
+    SubtypeOutOfRange(u8),
+    /// The name must be four ASCII characters (RFC 3550 §6.7).
+    #[error("RTCP APP name is not ASCII")]
+    NonAsciiName,
+    /// Application data must be a multiple of 32 bits (RFC 3550 §6.7, TS 24.380 §8.1.3).
+    #[error("RTCP APP data length {0} is not a multiple of 4")]
+    Unaligned(usize),
+    /// More data than the 16-bit length field can describe.
+    #[error("RTCP APP data length {0} exceeds the length field")]
+    TooLong(usize),
+    /// `out` cannot hold the packet.
+    #[error("RTCP APP needs a {needed}-byte buffer")]
+    BufferTooSmall {
+        /// Bytes the packet takes.
+        needed: usize,
+    },
+}
+
+/// Write one RTCP APP packet (RFC 3550 §6.7) into `out`, returning its length.
+///
+/// The packet is written unpadded (P=0, as TS 24.380 §8.1.2 requires for floor control). `data` is
+/// copied as given: its field coding (TS 24.380 §8.1.3) belongs to the caller, so data that is not a
+/// whole number of words is refused rather than padded behind the caller's back.
+pub fn write_app(
+    subtype: u8,
+    ssrc: u32,
+    name: [u8; 4],
+    data: &[u8],
+    out: &mut [u8],
+) -> Result<usize, AppWriteError> {
+    if subtype > 0x1F {
+        return Err(AppWriteError::SubtypeOutOfRange(subtype));
+    }
+    if !name.is_ascii() {
+        return Err(AppWriteError::NonAsciiName);
+    }
+    if !data.len().is_multiple_of(4) {
+        return Err(AppWriteError::Unaligned(data.len()));
+    }
+    if data.len() > APP_MAX_DATA_LEN {
+        return Err(AppWriteError::TooLong(data.len()));
+    }
+    let total = APP_HEADER_LEN + data.len();
+    let packet = out
+        .get_mut(..total)
+        .ok_or(AppWriteError::BufferTooSmall { needed: total })?;
+    let length_words =
+        u16::try_from(total / 4 - 1).map_err(|_| AppWriteError::TooLong(data.len()))?;
+    packet[0] = 0x80 | subtype; // V=2, P=0
+    packet[1] = packet_type::APP;
+    packet[2..4].copy_from_slice(&length_words.to_be_bytes());
+    packet[4..8].copy_from_slice(&ssrc.to_be_bytes());
+    packet[8..12].copy_from_slice(&name);
+    packet[APP_HEADER_LEN..].copy_from_slice(data);
+    Ok(total)
 }
 
 /// Rewrite the **sender SSRC** of every Sender and Receiver Report in a compound packet, in place.
@@ -556,6 +727,250 @@ mod tests {
         assert_eq!(demux(&[0x80]), None);
     }
 
+    /// TS 24.380 §8.2.4 Floor Request (subtype '00000') carrying a Floor Priority field
+    /// (§8.2.3.2: field ID 0, length 2, priority 5, one spare octet). Cross-checked with tshark's
+    /// RTCP MCPT dissector, which reads it as "Floor Request, Floor Priority: 5".
+    const FLOOR_REQUEST: [u8; 16] = [
+        0x80, 0xCC, 0x00, 0x03, // V=2 P=0 subtype=0, PT=204, length=3 words
+        0x11, 0x22, 0x33, 0x44, // SSRC of the requesting floor participant
+        b'M', b'C', b'P', b'T', // name
+        0x00, 0x02, 0x05, 0x00, // Floor Priority field
+    ];
+
+    /// TS 24.380 §8.2.5 Floor Granted with the acknowledgement bit set (subtype 'x0001', x=1 ⇒ 17),
+    /// a Duration field (§8.2.3.3: ID 1, length 2, 30 s) and an Audio SSRC of Granted Participant
+    /// field (§8.2.3.16: ID 14, length 6, SSRC, two spare octets). tshark reads it as
+    /// "Floor Granted(ack req), Duration: 30 seconds, SSRC: 305419896".
+    const FLOOR_GRANTED: [u8; 24] = [
+        0x91, 0xCC, 0x00, 0x05, // V=2 P=0 subtype=17, PT=204, length=5 words
+        0xAA, 0xBB, 0xCC, 0xDD, // RTCP SSRC of the floor control server
+        b'M', b'C', b'P', b'T', // name
+        0x01, 0x02, 0x00, 0x1E, // Duration field
+        0x0E, 0x06, 0x12, 0x34, 0x56, 0x78, 0x00, 0x00, // Audio SSRC of Granted Participant
+    ];
+
+    #[test]
+    fn reads_a_floor_request_app_packet() {
+        let packets: Vec<_> = app_packets(&FLOOR_REQUEST).collect();
+        assert_eq!(packets.len(), 1);
+        let app = packets[0].as_ref().expect("valid APP");
+        assert_eq!(app.subtype, 0);
+        assert_eq!(app.ssrc, 0x1122_3344);
+        assert_eq!(&app.name, b"MCPT");
+        assert_eq!(app.data, &FLOOR_REQUEST[12..]);
+    }
+
+    #[test]
+    fn reads_the_acknowledgement_bit_as_part_of_the_subtype() {
+        let app = app_packets(&FLOOR_GRANTED)
+            .next()
+            .expect("one packet")
+            .expect("valid APP");
+        assert_eq!(
+            app.subtype, 0b1_0001,
+            "x bit + Floor Granted (TS 24.380 §8.2.2.1)"
+        );
+        assert_eq!(app.ssrc, 0xAABB_CCDD);
+        assert_eq!(app.data, &FLOOR_GRANTED[12..]);
+    }
+
+    #[test]
+    fn reads_several_standalone_app_packets_in_one_datagram() {
+        // TS 24.380 §8.1.1: not a compound packet (no SR/RR first), but several messages may
+        // share one IP packet.
+        let mut datagram = FLOOR_REQUEST.to_vec();
+        datagram.extend_from_slice(&FLOOR_GRANTED);
+        let packets: Vec<_> = app_packets(&datagram)
+            .collect::<Result<_, _>>()
+            .expect("both valid");
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].subtype, 0);
+        assert_eq!(packets[1].subtype, 17);
+    }
+
+    #[test]
+    fn skips_reports_and_yields_app_parts_of_a_compound() {
+        // An audio RTCP compound (SR first, RFC 3550 §6.1) with an APP part some clients append.
+        let mut datagram = vec![0x80, 200, 0x00, 0x06];
+        datagram.extend_from_slice(&[0u8; 24]);
+        datagram.extend_from_slice(&FLOOR_REQUEST);
+        let packets: Vec<_> = app_packets(&datagram)
+            .collect::<Result<_, _>>()
+            .expect("valid");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].ssrc, 0x1122_3344);
+    }
+
+    #[test]
+    fn strips_rtcp_padding_from_app_data() {
+        // RFC 3550 §6.4.1: P=1, the last octet counts the padding octets (including itself).
+        let mut datagram = FLOOR_REQUEST.to_vec();
+        datagram[0] |= 0x20;
+        datagram[3] = 4; // one more word
+        datagram.extend_from_slice(&[0, 0, 0, 4]);
+        let app = app_packets(&datagram).next().expect("one").expect("valid");
+        assert_eq!(app.data, &FLOOR_REQUEST[12..]);
+    }
+
+    #[test]
+    fn refuses_padding_longer_than_the_application_data() {
+        let mut datagram = FLOOR_REQUEST.to_vec();
+        datagram[0] |= 0x20;
+        datagram[15] = 9; // claims 9 padding octets, only 4 data octets exist
+        assert_eq!(
+            app_packets(&datagram).next(),
+            Some(Err(RtcpError::BadPadding))
+        );
+        datagram[15] = 0; // a zero padding count is equally invalid
+        assert_eq!(
+            app_packets(&datagram).next(),
+            Some(Err(RtcpError::BadPadding))
+        );
+    }
+
+    #[test]
+    fn refuses_an_app_packet_without_room_for_ssrc_and_name() {
+        // Length 1 word: only the SSRC, no name (RFC 3550 §6.7 needs both).
+        let datagram = [0x80, 0xCC, 0x00, 0x01, 0x11, 0x22, 0x33, 0x44];
+        assert_eq!(
+            app_packets(&datagram).next(),
+            Some(Err(RtcpError::TooShort))
+        );
+    }
+
+    #[test]
+    fn stops_after_the_first_malformed_packet() {
+        let mut datagram = FLOOR_REQUEST.to_vec();
+        datagram.extend_from_slice(&[0x80, 0xCC, 0x00, 0x09]); // overruns the buffer
+        let results: Vec<_> = app_packets(&datagram).collect();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert_eq!(results[1], Err(RtcpError::BadLength));
+    }
+
+    #[test]
+    fn rejects_a_non_version_2_header() {
+        let mut datagram = FLOOR_REQUEST;
+        datagram[0] = 0x40 | (datagram[0] & 0x3F);
+        assert_eq!(
+            app_packets(&datagram).next(),
+            Some(Err(RtcpError::BadVersion(1)))
+        );
+    }
+
+    #[test]
+    fn an_empty_datagram_has_no_app_packets() {
+        assert_eq!(app_packets(&[]).next(), None);
+    }
+
+    #[test]
+    fn writes_the_floor_request_vector_byte_for_byte() {
+        let mut out = [0u8; 64];
+        let len =
+            write_app(0, 0x1122_3344, *b"MCPT", &FLOOR_REQUEST[12..], &mut out).expect("write");
+        assert_eq!(&out[..len], &FLOOR_REQUEST);
+    }
+
+    #[test]
+    fn writes_the_floor_granted_vector_byte_for_byte() {
+        let mut out = [0u8; 64];
+        let len =
+            write_app(17, 0xAABB_CCDD, *b"MCPT", &FLOOR_GRANTED[12..], &mut out).expect("write");
+        assert_eq!(&out[..len], &FLOOR_GRANTED);
+    }
+
+    #[test]
+    fn writes_an_app_packet_with_no_application_data() {
+        let mut out = [0u8; 12];
+        let len = write_app(5, 1, *b"MCPC", &[], &mut out).expect("write");
+        assert_eq!(
+            &out[..len],
+            &[0x85, 0xCC, 0, 2, 0, 0, 0, 1, b'M', b'C', b'P', b'C']
+        );
+    }
+
+    #[test]
+    fn write_app_refuses_a_subtype_wider_than_five_bits() {
+        let mut out = [0u8; 64];
+        assert_eq!(
+            write_app(32, 0, *b"MCPT", &[], &mut out),
+            Err(AppWriteError::SubtypeOutOfRange(32))
+        );
+    }
+
+    #[test]
+    fn write_app_refuses_data_that_is_not_word_aligned() {
+        // RFC 3550 §6.7 / TS 24.380 §8.1.3: application data is a multiple of 32 bits. The
+        // caller owns the field coding, so the engine refuses rather than padding it silently.
+        let mut out = [0u8; 64];
+        assert_eq!(
+            write_app(0, 0, *b"MCPT", &[0, 2, 5], &mut out),
+            Err(AppWriteError::Unaligned(3))
+        );
+    }
+
+    #[test]
+    fn write_app_refuses_a_non_ascii_name() {
+        let mut out = [0u8; 64];
+        assert_eq!(
+            write_app(0, 0, [b'M', 0xC3, b'P', b'T'], &[], &mut out),
+            Err(AppWriteError::NonAsciiName)
+        );
+    }
+
+    #[test]
+    fn write_app_refuses_a_short_buffer() {
+        let mut out = [0u8; 15];
+        assert_eq!(
+            write_app(0, 0, *b"MCPT", &FLOOR_REQUEST[12..], &mut out),
+            Err(AppWriteError::BufferTooSmall { needed: 16 })
+        );
+    }
+
+    #[test]
+    fn write_app_refuses_data_past_the_length_field() {
+        // The 16-bit length counts words after the first, so a packet tops out at 65536 words.
+        let data = vec![0u8; APP_MAX_DATA_LEN + 4];
+        let mut out = vec![0u8; data.len() + APP_HEADER_LEN];
+        assert_eq!(
+            write_app(0, 0, *b"MCPT", &data, &mut out),
+            Err(AppWriteError::TooLong(data.len()))
+        );
+        let data = vec![0u8; APP_MAX_DATA_LEN];
+        assert!(write_app(0, 0, *b"MCPT", &data, &mut out).is_ok());
+    }
+
+    #[test]
+    fn app_write_error_messages_name_the_problem() {
+        assert_eq!(
+            AppWriteError::SubtypeOutOfRange(40).to_string(),
+            "RTCP APP subtype 40 does not fit in 5 bits"
+        );
+        assert_eq!(
+            AppWriteError::Unaligned(3).to_string(),
+            "RTCP APP data length 3 is not a multiple of 4"
+        );
+        assert_eq!(
+            AppWriteError::BufferTooSmall { needed: 16 }.to_string(),
+            "RTCP APP needs a 16-byte buffer"
+        );
+        assert_eq!(
+            RtcpError::BadPadding.to_string(),
+            "RTCP padding count is invalid"
+        );
+    }
+
+    #[test]
+    fn parse_compound_still_reports_app_as_other() {
+        let packets = parse_compound(&FLOOR_REQUEST).expect("parse");
+        assert_eq!(
+            packets,
+            vec![RtcpPacket::Other {
+                packet_type: packet_type::APP
+            }]
+        );
+    }
+
     use proptest::prelude::*;
 
     proptest! {
@@ -564,6 +979,29 @@ mod tests {
         fn parsers_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
             let _ = parse_compound(&bytes);
             let _ = demux(&bytes);
+            for result in app_packets(&bytes) {
+                let _ = result;
+            }
+        }
+
+        /// What `write_app` builds, `app_packets` reads back field for field.
+        #[test]
+        fn written_app_packets_read_back(
+            subtype in 0u8..32,
+            ssrc in any::<u32>(),
+            name in prop::array::uniform4(0x20u8..0x7F),
+            words in prop::collection::vec(any::<[u8; 4]>(), 0..64),
+        ) {
+            let data: Vec<u8> = words.concat();
+            let mut out = vec![0u8; APP_HEADER_LEN + data.len()];
+            let len = write_app(subtype, ssrc, name, &data, &mut out).expect("write");
+            let packets: Vec<_> = app_packets(&out[..len]).collect();
+            prop_assert_eq!(packets.len(), 1);
+            let app = packets[0].as_ref().expect("valid");
+            prop_assert_eq!(app.subtype, subtype);
+            prop_assert_eq!(app.ssrc, ssrc);
+            prop_assert_eq!(app.name, name);
+            prop_assert_eq!(app.data, &data[..]);
         }
     }
 }

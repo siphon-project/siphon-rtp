@@ -5,7 +5,6 @@ use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{
     AddressFamily, Datapath, FlowAction, IceAgentMode, IceConfig, SourceFilter,
 };
-use siphon_rtp_dtls::Fingerprint as DtlsFingerprint;
 use siphon_rtp_media::mixer::Role;
 use siphon_rtp_media::playback::Gain;
 use siphon_rtp_media::player::{PcmPlayer, PcmRepeat};
@@ -21,19 +20,16 @@ use std::sync::Arc;
 use crate::conference::{
     seat, ConferenceControl, ParticipantConfig, ParticipantTextConfig, Routing,
 };
-use crate::dtls_bridge::DtlsCallPlan;
-use crate::ice;
 use crate::media_pipeline::PlayRequest;
-use crate::sdp::{self, EngineMedia, IceRewrite, ImageRewrite, SecurityAdvertisement, TextRewrite};
+use crate::sdp::{self, EngineMedia, TextRewrite};
 
 use super::answer_local::answer_codec_candidates;
 use super::negotiate::{
-    filter_component, ice_directive, ice_tie_breaker, parse_codec_flags, peer_ice_credentials,
-    peer_media_address, random_ssrc, IceDirective,
+    filter_component, ice_tie_breaker, parse_codec_flags, peer_ice_credentials, random_ssrc,
 };
 use super::play::{parse_prompt_wav, PlayOptions, ResolvedPlaySource};
 use super::record::AudioRecording;
-use super::{error_result, ok_empty, ok_sdp, ClientId, Engine, Leg};
+use super::{error_result, ok_empty, ok_sdp, ClientId, Engine};
 
 /// What anchoring a conference seat's RFC 9071 text stream leaves for the seat.
 struct SeatText {
@@ -60,7 +56,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// an ICE seat deliberately leaves open.
     ///
     /// Returns whether a full agent now runs on the seat, which holds it `ice_pending`.
-    fn arm_seat_ice(
+    pub(super) fn arm_seat_ice(
         &self,
         conference_id: &str,
         endpoint: siphon_rtp_datapath::Endpoint,
@@ -260,30 +256,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(info) => info,
             Err(error) => return error_result("conference_join: SDP parse", &error),
         };
-        // ICE on a conference leg (RFC 8445). Unlike a relay leg, the room — not a datapath forward
-        // rule — owns the seat's egress, so a selection has to reach the room actor as well as the
-        // datapath; that is `ConferenceRegistry::ice_selected`, driven from `drive_ice_agents`.
-        //
-        // RFC 8839 §5.3: an offer whose default destination matches none of its own candidates was
-        // rewritten in transit, so ICE describes a topology media no longer follows. Fall back to the
-        // signalled address rather than negotiate ICE we cannot trust.
-        let ice_mismatch = siphon_rtp_ice::is_ice_mismatch(info.remote_rtp, &info.candidates)
-            && ice_directive(profile) != Some(IceDirective::Force);
-        let want_ice = match ice_directive(profile) {
-            _ if ice_mismatch => false,
-            Some(IceDirective::Force) => true,
-            Some(IceDirective::Remove) => false,
-            None => info.is_ice(),
-        };
-        let ice_creds = if want_ice {
-            ice::generate_credentials()
-        } else {
-            None
-        };
-        if want_ice && ice_creds.is_none() {
+        // A forwarding room (push-to-talk) and a mixing room share no seats: the id names one kind.
+        if self.conference.forward().contains(conference_id) {
             return error_result(
                 "conference_join",
-                &"could not mint ICE credentials (OS RNG unavailable)",
+                &format!("{conference_id} is a forwarding room; use forward_join"),
             );
         }
         // A tag the room has offered a seat to is that seat's until it is answered, left or expired.
@@ -302,161 +279,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let codec = seat.spec.clone();
         let telephone_event =
             sdp::TelephoneEvent::accompanying(&info.telephone_events(), Some(&codec));
-        // One engine endpoint in the offer's address family, redirected to the conference actor. A
-        // participant is a single leg, so it uses the near (`direction[0]`) interface — its bind IP and
-        // advertised (public) address — defaulting when the join carries no `direction`.
-        let family = AddressFamily::of(info.remote_rtp.ip());
-        let (participant_interface, _) = self.interfaces.resolve_direction(&profile.direction);
-        let (bind, advertised_override) = Self::leg_binding(participant_interface, family);
-        let endpoint = match self.alloc_endpoints(1, family, bind).await {
-            Ok(mut endpoints) => endpoints.remove(0),
-            Err(reason) => return error_result("conference_join", &reason),
-        };
-        let advertised = advertised_override.unwrap_or_else(|| endpoint.local_addr.ip());
-        if let Err(error) = self
-            .datapath
-            .install_flow(endpoint.id, FlowAction::Redirect)
+        let mut transport = match self
+            .open_seat_transport("conference_join", conference_id, &info, profile)
+            .await
         {
-            self.free(&[endpoint]).await;
-            return error_result("conference_join: install redirect", &error);
-        }
-        // RTPBleed gate: exact signalled-source by default; accept-any only for an explicit symmetric
-        // leg. The constrained latch then learns the reply address from the gated source.
-        //
-        // An ICE seat runs this gate open (`Any`), because the signalled address is not the
-        // discriminator on an ICE leg: a connectivity check legitimately arrives from a
-        // peer-reflexive transport the SDP never carried (RFC 8445 §7.3.1.3). What actually holds
-        // the seat shut is the datapath's **layer-4 ICE gate**, which redirects media to this room
-        // only from the source a check authenticated with our own password — for a full-agent seat
-        // the room's `ice_pending` below additionally drops everything until the agent selects, and
-        // `ice_selected` then narrows this filter to the selected pair.
-        // (docs/security-and-nat.md §4 layer 4; RFC 8445 §7.)
-        //
-        // A NATed participant advertises a private `c=` and sends from its NAT's public address,
-        // which the SIP proxy saw its request arrive from (`profile.received_from`). The gate and
-        // the mix's opening destination follow that hint exactly as a two-party answer's do
-        // ([`peer_media_address`]); an ICE seat keeps the signalled address, since ICE decides its
-        // transport.
-        let seat_remote = if want_ice {
-            info.remote_rtp
-        } else {
-            peer_media_address(info.remote_rtp, profile.received_from)
+            Ok(transport) => transport,
+            Err(refusal) => return *refusal,
         };
-        let accepted_source = if want_ice || profile.flags.iter().any(|flag| flag == "symmetric") {
-            SourceFilter::Any
-        } else {
-            SourceFilter::Exact(seat_remote.ip())
-        };
-
-        // Gather this seat's candidates before the answer is written — the answer *is* the candidate
-        // list. A conference leg is always RTP/RTCP-muxed onto one endpoint, so it has exactly one
-        // component (RFC 8445 §4.1.1.1).
-        let (ice_candidates, ice_config) = match ice_creds.as_ref() {
-            Some(creds) => {
-                let config = IceConfig {
-                    local_ufrag: creds.ufrag.clone(),
-                    local_pwd: creds.pwd.clone(),
-                };
-                let leg = Leg {
-                    rtp: endpoint,
-                    rtcp: None,
-                    remote_rtp: None,
-                    remote_rtcp: None,
-                    advertised_ip: advertised,
-                    // A conference seat anchors audio only — RFC 9071 multiparty text is a later
-                    // phase — so there is no text component to gather candidates for.
-                    text: None,
-                    text_remote_rtp: None,
-                    // Neither a single-leg local answer nor a conference seat relays fax.
-                    image: None,
-                    image_remote: None,
-                };
-                let candidates = self.gather_leg_candidates(&leg, &config).await;
-                (candidates, Some(config))
-            }
-            None => (Vec::new(), None),
-        };
-
-        let ice_pending = self.arm_seat_ice(
-            conference_id,
-            endpoint,
-            &info,
-            ice_config.as_ref(),
-            &ice_candidates,
-        );
-        // SDES-SRTP (RTP/SAVP): the participant offered a secure leg + its a=crypto. Mint our own key,
-        // build the secure leg (decrypt inbound with theirs, encrypt outbound with ours), and answer
-        // RTP/SAVP + a=crypto. (DTLS-SRTP / ICE WebRTC legs remain a follow-up — see the is_ice() guard.)
-        // DTLS-SRTP (`UDP/TLS/RTP/SAVPF`): there is no key to build here — the RFC 5764 handshake
-        // produces it after this command returns — so the seat is taken **pending** and keyed later
-        // over `ConferenceControl::AttachSecureLeg`. Until then the room drops its ingress and sends
-        // it nothing, so an unkeyed seat can neither inject noise into the mix nor receive the other
-        // participants in the clear.
-        let dtls_leg = info.dtls;
-        // The handshake needs the engine's certificate and the offer's fingerprint. Both are bound
-        // here, once, and carried to the answer and to the handshake plan below.
-        let dtls_keys = if dtls_leg {
-            let Some(certificate) = self.dtls_certificate.clone() else {
-                self.free(&[endpoint]).await;
-                return error_result("conference_join", &"engine has no DTLS certificate");
-            };
-            let Some(peer_fingerprint) = info.fingerprint.clone() else {
-                self.free(&[endpoint]).await;
-                return error_result(
-                    "conference_join",
-                    &"UDP/TLS/RTP/SAVPF offer without an a=fingerprint",
-                );
-            };
-            Some((certificate, peer_fingerprint))
-        } else {
-            None
-        };
-        let (secure, security) = if let Some((certificate, _)) = dtls_keys.as_ref() {
-            // The answer advertises the engine's fingerprint and the answerer's DTLS role for the
-            // offerer's `a=setup` (RFC 4145 §4.1, RFC 5763 §5).
-            let (setup, _) = super::negotiate::answerer_dtls_setup(info.setup, None);
-            (
-                None,
-                Some(SecurityAdvertisement::Dtls {
-                    fingerprint: sdp::Fingerprint {
-                        hash_function: certificate.fingerprint().hash_function,
-                        bytes: certificate.fingerprint().bytes,
-                    },
-                    setup,
-                    // A seat is a new association each time it joins; the offer's `a=tls-id` is not
-                    // yet answered here.
-                    tls_id: None,
-                }),
-            )
-        } else if info.secure {
-            let Some(remote) = info.crypto.first().copied() else {
-                self.free(&[endpoint]).await;
-                return error_result(
-                    "conference_join",
-                    &"RTP/SAVP offer without a usable a=crypto",
-                );
-            };
-            // Under the accepted line's tag and suite (RFC 4568 §5.1.2).
-            let local = match CryptoAttribute::answer_to(&remote) {
-                Ok(local) => local,
-                Err(error) => {
-                    self.free(&[endpoint]).await;
-                    return error_result("conference_join: generate SDES key", &error);
-                }
-            };
-            (
-                Some(SecureLeg::new(&local.key, &remote.key)),
-                Some(SecurityAdvertisement::Secure(local)),
-            )
-        } else {
-            (None, None)
-        };
+        let endpoint = transport.endpoint;
         let SeatText {
             config: text_config,
             rewrite: text_rewrite,
             endpoint: text_endpoint,
         } = match self
-            .anchor_seat_text(&info, profile, family, bind, endpoint, advertised)
+            .anchor_seat_text(
+                &info,
+                profile,
+                transport.family,
+                transport.bind,
+                endpoint,
+                transport.advertised,
+            )
             .await
         {
             Ok(text) => text,
@@ -473,11 +316,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     codec: seat,
                     telephone_event,
                     endpoint,
-                    remote_rtp: seat_remote,
-                    accepted_source,
-                    secure,
-                    secure_pending: dtls_leg,
-                    ice_pending,
+                    remote_rtp: transport.seat_remote,
+                    accepted_source: transport.accepted_source,
+                    secure: transport.secure.take(),
+                    secure_pending: transport.dtls_pending(),
+                    ice_pending: transport.ice_pending,
                     text: text_config,
                     text_endpoint,
                     role,
@@ -492,99 +335,35 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return error_result("conference_join", &refusal);
         }
 
-        // A DTLS seat needs the handshake in front of its endpoint: the bridge keeps the RFC 7983
-        // demux (DTLS records drive the handshake) and forwards accepted media to the room actor
-        // still encrypted, which decrypts it on the seat's own `SecureLeg` once keyed. The seat was
-        // taken `secure_pending`, so until then it is neither mixed nor sent to.
-        if let Some((certificate, peer_fingerprint)) = dtls_keys {
-            // The role matching the `a=setup` advertised in the answer above (RFC 4145 §4.1, RFC 5763
-            // §5).
-            let (_, role) = super::negotiate::answerer_dtls_setup(info.setup, None);
-            if let Err(error) = self
-                .datapath
-                .install_flow(endpoint.id, FlowAction::Redirect)
-            {
-                self.conference.leave(conference_id, &from_tag);
-                self.stop_seat_ice_follow(&[endpoint.id]);
-                let mut to_free = vec![endpoint];
-                to_free.extend(text_endpoint);
-                if let Some(text_endpoint) = text_endpoint {
-                    self.endpoint_calls.remove(&text_endpoint.id);
-                    self.awaiting_media.remove(&text_endpoint.id);
-                }
-                self.free(&to_free).await;
-                return error_result("conference_join: install DTLS redirect", &error);
+        // A DTLS seat needs the handshake in front of its endpoint; it was taken `secure_pending`,
+        // so until the handshake keys it, it is neither mixed nor sent to.
+        let dtls_target = crate::dtls_bridge::PipelineTarget::Conference {
+            conference: self.conference.clone(),
+            conference_id: conference_id.to_string(),
+            tag: from_tag.clone(),
+        };
+        if let Err(error) = self.start_seat_dtls(&transport, &info, dtls_target) {
+            self.conference.leave(conference_id, &from_tag);
+            self.stop_seat_ice_follow(&[endpoint.id]);
+            let mut to_free = vec![endpoint];
+            to_free.extend(text_endpoint);
+            if let Some(text_endpoint) = text_endpoint {
+                self.endpoint_calls.remove(&text_endpoint.id);
+                self.awaiting_media.remove(&text_endpoint.id);
             }
-            // The seat's validated source as the datapath publishes it: a full agent's selection, or
-            // the source of the check the ice-lite responder authenticated. `None` without ICE.
-            let ice_validated = self.datapath.watch_ice_validated(endpoint.id);
-            self.dtls_bridge().register_for_pipeline(
-                DtlsCallPlan {
-                    // A conference seat is one muxed endpoint; the "plain" side is unused in
-                    // pipeline mode (the room owns egress), so it mirrors the secure one.
-                    plain_endpoint: endpoint.id,
-                    plain_source: accepted_source,
-                    plain_dst: seat_remote,
-                    secure_endpoint: endpoint.id,
-                    secure_source: accepted_source,
-                    secure_dst: seat_remote,
-                    secure_local: endpoint.local_addr,
-                    certificate,
-                    role,
-                    peer_fingerprint: DtlsFingerprint::new(
-                        peer_fingerprint.hash_function,
-                        peer_fingerprint.bytes,
-                    ),
-                    // RFC 8445 §12, §12.1.1: a DTLS-SRTP seat keys the transport ICE chose. A full
-                    // agent's selection and an ice-lite responder's validated check both arrive
-                    // through `ice_validated`, so the handshake waits for either and its records
-                    // follow it; a seat without ICE starts at once, since nothing would release it.
-                    gate_on_ice: ice_pending || ice_validated.is_some(),
-                    ice_validated,
-                    plain_rtcp: None,
-                },
-                crate::dtls_bridge::PipelineTarget::Conference {
-                    conference: self.conference.clone(),
-                    conference_id: conference_id.to_string(),
-                    tag: from_tag.clone(),
-                },
-            );
+            self.free(&to_free).await;
+            return error_result("conference_join: install DTLS redirect", &error);
         }
 
-        // Answer: advertise the engine endpoint (the interface's advertised IP), keep the participant's
-        // codec, sendrecv, and (for a secure leg) RTP/SAVP + the engine's a=crypto.
-        let engine = EngineMedia {
-            rtp: endpoint.local_addr,
-            rtcp: None,
-            advertised_ip: advertised,
-        };
-        // A conference leg is always RTP/RTCP-muxed onto the one participant endpoint; the mux
-        // presentation mirrors the participant's offer (`None`) — the `rtcp-mux` directive is an
-        // offer/answer relay concern, not a conference one.
-        //
-        // ICE (RFC 8839 §5): re-originate with our own credentials and gathered candidates when we
-        // minted them; say `a=ice-mismatch` when the offer's ICE was altered in transit, so the peer
-        // stops waiting for checks that will never come; strip on `ICE=remove`; else pass through.
-        // `text_rewrite` anchors (or declines) the participant's `m=text` section
-        // (RFC 9071 multiparty RTT) resolved above.
-        let ice_rewrite = match (ice_creds.as_ref(), ice_directive(profile)) {
-            (Some(creds), _) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
-                ufrag: creds.ufrag.as_str(),
-                pwd: creds.pwd.as_str(),
-                candidates: &ice_candidates,
-            }),
-            (None, _) if ice_mismatch => IceRewrite::Mismatch,
-            (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
-            (None, _) => IceRewrite::Keep,
-        };
-        match sdp::rewrite(
+        // Answer: the engine endpoint (the interface's advertised IP), the participant's codec,
+        // sendrecv, and for a secure leg RTP/SAVP + the engine's a=crypto. `text_rewrite` anchors (or
+        // declines) the participant's `m=text` section (RFC 9071 multiparty RTT) resolved above.
+        match self.answer_seat_sdp(
             sdp,
-            engine,
-            ice_rewrite,
-            security,
-            None,
+            &mut transport,
+            profile,
             text_rewrite,
-            ImageRewrite::None,
+            Some(&sdp::OwnSsrc::with_random_cname(egress_ssrc)),
         ) {
             // RFC 3264 §6: the room is the answerer, and it mixes audio and the text it anchored.
             // Every other stream the participant offered is declined with port 0, and the audio is
@@ -595,13 +374,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // its receive stream to its own SSRC and drop the whole mix. It names the SSRC the room
             // sends instead (RFC 5576 §4.1, RFC 8830 §2).
             Ok(rewritten) => ok_sdp(
-                sdp::own_stream_identity(
-                    &sdp::force_answer_codec(
-                        &sdp::decline_unanswered_media(rewritten.sdp, text_rewrite.is_anchored()),
-                        &codec,
-                        telephone_event,
-                    ),
-                    Some(&sdp::OwnSsrc::with_random_cname(egress_ssrc)),
+                sdp::force_answer_codec(
+                    &sdp::decline_unanswered_media(rewritten, text_rewrite.is_anchored()),
+                    &codec,
+                    telephone_event,
                 ),
                 Some(from_tag),
             ),
