@@ -9,10 +9,24 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **Forwarding rooms for push-to-talk group calls (`forward_join`, `forward_leave`,
+  `forward_set_source`; `node_info` feature `forward_room`).** A room forwards one chosen source seat's
+  RTP to every other seat through a per-receiver RTP translator (RFC 3550 §7), payload unchanged: no
+  mixing, no jitter buffer, no media tick, up to 1000 seats. The first seat fixes the room codec
+  (name, clock rate, channels and, for AMR, `octet-align`, which changes the payload layout, RFC 4867
+  §4.4); it needs no encoder or decoder, so AMR-WB forwards without the `amr` feature. Each receiver
+  keeps one SSRC with continuous sequence and timestamp across talker changes, the marker on the first
+  packet of each run. Telephone-event is forwarded between seats that negotiated it at the same clock
+  rate. Seat RTCP is consumed, never relayed, and each seat gets a Sender Report every 5 s. A seat is
+  never freed for silence, because a listener sends nothing while others talk; the media-timeout sweep
+  raises `forward_seat_inactive` once instead. The per-seat ingress chain (source gate, latch, SRTP,
+  DTLS and ICE gates) is now shared with the mixing conference. Fan-out costs about 18 ns per
+  forwarded packet, allocation-free (`benches/forward_fanout_bench.rs`, `docs/cookbook/forwarding.md`).
+
 - **Control contract for push-to-talk forwarding rooms and RTCP APP (`siphon-rtp-proto`).** These
   are the wire types only, so a controller can build against them. The engine refuses every new verb
   by name (`unsupported command: forward_join`) until it serves it, and `node_info` advertises
-  nothing new yet.
+  a feature only for the verbs it serves.
   - Verbs: `forward_join`, `forward_offer`, `forward_answer`, `forward_leave` and
     `forward_set_source`. Like the other room verbs they take no `scope`.
   - `send_rtcp_app` is addressed by `call_id` + `from_tag`, by a room seat, or to a whole room with
