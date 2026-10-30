@@ -7,6 +7,109 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [0.16.0] — 2026-10-30
 
+### Added
+
+- **MCPTT floor control over a WebRTC data channel, for a browser seat (`node_info` feature
+  `webrtc_floor_channel`).** A browser cannot send RTCP APP, so `forward_join` and `answer_local` now answer an
+  `m=application <port> UDP/DTLS/SCTP webrtc-datachannel` section (RFC 8841) that is bundled with a DTLS-SRTP
+  audio section, on the audio's own port, and carry the floor on a channel the browser opens labelled
+  `mcptt-floor`. SCTP (RFC 9260) and DCEP (RFC 8832) run inside the seat's existing DTLS association (RFC 8261,
+  RFC 8831), so there is no new UDP ingress; the DTLS driver of the leg owns the association. One floor message
+  is one binary message encoded as the RTCP APP packet itself, raised as the same `rtcp_app` event and sent by
+  the same `send_rtcp_app` (`stream: "floor"`). TS 24.380 has no WebRTC binding: the convention is ours. A
+  data channel on a non-DTLS leg or outside the bundle is declined, and the two-party `offer` / `answer` pair
+  does not answer one yet. New dependencies `rtc-sctp` and `rtc-datachannel` (`docs/supply-chain.md`). About
+  1.2 µs per message each way (`benches/floor_channel_bench.rs`, `docs/cookbook/forwarding.md`).
+
+- **Dial-out, transcoding and a whole-room backstop for forwarding rooms (`forward_offer`,
+  `forward_answer`; `node_info` features `forward_dialout`, `forward_transcode`; `--forward-room-idle-secs`).**
+  `forward_offer` offers a pending seat to a member the room calls out to (the room's codec first with its
+  format parameters, then the codecs the engine can transcode to it; every codec a room could carry for a
+  new room; an anchored MCPTT floor section with `floor_fmtp`), and `forward_answer` seats it as
+  `forward_join` does. A seat in another codec than the room's is no longer refused: the room decodes the
+  source once per packet and encodes once per codec group, each seat getting its own SSRC, sequence and
+  timestamps (AMR needs the `amr` feature, and the refusal names the build when it lacks it; the seat's
+  packetization interval must be the room's). A room in which every seat has received nothing for
+  `--forward-room-idle-secs` (default 3600, `0` off) is freed with one `media_timeout` per seat.
+  `conference_offer` and `forward_offer` now refuse an id that names the other kind of room.
+  A 100-seat room over two codec groups costs about 175 µs per inbound packet, allocation-free
+  (`benches/forward_transcode_bench.rs`, `docs/cookbook/forwarding.md`).
+
+- **Forwarding rooms for push-to-talk group calls (`forward_join`, `forward_leave`,
+  `forward_set_source`; `node_info` feature `forward_room`).** A room forwards one chosen source seat's
+  RTP to every other seat through a per-receiver RTP translator (RFC 3550 §7), payload unchanged: no
+  mixing, no jitter buffer, no media tick, up to 1000 seats. The first seat fixes the room codec
+  (name, clock rate, channels and, for AMR, `octet-align`, which changes the payload layout, RFC 4867
+  §4.4); it needs no encoder or decoder, so AMR-WB forwards without the `amr` feature. Each receiver
+  keeps one SSRC with continuous sequence and timestamp across talker changes, the marker on the first
+  packet of each run. Telephone-event is forwarded between seats that negotiated it at the same clock
+  rate. Seat RTCP is consumed, never relayed, and each seat gets a Sender Report every 5 s. A seat is
+  never freed for silence, because a listener sends nothing while others talk; the media-timeout sweep
+  raises `forward_seat_inactive` once instead. The per-seat ingress chain (source gate, latch, SRTP,
+  DTLS and ICE gates) is now shared with the mixing conference. Fan-out costs about 18 ns per
+  forwarded packet, allocation-free (`benches/forward_fanout_bench.rs`, `docs/cookbook/forwarding.md`).
+
+- **MCPTT floor-control stream and RTCP APP on forwarding-room seats (`send_rtcp_app`, `rtcp_app`;
+  `node_info` features `mcptt_floor`, `rtcp_app`).** An offered `m=application <port> udp MCPTT`
+  section is anchored on its own engine endpoint instead of declined, and answered with
+  `a=fmtp:MCPTT <profile.floor_fmtp>` verbatim (3GPP TS 24.380 §14.3.1; a line break in it refuses the
+  join). Every RTCP APP packet read from the floor stream or out of a seat's audio RTCP becomes one
+  `rtcp_app` event, in arrival order, and is never forwarded to another seat. The floor stream has no SSRC,
+  so it is gated by the signalled source plus a learn-once latch (`docs/security-and-nat.md` Layer 5h);
+  floor traffic counts as seat activity. `send_rtcp_app` builds the packet and sends it to one seat or
+  to every seat but `except_from_tags`, and answers `ok` only after the datapath took it for every
+  addressed seat. `rtcp_app` events travel in their own 4096-deep queue per controller that drops the
+  oldest on overflow with an `error!` and counts it in the new `statistics.rtcp_app_dropped_total`
+  (`siphon_rtp_rtcp_app_dropped_total` on `/metrics`; additive, absent from the wire when zero). The floor
+  stream is plain: media control security (TS 24.380 §13) is not negotiated. A floor message costs about
+  140 ns from the wire to its event, and a room-wide send to 500 seats about 3.5 µs, allocation-free
+  (`benches/forward_floor_bench.rs`).
+
+- **The MCPTT floor-control stream on two-party calls.** `offer`, `answer` and `answer_local` anchor an
+  offered or answered `m=application <port> udp MCPTT` on an engine endpoint per party, with
+  `a=fmtp:MCPTT <profile.floor_fmtp>` verbatim. The stream is terminated, never relayed between the
+  parties: what a party sends arrives as `rtcp_app` with `call_id` and the leg's `from_tag`, and
+  `send_rtcp_app` with `call_id` + `from_tag` sends to that leg (the leg's own SSRC when none is named).
+  The endpoints are `Redirect`, so it works whatever carries the call's audio, and they are freed with
+  the call and kept through a re-offer. APP parts in a party's audio RTCP are reported as `rtcp_app` on
+  the audio stream wherever the userspace media pipeline terminates that RTCP, and the compound is still
+  relayed unchanged. A call with a floor stream cannot be checkpointed.
+
+- **Control contract for push-to-talk forwarding rooms and RTCP APP (`siphon-rtp-proto`).** These
+  are the wire types only, so a controller can build against them. The engine refuses every new verb
+  by name (`unsupported command: forward_join`) until it serves it, and `node_info` advertises
+  a feature only for the verbs it serves.
+  - Verbs: `forward_join`, `forward_offer`, `forward_answer`, `forward_leave` and
+    `forward_set_source`. Like the other room verbs they take no `scope`.
+  - `send_rtcp_app` is addressed by `call_id` + `from_tag`, by a room seat, or to a whole room with
+    `except_from_tags`.
+  - Events: `rtcp_app`, `forward_source_started` and `forward_seat_inactive`.
+  - `profile.floor_fmtp` carries the `a=fmtp:MCPTT` parameters (3GPP TS 24.380 §14) verbatim.
+  - Payloads are strict base64 (RFC 4648 §4).
+  - A forwarding seat is never reaped for silence, because a push-to-talk listener sends nothing
+    while others talk. It is reported as `forward_seat_inactive` instead.
+
+- **RTCP APP packets can be read and built (RFC 3550 §6.7).** This is groundwork for MCPTT floor
+  control (3GPP TS 24.380 §8), which sends each floor message as a standalone APP packet, never in
+  a compound, with several messages allowed in one datagram (§8.1.1). The compound parser kept only
+  the packet type of an APP packet. `rtcp::app_packets` now reads every APP packet in a datagram,
+  without allocating, and keeps the 5-bit subtype whole so the MCPTT acknowledgement bit survives.
+  `rtcp::write_app` builds one into a caller buffer. Application data that is not a whole number of
+  32-bit words is refused rather than padded, because its field coding (§8.1.3) belongs to the
+  caller. Nothing is wired to the control protocol yet.
+
+- `siphon-rtp-media::translator::Translator`: a per-receiver RTP translator (RFC 3550 §7.1/§7.2) for
+  one-to-many forwarding. One stable egress SSRC per receiver; sequence numbers and timestamps stay
+  continuous across talker changes, the marker bit is set on the first packet of each run, in-source
+  loss is preserved, late packets of the previous source are dropped. Payload is copied unchanged;
+  CSRCs and the header extension are dropped, padding is kept. Exposes SR counters.
+
+### Changed
+
+- **`rtc-dtls`, `rtc-shared` and `rtc-crypto` move to crates.io 0.21.1; the last-flight fork is retired.** The
+  RFC 6347 §4.2.4 last-flight retransmission fix landed upstream (webrtc-rs/rtc#243) and ships in
+  0.21.1, so the `[patch.crates-io]` git entries and the `allow-git` exception in `deny.toml` are gone.
+
 ### Fixed
 
 - **A WebRTC participant in a conference hears the room.** A seat's answer is written from the
@@ -17,6 +120,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   the participant, and the participant heard nothing. The answer now drops all of those lines and
   names the SSRC the room really sends (`a=ssrc:<ssrc> cname:<cname>`). `answer_local` drops them
   too, and names no SSRC of its own.
+  A forwarding-room seat's answer (`forward_join`) drops them the same way and names the SSRC the
+  room forwards to the seat.
 - **An event raised just after a control reconnect reaches the new connection.** A reconnect gives
   the new connection a receiver on the same event channel as the one it replaces, and until the old
   connection's loop noticed it was superseded it was a second consumer. Woken with its eviction,

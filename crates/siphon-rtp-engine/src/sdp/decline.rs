@@ -5,6 +5,8 @@
 //! answerer has no far party, so the same copy would hand the offer's own section back as the answer
 //! to it.
 
+use super::data_channel::is_data_channel_media_line;
+use super::floor::is_floor_media_line;
 use super::{parse_media_line, rewrite_media_line, MediaKind, TextRewrite, CRLF};
 
 impl TextRewrite {
@@ -39,8 +41,37 @@ impl TextRewrite {
 /// so they are left in place rather than edited.
 #[must_use]
 pub fn decline_unanswered_media(sdp: String, text_answered: bool) -> String {
+    decline_unanswered_streams(sdp, text_answered, false)
+}
+
+/// [`decline_unanswered_media`] for an answer that may also carry the MCPTT floor-control stream:
+/// with `floor_answered` the first live `m=application … udp MCPTT` section is the one the engine
+/// anchored ([`super::anchor_floor`]) and stays; any further floor section is declined like every
+/// other stream the engine did not answer.
+#[must_use]
+pub fn decline_unanswered_streams(
+    sdp: String,
+    text_answered: bool,
+    floor_answered: bool,
+) -> String {
+    decline_unanswered_with_data_channel(sdp, text_answered, floor_answered, false)
+}
+
+/// [`decline_unanswered_streams`] for an answer that may also carry the WebRTC data channel
+/// (`m=application … UDP/DTLS/SCTP webrtc-datachannel`, RFC 8841): with `data_channel_answered` the
+/// first live data channel section is the one the engine anchored ([`super::anchor_data_channel`])
+/// and stays; any further one is declined like every other stream the engine did not answer.
+#[must_use]
+pub fn decline_unanswered_with_data_channel(
+    sdp: String,
+    text_answered: bool,
+    floor_answered: bool,
+    data_channel_answered: bool,
+) -> String {
+    let mut data_channel_seen = false;
     let mut audio_seen = false;
     let mut text_seen = false;
+    let mut floor_seen = false;
     // Each line to replace, with its replacement. Empty, and so unallocated, for an audio-only answer.
     let mut declined: Vec<(usize, String)> = Vec::new();
     for (index, raw_line) in sdp.split('\n').enumerate() {
@@ -57,6 +88,16 @@ pub fn decline_unanswered_media(sdp: String, text_answered: bool) -> String {
             MediaKind::Text if !text_seen && port.is_some() => {
                 text_seen = true;
                 text_answered
+            }
+            MediaKind::Other if data_channel_answered && is_data_channel_media_line(value) => {
+                let first = !data_channel_seen && port.is_some_and(|port| port != 0);
+                data_channel_seen |= first;
+                first
+            }
+            MediaKind::Other if floor_answered && is_floor_media_line(value) => {
+                let first = !floor_seen && port.is_some_and(|port| port != 0);
+                floor_seen |= first;
+                first
             }
             _ => false,
         };
@@ -170,6 +211,40 @@ mod tests {
     }
 
     #[test]
+    fn an_answered_data_channel_stays_and_a_second_one_is_declined() {
+        // RFC 8841: the engine answers one data channel section; with `data_channel_answered` the
+        // first live one is kept and any further one is declined like every other unanswered stream.
+        let offer = offer_with_sections(&[
+            "m=application 20100 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+            "m=application 20200 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+        ]);
+        let answer = decline_unanswered_with_data_channel(offer, false, false, true);
+        assert_eq!(
+            media_lines(&answer),
+            vec![
+                "m=audio 20100 RTP/AVP 0",
+                "m=application 20100 UDP/DTLS/SCTP webrtc-datachannel",
+                "m=application 0 UDP/DTLS/SCTP webrtc-datachannel",
+            ],
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn a_data_channel_is_declined_unless_the_caller_answered_it() {
+        let offer =
+            offer_with_sections(&["m=application 20100 UDP/DTLS/SCTP webrtc-datachannel\r\n"]);
+        let answer = decline_unanswered_with_data_channel(offer, false, false, false);
+        assert_eq!(
+            media_lines(&answer),
+            vec![
+                "m=audio 20100 RTP/AVP 0",
+                "m=application 0 UDP/DTLS/SCTP webrtc-datachannel",
+            ]
+        );
+    }
+
+    #[test]
     fn a_second_audio_stream_is_declined_and_the_first_kept() {
         // The engine anchors one audio stream, the first. A second one was copied back at the
         // offerer with the offerer's own port, exactly as a video section was.
@@ -255,6 +330,31 @@ mod tests {
         assert!(TextRewrite::AnchorSecure { engine, crypto }.is_anchored());
         assert!(!TextRewrite::Decline.is_anchored());
         assert!(!TextRewrite::None.is_anchored());
+    }
+
+    #[test]
+    fn the_anchored_floor_stream_is_kept_and_any_other_is_declined() {
+        let answer = offer_with_sections(&[
+            "m=application 30002 udp MCPTT\r\na=fmtp:MCPTT mc_granted\r\n",
+            "m=application 30004 udp MCPTT\r\n",
+            "m=application 30006 udp t38\r\n",
+        ]);
+        let kept = decline_unanswered_streams(answer.clone(), false, true);
+        assert_eq!(
+            media_lines(&kept),
+            [
+                "m=audio 20100 RTP/AVP 0",
+                "m=application 30002 udp MCPTT",
+                "m=application 0 udp MCPTT",
+                "m=application 0 udp t38",
+            ]
+        );
+        // Without an anchored floor stream every application section is declined, as before.
+        let declined = decline_unanswered_streams(answer.clone(), false, false);
+        assert_eq!(declined, decline_unanswered_media(answer, false));
+        assert!(media_lines(&declined)[1..]
+            .iter()
+            .all(|line| line.contains(" 0 ")));
     }
 
     #[test]

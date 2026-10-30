@@ -159,6 +159,9 @@ pub struct FileConfig {
     /// Reap a call that has never carried a packet — one still in setup — after this many seconds;
     /// `0` disables it (`--setup-timeout-secs`).
     pub setup_timeout_secs: Option<u64>,
+    /// Free a forwarding room in which every seat has received nothing for this many seconds;
+    /// `0` disables it (`--forward-room-idle-secs`).
+    pub forward_room_idle_secs: Option<u64>,
     /// Bounded SIGTERM/SIGINT drain grace period, seconds (`--shutdown-grace-secs`).
     pub shutdown_grace_secs: Option<u64>,
     /// STUN servers asked for a server-reflexive ICE candidate when gathering (`--stun-server`).
@@ -318,6 +321,7 @@ mod tests {
             "media_timeout_secs = 45\n",
             "held_media_timeout_secs = 3600\n",
             "setup_timeout_secs = 240\n",
+            "forward_room_idle_secs = 1800\n",
             "shutdown_grace_secs = 30\n",
             "turn_udp = \"0.0.0.0:3478\"\n",
             "turn_tcp = \"0.0.0.0:3478\"\n",
@@ -365,6 +369,7 @@ mod tests {
         assert_eq!(config.amr_mode_request, None);
         assert_eq!(config.amr_wb_mode_request, Some(2));
         assert_eq!(config.setup_timeout_secs, Some(240));
+        assert_eq!(config.forward_room_idle_secs, Some(1800));
         assert_eq!(config.shutdown_grace_secs, Some(30));
         assert_eq!(
             config.turn_tls_cert.as_deref(),

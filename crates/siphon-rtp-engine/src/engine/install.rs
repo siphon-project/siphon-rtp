@@ -519,6 +519,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .media_call(directions)
             .with_far_secure_leg(leg)
             .with_rtcp_relays(rtcp_relays);
+        let call = call.with_app_events(self.call_app_queue(wiring.call_id));
         self.media
             .register(call, self.datapath.clone(), owner_events);
         Ok(())
@@ -608,6 +609,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None => call.with_near_secure_leg(near_leg),
         }
         .with_rtcp_relays(rtcp_relays);
+        let call = call.with_app_events(self.call_app_queue(wiring.call_id));
         self.media
             .register(call, self.datapath.clone(), owner_events);
         Ok(())
@@ -666,6 +668,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
         let call = wiring.media_call(directions);
+        let call = call.with_app_events(self.call_app_queue(wiring.call_id));
         self.media
             .register(call, self.datapath.clone(), owner_events);
         Ok(())

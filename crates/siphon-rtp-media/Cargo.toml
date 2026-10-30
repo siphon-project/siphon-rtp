@@ -58,6 +58,10 @@ name = "qos_bench"
 harness = false
 
 [[bench]]
+name = "rtcp_app_bench"
+harness = false
+
+[[bench]]
 name = "pcap_bench"
 harness = false
 
@@ -75,6 +79,11 @@ harness = false
 
 [[bench]]
 name = "text_mixer_bench"
+harness = false
+
+# Per-receiver RTP translator rewrite cost, single and 500-receiver fan-out.
+[[bench]]
+name = "translator_bench"
 harness = false
 
 [lints]

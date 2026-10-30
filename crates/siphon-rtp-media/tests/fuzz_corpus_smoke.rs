@@ -30,6 +30,9 @@ fn drive(bytes: &[u8]) {
     let _ = RtpPacket::parse(bytes);
     let _ = rtcp::parse_compound(bytes);
     let _ = rtcp::demux(bytes);
+    for app in rtcp::app_packets(bytes) {
+        let _ = app;
+    }
 }
 
 #[test]
@@ -45,6 +48,11 @@ fn crafted_malformed_datagrams_never_panic() {
         &[0x80, 200, 0xFF, 0xFF, 0, 0, 0, 0],           // SR claiming 0xFFFF length words
         &[0x80, 201, 0x00, 0x00],                       // RR length-words=0 (packet_len=4)
         &[0x81, 202, 0x00, 0x01, 0, 0, 0, 0],           // SDES (Other)
+        &[0x80, 204, 0x00, 0x01, 0, 0, 0, 0],           // APP with no room for its name
+        &[0xA0, 204, 0x00, 0x02, 0, 0, 0, 0, b'M', b'C', b'P', 0xFF], // APP, pad count > data
+        &[
+            0x80, 204, 0x00, 0x02, 0, 0, 0, 0, b'M', b'C', b'P', b'T', 0x80, 204, 0xFF, 0xFF,
+        ], // APP then an overrun
     ];
     for sample in samples {
         for end in 0..=sample.len() {

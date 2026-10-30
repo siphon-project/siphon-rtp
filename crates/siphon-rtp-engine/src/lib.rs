@@ -14,6 +14,8 @@
 //! it, so the stable workspace and `cargo test` never touch nightly/eBPF.
 #![forbid(unsafe_code)]
 
+pub mod app_events;
+pub mod call_floor;
 pub mod cluster;
 pub mod conference;
 pub mod config;
@@ -21,6 +23,8 @@ pub mod daemon;
 pub mod dtls_bridge;
 mod dtls_session;
 pub mod engine;
+pub mod floor_channel;
+pub mod forward;
 pub mod ha;
 pub mod healthcheck;
 pub mod hep_export;
@@ -35,6 +39,7 @@ pub mod prompt_cache;
 pub mod recording;
 mod reply_latch;
 pub mod sdp;
+mod seat_gate;
 pub mod server;
 pub mod shutdown;
 pub mod srtp_bridge;

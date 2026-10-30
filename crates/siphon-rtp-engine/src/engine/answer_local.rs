@@ -20,8 +20,8 @@ use super::negotiate::{
 };
 use super::takeover::{ws_takeover_media_address, WsBridgeProcessing, WsBridgeSetup};
 use super::{
-    error_result, ok_sdp, unknown_call, Call, CallerMediaLeg, ClientId, Engine, Leg, PipelineKind,
-    PromoteMode, PromotionReason,
+    boxed_error_result, error_result, ok_sdp, unknown_call, Call, CallerMediaLeg, ClientId, Engine,
+    Leg, PipelineKind, PromoteMode, PromotionReason,
 };
 
 /// What bridging a single-leg answer to a WebSocket server reads: the negotiated codec and SDP,
@@ -95,6 +95,56 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }));
         }
         Ok(true)
+    }
+
+    /// The engine's own keying for a secure takeover leg — its SDES key (RFC 4568) or its
+    /// certificate fingerprint plus the complement of the offerer's `a=setup` (RFC 5763 §5). The
+    /// SDES key is returned too, so the `SecureLeg` encrypts egress with exactly the key this answer
+    /// told the peer to decrypt with. On an error the call's `endpoints` are freed.
+    async fn local_answer_keying(
+        &self,
+        offerer_security: &WsTakeoverSecurity,
+        endpoints: &[siphon_rtp_datapath::Endpoint],
+    ) -> Result<(Option<SecurityAdvertisement>, Option<CryptoAttribute>), Box<CmdResult>> {
+        Ok(match offerer_security {
+            WsTakeoverSecurity::Plain => (None, None),
+            // Under the tag and suite of the offer line accepted (RFC 4568 §5.1.2).
+            WsTakeoverSecurity::Sdes { peer_key } => match CryptoAttribute::answer_to(peer_key) {
+                Ok(local) => (Some(SecurityAdvertisement::Secure(local)), Some(local)),
+                Err(error) => {
+                    self.free(endpoints).await;
+                    return Err(boxed_error_result(
+                        "answer_local: generate SDES key",
+                        &error,
+                    ));
+                }
+            },
+            WsTakeoverSecurity::Dtls { peer_setup, .. } => {
+                let Some(certificate) = self.dtls_certificate.as_ref() else {
+                    self.free(endpoints).await;
+                    return Err(boxed_error_result(
+                        "answer_local",
+                        &"ws-takeover-unkeyable: engine has no DTLS certificate",
+                    ));
+                };
+                // The answerer's `a=setup` for the offerer's (RFC 4145 §4.1, RFC 5763 §5): an
+                // `active` offerer, or one that sent no `a=setup`, makes the engine passive (the DTLS
+                // server); `passive` or `actpass` makes it active.
+                let (setup, _) = super::negotiate::answerer_dtls_setup(*peer_setup, None);
+                let fingerprint = certificate.fingerprint();
+                (
+                    Some(SecurityAdvertisement::Dtls {
+                        fingerprint: sdp::Fingerprint {
+                            hash_function: fingerprint.hash_function,
+                            bytes: fingerprint.bytes,
+                        },
+                        setup,
+                        tls_id: None,
+                    }),
+                    None,
+                )
+            }
+        })
     }
 
     /// Tear down the single-leg call a re-answer replaces — the same end-of-call path as `delete`,
@@ -180,6 +230,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // Neither a single-leg local answer nor a conference seat relays fax.
                     image: None,
                     image_remote: None,
+                    floor: None,
+                    floor_remote: None,
                 },
                 // No B-facing leg, and never will be: this verb *is* the answer (see the allocation
                 // comment above). `answer` refuses to run on such a call rather than inventing one.
@@ -751,7 +803,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let near_rtp = near_endpoints[0];
         let near_rtcp = (!near_mux).then(|| near_endpoints[1]);
         let near_advertised = near_advertised_override.unwrap_or_else(|| near_rtp.local_addr.ip());
-        let endpoints: Vec<_> = near_endpoints.to_vec();
+        let mut endpoints: Vec<_> = near_endpoints.to_vec();
+        // The MCPTT floor stream, if the offer carries one: terminated on an endpoint of its own.
+        let local_floor = self
+            .anchor_local_floor(sdp, near_family, near_bind, &mut endpoints)
+            .await;
 
         // The answer goes back to the offerer and advertises the leg it was allocated for — the socket
         // the caller sends to, and the one the single-leg pipeline listens on.
@@ -765,41 +821,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // certificate fingerprint plus the complement of the offerer's `a=setup` (RFC 5763 §5). The
         // SDES key is kept so the `SecureLeg` below encrypts egress with exactly the key this answer
         // told the peer to decrypt with.
-        let (security, near_local_crypto) = match &offerer_security {
-            WsTakeoverSecurity::Plain => (None, None),
-            // Under the tag and suite of the offer line accepted (RFC 4568 §5.1.2).
-            WsTakeoverSecurity::Sdes { peer_key } => match CryptoAttribute::answer_to(peer_key) {
-                Ok(local) => (Some(SecurityAdvertisement::Secure(local)), Some(local)),
-                Err(error) => {
-                    self.free(&endpoints).await;
-                    return error_result("answer_local: generate SDES key", &error);
-                }
-            },
-            WsTakeoverSecurity::Dtls { peer_setup, .. } => {
-                let Some(certificate) = self.dtls_certificate.as_ref() else {
-                    self.free(&endpoints).await;
-                    return error_result(
-                        "answer_local",
-                        &"ws-takeover-unkeyable: engine has no DTLS certificate",
-                    );
-                };
-                // The answerer's `a=setup` for the offerer's (RFC 4145 §4.1, RFC 5763 §5): an
-                // `active` offerer, or one that sent no `a=setup`, makes the engine passive (the DTLS
-                // server); `passive` or `actpass` makes it active.
-                let (setup, _) = super::negotiate::answerer_dtls_setup(*peer_setup, None);
-                let fingerprint = certificate.fingerprint();
-                (
-                    Some(SecurityAdvertisement::Dtls {
-                        fingerprint: sdp::Fingerprint {
-                            hash_function: fingerprint.hash_function,
-                            bytes: fingerprint.bytes,
-                        },
-                        setup,
-                        tls_id: None,
-                    }),
-                    None,
-                )
-            }
+        let (security, near_local_crypto) = match self
+            .local_answer_keying(&offerer_security, &endpoints)
+            .await
+        {
+            Ok(keying) => keying,
+            Err(result) => return *result,
         };
         // ICE (RFC 8839 §5): re-originate with the engine's own credentials and gathered candidates
         // when the takeover leg runs an agent. The answer *is* the candidate list — there is no second
@@ -836,6 +863,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // Neither a single-leg local answer nor a conference seat relays fax.
                     image: None,
                     image_remote: None,
+                    floor: None,
+                    floor_remote: None,
                 };
                 let candidates = self.gather_leg_candidates(&leg, &config).await;
                 (candidates, Some(config))
@@ -881,7 +910,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
         // RFC 3264 §6: the engine is the answerer here, so every stream it does not carry is declined
         // with port 0 rather than handed back as the offer wrote it.
-        rewritten.sdp = sdp::decline_unanswered_media(rewritten.sdp, false);
+        // A DTLS caller that offered a WebRTC data channel (RFC 8841) carries its MCPTT floor on it.
+        let data_channel = matches!(offerer_security, WsTakeoverSecurity::Dtls { .. })
+            && sdp::parse_data_channel(sdp).is_some();
+        rewritten.sdp = self.present_local_floor(
+            rewritten.sdp,
+            local_floor,
+            near_advertised,
+            profile,
+            data_channel,
+        );
         // rtpengine `replace: [origin]`: hide the originator's real IP behind the engine's advertised
         // address (topology hiding).
         if profile.replace.iter().any(|field| field == "origin") {
@@ -894,6 +932,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.free(&endpoints).await;
             return refusal;
         }
+        let floor_channel_tag = from_tag.clone();
         self.register_local_call(
             client,
             call_id,
@@ -904,6 +943,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &info,
             profile,
         );
+        if let Some(floor) = local_floor {
+            self.install_local_floor(call_id, profile, floor);
+        }
+        // The data channel's plan goes to the endpoint's DTLS driver before that driver is
+        // registered (below, in `key_local_pipeline` or the takeover).
+        if data_channel {
+            let plan = self.new_call_floor_channel(call_id, &floor_channel_tag, client);
+            self.dtls_bridge().attach_floor_channel(near_rtp.id, plan);
+        }
 
         // Pick the ONE negotiated codec (RFC 3264 §6.1). The candidate set is the offerer's own
         // offered audio codecs, in offer order, edited by the profile's codec policy with answer-side

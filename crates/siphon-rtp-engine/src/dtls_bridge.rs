@@ -27,6 +27,7 @@ use siphon_rtp_srtp::leg::{is_rtcp, PacketKind, SecureLeg};
 use tokio::task::JoinHandle;
 
 use crate::dtls_session::{spawn_session, DriverPlan, SessionOutcome};
+use crate::floor_channel::FloorChannelPlan;
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::plain_tap::{PlainTapSender, PlainTaps};
 use crate::x3::X3Tap;
@@ -108,6 +109,13 @@ pub enum PipelineTarget {
         conference_id: String,
         tag: String,
     },
+    /// A forwarding-room seat: the room actor forwards this member's source once its handshake keys
+    /// the seat.
+    Forward {
+        forward: Arc<crate::forward::ForwardRegistry>,
+        room_id: String,
+        tag: String,
+    },
     /// A WebSocket-**takeover** leg (`PipelineKind::Ws`): the WS media server is this leg's far side,
     /// so the leg's own [`crate::ws_bridge::WsSecureLeg`] decrypts its ingress and encrypts the
     /// bridge's downlink. Until the handshake keys it the registry drops ingress and refuses egress.
@@ -134,6 +142,7 @@ impl PipelineTarget {
         match self {
             Self::Call { media, .. } => media.dispatch(packet),
             Self::Conference { conference, .. } => conference.dispatch(packet),
+            Self::Forward { forward, .. } => forward.dispatch(packet),
             Self::Ws { ws, .. } => ws.dispatch(packet),
         }
     }
@@ -172,6 +181,17 @@ impl PipelineTarget {
                     leg: Box::new(leg),
                 },
             ),
+            Self::Forward {
+                forward,
+                room_id,
+                tag,
+            } => forward.control(
+                room_id,
+                crate::forward::ForwardControl::AttachSecureLeg {
+                    tag: tag.clone(),
+                    leg: Box::new(leg),
+                },
+            ),
             // No mailbox hop: the WS leg's crypto is shared state the registry writes synchronously,
             // so the key is in place before `keyed` is published and therefore before this bridge
             // releases the first media packet.
@@ -190,7 +210,7 @@ impl PipelineTarget {
                 call_id,
                 party,
             } => media.control(call_id, party.attach(leg)),
-            Self::Conference { .. } | Self::Ws { .. } => false,
+            Self::Conference { .. } | Self::Forward { .. } | Self::Ws { .. } => false,
         }
     }
 }
@@ -354,6 +374,10 @@ pub struct DtlsBridge<D: Datapath> {
     /// renegotiation, which rebuilds that actor, can re-key it with the same leg. Shared with the
     /// handshake task that fills it.
     pipeline_keys: Arc<DashMap<EndpointId, Arc<Mutex<SecureLeg>>>>,
+    /// Per secure endpoint, the WebRTC data channel (MCPTT floor) its association carries, when the
+    /// leg negotiated one. Set before the leg is registered, handed to every driver spawned for the
+    /// endpoint, and forgotten with the endpoint ([`Self::deregister`]).
+    floor_channels: DashMap<EndpointId, FloorChannelPlan>,
 }
 
 /// Dropping the bridge aborts every session it still owns, as per-call teardown does through
@@ -384,7 +408,15 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             destinations: DashMap::new(),
             associations: DashMap::new(),
             pipeline_keys: Arc::new(DashMap::new()),
+            floor_channels: DashMap::new(),
         }
+    }
+
+    /// Give the leg whose DTLS association will run on `secure_endpoint` a WebRTC data channel for the
+    /// MCPTT floor (RFC 8831 over RFC 8261). Call before registering the leg; the driver then runs an
+    /// SCTP association on the same DTLS association and does not retire it after the handshake.
+    pub fn attach_floor_channel(&self, secure_endpoint: EndpointId, plan: FloorChannelPlan) {
+        self.floor_channels.insert(secure_endpoint, plan);
     }
 
     /// Abort and forget the session currently owning `secure_endpoint` — the displaced half of a
@@ -597,6 +629,10 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             outcome: SessionOutcome::Relay {
                 secure: secure.clone(),
             },
+            floor_channel: self
+                .floor_channels
+                .get(&plan.secure_endpoint)
+                .map(|channel| channel.clone()),
         });
 
         // A new association can come with a different plain RTCP layout: drop the flow on a port the
@@ -722,6 +758,10 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 retained: self.pipeline_keys.clone(),
                 secure_endpoint: plan.secure_endpoint,
             },
+            floor_channel: self
+                .floor_channels
+                .get(&plan.secure_endpoint)
+                .map(|channel| channel.clone()),
         });
 
         self.flows.insert(
@@ -778,8 +818,22 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         for endpoint in endpoints {
             self.flows.remove(&endpoint);
             self.destinations.remove(&endpoint);
+            self.floor_channels.remove(&endpoint);
             self.retire(endpoint);
         }
+    }
+
+    /// DTLS driver tasks currently owned (one per live association): the leak soak reads it, and it
+    /// must drain to zero with the legs.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Legs holding a data channel plan; drains to zero with the legs, like [`Self::session_count`].
+    #[must_use]
+    pub fn floor_channel_count(&self) -> usize {
+        self.floor_channels.len()
     }
 
     /// Whether this bridge owns `endpoint` — the dispatcher's routing predicate.

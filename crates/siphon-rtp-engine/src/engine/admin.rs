@@ -72,6 +72,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 deletes_total: snapshot.deletes_total,
                 control_errors_total: snapshot.control_errors_total,
                 sessions: self.session_count() as u64,
+                rtcp_app_dropped_total: snapshot.rtcp_app_dropped_total,
             },
         }
     }
@@ -134,6 +135,27 @@ fn supported_features() -> Vec<String> {
         // `conference_seat`: a live call's leg seated in a room in place. A controller gates the
         // verb on this entry, so it is advertised only where the verb is served.
         "conference_seat".to_string(),
+        // Forwarding rooms for push-to-talk group calls: `forward_join`, `forward_leave` and
+        // `forward_set_source`. A controller gates the verbs on this entry, so it is advertised only
+        // where they are served.
+        "forward_room".to_string(),
+        // `forward_offer` / `forward_answer`: the room dials a member out (a group call's fan-out),
+        // on the same terms `conference_offer` / `conference_answer` dial out of a mixing room.
+        "forward_dialout".to_string(),
+        // A forwarding-room seat in another codec than the room's is transcoded for (decode once,
+        // encode once per codec group), where it used to be refused. A controller gates seating
+        // mixed-codec members on this entry.
+        "forward_transcode".to_string(),
+        // The MCPTT floor-control stream (`m=application <port> udp MCPTT`, 3GPP TS 24.380) is
+        // anchored on a forwarding-room seat, and RTCP APP packets travel both ways as
+        // `send_rtcp_app` / `rtcp_app`. Controllers gate floor control on these entries.
+        "mcptt_floor".to_string(),
+        "rtcp_app".to_string(),
+        // A browser seat's floor control runs over a WebRTC data channel labelled `mcptt-floor`
+        // (`m=application … UDP/DTLS/SCTP webrtc-datachannel`, RFC 8841), because a browser cannot
+        // send RTCP APP. The same `rtcp_app` / `send_rtcp_app` carry it. A controller gates offering
+        // the data channel to a browser on this entry.
+        "webrtc_floor_channel".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

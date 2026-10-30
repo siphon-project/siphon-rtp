@@ -46,10 +46,14 @@ use super::*;
 /// The default control client for tests that don't exercise per-client isolation.
 const CLIENT: ClientId = ClientId(1);
 
+mod call_floor;
 mod conference_dial_out;
 mod conference_received_from;
 mod conference_seat;
 mod conference_seat_call;
+mod forward_floor;
+mod forward_room;
+mod forward_stream_identity;
 mod offer_far;
 mod ogg_opus_recording;
 mod record_call_streams;
@@ -59,6 +63,7 @@ mod stream_identity;
 mod tee_sendonly;
 mod tee_undecodable;
 mod transcode_offer;
+mod webrtc_floor_channel;
 
 #[test]
 fn ws_vad_config_is_absent_unless_vad_or_barge_in_is_requested() {
@@ -382,6 +387,32 @@ fn command_call_id_extracts_the_addressed_correlation_key() {
         from_tag: "ft".into(),
     };
     assert_eq!(command_call_id(&leave), Some("room-1"));
+
+    // Forwarding-room verbs too; a send correlates on whichever of call or room it names.
+    let set_source = Command::ForwardSetSource {
+        conference_id: "group-1".into(),
+        from_tag: None,
+    };
+    assert_eq!(command_call_id(&set_source), Some("group-1"));
+    let send = |call_id: Option<&str>, conference_id: Option<&str>| Command::SendRtcpApp {
+        call_id: call_id.map(Into::into),
+        conference_id: conference_id.map(Into::into),
+        from_tag: None,
+        except_from_tags: Vec::new(),
+        stream: siphon_rtp_proto::RtcpAppStream::Floor,
+        ssrc: None,
+        name: "MCPT".into(),
+        subtype: 0,
+        payload: Vec::new(),
+    };
+    assert_eq!(
+        command_call_id(&send(Some("call-42"), None)),
+        Some("call-42")
+    );
+    assert_eq!(
+        command_call_id(&send(None, Some("group-1"))),
+        Some("group-1")
+    );
 
     // Census / health / cluster verbs address no specific call.
     assert_eq!(command_call_id(&Command::Ping), None);

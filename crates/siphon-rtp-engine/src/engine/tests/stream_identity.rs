@@ -5,11 +5,11 @@
 use super::*;
 
 /// The offerer's SSRC, as a browser would signal it.
-const OFFERER_SSRC: u32 = 2_712_110_744;
+pub(super) const OFFERER_SSRC: u32 = 2_712_110_744;
 
 /// A plain RTP offer carrying the stream identity and header extensions a browser signals (RFC 5576
 /// `a=ssrc`, RFC 8830 `a=msid`, RFC 8285 `a=extmap`), so the test needs no DTLS.
-fn browser_shaped_offer(rtp: SocketAddr) -> String {
+pub(super) fn browser_shaped_offer(rtp: SocketAddr) -> String {
     format!(
         "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nt=0 0\r\na=msid-semantic: WMS stream-a\r\n\
              m=audio {port} RTP/AVP 0\r\nc=IN IP4 {ip}\r\na=rtpmap:0 PCMU/8000\r\n\
@@ -22,7 +22,7 @@ fn browser_shaped_offer(rtp: SocketAddr) -> String {
 }
 
 /// The `a=ssrc` values an SDP names.
-fn signalled_ssrcs(sdp: &str) -> Vec<u32> {
+pub(super) fn signalled_ssrcs(sdp: &str) -> Vec<u32> {
     let mut ssrcs: Vec<u32> = sdp
         .lines()
         .filter_map(|line| line.strip_prefix("a=ssrc:"))
@@ -32,7 +32,7 @@ fn signalled_ssrcs(sdp: &str) -> Vec<u32> {
     ssrcs
 }
 
-fn assert_nothing_of_the_offerer(answer: &str) {
+pub(super) fn assert_nothing_of_the_offerer(answer: &str) {
     assert!(
         !answer.contains(&OFFERER_SSRC.to_string()),
         "the offerer's SSRC came back:\n{answer}"
