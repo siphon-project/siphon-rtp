@@ -116,6 +116,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
         let floor_endpoint = floor.as_ref().map(|(endpoint, _)| *endpoint);
+        let egress_ssrc = random_ssrc();
         let config = ForwardSeatConfig {
             tag: from_tag.clone(),
             endpoint: endpoint.id,
@@ -127,7 +128,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             secure: transport.secure.take(),
             secure_pending: transport.dtls_pending(),
             ice_pending: transport.ice_pending,
-            egress_ssrc: random_ssrc(),
+            egress_ssrc,
             // RFC 3550 §5.1: the initial sequence number and timestamp are random.
             initial_sequence: random_ssrc() as u16,
             initial_timestamp: random_ssrc(),
@@ -172,7 +173,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Answer in the one codec the seat was built for (RFC 3264 §6.1), and the floor stream on
         // its own endpoint when it has one (TS 24.380 §14.3.1). Every other stream the offer carries
         // (video, a second floor section) is declined with port 0.
-        match self.answer_seat_sdp(offer, &mut transport, profile, TextRewrite::None) {
+        match self.answer_seat_sdp(
+            offer,
+            &mut transport,
+            profile,
+            TextRewrite::None,
+            Some(&sdp::OwnSsrc::with_random_cname(egress_ssrc)),
+        ) {
             Ok(rewritten) => ok_sdp(
                 sdp::force_answer_codec(
                     &sdp::decline_unanswered_streams(
