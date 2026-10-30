@@ -71,6 +71,9 @@ pub(super) struct AnswerWiring<'a> {
     /// A terminated DTLS-SRTP offerer: A's fingerprint, which the handshake verifies, and the role
     /// the engine answered A with. `None` unless the call is a [`PipelineKind::DtlsOfferer`].
     pub(super) near_dtls: Option<(&'a sdp::Fingerprint, DtlsRole)>,
+    /// The terminated DTLS offerer bundled a WebRTC data channel with its audio and the engine
+    /// answered it: A's MCPTT floor rides it (`NearDtls`).
+    pub(super) near_data_channel: bool,
     /// Endpoints a full ICE agent runs on; a DTLS handshake waits for a selection only on those.
     pub(super) agent_endpoints: &'a [EndpointId],
 }

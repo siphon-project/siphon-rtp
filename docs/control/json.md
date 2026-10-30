@@ -689,8 +689,13 @@ as small as it can be:
   it on the audio's own port, ICE credentials, fingerprint and `a=setup` (RFC 8843), with
   `a=sctp-port:5000` and `a=max-message-size:65536`. An offer that keeps the channel on a transport of
   its own, or on a leg that is not DTLS-SRTP, gets the section declined with port 0 (RFC 3264 §6). The
-  two-party `offer` / `answer` pair does not answer a data channel yet: the section is relayed as it
-  was before.
+  two-party `offer` / `answer` pair answers it too, when the caller's DTLS-SRTP is terminated by the
+  engine (a plain callee, `transport_protocol: RTP/AVP` or `dtls: off`): the callee is offered the
+  section declined with port 0 and no bundle, so it never sees the browser's address, and `answer`
+  gives the browser the section on its audio port with `a=group:BUNDLE`, the audio's `a=mid` and the
+  channel's. `rtcp_app` then carries the call's `call_id` and the caller's `from_tag`, and
+  `send_rtcp_app` with that `from_tag` writes to the channel; the callee has none. A browser leg
+  relayed DTLS to DTLS is not terminated here and is not covered, nor is a re-offer.
 - The SCTP association (RFC 9260) rides the **same DTLS association** as the SRTP keys (RFC 8261, RFC 8831
   §5), so the channel needs no port of its own and nothing is accepted before the DTLS handshake has
   verified the browser's certificate against its SDP fingerprint. The engine accepts the browser's SCTP INIT

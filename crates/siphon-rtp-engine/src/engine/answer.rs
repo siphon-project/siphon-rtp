@@ -280,6 +280,9 @@ struct AnswerPresentation<'a> {
     /// The DTLS keying A is answered with when the engine terminates A's DTLS-SRTP: the engine's
     /// fingerprint, the `a=setup` it settled on and the `a=tls-id` it assigned.
     near_dtls_presentation: Option<&'a (sdp::Fingerprint, sdp::Setup, Option<String>)>,
+    /// The mids of the data channel the engine answers to A itself (`NearDtls`), when it terminates
+    /// A's DTLS.
+    data_channel: Option<&'a (String, String)>,
     secure_text_accepted: bool,
     text_accepted: bool,
     dtls_role: DtlsRole,
@@ -312,6 +315,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_dtls,
             far_downgraded_to_plain,
             near_dtls_presentation,
+            data_channel,
             secure_text_accepted,
             text_accepted,
             dtls_role,
@@ -460,7 +464,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }))
             }
         };
-        Ok(presented)
+        // Only a leg whose DTLS the engine terminates has a channel to answer (`NearDtls`).
+        let channel = data_channel.filter(|_| near_dtls_presentation.is_some());
+        Ok(answer_data_channel(presented, channel))
     }
 }
 
@@ -960,6 +966,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 }
 
+/// The mids of the WebRTC data channel a terminated DTLS offerer bundled with its audio: the engine
+/// answers the section itself (B never saw it) and carries A's MCPTT floor on it. Not on a re-offer
+/// from B (`reversed`), which answers A's leg to B.
+fn terminated_data_channel(
+    near_dtls: Option<&super::NearDtls>,
+    reversed: bool,
+) -> Option<(String, String)> {
+    near_dtls
+        .and_then(|keying| keying.data_channel.clone())
+        .filter(|_| !reversed)
+}
+
+/// A's answer with the data channel section the engine answers itself (see `NearDtls`).
+fn answer_data_channel(answer: String, channel: Option<&(String, String)>) -> String {
+    match channel {
+        Some((audio_mid, mid)) => sdp::answer_terminated_data_channel(&answer, audio_mid, mid),
+        None => answer,
+    }
+}
+
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     pub(super) async fn answer(
         &self,
@@ -1020,6 +1046,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Err(result) => return *result,
         };
         let far = self.settle_far_rtcp_fallback(call_id, far, &info).await;
+        let near_data_channel = terminated_data_channel(near_dtls.as_ref(), reversed.is_some());
         // The owner's async event sink (DTMF events flow here from the media actor), if registered.
         // In a shared scope the answering client need not be the one that created the call.
         let owner = self.owned_call_internal(call_id, |call| call.owner);
@@ -1027,11 +1054,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Cloned up front for the secure text actor: `owner_events` is moved into the audio pipeline's
         // actor registration below, so the secure-text branch (which registers its own text actor after
         // that) takes its event sink here. `Event::Text` flows only when the controller asked for it.
-        let secure_text_events_sink = if text_events {
-            owner_events.clone()
-        } else {
-            None
-        };
+        let secure_text_events_sink = owner_events.clone().filter(|_| text_events);
 
         // RFC 3264 §6.1: B's answer selects the format, and that answer is relayed to A unmodified on
         // every non-transcoding pipeline — so if B picked something A offered, A sends it too and the
@@ -1160,6 +1183,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_dtls,
             far_downgraded_to_plain,
             near_dtls_presentation: near_dtls_settled.as_ref().map(NearDtlsAnswer::presented),
+            data_channel: near_data_channel.as_ref(),
             secure_text_accepted,
             text_accepted,
             dtls_role,
@@ -1251,6 +1275,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ptime_override,
             dtls_role,
             near_dtls: near_dtls_settled.as_ref().map(NearDtlsAnswer::wiring),
+            near_data_channel: near_data_channel.is_some() && near_dtls_settled.is_some(),
             agent_endpoints: &agent_endpoints,
         };
         let pinned = self.pin_call_recordings(call_id, answered_before);

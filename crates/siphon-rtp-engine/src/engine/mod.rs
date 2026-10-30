@@ -674,6 +674,10 @@ struct NearDtls {
     /// The engine's own `a=tls-id` toward A: assigned for a new association when A signalled one, and
     /// repeated for as long as that association is kept (RFC 8842 §5.3). `None` when A sent none.
     local_tls_id: Option<String>,
+    /// The `a=mid` of A's audio section and of the WebRTC data channel section it bundles with it
+    /// (RFC 8841, RFC 8843), when A offered one. The engine terminates the channel on A's leg (it
+    /// carries A's MCPTT floor); B was offered the section declined and never sees it.
+    data_channel: Option<(String, String)>,
 }
 
 impl NearDtls {
