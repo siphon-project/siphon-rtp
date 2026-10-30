@@ -381,6 +381,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             SourceFilter::Exact(remote_rtp.ip())
         };
         Ok(SeatRequest {
+            egress_ssrc: super::negotiate::random_ssrc(),
             tag: from_tag.to_string(),
             codec,
             telephone_event,
