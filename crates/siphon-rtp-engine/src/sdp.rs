@@ -28,7 +28,10 @@ pub(crate) use amr::offered as offered_amr;
 pub use amr::{set_policy as set_amr_policy, AmrFmtp, AmrPolicy};
 pub use decline::{decline_unanswered_media, decline_unanswered_streams};
 pub use direction::answer_direction;
-pub use floor::{anchor_floor, parse_floor, validate_floor_fmtp, FloorFmtpError, FloorMediaInfo};
+pub use floor::{
+    anchor_floor, decline_floor, parse_floor, validate_floor_fmtp, FloorFmtpError, FloorMediaInfo,
+    FloorRewrite,
+};
 mod telephone_event;
 pub use telephone_event::TelephoneEvent;
 

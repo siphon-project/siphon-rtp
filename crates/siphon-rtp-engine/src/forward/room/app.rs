@@ -17,10 +17,10 @@ use std::net::SocketAddr;
 
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_media::rtcp::{self, AppWriteError};
-use siphon_rtp_proto::{Event, RtcpAppStream};
+use siphon_rtp_proto::RtcpAppStream;
 
 use super::{ForwardRoom, ForwardSeatStats, Seat};
-use crate::app_events::AppEventQueue;
+use crate::app_events::{surface_app_to_queue, AppEventQueue, AppScope};
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{OpaqueLatch, ReplyLatch};
 
@@ -131,21 +131,8 @@ fn usable(destination: SocketAddr) -> bool {
     !destination.ip().is_unspecified() && destination.port() != 0
 }
 
-/// An APP packet's name as the event carries it: octets outside ASCII become `?`.
-fn name_text(name: [u8; 4]) -> String {
-    name.iter()
-        .map(|&octet| {
-            if octet.is_ascii() {
-                char::from(octet)
-            } else {
-                '?'
-            }
-        })
-        .collect()
-}
-
-/// Raise one [`Event::RtcpApp`] for every APP packet in `data`, in order. A malformed datagram is
-/// counted and logged, never reported: a controller cannot act on bytes the engine could not read.
+/// Raise one [`Event::RtcpApp`] for every APP packet in `data`, in order, counting them and any
+/// datagram that could not be read to the end into the seat's counters.
 fn surface_apps(
     room_id: &str,
     tag: &str,
@@ -154,37 +141,15 @@ fn surface_apps(
     stream: RtcpAppStream,
     data: &[u8],
 ) {
-    for packet in rtcp::app_packets(data) {
-        match packet {
-            Ok(app) => {
-                counters.app_events += 1;
-                let Some(queue) = queue else {
-                    tracing::warn!(
-                        target: "siphon_rtp::media", room = room_id, tag,
-                        "RTCP APP packet from a seat whose controller has no event queue; not reported"
-                    );
-                    continue;
-                };
-                queue.push(Event::RtcpApp {
-                    call_id: None,
-                    conference_id: Some(room_id.to_string()),
-                    from_tag: tag.to_string(),
-                    stream,
-                    ssrc: app.ssrc,
-                    name: name_text(app.name),
-                    subtype: app.subtype,
-                    payload: app.data.to_vec(),
-                });
-            }
-            Err(error) => {
-                counters.malformed_app += 1;
-                tracing::debug!(
-                    target: "siphon_rtp::media", room = room_id, tag, %error,
-                    "malformed RTCP in an APP-bearing datagram; rest of it ignored"
-                );
-            }
-        }
-    }
+    surface_app_to_queue(
+        AppScope::Room(room_id),
+        tag,
+        queue,
+        stream,
+        data,
+        &mut counters.app_events,
+        &mut counters.malformed_app,
+    );
 }
 
 /// Raise the APP events of a seat's audio RTCP (a compound with an APP part; SR and RR stay with the

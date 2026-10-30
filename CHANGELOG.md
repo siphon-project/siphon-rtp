@@ -39,6 +39,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   140 ns from the wire to its event, and a room-wide send to 500 seats about 3.5 µs, allocation-free
   (`benches/forward_floor_bench.rs`).
 
+- **The MCPTT floor-control stream on two-party calls.** `offer`, `answer` and `answer_local` anchor an
+  offered or answered `m=application <port> udp MCPTT` on an engine endpoint per party, with
+  `a=fmtp:MCPTT <profile.floor_fmtp>` verbatim. The stream is terminated, never relayed between the
+  parties: what a party sends arrives as `rtcp_app` with `call_id` and the leg's `from_tag`, and
+  `send_rtcp_app` with `call_id` + `from_tag` sends to that leg (the leg's own SSRC when none is named).
+  The endpoints are `Redirect`, so it works whatever carries the call's audio, and they are freed with
+  the call and kept through a re-offer. APP parts in a party's audio RTCP are reported as `rtcp_app` on
+  the audio stream wherever the userspace media pipeline terminates that RTCP, and the compound is still
+  relayed unchanged. A call with a floor stream cannot be checkpointed.
+
 - **Control contract for push-to-talk forwarding rooms and RTCP APP (`siphon-rtp-proto`).** These
   are the wire types only, so a controller can build against them. The engine refuses every new verb
   by name (`unsupported command: forward_join`) until it serves it, and `node_info` advertises
@@ -46,7 +56,7 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   - Verbs: `forward_join`, `forward_offer`, `forward_answer`, `forward_leave` and
     `forward_set_source`. Like the other room verbs they take no `scope`.
   - `send_rtcp_app` is addressed by `call_id` + `from_tag`, by a room seat, or to a whole room with
-    `except_from_tags`. (A room is served; `call_id` is not yet.)
+    `except_from_tags`.
   - Events: `rtcp_app`, `forward_source_started` and `forward_seat_inactive`.
   - `profile.floor_fmtp` carries the `a=fmtp:MCPTT` parameters (3GPP TS 24.380 §14) verbatim.
   - Payloads are strict base64 (RFC 4648 §4).

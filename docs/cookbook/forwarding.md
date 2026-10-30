@@ -126,6 +126,26 @@ use another (TS 24.380 §8.1.2 wants the SSRC the receiving party learnt at sess
 
 The floor stream is plain in this build: media control security (TS 24.380 §13) is not negotiated.
 
+### Two-party calls
+
+A two-party call carries the same stream. When the offerer's SDP has `m=application <port> udp MCPTT`,
+`offer` gives each side an engine endpoint for it: the offer B receives carries the far endpoint with
+`a=fmtp:MCPTT <profile.floor_fmtp>`, and when B answers with its own floor section the answer A receives
+carries the near endpoint, with the `floor_fmtp` of the `answer` command. `answer_local` terminates it
+on its one leg. If B answers without a floor section, A's is declined and nothing is served.
+
+The engine **terminates** the stream on each side; it is not relayed. What a party sends arrives as
+`rtcp_app` with `call_id` and the `from_tag` of that leg (the call's from-tag for the offerer, the
+to-tag for the answerer), and `send_rtcp_app` with `call_id` and a `from_tag` sends to that leg. The
+SSRC an unnamed send carries is minted per leg when the call is answered and stays the same.
+
+The floor endpoints are `Redirect`, so this works whatever carries the call's audio. Limits, all
+explicit: a re-offer keeps the endpoints and their addresses, and a floor stream added to a call that
+had none is declined; a call with a floor stream cannot be checkpointed (`checkpoint` says so); and
+APP packets in a party's *audio* RTCP are reported only where the userspace pipeline terminates that
+RTCP (a transcoding or recording call), where the compound is still relayed to the other party as
+before, never on the plain in-kernel relay.
+
 ## Inactivity
 
 A forwarding seat is **never freed for silence**. A listener sends nothing for as long as others

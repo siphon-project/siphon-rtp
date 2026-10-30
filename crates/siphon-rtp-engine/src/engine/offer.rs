@@ -523,13 +523,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     async fn anchor_offer_streams(
         &self,
         profile: &ProfileFlags,
+        offer: &str,
         info: &sdp::MediaInfo,
         near_family: AddressFamily,
         near_bind: Option<std::net::IpAddr>,
         far_family: AddressFamily,
         far_bind: Option<std::net::IpAddr>,
         endpoints: &mut Vec<siphon_rtp_datapath::Endpoint>,
-    ) -> Result<(OfferText, OfferImage), Box<CmdResult>> {
+    ) -> Result<(OfferText, OfferImage, super::floor::OfferFloor), Box<CmdResult>> {
         let text = self
             .anchor_offer_text(
                 profile,
@@ -552,7 +553,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 endpoints,
             )
             .await?;
-        Ok((text, image))
+        // The MCPTT floor-control stream is terminated, so each leg gets an endpoint of its own.
+        let families = ((near_family, near_bind), (far_family, far_bind));
+        let floor = self
+            .anchor_offer_floor(profile, offer, families, endpoints)
+            .await;
+        Ok((text, image, floor))
     }
 
     /// Anchor an offer's T.38 fax stream: one UDPTL endpoint per leg, sharing each leg's family and
@@ -714,11 +720,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let near_advertised = near_advertised_override.unwrap_or_else(|| near_rtp.local_addr.ip());
         let far_advertised = far_advertised_override.unwrap_or_else(|| far_rtp.local_addr.ip());
         // Combined list for teardown on any later error path in this offer.
-        let mut endpoints: Vec<_> = near_endpoints
-            .iter()
-            .chain(far_endpoints.iter())
-            .copied()
-            .collect();
+        let mut endpoints = [near_endpoints.as_slice(), far_endpoints.as_slice()].concat();
 
         let (
             OfferText {
@@ -731,9 +733,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_text_local_crypto,
             },
             offer_image,
+            offer_floor,
         ) = match self
             .anchor_offer_streams(
                 profile,
+                sdp,
                 &info,
                 near_family,
                 near_bind,
@@ -761,6 +765,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             image: offer_image.far_image_endpoint,
             // As with text, the far side's fax address arrives with its answer.
             image_remote: None,
+            floor: offer_floor.far,
+            floor_remote: None,
         };
         let text_rewrite = match far_leg.text_anchor(far_text_local_crypto) {
             Some(anchor) => anchor,
@@ -803,6 +809,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 mux_override: far_mux_override,
                 text: text_rewrite,
                 image: image_rewrite,
+                floor: far_leg.floor_rewrite(profile.floor_fmtp.as_deref()),
                 codec: CodecPresentation::Policy(&codec_policy),
             },
             &profile.replace,
@@ -922,6 +929,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     text_remote_rtp: near_text_remote,
                     image: offer_image.near_image_endpoint,
                     image_remote: info.image.as_ref().map(|image| image.remote),
+                    floor: offer_floor.near,
+                    floor_remote: offer_floor.near_remote,
                 },
                 // An offer always allocates a B-facing leg: a B side may still answer, and the offer
                 // being rewritten right here is what would be delivered to it.

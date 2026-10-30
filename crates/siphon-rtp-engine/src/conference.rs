@@ -2367,13 +2367,23 @@ pub struct ConferenceRegistry {
     /// to every dispatcher call site: [`Self::owns`], [`Self::dispatch`] and [`Self::ice_selected`]
     /// fall through to it.
     forward: std::sync::Arc<crate::forward::ForwardRegistry>,
+    /// The floor-control streams of two-party calls, which share this registry's dispatcher slot.
+    floors: std::sync::Arc<crate::call_floor::CallFloorRegistry>,
 }
 
 impl ConferenceRegistry {
     /// Whether the registry routes datagrams for `endpoint` (the dispatcher's predicate).
     #[must_use]
     pub fn owns(&self, endpoint: EndpointId) -> bool {
-        self.routes.contains_key(&endpoint) || self.forward.owns(endpoint)
+        self.routes.contains_key(&endpoint)
+            || self.forward.owns(endpoint)
+            || self.floors.owns(endpoint)
+    }
+
+    /// The two-party calls' floor streams that share this registry's dispatcher slot.
+    #[must_use]
+    pub fn floors(&self) -> &std::sync::Arc<crate::call_floor::CallFloorRegistry> {
+        &self.floors
     }
 
     /// The forwarding rooms that share this registry's dispatcher slot.
@@ -2389,6 +2399,8 @@ impl ConferenceRegistry {
             if mailbox.try_send(ConferenceInput::Packet(packet)).is_err() {
                 tracing::trace!("conference mailbox full or closed; dropping redirected datagram");
             }
+        } else if self.floors.owns(packet.endpoint) {
+            self.floors.dispatch(packet);
         } else {
             self.forward.dispatch(packet);
         }

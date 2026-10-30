@@ -182,6 +182,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // Neither a single-leg local answer nor a room seat relays fax.
                     image: None,
                     image_remote: None,
+                    floor: None,
+                    floor_remote: None,
                 };
                 let candidates = self.gather_leg_candidates(&leg, &config).await;
                 (candidates, Some(config))

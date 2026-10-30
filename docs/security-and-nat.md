@@ -1217,6 +1217,13 @@ channel (TS 24.380 §13) is not implemented, so the answer never offers it.
   not reported as quiet.
 - **Teardown.** The floor endpoint is part of the seat's endpoints for `forward_leave`, a room's end,
   and an ICE failure, so it is freed with the seat and its route removed.
+- **Two-party calls run the same gate.** A call's floor endpoints (`Leg::floor`) are `Redirect`ed and
+  routed to `call_floor`, which applies layer 2 (the signalled floor address, tightened by the
+  `received-from` hint, or the `symmetric` posture) and the learn-once latch per leg, and terminates the
+  stream: nothing a party sends on it reaches the other party. They are part of the leg's endpoint set,
+  so call teardown, the idle sweep's liveness reading and re-offers treat them like any other stream's
+  endpoint, and a re-offer never moves a floor leg's gate. APP parts in a party's audio RTCP are read
+  after the pipeline's own gate, decrypt and latch, and the compound is relayed as before.
 
 ### Layer 5e — The WebSocket-takeover Redirect path
 A **takeover** call (`ProfileFlags.ws_uri`, `PipelineKind::Ws`) points leg A's RTP endpoint at

@@ -547,17 +547,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 subtype,
                 payload,
             } => {
-                self.send_rtcp_app(super::rtcp_app::AppSend {
-                    call_id,
-                    conference_id,
-                    from_tag,
-                    except_from_tags,
-                    stream,
-                    ssrc,
-                    name,
-                    subtype,
-                    payload,
-                })
+                self.send_rtcp_app(
+                    client,
+                    super::rtcp_app::AppSend {
+                        call_id,
+                        conference_id,
+                        from_tag,
+                        except_from_tags,
+                        stream,
+                        ssrc,
+                        name,
+                        subtype,
+                        payload,
+                    },
+                )
                 .await
             }
             Command::AttachWsTee {

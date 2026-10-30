@@ -369,6 +369,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ),
                 mux_override: near_mux_override,
                 image: near.image_rewrite(info.image.is_some()),
+                floor: near.floor_rewrite(profile.floor_fmtp.as_deref()),
                 text: if near.text.is_none() {
                     TextRewrite::None
                 } else if secure_text_accepted {
@@ -415,6 +416,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 LegPresentation {
                     engine: far.engine_media(),
                     image: far.image_rewrite(info.image.is_some()),
+                    floor: far.floor_rewrite(profile.floor_fmtp.as_deref()),
                     // B's leg as the original offer presented it: without ICE when `ice: remove` took
                     // it off, whatever credentials the call holds for A's leg (RFC 8839 §4.2.5).
                     ice: if far_ice_removed {
@@ -1299,6 +1301,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // own gate and latch, and a failure to bring it up must not fail the call's audio.
         let far_image_remote =
             self.install_answer_image(call_id, profile, &info, &near, &far, offer_received_from);
+
+        // The MCPTT floor stream is terminated on both parties' endpoints.
+        self.install_answer_floor(&wiring, sdp, reversed.is_some());
 
         self.record_answer(
             call_id,

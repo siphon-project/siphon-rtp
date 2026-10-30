@@ -46,6 +46,7 @@ use super::*;
 /// The default control client for tests that don't exercise per-client isolation.
 const CLIENT: ClientId = ClientId(1);
 
+mod call_floor;
 mod conference_dial_out;
 mod conference_received_from;
 mod conference_seat;

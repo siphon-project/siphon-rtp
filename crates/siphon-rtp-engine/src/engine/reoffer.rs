@@ -57,6 +57,16 @@ struct ReofferState {
 }
 
 impl ReofferState {
+    /// Whether the call's text stream is secure and the engine holds no key to present it under to
+    /// `presented`: a secure stream must never be presented as plaintext.
+    fn secure_text_key_missing(&self, presented: Party) -> bool {
+        let key = match presented {
+            Party::Far => self.far_text_local_crypto,
+            Party::Near => self.near_text_local_crypto,
+        };
+        self.text_secure && key.is_none()
+    }
+
     fn capture(call: &Call, party: Party) -> Self {
         let (previous_remote_ice, previous_codec) = match party {
             Party::Near => (call.near_remote_ice.clone(), call.near_codec.clone()),
@@ -486,11 +496,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // it never mints one). That key always exists once the secure text leg registered at answer;
         // fail closed rather than present a secure stream as plaintext if it is somehow absent
         // (docs/security-and-nat.md Layer 5f — never bridge or present secure↔insecure).
-        let presented_text_key = match presented_party {
-            Party::Far => state.far_text_local_crypto,
-            Party::Near => state.near_text_local_crypto,
-        };
-        if state.text_secure && presented_text_key.is_none() {
+        if state.secure_text_key_missing(presented_party) {
             return error_result(
                 "re-offer secure text",
                 &"secure text stream has no stored engine a=crypto to re-present",
@@ -528,6 +534,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 LegPresentation {
                     engine: presented_media,
                     image: presented_leg.image_rewrite(info.image.is_some()),
+                    floor: presented_leg.floor_rewrite(profile.floor_fmtp.as_deref()),
                     ice: offer_ice_rewrite(
                         ice_creds.as_ref(),
                         &presented_candidates,
@@ -573,6 +580,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 LegPresentation {
                     engine: presented_media,
                     image: presented_leg.image_rewrite(info.image.is_some()),
+                    floor: presented_leg.floor_rewrite(profile.floor_fmtp.as_deref()),
                     ice: answer_ice_rewrite(ice_creds.as_ref(), &presented_candidates),
                     security: near_security(
                         state.near_local_crypto,

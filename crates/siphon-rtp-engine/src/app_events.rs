@@ -15,12 +15,16 @@
 
 use std::sync::Arc;
 
-use siphon_rtp_proto::Event;
+use siphon_rtp_media::rtcp;
+use siphon_rtp_proto::{Event, RtcpAppStream};
 
 use crate::metrics::Metrics;
 
 /// Events one controller's APP queue holds before it sheds the oldest.
 pub const APP_EVENT_QUEUE_CAPACITY: usize = 4096;
+
+/// The largest RTCP APP datagram the engine builds for a send: one Ethernet MTU.
+pub(crate) const MAX_APP_DATAGRAM: usize = 1500;
 
 /// A controller's `rtcp_app` queue: cheap to clone, every clone feeds the same FIFO.
 #[derive(Clone)]
@@ -100,6 +104,101 @@ impl AppEventQueue {
                 subtype,
                 "rtcp_app queue full; oldest event dropped (a floor message was lost)"
             );
+        }
+    }
+}
+
+/// [`surface_app_packets`] straight onto a controller's APP queue. A packet with nowhere to go (the
+/// controller has no queue) is a `warn`, never silent.
+pub(crate) fn surface_app_to_queue(
+    scope: AppScope<'_>,
+    tag: &str,
+    queue: Option<&AppEventQueue>,
+    stream: RtcpAppStream,
+    data: &[u8],
+    raised: &mut u64,
+    malformed: &mut u64,
+) {
+    surface_app_packets(
+        scope,
+        tag,
+        stream,
+        data,
+        raised,
+        malformed,
+        |event| match queue {
+            Some(queue) => queue.push(event),
+            None => tracing::warn!(
+                target: "siphon_rtp::media", ?scope, tag,
+                "RTCP APP packet from a party whose controller has no event queue; not reported"
+            ),
+        },
+    );
+}
+
+/// Whose party an APP packet came from: a two-party call, or a forwarding room's seat.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AppScope<'a> {
+    /// A two-party call, by call key.
+    Call(&'a str),
+    /// A forwarding room, by room id.
+    Room(&'a str),
+}
+
+/// An APP packet's name as the event carries it: octets outside ASCII become `?`.
+fn name_text(name: [u8; 4]) -> String {
+    name.iter()
+        .map(|&octet| {
+            if octet.is_ascii() {
+                char::from(octet)
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// Raise one [`Event::RtcpApp`] for every APP packet in `data`, in order, onto `queue`.
+///
+/// `raised` counts the APP packets read and `malformed` the datagrams that could not be read to the
+/// end (their length fields cannot be trusted, so nothing after the break is located): counted and
+/// logged at `debug`, never reported, because a controller cannot act on bytes the engine could not
+/// read. A packet with nowhere to go (no queue) is a `warn`.
+pub(crate) fn surface_app_packets(
+    scope: AppScope<'_>,
+    tag: &str,
+    stream: RtcpAppStream,
+    data: &[u8],
+    raised: &mut u64,
+    malformed: &mut u64,
+    mut emit: impl FnMut(Event),
+) {
+    for packet in rtcp::app_packets(data) {
+        match packet {
+            Ok(app) => {
+                *raised += 1;
+                let (call_id, conference_id) = match scope {
+                    AppScope::Call(call) => (Some(call.to_string()), None),
+                    AppScope::Room(room) => (None, Some(room.to_string())),
+                };
+                emit(Event::RtcpApp {
+                    call_id,
+                    conference_id,
+                    from_tag: tag.to_string(),
+                    stream,
+                    ssrc: app.ssrc,
+                    name: name_text(app.name),
+                    subtype: app.subtype,
+                    payload: app.data.to_vec(),
+                });
+            }
+            Err(error) => {
+                *malformed += 1;
+                tracing::debug!(
+                    target: "siphon_rtp::media", ?scope, tag, %error,
+                    "malformed RTCP in an APP-bearing datagram; rest of it ignored"
+                );
+            }
         }
     }
 }
