@@ -22,11 +22,10 @@ ignore = [
     # rule). We don't own that edge and there is no safe upgrade; drop this ignore once
     # tikv-jemalloc-ctl moves off paste.
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; compile-time-only, dev-dep via tikv-jemalloc-ctl, no upgrade" },
-    # RUSTSEC-2025-0141: `bincode` 1.3.x is unmaintained — the team ceased development after a doxxing
-    # incident and considers 1.3.3 a complete, final release (not a vulnerability). Reached transitively
-    # through `webrtc-dtls`/`webrtc-util` (the DTLS-SRTP leg in siphon-rtp-dtls). We don't own that edge
-    # and there is no safe upgrade path yet; drop this ignore once webrtc-* moves off bincode 1.x.
-    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.x unmaintained (final release, not a vuln); transitive via webrtc-dtls, no upgrade" },
+    # RUSTSEC-2025-0141: `bincode` 1.3.x is unmaintained (final release, not a vulnerability). Reached
+    # transitively through `iai-callgrind`, a dev-dependency used only by the instruction-count perf gate.
+    # We do not own that edge; drop this ignore once iai-callgrind moves off bincode 1.x.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.x unmaintained (final release, not a vuln); dev-dep via iai-callgrind, no upgrade" },
     # RUSTSEC-2026-0173: `proc-macro-error2` is unmaintained (the author confirmed it, and the upstream
     # `proc-macro-error` it forked is likewise abandoned; not a vulnerability). It is a compile-time-only
     # proc-macro reached transitively through `iai-callgrind-macros` / `iai-callgrind`, which we use
@@ -95,16 +94,3 @@ exceptions = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# The one git source, and it is temporary. `rtc-dtls` cannot retransmit its last handshake flight:
-# `send()` arms no retransmit timer for it, `Endpoint::handle_timeout` gates its only
-# `handshake_timeout` call behind `!is_handshake_completed()`, and `Endpoint::read` re-enters the state
-# machine only while the handshake is incomplete — so a completed DTLS server answers a repeated peer
-# flight with nothing, and the call sits up with no media while every counter reads healthy. RFC 6347
-# §4.2.4 makes the last-flight sender responsible for re-sending, and replaying the cached records
-# verbatim does not work either: the peer's replay window (§4.1.2.6) drops them, so the retransmission
-# has to come from the state machine with fresh record sequence numbers. Proven by
-# `session::tests::a_completed_server_retransmits_its_last_flight_when_the_client_repeats_its_own`,
-# which fails against the unpatched crate and passes against this fork. Filed upstream as
-# webrtc-rs/rtc#243; when that merges, this entry and the `[patch.crates-io]` block in the root
-# manifest both come out again.
-allow-git = ["https://github.com/killdashnine/rtc"]

@@ -5,6 +5,14 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Changed
+
+- **`rtc-dtls`, `rtc-shared` and `rtc-crypto` move to crates.io 0.21.1; the last-flight fork is retired.** The
+  RFC 6347 §4.2.4 last-flight retransmission fix landed upstream (webrtc-rs/rtc#243) and ships in
+  0.21.1, so the `[patch.crates-io]` git entries and the `allow-git` exception in `deny.toml` are gone.
+
 ## [0.15.5] — 2026-10-29
 
 ### Fixed
