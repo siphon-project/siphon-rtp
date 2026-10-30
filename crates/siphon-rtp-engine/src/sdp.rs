@@ -22,6 +22,7 @@ mod decline;
 mod direction;
 pub(crate) mod floor;
 mod offer;
+mod stream_identity;
 pub use offer::conference_seat_offer;
 
 pub(crate) use amr::offered as offered_amr;
@@ -32,6 +33,7 @@ pub use floor::{
     anchor_floor, decline_floor, parse_floor, validate_floor_fmtp, FloorFmtpError, FloorMediaInfo,
     FloorRewrite,
 };
+pub use stream_identity::{own_stream_identity, OwnSsrc};
 mod telephone_event;
 pub use telephone_event::TelephoneEvent;
 

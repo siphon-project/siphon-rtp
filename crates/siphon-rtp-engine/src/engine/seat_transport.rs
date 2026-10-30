@@ -342,7 +342,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Write the answer to a seat's offer: the engine's endpoint, ICE (re-originated with the
     /// credentials and candidates minted for it, `a=ice-mismatch` when the offer's ICE was altered in
     /// transit so the peer stops waiting for checks that will never come, stripped on `ICE=remove`),
-    /// and the keying the seat negotiated. A room leg is always RTP/RTCP-muxed onto the one endpoint,
+    /// and the keying the seat negotiated. The offerer's own stream identity (`a=ssrc`, `a=msid`,
+    /// `a=extmap`) is dropped, and `own` names the SSRC the room sends the seat under. A room leg is always RTP/RTCP-muxed onto the one endpoint,
     /// so the mux presentation mirrors the offer (the `rtcp-mux` directive is an offer/answer relay
     /// concern, not a room one).
     ///
@@ -354,6 +355,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         transport: &mut SeatTransport,
         profile: &ProfileFlags,
         text: TextRewrite,
+        own: Option<&sdp::OwnSsrc>,
     ) -> Result<String, sdp::SdpError> {
         let engine = EngineMedia {
             rtp: transport.endpoint.local_addr,
@@ -363,6 +365,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let security = transport.security.take();
         let ice = transport.ice_rewrite(profile);
         sdp::rewrite(offer, engine, ice, security, None, text, ImageRewrite::None)
-            .map(|rewritten| rewritten.sdp)
+            // The answer is written from the offer, which describes the offerer: drop its own
+            // `a=ssrc` / `a=msid` / `a=extmap` (RFC 5576 §4.1, RFC 8830 §2, RFC 8285 §5) so it is
+            // not told the seat is sent its own SSRC, and name the SSRC the room really sends
+            // (`own`). `a=mid` and `a=group:BUNDLE` stay (RFC 8843 §7.3).
+            .map(|rewritten| sdp::own_stream_identity(&rewritten.sdp, own))
     }
 }
