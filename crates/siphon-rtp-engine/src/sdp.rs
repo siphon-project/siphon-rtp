@@ -20,13 +20,15 @@ use siphon_rtp_srtp::sdes::CryptoAttribute;
 mod amr;
 mod decline;
 mod direction;
+mod floor;
 mod offer;
 pub use offer::conference_seat_offer;
 
 pub(crate) use amr::offered as offered_amr;
 pub use amr::{set_policy as set_amr_policy, AmrFmtp, AmrPolicy};
-pub use decline::decline_unanswered_media;
+pub use decline::{decline_unanswered_media, decline_unanswered_streams};
 pub use direction::answer_direction;
+pub use floor::{anchor_floor, parse_floor, validate_floor_fmtp, FloorFmtpError, FloorMediaInfo};
 mod telephone_event;
 pub use telephone_event::TelephoneEvent;
 

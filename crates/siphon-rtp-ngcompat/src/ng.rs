@@ -1069,6 +1069,7 @@ mod tests {
                 deletes_total: 10,
                 control_errors_total: 2,
                 sessions: 3,
+                rtcp_app_dropped_total: 0,
             },
         });
         assert_eq!(result.get("result").and_then(Value::as_str), Some("ok"));

@@ -14,6 +14,7 @@
 //! it, so the stable workspace and `cargo test` never touch nightly/eBPF.
 #![forbid(unsafe_code)]
 
+pub mod app_events;
 pub mod cluster;
 pub mod conference;
 pub mod config;

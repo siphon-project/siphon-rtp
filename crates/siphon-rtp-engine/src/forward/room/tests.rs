@@ -37,6 +37,8 @@ fn seat_config(index: u8) -> ForwardSeatConfig {
         egress_ssrc: 0xE000_0000 | u32::from(index),
         initial_sequence: 1000,
         initial_timestamp: 50_000,
+        floor: None,
+        app_events: None,
     }
 }
 
@@ -657,3 +659,5 @@ fn ice_selection_opens_a_pending_seat_and_aims_it_at_the_selected_pair() {
     let sent = forwarded(&mut room, &packet);
     assert_eq!(sent[0].1, address("198.51.100.20:5004"));
 }
+
+mod floor;

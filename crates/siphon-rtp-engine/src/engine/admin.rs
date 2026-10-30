@@ -72,6 +72,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 deletes_total: snapshot.deletes_total,
                 control_errors_total: snapshot.control_errors_total,
                 sessions: self.session_count() as u64,
+                rtcp_app_dropped_total: snapshot.rtcp_app_dropped_total,
             },
         }
     }
@@ -138,6 +139,11 @@ fn supported_features() -> Vec<String> {
         // `forward_set_source`. A controller gates the verbs on this entry, so it is advertised only
         // where they are served.
         "forward_room".to_string(),
+        // The MCPTT floor-control stream (`m=application <port> udp MCPTT`, 3GPP TS 24.380) is
+        // anchored on a forwarding-room seat, and RTCP APP packets travel both ways as
+        // `send_rtcp_app` / `rtcp_app`. Controllers gate floor control on these entries.
+        "mcptt_floor".to_string(),
+        "rtcp_app".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

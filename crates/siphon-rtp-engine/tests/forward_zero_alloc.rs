@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
-use siphon_rtp_engine::forward::{ForwardRoom, ForwardSeatConfig, RoomCodec};
+use siphon_rtp_engine::forward::{
+    AppRequest, AppTarget, FloorConfig, ForwardRoom, ForwardSeatConfig, RoomCodec,
+};
 use siphon_rtp_engine::sdp;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader};
 
@@ -72,6 +74,8 @@ fn room() -> ForwardRoom {
                 egress_ssrc: 0xE000_0000 + index as u32,
                 initial_sequence: 0,
                 initial_timestamp: 0,
+                floor: None,
+                app_events: None,
             },
             0,
         )
@@ -168,4 +172,74 @@ fn ingest_and_fan_out_make_no_heap_allocation() {
         "{switching} allocations across 200 source changes (the event's two strings each, at most)"
     );
     assert!(forwarded > 0);
+}
+
+#[test]
+fn a_room_wide_rtcp_app_send_makes_no_heap_allocation() {
+    // The send path writes every seat's datagram into the room's own scratch and lends it out.
+    let mut room = {
+        let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
+                     m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
+        let codecs = sdp::parse(offer).unwrap().audio_codecs();
+        let (codec, _) = RoomCodec::from_offer(&codecs).unwrap();
+        ForwardRoom::new("zero-alloc-app".to_string(), codec)
+    };
+    for index in 0..SEATS {
+        room.add_seat(
+            ForwardSeatConfig {
+                tag: format!("seat-{index}"),
+                endpoint: EndpointId(index as u64 + 1),
+                egress_destination: format!("192.0.2.{}:{}", 1 + index % 250, 4000 + index)
+                    .parse()
+                    .unwrap(),
+                accepted_source: SourceFilter::Any,
+                latch: true,
+                audio_payload_type: 96,
+                telephone_event: None,
+                secure: None,
+                secure_pending: false,
+                ice_pending: false,
+                egress_ssrc: 0xE000_0000 + index as u32,
+                initial_sequence: 0,
+                initial_timestamp: 0,
+                floor: Some(FloorConfig {
+                    endpoint: EndpointId(10_000 + index as u64),
+                    destination: format!("192.0.2.{}:{}", 1 + index % 250, 8000 + index)
+                        .parse()
+                        .unwrap(),
+                    accepted_source: SourceFilter::Any,
+                    ice_gated: false,
+                }),
+                app_events: None,
+            },
+            0,
+        )
+        .unwrap();
+    }
+    let request = AppRequest {
+        stream: siphon_rtp_proto::RtcpAppStream::Floor,
+        ssrc: None,
+        name: *b"MCPT",
+        subtype: 17,
+        payload: vec![0; 12],
+    };
+    let everyone = AppTarget::Room { except: Vec::new() };
+    let mut sent = 0usize;
+    room.send_app(&everyone, &request, |_, _, data| sent += data.len())
+        .unwrap();
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..200 {
+        room.send_app(&everyone, &request, |_, _, data| {
+            sent += std::hint::black_box(data).len();
+        })
+        .unwrap();
+    }
+    let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(sent > 0);
+    assert_eq!(
+        allocated, 0,
+        "send_rtcp_app allocated {allocated} times across 200 room-wide sends"
+    );
 }

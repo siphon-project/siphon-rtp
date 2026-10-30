@@ -142,6 +142,12 @@ harness = false
 name = "forward_fanout_bench"
 harness = false
 
+# The MCPTT floor stream in a forwarding room at 500 seats: one floor message from the wire to its
+# `rtcp_app` event, and one room-wide `send_rtcp_app`, with no sockets.
+[[bench]]
+name = "forward_floor_bench"
+harness = false
+
 # The per-connection cost of resolving a control client's stable `controller_id` to the identity
 # call ownership is keyed by: first sight, a second connection evicting the first, and the claim +
 # release lifecycle that reaps the row again.

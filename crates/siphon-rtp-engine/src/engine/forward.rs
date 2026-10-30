@@ -6,16 +6,17 @@
 //! different is the codec rule (the first seat fixes the room codec, later seats must offer it) and
 //! that a seat is never freed for silence.
 
-use siphon_rtp_datapath::Datapath;
+use siphon_rtp_datapath::{Datapath, Endpoint, FlowAction, SourceFilter};
 use siphon_rtp_proto::{CmdResult, Command, ProfileFlags};
 
 use crate::dtls_bridge::PipelineTarget;
-use crate::forward::{ForwardSeatConfig, RoomCodec};
-use crate::sdp::{self, TextRewrite};
+use crate::forward::{FloorConfig, ForwardSeatConfig, RoomCodec};
+use crate::sdp::{self, EngineMedia, TextRewrite};
 
 use super::answer_local::answer_codec_candidates;
-use super::negotiate::{parse_codec_flags, random_ssrc};
-use super::{error_result, ok_empty, ok_sdp, ClientId, Engine};
+use super::negotiate::{parse_codec_flags, peer_media_address, random_ssrc};
+use super::seat_transport::SeatTransport;
+use super::{boxed_error_result, error_result, ok_empty, ok_sdp, ClientId, Engine};
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Dispatch a forwarding-room command.
@@ -65,6 +66,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Err(reason) = super::validate_sip_call_id(profile) {
             return error_result("forward_join", &reason);
         }
+        // The controller's floor parameters go into the answer verbatim, so a line break would let
+        // them write SDP lines of their own. Refused before anything is allocated.
+        if let Some(fmtp) = &profile.floor_fmtp {
+            if let Err(error) = sdp::validate_floor_fmtp(fmtp) {
+                return error_result("forward_join", &error);
+            }
+        }
         let info = match sdp::parse(offer) {
             Ok(info) => info,
             Err(error) => return error_result("forward_join: SDP parse", &error),
@@ -99,6 +107,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Err(refusal) => return *refusal,
         };
         let endpoint = transport.endpoint;
+        // The MCPTT floor-control stream (TS 24.380), when the seat offered one: its own endpoint.
+        let floor = match self.open_floor_endpoint(&transport, offer, profile).await {
+            Ok(floor) => floor,
+            Err(refusal) => {
+                self.free(&[endpoint]).await;
+                return *refusal;
+            }
+        };
+        let floor_endpoint = floor.as_ref().map(|(endpoint, _)| *endpoint);
         let config = ForwardSeatConfig {
             tag: from_tag.clone(),
             endpoint: endpoint.id,
@@ -114,6 +131,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // RFC 3550 §5.1: the initial sequence number and timestamp are random.
             initial_sequence: random_ssrc() as u16,
             initial_timestamp: random_ssrc(),
+            floor: floor.map(|(_, config)| config),
+            app_events: self.app_event_queue(client),
         };
         let joined_tick = self.datapath.now_ticks();
         if let Err(refusal) = forward
@@ -129,11 +148,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .await
         {
             self.free(&[endpoint]).await;
+            if let Some(floor) = floor_endpoint {
+                self.free(&[floor]).await;
+            }
             return error_result("forward_join", &refusal);
         }
         // Seated: aim the room's egress at whatever ICE validates for this seat.
         self.follow_seat_ice(endpoint.id);
         self.endpoint_calls.insert(endpoint.id, room_id.to_string());
+        if let Some(floor) = floor_endpoint {
+            self.endpoint_calls.insert(floor.id, room_id.to_string());
+        }
 
         let target = PipelineTarget::Forward {
             forward: forward.clone(),
@@ -144,12 +169,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.release_forward_seat(room_id, &from_tag).await;
             return error_result("forward_join: install DTLS redirect", &error);
         }
-        // Answer in the one codec the seat was built for (RFC 3264 §6.1). Every other stream the
-        // offer carries (video, the MCPTT floor stream) is declined with port 0.
+        // Answer in the one codec the seat was built for (RFC 3264 §6.1), and the floor stream on
+        // its own endpoint when it has one (TS 24.380 §14.3.1). Every other stream the offer carries
+        // (video, a second floor section) is declined with port 0.
         match self.answer_seat_sdp(offer, &mut transport, profile, TextRewrite::None) {
             Ok(rewritten) => ok_sdp(
                 sdp::force_answer_codec(
-                    &sdp::decline_unanswered_media(rewritten, false),
+                    &sdp::decline_unanswered_streams(
+                        match floor_endpoint {
+                            Some(floor) => sdp::anchor_floor(
+                                &rewritten,
+                                EngineMedia {
+                                    rtp: floor.local_addr,
+                                    rtcp: None,
+                                    advertised_ip: transport.advertised,
+                                },
+                                profile.floor_fmtp.as_deref(),
+                            ),
+                            None => rewritten,
+                        },
+                        false,
+                        floor_endpoint.is_some(),
+                    ),
                     &spec,
                     telephone_event,
                 ),
@@ -160,6 +201,63 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 error_result("forward_join: SDP rewrite", &error)
             }
         }
+    }
+
+    /// Allocate the endpoint for the floor-control stream the offer carries, if it carries one the
+    /// seat can take: its own redirected socket, gated by the signalled floor address (or the
+    /// `received_from` hint), with the learn-once latch the room runs on it
+    /// (docs/security-and-nat.md §4 layer 5h). A floor stream in another address family than the
+    /// seat's audio is left to be declined rather than bound on a second interface.
+    async fn open_floor_endpoint(
+        &self,
+        transport: &SeatTransport,
+        offer: &str,
+        profile: &ProfileFlags,
+    ) -> Result<Option<(Endpoint, FloorConfig)>, Box<CmdResult>> {
+        let Some(offered) = sdp::parse_floor(offer) else {
+            return Ok(None);
+        };
+        if siphon_rtp_datapath::AddressFamily::of(offered.remote.ip()) != transport.family {
+            tracing::debug!(
+                "the floor stream is in another address family than the seat; declined"
+            );
+            return Ok(None);
+        }
+        let endpoint = match self
+            .alloc_endpoints(1, transport.family, transport.bind)
+            .await
+        {
+            Ok(mut endpoints) => endpoints.remove(0),
+            Err(reason) => return Err(boxed_error_result("forward_join: floor stream", &reason)),
+        };
+        if let Err(error) = self
+            .datapath
+            .install_flow(endpoint.id, FlowAction::Redirect)
+        {
+            self.free(&[endpoint]).await;
+            return Err(boxed_error_result(
+                "forward_join: install floor redirect",
+                &error,
+            ));
+        }
+        let destination = peer_media_address(offered.remote, profile.received_from);
+        // An ICE seat holds the gate open until its pair is selected, then the room narrows it; a
+        // `symmetric` seat stays open and the learn-once latch is the only constraint.
+        let accepted_source =
+            if transport.ice_pending || profile.flags.iter().any(|flag| flag == "symmetric") {
+                SourceFilter::Any
+            } else {
+                SourceFilter::Exact(destination.ip())
+            };
+        Ok(Some((
+            endpoint,
+            FloorConfig {
+                endpoint: endpoint.id,
+                destination,
+                accepted_source,
+                ice_gated: transport.ice_pending,
+            },
+        )))
     }
 
     /// Unseat a member ([`Command::ForwardLeave`]), freeing its endpoint, flows, and DTLS and ICE

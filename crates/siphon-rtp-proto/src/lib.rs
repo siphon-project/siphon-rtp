@@ -1772,6 +1772,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 /// A response to a [`Request`], correlated by [`Response::id`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
@@ -1848,6 +1852,10 @@ pub struct EngineStatistics {
     pub control_errors_total: u64,
     /// Live calls currently in the session registry (a gauge, not a running total).
     pub sessions: u64,
+    /// `rtcp_app` events dropped (oldest first) because a controller's APP queue was full. Zero
+    /// is omitted from the wire. A floor message lost here is a real loss: alert on any increase.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rtcp_app_dropped_total: u64,
 }
 
 /// This engine's live load, returned by [`Command::Load`] — the cluster-placement view a SIP media
@@ -4615,6 +4623,7 @@ mod tests {
                     deletes_total: 8,
                     control_errors_total: 1,
                     sessions: 2,
+                    rtcp_app_dropped_total: 0,
                 },
             },
         });

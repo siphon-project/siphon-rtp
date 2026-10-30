@@ -29,6 +29,8 @@ fn config(index: u64) -> ForwardSeatConfig {
         egress_ssrc: index as u32,
         initial_sequence: 0,
         initial_timestamp: 0,
+        floor: None,
+        app_events: None,
     }
 }
 

@@ -1178,6 +1178,46 @@ own copy of Layers 2–3. Layer 1 is where it differs, and that difference is th
   activity only for a datagram that cleared both gates — so a spoofed spray cannot extend a call's
   life, and a fax-only call (which by then carries no audio at all) is not reaped mid-transmission.
 
+### Layer 5h — The MCPTT floor-control stream of a forwarding-room seat
+A forwarding-room seat may offer `m=application <port> udp MCPTT` (3GPP TS 24.380 §14, SDP per
+TS 24.379). The engine anchors it on a **separate** `Redirect` endpoint per seat, because RTPBleed is
+per-stream and the floor stream is a full inbound surface that reaches the controller. The stream
+carries only RTCP APP packets (RFC 3550 §6.7) and is plain in this build; SRTP for the media control
+channel (TS 24.380 §13) is not implemented, so the answer never offers it.
+
+- **Layer 2, the same source gate as the seat's audio.** The floor endpoint is gated to the address
+  the floor m-line signalled (its own `c=`, else the session one), tightened to the `received-from`
+  hint exactly as the audio is, or open under the opt-in `symmetric` flag. An ICE seat holds it open
+  until its pair is selected and the room then narrows it to the selected address. A datagram from any
+  other source never produces an event.
+- **The floor opens when the audio path does.** A DTLS seat before its handshake and an ICE seat
+  before its pair is selected have their floor datagrams refused, and `send_rtcp_app` to them is an
+  error naming the seat, so floor control cannot race the decisions that gate the media.
+- **Layer 3 is the learn-once `OpaqueLatch`, not the SSRC latch.** The stream has no RTP, and
+  `rtp_media_ssrc` returns nothing for RTCP, so there is no SSRC to prove a new source is the same
+  stream. The first gated source is learned as the reply address and every later source is refused,
+  the posture Layer 5g describes for UDPTL. A NAT rebind therefore stops floor control rather than
+  following it; the controller sees `forward_seat_inactive` for a seat that has gone quiet. An SSRC
+  inside an APP packet is the sender's claim and is never used to move the latch.
+- **Never forward into the void.** `send_rtcp_app` to a seat whose floor destination is not yet known
+  (no address, or the seat not open yet) is refused for that seat, never guessed.
+- **Floor messages are terminated, never relayed.** An APP packet from a seat becomes a control
+  event for the controller that seated it and is not sent to any other seat. The controller decides
+  what the room hears. The same holds for APP parts inside a seat's audio RTCP: they are surfaced,
+  the reports in the same compound are read as before, and nothing is relayed.
+- **A malformed datagram is counted and dropped.** `rtcp::app_packets` reads at most what the
+  datagram's own length fields describe, never allocates and never panics; a datagram it cannot read
+  to the end is counted per seat and logged at `debug`, and raises no event.
+- **Events are not shed silently.** `rtcp_app` events use their own per-controller queue (4096),
+  drained by the same connection loop. When it fills the *oldest* event is dropped, with an `error!`
+  naming the room and seat, and `siphon_rtp_rtcp_app_dropped_total` / `statistics.rtcp_app_dropped_total`
+  count it, so a floor message lost to a stuck controller is visible and never a surprise.
+- **Liveness.** Datagrams that clear the gate stamp the floor endpoint's activity, and the inactivity
+  scan takes the newer of a seat's audio and floor activity, so a seat that only sends floor traffic is
+  not reported as quiet.
+- **Teardown.** The floor endpoint is part of the seat's endpoints for `forward_leave`, a room's end,
+  and an ICE failure, so it is freed with the seat and its route removed.
+
 ### Layer 5e — The WebSocket-takeover Redirect path
 A **takeover** call (`ProfileFlags.ws_uri`, `PipelineKind::Ws`) points leg A's RTP endpoint at
 `FlowAction::Redirect` and makes an external WebSocket media server A's far side; the A↔B
