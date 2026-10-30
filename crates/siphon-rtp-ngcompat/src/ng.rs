@@ -498,6 +498,8 @@ fn parse_profile(request: &Value) -> ProfileFlags {
             }
             mux
         },
+        // MCPTT floor control is a native-protocol feature; rtpengine's NG has no such key.
+        floor_fmtp: None,
     }
 }
 

@@ -382,6 +382,32 @@ fn command_call_id_extracts_the_addressed_correlation_key() {
     };
     assert_eq!(command_call_id(&leave), Some("room-1"));
 
+    // Forwarding-room verbs too; a send correlates on whichever of call or room it names.
+    let set_source = Command::ForwardSetSource {
+        conference_id: "group-1".into(),
+        from_tag: None,
+    };
+    assert_eq!(command_call_id(&set_source), Some("group-1"));
+    let send = |call_id: Option<&str>, conference_id: Option<&str>| Command::SendRtcpApp {
+        call_id: call_id.map(Into::into),
+        conference_id: conference_id.map(Into::into),
+        from_tag: None,
+        except_from_tags: Vec::new(),
+        stream: siphon_rtp_proto::RtcpAppStream::Floor,
+        ssrc: None,
+        name: "MCPT".into(),
+        subtype: 0,
+        payload: Vec::new(),
+    };
+    assert_eq!(
+        command_call_id(&send(Some("call-42"), None)),
+        Some("call-42")
+    );
+    assert_eq!(
+        command_call_id(&send(None, Some("group-1"))),
+        Some("group-1")
+    );
+
     // Census / health / cluster verbs address no specific call.
     assert_eq!(command_call_id(&Command::Ping), None);
     assert_eq!(command_call_id(&Command::List), None);
@@ -390,6 +416,30 @@ fn command_call_id_extracts_the_addressed_correlation_key() {
             snapshot: String::new()
         }),
         None
+    );
+}
+
+#[tokio::test]
+async fn forwarding_room_verbs_are_refused_by_name_until_the_engine_serves_them() {
+    // The contract lands before the engine side: a controller trying it gets a refusal naming the
+    // verb, never a silent success.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::ForwardJoin {
+                conference_id: "group-1".into(),
+                from_tag: "a7c31f".into(),
+                sdp: String::new(),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    assert_eq!(
+        result,
+        CmdResult::Error {
+            reason: "unsupported command: forward_join".into()
+        }
     );
 }
 
