@@ -71,6 +71,27 @@ one-shot prompt fetch needs. No `native-tls`, no OpenSSL, no C.
 The operational bounds and the SSRF posture of that fetch are documented in
 [the JSON control reference](control/json.md#playback-from-a-url).
 
+### WebRTC data channels (`mcptt-floor`)
+
+A browser seat cannot send RTCP APP, so its MCPTT floor control rides a WebRTC data channel: SCTP
+(RFC 9260) over the leg's DTLS association (RFC 8261) with DCEP (RFC 8832). The pair below is
+sans-I/O, owns no socket, clock or task, and is published by the same publisher as `rtc-dtls`
+(rainliu, webrtc-rs). Both are `MIT/Apache-2.0`, contain no `unsafe` and no `build.rs`, and are
+pinned exactly like `rtc-dtls`.
+
+| Crate | Why | Licence |
+| --- | --- | --- |
+| `rtc-sctp` `=0.21.1` | The SCTP association (RFC 9260) under the data channel. | MIT/Apache-2.0 |
+| `rtc-datachannel` `=0.21.1` | DCEP (RFC 8832) open/ack framing and the data-channel message types. | MIT/Apache-2.0 |
+| `crc32c` 0.6.8 | CRC32c checksum of every SCTP packet. Single owner (zowens); its `build.rs` only writes the CRC tables to `OUT_DIR`; the hardware paths use SIMD `unsafe`; last release 2024-06. | MIT/Apache-2.0 |
+| `rustc-hash` 2.x | Fast hasher for the association's stream maps (rust-lang), no `unsafe`. | MIT/Apache-2.0 |
+| `sansio` 1.0.1 | The sans-I/O trait both crates implement (rainliu + yapprtc), no dependencies, no `unsafe`. | MIT/Apache-2.0 |
+
+Rejected alternative: a hand-rolled SCTP (RFC 9260 with the RFC 8831 / RFC 8832 data-channel profile)
+is months of work and its own attack surface. The exposure is bounded: SCTP bytes are only parsed
+after the DTLS record layer has authenticated them (see
+[security-and-nat.md](security-and-nat.md#webrtc-data-channel-floor-control)).
+
 ## Software Bill of Materials (SBOM)
 
 Every tagged release ships a full SBOM in **two industry formats**, generated from the exact
