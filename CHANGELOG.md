@@ -52,6 +52,25 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   loss is preserved, late packets of the previous source are dropped. Payload is copied unchanged;
   CSRCs and the header extension are dropped, padding is kept. Exposes SR counters.
 
+### Fixed
+
+- **A WebRTC participant in a conference hears the room.** A seat's answer is written from the
+  participant's own offer, and nothing removed the offer's stream identity, so it went back to the
+  participant: its own `a=ssrc` and `a=msid` (RFC 5576, RFC 8830) and its `a=extmap` header
+  extensions (RFC 8285). The browser then bound its receive stream to its own SSRC. The room sends
+  under a different SSRC and with no header extensions, so every packet was dropped: everyone heard
+  the participant, and the participant heard nothing. The answer now drops all of those lines and
+  names the SSRC the room really sends (`a=ssrc:<ssrc> cname:<cname>`). `answer_local` drops them
+  too, and names no SSRC of its own.
+  A forwarding-room seat's answer (`forward_join`) drops them the same way and names the SSRC the
+  room forwards to the seat.
+- **An event raised just after a control reconnect reaches the new connection.** A reconnect gives
+  the new connection a receiver on the same event channel as the one it replaces, and until the old
+  connection's loop noticed it was superseded it was a second consumer. Woken with its eviction,
+  its end of stream and a new event all ready, it picked one at random, and sometimes took the event
+  and wrote it into the closed socket: a `call_summary` (or any event) lost to the controller. The
+  loop now checks eviction and end of stream first.
+
 ## [0.15.5] — 2026-10-29
 
 ### Fixed
