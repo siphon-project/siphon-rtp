@@ -62,9 +62,11 @@ pub enum ForwardRefusal {
 
 /// A control operation on a room actor.
 pub enum ForwardControl {
-    /// Seat a member; the verdict goes back on `reply`.
+    /// Seat a member; the verdict goes back on `reply`. `transcoded` is the seat's own codec when it
+    /// is not the room's.
     Add {
         config: Box<ForwardSeatConfig>,
+        transcoded: Option<Box<CodecSpec>>,
         reply: tokio::sync::oneshot::Sender<Result<(), ForwardError>>,
     },
     /// Unseat a member.
@@ -89,6 +91,21 @@ pub enum ForwardControl {
     IceSelected { tag: String, remote: SocketAddr },
     /// End the actor.
     Stop,
+}
+
+/// How a seat is admitted to a room.
+enum Admission<'a> {
+    /// The seat reads the room's codec (or starts the room with `proposed`).
+    RoomCodec {
+        proposed: RoomCodec,
+        spec: &'a CodecSpec,
+    },
+    /// The seat is in `spec`, another codec, and the room (which carried `room` when it was checked)
+    /// transcodes for it.
+    Transcoded {
+        room: RoomCodec,
+        spec: &'a CodecSpec,
+    },
 }
 
 enum ForwardInput {
@@ -239,6 +256,54 @@ impl ForwardRegistry {
     where
         D: Datapath + Clone + Send + 'static,
     {
+        let admission = Admission::RoomCodec {
+            proposed,
+            spec: seat_spec,
+        };
+        self.join_with(room_id, admission, config, joined_tick, events, datapath)
+            .await
+    }
+
+    /// Seat a member whose codec `seat_spec` is not the room's, in the existing room whose codec was
+    /// `room_codec` when the seat was checked ([`RoomCodec::admit_cross`]). The room transcodes for
+    /// it. Never creates a room: a room that ended or changed codec since is refused, because the
+    /// seat's codec was checked against another one.
+    ///
+    /// # Errors
+    /// [`ForwardRefusal`] naming why the seat was not taken.
+    pub async fn join_transcoded<D>(
+        &self,
+        room_id: &str,
+        room_codec: RoomCodec,
+        seat_spec: &CodecSpec,
+        config: ForwardSeatConfig,
+        joined_tick: u64,
+        events: Option<flume::Sender<Event>>,
+        datapath: D,
+    ) -> Result<(), ForwardRefusal>
+    where
+        D: Datapath + Clone + Send + 'static,
+    {
+        let admission = Admission::Transcoded {
+            room: room_codec,
+            spec: seat_spec,
+        };
+        self.join_with(room_id, admission, config, joined_tick, events, datapath)
+            .await
+    }
+
+    async fn join_with<D>(
+        &self,
+        room_id: &str,
+        admission: Admission<'_>,
+        config: ForwardSeatConfig,
+        joined_tick: u64,
+        events: Option<flume::Sender<Event>>,
+        datapath: D,
+    ) -> Result<(), ForwardRefusal>
+    where
+        D: Datapath + Clone + Send + 'static,
+    {
         let endpoint = config.endpoint;
         let floor_endpoint = config.floor.as_ref().map(|floor| floor.endpoint);
         let tag = config.tag.clone();
@@ -249,6 +314,21 @@ impl ForwardRegistry {
             joined_tick,
             events,
             reported_quiet_since: None,
+        };
+        if let Admission::Transcoded { room, .. } = &admission {
+            match self.rooms.get(room_id) {
+                None => return Err(ForwardRefusal::UnknownRoom(room_id.to_string())),
+                Some(existing) if existing.codec != *room => {
+                    return Err(ForwardRefusal::Codec(
+                        "the room's codec changed while the seat was being set up".to_string(),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        let (proposed, transcoded) = match &admission {
+            Admission::RoomCodec { proposed, .. } => (proposed.clone(), None),
+            Admission::Transcoded { room, spec } => (room.clone(), Some((*spec).clone())),
         };
         let mailbox = {
             let mut room = self.rooms.entry(room_id.to_string()).or_insert_with(|| {
@@ -263,14 +343,25 @@ impl ForwardRegistry {
                 }
             });
             // The authority is the room's own codec, not the caller's snapshot of it: a second
-            // first-seat racing the creation must be held to the codec that won.
-            let admitted = room.codec.admit(std::slice::from_ref(seat_spec));
+            // first-seat racing the creation must be held to the codec that won. A transcoded seat
+            // was checked against a codec, and is only taken while the room still has it.
+            let admitted = match &admission {
+                Admission::RoomCodec { spec, .. } => room
+                    .codec
+                    .admit(std::slice::from_ref(*spec))
+                    .map(|_| ())
+                    .map_err(ForwardRefusal::Codec),
+                Admission::Transcoded { room: checked, .. } if room.codec != *checked => Err(
+                    ForwardRefusal::Codec("the room's codec changed".to_string()),
+                ),
+                Admission::Transcoded { .. } => Ok(()),
+            };
             let refusal = match admitted {
-                Err(reason) => Some(ForwardRefusal::Codec(reason)),
-                Ok(_) if room.members.iter().any(|seated| seated.tag == tag) => {
+                Err(refusal) => Some(refusal),
+                Ok(()) if room.members.iter().any(|seated| seated.tag == tag) => {
                     Some(ForwardError::DuplicateTag(tag.clone()).into())
                 }
-                Ok(_) => None,
+                Ok(()) => None,
             };
             if let Some(refusal) = refusal {
                 let empty = room.members.is_empty();
@@ -286,6 +377,7 @@ impl ForwardRegistry {
         let (reply, verdict) = tokio::sync::oneshot::channel();
         let add = ForwardControl::Add {
             config: Box::new(config),
+            transcoded: transcoded.map(Box::new),
             reply,
         };
         let seated = match mailbox.try_send(ForwardInput::Control(add)) {
@@ -468,6 +560,75 @@ impl ForwardRegistry {
         }
         raised
     }
+
+    /// Free every room in which **every** seat has received nothing at all (no RTP, RTCP or floor
+    /// packet, which is what `last_activity` reads) for `idle_ticks`, and say so to each seat's
+    /// client: one [`Event::MediaTimeout`] with an empty `call_id` and the room as `conference_id`
+    /// per seat, the shape a mixing room's reaped seat has. Returns the endpoints to free; the room
+    /// and its routes are gone already. `idle_ticks == 0` disables it.
+    ///
+    /// This is the backstop for a room nobody ended (a controller that crashed, an operator that
+    /// forgot), never a judgement of one seat: a seat on its own is not reaped, because a listener
+    /// sends no audio for as long as others talk (3GPP TS 24.379). A live group cannot trip it,
+    /// since each receiver sends RTCP receiver reports for as long as it is on the call (RFC 3550
+    /// §6.2: at least one report every 5 s, scaled by the group size). Silence of the whole room
+    /// is therefore a room whose members are all gone. A seat is measured from the tick it joined
+    /// until it is first heard, so a room is never freed before it has had `idle_ticks` to hear
+    /// anything. Driven by the datapath's logical clock, so tests advance it.
+    pub fn reap_silent_rooms(
+        &self,
+        now: u64,
+        idle_ticks: u64,
+        last_activity: impl Fn(EndpointId) -> Option<u64>,
+    ) -> Vec<EndpointId> {
+        if idle_ticks == 0 {
+            return Vec::new();
+        }
+        let silent: Vec<String> = self
+            .rooms
+            .iter()
+            .filter(|room| {
+                !room.members.is_empty()
+                    && room.members.iter().all(|member| {
+                        let last = member
+                            .endpoints()
+                            .into_iter()
+                            .filter_map(&last_activity)
+                            .max()
+                            .unwrap_or(0)
+                            .max(member.joined_tick);
+                        now.saturating_sub(last) >= idle_ticks
+                    })
+            })
+            .map(|room| room.key().clone())
+            .collect();
+        let mut freed = Vec::new();
+        for room_id in silent {
+            if let Some(room) = self.rooms.get(&room_id) {
+                tracing::warn!(
+                    target: "siphon_rtp::media", room = %room_id, seats = room.members.len(),
+                    idle_secs = idle_ticks,
+                    "forwarding room has received nothing from any seat; freed"
+                );
+                for member in &room.members {
+                    let Some(sink) = &member.events else {
+                        continue;
+                    };
+                    let event = Event::MediaTimeout {
+                        call_id: String::new(),
+                        from_tag: member.tag.clone(),
+                        conference_id: Some(room_id.clone()),
+                        reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
+                    };
+                    if sink.try_send(event).is_err() {
+                        tracing::debug!("forwarding room timeout event dropped (sink full)");
+                    }
+                }
+            }
+            freed.extend(self.deregister(&room_id));
+        }
+        freed
+    }
 }
 
 /// The room actor: ingest datagrams, forward, and send the periodic Sender Reports.
@@ -493,8 +654,13 @@ async fn run_forward_room<D: Datapath>(
                             }
                         }
                     }
-                    ForwardInput::Control(ForwardControl::Add { config, reply }) => {
-                        let _ = reply.send(room.add_seat(*config, datapath.now_micros()));
+                    ForwardInput::Control(ForwardControl::Add { config, transcoded, reply }) => {
+                        let now = datapath.now_micros();
+                        let outcome = match transcoded {
+                            Some(spec) => room.add_cross_codec_seat(*config, *spec, now),
+                            None => room.add_seat(*config, now),
+                        };
+                        let _ = reply.send(outcome);
                     }
                     ForwardInput::Control(ForwardControl::Remove(tag)) => {
                         if room.remove_seat(&tag) && room.is_empty() {

@@ -1,22 +1,33 @@
-//! Forwarding-room verbs: `forward_join`, `forward_leave`, `forward_set_source`.
+//! Forwarding-room verbs: `forward_join`, `forward_leave`, `forward_set_source` (the dial-out pair,
+//! `forward_offer` and `forward_answer`, is in [`super::forward_dial_out`]).
 //!
 //! A forwarding room is the push-to-talk counterpart of the mixing conference (3GPP TS 24.379): one
 //! chosen seat's RTP is forwarded to every other seat through a per-receiver RTP translator, with no
 //! mixing. A seat is opened the way a conference seat is ([`Engine::open_seat_transport`]); what is
-//! different is the codec rule (the first seat fixes the room codec, later seats must offer it) and
-//! that a seat is never freed for silence.
+//! different is the codec rule (the first seat fixes the room codec; a later seat either offers it,
+//! and is forwarded to untouched, or offers a codec the engine can transcode to and from the room's,
+//! and is transcoded for) and that a seat is never freed for silence.
 
+use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{Datapath, Endpoint, FlowAction, SourceFilter};
 use siphon_rtp_proto::{CmdResult, Command, ProfileFlags};
 
 use crate::dtls_bridge::PipelineTarget;
-use crate::forward::{FloorConfig, ForwardSeatConfig, RoomCodec};
+use crate::forward::{FloorConfig, ForwardRefusal, ForwardSeatConfig, RoomCodec};
 use crate::sdp::{self, EngineMedia, TextRewrite};
 
 use super::answer_local::answer_codec_candidates;
 use super::negotiate::{parse_codec_flags, peer_media_address, random_ssrc};
 use super::seat_transport::SeatTransport;
 use super::{boxed_error_result, error_result, ok_empty, ok_sdp, ClientId, Engine};
+
+/// How a seat joins its room: the room's codec as it stands (or as this seat fixes it), the codec
+/// the seat is answered in, and whether the room transcodes for the seat.
+pub(super) struct ForwardAdmission {
+    pub(super) room: RoomCodec,
+    pub(super) spec: CodecSpec,
+    pub(super) transcoded: bool,
+}
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Dispatch a forwarding-room command.
@@ -29,6 +40,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 profile,
             } => {
                 self.forward_join(client, &conference_id, from_tag, &sdp, &profile)
+                    .await
+            }
+            Command::ForwardOffer {
+                conference_id,
+                from_tag,
+                profile,
+            } => self.forward_offer(&conference_id, from_tag, profile).await,
+            Command::ForwardAnswer {
+                conference_id,
+                from_tag,
+                sdp,
+                received_from,
+            } => {
+                self.forward_answer(client, &conference_id, &from_tag, &sdp, received_from)
                     .await
             }
             Command::ForwardLeave {
@@ -53,8 +78,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// Seat a member in a forwarding room, creating the room on the first join
     /// ([`Command::ForwardJoin`]). The first seat fixes the room's codec from its offer in RFC 3264
-    /// order; a later seat must offer that codec in the same payload format and is answered with its
-    /// own payload type for it. Nothing is allocated for a seat the room would refuse.
+    /// order; a later seat that offers that codec in the same payload format is answered with its own
+    /// payload type for it, and one that does not is transcoded for if the engine can decode and
+    /// encode both codecs ([`Self::forward_admission`]). Nothing is allocated for a seat the room
+    /// would refuse.
     pub(super) async fn forward_join(
         &self,
         client: ClientId,
@@ -87,16 +114,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // decoder here: the room forwards the payload as it came (RFC 3550 §7.1).
         let offered = answer_codec_candidates(&info, &parse_codec_flags(&profile.flags));
         let forward = self.conference.forward();
-        let (proposed, spec) = match forward.room_codec(room_id) {
-            Some(room) => match room.admit(&offered) {
-                Ok(spec) => (room, spec),
-                Err(reason) => return error_result("forward_join", &reason),
-            },
-            None => match RoomCodec::from_offer(&offered) {
-                Ok((room, spec)) => (room, spec),
-                Err(reason) => return error_result("forward_join", &reason),
-            },
+        let admission = match self.forward_admission(room_id, &offered) {
+            Ok(admission) => admission,
+            Err(reason) => return error_result("forward_join", &reason),
         };
+        let spec = admission.spec.clone();
         let telephone_event =
             sdp::TelephoneEvent::accompanying(&info.telephone_events(), Some(&spec));
         let mut transport = match self
@@ -134,30 +156,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             floor: floor.map(|(_, config)| config),
             app_events: self.app_event_queue(client),
         };
-        let joined_tick = self.datapath.now_ticks();
-        if let Err(refusal) = forward
-            .join(
-                room_id,
-                proposed,
-                &spec,
-                config,
-                joined_tick,
-                self.event_sink(client),
-                self.datapath.clone(),
-            )
+        if let Err(refusal) = self
+            .seat_forward_member(client, room_id, admission, config, endpoint, floor_endpoint)
             .await
         {
-            self.free(&[endpoint]).await;
-            if let Some(floor) = floor_endpoint {
-                self.free(&[floor]).await;
-            }
             return error_result("forward_join", &refusal);
-        }
-        // Seated: aim the room's egress at whatever ICE validates for this seat.
-        self.follow_seat_ice(endpoint.id);
-        self.endpoint_calls.insert(endpoint.id, room_id.to_string());
-        if let Some(floor) = floor_endpoint {
-            self.endpoint_calls.insert(floor.id, room_id.to_string());
         }
 
         let target = PipelineTarget::Forward {
@@ -261,13 +264,109 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Unseat a member ([`Command::ForwardLeave`]), freeing its endpoint, flows, and DTLS and ICE
-    /// state. The last leave ends the room.
+    /// state. The last leave ends the room. A seat offered by `forward_offer` and not yet answered is
+    /// not in the room; leaving drops the offer and frees its endpoints.
     pub(super) async fn forward_leave(&self, room_id: &str, from_tag: &str) -> CmdResult {
-        if self.release_forward_seat(room_id, from_tag).await {
+        if self.release_forward_seat(room_id, from_tag).await
+            || self.drop_pending_forward_seat(room_id, from_tag).await
+        {
             ok_empty()
         } else {
             error_result("forward_leave", &"no such forwarding room seat")
         }
+    }
+
+    /// Decide how a seat offering `offered` joins `room_id`, before anything is allocated: the first
+    /// seat fixes the room's codec; a later seat offering the room's codec in its payload format is
+    /// forwarded to untouched; any other is transcoded for when the engine has a decoder and an
+    /// encoder for both codecs and the seat's packetization interval is the room's. The refusal
+    /// names why the room's codec was not offered and why the engine cannot transcode either.
+    pub(super) fn forward_admission(
+        &self,
+        room_id: &str,
+        offered: &[CodecSpec],
+    ) -> Result<ForwardAdmission, String> {
+        let Some(room) = self.conference.forward().room_codec(room_id) else {
+            return RoomCodec::from_offer(offered).map(|(room, spec)| ForwardAdmission {
+                room,
+                spec,
+                transcoded: false,
+            });
+        };
+        match room.admit(offered) {
+            Ok(spec) => Ok(ForwardAdmission {
+                room,
+                spec,
+                transcoded: false,
+            }),
+            Err(forwarded) => match room.admit_cross(offered) {
+                Ok(spec) => Ok(ForwardAdmission {
+                    room,
+                    spec,
+                    transcoded: true,
+                }),
+                Err(transcoded) => Err(format!(
+                    "{forwarded}; and it cannot be transcoded to: {transcoded}"
+                )),
+            },
+        }
+    }
+
+    /// Put an admitted seat in its room and make it reachable: the room (waiting for its verdict),
+    /// then the ICE follower and the endpoint-to-room bookkeeping. A refusal frees the seat's audio
+    /// and floor endpoints, so a caller that gets `Err` has nothing left to release.
+    pub(super) async fn seat_forward_member(
+        &self,
+        client: ClientId,
+        room_id: &str,
+        admission: ForwardAdmission,
+        config: ForwardSeatConfig,
+        endpoint: Endpoint,
+        floor_endpoint: Option<Endpoint>,
+    ) -> Result<(), ForwardRefusal> {
+        let forward = self.conference.forward();
+        let joined_tick = self.datapath.now_ticks();
+        let events = self.event_sink(client);
+        let datapath = self.datapath.clone();
+        let outcome = if admission.transcoded {
+            forward
+                .join_transcoded(
+                    room_id,
+                    admission.room,
+                    &admission.spec,
+                    config,
+                    joined_tick,
+                    events,
+                    datapath,
+                )
+                .await
+        } else {
+            forward
+                .join(
+                    room_id,
+                    admission.room,
+                    &admission.spec,
+                    config,
+                    joined_tick,
+                    events,
+                    datapath,
+                )
+                .await
+        };
+        if let Err(refusal) = outcome {
+            self.free(&[endpoint]).await;
+            if let Some(floor) = floor_endpoint {
+                self.free(&[floor]).await;
+            }
+            return Err(refusal);
+        }
+        // Seated: aim the room's egress at whatever ICE validates for this seat.
+        self.follow_seat_ice(endpoint.id);
+        self.endpoint_calls.insert(endpoint.id, room_id.to_string());
+        if let Some(floor) = floor_endpoint {
+            self.endpoint_calls.insert(floor.id, room_id.to_string());
+        }
+        Ok(())
     }
 
     /// Take a seat out of its room and free everything it held. Returns whether it was seated.

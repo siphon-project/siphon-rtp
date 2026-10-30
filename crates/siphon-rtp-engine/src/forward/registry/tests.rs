@@ -217,3 +217,5 @@ async fn deregister_hands_back_every_seat_endpoint() {
     assert!(!registry.owns(EndpointId(1)));
     assert!(registry.deregister("group").is_empty());
 }
+
+mod reaping;
