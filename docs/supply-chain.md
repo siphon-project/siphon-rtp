@@ -31,6 +31,9 @@ list, so none can sneak in transitively. The **`deny` CI job runs
 `cargo deny check bans licenses sources` on every pull request**; a PR that pulls a banned crate,
 a crate outside the OSI-permissive licence allow-list, or any crate from outside crates.io
 (unknown registries and git sources are denied), fails before review.
+The workspace carries no git or patched dependency: `rtc-dtls`, `rtc-shared` and `rtc-crypto` come from
+crates.io at 0.21.1, which includes the RFC 6347 §4.2.4 last-flight retransmission fix (webrtc-rs/rtc#243).
+The former fork pin and its `allow-git` entry are retired.
 
 Two vendored exceptions, stated so the claim stays honest: the jemalloc allocator
 (`tikv-jemallocator`, the one accepted `-sys` dependency) and ring's crypto primitives contain
@@ -160,7 +163,7 @@ a RustSec advisory filed a week later without a line of code changing. siphon-rt
   carry LLVM's NCSA licence; nothing else may, and NCSA is not on the general allow-list.
 - **Ignores are explicit and justified in `deny.toml`**, each with the reason and the exit
   condition recorded (currently three unmaintained-crate notices reached transitively:
-  `paste` via the jemalloc stats dev-dependency, `bincode` 1.x via `webrtc-dtls`, and
+  `paste` via the jemalloc stats dev-dependency, `bincode` 1.x via the `iai-callgrind` dev-dependency, and
   `proc-macro-error2` via the `iai-callgrind` perf-gate dev-dependency; none is a
   vulnerability and none has an upstream fix yet; see `deny.toml`).
 

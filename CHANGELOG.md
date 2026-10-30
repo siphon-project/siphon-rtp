@@ -92,6 +92,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   loss is preserved, late packets of the previous source are dropped. Payload is copied unchanged;
   CSRCs and the header extension are dropped, padding is kept. Exposes SR counters.
 
+### Changed
+
+- **`rtc-dtls`, `rtc-shared` and `rtc-crypto` move to crates.io 0.21.1; the last-flight fork is retired.** The
+  RFC 6347 §4.2.4 last-flight retransmission fix landed upstream (webrtc-rs/rtc#243) and ships in
+  0.21.1, so the `[patch.crates-io]` git entries and the `allow-git` exception in `deny.toml` are gone.
+
 ## [0.15.5] — 2026-10-29
 
 ### Fixed
