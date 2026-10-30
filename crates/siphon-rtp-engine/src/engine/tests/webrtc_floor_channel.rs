@@ -283,6 +283,54 @@ async fn next_app(events: &flume::Receiver<Event>) -> Event {
         .expect("open queue")
 }
 
+/// The browser's own stream identity is dropped from the answer in every section, and what bundling
+/// the data channel needs (`a=mid`, `a=group:BUNDLE`, `a=sctp-port`, the channel's own port) is not.
+#[tokio::test]
+async fn the_answer_drops_the_browsers_stream_identity_but_keeps_what_the_channel_needs() {
+    use super::stream_identity::{assert_nothing_of_the_offerer, signalled_ssrcs, OFFERER_SSRC};
+    let engine = engine_with_dispatcher();
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let address = socket.local_addr().expect("addr");
+    let certificate = DtlsCertificate::generate().expect("browser certificate");
+    let offer = browser_offer(address, &certificate, "active", true)
+        .replace(
+            "t=0 0\r\n",
+            "t=0 0\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS stream-a\r\n",
+        )
+        .replace(
+            "a=mid:0\r\n",
+            &format!(
+                "a=mid:0\r\na=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
+                 a=msid:stream-a track-a\r\na=ssrc:{OFFERER_SSRC} cname:offerer-cname\r\n"
+            ),
+        );
+    let answer = ok_sdp_text(&join(&engine, "a", offer).await);
+    assert_nothing_of_the_offerer(&answer);
+    assert!(!answer.contains("extmap"), "{answer}");
+    assert_eq!(
+        signalled_ssrcs(&answer).len(),
+        1,
+        "only the room's: {answer}"
+    );
+    let lines: Vec<&str> = answer.split("\r\n").collect();
+    for expected in [
+        "a=group:BUNDLE 0 1",
+        "a=mid:0",
+        "a=mid:1",
+        "a=sctp-port:5000",
+    ] {
+        assert!(lines.contains(&expected), "{expected} in {answer}");
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("m=application ") && line.contains("webrtc-datachannel")),
+        "the channel is still answered: {answer}"
+    );
+}
+
 #[tokio::test]
 async fn the_answer_carries_the_data_channel_on_the_audio_transport() {
     let engine = engine_with_dispatcher();

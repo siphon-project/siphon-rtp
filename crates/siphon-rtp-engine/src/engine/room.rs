@@ -305,11 +305,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(text) => text,
             Err(result) => return *result,
         };
+        let egress_ssrc = random_ssrc();
         let seated = self
             .seat_participant(
                 client,
                 conference_id,
                 SeatRequest {
+                    egress_ssrc,
                     tag: from_tag.clone(),
                     codec: seat,
                     telephone_event,
@@ -356,10 +358,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Answer: the engine endpoint (the interface's advertised IP), the participant's codec,
         // sendrecv, and for a secure leg RTP/SAVP + the engine's a=crypto. `text_rewrite` anchors (or
         // declines) the participant's `m=text` section (RFC 9071 multiparty RTT) resolved above.
-        match self.answer_seat_sdp(sdp, &mut transport, profile, text_rewrite) {
+        match self.answer_seat_sdp(
+            sdp,
+            &mut transport,
+            profile,
+            text_rewrite,
+            Some(&sdp::OwnSsrc::with_random_cname(egress_ssrc)),
+        ) {
             // RFC 3264 §6: the room is the answerer, and it mixes audio and the text it anchored.
             // Every other stream the participant offered is declined with port 0, and the audio is
             // answered in the one codec the seat was built for (§6.1).
+            //
+            // The answer is written from the participant's offer, so it would otherwise carry the
+            // participant's own `a=ssrc` / `a=msid` back to it, and a WebRTC participant would bind
+            // its receive stream to its own SSRC and drop the whole mix. It names the SSRC the room
+            // sends instead (RFC 5576 §4.1, RFC 8830 §2).
             Ok(rewritten) => ok_sdp(
                 sdp::force_answer_codec(
                     &sdp::decline_unanswered_media(rewritten, text_rewrite.is_anchored()),
@@ -410,6 +423,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             role,
             sip_call_id,
             held,
+            egress_ssrc,
         } = request;
         let config = ParticipantConfig {
             tag,
@@ -420,7 +434,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             egress_dst: remote_rtp,
             accepted_source,
             latch: true,
-            egress_ssrc: random_ssrc(),
+            egress_ssrc,
             egress_payload_type: codec.spec.payload_type,
             secure_pending,
             ice_pending,
@@ -1017,6 +1031,9 @@ pub(super) struct SeatRequest {
     pub(super) sip_call_id: Option<String>,
     /// Whether the participant said it will not send (`a=recvonly` / `a=inactive`, RFC 4566 §6).
     pub(super) held: bool,
+    /// The SSRC the room sends this participant its mix under. Chosen by the caller, so an answer
+    /// the engine writes can name the stream the participant will actually receive (RFC 5576).
+    pub(super) egress_ssrc: u32,
 }
 
 /// Build both halves of a seat in `spec` and check the room can hold its frame ([`seat::fit`]) — the
