@@ -58,6 +58,10 @@ name = "qos_bench"
 harness = false
 
 [[bench]]
+name = "rtcp_app_bench"
+harness = false
+
+[[bench]]
 name = "pcap_bench"
 harness = false
 
