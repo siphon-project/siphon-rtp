@@ -50,6 +50,7 @@ mod conference_dial_out;
 mod conference_received_from;
 mod conference_seat;
 mod conference_seat_call;
+mod forward_room;
 mod offer_far;
 mod ogg_opus_recording;
 mod record_call_streams;
@@ -416,30 +417,6 @@ fn command_call_id_extracts_the_addressed_correlation_key() {
             snapshot: String::new()
         }),
         None
-    );
-}
-
-#[tokio::test]
-async fn forwarding_room_verbs_are_refused_by_name_until_the_engine_serves_them() {
-    // The contract lands before the engine side: a controller trying it gets a refusal naming the
-    // verb, never a silent success.
-    let engine = Engine::new(UdpLoopbackDatapath::new());
-    let result = engine
-        .handle(
-            CLIENT,
-            Command::ForwardJoin {
-                conference_id: "group-1".into(),
-                from_tag: "a7c31f".into(),
-                sdp: String::new(),
-                profile: ProfileFlags::default(),
-            },
-        )
-        .await;
-    assert_eq!(
-        result,
-        CmdResult::Error {
-            reason: "unsupported command: forward_join".into()
-        }
     );
 }
 

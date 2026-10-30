@@ -350,6 +350,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 Command::Offer { .. }
                     | Command::AnswerLocal { .. }
                     | Command::ConferenceJoin { .. }
+                    | Command::ForwardJoin { .. }
                     | Command::ConferenceOffer { .. }
                     // A seat is a new conference participant, even though its call is not new.
                     | Command::ConferenceSeat { .. }
@@ -511,6 +512,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             | Command::ConferenceStopRecording { .. }) => {
                 self.dispatch_conference(client, command).await
             }
+            command @ (Command::ForwardJoin { .. }
+            | Command::ForwardLeave { .. }
+            | Command::ForwardSetSource { .. }) => self.dispatch_forward(client, command).await,
             Command::AttachWsTee {
                 call_id,
                 ws_uri,
@@ -853,7 +857,7 @@ fn is_error(result: &CmdResult) -> bool {
     matches!(result, CmdResult::Error { .. })
 }
 
-fn command_name(command: &Command) -> &'static str {
+pub(super) fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Offer { .. } => "offer",
         Command::Reoffer { .. } => "reoffer",

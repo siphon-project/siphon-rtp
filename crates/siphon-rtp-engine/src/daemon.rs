@@ -1061,6 +1061,10 @@ where
                     "media timeout — conference participants reaped"
                 );
             }
+            // Forwarding-room seats are never reaped for silence (a push-to-talk listener sends
+            // nothing for minutes); a seat quiet past the media timeout is reported to the client that
+            // seated it, once, and the controller decides.
+            let _ = sweeper.scan_inactive_forward_seats(timeout_ticks);
             // A seat the room offered and nobody answered is in setup, so it takes the setup ceiling.
             let expired = sweeper
                 .reap_pending_seats(setup_timeout_ticks, timeout_ticks)

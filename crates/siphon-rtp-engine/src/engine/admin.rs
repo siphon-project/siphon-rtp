@@ -134,6 +134,10 @@ fn supported_features() -> Vec<String> {
         // `conference_seat`: a live call's leg seated in a room in place. A controller gates the
         // verb on this entry, so it is advertised only where the verb is served.
         "conference_seat".to_string(),
+        // Forwarding rooms for push-to-talk group calls: `forward_join`, `forward_leave` and
+        // `forward_set_source`. A controller gates the verbs on this entry, so it is advertised only
+        // where they are served.
+        "forward_room".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.
