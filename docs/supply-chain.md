@@ -87,6 +87,8 @@ pinned exactly like `rtc-dtls`.
 | `rustc-hash` 2.x | Fast hasher for the association's stream maps (rust-lang), no `unsafe`. | MIT/Apache-2.0 |
 | `sansio` 1.0.1 | The sans-I/O trait both crates implement (rainliu + yapprtc), no dependencies, no `unsafe`. | MIT/Apache-2.0 |
 
+The fuzz/ and crates/siphon-rtp-xdp/ lockfiles additionally gain `rustc_version` 0.4.1 (build-time version probe of `crc32c`) and, in fuzz/, `semver` 1.0.28, both already in the root tree.
+
 Rejected alternative: a hand-rolled SCTP (RFC 9260 with the RFC 8831 / RFC 8832 data-channel profile)
 is months of work and its own attack surface. The exposure is bounded: SCTP bytes are only parsed
 after the DTLS record layer has authenticated them (see

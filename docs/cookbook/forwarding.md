@@ -201,6 +201,44 @@ use another (TS 24.380 §8.1.2 wants the SSRC the receiving party learnt at sess
 
 The floor stream is plain in this build: media control security (TS 24.380 §13) is not negotiated.
 
+### A browser dispatcher
+
+A browser cannot send RTCP APP, so a web dispatcher console runs the same floor control over a WebRTC
+data channel. TS 24.380 defines no WebRTC binding: **the convention is ours.** Offer audio and a data
+channel in one BUNDLE group, DTLS-SRTP on both (what every browser does by default):
+
+```
+a=group:BUNDLE 0 1
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+a=mid:0
+...
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+a=mid:1
+a=sctp-port:5000
+```
+
+`forward_join` answers the second section on the audio's own port with `a=sctp-port:5000` and
+`a=max-message-size:65536`. In the page, **open a channel labelled `mcptt-floor`** once the connection is
+up (the engine opens none):
+
+```js
+const floor = pc.createDataChannel("mcptt-floor");
+floor.binaryType = "arraybuffer";
+floor.onopen = () => floor.send(floorRequest);   // 16 bytes: 80 CC 00 03 .. 4D 43 50 54 00 02 05 00
+floor.onmessage = (event) => handle(new Uint8Array(event.data));
+```
+
+Each message is one complete RTCP APP packet, 12-byte header included, in a **binary** message; a string
+message is dropped. You get the same `rtcp_app` events (`stream: "floor"`, `conference_id`, `from_tag`)
+as from a phone, and answer with the same `send_rtcp_app` (`stream: "floor"`). `send_rtcp_app` to the
+browser is an error until it has opened `mcptt-floor`, so wait for your own `onopen`. Check
+`node_info` `features` for `webrtc_floor_channel` first.
+
+The browser's audio is Opus (or whatever it negotiated) and crosses codecs like any other seat's; an
+Opus seat in an AMR-WB room needs a build with the `amr` feature. The two-party `offer` / `answer` pair
+does not answer a data channel yet. There is no headless browser in this repository: acceptance in a real
+browser is yours to run against a controller.
+
 ### Two-party calls
 
 A two-party call carries the same stream. When the offerer's SDP has `m=application <port> udp MCPTT`,

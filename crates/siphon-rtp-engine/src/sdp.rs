@@ -18,6 +18,7 @@ use siphon_rtp_ice::{Candidate, IceOptions, END_OF_CANDIDATES_ATTRIBUTE, ICE_MIS
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
 mod amr;
+mod data_channel;
 mod decline;
 mod direction;
 pub(crate) mod floor;
@@ -26,7 +27,12 @@ pub use offer::conference_seat_offer;
 
 pub(crate) use amr::offered as offered_amr;
 pub use amr::{set_policy as set_amr_policy, AmrFmtp, AmrPolicy};
-pub use decline::{decline_unanswered_media, decline_unanswered_streams};
+pub use data_channel::{
+    anchor_data_channel, parse_data_channel, DataChannelMedia, DATA_CHANNEL_SCTP_PORT,
+};
+pub use decline::{
+    decline_unanswered_media, decline_unanswered_streams, decline_unanswered_with_data_channel,
+};
 pub use direction::answer_direction;
 pub use floor::{
     anchor_floor, decline_floor, parse_floor, validate_floor_fmtp, FloorFmtpError, FloorMediaInfo,

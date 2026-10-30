@@ -34,6 +34,7 @@ use siphon_rtp_srtp::leg::SecureLeg;
 use super::codec::RoomCodec;
 use super::transcode::{EventSource, SeatLeg, StreamPoint, TranscodeStats, Transcoder};
 use crate::app_events::AppEventQueue;
+use crate::floor_channel::FloorChannelHandle;
 use crate::ingress::{Ingress, RefusalLog};
 use crate::media_pipeline::Outbound;
 use crate::reply_latch::SymmetricLatch;
@@ -149,6 +150,9 @@ struct Seat {
     floor: Option<FloorStream>,
     /// Where this seat's RTCP APP events go.
     app_events: Option<AppEventQueue>,
+    /// The seat's floor data channel (a browser seat, docs/control/json.md), when it negotiated one
+    /// and has no UDP floor stream. Floor control to the seat is one binary message on it.
+    floor_channel: Option<FloorChannelHandle>,
     /// Reception statistics of the seat's own inbound stream, for the reception report block.
     stats: IngressStats,
     /// Middle 32 bits of the NTP timestamp of the seat's last Sender Report (our LSR), and when it
@@ -250,6 +254,8 @@ pub struct ForwardRoom {
     clear_in: Vec<u8>,
     /// The translated packet, before SRTP.
     scratch: Vec<u8>,
+    /// Floor sends queued for seats' data channels, awaiting their verdicts (see `app.rs`).
+    pending_channel: Vec<(String, crate::floor_channel::PendingSend)>,
     /// The SRTP-protected packet.
     secure_out: Vec<u8>,
 }
@@ -270,6 +276,7 @@ impl ForwardRoom {
             events: Vec::new(),
             clear_in: Vec::with_capacity(MAX_DATAGRAM),
             scratch: vec![0; MAX_DATAGRAM],
+            pending_channel: Vec::new(),
             secure_out: Vec::with_capacity(MAX_DATAGRAM),
         }
     }
@@ -413,6 +420,7 @@ impl ForwardRoom {
             clock_rate_hz,
             floor: config.floor.map(FloorStream::new),
             app_events: config.app_events,
+            floor_channel: None,
             stats: IngressStats::new(clock_rate_hz),
             last_sender_report_ntp_middle: 0,
             last_sender_report_arrival: None,
@@ -497,6 +505,15 @@ impl ForwardRoom {
         for seat in &mut self.seats {
             seat.translator.switch_source();
         }
+    }
+
+    /// Give seat `tag` its floor data channel. `false` when the seat already left.
+    pub fn attach_floor_channel(&mut self, tag: &str, channel: FloorChannelHandle) -> bool {
+        let Some(index) = self.index_of(tag) else {
+            return false;
+        };
+        self.seats[index].floor_channel = Some(channel);
+        true
     }
 
     /// Install a DTLS seat's key and let the room reach it.

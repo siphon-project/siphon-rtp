@@ -13,6 +13,7 @@ use siphon_rtp_datapath::{Datapath, Endpoint, FlowAction, SourceFilter};
 use siphon_rtp_proto::{CmdResult, Command, ProfileFlags};
 
 use crate::dtls_bridge::PipelineTarget;
+use crate::floor_channel::{floor_channel, FloorScope, FloorSink};
 use crate::forward::{FloorConfig, ForwardRefusal, ForwardSeatConfig, RoomCodec};
 use crate::sdp::{self, EngineMedia, TextRewrite};
 
@@ -162,6 +163,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         {
             return error_result("forward_join", &refusal);
         }
+        // A DTLS seat that offered a WebRTC data channel carries its floor control on it (a browser
+        // cannot send RTCP APP). The DTLS driver runs the SCTP association; the room sends through
+        // the handle.
+        let data_channel = transport
+            .dtls_pending()
+            .then(|| sdp::parse_data_channel(offer))
+            .flatten();
+        if data_channel.is_some() {
+            let (handle, plan) = floor_channel(FloorSink {
+                scope: FloorScope::Room(room_id.to_string()),
+                tag: from_tag.clone(),
+                events: self.app_event_queue(client),
+            });
+            self.dtls_bridge().attach_floor_channel(endpoint.id, plan);
+            if !forward.attach_floor_channel(room_id, &from_tag, handle) {
+                tracing::warn!(room_id, tag = %from_tag, "floor data channel for a seat that already left");
+            }
+        }
 
         let target = PipelineTarget::Forward {
             forward: forward.clone(),
@@ -176,29 +195,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // its own endpoint when it has one (TS 24.380 §14.3.1). Every other stream the offer carries
         // (video, a second floor section) is declined with port 0.
         match self.answer_seat_sdp(offer, &mut transport, profile, TextRewrite::None) {
-            Ok(rewritten) => ok_sdp(
-                sdp::force_answer_codec(
-                    &sdp::decline_unanswered_streams(
-                        match floor_endpoint {
-                            Some(floor) => sdp::anchor_floor(
-                                &rewritten,
-                                EngineMedia {
-                                    rtp: floor.local_addr,
-                                    rtcp: None,
-                                    advertised_ip: transport.advertised,
-                                },
-                                profile.floor_fmtp.as_deref(),
-                            ),
-                            None => rewritten,
+            Ok(rewritten) => {
+                let anchored = match floor_endpoint {
+                    Some(floor) => sdp::anchor_floor(
+                        &rewritten,
+                        EngineMedia {
+                            rtp: floor.local_addr,
+                            rtcp: None,
+                            advertised_ip: transport.advertised,
                         },
-                        false,
-                        floor_endpoint.is_some(),
+                        profile.floor_fmtp.as_deref(),
                     ),
-                    &spec,
-                    telephone_event,
-                ),
-                Some(from_tag),
-            ),
+                    None => rewritten,
+                };
+                // RFC 8841: the data channel section is answered on the audio's transport (BUNDLE).
+                let anchored = if data_channel.is_some() {
+                    sdp::anchor_data_channel(&anchored)
+                } else {
+                    anchored
+                };
+                ok_sdp(
+                    sdp::force_answer_codec(
+                        &sdp::decline_unanswered_with_data_channel(
+                            anchored,
+                            false,
+                            floor_endpoint.is_some(),
+                            data_channel.is_some(),
+                        ),
+                        &spec,
+                        telephone_event,
+                    ),
+                    Some(from_tag),
+                )
+            }
             Err(error) => {
                 self.release_forward_seat(room_id, &from_tag).await;
                 error_result("forward_join: SDP rewrite", &error)

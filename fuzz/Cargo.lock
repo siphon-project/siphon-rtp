@@ -1769,9 +1769,11 @@ version = "0.15.5"
 name = "siphon-rtp-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "libfuzzer-sys",
  "siphon-rtp",
  "siphon-rtp-codec",
+ "siphon-rtp-dtls",
  "siphon-rtp-ice",
  "siphon-rtp-li",
  "siphon-rtp-media",

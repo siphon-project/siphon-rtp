@@ -170,6 +170,30 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         match stream {
             RtcpAppStream::Floor => {
+                // A DTLS leg whose party opened the `mcptt-floor` data channel (a browser).
+                if target.leg.floor.is_none() {
+                    if let Some(channel) = self
+                        .call_floor_channels
+                        .get(&(call_id.to_string(), tag.to_string()))
+                        .map(|entry| entry.value().clone())
+                    {
+                        return match crate::floor_channel::send_floor_message(
+                            &channel.handle,
+                            request.ssrc.unwrap_or(channel.ssrc),
+                            request.name,
+                            request.subtype,
+                            &request.payload,
+                        )
+                        .await
+                        {
+                            Ok(()) => ok_empty(),
+                            Err(error) => error_result(
+                                "send_rtcp_app",
+                                &format!("{tag} ({error}) on call {call_id}"),
+                            ),
+                        };
+                    }
+                }
                 if target.leg.floor.is_none() {
                     return error_result(
                         "send_rtcp_app",

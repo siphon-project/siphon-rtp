@@ -1135,6 +1135,9 @@ pub struct Engine<D: Datapath> {
     controller_ids: DashMap<ClientId, Arc<str>>,
     /// Reverse index endpoint → call-id, correlating observed RTCP back to its call (HEP telemetry).
     endpoint_calls: DashMap<EndpointId, String>,
+    /// The WebRTC data channel that carries the MCPTT floor of a two-party call's DTLS leg
+    /// (`(call key, leg tag)`), where `send_rtcp_app` finds it. Drained with the call.
+    call_floor_channels: DashMap<(String, String), floor::CallFloorChannel>,
     /// The RTP endpoints whose first accepted packet has not been seen yet — what
     /// [`Engine::detect_media_started`] polls. Drained at teardown with `endpoint_calls`; the poll
     /// also drops any entry whose call is gone, as a backstop.

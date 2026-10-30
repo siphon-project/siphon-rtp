@@ -111,11 +111,16 @@ pub enum AppSendError {
 /// Why one seat cannot be sent an APP packet right now.
 fn unreachable_reason(seat: &Seat, stream: RtcpAppStream) -> Option<&'static str> {
     match stream {
-        RtcpAppStream::Floor => match &seat.floor {
-            None => Some("no floor stream"),
-            Some(_) if seat.secure_pending || seat.ice_pending => Some("floor stream not open yet"),
-            Some(floor) if !usable(floor.destination) => Some("no floor destination yet"),
-            Some(_) => None,
+        RtcpAppStream::Floor => match (&seat.floor, &seat.floor_channel) {
+            (Some(_), _) if seat.secure_pending || seat.ice_pending => {
+                Some("floor stream not open yet")
+            }
+            (Some(floor), _) if !usable(floor.destination) => Some("no floor destination yet"),
+            (Some(_), _) => None,
+            // A seat with no UDP floor stream but a data channel (a browser seat).
+            (None, Some(channel)) if !channel.is_open() => Some("floor data channel not open yet"),
+            (None, Some(_)) => None,
+            (None, None) => Some("no floor stream"),
         },
         RtcpAppStream::Audio => {
             if seat.reachable() {
@@ -257,7 +262,9 @@ impl ForwardRoom {
                 (None, AppTarget::Room { except }) => {
                     !except.contains(&seat.tag)
                         // Room-wide floor control skips a seat that has no floor stream at all.
-                        && (request.stream == RtcpAppStream::Audio || seat.floor.is_some())
+                        && (request.stream == RtcpAppStream::Audio
+                            || seat.floor.is_some()
+                            || seat.floor_channel.is_some())
                 }
                 (None, AppTarget::Seat(_)) => false,
             };
@@ -280,10 +287,18 @@ impl ForwardRoom {
             )?;
             match request.stream {
                 RtcpAppStream::Floor => {
-                    let Some(floor) = seat.floor.as_ref() else {
-                        continue;
-                    };
-                    emit(floor.endpoint, floor.destination, &self.scratch[..length]);
+                    if let Some(floor) = seat.floor.as_ref() {
+                        emit(floor.endpoint, floor.destination, &self.scratch[..length]);
+                    } else if let Some(channel) = seat.floor_channel.as_ref() {
+                        // One binary message carrying the packet exactly as it would be on the wire.
+                        let message = bytes::Bytes::copy_from_slice(&self.scratch[..length]);
+                        match channel.submit(message) {
+                            Ok(pending) => self.pending_channel.push((seat.tag.clone(), pending)),
+                            Err(error) => {
+                                push_failure(&mut failures, &seat.tag, &error.to_string());
+                            }
+                        }
+                    }
                 }
                 RtcpAppStream::Audio => {
                     let wire: &[u8] = match seat.secure.as_mut() {
@@ -309,6 +324,16 @@ impl ForwardRoom {
         } else {
             Err(AppSendError::NotSent(failures))
         }
+    }
+}
+
+impl ForwardRoom {
+    /// The floor sends [`Self::send_app`] queued for seats' data channels since the last call. The
+    /// caller awaits each one (`PendingSend::wait`) so `ok` means on the wire, as for a UDP seat.
+    pub fn take_pending_channel_sends(
+        &mut self,
+    ) -> Vec<(String, crate::floor_channel::PendingSend)> {
+        std::mem::take(&mut self.pending_channel)
     }
 }
 

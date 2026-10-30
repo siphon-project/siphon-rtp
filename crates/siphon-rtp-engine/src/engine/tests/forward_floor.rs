@@ -594,7 +594,7 @@ async fn node_info_advertises_floor_control_and_statistics_count_dropped_app_eve
     let CmdResult::NodeInfo { node } = engine.handle(CLIENT, Command::NodeInfo).await else {
         panic!("node_info answers a node");
     };
-    for feature in ["mcptt_floor", "rtcp_app"] {
+    for feature in ["mcptt_floor", "rtcp_app", "webrtc_floor_channel"] {
         assert!(
             node.features.iter().any(|name| name == feature),
             "{feature}"
