@@ -201,6 +201,25 @@ fn sdp_rewrite(criterion: &mut Criterion) {
         );
     });
 
+    // The pass an engine-written answer runs last: drop the offerer's own `a=ssrc` / `a=msid` /
+    // `a=extmap` and name the engine's SSRC. A browser-shaped answer is the case it exists for
+    // (several identity and extension lines to drop); the session-level one is the plain floor.
+    let browser_shaped = format!(
+        "{session_level}a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
+         a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid\r\na=msid:stream-a track-a\r\n\
+         a=ssrc:2712110744 cname:offerer-cname\r\na=ssrc:2712110744 msid:stream-a track-a\r\n"
+    );
+    let own = sdp::OwnSsrc {
+        ssrc: 0x3fae_627b,
+        cname: "0123456789abcdef01234567".into(),
+    };
+    group.bench_function("own_stream_identity_browser_shaped", |bencher| {
+        bencher.iter(|| sdp::own_stream_identity(black_box(&browser_shaped), Some(&own)));
+    });
+    group.bench_function("own_stream_identity_nothing_to_drop", |bencher| {
+        bencher.iter(|| sdp::own_stream_identity(black_box(&session_level), Some(&own)));
+    });
+
     // The offer a room writes whole for a seat it calls out to (`conference_offer`): no peer SDP to
     // rewrite, so this is the whole SDP cost of that verb. Listed as an always-built room offers it.
     let seat_codecs = [
