@@ -5,6 +5,19 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Added
+
+- **RTCP APP packets can be read and built (RFC 3550 §6.7).** This is groundwork for MCPTT floor
+  control (3GPP TS 24.380 §8), which sends each floor message as a standalone APP packet, never in
+  a compound, with several messages allowed in one datagram (§8.1.1). The compound parser kept only
+  the packet type of an APP packet. `rtcp::app_packets` now reads every APP packet in a datagram,
+  without allocating, and keeps the 5-bit subtype whole so the MCPTT acknowledgement bit survives.
+  `rtcp::write_app` builds one into a caller buffer. Application data that is not a whole number of
+  32-bit words is refused rather than padded, because its field coding (§8.1.3) belongs to the
+  caller. Nothing is wired to the control protocol yet.
+
 ## [0.15.5] — 2026-10-29
 
 ### Fixed
