@@ -5,7 +5,7 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.16.0] — 2026-10-30
 
 ### Added
 
@@ -28,6 +28,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   the participant, and the participant heard nothing. The answer now drops all of those lines and
   names the SSRC the room really sends (`a=ssrc:<ssrc> cname:<cname>`). `answer_local` drops them
   too, and names no SSRC of its own.
+- **An event raised just after a control reconnect reaches the new connection.** A reconnect gives
+  the new connection a receiver on the same event channel as the one it replaces, and until the old
+  connection's loop noticed it was superseded it was a second consumer. Woken with its eviction,
+  its end of stream and a new event all ready, it picked one at random, and sometimes took the event
+  and wrote it into the closed socket: a `call_summary` (or any event) lost to the controller. The
+  loop now checks eviction and end of stream first.
 
 ## [0.15.5] — 2026-10-29
 
