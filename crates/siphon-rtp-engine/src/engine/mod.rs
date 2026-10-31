@@ -24,6 +24,7 @@ mod dial_out;
 mod dispatch;
 mod fax;
 mod floor;
+mod floor_keys;
 mod fork;
 mod forward;
 mod forward_dial_out;

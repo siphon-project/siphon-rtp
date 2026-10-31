@@ -24,6 +24,7 @@ pub mod dtls_bridge;
 mod dtls_session;
 pub mod engine;
 pub mod floor_channel;
+pub mod floor_srtcp;
 pub mod forward;
 pub mod ha;
 pub mod healthcheck;

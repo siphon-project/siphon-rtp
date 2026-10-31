@@ -22,14 +22,13 @@ use super::negotiate::{parse_codec_flags, peer_media_address, random_ssrc};
 use super::seat_transport::SeatTransport;
 use super::{boxed_error_result, error_result, ok_empty, ok_sdp, ClientId, Engine};
 
-/// `floor_keys` are part of the contract but not implemented by this build: refused loudly, before
-/// anything is allocated, rather than ignored.
+/// `floor_keys` are checked (3GPP TS 33.180 §9.4) before anything is allocated.
 ///
 /// `key_mgmt` is refused in a translate room: it sets up end-to-end SRTP between the UEs, which the
 /// translator breaks by rewriting the SSRC and sequence number (RFC 3711 §3.3 authenticates both;
 /// 3GPP TS 33.180 §7.5.2 NOTE 3). The call would connect and the audio be silently undecryptable.
 fn refuse_forward_security(profile: &ProfileFlags, media: ForwardMedia) -> Result<(), String> {
-    crate::media_pipeline::refuse_floor_keys(profile)?;
+    crate::media_pipeline::refuse_floor_security(profile)?;
     if profile.key_mgmt.is_some() && media == ForwardMedia::Translate {
         return Err("key_mgmt sets up end-to-end SRTP, which a translate room rewrites; use \"media\": \"preserve\"".to_string());
     }
@@ -322,6 +321,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ));
         }
         let destination = peer_media_address(offered.remote, profile.received_from);
+        let keys = match crate::floor_srtcp::master_keys(&profile.floor_keys) {
+            Ok(keys) => keys,
+            Err(reason) => {
+                self.free(&[endpoint]).await;
+                return Err(boxed_error_result("forward_join: floor_keys", &reason));
+            }
+        };
         // An ICE seat holds the gate open until its pair is selected, then the room narrows it; a
         // `symmetric` seat stays open and the learn-once latch is the only constraint.
         let accepted_source =
@@ -337,6 +343,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 destination,
                 accepted_source,
                 ice_gated: transport.ice_pending,
+                keys,
             },
         )))
     }

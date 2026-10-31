@@ -45,7 +45,7 @@ mod app;
 
 pub(crate) use app::push_failure;
 use app::FloorStream;
-pub use app::{AppRequest, AppSendError, AppTarget, FloorConfig};
+pub use app::{AppRequest, AppSendError, AppTarget, FloorConfig, FloorKeysError};
 
 /// The most seats one forwarding room holds. A group call's fan-out is one translate per receiver
 /// per packet, so the cap is a statement of what one actor is benchmarked to carry
@@ -121,6 +121,8 @@ pub struct ForwardSeatStats {
     pub app_events: u64,
     /// Datagrams with APP-bearing RTCP the room could not read to the end: counted, no event.
     pub malformed_app: u64,
+    /// Floor datagrams a keyed seat's SRTCP refused (plaintext, unknown MKI, failed tag, replay).
+    pub floor_refused: u64,
     /// Packets from the seat, while it was the source, that could not be transcoded for the
     /// cross-codec seats (a payload the decoder refused, or a frame of another length than the
     /// negotiated one). Same-codec seats were still sent them.

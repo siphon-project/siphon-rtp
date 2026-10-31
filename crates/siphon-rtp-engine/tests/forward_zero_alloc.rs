@@ -243,6 +243,7 @@ fn a_room_wide_rtcp_app_send_makes_no_heap_allocation() {
                         .unwrap(),
                     accepted_source: SourceFilter::Any,
                     ice_gated: false,
+                    keys: Vec::new(),
                 }),
                 app_events: None,
             },

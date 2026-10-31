@@ -7,7 +7,9 @@
 //! The cost of MCPTT floor control (3GPP TS 24.380) in a forwarding room, with no sockets: one
 //! Floor Request from the floor stream to its `rtcp_app` event, and one room-wide `send_rtcp_app`
 //! at 500 seats. The event itself allocates (its name, tag and payload are owned strings the
-//! controller connection serialises); the send path allocates nothing.
+//! controller connection serialises); the send path allocates nothing. Each is measured with the
+//! floor stream in the clear and keyed with AEAD_AES_128_GCM SRTCP (3GPP TS 33.180 §9.4): the keyed
+//! numbers are the extra per-packet cost a protected floor stream pays.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,6 +24,7 @@ use siphon_rtp_engine::forward::{
 use siphon_rtp_engine::metrics::Metrics;
 use siphon_rtp_engine::sdp;
 use siphon_rtp_proto::RtcpAppStream;
+use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
 
 const SEATS: usize = 500;
 
@@ -30,7 +33,7 @@ const FLOOR_REQUEST: [u8; 16] = [
     0x80, 0xCC, 0x00, 0x03, 0x11, 0x22, 0x33, 0x44, 0x4D, 0x43, 0x50, 0x54, 0x00, 0x02, 0x05, 0x00,
 ];
 
-fn room_of(seats: usize, queue: &AppEventQueue) -> ForwardRoom {
+fn room_of(seats: usize, queue: &AppEventQueue, keys: &[FloorMasterKey]) -> ForwardRoom {
     let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
                  m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
     let codecs = sdp::parse(offer).unwrap().audio_codecs();
@@ -63,6 +66,7 @@ fn room_of(seats: usize, queue: &AppEventQueue) -> ForwardRoom {
                     destination: floor,
                     accepted_source: SourceFilter::Any,
                     ice_gated: false,
+                    keys: keys.to_vec(),
                 }),
                 app_events: Some(queue.clone()),
             },
@@ -73,9 +77,14 @@ fn room_of(seats: usize, queue: &AppEventQueue) -> ForwardRoom {
     room
 }
 
+fn floor_key() -> FloorMasterKey {
+    FloorMasterKey::from_salt_96(7, [0x11; 16], &[0x22; 12])
+}
+
 fn floor_costs(criterion: &mut Criterion) {
     let queue = AppEventQueue::new(4096, Arc::new(Metrics::new()));
-    let mut room = room_of(SEATS, &queue);
+    let mut room = room_of(SEATS, &queue, &[]);
+    let mut keyed_room = room_of(SEATS, &queue, &[floor_key()]);
     let received = queue.receiver();
 
     let packet = RxPacket {
@@ -96,6 +105,32 @@ fn floor_costs(criterion: &mut Criterion) {
         });
     });
 
+    // A keyed stream refuses a repeated index (RFC 3711 §3.3.2), so every iteration gets a fresh
+    // protected packet from the phone's side; building it is outside the timing.
+    let mut phone = SrtcpGcmContext::new(&[floor_key()]).unwrap();
+    let mut protect = move || {
+        let mut wire = Vec::new();
+        phone.protect(&FLOOR_REQUEST, true, &mut wire).unwrap();
+        RxPacket {
+            endpoint: EndpointId(10_000),
+            source: "192.0.2.1:8000".parse().unwrap(),
+            arrival: 1_000_000,
+            data: Bytes::from(wire),
+        }
+    };
+    keyed_room.ingest(&protect());
+    received.try_iter().for_each(drop);
+    group.bench_function("floor_request_to_event_keyed", |bencher| {
+        bencher.iter_batched(
+            &mut protect,
+            |packet| {
+                keyed_room.ingest(black_box(&packet));
+                black_box(received.try_recv().unwrap())
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
     let request = AppRequest {
         stream: RtcpAppStream::Floor,
         ssrc: None,
@@ -113,6 +148,17 @@ fn floor_costs(criterion: &mut Criterion) {
                 bytes += data.len();
             })
             .unwrap();
+            black_box(bytes)
+        });
+    });
+    group.bench_function("send_rtcp_app_room_wide_500_seats_keyed", |bencher| {
+        bencher.iter(|| {
+            let mut bytes = 0usize;
+            keyed_room
+                .send_app(black_box(&everyone), black_box(&request), |_, _, data| {
+                    bytes += data.len();
+                })
+                .unwrap();
             black_box(bytes)
         });
     });
