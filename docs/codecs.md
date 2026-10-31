@@ -138,8 +138,11 @@ stream is framed and which mode it is sent in is negotiated, see
 MR795 carries an adaptive gain quantizer (a pre-quantizer over three pitch-gain candidates,
 a gain adaptor, then a modified codebook-gain search) and is the only mode that sends two
 gain indices per subframe. This is a full AMR-NB encoder for G.711 transcoding in both
-directions. Error concealment (3GPP TS 26.091) is not ported: a lost or damaged AMR-NB
-frame is played as 20 ms of silence, where AMR-WB conceals it.
+directions. A lost or damaged AMR-NB frame is concealed per 3GPP TS 26.091 exactly as the
+TS 26.073 reference decoder does (bit-exact against it): LSF, pitch lag and gains are extrapolated
+from the last frames and attenuated by the bad-frame state machine, with the background-noise
+detector and excitation control; a frame with the Q bit clear still contributes its innovation
+bits. DTX (SID frames, comfort noise) is not implemented, see below.
 
 **Opus.** **Both directions are complete and wired into the codec factory**, so an Opus leg
 transcodes either way — Opus ↔ G.711 and Opus ↔ AMR-WB, the WebRTC-trunk and voice-AI

@@ -9,6 +9,7 @@
 
 pub mod bitstream;
 pub mod codebook;
+pub mod conceal;
 pub mod constants;
 pub mod dec_main;
 pub mod enc_cb;
@@ -29,3 +30,6 @@ mod math_nb;
 pub mod pitch;
 pub mod postfilter;
 pub mod support;
+
+#[cfg(test)]
+mod conceal_vectors;

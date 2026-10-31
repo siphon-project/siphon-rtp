@@ -1,22 +1,31 @@
 //! AMR-NB decoder main — 3GPP TS 26.073 `dec_amr.c` + `sp_dec.c` + `d_homing.c`. Ported bit-exact
-//! for the clean (error-free, NODTX) speech path.
+//! for the NODTX speech path, error-free and concealed.
 //!
 //! `decode_frame` is the public per-frame entry: serial bits (encoder/`.COD` order, `0`/`1`) +
 //! mode → 160 post-filtered, post-processed, 13-bit-truncated samples, plus the encoder/decoder
 //! homing-frame handling from `sp_dec.c`/`decoder.c`.
 //!
-//! **Scope:** DTX/CNG, the error-concealment (`ec_gain_*`, `Ex_ctrl`) branches, and the
-//! source-characteristic detector (`Bgn_scd`) are intentionally **not** ported here. For an
-//! error-free NODTX bitstream (`bfi ≡ 0`) every branch that consumes `inBackgroundNoise` /
-//! `voicedHangover` is additionally gated on a never-set error flag, so pinning those to 0 is
-//! bit-exact against the reference on the speech-good vectors (verified path-by-path). Bad-frame
-//! input is decoded as a good frame (no concealment) — a follow-up tier.
+//! **Concealment:** the `bfi` / `prev_bf` branches of `dec_amr.c` are ported, so a bad frame
+//! (`RX_SPEECH_BAD`, bits kept) or a lost one (`RX_NO_DATA`, parameters substituted by
+//! `build_CN_param`) is concealed per 3GPP TS 26.091: LSF/pitch-lag/gain extrapolation
+//! ([`crate::amr::nb::conceal`]), the BFH state machine (`state` 0..=6), the background-noise
+//! detector (`Bgn_scd`) and the excitation control (`Ex_ctrl`). Bit-exact against the TS 26.073
+//! reference decoder (see `conceal_vectors`).
+//!
+//! **Not ported:** DTX / comfort noise (`dtx_dec.c`, SID frames, the `DTX` / `DTX_MUTE` global
+//! states) and `RX_SPEECH_DEGRADED` / `RX_ONSET` (no RTP equivalent). A lost frame is therefore
+//! always concealed as speech, which is what the reference does while its DTX state is `SPEECH`.
 
-use crate::amr::basic_ops::{add, l_mac, l_mult, l_shl, l_shr, mult, round_word, shl, shr, sub};
-use crate::amr::nb::bitstream::bits2prm;
+use crate::amr::basic_ops::{
+    add, extract_l, l_mac, l_mult, l_shl, l_shr, mult, round_word, shl, shr, sub,
+};
+use crate::amr::nb::bitstream::{bits2prm, MAX_PRM_SIZE};
 use crate::amr::nb::codebook::{
     dec_10i40_35bits, dec_8i40_31bits, decode_2i40_11bits, decode_2i40_9bits, decode_3i40_14bits,
     decode_4i40_17bits,
+};
+use crate::amr::nb::conceal::{
+    build_cn_param, ex_ctrl, BackgroundNoiseDetector, EcGainCode, EcGainPitch,
 };
 use crate::amr::nb::constants::{
     EHF_MASK, L_FRAME, L_FRAME_BY2, L_SUBFR, M, MP1, PIT_MAX, PIT_MIN, PIT_MIN_MR122, SHARPMAX,
@@ -24,6 +33,7 @@ use crate::amr::nb::constants::{
 use crate::amr::nb::filters::{agc2, syn_filt_overflow};
 use crate::amr::nb::gains::{d_gain_code, dec_gain, GcPredState};
 use crate::amr::nb::lpc::{d_plsf_3, d_plsf_5, int_lpc_1and3, int_lpc_1to3, DPlsfState};
+use crate::amr::nb::math_nb::sqrt_l_exp;
 use crate::amr::nb::pitch::{d_gain_pitch, dec_lag3, dec_lag6, pred_lt_3or6};
 use crate::amr::nb::postfilter::{PhDisp, PostFilter};
 use crate::amr::nb::support::{int_lsf, CbGainAverage, LspAvg};
@@ -52,7 +62,7 @@ pub struct DecoderAmrState {
     sharp: i16,
     /// Previous integer pitch lag (`old_T0`).
     old_t0: i16,
-    /// LTP gain history ring, 9 entries Q14 (`ltpGainHistory`); maintained for parity.
+    /// LTP gain history of the last nine good subframes, Q14, oldest first (`ltpGainHistory`).
     ltp_gain_history: [i16; 9],
     /// LSF dequantizer state.
     lsf_state: DPlsfState,
@@ -64,10 +74,40 @@ pub struct DecoderAmrState {
     lsp_avg: LspAvg,
     /// Phase-dispersion state.
     ph_disp: PhDisp,
-    /// Previous bad-frame flag (always 0 on the clean path; kept for parity).
+    /// Previous bad-frame flag (`prev_bf`).
     prev_bf: i16,
-    /// Previous potential-degraded flag (always 0 on the clean path).
+    /// Previous potential-degraded flag (`prev_pdf`); `RX_SPEECH_DEGRADED` is never signalled, so 0.
     prev_pdf: i16,
+    /// Bad-frame-handling state machine, 0 (good) ..= 6 (long loss) (`state`).
+    state: i16,
+    /// Last decoded pitch lag, used in place of the lag of a bad frame in background noise
+    /// (`T0_lagBuff`).
+    t0_lag_buff: i16,
+    /// Background-noise decision of the previous frame (`inBackgroundNoise`).
+    in_background_noise: i16,
+    /// Frames since the last voiced frame, capped at 10 (`voicedHangover`).
+    voiced_hangover: i16,
+    /// Excitation energies of the last nine subframes (`excEnergyHist`).
+    exc_energy_history: [i16; 9],
+    /// Source-characteristic detector (`background_state`).
+    background: BackgroundNoiseDetector,
+    /// Pitch-gain concealment (`ec_gain_p_st`).
+    ec_gain_pitch: EcGainPitch,
+    /// Code-gain concealment (`ec_gain_c_st`).
+    ec_gain_code: EcGainCode,
+    /// Seed of the parameters substituted for a lost frame (`nodataSeed`).
+    nodata_seed: i16,
+}
+
+/// How the frame being decoded was received (`frame.h` `RXFrameType`, speech cases only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reception {
+    /// `RX_SPEECH_GOOD`.
+    Good,
+    /// `RX_SPEECH_BAD`: the bits are present but unusable; the frame is concealed.
+    Bad,
+    /// `RX_NO_DATA`: nothing arrived; parameters are substituted and the frame is concealed.
+    NoData,
 }
 
 impl Default for DecoderAmrState {
@@ -94,20 +134,52 @@ impl DecoderAmrState {
             ph_disp: PhDisp::new(),
             prev_bf: 0,
             prev_pdf: 0,
+            state: 0,
+            t0_lag_buff: 40,
+            in_background_noise: 0,
+            voiced_hangover: 0,
+            exc_energy_history: [0; 9],
+            background: BackgroundNoiseDetector::new(),
+            ec_gain_pitch: EcGainPitch::new(),
+            ec_gain_code: EcGainCode::new(),
+            nodata_seed: 21845,
         }
     }
 
-    /// Decode one speech frame (`dec_amr.c` `Decoder_amr`), clean path (`bfi = 0`).
-    /// `parm` holds the decoded integer parameters (from [`bits2prm`]); `synth` receives L_FRAME
-    /// samples; `az_dec` receives the 4×MP1 interpolated LPC for the post-filter.
-    fn decode(&mut self, mode: usize, parm: &[i16], synth: &mut [i16], az_dec: &mut [i16]) {
-        let bfi = 0i16;
+    /// Decode one speech frame (`dec_amr.c` `Decoder_amr`). `parm` holds the decoded integer
+    /// parameters (from [`bits2prm`]); for [`Reception::NoData`] they are replaced by the
+    /// substitute parameters of `build_CN_param`. `synth` receives L_FRAME samples; `az_dec`
+    /// receives the 4×MP1 interpolated LPC for the post-filter.
+    fn decode(
+        &mut self,
+        mode: usize,
+        parm: &[i16],
+        reception: Reception,
+        synth: &mut [i16],
+        az_dec: &mut [i16],
+    ) {
+        let bfi = i16::from(reception != Reception::Good);
         let pdfi = 0i16;
-        // inBackgroundNoise / voicedHangover are pinned to 0 (Bgn_scd not ported); see module docs.
-        let in_background_noise = 0i16;
-        let voiced_hangover = 0i16;
 
-        let mut prm = parm; // advancing cursor into the parameter vector
+        let mut substitute = [0i16; MAX_PRM_SIZE];
+        let mut prm = if reception == Reception::NoData {
+            build_cn_param(&mut self.nodata_seed, mode, &mut substitute);
+            &substitute[..]
+        } else {
+            parm
+        }; // advancing cursor into the parameter vector
+
+        // TS 26.091 §6: bad-frame-handling state machine
+        if bfi != 0 {
+            self.state = add(self.state, 1);
+        } else if sub(self.state, 6) == 0 {
+            self.state = 5;
+        } else {
+            self.state = 0;
+        }
+        if sub(self.state, 6) > 0 {
+            self.state = 6;
+        }
 
         // save old LSFs for CB gain smoothing
         let prev_lsf = self.lsf_state.past_lsf_q;
@@ -175,14 +247,42 @@ impl DecoderAmrState {
                     t0_max = PIT_MAX;
                     t0_min = sub(t0_max, delta_frc_range);
                 }
-                let (tt, tf) = dec_lag3(index, t0_min, t0_max, pit_flag, self.old_t0, flag4);
-                t0 = tt;
-                t0_frac = tf;
+                let (decoded_t0, decoded_frac) =
+                    dec_lag3(index, t0_min, t0_max, pit_flag, self.old_t0, flag4);
+                let mut lag = decoded_t0;
+                let mut lag_frac = decoded_frac;
+                self.t0_lag_buff = lag;
+                if bfi != 0 {
+                    // TS 26.091 §6.1: graceful pitch degradation, the previous lag creeps up
+                    if sub(self.old_t0, PIT_MAX) < 0 {
+                        self.old_t0 = add(self.old_t0, 1);
+                    }
+                    lag = self.old_t0;
+                    lag_frac = 0;
+                    if self.in_background_noise != 0
+                        && sub(self.voiced_hangover, 4) > 0
+                        && (mode == AmrNbMode::Mr475 as usize
+                            || mode == AmrNbMode::Mr515 as usize
+                            || mode == AmrNbMode::Mr590 as usize)
+                    {
+                        lag = self.t0_lag_buff;
+                    }
+                }
+                t0 = lag;
+                t0_frac = lag_frac;
                 pred_lt_3or6(&mut self.old_exc, EXC_OFFSET, t0, t0_frac, L_SUBFR, true);
             } else {
-                let (tt, tf) = dec_lag6(index, PIT_MIN_MR122, PIT_MAX, pit_flag, self.old_t0);
-                t0 = tt;
-                t0_frac = tf;
+                let (decoded_t0, decoded_frac) =
+                    dec_lag6(index, PIT_MIN_MR122, PIT_MAX, pit_flag, self.old_t0);
+                if bfi == 0 && (pit_flag == 0 || sub(index, 61) < 0) {
+                    t0 = decoded_t0;
+                    t0_frac = decoded_frac;
+                } else {
+                    // a bad frame, or an index outside the valid relative range: keep the old lag
+                    self.t0_lag_buff = decoded_t0;
+                    t0 = self.old_t0;
+                    t0_frac = 0;
+                }
                 pred_lt_3or6(&mut self.old_exc, EXC_OFFSET, t0, t0_frac, L_SUBFR, false);
             }
 
@@ -222,7 +322,14 @@ impl DecoderAmrState {
                 // MR122: pitch gain is decoded here, before the code
                 let idx = prm[0];
                 prm = &prm[1..];
-                gain_pit = d_gain_pitch(mode, idx);
+                let mut concealed_or_decoded = if bfi != 0 {
+                    self.ec_gain_pitch.conceal(self.state)
+                } else {
+                    d_gain_pitch(mode, idx)
+                };
+                self.ec_gain_pitch
+                    .update(bfi != 0, self.prev_bf != 0, &mut concealed_or_decoded);
+                gain_pit = concealed_or_decoded;
                 dec_10i40_35bits(prm, &mut code);
                 prm = &prm[10..];
                 pit_sharp = shl(gain_pit, 1);
@@ -239,9 +346,6 @@ impl DecoderAmrState {
                     prev_lsf,
                     i_subfr as i16,
                     bfi,
-                    pdfi,
-                    in_background_noise,
-                    voiced_hangover,
                 );
                 self.post_subframe(i_subfr, t0);
                 i_subfr += L_SUBFR;
@@ -259,7 +363,8 @@ impl DecoderAmrState {
                     index_mr475 = prm[0];
                     prm = &prm[1..];
                 }
-                let (gp, gc) = dec_gain(&mut self.pred_state, mode, index_mr475, &code, even_subfr);
+                let (gp, gc) =
+                    self.decode_or_conceal_gains(mode, index_mr475, &code, even_subfr, bfi);
                 gain_pit = gp;
                 gain_code = gc;
                 pit_sharp = gain_pit.min(SHARPMAX);
@@ -267,7 +372,7 @@ impl DecoderAmrState {
                 // MR515, MR59, MR67, MR74, MR102
                 let idx = prm[0];
                 prm = &prm[1..];
-                let (gp, gc) = dec_gain(&mut self.pred_state, mode, idx, &code, even_subfr);
+                let (gp, gc) = self.decode_or_conceal_gains(mode, idx, &code, even_subfr, bfi);
                 gain_pit = gp;
                 gain_code = gc;
                 pit_sharp = gain_pit.min(SHARPMAX);
@@ -280,10 +385,17 @@ impl DecoderAmrState {
                 // MR795
                 let idx = prm[0];
                 prm = &prm[1..];
-                gain_pit = d_gain_pitch(mode, idx);
+                let mut pitch_gain = if bfi != 0 {
+                    self.ec_gain_pitch.conceal(self.state)
+                } else {
+                    d_gain_pitch(mode, idx)
+                };
+                self.ec_gain_pitch
+                    .update(bfi != 0, self.prev_bf != 0, &mut pitch_gain);
+                gain_pit = pitch_gain;
                 let gidx = prm[0];
                 prm = &prm[1..];
-                gain_code = d_gain_code(&mut self.pred_state, mode, gidx, &code);
+                gain_code = self.decode_or_conceal_code_gain(mode, gidx, &code, bfi);
                 pit_sharp = gain_pit.min(SHARPMAX);
             }
 
@@ -303,19 +415,67 @@ impl DecoderAmrState {
                 prev_lsf,
                 i_subfr as i16,
                 bfi,
-                pdfi,
-                in_background_noise,
-                voiced_hangover,
             );
             self.post_subframe(i_subfr, t0);
             i_subfr += L_SUBFR;
             az_off += MP1;
         }
 
-        // end of frame: maintain ltpGainHistory is done per-subframe; lsp_avg here.
-        self.lsp_avg.update(&self.lsf_state.past_lsf_q);
+        // Source characteristic detector: updates inBackgroundNoise / voicedHangover for the
+        // next frame (dec_amr.c; the previous frame's decision is what a bad frame consults).
+        self.in_background_noise =
+            self.background
+                .detect(&self.ltp_gain_history, synth, &mut self.voiced_hangover);
+
+        // store bfi for the next frame
         self.prev_bf = bfi;
         self.prev_pdf = pdfi;
+
+        // LSF averages over the eight previous frames
+        self.lsp_avg.update(&self.lsf_state.past_lsf_q);
+    }
+
+    /// Pitch and code gain of one subframe from the joint VQ index, or, in a bad frame, concealed
+    /// by [`EcGainPitch`] / [`EcGainCode`] (the `Dec_gain` / `ec_gain_*` branch of `dec_amr.c`).
+    fn decode_or_conceal_gains(
+        &mut self,
+        mode: usize,
+        index: i16,
+        code: &[i16],
+        even_subfr: i16,
+        bfi: i16,
+    ) -> (i16, i16) {
+        let (mut gain_pit, mut gain_code) = if bfi == 0 {
+            dec_gain(&mut self.pred_state, mode, index, code, even_subfr)
+        } else {
+            (
+                self.ec_gain_pitch.conceal(self.state),
+                self.ec_gain_code.conceal(&mut self.pred_state, self.state),
+            )
+        };
+        self.ec_gain_pitch
+            .update(bfi != 0, self.prev_bf != 0, &mut gain_pit);
+        self.ec_gain_code
+            .update(bfi != 0, self.prev_bf != 0, &mut gain_code);
+        (gain_pit, gain_code)
+    }
+
+    /// Code gain of one subframe (MR795, MR122) from its index, or concealed in a bad frame.
+    fn decode_or_conceal_code_gain(
+        &mut self,
+        mode: usize,
+        index: i16,
+        code: &[i16],
+        bfi: i16,
+    ) -> i16 {
+        let mut gain_code = if bfi == 0 {
+            d_gain_code(&mut self.pred_state, mode, index, code)
+        } else {
+            self.ec_gain_code.conceal(&mut self.pred_state, self.state)
+        };
+        self.ec_gain_code
+            .update(bfi != 0, self.prev_bf != 0, &mut gain_code);
+        gain_code
     }
 
     /// MR122 gain-code + excitation/synthesis tail (gain_pit already decoded).
@@ -333,9 +493,6 @@ impl DecoderAmrState {
         prev_lsf: [i16; M],
         i_subfr: i16,
         bfi: i16,
-        pdfi: i16,
-        in_background_noise: i16,
-        voiced_hangover: i16,
     ) {
         // pitch contribution uses pit_sharp = shl(gain_pit,1)
         let mut pit_sharp = pit_sharp_in;
@@ -343,26 +500,14 @@ impl DecoderAmrState {
 
         let idx = prm[0];
         *prm = &prm[1..];
-        let gain_code = d_gain_code(&mut self.pred_state, mode, idx, code);
+        let gain_code = self.decode_or_conceal_code_gain(mode, idx, code, bfi);
 
         // store sharp for next subframe (MR122 always updates)
         self.sharp = gain_pit.min(SHARPMAX);
         pit_sharp = gain_pit; // pit_sharp = gain_pit for MR122 (then doubled in finish)
 
         self.finish_subframe(
-            mode,
-            code,
-            synth,
-            az,
-            gain_pit,
-            gain_code,
-            pit_sharp,
-            prev_lsf,
-            i_subfr,
-            bfi,
-            pdfi,
-            in_background_noise,
-            voiced_hangover,
+            mode, code, synth, az, gain_pit, gain_code, pit_sharp, prev_lsf, i_subfr, bfi,
         );
     }
 
@@ -381,10 +526,8 @@ impl DecoderAmrState {
         prev_lsf: [i16; M],
         i_subfr: i16,
         bfi: i16,
-        pdfi: i16,
-        in_background_noise: i16,
-        voiced_hangover: i16,
     ) {
+        let pdfi = 0i16; // RX_SPEECH_DEGRADED is never signalled over RTP
         let pit_sharp = shl(pit_sharp_in, 1);
 
         // excp (only when pit_sharp > 16384)
@@ -401,11 +544,27 @@ impl DecoderAmrState {
             }
         }
 
-        // ltpGainHistory (clean: bfi==0)
-        for i in 0..8 {
-            self.ltp_gain_history[i] = self.ltp_gain_history[i + 1];
+        let low_rate_mode = mode == AmrNbMode::Mr475 as usize
+            || mode == AmrNbMode::Mr515 as usize
+            || mode == AmrNbMode::Mr590 as usize;
+
+        // LTP gains feed the source characteristic detector; only good frames count
+        if bfi == 0 {
+            self.ltp_gain_history.copy_within(1.., 0);
+            self.ltp_gain_history[8] = gain_pit;
         }
-        self.ltp_gain_history[8] = gain_pit;
+
+        // Limit gain_pit in background noise after an error (MR475, MR515, MR59 only)
+        let mut gain_pit = gain_pit;
+        if (self.prev_bf != 0 || bfi != 0) && self.in_background_noise != 0 && low_rate_mode {
+            if sub(gain_pit, 12288) > 0 {
+                // gain_pit = (gain_pit - 0.75) / 2 + 0.75, Q14
+                gain_pit = add(shr(sub(gain_pit, 12288), 1), 12288);
+            }
+            if sub(gain_pit, 14745) > 0 {
+                gain_pit = 14745; // 0.90 in Q14
+            }
+        }
 
         // CB mixed gain
         let mut lsf_i = [0i16; M];
@@ -419,8 +578,8 @@ impl DecoderAmrState {
             self.prev_bf,
             pdfi,
             self.prev_pdf,
-            in_background_noise,
-            voiced_hangover,
+            self.in_background_noise,
+            self.voiced_hangover,
         );
         // MR74, MR795, MR122 use the original code gain
         if mode > AmrNbMode::Mr670 as usize && mode != AmrNbMode::Mr1020 as usize {
@@ -444,8 +603,15 @@ impl DecoderAmrState {
             self.old_exc[exc + i] = round_word(l_temp);
         }
 
-        // phase dispersion (clean path never locks)
+        // adaptive phase dispersion; always use the full dispersion on an error in background noise
         self.ph_disp.release();
+        if low_rate_mode
+            && sub(self.voiced_hangover, 3) > 0
+            && self.in_background_noise != 0
+            && bfi != 0
+        {
+            self.ph_disp.lock();
+        }
         self.ph_disp.run(
             mode,
             &mut exc_enhanced,
@@ -456,8 +622,42 @@ impl DecoderAmrState {
             tmp_shift,
         );
 
-        // excitation energy history (clean path: always update; Ex_ctrl never called)
-        // (excEnergyHist itself is only consumed by Ex_ctrl, which is BFI-only, so we skip storing.)
+        // Excitation control, active during errors: conceal drops in signal energy in noise.
+        let mut energy = 0i32;
+        for &sample in &exc_enhanced {
+            energy = l_mac(energy, sample, sample);
+        }
+        energy = l_shr(energy, 1); // excEnergy = sqrt(energy) in Q0
+        let mut exponent = 0i16;
+        energy = sqrt_l_exp(energy, &mut exponent);
+        energy = l_shr(energy, add(shr(exponent, 1), 15));
+        energy = l_shr(energy, 2); // to cope with 16-bit and the scaling in ex_ctrl
+        let exc_energy = extract_l(energy);
+
+        if low_rate_mode
+            && sub(self.voiced_hangover, 5) > 0
+            && self.in_background_noise != 0
+            && sub(self.state, 4) < 0
+            && (bfi != 0 || self.prev_bf != 0)
+        {
+            ex_ctrl(
+                &mut exc_enhanced,
+                exc_energy,
+                &self.exc_energy_history,
+                self.voiced_hangover,
+                self.prev_bf != 0,
+                false, // carefulFlag is set only for a potentially degraded good frame
+            );
+        }
+
+        // update the energy history unless concealing in background noise
+        if !(self.in_background_noise != 0
+            && (bfi != 0 || self.prev_bf != 0)
+            && sub(self.state, 4) < 0)
+        {
+            self.exc_energy_history.copy_within(1.., 0);
+            self.exc_energy_history[8] = exc_energy;
+        }
 
         // synthesis + overflow re-scale
         let mut overflow = false;
@@ -610,6 +810,7 @@ impl SpeechDecoder {
         self.core = DecoderAmrState::new();
         self.post_filter = PostFilter::new();
         self.post_process = crate::amr::nb::filters::PostProcessState::new();
+        self.prev_mode = 0;
     }
 
     /// Decode one frame of `serial` speech bits (encoder/`.COD` order, `0`/`1`) at `mode` (0..=7),
@@ -617,6 +818,41 @@ impl SpeechDecoder {
     /// homing frame received while already homed emits the canonical homing output; any homing
     /// frame resets the decoder afterwards.
     pub fn decode_frame(&mut self, mode: usize, serial: &[i16], synth: &mut [i16]) {
+        self.decode_received(mode, serial, Reception::Good, synth);
+    }
+
+    /// Decode a frame that arrived with unusable bits (`RX_SPEECH_BAD`, RFC 4867 Q bit clear):
+    /// the bits are read but the frame is concealed per TS 26.091 (LSF, pitch lag and gains are
+    /// extrapolated from the previous frames; only the innovation comes from the received bits).
+    pub fn decode_bad_frame(&mut self, mode: usize, serial: &[i16], synth: &mut [i16]) {
+        self.decode_received(mode, serial, Reception::Bad, synth);
+    }
+
+    /// Conceal a frame that never arrived (`RX_NO_DATA`) in the mode of the last frame received:
+    /// the reference substitutes pseudo-random parameters and runs the bad-frame decoder, giving
+    /// a faded continuation instead of silence. Writes L_FRAME (160) samples to `synth`.
+    pub fn conceal_frame(&mut self, synth: &mut [i16]) {
+        let mode = self.prev_mode;
+        self.synthesize(mode, &[], Reception::NoData, synth);
+        // A concealed frame is never a homing frame (`decoder.c` tests zeroed bits).
+        self.reset_flag_old = false;
+    }
+
+    /// The speech mode (0..=7) concealed frames are rendered in: that of the last frame decoded.
+    #[must_use]
+    pub fn last_mode(&self) -> usize {
+        self.prev_mode
+    }
+
+    /// Shared per-frame driver of `decoder.c`: homing check, synthesis, homing reset.
+    fn decode_received(
+        &mut self,
+        mode: usize,
+        serial: &[i16],
+        reception: Reception,
+        synth: &mut [i16],
+    ) {
+        self.prev_mode = mode;
         // If homed, only check until the end of the first subframe (decoder.c).
         let mut reset_flag = false;
         if self.reset_flag_old {
@@ -630,14 +866,7 @@ impl SpeechDecoder {
             }
         } else {
             let parm = bits2prm(mode, serial);
-            let mut az_dec = [0i16; 4 * MP1];
-            self.core.decode(mode, &parm, synth, &mut az_dec);
-            self.post_filter.run(mode, synth, &az_dec);
-            crate::amr::nb::filters::post_process(&mut self.post_process, synth, L_FRAME);
-            // truncate to 13 bits (sp_dec.c, NO13BIT not defined)
-            for s in synth.iter_mut().take(L_FRAME) {
-                *s &= 0xfff8u16 as i16;
-            }
+            self.synthesize(mode, &parm, reception, synth);
         }
 
         // If not homed, check the whole frame; reset if homing.
@@ -648,7 +877,18 @@ impl SpeechDecoder {
             self.reset();
         }
         self.reset_flag_old = reset_flag;
-        self.prev_mode = mode;
+    }
+
+    /// `sp_dec.c` `Speech_Decode_Frame`: core decode, post-filter, post-process, 13-bit truncation.
+    fn synthesize(&mut self, mode: usize, parm: &[i16], reception: Reception, synth: &mut [i16]) {
+        let mut az_dec = [0i16; 4 * MP1];
+        self.core.decode(mode, parm, reception, synth, &mut az_dec);
+        self.post_filter.run(mode, synth, &az_dec);
+        crate::amr::nb::filters::post_process(&mut self.post_process, synth, L_FRAME);
+        // truncate to 13 bits (sp_dec.c, NO13BIT not defined)
+        for s in synth.iter_mut().take(L_FRAME) {
+            *s &= 0xfff8u16 as i16;
+        }
     }
 }
 
@@ -723,6 +963,50 @@ mod tests {
         assert_eq!(st.sharp, 0);
         assert_eq!(st.lsp_old, LSP_INIT);
         assert_eq!(st.old_exc, [0i16; OLD_EXC_LEN]);
+        // Decoder_amr_reset: bad-frame-handling memories
+        assert_eq!((st.state, st.prev_bf, st.prev_pdf), (0, 0, 0));
+        assert_eq!(
+            (st.t0_lag_buff, st.in_background_noise, st.voiced_hangover),
+            (40, 0, 0)
+        );
+        assert_eq!(st.exc_energy_history, [0i16; 9]);
+        assert_eq!(st.nodata_seed, 21845);
+    }
+
+    #[test]
+    fn the_state_machine_climbs_per_bad_frame_and_recovers_through_state_five() {
+        let mut decoder = SpeechDecoder::new();
+        let mut synth = [0i16; L_FRAME];
+        decoder.reset_flag_old = false;
+        let mut states = Vec::new();
+        for _ in 0..8 {
+            decoder.conceal_frame(&mut synth);
+            states.push(decoder.core.state);
+        }
+        // Climbs by one per lost frame and saturates at 6.
+        assert_eq!(states, [1, 2, 3, 4, 5, 6, 6, 6]);
+        // The first good frame after a long loss steps to 5, the next to 0 (dec_amr.c).
+        let mut bits = [0i16; 244];
+        bits[0] = 1;
+        decoder.decode_frame(7, &bits, &mut synth);
+        assert_eq!(decoder.core.state, 5);
+        decoder.decode_frame(7, &bits, &mut synth);
+        assert_eq!(decoder.core.state, 0);
+    }
+
+    #[test]
+    fn a_concealed_frame_uses_the_mode_of_the_last_frame_decoded() {
+        let mut decoder = SpeechDecoder::new();
+        let mut synth = [0i16; L_FRAME];
+        assert_eq!(decoder.last_mode(), 0);
+        let mut bits = [0i16; 244];
+        bits[3] = 1;
+        decoder.decode_frame(5, &bits, &mut synth);
+        decoder.conceal_frame(&mut synth);
+        assert_eq!(decoder.last_mode(), 5);
+        // A homing reset forgets the mode, as `Speech_Decode_Frame_reset` does.
+        decoder.reset();
+        assert_eq!(decoder.last_mode(), 0);
     }
 
     /// (mode index, vector tag) for each of the 8 speech modes.

@@ -143,7 +143,9 @@ the room-codec seats are sent it too, because the stream they hear is the transc
   then faded by 20 % per 10 ms and muted after 60 ms, and the first good frame is cross-faded in. (The
   Appendix delays its output by 3.75 ms to smooth the start; a relay cannot hold samples back, so the
   start is joined with a fading offset instead.) AMR-WB and Opus use their own concealment.
-* **AMR-NB has no concealment** (3GPP TS 26.091 is not ported): its concealed frame is silence.
+* AMR-NB conceals with 3GPP TS 26.091 (bit-exact with the TS 26.073 reference decoder): lag, LSF and
+  gains are extrapolated from the last frames and faded by the bad-frame state machine. DTX is not
+  implemented, so a lost frame is always concealed as speech.
 * A seat that is sent the source's packets as they came is not given a synthesized frame: it sees the
   gap, as a same-codec seat always did, and its own decoder conceals. The same goes for a gap longer than
   120 ms, a talk-spurt start (marker bit) and a silence-suppression gap (the timestamps advanced by more

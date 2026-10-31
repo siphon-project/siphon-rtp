@@ -40,12 +40,12 @@
 //! 120 ms of consecutive audio packets are missing and the timestamp advanced by exactly the missing
 //! frames, [`Transcoder::begin_fill`] asks the decoder fed by the source for one concealment frame
 //! per missing packet ([`Decoder::conceal`]: waveform substitution for G.711, ITU-T G.711 Appendix I;
-//! the codecs' own PLC for AMR-WB and Opus) and every transcoded receiver is sent it, so it sees a
+//! the codecs' own PLC for AMR-NB, AMR-WB and Opus) and every transcoded receiver is sent it, so it sees a
 //! concealed frame in place of a gap, with its sequence and timestamp continuous. A seat that is sent
 //! the talker's packets as they came is not given a synthesized frame: its own decoder conceals. A
 //! gap longer than 120 ms, a gap across a talk spurt (marker bit) or a silence suppression gap
-//! (timestamp advanced by more than the missing frames) is not filled. AMR-NB has no concealment
-//! (3GPP TS 26.091 is not ported): its fill is silence.
+//! (timestamp advanced by more than the missing frames) is not filled. AMR-NB conceals per 3GPP
+//! TS 26.091, as the reference decoder does (no DTX, so a lost frame is concealed as speech).
 //!
 //! # Limits, stated
 //! * The packetization interval of a cross-codec seat must equal the room's, so one inbound packet

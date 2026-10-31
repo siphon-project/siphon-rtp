@@ -240,9 +240,10 @@ pub fn parse_octet_aligned(payload: &[u8]) -> Result<OctetAlignedHeader, CodecEr
 /// AMR-NB codec (8 kHz, mono, 20 ms = 160 samples a frame).
 ///
 /// Decode and encode cover **all 8 speech modes** (4.75 .. 12.2 kbit/s), bit-exact against the 3GPP
-/// TS 26.074 `T_<mode>` vectors, in both RFC 4867 payload formats. Not ported: discontinuous
-/// transmission (the encoder sends speech frames only; a received SID or NO_DATA frame is rendered
-/// as silence) and error concealment (a lost or damaged frame is rendered as silence).
+/// TS 26.074 `T_<mode>` vectors, in both RFC 4867 payload formats, plus the error concealment of
+/// 3GPP TS 26.091 for lost and damaged frames ([`Decoder::conceal`]), bit-exact against the TS 26.073
+/// reference decoder. Not ported: discontinuous transmission (the encoder sends speech frames
+/// only; a received SID or NO_DATA frame of a silence period is rendered as silence).
 #[derive(Debug, Clone)]
 pub struct AmrNb {
     params: CodecParams,
@@ -374,9 +375,31 @@ impl FrameCodec for AmrNb {
             .map(|_| ())
     }
 
-    /// The error concealment of 3GPP TS 26.091 is not ported: a lost or damaged frame is silence.
+    /// A frame that never arrived: the bad-frame branch of `dec_amr.c` (3GPP TS 26.091) in the mode
+    /// of the last frame received. Too small an output buffer is left untouched.
     fn conceal_frame(&mut self, pcm: &mut [i16]) {
-        pcm.fill(0);
+        if pcm.len() >= nb::constants::L_FRAME {
+            self.decoder.conceal_frame(pcm);
+        }
+    }
+
+    /// A frame with Q clear (RFC 4867 §4.3.2): decoded as `RX_SPEECH_BAD`, so the bits that did
+    /// arrive still shape the innovation while LSF, pitch lag and gains are concealed.
+    fn decode_damaged(
+        &mut self,
+        mode: u8,
+        frame: &[u8],
+        pcm: &mut [i16],
+    ) -> Result<(), CodecError> {
+        if usize::from(mode) > 7 {
+            return Err(CodecError::Unsupported("AMR-NB mode out of range"));
+        }
+        if pcm.len() < nb::constants::L_FRAME {
+            return Err(CodecError::Malformed("AMR-NB output buffer too small"));
+        }
+        let bits = nb::bitstream::unsort(frame, usize::from(mode));
+        self.decoder.decode_bad_frame(usize::from(mode), &bits, pcm);
+        Ok(())
     }
 
     fn encode_speech(
@@ -411,13 +434,17 @@ impl Decoder for AmrNb {
         decoded
     }
 
-    /// One packet's worth of silence for a lost packet (no error concealment is ported).
+    /// Conceal one lost packet (bad-frame branch of `dec_amr.c`, 3GPP TS 26.091): LSF, pitch lag and
+    /// gains extrapolated from the last frames and attenuated by the bad-frame state machine, 160
+    /// samples for each frame of the packet. Never panics, never emits guessed bitstream audio.
     fn conceal(&mut self, out: &mut [i16]) -> Result<usize, CodecError> {
         let samples = self.params.frame_samples();
         let Some(out) = out.get_mut(..samples) else {
             return Err(CodecError::Malformed("AMR-NB output buffer too small"));
         };
-        out.fill(0);
+        for frame in out.chunks_mut(nb::constants::L_FRAME) {
+            self.conceal_frame(frame);
+        }
         Ok(samples)
     }
 
@@ -738,6 +765,133 @@ mod tests {
             let mut codec = AmrNb::new();
             let mut out = [0i16; nb::constants::L_FRAME];
             let _ = codec.decode_mode_bits(mode, &bits, &mut out);
+        }
+    }
+
+    /// 20 ms of a 440 Hz tone, the `frame`th of a continuous stream.
+    fn tone_frame(frame: usize) -> Vec<i16> {
+        (0..nb::constants::L_FRAME)
+            .map(|n| {
+                let t = (frame * nb::constants::L_FRAME + n) as f64 / 8000.0;
+                ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16
+            })
+            .collect()
+    }
+
+    fn rms(samples: &[i16]) -> f64 {
+        let energy: f64 = samples.iter().map(|&s| f64::from(s).powi(2)).sum();
+        (energy / samples.len() as f64).sqrt()
+    }
+
+    /// An AMR-NB codec that has encoded and decoded `frames` of tone at `mode`, plus the bits of the
+    /// last frame (serial order).
+    fn warmed_up_codec(mode: AmrNbMode, frames: usize) -> (AmrNb, Vec<i16>) {
+        let mut codec = AmrNb::new();
+        let mut bits = vec![0i16; 244];
+        let mut out = [0i16; nb::constants::L_FRAME];
+        for frame in 0..frames {
+            codec
+                .encode_mode_bits(mode, &tone_frame(frame), &mut bits)
+                .unwrap();
+            codec
+                .decode_mode_bits(usize::from(mode.frame_type()), &bits, &mut out)
+                .unwrap();
+        }
+        (codec, bits)
+    }
+
+    #[test]
+    fn amr_nb_conceals_a_lost_frame_as_a_faded_continuation_not_silence() {
+        for mode in [AmrNbMode::Mr475, AmrNbMode::Mr795, AmrNbMode::Mr1220] {
+            let (mut codec, _) = warmed_up_codec(mode, 30);
+            let mut spoken = [0i16; nb::constants::L_FRAME];
+            let (mut reference, bits) = warmed_up_codec(mode, 30);
+            reference
+                .decode_mode_bits(usize::from(mode.frame_type()), &bits, &mut spoken)
+                .unwrap();
+
+            let mut concealed = [0i16; nb::constants::L_FRAME];
+            assert_eq!(codec.conceal(&mut concealed).unwrap(), 160);
+            assert!(rms(&concealed) > 0.1 * rms(&spoken), "{mode:?}: silence");
+            assert!(concealed.iter().all(|&s| s & 7 == 0), "13-bit output");
+        }
+    }
+
+    #[test]
+    fn amr_nb_concealment_is_deterministic_and_fades_in_a_long_loss() {
+        let run = || {
+            let (mut codec, _) = warmed_up_codec(AmrNbMode::Mr1220, 30);
+            let mut levels = Vec::new();
+            let mut out = [0i16; nb::constants::L_FRAME];
+            for _ in 0..30 {
+                codec.conceal(&mut out).unwrap();
+                levels.push(rms(&out));
+            }
+            levels
+        };
+        let levels = run();
+        assert_eq!(levels, run(), "the substitute parameters are seeded");
+        assert!(
+            levels[29] < 0.5 * levels[0],
+            "thirty lost frames must have faded: {levels:?}"
+        );
+    }
+
+    #[test]
+    fn amr_nb_conceal_from_a_fresh_decoder_is_bounded() {
+        let mut codec = AmrNb::new();
+        let mut out = [0i16; nb::constants::L_FRAME * 3];
+        assert_eq!(codec.conceal(&mut out).unwrap(), 160);
+        assert!(codec.conceal(&mut out[..100]).is_err());
+    }
+
+    #[test]
+    fn amr_nb_damaged_frame_is_concealed_not_decoded() {
+        // The same RFC 4867 octet-aligned frame decoded with Q set and with Q clear differs: the
+        // latter takes its LSF, lag and gains from the previous frames (TS 26.091).
+        let mut encoder = AmrNb::new();
+        let mut intact = AmrNb::new();
+        let mut damaged = AmrNb::new();
+        let mut payload = [0u8; 64];
+        let mut heard = [0i16; nb::constants::L_FRAME];
+        for frame in 0..30 {
+            let length = encoder.encode(&tone_frame(frame), &mut payload).unwrap();
+            intact.decode(&payload[..length], &mut heard).unwrap();
+            damaged.decode(&payload[..length], &mut heard).unwrap();
+        }
+        let length = encoder.encode(&tone_frame(30), &mut payload).unwrap();
+        let mut good_out = [0i16; nb::constants::L_FRAME];
+        intact.decode(&payload[..length], &mut good_out).unwrap();
+        payload[1] &= !0x04; // the Q bit of the table-of-contents entry
+        let mut damaged_out = [0i16; nb::constants::L_FRAME];
+        damaged
+            .decode(&payload[..length], &mut damaged_out)
+            .unwrap();
+
+        assert_ne!(good_out, damaged_out);
+        assert!(rms(&damaged_out) > 0.1 * rms(&good_out));
+    }
+
+    // Any mix of good, damaged and lost frames in any mode decodes or conceals without panicking,
+    // and every output sample keeps the 13-bit truncation of `sp_dec.c`.
+    proptest::proptest! {
+        #[test]
+        fn amr_nb_any_loss_pattern_in_any_mode_is_bounded_and_never_panics(
+            frames in proptest::collection::vec(
+                (0usize..=7, 0u8..3, proptest::collection::vec(0i16..=1, 244)),
+                1..40,
+            ),
+        ) {
+            let mut decoder = nb::dec_main::SpeechDecoder::new();
+            let mut out = [0i16; nb::constants::L_FRAME];
+            for (mode, kind, bits) in &frames {
+                match kind {
+                    0 => decoder.decode_frame(*mode, bits, &mut out),
+                    1 => decoder.decode_bad_frame(*mode, bits, &mut out),
+                    _ => decoder.conceal_frame(&mut out),
+                }
+                proptest::prop_assert!(out.iter().all(|&sample| sample & 7 == 0));
+            }
         }
     }
 

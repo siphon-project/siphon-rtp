@@ -416,7 +416,7 @@ fn bench_amrwb_decode(criterion: &mut Criterion) {
     }
 }
 
-/// AMR-NB full per-frame decode (`dec_main`), one bench per speech mode (0..=7), over the official
+/// AMR-NB full per-frame decode (`dec_main`) and lost-frame concealment, one bench each per speech mode (0..=7), over the official
 /// `T_<mode>` vectors. The decoder is warmed through the preceding frames so the timed decode sees
 /// realistic filter/predictor memory (not the post-reset transient).
 #[cfg(feature = "amr")]
@@ -465,6 +465,16 @@ fn bench_amrnb_decode(criterion: &mut Criterion) {
             bencher.iter_batched(
                 || warm.clone(),
                 |mut st| st.decode_frame(mode, black_box(&bits), black_box(&mut out)),
+                BatchSize::SmallInput,
+            );
+        });
+
+        // A lost frame (TS 26.091 concealment) right after the warmed-up speech: the first bad frame
+        // of a loss, the costliest (state 1, no attenuation yet).
+        criterion.bench_function(&format!("amrnb_conceal_mode{mode}_frame"), |bencher| {
+            bencher.iter_batched(
+                || warm.clone(),
+                |mut st| st.conceal_frame(black_box(&mut out)),
                 BatchSize::SmallInput,
             );
         });
