@@ -419,6 +419,17 @@ jobs:
       - name: veth XDP_TX relay smoke (self-skips without CAP_NET_ADMIN)
         run: cargo test --test xdp_tx_smoke -- --nocapture
 
+  # The MCPTT floor data channel against a real browser: headless Chrome (preinstalled on the hosted
+  # runner) joins a forwarding room over ICE, DTLS-SRTP and SCTP; the script needs no npm packages.
+  floor-channel-chrome:
+    name: floor channel (headless Chrome)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/check-floor-channel-chrome.sh
+
   # Single required status check for branch protection: green only if every job above is green.
   # perf-gate is included: it runs on pull_request (success) and is skipped on the push-to-main build,
   # and `if: always()` + the failure/cancelled check treats a skipped job as non-failing. xdp-integration
@@ -427,7 +438,7 @@ jobs:
   ci:
     name: CI passed
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, benches, deny, sbom, fuzz-targets, fuzz, docker-build, perf-gate, xdp-integration]
+    needs: [fmt, clippy, test, msrv, docs, benches, deny, sbom, fuzz-targets, fuzz, docker-build, perf-gate, xdp-integration, floor-channel-chrome]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job failed or was cancelled
