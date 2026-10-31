@@ -37,6 +37,8 @@ const FORMAT: &str = "webrtc-datachannel";
 pub struct DataChannelMedia {
     /// The section's `a=mid` (RFC 5888 §4), which the answer echoes.
     pub mid: String,
+    /// The `a=mid` of the audio section it is bundled with.
+    pub audio_mid: String,
 }
 
 /// Whether the body of an `m=` line (after `m=`) is a data channel section, whatever its port:
@@ -91,7 +93,7 @@ fn bundled_mids<'a>(lines: &[&'a str]) -> Vec<&'a str> {
 
 /// Where the first live data channel section is: its `m=` line index and exclusive end. Live is a
 /// non-zero port, or port 0 with `a=bundle-only` (RFC 8843 §6), which an answerer may accept.
-fn locate_data_channel(lines: &[&str]) -> Option<(usize, usize)> {
+fn locate_data_channel(lines: &[&str], any_port: bool) -> Option<(usize, usize)> {
     for (index, line) in lines.iter().enumerate() {
         let Some(value) = line.strip_prefix("m=") else {
             continue;
@@ -107,7 +109,7 @@ fn locate_data_channel(lines: &[&str]) -> Option<(usize, usize)> {
         let bundle_only = lines[index + 1..end]
             .iter()
             .any(|line| line.trim() == "a=bundle-only");
-        if port.is_some_and(|port| port != 0) || (port == Some(0) && bundle_only) {
+        if any_port || port.is_some_and(|port| port != 0) || (port == Some(0) && bundle_only) {
             return Some((index, end));
         }
     }
@@ -135,13 +137,13 @@ fn locate_audio(lines: &[&str]) -> Option<(usize, usize)> {
 #[must_use]
 pub fn parse_data_channel(offer: &str) -> Option<DataChannelMedia> {
     let lines = split_lines(offer);
-    let (start, end) = locate_data_channel(&lines)?;
+    let (start, end) = locate_data_channel(&lines, false)?;
     let mid = mid_of(&lines, start, end)?;
     let (audio_start, audio_end) = locate_audio(&lines)?;
     let audio_mid = mid_of(&lines, audio_start, audio_end)?;
     let bundled = bundled_mids(&lines);
     (bundled.contains(&mid.as_str()) && bundled.contains(&audio_mid.as_str()))
-        .then_some(DataChannelMedia { mid })
+        .then_some(DataChannelMedia { mid, audio_mid })
 }
 
 /// Whether `line` is a transport attribute that the data channel section shares with the audio
@@ -177,9 +179,106 @@ fn is_shared_transport_line(line: &str) -> bool {
 /// returned unchanged.
 #[must_use]
 pub fn anchor_data_channel(answer: &str) -> String {
+    anchor(answer, None, false)
+}
+
+/// Decline every data channel section of an offer the engine relays to a party that cannot carry one
+/// (port 0, RFC 3264 §6), and drop the offer's `a=group:BUNDLE` line, which would name a section
+/// that no longer travels. The m-line keeps its place so the answer's order still matches the offer's.
+#[must_use]
+pub fn decline_data_channels(offer: &str) -> String {
+    let lines = split_lines(offer);
+    let first_media = lines
+        .iter()
+        .position(|line| line.starts_with("m="))
+        .unwrap_or(lines.len());
+    let mut changed = false;
+    let out: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if index < first_media && line.starts_with("a=group:BUNDLE") {
+                changed = true;
+                return None;
+            }
+            match line.strip_prefix("m=") {
+                Some(value) if is_data_channel_media_line(value) => {
+                    let declined = rewrite_media_line(line, 0, None);
+                    changed |= declined != *line;
+                    Some(declined)
+                }
+                _ => Some((*line).to_string()),
+            }
+        })
+        .collect();
+    if changed {
+        out.join(CRLF)
+    } else {
+        offer.to_string()
+    }
+}
+
+/// Answer, toward a DTLS party the engine terminates, the data channel section that the answer built
+/// from the other party's reply has declined (that party never saw the channel, see
+/// [`decline_data_channels`]). The section is revived on the audio's transport as
+/// [`anchor_data_channel`] does, with the mids the party offered, and the bundle group and the audio
+/// section's `a=mid` that the other party's answer cannot carry are added (RFC 8843 §7).
+#[must_use]
+pub fn answer_terminated_data_channel(answer: &str, audio_mid: &str, mid: &str) -> String {
+    // The other party may have left the declined section out of its answer altogether: add it (at the
+    // end, where a browser puts its data channel) so there is one to answer.
+    let with_section;
+    let answer = if locate_data_channel(&split_lines(answer), true).is_some() {
+        answer
+    } else if locate_audio(&split_lines(answer)).is_some() {
+        with_section = format!(
+            "{}{CRLF}m=application 0 {TRANSPORT} {FORMAT}{CRLF}",
+            answer.trim_end_matches(['\r', '\n'])
+        );
+        &with_section
+    } else {
+        return answer.to_string();
+    };
+    let anchored = anchor(answer, Some(mid), true);
+    let lines = split_lines(&anchored);
+    let Some((audio_start, audio_end)) = locate_audio(&lines) else {
+        return anchored;
+    };
+    let first_media = lines
+        .iter()
+        .position(|line| line.starts_with("m="))
+        .unwrap_or(lines.len());
+    let has_group = !bundled_mids(&lines).is_empty();
+    let has_audio_mid = mid_of(&lines, audio_start, audio_end).is_some();
+    if has_group && has_audio_mid {
+        return anchored;
+    }
+    // The audio section's `a=mid` goes at the end of its attributes (after `c=`, RFC 4566 §5), before
+    // the empty remainder of an SDP that ends in CRLF.
+    let mut mid_at = audio_end;
+    while mid_at > audio_start + 1 && lines[mid_at - 1].is_empty() {
+        mid_at -= 1;
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
+    for (index, line) in lines.iter().enumerate() {
+        if index == first_media && !has_group {
+            out.push(format!("a=group:BUNDLE {audio_mid} {mid}"));
+        }
+        if index == mid_at && !has_audio_mid {
+            out.push(format!("a=mid:{audio_mid}"));
+        }
+        out.push((*line).to_string());
+    }
+    if mid_at == lines.len() && !has_audio_mid {
+        out.push(format!("a=mid:{audio_mid}"));
+    }
+    out.join(CRLF)
+}
+
+fn anchor(answer: &str, mid_override: Option<&str>, any_port: bool) -> String {
     let lines = split_lines(answer);
     let (Some((start, end)), Some((audio_start, audio_end))) =
-        (locate_data_channel(&lines), locate_audio(&lines))
+        (locate_data_channel(&lines, any_port), locate_audio(&lines))
     else {
         return answer.to_string();
     };
@@ -188,7 +287,10 @@ pub fn anchor_data_channel(answer: &str) -> String {
         .and_then(|value| value.split_whitespace().nth(1))
         .and_then(|port| port.parse::<u16>().ok())
         .unwrap_or(0);
-    let Some(mid) = mid_of(&lines, start, end) else {
+    let Some(mid) = mid_override
+        .map(str::to_string)
+        .or_else(|| mid_of(&lines, start, end))
+    else {
         return answer.to_string();
     };
     let shared: Vec<&str> = lines[audio_start + 1..audio_end]
@@ -289,7 +391,10 @@ mod tests {
     fn a_bundled_data_channel_section_is_recognised_with_its_mid() {
         assert_eq!(
             parse_data_channel(OFFER),
-            Some(DataChannelMedia { mid: "1".into() })
+            Some(DataChannelMedia {
+                mid: "1".into(),
+                audio_mid: "0".into()
+            })
         );
     }
 
@@ -334,7 +439,10 @@ mod tests {
             .replace("a=mid:1\r\n", "a=mid:1\r\na=bundle-only\r\n");
         assert_eq!(
             parse_data_channel(&offer),
-            Some(DataChannelMedia { mid: "1".into() })
+            Some(DataChannelMedia {
+                mid: "1".into(),
+                audio_mid: "0".into()
+            })
         );
     }
 
@@ -394,6 +502,80 @@ mod tests {
         assert!(
             anchored.ends_with("a=max-message-size:65536\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n")
         );
+    }
+
+    /// What the other party's plain answer looks like once the engine has re-originated it toward the
+    /// DTLS party: the audio section, and the data channel section that party declined.
+    const TERMINATED_ANSWER_BEFORE: &str = concat!(
+        "v=0\r\n",
+        "o=- 1 1 IN IP4 198.51.100.9\r\n",
+        "s=-\r\n",
+        "t=0 0\r\n",
+        "m=audio 40000 UDP/TLS/RTP/SAVPF 0\r\n",
+        "c=IN IP4 198.51.100.9\r\n",
+        "a=ice-ufrag:engine\r\n",
+        "a=fingerprint:sha-256 CC:DD\r\n",
+        "a=setup:passive\r\n",
+        "a=rtpmap:0 PCMU/8000\r\n",
+        "m=application 0 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+    );
+
+    #[test]
+    fn a_declined_section_is_revived_with_the_bundle_the_party_offered() {
+        let answer = answer_terminated_data_channel(TERMINATED_ANSWER_BEFORE, "0", "1");
+        let expected = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 198.51.100.9\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "a=group:BUNDLE 0 1\r\n",
+            "m=audio 40000 UDP/TLS/RTP/SAVPF 0\r\n",
+            "c=IN IP4 198.51.100.9\r\n",
+            "a=ice-ufrag:engine\r\n",
+            "a=fingerprint:sha-256 CC:DD\r\n",
+            "a=setup:passive\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=mid:0\r\n",
+            "m=application 40000 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+            "c=IN IP4 198.51.100.9\r\n",
+            "a=mid:1\r\n",
+            "a=ice-ufrag:engine\r\n",
+            "a=fingerprint:sha-256 CC:DD\r\n",
+            "a=setup:passive\r\n",
+            "a=sctp-port:5000\r\n",
+            "a=max-message-size:65536\r\n",
+        );
+        assert_eq!(answer, expected);
+    }
+
+    #[test]
+    fn reviving_adds_the_section_when_the_other_partys_answer_left_it_out() {
+        let audio_only = TERMINATED_ANSWER_BEFORE
+            .split("m=application")
+            .next()
+            .expect("audio part");
+        let answer = answer_terminated_data_channel(audio_only, "0", "1");
+        assert_eq!(
+            answer,
+            answer_terminated_data_channel(TERMINATED_ANSWER_BEFORE, "0", "1")
+        );
+    }
+
+    #[test]
+    fn an_answer_with_no_audio_is_left_alone() {
+        let nothing = "v=0\r\ns=-\r\nt=0 0\r\n";
+        assert_eq!(answer_terminated_data_channel(nothing, "0", "1"), nothing);
+    }
+
+    #[test]
+    fn declining_toward_the_other_party_zeroes_the_port_and_drops_the_bundle() {
+        let declined = decline_data_channels(OFFER);
+        assert!(declined.contains("m=application 0 UDP/DTLS/SCTP webrtc-datachannel\r\n"));
+        assert!(!declined.contains("a=group:BUNDLE"));
+        assert!(declined.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"));
+        // Nothing to decline: returned as it was.
+        let audio_only = "v=0\r\ns=-\r\nt=0 0\r\nm=audio 9 RTP/AVP 0\r\n";
+        assert_eq!(decline_data_channels(audio_only), audio_only);
     }
 
     #[test]

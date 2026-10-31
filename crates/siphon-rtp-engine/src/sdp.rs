@@ -29,7 +29,8 @@ pub use offer::conference_seat_offer;
 pub(crate) use amr::offered as offered_amr;
 pub use amr::{set_policy as set_amr_policy, AmrFmtp, AmrPolicy};
 pub use data_channel::{
-    anchor_data_channel, parse_data_channel, DataChannelMedia, DATA_CHANNEL_SCTP_PORT,
+    anchor_data_channel, answer_terminated_data_channel, decline_data_channels, parse_data_channel,
+    DataChannelMedia, DATA_CHANNEL_SCTP_PORT,
 };
 pub use decline::{
     decline_unanswered_media, decline_unanswered_streams, decline_unanswered_with_data_channel,

@@ -283,18 +283,11 @@ async fn next_app(events: &flume::Receiver<Event>) -> Event {
         .expect("open queue")
 }
 
-/// The browser's own stream identity is dropped from the answer in every section, and what bundling
-/// the data channel needs (`a=mid`, `a=group:BUNDLE`, `a=sctp-port`, the channel's own port) is not.
-#[tokio::test]
-async fn the_answer_drops_the_browsers_stream_identity_but_keeps_what_the_channel_needs() {
-    use super::stream_identity::{assert_nothing_of_the_offerer, signalled_ssrcs, OFFERER_SSRC};
-    let engine = engine_with_dispatcher();
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind");
-    let address = socket.local_addr().expect("addr");
-    let certificate = DtlsCertificate::generate().expect("browser certificate");
-    let offer = browser_offer(address, &certificate, "active", true)
+/// A browser offer that also carries the stream identity and header extensions a browser signals
+/// (RFC 5576 `a=ssrc`, RFC 8830 `a=msid`, RFC 8285 `a=extmap`).
+fn identity_laden_browser_offer(address: SocketAddr, certificate: &DtlsCertificate) -> String {
+    use super::stream_identity::OFFERER_SSRC;
+    browser_offer(address, certificate, "active", true)
         .replace(
             "t=0 0\r\n",
             "t=0 0\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS stream-a\r\n",
@@ -305,7 +298,62 @@ async fn the_answer_drops_the_browsers_stream_identity_but_keeps_what_the_channe
                 "a=mid:0\r\na=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
                  a=msid:stream-a track-a\r\na=ssrc:{OFFERER_SSRC} cname:offerer-cname\r\n"
             ),
-        );
+        )
+}
+
+/// A single-leg `answer_local` answer to the same offer: it echoes none of the browser's identity
+/// either, names no SSRC of its own, and keeps what bundling the data channel needs.
+#[tokio::test]
+async fn a_local_answer_drops_the_browsers_stream_identity_but_keeps_what_the_channel_needs() {
+    use super::stream_identity::{assert_nothing_of_the_offerer, signalled_ssrcs};
+    let engine = engine_with_dispatcher();
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let address = socket.local_addr().expect("addr");
+    let certificate = DtlsCertificate::generate().expect("browser certificate");
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "ivr-identity".into(),
+                from_tag: "caller".into(),
+                sdp: identity_laden_browser_offer(address, &certificate),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&answered);
+    assert_nothing_of_the_offerer(&answer);
+    assert!(!answer.contains("extmap"), "{answer}");
+    assert!(signalled_ssrcs(&answer).is_empty(), "{answer}");
+    let lines: Vec<&str> = answer.split("\r\n").collect();
+    for expected in [
+        "a=group:BUNDLE 0 1",
+        "a=mid:0",
+        "a=mid:1",
+        "a=sctp-port:5000",
+    ] {
+        assert!(lines.contains(&expected), "{expected} in {answer}");
+    }
+    assert!(
+        answer.contains("UDP/DTLS/SCTP webrtc-datachannel") && !answer.contains("m=application 0"),
+        "the channel is still answered: {answer}"
+    );
+}
+
+/// The browser's own stream identity is dropped from the answer in every section, and what bundling
+/// the data channel needs (`a=mid`, `a=group:BUNDLE`, `a=sctp-port`, the channel's own port) is not.
+#[tokio::test]
+async fn the_answer_drops_the_browsers_stream_identity_but_keeps_what_the_channel_needs() {
+    use super::stream_identity::{assert_nothing_of_the_offerer, signalled_ssrcs};
+    let engine = engine_with_dispatcher();
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let address = socket.local_addr().expect("addr");
+    let certificate = DtlsCertificate::generate().expect("browser certificate");
+    let offer = identity_laden_browser_offer(address, &certificate);
     let answer = ok_sdp_text(&join(&engine, "a", offer).await);
     assert_nothing_of_the_offerer(&answer);
     assert!(!answer.contains("extmap"), "{answer}");
@@ -724,5 +772,226 @@ async fn a_single_leg_local_answer_carries_floor_control_on_the_data_channel_too
         .await;
     assert!(matches!(deleted, CmdResult::Ok { .. }), "{deleted:?}");
     assert_eq!(engine.dtls_bridge().session_count(), 0);
+    assert_eq!(engine.dtls_bridge().floor_channel_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_two_party_call_answers_a_browsers_data_channel_and_carries_its_floor() {
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let app_events = engine.app_event_receiver(CLIENT).expect("queue");
+    let socket = Arc::new(
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind"),
+    );
+    let address = socket.local_addr().expect("addr");
+    let (_callee, callee_address) = phone().await;
+    let certificate = DtlsCertificate::generate().expect("browser certificate");
+
+    // A browser calls a plain callee: the engine terminates A's DTLS and the callee is offered plain
+    // RTP, with the data channel declined (it is A's to answer, not the callee's).
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "dc-call".into(),
+                from_tag: "browser".into(),
+                sdp: browser_offer(address, &certificate, "active", true),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/AVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let to_callee = ok_sdp_text(&offered);
+    assert!(
+        to_callee.contains("m=application 0 UDP/DTLS/SCTP webrtc-datachannel"),
+        "{to_callee}"
+    );
+    assert!(
+        !to_callee.contains("a=group:BUNDLE"),
+        "the callee is not told of a bundle: {to_callee}"
+    );
+
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "dc-call".into(),
+                from_tag: "browser".into(),
+                to_tag: "callee".into(),
+                sdp: sdp_for(callee_address, true),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let to_browser = ok_sdp_text(&answered);
+    let lines: Vec<&str> = to_browser.split("\r\n").collect();
+    let audio = lines
+        .iter()
+        .position(|line| line.starts_with("m=audio"))
+        .expect("audio");
+    let channel = lines
+        .iter()
+        .position(|line| line.starts_with("m=application"))
+        .expect("data channel");
+    let audio_port = lines[audio].split(' ').nth(1).expect("port");
+    assert_eq!(
+        lines[channel],
+        format!("m=application {audio_port} UDP/DTLS/SCTP webrtc-datachannel"),
+        "{to_browser}"
+    );
+    assert!(lines.contains(&"a=group:BUNDLE 0 1"), "{to_browser}");
+    assert!(lines[audio..channel].contains(&"a=mid:0"), "{to_browser}");
+    assert!(lines[channel..].contains(&"a=mid:1"), "{to_browser}");
+    assert!(
+        lines[channel..].contains(&"a=sctp-port:5000"),
+        "{to_browser}"
+    );
+    assert!(
+        lines[channel..].contains(&"a=max-message-size:65536"),
+        "{to_browser}"
+    );
+
+    let parsed = sdp::parse(&to_browser).expect("answer");
+    let fingerprint = parsed.fingerprint.clone().expect("fingerprint");
+    let browser = Browser::start(
+        socket,
+        parsed.remote_rtp,
+        certificate,
+        &fingerprint,
+        DtlsRole::Client,
+    );
+    browser
+        .expect(|event| matches!(event, DataChannelEvent::Connected))
+        .await;
+    browser.order(Order::Open("mcptt-floor"));
+    browser
+        .expect(|event| matches!(event, DataChannelEvent::ChannelOpened { .. }))
+        .await;
+    browser.order(Order::Binary(FLOOR_REQUEST.to_vec()));
+    assert_eq!(
+        next_app(&app_events).await,
+        Event::RtcpApp {
+            call_id: Some("dc-call".into()),
+            conference_id: None,
+            from_tag: "browser".into(),
+            stream: RtcpAppStream::Floor,
+            ssrc: 0x1122_3344,
+            name: "MCPT".into(),
+            subtype: 0,
+            payload: vec![0x00, 0x02, 0x05, 0x00],
+        }
+    );
+    let sent = engine
+        .handle(
+            CLIENT,
+            Command::SendRtcpApp {
+                call_id: Some("dc-call".into()),
+                conference_id: None,
+                from_tag: Some("browser".into()),
+                except_from_tags: vec![],
+                stream: RtcpAppStream::Floor,
+                ssrc: Some(0x5566_7788),
+                name: "MCPT".into(),
+                subtype: 17,
+                payload: FLOOR_GRANTED_PAYLOAD.to_vec(),
+            },
+        )
+        .await;
+    assert!(matches!(sent, CmdResult::Ok { .. }), "{sent:?}");
+    let DataChannelEvent::Message { data, binary, .. } = browser
+        .expect(|event| matches!(event, DataChannelEvent::Message { .. }))
+        .await
+    else {
+        panic!("a message");
+    };
+    assert!(binary);
+    assert_eq!(&data[..4], &[0x91, 0xCC, 0x00, 0x05]);
+    assert_eq!(&data[12..], &FLOOR_GRANTED_PAYLOAD);
+
+    // The callee has no data channel: floor control toward it is refused, not queued.
+    let to_callee = engine
+        .handle(
+            CLIENT,
+            Command::SendRtcpApp {
+                call_id: Some("dc-call".into()),
+                conference_id: None,
+                from_tag: Some("callee".into()),
+                except_from_tags: vec![],
+                stream: RtcpAppStream::Floor,
+                ssrc: Some(1),
+                name: "MCPT".into(),
+                subtype: 17,
+                payload: FLOOR_GRANTED_PAYLOAD.to_vec(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(to_callee, CmdResult::Error { .. }),
+        "{to_callee:?}"
+    );
+
+    let deleted = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "dc-call".into(),
+                from_tag: "browser".into(),
+                to_tag: Some("callee".into()),
+            },
+        )
+        .await;
+    assert!(matches!(deleted, CmdResult::Ok { .. }), "{deleted:?}");
+    assert_eq!(engine.dtls_bridge().session_count(), 0);
+    assert_eq!(engine.dtls_bridge().floor_channel_count(), 0);
+}
+
+#[tokio::test]
+async fn a_dtls_caller_with_an_unbundled_channel_gets_no_floor_channel_and_the_callee_sees_it_declined(
+) {
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let address = socket.local_addr().expect("addr");
+    let (_callee, callee_address) = phone().await;
+    let certificate = DtlsCertificate::generate().expect("certificate");
+    let offer = browser_offer(address, &certificate, "active", true)
+        .replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0");
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "dc-unbundled".into(),
+                from_tag: "browser".into(),
+                sdp: offer,
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/AVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    assert!(
+        ok_sdp_text(&offered).contains("m=application 0 UDP/DTLS/SCTP"),
+        "never relayed to the callee"
+    );
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "dc-unbundled".into(),
+                from_tag: "browser".into(),
+                to_tag: "callee".into(),
+                sdp: sdp_for(callee_address, true),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
     assert_eq!(engine.dtls_bridge().floor_channel_count(), 0);
 }

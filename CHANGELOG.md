@@ -58,8 +58,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   RFC 8831), so there is no new UDP ingress; the DTLS driver of the leg owns the association. One floor message
   is one binary message encoded as the RTCP APP packet itself, raised as the same `rtcp_app` event and sent by
   the same `send_rtcp_app` (`stream: "floor"`). TS 24.380 has no WebRTC binding: the convention is ours. A
-  data channel on a non-DTLS leg or outside the bundle is declined, and the two-party `offer` / `answer` pair
-  does not answer one yet. New dependencies `rtc-sctp` and `rtc-datachannel` (`docs/supply-chain.md`). About
+  data channel on a non-DTLS leg or outside the bundle is declined. A browser caller toward a plain
+  callee gets it on the two-party `offer` / `answer` pair too, with the section declined toward the callee. New dependencies `rtc-sctp` and `rtc-datachannel` (`docs/supply-chain.md`). About
   1.2 µs per message each way (`benches/floor_channel_bench.rs`, `docs/cookbook/forwarding.md`).
 
 - **Dial-out, transcoding and a whole-room backstop for forwarding rooms (`forward_offer`,
