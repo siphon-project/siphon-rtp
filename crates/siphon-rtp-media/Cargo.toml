@@ -81,6 +81,11 @@ harness = false
 name = "text_mixer_bench"
 harness = false
 
+# Per-receiver RTP translator rewrite cost, single and 500-receiver fan-out.
+[[bench]]
+name = "translator_bench"
+harness = false
+
 [lints]
 workspace = true
 
