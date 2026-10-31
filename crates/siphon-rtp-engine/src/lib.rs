@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app_events;
+pub mod call_floor;
 pub mod cluster;
 pub mod conference;
 pub mod config;

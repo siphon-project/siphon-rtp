@@ -170,6 +170,58 @@ pub fn anchor_floor(sdp: &str, engine: EngineMedia, fmtp: Option<&str>) -> Strin
     out.join(CRLF)
 }
 
+/// How a presented SDP treats its MCPTT floor-control section, beside [`super::TextRewrite`] and
+/// [`super::ImageRewrite`]. There is no pass-through: an unanchored section would hand the other party
+/// the offerer's own, often private, floor address, so the section is anchored or declined.
+#[derive(Debug, Clone, Copy)]
+pub enum FloorRewrite<'a> {
+    /// Anchor the section on the engine's floor endpoint, with `a=fmtp:MCPTT <fmtp>` ([`anchor_floor`]).
+    Anchor {
+        /// The engine floor endpoint and the address advertised for it.
+        engine: EngineMedia,
+        /// The controller's floor parameters, verbatim.
+        fmtp: Option<&'a str>,
+    },
+    /// The leg has no floor endpoint: decline the section ([`decline_floor`]).
+    Decline,
+}
+
+impl FloorRewrite<'_> {
+    /// Apply the directive to a presented SDP.
+    #[must_use]
+    pub fn apply(self, presented: &str) -> String {
+        match self {
+            Self::Anchor { engine, fmtp } => anchor_floor(presented, engine, fmtp),
+            Self::Decline => decline_floor(presented),
+        }
+    }
+}
+
+/// Decline every live floor section of `sdp` (port 0, RFC 3264 §6), for a section the engine cannot
+/// anchor, such as one a party adds mid-call to a leg that has no floor endpoint. Passing it through
+/// instead would hand the other party the offerer's own, often private, floor address.
+#[must_use]
+pub fn decline_floor(sdp: &str) -> String {
+    let mut changed = false;
+    let lines: Vec<String> = split_lines(sdp)
+        .into_iter()
+        .map(|line| match line.strip_prefix("m=") {
+            Some(value)
+                if is_floor_media_line(value) && value.split_whitespace().nth(1) != Some("0") =>
+            {
+                changed = true;
+                rewrite_media_line(line, 0, None)
+            }
+            _ => line.to_string(),
+        })
+        .collect();
+    if changed {
+        lines.join(CRLF)
+    } else {
+        sdp.to_string()
+    }
+}
+
 /// Whether `line` is an `a=fmtp` for the floor format.
 fn is_floor_fmtp(line: &str) -> bool {
     line.strip_prefix("a=fmtp:")
@@ -348,6 +400,29 @@ mod tests {
                 "a=fmtp:MCPTT y\r\n",
             )
         );
+    }
+
+    #[test]
+    fn declining_zeroes_every_live_floor_section_and_nothing_else() {
+        let offer = concat!(
+            "v=0\r\nc=IN IP4 192.0.2.10\r\n",
+            "m=audio 20100 RTP/AVP 0\r\n",
+            "m=application 20032 udp MCPTT\r\na=fmtp:MCPTT x\r\n",
+            "m=application 20034 udp t38\r\n",
+            "m=application 0 udp MCPTT\r\n",
+        );
+        assert_eq!(
+            decline_floor(offer),
+            concat!(
+                "v=0\r\nc=IN IP4 192.0.2.10\r\n",
+                "m=audio 20100 RTP/AVP 0\r\n",
+                "m=application 0 udp MCPTT\r\na=fmtp:MCPTT x\r\n",
+                "m=application 20034 udp t38\r\n",
+                "m=application 0 udp MCPTT\r\n",
+            )
+        );
+        let none = "v=0\r\nm=audio 1 RTP/AVP 0\r\n";
+        assert_eq!(decline_floor(none), none);
     }
 
     #[test]

@@ -43,6 +43,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.stop_x3(call_id, X3EndReason::CallEnded).await;
             self.bridge.deregister(endpoints.iter().copied());
             self.media.deregister(call_id);
+            self.conference.floors().deregister_call(call_id);
             // ...and any WS takeover bridge, so its controller gets a final `ws_bridge_ended` rather
             // than a stream that simply stops.
             self.stop_ws_bridge(call_id, WsBridgeEndReason::CallEnded)
@@ -297,6 +298,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.media.deregister(call_id);
         self.text.deregister(call_id);
         self.udptl.deregister(call_id);
+        // …and the MCPTT floor legs, so a datagram on a freed floor endpoint is routed nowhere.
+        self.conference.floors().deregister_call(call_id);
         // The WS takeover bridge closes with the call, so its controller gets a final
         // `ws_bridge_ended` rather than a stream that simply stops.
         self.stop_ws_bridge(call_id, WsBridgeEndReason::CallEnded)
