@@ -275,6 +275,7 @@ pub(crate) fn validate_profile(profile: &ProfileFlags) -> Result<(), String> {
     validate_echo_delay_search_ms(profile)?;
     crate::engine::validate_sip_call_id(profile)?;
     validate_floor_fmtp(profile)?;
+    refuse_floor_keys(profile)?;
     validate_fax_passthrough(profile)
 }
 
@@ -285,6 +286,21 @@ fn validate_floor_fmtp(profile: &ProfileFlags) -> Result<(), String> {
         Some(fmtp) => crate::sdp::validate_floor_fmtp(fmtp).map_err(|error| error.to_string()),
         None => Ok(()),
     }
+}
+
+/// `floor_keys` are part of the control contract but this build has no SRTCP floor security:
+/// accepting them would leave the floor stream in the clear while the controller believes it is
+/// protected. Refused loudly instead of ignored. (`key_mgmt` is not refused: it is an SDP attribute
+/// the controller owns and the engine writes verbatim, see [`crate::sdp::apply_key_mgmt`].)
+///
+/// # Errors
+/// The reason string, ready to return as a `CmdResult::Error`.
+pub(crate) fn refuse_floor_keys(profile: &ProfileFlags) -> Result<(), String> {
+    profile.validate().map_err(|error| error.to_string())?;
+    if !profile.floor_keys.is_empty() {
+        return Err("floor_keys are not supported by this engine build".to_string());
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_fax_passthrough(profile: &ProfileFlags) -> Result<(), String> {
@@ -1293,12 +1309,62 @@ impl RtcpRelay {
         }
     }
 
-    /// Relay one RTCP datagram: SRTCP-decrypt (if the ingress is secure) → SRTCP-encrypt (if the
-    /// egress is secure — [`SecureLeg`] auto-demuxes RTCP) → transmit toward the peer's RTCP address.
-    /// Drops on any (de)crypt failure — never forward garbage RTCP — and says so: the source already
-    /// passed the gate, so a drop here is [`Ingress::DroppedFromPeer`].
-    fn relay(
+    /// Gate `packet`'s source against the signalled one (RTPBleed, docs/security-and-nat.md §4
+    /// layer 2; RFC 3264) and, when admitted, [`RtcpRelay::relay_to`] `destination`. A refused source
+    /// is logged and reported as [`Ingress::Refused`], never relayed.
+    pub(crate) fn relay_gated(
         &self,
+        destination: SocketAddr,
+        packet: &RxPacket,
+        call_id: &str,
+        out: &mut Vec<Outbound>,
+    ) -> Ingress {
+        if !self.accepted_source.accepts(packet.source.ip()) {
+            self.refusals.log(
+                Refusal::UnsignalledSource,
+                RefusalContext {
+                    component: "media-pipeline rtcp",
+                    call_id,
+                    endpoint: self.ingress_endpoint,
+                    source: packet.source,
+                    expected: self.accepted_source,
+                },
+            );
+            return Ingress::Refused;
+        }
+        self.relay_to(destination, &packet.data, packet.source, call_id, out)
+    }
+
+    /// The endpoint this relay receives RTCP on.
+    pub(crate) fn ingress_endpoint(&self) -> EndpointId {
+        self.ingress_endpoint
+    }
+
+    /// The endpoint this relay transmits from.
+    pub(crate) fn egress_endpoint(&self) -> EndpointId {
+        self.egress_endpoint
+    }
+
+    /// The peer's signalled RTCP address, the destination until a latched one replaces it.
+    pub(crate) fn egress_dst(&self) -> SocketAddr {
+        self.egress_dst
+    }
+
+    /// Publish the RTCP this relay admits to the telemetry tap.
+    #[must_use]
+    pub(crate) fn with_rtcp_tap(mut self, tap: Option<flume::Sender<ObservedRtcp>>) -> Self {
+        self.rtcp_tap = tap;
+        self
+    }
+
+    /// Relay one RTCP datagram: SRTCP-decrypt (if the ingress is secure) → SRTCP-encrypt (if the
+    /// egress is secure — [`SecureLeg`] auto-demuxes RTCP) → transmit toward `destination`: the
+    /// peer's signalled RTCP address, or its latched source for a plain relay that follows its peer
+    /// (RFC 4961 symmetric RTP). Drops on any (de)crypt failure — never forward garbage RTCP — and
+    /// says so: the source already passed the gate, so a drop here is [`Ingress::DroppedFromPeer`].
+    fn relay_to(
+        &self,
+        destination: SocketAddr,
         data: &[u8],
         source: SocketAddr,
         call_id: &str,
@@ -1338,7 +1404,7 @@ impl RtcpRelay {
             self.rtcp_tap.as_ref(),
             self.ingress_endpoint,
             source,
-            self.egress_dst,
+            destination,
             plaintext,
         );
         let encrypted;
@@ -1358,7 +1424,7 @@ impl RtcpRelay {
         };
         out.push(Outbound {
             endpoint: self.egress_endpoint,
-            dst: self.egress_dst,
+            dst: destination,
             data: Bytes::copy_from_slice(payload),
         });
         Ingress::Accepted
@@ -3346,20 +3412,7 @@ impl MediaCall {
         {
             // Companion (non-muxed) RTCP on a secure-transcode leg: gate the source (RTPBleed) then
             // SRTCP-(de)crypt and relay it untranscoded toward the peer's RTCP port.
-            if !relay.accepted_source.accepts(packet.source.ip()) {
-                relay.refusals.log(
-                    Refusal::UnsignalledSource,
-                    RefusalContext {
-                        component: "media-pipeline rtcp",
-                        call_id: &self.call_id,
-                        endpoint: relay.ingress_endpoint,
-                        source: packet.source,
-                        expected: relay.accepted_source,
-                    },
-                );
-                return Ingress::Refused;
-            }
-            relay.relay(&packet.data, packet.source, &self.call_id, out)
+            relay.relay_gated(relay.egress_dst, packet, &self.call_id, out)
         } else {
             // Not one of this call's endpoints: the dispatcher routed it here by mistake, and it goes
             // nowhere.
@@ -4177,6 +4230,10 @@ pub struct MediaRegistry {
     /// the actor owns its `MediaCall` and the control path cannot read into it; the call record needs
     /// the address the pipeline actually replies to, not the one that was signalled.
     observed: Arc<DashMap<EndpointId, SocketAddr>>,
+    /// The userspace RTCP relays of kernel-relayed floor calls. Routed through this registry so the
+    /// one `media` handle the redirect dispatcher already holds reaches them; kept apart from
+    /// `calls` so a relay is never mistaken for a media actor (`is_media_call`, promotion).
+    rtcp_relays: crate::rtcp_relay::RtcpRelayRegistry,
 }
 
 /// A handle to a running media-call actor.
@@ -4205,7 +4262,13 @@ impl MediaRegistry {
     /// Whether the registry routes datagrams for `endpoint` (the dispatcher's predicate).
     #[must_use]
     pub fn owns(&self, endpoint: EndpointId) -> bool {
-        self.routes.contains_key(&endpoint)
+        self.routes.contains_key(&endpoint) || self.rtcp_relays.owns(endpoint)
+    }
+
+    /// The userspace RTCP relays of kernel-relayed floor calls.
+    #[must_use]
+    pub fn rtcp_relays(&self) -> &crate::rtcp_relay::RtcpRelayRegistry {
+        &self.rtcp_relays
     }
 
     /// Test-only: the two ingress endpoints a registered call routes. They are **equal** for an
@@ -4236,6 +4299,8 @@ impl MediaRegistry {
             if mailbox.try_send(MediaInput::Packet(packet)).is_err() {
                 tracing::trace!("media-call mailbox full or closed; dropping redirected datagram");
             }
+        } else {
+            self.rtcp_relays.dispatch(packet);
         }
     }
 
@@ -4678,7 +4743,7 @@ async fn run_media_call<D>(
 
 /// RFC 5761 demux: a datagram whose second byte's payload-type field is in `64..=95` is RTCP (never a
 /// valid RTP payload type at that offset), so the muxed RTP/RTCP flow can tell them apart.
-fn is_rtcp_datagram(data: &[u8]) -> bool {
+pub(crate) fn is_rtcp_datagram(data: &[u8]) -> bool {
     data.len() >= 2 && (64..=95).contains(&(data[1] & 0x7f))
 }
 
@@ -4711,7 +4776,7 @@ fn emit_events(
 
 /// Transmit every queued outbound datagram, draining the buffer. Send errors are logged, never
 /// propagated — a transient socket error must not stall the actor.
-async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
+pub(crate) async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
     for datagram in outbound.drain(..) {
         if let Err(error) = datapath
             .send(datagram.endpoint, datagram.dst, &datagram.data)

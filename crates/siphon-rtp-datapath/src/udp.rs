@@ -309,6 +309,23 @@ impl Inner {
                     in_stats.last_rtp_seq.store(updated_last, Ordering::Relaxed);
                 }
 
+                // RFC 3550 §6 / RFC 5761 §4: a rule that asks for it hands the RTCP it admitted to the
+                // engine instead of forwarding it, so the engine can read it (an MCPTT floor call's
+                // APP packets) and relay it itself. Placed after the gate and the latch above, so an
+                // unadmitted source never reaches the consumer; RTP is untouched.
+                if rule.rtcp_to_userspace && is_rtcp(payload) {
+                    let packet = RxPacket {
+                        endpoint,
+                        source,
+                        arrival: self.clock.load(Ordering::Relaxed).saturating_mul(20_000),
+                        data: Bytes::copy_from_slice(payload),
+                    };
+                    if self.redirect_tx.send(packet).is_err() {
+                        tracing::debug!(?endpoint, "redirect stream has no receiver");
+                    }
+                    return;
+                }
+
                 // Forward toward the peer endpoint: prefer its latched source (symmetric RTP) over
                 // its configured destination; drop if neither resolves (never forward into the void).
                 let destination = self
@@ -1472,6 +1489,7 @@ mod tests {
                     out_dst: Some(addr_b),
                     accepted_source: SourceFilter::Any,
                     latch: LatchPolicy::Off,
+                    rtcp_to_userspace: false,
                 }),
             )
             .expect("flow a");
@@ -1483,6 +1501,7 @@ mod tests {
                     out_dst: Some(addr_a),
                     accepted_source: SourceFilter::Any,
                     latch: LatchPolicy::Off,
+                    rtcp_to_userspace: false,
                 }),
             )
             .expect("flow b");
@@ -1751,6 +1770,7 @@ mod tests {
                     out_dst: Some(addr_b),
                     accepted_source: SourceFilter::Any,
                     latch: LatchPolicy::Off,
+                    rtcp_to_userspace: false,
                 }),
             )
             .expect("flow a");
@@ -2101,6 +2121,130 @@ mod tests {
         packet.extend_from_slice(&ssrc.to_be_bytes());
         packet.extend_from_slice(b"audio");
         packet
+    }
+
+    /// A minimal RTCP sender report (V=2, PT=200, RFC 3550 §6.4.1) from `ssrc`.
+    fn rtcp_sender_report(ssrc: u32) -> Vec<u8> {
+        let mut packet = vec![0x80, 200, 0x00, 0x06];
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(&[0u8; 20]);
+        packet
+    }
+
+    /// Install a near->far relay with `rtcp_to_userspace` set as asked, gated to `addr_near`.
+    fn install_relay_with_rtcp_flag(
+        datapath: &UdpLoopbackDatapath,
+        near: EndpointId,
+        far: EndpointId,
+        addr_near: SocketAddr,
+        addr_far: SocketAddr,
+        rtcp_to_userspace: bool,
+    ) {
+        let mut rule = ForwardRule::signalled(far, Some(addr_far), addr_near.ip());
+        rule.rtcp_to_userspace = rtcp_to_userspace;
+        datapath
+            .install_flow(near, FlowAction::Forward(rule))
+            .expect("relay flow");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rtcp_goes_to_the_redirect_stream_when_the_rule_asks_and_rtp_is_still_forwarded() {
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        install_relay_with_rtcp_flag(&datapath, near.id, far.id, addr_a, addr_b, true);
+        let rx = datapath.rx();
+
+        let report = rtcp_sender_report(0xA0A0_0001);
+        phone_a
+            .send_to(&report, near.local_addr)
+            .await
+            .expect("send rtcp");
+        let redirected = timeout(SHORT, rx.recv_async())
+            .await
+            .expect("the RTCP reaches the redirect stream")
+            .expect("open");
+        assert_eq!(redirected.endpoint, near.id);
+        assert_eq!(redirected.source, addr_a);
+        assert_eq!(&redirected.data[..], &report[..], "byte-identical");
+        let mut scratch = [0u8; 2048];
+        assert!(
+            timeout(NEGATIVE, phone_b.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "the backend does not also forward it: the consumer relays it"
+        );
+
+        phone_a
+            .send_to(&rtp(0xA0A0_0001, 1), near.local_addr)
+            .await
+            .expect("send rtp");
+        let (data, _) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0xA0A0_0001, 1), "RTP is still forwarded");
+        assert!(
+            timeout(NEGATIVE, rx.recv_async()).await.is_err(),
+            "and never redirected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rtcp_is_forwarded_as_before_when_the_rule_does_not_ask() {
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        install_relay_with_rtcp_flag(&datapath, near.id, far.id, addr_a, addr_b, false);
+        let rx = datapath.rx();
+
+        let report = rtcp_sender_report(0xA0A0_0001);
+        phone_a
+            .send_to(&report, near.local_addr)
+            .await
+            .expect("send rtcp");
+        let (data, _) = recv(&phone_b).await;
+        assert_eq!(data, report);
+        assert!(
+            timeout(NEGATIVE, rx.recv_async()).await.is_err(),
+            "nothing is redirected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rtcp_from_an_unadmitted_source_is_dropped_not_redirected() {
+        // RTPBleed: the gate runs before the redirect decision, so an off-path sender cannot put
+        // datagrams in front of the engine's RTCP consumer either.
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (_phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 66)).await;
+        install_relay_with_rtcp_flag(&datapath, near.id, far.id, addr_a, addr_b, true);
+        let rx = datapath.rx();
+
+        attacker
+            .send_to(&rtcp_sender_report(0xBAD0_0001), near.local_addr)
+            .await
+            .expect("send rtcp");
+        assert!(
+            timeout(NEGATIVE, rx.recv_async()).await.is_err(),
+            "an unadmitted source's RTCP is not redirected"
+        );
+        let mut scratch = [0u8; 2048];
+        assert!(
+            timeout(NEGATIVE, phone_b.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "nor forwarded"
+        );
+        assert_eq!(
+            datapath.stats(near.id).expect("stats").packets_dropped,
+            1,
+            "it is counted as dropped"
+        );
     }
 
     // The three RTPBleed checks below are the backend-agnostic ones from `crate::conformance`, which
@@ -2540,6 +2684,7 @@ mod tests {
                     out_dst: Some(addr_b),
                     accepted_source: SourceFilter::Exact(addr_a.ip()),
                     latch: LatchPolicy::SignalledOnly,
+                    rtcp_to_userspace: false,
                 }),
             )
             .expect("flow");
@@ -2680,6 +2825,7 @@ mod tests {
                     out_dst: Some(addr_b),
                     accepted_source: SourceFilter::Exact(addr_a.ip()),
                     latch: LatchPolicy::SignalledOnly,
+                    rtcp_to_userspace: false,
                 }),
             )
             .expect("flow a");
@@ -2865,6 +3011,7 @@ mod tests {
                     out_dst: Some(callee_addr),
                     accepted_source: SourceFilter::Any,
                     latch: LatchPolicy::Off,
+                    rtcp_to_userspace: false,
                 }),
             )
             .expect("flow");
@@ -3132,6 +3279,7 @@ mod tests {
                     out_dst: None,
                     accepted_source: SourceFilter::Any,
                     latch: LatchPolicy::SignalledOnly,
+                    rtcp_to_userspace: false,
                 }),
             )
             .expect("flow a");
@@ -3300,6 +3448,7 @@ mod tests {
                     out_dst: Some(addr_b),
                     accepted_source: SourceFilter::Any,
                     latch: LatchPolicy::Off,
+                    rtcp_to_userspace: false,
                 }),
             )
             .expect("flow a");

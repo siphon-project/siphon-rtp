@@ -141,6 +141,7 @@ fn bench_dispatch(criterion: &mut Criterion) {
                     out_dst: Some(far_addr),
                     accepted_source: SourceFilter::Exact(peer_addr.ip()),
                     latch: LatchPolicy::SignalledOnly,
+                    rtcp_to_userspace: false,
                 }),
             )
             .expect("forward flow");

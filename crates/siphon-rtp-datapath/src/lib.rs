@@ -195,9 +195,22 @@ pub struct ForwardRule {
     pub accepted_source: SourceFilter,
     /// Latch lifecycle for this endpoint's incoming source.
     pub latch: LatchPolicy,
+    /// Hand the RTCP this endpoint receives to the [`FlowAction::Redirect`] stream instead of
+    /// forwarding it, so the engine reads it (RFC 3550 §6) and relays it itself; RTP keeps being
+    /// forwarded by the backend. Applies only after the gate and latch above have admitted the
+    /// datagram, so traffic from an unadmitted source is never handed up. Works for RTCP on its
+    /// own port and muxed with RTP on one (RFC 5761 §4 payload-type demux). Default `false`.
+    pub rtcp_to_userspace: bool,
 }
 
 impl ForwardRule {
+    /// This rule, with RTCP handed to userspace (see [`ForwardRule::rtcp_to_userspace`]).
+    #[must_use]
+    pub fn with_rtcp_to_userspace(mut self) -> Self {
+        self.rtcp_to_userspace = true;
+        self
+    }
+
     /// The safe default: forward toward `out_endpoint`/`out_dst`, accept only media whose source IP
     /// is `expected` (the SDP-signalled peer), and latch `SignalledOnly`.
     #[must_use]
@@ -211,6 +224,7 @@ impl ForwardRule {
             out_dst,
             accepted_source: SourceFilter::Exact(expected),
             latch: LatchPolicy::SignalledOnly,
+            rtcp_to_userspace: false,
         }
     }
 
@@ -223,6 +237,7 @@ impl ForwardRule {
             out_dst,
             accepted_source: SourceFilter::Any,
             latch: LatchPolicy::Symmetric,
+            rtcp_to_userspace: false,
         }
     }
 }

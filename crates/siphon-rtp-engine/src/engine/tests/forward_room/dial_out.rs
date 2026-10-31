@@ -20,6 +20,7 @@ async fn offer_member(
         .handle(
             CLIENT,
             Command::ForwardOffer {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: tag.into(),
                 profile,
@@ -614,6 +615,7 @@ async fn a_forwarding_room_and_a_mixing_conference_do_not_share_an_id_in_either_
         .handle(
             CLIENT,
             Command::ForwardOffer {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: "mix".into(),
                 from_tag: "d".into(),
                 profile: ProfileFlags::default(),
@@ -636,6 +638,7 @@ async fn an_id_that_changed_kind_between_offer_and_answer_is_refused_and_freed()
             .handle(
                 CLIENT,
                 Command::ForwardOffer {
+                    media: siphon_rtp_proto::ForwardMedia::Translate,
                     conference_id: "late".into(),
                     from_tag: "d".into(),
                     profile: ProfileFlags::default(),
@@ -719,7 +722,7 @@ async fn node_info_advertises_dial_out_and_transcoding() {
     let CmdResult::NodeInfo { node } = engine.handle(CLIENT, Command::NodeInfo).await else {
         panic!("node_info answers a node");
     };
-    for feature in ["forward_dialout", "forward_transcode"] {
+    for feature in ["forward_dialout", "forward_transcode", "forward_preserve"] {
         assert!(
             node.features.iter().any(|name| name == feature),
             "{feature}"

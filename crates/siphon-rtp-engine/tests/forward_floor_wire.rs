@@ -93,6 +93,7 @@ async fn floor_request_is_an_event_frame_and_floor_granted_reaches_the_phone() {
     let join = Request {
         id: 1,
         command: Command::ForwardJoin {
+            media: siphon_rtp_proto::ForwardMedia::Translate,
             conference_id: "group-1".into(),
             from_tag: "a".into(),
             sdp: offer,
