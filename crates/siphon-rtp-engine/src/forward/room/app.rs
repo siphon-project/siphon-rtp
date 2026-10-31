@@ -18,11 +18,13 @@ use std::net::SocketAddr;
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_media::rtcp::{self, AppWriteError};
 use siphon_rtp_proto::RtcpAppStream;
+use siphon_rtp_srtp::srtcp_gcm::FloorMasterKey;
 
 use super::{ForwardRoom, ForwardSeatStats, Seat};
 use crate::app_events::{surface_app_to_queue, AppEventQueue, AppScope};
+use crate::floor_srtcp::{self, FloorDrop, FloorProtection};
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
-use crate::reply_latch::{OpaqueLatch, ReplyLatch};
+use crate::reply_latch::OpaqueLatch;
 
 /// The floor endpoint of a seat, as the engine resolves it from the offer.
 pub struct FloorConfig {
@@ -36,6 +38,9 @@ pub struct FloorConfig {
     /// The filter is open only because ICE decides the transport; [`ForwardRoom::ice_selected`]
     /// narrows it to the selected pair's address.
     pub ice_gated: bool,
+    /// The SRTCP master keys of the floor stream (3GPP TS 33.180 §9.4); empty leaves it in the
+    /// clear. The last protects what the room sends, the newest two are accepted.
+    pub keys: Vec<FloorMasterKey>,
 }
 
 pub(super) struct FloorStream {
@@ -45,6 +50,8 @@ pub(super) struct FloorStream {
     ice_gated: bool,
     latch: OpaqueLatch,
     refusals: RefusalLog,
+    /// `Some` once the stream is keyed: every datagram in and out is AEAD_AES_128_GCM SRTCP.
+    protection: Option<FloorProtection>,
 }
 
 impl FloorStream {
@@ -56,6 +63,7 @@ impl FloorStream {
             ice_gated: config.ice_gated,
             latch: OpaqueLatch::default(),
             refusals: RefusalLog::default(),
+            protection: FloorProtection::new(&config.keys),
         }
     }
 
@@ -66,6 +74,21 @@ impl FloorStream {
             self.accepted_source = SourceFilter::Exact(remote.ip());
         }
     }
+}
+
+/// Why [`ForwardRoom::set_floor_keys`] changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FloorKeysError {
+    /// No seat has this from-tag.
+    #[error("no seat {0} in this room")]
+    UnknownSeat(String),
+    /// The seat has no UDP floor stream to protect (none negotiated, or a data channel that DTLS
+    /// already protects).
+    #[error("{0} (no floor stream to protect)")]
+    NoFloorStream(String),
+    /// The SRTP layer refused the key set.
+    #[error("{0}")]
+    Keys(String),
 }
 
 /// Which seats a [`ForwardRoom::send_app`] addresses.
@@ -200,22 +223,34 @@ impl ForwardRoom {
         if secure_pending || ice_pending {
             return Ingress::Refused;
         }
-        // Layer 5h: learn the reply address once, never move it (RFC 3550 §8 has no SSRC to offer).
-        match floor.latch.admit(packet.source) {
-            ReplyLatch::Reject => {
-                floor.refusals.log(Refusal::NewSource, context);
+        // Layer 5h: learn the reply address once, never move it (RFC 3550 §8 has no SSRC to offer). A
+        // keyed stream authenticates first (TS 33.180 §9.4.1), so only a verified packet can latch.
+        let data = match floor_srtcp::admit(
+            &mut floor.protection,
+            &mut floor.latch,
+            &floor.refusals,
+            context,
+            packet,
+        ) {
+            Ok((data, learned)) => {
+                if let Some(destination) = learned {
+                    floor.destination = destination;
+                }
+                data
+            }
+            Err(FloorDrop::Latch) => return Ingress::Refused,
+            Err(FloorDrop::Unauthenticated) => {
+                seat.counters.floor_refused += 1;
                 return Ingress::Refused;
             }
-            ReplyLatch::Accept(Some(destination)) => floor.destination = destination,
-            ReplyLatch::Accept(None) => {}
-        }
+        };
         surface_apps(
             &self.room_id,
             &seat.tag,
             seat.app_events.as_ref(),
             &mut seat.counters,
             RtcpAppStream::Floor,
-            &packet.data,
+            data,
         );
         Ingress::Accepted
     }
@@ -227,8 +262,9 @@ impl ForwardRoom {
     /// stream has no floor control to send), minus the excepted ones. A seat that has the stream but
     /// cannot be reached yet (never sent into the void: no destination, ICE or DTLS pending) is not
     /// sent to and is named in the error; the rest are still sent. An audio-stream packet is
-    /// SRTCP-protected on a secure seat (RFC 3711 §3.4); the floor stream is plain in this build, and
-    /// is never protected.
+    /// SRTCP-protected on a secure seat (RFC 3711 §3.4) under the seat's media key. A floor packet is
+    /// protected only when the seat's floor stream is keyed, with AEAD_AES_128_GCM under the floor
+    /// keys (RFC 7714 §9.2; 3GPP TS 33.180 §9.4.1), and never with the media key.
     ///
     /// # Errors
     /// [`AppSendError`]: an invalid packet (nothing sent), an unknown single seat (nothing sent), or
@@ -287,8 +323,23 @@ impl ForwardRoom {
             )?;
             match request.stream {
                 RtcpAppStream::Floor => {
-                    if let Some(floor) = seat.floor.as_ref() {
-                        emit(floor.endpoint, floor.destination, &self.scratch[..length]);
+                    if let Some(floor) = seat.floor.as_mut() {
+                        match floor.protection.as_mut() {
+                            Some(protection) => {
+                                // TS 33.180 §9.4.1: floor RTCP to the UE is always protected.
+                                if protection
+                                    .seal(&self.scratch[..length], &mut self.secure_out)
+                                    .is_err()
+                                {
+                                    push_failure(&mut failures, &seat.tag, "SRTCP protect failed");
+                                    continue;
+                                }
+                                emit(floor.endpoint, floor.destination, &self.secure_out);
+                            }
+                            None => {
+                                emit(floor.endpoint, floor.destination, &self.scratch[..length]);
+                            }
+                        }
                     } else if let Some(channel) = seat.floor_channel.as_ref() {
                         // One binary message carrying the packet exactly as it would be on the wire.
                         let message = bytes::Bytes::copy_from_slice(&self.scratch[..length]);
@@ -328,6 +379,46 @@ impl ForwardRoom {
 }
 
 impl ForwardRoom {
+    /// Replace the floor SRTCP keys of seat `tag` (the newest two are kept, outbound uses the last).
+    /// A seat whose floor stream was in the clear becomes protected; an empty set removes the
+    /// protection. Takes effect for the next datagram in either direction.
+    ///
+    /// # Errors
+    /// [`FloorKeysError`]; the seat's keys are then unchanged.
+    pub fn set_floor_keys(
+        &mut self,
+        tag: &str,
+        keys: &[FloorMasterKey],
+    ) -> Result<(), FloorKeysError> {
+        let index = self
+            .index_of(tag)
+            .ok_or_else(|| FloorKeysError::UnknownSeat(tag.to_string()))?;
+        let floor = self.seats[index]
+            .floor
+            .as_mut()
+            .ok_or_else(|| FloorKeysError::NoFloorStream(tag.to_string()))?;
+        if keys.is_empty() {
+            floor.protection = None;
+            return Ok(());
+        }
+        match floor.protection.as_mut() {
+            Some(protection) => protection.replace_keys(keys),
+            None => FloorProtection::new(keys)
+                .map(|protection| floor.protection = Some(protection))
+                .ok_or(siphon_rtp_srtp::SrtpError::NoKeys),
+        }
+        .map_err(|error| FloorKeysError::Keys(error.to_string()))
+    }
+
+    /// The SRTCP state of seat `tag`'s floor stream for an HA snapshot: the key set in force
+    /// (oldest first) and the next outgoing index. `None` for an unkeyed or unknown seat.
+    #[must_use]
+    pub fn floor_key_state(&self, tag: &str) -> Option<(Vec<FloorMasterKey>, u32)> {
+        let index = self.index_of(tag)?;
+        let protection = self.seats[index].floor.as_ref()?.protection.as_ref()?;
+        Some((protection.keys().to_vec(), protection.send_index()))
+    }
+
     /// The floor sends [`Self::send_app`] queued for seats' data channels since the last call. The
     /// caller awaits each one (`PendingSend::wait`) so `ok` means on the wire, as for a UDP seat.
     pub fn take_pending_channel_sends(

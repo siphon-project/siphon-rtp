@@ -913,10 +913,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The near (offerer) leg's signalled text address + the negotiated T.140/RED payload types,
         // captured only when we anchored a plaintext text stream (else `None`).
         let anchored_text = info.text.as_ref().filter(|_| anchor_text);
-        let near_text_remote = anchored_text.map(|text| text.remote_rtp);
         let text_t140_payload_type = anchored_text.and_then(|text| text.t140_payload_type);
         let text_red_payload_type = anchored_text.and_then(|text| text.red_payload_type);
 
+        self.hold_offer_floor_keys(&call_id, offer_floor.near_keys);
         self.calls.insert(
             call_id.clone(),
             Call {
@@ -948,7 +948,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     remote_rtcp: Some(info.remote_rtcp),
                     advertised_ip: near_advertised,
                     text: near_text_endpoint,
-                    text_remote_rtp: near_text_remote,
+                    text_remote_rtp: anchored_text.map(|text| text.remote_rtp),
                     image: offer_image.near_image_endpoint,
                     image_remote: info.image.as_ref().map(|image| image.remote),
                     floor: offer_floor.near,

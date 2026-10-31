@@ -1,6 +1,6 @@
-//! The contract carries `set_floor_keys`, `profile.floor_keys`, `profile.key_mgmt` and
-//! `media: preserve`, but this build implements none of them: each is refused, never ignored, and
-//! nothing is allocated for the refused request.
+//! The contract carries `profile.key_mgmt` and `media: preserve`, which this build does not
+//! implement: each is refused, never ignored, and nothing is allocated for the refused request.
+//! (`floor_keys` and `set_floor_keys` are implemented; see `floor_srtcp.rs`.)
 
 use super::*;
 use siphon_rtp_proto::{FloorKey, ForwardMedia};
@@ -60,25 +60,6 @@ async fn join(
 }
 
 #[tokio::test]
-async fn set_floor_keys_is_refused_as_unsupported() {
-    let engine = Engine::new(UdpLoopbackDatapath::new());
-    for (call_id, conference_id) in [(None, Some(ROOM)), (Some("call-1"), None)] {
-        let result = engine
-            .handle(
-                CLIENT,
-                Command::SetFloorKeys {
-                    call_id: call_id.map(str::to_string),
-                    conference_id: conference_id.map(str::to_string),
-                    from_tag: "a".into(),
-                    keys: vec![floor_key()],
-                },
-            )
-            .await;
-        assert_eq!(reason(result), "unsupported command: set_floor_keys");
-    }
-}
-
-#[tokio::test]
 async fn a_preserve_room_is_refused_on_join_and_offer() {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_, audio) = phone().await;
@@ -117,16 +98,12 @@ async fn a_preserve_room_is_refused_on_join_and_offer() {
 }
 
 #[tokio::test]
-async fn floor_keys_and_key_mgmt_are_refused_on_join_and_offer() {
+async fn key_mgmt_is_refused_on_join_and_offer_even_beside_floor_keys() {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_, audio) = phone().await;
     for (profile, needle) in [
-        (secured(vec![floor_key()], None), "floor_keys"),
         (secured(vec![], Some("mikey AQAF")), "key_mgmt"),
-        (
-            secured(vec![floor_key()], Some("mikey AQAF")),
-            "not supported",
-        ),
+        (secured(vec![floor_key()], Some("mikey AQAF")), "key_mgmt"),
     ] {
         let joined = reason(join(&engine, audio, profile.clone(), ForwardMedia::Translate).await);
         assert!(joined.contains(needle), "{joined}");
@@ -150,12 +127,12 @@ async fn floor_keys_and_key_mgmt_are_refused_on_join_and_offer() {
 }
 
 #[tokio::test]
-async fn floor_keys_and_key_mgmt_are_refused_on_a_two_party_offer() {
+async fn key_mgmt_is_refused_on_a_two_party_offer() {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_, audio) = phone().await;
     for profile in [
-        secured(vec![floor_key()], None),
         secured(vec![], Some("mikey AQAF")),
+        secured(vec![floor_key()], Some("mikey AQAF")),
     ] {
         let result = engine
             .handle(
@@ -168,7 +145,7 @@ async fn floor_keys_and_key_mgmt_are_refused_on_a_two_party_offer() {
                 },
             )
             .await;
-        assert!(reason(result).contains("not supported"));
+        assert!(reason(result).contains("key_mgmt"));
     }
     assert!(engine.endpoint_calls.is_empty(), "nothing was allocated");
 }

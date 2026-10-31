@@ -4,6 +4,7 @@ use super::*;
 use crate::app_events::AppEventQueue;
 use siphon_rtp_media::rtcp::AppWriteError;
 use siphon_rtp_proto::RtcpAppStream;
+use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
 
 /// The floor endpoint of seat `index` is `100 + index`; its phone is at `192.0.2.<index>:4100`.
 fn floor_config(index: u8) -> FloorConfig {
@@ -12,6 +13,7 @@ fn floor_config(index: u8) -> FloorConfig {
         destination: address(&format!("192.0.2.{index}:4100")),
         accepted_source: SourceFilter::Exact(address(&format!("192.0.2.{index}:4100")).ip()),
         ice_gated: false,
+        keys: Vec::new(),
     }
 }
 
@@ -462,4 +464,93 @@ fn removing_a_seat_forgets_its_floor_endpoint() {
         room.ingest(&floor_rx(1, FLOOR_REQUEST.to_vec())),
         Ingress::Refused
     );
+}
+
+fn floor_master_key(mki: u32) -> FloorMasterKey {
+    FloorMasterKey::from_salt_96(mki, [0x11; 16], &[0x22; 12])
+}
+
+#[test]
+fn a_keyed_seat_sends_protected_floor_and_a_rekey_moves_the_sending_key() {
+    let (mut room, _queue) = floor_room(1);
+    assert!(room.floor_key_state("seat-1").is_none(), "unkeyed to begin");
+    room.set_floor_keys("seat-1", &[floor_master_key(1)])
+        .unwrap();
+    let (result, sent) = sent_app(
+        &mut room,
+        &AppTarget::Seat("seat-1".into()),
+        &floor_granted(),
+    );
+    result.unwrap();
+    let mut phone = SrtcpGcmContext::new(&[floor_master_key(1)]).unwrap();
+    let mut plain = Vec::new();
+    phone.unprotect(&sent[0].2, &mut plain).unwrap();
+    assert_eq!(&plain[8..12], b"MCPT");
+    assert_eq!(room.floor_key_state("seat-1").unwrap().1, 1, "next index");
+
+    room.set_floor_keys("seat-1", &[floor_master_key(1), floor_master_key(2)])
+        .unwrap();
+    let (_, sent) = sent_app(
+        &mut room,
+        &AppTarget::Seat("seat-1".into()),
+        &floor_granted(),
+    );
+    assert_eq!(sent[0].2[sent[0].2.len() - 4..], 2u32.to_be_bytes());
+    let (keys, index) = room.floor_key_state("seat-1").unwrap();
+    assert_eq!((keys.len(), index), (2, 2));
+
+    assert_eq!(
+        room.set_floor_keys("nobody", &[floor_master_key(1)]),
+        Err(FloorKeysError::UnknownSeat("nobody".into()))
+    );
+    assert!(room.set_floor_keys("seat-1", &[]).is_ok());
+    assert!(room.floor_key_state("seat-1").is_none(), "removed");
+}
+
+#[test]
+fn a_keyed_seat_refuses_plaintext_and_counts_it() {
+    let (mut room, queue) = floor_room(1);
+    room.set_floor_keys("seat-1", &[floor_master_key(1)])
+        .unwrap();
+    let plaintext = RxPacket {
+        endpoint: EndpointId(101),
+        source: address("192.0.2.1:4100"),
+        arrival: 0,
+        data: bytes::Bytes::from_static(&[
+            0x80, 0xCC, 0x00, 0x03, 0x11, 0x22, 0x33, 0x44, 0x4D, 0x43, 0x50, 0x54, 0x00, 0x02,
+            0x05, 0x00,
+        ]),
+    };
+    assert_eq!(room.ingest(&plaintext), Ingress::Refused);
+    assert!(queue.is_empty());
+    assert_eq!(room.seat_stats("seat-1").unwrap().floor_refused, 1);
+}
+
+/// Emit a protected Floor Granted for `scripts/check-floor-srtcp-tshark.sh`, which feeds it to
+/// Wireshark as an independent decoder. Ignored: it writes a file and is driven by the script.
+#[test]
+#[ignore = "driven by scripts/check-floor-srtcp-tshark.sh"]
+fn emit_protected_floor_granted_hex_for_tshark() {
+    let Ok(path) = std::env::var("FLOOR_SRTCP_HEX_OUT") else {
+        return;
+    };
+    let (mut room, _queue) = floor_room(1);
+    room.set_floor_keys("seat-1", &[floor_master_key(0x0102_0304)])
+        .unwrap();
+    let (result, sent) = sent_app(
+        &mut room,
+        &AppTarget::Seat("seat-1".into()),
+        &floor_granted(),
+    );
+    result.unwrap();
+    let hex: String = sent[0]
+        .2
+        .chunks(16)
+        .enumerate()
+        .map(|(row, chunk)| {
+            let bytes: Vec<String> = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!("{:04x}  {}\n", row * 16, bytes.join(" "))
+        })
+        .collect();
+    std::fs::write(path, hex).unwrap();
 }

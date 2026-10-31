@@ -1199,8 +1199,9 @@ own copy of Layers 2–3. Layer 1 is where it differs, and that difference is th
 A forwarding-room seat may offer `m=application <port> udp MCPTT` (3GPP TS 24.380 §14, SDP per
 TS 24.379). The engine anchors it on a **separate** `Redirect` endpoint per seat, because RTPBleed is
 per-stream and the floor stream is a full inbound surface that reaches the controller. The stream
-carries only RTCP APP packets (RFC 3550 §6.7) and is plain in this build; SRTP for the media control
-channel (TS 24.380 §13) is not implemented, so the answer never offers it.
+carries only RTCP APP packets (RFC 3550 §6.7). It is plain unless the controller keyed it (the SRTCP
+rule below); SRTP for the media control channel (TS 24.380 §13) is not implemented, so the answer
+never offers it.
 
 - **Layer 2, the same source gate as the seat's audio.** The floor endpoint is gated to the address
   the floor m-line signalled (its own `c=`, else the session one), tightened to the `received-from`
@@ -1216,6 +1217,24 @@ channel (TS 24.380 §13) is not implemented, so the answer never offers it.
   the posture Layer 5g describes for UDPTL. A NAT rebind therefore stops floor control rather than
   following it; the controller sees `forward_seat_inactive` for a seat that has gone quiet. An SSRC
   inside an APP packet is the sender's claim and is never used to move the latch.
+- **Keyed floor is SRTCP, and nothing else is accepted.** A stream keyed by `profile.floor_keys` or
+  `set_floor_keys` is `AEAD_AES_128_GCM` SRTCP (RFC 7714 §9; 3GPP TS 33.180 §9.4.1 requires RTCP
+  protection between the UE and the server, §9.4.8 fixes the profile, §9.4.7 the 4-octet MKI that
+  is the KFC-ID). A datagram is first checked by layer 2, then **authenticated**, then latched, then
+  parsed. A plaintext packet, an unknown MKI, a failed tag and a replay (RFC 3711 §3.3.2, recorded
+  only after the tag verified) are dropped, counted per seat or leg (`floor_refused`) and logged
+  through the rate-limited refusal log (a replay at `debug` only). No APP packet from an
+  unauthenticated datagram reaches the controller. The reply latch is committed only from an
+  authenticated packet, and a datagram from a source other than the pinned one is refused before it
+  is opened, so a forged datagram from the signalled host can neither pin the stream's destination
+  nor spend an anti-replay slot. Outbound floor control on a keyed stream is always protected
+  (E=1) under the newest key, never in the clear. The newest two keys are accepted
+  (`set_floor_keys` replaces the set; an unchanged key keeps its replay state and the send index
+  never moves back, because a reused (key, index) pair reuses the GCM IV, RFC 7714 §9.4). An
+  unkeyed stream behaves exactly as before. The floor keys are never used on the audio stream's
+  RTCP, which is end to end under the media key, and a floor data channel is protected by its DTLS
+  association instead. The engine applies keys; the MIKEY-SAKKE exchange (§9.4.6) belongs to the
+  controller.
 - **Never forward into the void.** `send_rtcp_app` to a seat whose floor destination is not yet known
   (no address, or the seat not open yet) is refused for that seat, never guessed.
 - **Floor messages are terminated, never relayed.** An APP packet from a seat becomes a control
@@ -1240,7 +1259,9 @@ channel (TS 24.380 §13) is not implemented, so the answer never offers it.
   stream: nothing a party sends on it reaches the other party. They are part of the leg's endpoint set,
   so call teardown, the idle sweep's liveness reading and re-offers treat them like any other stream's
   endpoint, and a re-offer never moves a floor leg's gate. APP parts in a party's audio RTCP are read
-  after the pipeline's own gate, decrypt and latch, and the compound is relayed as before.
+  after the pipeline's own gate, decrypt and latch, and the compound is relayed as before. Each
+  party's floor keys are its own: the offerer's from its `offer` profile, the answerer's from its
+  `answer` profile (`answer_local` keys its one leg); one party may be keyed and the other not.
 
 ### WebRTC data channel (floor control for a browser seat)
 
