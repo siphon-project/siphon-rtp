@@ -435,11 +435,11 @@ async fn a_floor_stream_keeps_a_call_alive_for_the_idle_sweep() {
 }
 
 #[tokio::test]
-async fn checkpoint_refuses_a_call_with_a_floor_stream() {
+async fn checkpoint_carries_a_call_with_a_floor_stream() {
     let engine = engine_with_dispatcher();
     let _events = engine.register_client(CLIENT);
     let (a, b) = (party().await, party().await);
-    floor_call(&engine, &a, &b).await;
+    let (toward_a, toward_b, _, _) = floor_call(&engine, &a, &b).await;
     let result = engine
         .handle(
             CLIENT,
@@ -449,10 +449,21 @@ async fn checkpoint_refuses_a_call_with_a_floor_stream() {
             },
         )
         .await;
-    let CmdResult::Error { reason } = result else {
-        panic!("expected a refusal");
+    let CmdResult::Checkpoint { snapshot } = result else {
+        panic!("expected a checkpoint, got {result:?}");
     };
-    assert!(reason.contains("MCPTT floor stream"), "{reason}");
+    let record = crate::ha::CallSnapshot::from_json(&snapshot).expect("parses at its version");
+    assert_eq!(record.version, crate::ha::SNAPSHOT_VERSION_FLOOR);
+    for (leg, engine_floor) in [(&record.near, toward_a), (&record.far, toward_b)] {
+        let floor = leg.floor.as_ref().expect("the floor stream is carried");
+        assert_eq!(floor.local, engine_floor, "the port the phone sends to");
+        assert_eq!(floor.fmtp.as_deref(), Some(FLOOR_FMTP));
+        assert!(floor.keys.is_empty(), "an unkeyed stream carries no keys");
+    }
+    assert_eq!(
+        record.near.floor.as_ref().unwrap().remote,
+        Some(a.floor_addr)
+    );
 }
 
 #[tokio::test]

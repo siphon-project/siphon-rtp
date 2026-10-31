@@ -11,8 +11,10 @@ use siphon_rtp_srtp::StreamRollover;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use super::snapshot_floor;
 use crate::ice::IceCredentials;
-use crate::media_pipeline::{EchoProfile, MediaCall};
+use crate::media_pipeline::{EchoProfile, MediaCall, RtcpRelay};
+use crate::rtcp_relay::{RtcpRelayCall, RtcpRelayLeg};
 use crate::sdp;
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeLeg};
 
@@ -33,6 +35,8 @@ pub(super) fn leg_snapshot(leg: &Leg) -> crate::ha::LegSnapshot {
         remote_rtp: leg.remote_rtp,
         remote_rtcp: leg.remote_rtcp,
         advertised_ip,
+        // Filled by `checkpoint`, which reads the stream's live state from the actor serving it.
+        floor: None,
     }
 }
 
@@ -196,7 +200,7 @@ pub(super) fn latch_snapshot(latch: LatchPolicy) -> crate::ha::LatchSnapshot {
 }
 
 /// Map a snapshot source-filter back to the datapath [`SourceFilter`] on restore.
-fn restore_source_filter(filter: crate::ha::SourceFilterSnapshot) -> SourceFilter {
+pub(super) fn restore_source_filter(filter: crate::ha::SourceFilterSnapshot) -> SourceFilter {
     use crate::ha::SourceFilterSnapshot;
     match filter {
         SourceFilterSnapshot::Exact(ip) => SourceFilter::Exact(ip),
@@ -279,38 +283,48 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Snapshot a call's replicable state for HA failover ([`Command::Checkpoint`]) — the opaque blob
     /// the SIP proxy stores and hands back to `restore` on a standby. Ownership-gated like `query`: a
     /// non-owner gets `unknown_call`, so it cannot even probe for a call's existence (A3 — docs §5).
-    pub(super) fn checkpoint(&self, client: ClientId, call_id: &str) -> CmdResult {
+    pub(super) async fn checkpoint(&self, client: ClientId, call_id: &str) -> CmdResult {
         // `to_snapshot` only sees the `Call`; a secure call's live SRTP rollover lives in a running
         // component — the SRTP bridge for a plain secure leg (`Srtp`), the media actor for a secure
         // *transcode* leg (`SrtpMedia`) — so the closure also hands back what that later query needs
         // (the peer's SDES key, plus the endpoint roles the bridge query maps its flow ids through).
-        let Some((snapshot, secure_ctx, refusal)) = self.owned_call(client, call_id, |call| {
-            let snapshot = call.to_snapshot();
-            // An MCPTT floor stream is terminated on engine endpoints whose gate, learned reply
-            // address and engine SSRC are not in the snapshot record, so a standby would resume the
-            // call with the floor stream silently gone. Refused, named, rather than restored without it.
-            let has_floor =
-                call.near.floor.is_some() || call.far.is_some_and(|far| far.floor.is_some());
-            let refusal = call.pipeline.checkpoint_refusal().or_else(|| {
-                has_floor.then_some(
-                    "the MCPTT floor stream is terminated on the engine and is not carried in \
-                     the snapshot record, so a standby would resume the call without it",
-                )
-            });
-            let secure_ctx = call
-                .far_remote_crypto
-                .as_ref()
-                .map(crypto_snapshot)
-                .and_then(|far_remote_crypto| match call.pipeline {
-                    PipelineKind::Srtp => Some(SecureCheckpoint::Bridge {
-                        roles: call.endpoint_roles(),
-                        far_remote_crypto,
+        let Some((snapshot, secure_ctx, refusal, floors)) =
+            self.owned_call(client, call_id, |call| {
+                let snapshot = call.to_snapshot();
+                // An MCPTT floor stream is terminated on engine endpoints and served by an actor, so its
+                // live state is read from there below. A DTLS or data-channel floor stream is refused by
+                // the pipeline kind, which cannot be restored at all.
+                let floors = [
+                    call.near.floor.map(|endpoint| {
+                        (
+                            call.from_tag.clone(),
+                            endpoint.local_addr,
+                            call.near.floor_remote,
+                        )
                     }),
-                    PipelineKind::SrtpMedia => Some(SecureCheckpoint::Media { far_remote_crypto }),
-                    _ => None,
-                });
-            (snapshot, secure_ctx, refusal)
-        }) else {
+                    call.far.and_then(|far| {
+                        let endpoint = far.floor?;
+                        Some((call.to_tag.clone()?, endpoint.local_addr, far.floor_remote))
+                    }),
+                ];
+                let refusal = call.pipeline.checkpoint_refusal();
+                let secure_ctx = call
+                    .far_remote_crypto
+                    .as_ref()
+                    .map(crypto_snapshot)
+                    .and_then(|far_remote_crypto| match call.pipeline {
+                        PipelineKind::Srtp => Some(SecureCheckpoint::Bridge {
+                            roles: call.endpoint_roles(),
+                            far_remote_crypto,
+                        }),
+                        PipelineKind::SrtpMedia => {
+                            Some(SecureCheckpoint::Media { far_remote_crypto })
+                        }
+                        _ => None,
+                    });
+                (snapshot, secure_ctx, refusal, floors)
+            })
+        else {
             return unknown_call(call_id);
         };
         // A media path the snapshot record cannot describe is refused **here**, not discovered at
@@ -337,7 +351,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (plain_call_id, call_scope) = super::scope::split(call_id);
         snapshot.call_id = plain_call_id.to_string();
         snapshot.scope = call_scope.map(str::to_owned);
-        snapshot.version = crate::ha::CallSnapshot::version_for(call_scope);
+        // Each party's floor stream, as its actor holds it now. A stream nobody serves (the answerer
+        // declined it) is not in the record, exactly as it is not on the call.
+        for (leg, floor) in [&mut snapshot.near, &mut snapshot.far]
+            .into_iter()
+            .zip(floors)
+        {
+            let Some((tag, local, remote)) = floor else {
+                continue;
+            };
+            match self.floor_snapshot(call_id, &tag, local, remote).await {
+                Ok(state) => leg.floor = state,
+                Err(reason) => {
+                    return CmdResult::Error {
+                        reason: format!("checkpoint is unsupported for this call: {reason}"),
+                    };
+                }
+            }
+        }
+        snapshot.version = crate::ha::CallSnapshot::version_for(call_scope, snapshot.has_floor());
         // For a secure call, fold in the live SRTP rollover (+ bridge flow plans, for `Srtp`). Sourced
         // from the SRTP bridge for `Srtp`, from the media actor's shared `SecureLeg` for `SrtpMedia`.
         snapshot.secure = match secure_ctx {
@@ -468,13 +500,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
         }
 
+        // A floor stream's keys and index are validated before anything is bound, so a refusal
+        // costs no port.
+        let prepared = |floor: &Option<crate::ha::FloorSnapshot>| {
+            floor.as_ref().map(snapshot_floor::prepare).transpose()
+        };
+        let floors = match (
+            prepared(&snapshot.near.floor),
+            prepared(&snapshot.far.floor),
+        ) {
+            (Ok(near), Ok(far)) => [near, far],
+            (Err(reason), _) | (_, Err(reason)) => {
+                return error_result("restore: floor stream", &reason);
+            }
+        };
         // Bind the endpoints at their exact ports (shared by every pipeline).
         let bound = match self.bind_snapshot_endpoints(&snapshot).await {
             Ok(bound) => bound,
             Err(reason) => return *reason,
         };
         // Whichever step refuses from here on, the endpoints bound above are rolled back.
-        if let Err(result) = self.restore_bound(client, snapshot, &bound) {
+        if let Err(result) = self.restore_bound(client, snapshot, &bound, floors) {
             self.free_bound(&bound).await;
             return *result;
         }
@@ -489,6 +535,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         client: ClientId,
         snapshot: crate::ha::CallSnapshot,
         bound: &[(crate::ha::EndpointRole, Endpoint)],
+        floors: [Option<snapshot_floor::PreparedFloor>; 2],
     ) -> Result<(), Box<CmdResult>> {
         use crate::ha::{EndpointRole, PipelineSnapshot};
         let role_endpoint = |role: EndpointRole| -> Option<Endpoint> {
@@ -527,8 +574,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // that uses it.
             image: None,
             image_remote: None,
-            floor: None,
-            floor_remote: None,
+            floor: role_endpoint(EndpointRole::NearFloor),
+            floor_remote: snapshot.near.floor.as_ref().and_then(|floor| floor.remote),
         };
         let far = Leg {
             rtp: far_rtp,
@@ -544,9 +591,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text_remote_rtp: None,
             image: None,
             image_remote: None,
-            floor: None,
-            floor_remote: None,
+            floor: role_endpoint(EndpointRole::FarFloor),
+            floor_remote: snapshot.far.floor.as_ref().and_then(|floor| floor.remote),
         };
+
+        // A floor stream is terminated here, not relayed: its endpoint redirects to the call-floor
+        // actor, whichever way the audio is carried (the same flow `alloc_floor_endpoint` installs).
+        for floor in [near.floor, far.floor].into_iter().flatten() {
+            if let Err(error) = self.datapath.install_flow(floor.id, FlowAction::Redirect) {
+                return Err(boxed_error_result(
+                    "restore: redirect floor endpoint",
+                    &error,
+                ));
+            }
+        }
 
         // Install the datapath flows and resolve the crypto per pipeline.
         let media = match snapshot.pipeline {
@@ -563,6 +621,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Read before the snapshot's credentials are moved into the call below.
         let restored_ice = snapshot.ice.is_some();
+        // The audio RTCP relay of a plain-relay floor call, rebuilt from the rules that hand RTCP up.
+        let rtcp_legs = restored_rtcp_relay_legs(&snapshot, &near, &media.relay_flows);
+        let tags = (snapshot.from_tag.clone(), snapshot.to_tag.clone());
+        let (near_floor, far_floor) = (near.floor, far.floor);
         self.calls.insert(
             snapshot.call_id.clone(),
             Call {
@@ -695,6 +757,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         );
         // Register the reconstructed call under the requesting (standby) client.
         self.index_new_call(&snapshot.call_id, client);
+        // The floor streams and the audio RTCP relay report to the controller that now owns the
+        // call, so they come up after it is registered.
+        let [near_prepared, far_prepared] = floors;
+        for (prepared, endpoint, tag) in [
+            (near_prepared, near_floor, Some(tags.0)),
+            (far_prepared, far_floor, tags.1),
+        ] {
+            if let (Some(prepared), Some(endpoint), Some(tag)) = (prepared, endpoint, tag) {
+                self.register_restored_floor(
+                    client,
+                    &snapshot.call_id,
+                    &tag,
+                    endpoint.id,
+                    prepared,
+                );
+            }
+        }
+        if !rtcp_legs.is_empty() {
+            self.media.rtcp_relays().register(
+                RtcpRelayCall::new(
+                    snapshot.call_id.as_str(),
+                    rtcp_legs,
+                    self.call_app_queue(&snapshot.call_id),
+                ),
+                self.datapath.clone(),
+            );
+        }
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
         // Be loud about the gap rather than let a restored ICE call look fully covered: consent
         // freshness needs the peer's credentials, which the snapshot does not carry.
@@ -731,6 +820,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 out_dst: flow.out_dst,
                 accepted_source: restore_source_filter(flow.accepted_source),
                 latch: restore_latch(flow.latch),
+                rtcp_to_userspace: flow.rtcp_to_userspace,
             });
             if let Err(error) = self.datapath.install_flow(installed_on.id, action) {
                 return Err(boxed_error_result("restore: install forward flow", &error));
@@ -968,6 +1058,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(addr) = snapshot.far.rtcp_local {
             targets.push((EndpointRole::FarRtcp, addr));
         }
+        // The floor sockets are re-bound on their ports too: the phones keep sending to them.
+        if let Some(floor) = &snapshot.near.floor {
+            targets.push((EndpointRole::NearFloor, floor.local));
+        }
+        if let Some(floor) = &snapshot.far.floor {
+            targets.push((EndpointRole::FarFloor, floor.local));
+        }
         let mut bound: Vec<(EndpointRole, Endpoint)> = Vec::new();
         for (role, addr) in targets {
             // Re-bind the exact source IP *and* port the primary used, so a call pinned to a named
@@ -1019,6 +1116,42 @@ impl RestoredMedia {
             far_codec: None,
         }
     }
+}
+
+/// The directions of the audio RTCP relay a restored plain-relay floor call needs: one per restored
+/// rule that hands RTCP up to userspace, toward the peer the rule forwards to, reporting the party
+/// whose endpoint receives it. Empty for a call without a floor stream (no rule carries the flag).
+fn restored_rtcp_relay_legs(
+    snapshot: &crate::ha::CallSnapshot,
+    near: &Leg,
+    relay_flows: &[(EndpointId, FlowAction)],
+) -> Vec<RtcpRelayLeg> {
+    relay_flows
+        .iter()
+        .filter_map(|(ingress, action)| {
+            let FlowAction::Forward(rule) = action else {
+                return None;
+            };
+            if !rule.rtcp_to_userspace {
+                return None;
+            }
+            let destination = rule.out_dst?;
+            let sender = if near.endpoint_ids().any(|id| id == *ingress) {
+                snapshot.from_tag.clone()
+            } else {
+                snapshot.to_tag.clone()?
+            };
+            Some(RtcpRelayLeg::new(
+                RtcpRelay::new(
+                    *ingress,
+                    rule.accepted_source,
+                    rule.out_endpoint,
+                    destination,
+                ),
+                sender,
+            ))
+        })
+        .collect()
 }
 
 /// The freshly-bound endpoint a snapshot `role` maps to, if the snapshot bound one.

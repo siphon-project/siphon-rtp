@@ -39,6 +39,7 @@ pub mod plain_tap;
 pub mod prompt_cache;
 pub mod recording;
 mod reply_latch;
+pub mod rtcp_relay;
 pub mod sdp;
 mod seat_gate;
 pub mod server;

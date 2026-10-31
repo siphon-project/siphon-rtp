@@ -630,6 +630,21 @@ fn forward_in_kernel(
     let new_src_ip_host = rule.out_local_ipv4; // host-order
     let new_src_port_host = u16::from_be(rule.out_src_port); // network-order -> host
 
+    // --- RTCP to userspace (RFC 3550 §6; RFC 5761 §4 demux). A flow that asks for it (an MCPTT floor
+    //     call's audio, whose APP packets the engine reads) hands the RTCP it just admitted — it has
+    //     passed the layer 1-3 gates above — to the AF_XDP socket instead of forwarding it; the
+    //     engine relays it itself and offers it to the telemetry tap. RTP keeps XDP_TX-forwarding.
+    //     Placed after the destination check so a flow with nothing to forward to still drops. ------
+    if is_rtcp && rule.rtcp_to_userspace != 0 {
+        return match XSKS.redirect(rule.redirect_queue, 0) {
+            Ok(redirect) => Ok(redirect),
+            Err(_) => {
+                account(stats_entry, |s| s.packets_dropped += 1);
+                Ok(xdp_action::XDP_DROP)
+            }
+        };
+    }
+
     // --- RTCP copy-to-userspace tap (HEP QoS export for a kernelized relay). Purely additive: the
     //     RTCP datagram still XDP_TX-forwards below exactly as before; this only mirrors a copy to
     //     userspace. Placed *after* the destination resolved (above), so — like the UDP backend's

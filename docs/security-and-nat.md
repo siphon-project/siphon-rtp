@@ -1262,6 +1262,31 @@ never offers it.
   after the pipeline's own gate, decrypt and latch, and the compound is relayed as before. Each
   party's floor keys are its own: the offerer's from its `offer` profile, the answerer's from its
   `answer` profile (`answer_local` keys its one leg); one party may be keyed and the other not.
+- **Audio RTCP of a floor call on the in-kernel relay leaves the kernel, behind the same gate.** A
+  plain-relay call that carries a floor stream installs its relay rules with `rtcp_to_userspace`: RTP
+  keeps forwarding in the backend, while an RTCP datagram (RFC 5761 §4 demux, muxed or on its own port)
+  is handed to the `Redirect` stream **only after** layers 1 to 4 admitted it, in the UDP backend's
+  `Forward` arm and in the XDP classifier alike. An unadmitted source is dropped there and never reaches
+  userspace. The consumer (`rtcp_relay`) re-checks the rule's signalled-source filter, reads the APP
+  parts (RFC 3550 §6.7), offers the datagram to the telemetry tap and relays it unchanged toward the
+  peer's latched source, else its signalled RTCP address, as the backend's own arm does. It owns no
+  latch of its own: the backend's is the one latch of the stream. The relay is registered with the call
+  and removed at its teardown, and a re-answer that drops the floor stream removes it. Secure calls are
+  not affected: their RTCP is already userspace.
+- **A floor stream survives an HA failover without reopening learning or reusing an IV.** `checkpoint`
+  reads the stream from the actor that owns it and records its gate, its reply address, its SSRC and, if
+  keyed, its keys with the outgoing SRTCP index and the highest index received per key. `restore`
+  re-binds the floor port, redirects it to the call-floor actor and registers the leg with the learn-once
+  latch **already pinned** to the recorded source: a standby never lets the first sender win the stream
+  (the RTPbleed rule), and a stream that had learned nothing learns once, as a new one does. The outgoing
+  index resumes 2^16 past the recorded one (`SEND_INDEX_MARGIN`): the primary keeps sending between the
+  checkpoint and its failure, and RFC 7714 §9.4 forbids protecting two packets under one key with one
+  index. A margin that would leave the 31-bit index space refuses the restore; the index never wraps. The
+  replay state of each key comes back closed at the highest received index (RFC 3711 §3.3.2), so the
+  phone's last packets are not accepted twice; only packets the primary consumed after the checkpoint can
+  be, once. The snapshot of a floor call carries its own version so a standby that predates this refuses
+  it instead of resuming without the stream. A DTLS or data-channel floor stream is not carried (its keys
+  come from the handshake) and the call is refused at `checkpoint`.
 
 ### WebRTC data channel (floor control for a browser seat)
 
