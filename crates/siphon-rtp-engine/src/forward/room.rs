@@ -31,11 +31,18 @@ use siphon_rtp_proto::Event;
 use siphon_rtp_srtp::leg::SecureLeg;
 
 use super::codec::RoomCodec;
+use crate::app_events::AppEventQueue;
 use crate::ingress::{Ingress, RefusalLog};
 use crate::media_pipeline::Outbound;
 use crate::reply_latch::SymmetricLatch;
 use crate::sdp::TelephoneEvent;
 use crate::seat_gate::{self, RtcpItem, SeatGate};
+
+mod app;
+
+pub(crate) use app::push_failure;
+use app::FloorStream;
+pub use app::{AppRequest, AppSendError, AppTarget, FloorConfig};
 
 /// The most seats one forwarding room holds. A group call's fan-out is one translate per receiver
 /// per packet, so the cap is a statement of what one actor is benchmarked to carry
@@ -87,6 +94,10 @@ pub struct ForwardSeatConfig {
     pub egress_ssrc: u32,
     pub initial_sequence: u16,
     pub initial_timestamp: u32,
+    /// The seat's MCPTT floor-control stream, when it offered one and the engine anchored it.
+    pub floor: Option<FloorConfig>,
+    /// Where the seat's RTCP APP events go: the queue of the controller that seated it.
+    pub app_events: Option<AppEventQueue>,
 }
 
 /// What the room counted about one seat, for logs and stats.
@@ -100,6 +111,10 @@ pub struct ForwardSeatStats {
     pub forwarded_packets: u32,
     /// Payload octets the room forwarded to the seat.
     pub forwarded_octets: u32,
+    /// RTCP APP packets read from the seat (floor stream and audio RTCP), each raised as an event.
+    pub app_events: u64,
+    /// Datagrams with APP-bearing RTCP the room could not read to the end: counted, no event.
+    pub malformed_app: u64,
 }
 
 struct Seat {
@@ -116,6 +131,10 @@ struct Seat {
     reverse_latch: SymmetricLatch,
     refusals: RefusalLog,
     translator: Translator,
+    /// The MCPTT floor-control stream, when the seat has one.
+    floor: Option<FloorStream>,
+    /// Where this seat's RTCP APP events go.
+    app_events: Option<AppEventQueue>,
     /// Reception statistics of the seat's own inbound stream, for the reception report block.
     stats: IngressStats,
     /// Middle 32 bits of the NTP timestamp of the seat's last Sender Report (our LSR), and when it
@@ -136,6 +155,15 @@ impl Seat {
             && !self.egress_destination.ip().is_unspecified()
             && self.egress_destination.port() != 0
     }
+}
+
+/// Which of a seat's endpoints a datagram arrived on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Port {
+    /// The audio endpoint (RTP and RTCP muxed).
+    Audio,
+    /// The MCPTT floor-control endpoint (RTCP APP only).
+    Floor,
 }
 
 /// What kind of RTP the armed plan forwards.
@@ -164,7 +192,7 @@ pub struct ForwardRoom {
     room_id: String,
     codec: RoomCodec,
     seats: Vec<Seat>,
-    by_endpoint: HashMap<EndpointId, usize>,
+    by_endpoint: HashMap<EndpointId, (usize, Port)>,
     /// Index of the seat being forwarded, or `None`.
     source: Option<usize>,
     /// A source change is waiting for its first forwarded packet to be announced.
@@ -228,6 +256,13 @@ impl ForwardRoom {
         self.source.map(|index| self.seats[index].tag.as_str())
     }
 
+    /// The tag of the seat that owns `endpoint` (its audio or its floor endpoint).
+    #[must_use]
+    pub fn tag_at(&self, endpoint: EndpointId) -> Option<&str> {
+        let &(index, _) = self.by_endpoint.get(&endpoint)?;
+        Some(self.seats[index].tag.as_str())
+    }
+
     /// The RTP timestamp-unit reading of a microsecond clock, at the room codec's clock rate.
     fn rtp_clock(&self, micros: u64) -> u32 {
         ((u128::from(micros) * u128::from(self.codec.clock_rate_hz())) / 1_000_000) as u32
@@ -253,7 +288,12 @@ impl ForwardRoom {
             return Err(ForwardError::DuplicateTag(config.tag));
         }
         let anchor = self.rtp_clock(now_micros);
-        self.by_endpoint.insert(config.endpoint, self.seats.len());
+        self.by_endpoint
+            .insert(config.endpoint, (self.seats.len(), Port::Audio));
+        if let Some(floor) = &config.floor {
+            self.by_endpoint
+                .insert(floor.endpoint, (self.seats.len(), Port::Floor));
+        }
         self.seats.push(Seat {
             tag: config.tag,
             endpoint: config.endpoint,
@@ -272,6 +312,8 @@ impl ForwardRoom {
                 config.initial_sequence,
                 config.initial_timestamp,
             ),
+            floor: config.floor.map(FloorStream::new),
+            app_events: config.app_events,
             stats: IngressStats::new(self.codec.clock_rate_hz()),
             last_sender_report_ntp_middle: 0,
             last_sender_report_arrival: None,
@@ -299,7 +341,12 @@ impl ForwardRoom {
         );
         self.by_endpoint.clear();
         for (position, seat) in self.seats.iter().enumerate() {
-            self.by_endpoint.insert(seat.endpoint, position);
+            self.by_endpoint
+                .insert(seat.endpoint, (position, Port::Audio));
+            if let Some(floor) = &seat.floor {
+                self.by_endpoint
+                    .insert(floor.endpoint, (position, Port::Floor));
+            }
         }
         self.plan = None;
         match self.source {
@@ -375,6 +422,9 @@ impl ForwardRoom {
         seat.reverse_latch = SymmetricLatch::default();
         seat.refusals = RefusalLog::default();
         seat.ice_pending = false;
+        if let Some(floor) = seat.floor.as_mut() {
+            floor.ice_selected(remote);
+        }
         tracing::info!(
             target: "siphon_rtp::media", room = %self.room_id, tag, %remote,
             "ICE selected a candidate pair for a forwarding seat; media path open"
@@ -405,9 +455,12 @@ impl ForwardRoom {
     /// stamps liveness, because the seat is alive and merely not talking.
     pub fn ingest(&mut self, packet: &RxPacket) -> Ingress {
         self.plan = None;
-        let Some(&index) = self.by_endpoint.get(&packet.endpoint) else {
+        let Some(&(index, port)) = self.by_endpoint.get(&packet.endpoint) else {
             return Ingress::Refused;
         };
+        if port == Port::Floor {
+            return self.ingest_floor(index, packet);
+        }
         let seat = &mut self.seats[index];
         let data = match seat_gate::admit(
             SeatGate {
@@ -437,6 +490,9 @@ impl ForwardRoom {
         // never saw (RFC 3550 §7.3: a translator rewrites reports, it does not echo them).
         if seat_gate::is_rtcp(data) {
             let egress_ssrc = seat.translator.egress_ssrc();
+            // APP parts (an MCPTT client may put floor control in its audio RTCP) go to the
+            // controller; the reports stay here.
+            app::surface_audio_apps(&self.room_id, seat, data);
             seat_gate::consume_rtcp(data, |item| match item {
                 RtcpItem::SenderReportNtp(ntp) => {
                     seat.last_sender_report_ntp_middle = ((ntp >> 16) & 0xFFFF_FFFF) as u32;

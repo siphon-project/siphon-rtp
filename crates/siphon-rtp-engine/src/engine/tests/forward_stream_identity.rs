@@ -112,3 +112,39 @@ async fn a_forward_join_answer_keeps_the_bundle_mid_of_a_browser_offer() {
         "a=group:BUNDLE must survive:\n{answer}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forward_join_answer_echoes_no_stream_identity_in_the_floor_section_either() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_listener, listener_addr) = phone().await;
+    let (_floor, floor_addr) = phone().await;
+    let offer = format!(
+        "{}m=application {} udp MCPTT\r\nc=IN IP4 {}\r\na=extmap:5 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
+         a=msid:stream-a track-floor\r\na=ssrc:{OFFERER_SSRC} cname:offerer-cname\r\n\
+         a=fmtp:MCPTT mc_queueing\r\n",
+        browser_shaped_offer(listener_addr),
+        floor_addr.port(),
+        floor_addr.ip()
+    );
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::ForwardJoin {
+                conference_id: ROOM.into(),
+                from_tag: "listener".into(),
+                sdp: offer,
+                profile: ProfileFlags {
+                    floor_fmtp: Some("mc_granted".into()),
+                    ..ProfileFlags::default()
+                },
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&answered);
+    assert_nothing_of_the_offerer(&answer);
+    assert!(
+        answer.contains("udp MCPTT") && answer.contains("a=fmtp:MCPTT mc_granted"),
+        "the floor section is still answered:\n{answer}"
+    );
+    assert!(!answer.contains("m=application 0"), "{answer}");
+}

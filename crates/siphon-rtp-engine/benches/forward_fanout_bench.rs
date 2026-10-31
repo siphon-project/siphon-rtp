@@ -55,6 +55,8 @@ fn room_of(seats: usize) -> ForwardRoom {
                 egress_ssrc: 0xE000_0000 + index as u32,
                 initial_sequence: 0,
                 initial_timestamp: 0,
+                floor: None,
+                app_events: None,
             },
             0,
         )

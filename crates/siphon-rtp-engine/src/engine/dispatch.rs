@@ -45,6 +45,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 generation,
                 sender,
                 receiver,
+                app: crate::app_events::AppEventQueue::new(
+                    crate::app_events::APP_EVENT_QUEUE_CAPACITY,
+                    self.metrics.clone(),
+                ),
             }
         });
         sink.generation = generation;
@@ -55,6 +59,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// a pipeline rather than once. `None` when the client has no registered channel.
     pub(super) fn event_sink(&self, client: ClientId) -> Option<flume::Sender<Event>> {
         self.events.get(&client).map(|sink| sink.sender.clone())
+    }
+
+    /// The `rtcp_app` queue of `client`, for a room actor that raises APP events for the life of a
+    /// seat. `None` when the client has no registered channel.
+    pub(super) fn app_event_queue(
+        &self,
+        client: ClientId,
+    ) -> Option<crate::app_events::AppEventQueue> {
+        self.events.get(&client).map(|sink| sink.app.clone())
+    }
+
+    /// The end of `client`'s `rtcp_app` queue its control connection drains alongside the ordinary
+    /// event receiver. Re-read it after the client's registration changes (a controller identity
+    /// claim): the queue itself is kept across a reconnect, like the ordinary one.
+    #[must_use]
+    pub fn app_event_receiver(&self, client: ClientId) -> Option<flume::Receiver<Event>> {
+        self.events.get(&client).map(|sink| sink.app.receiver())
     }
 
     /// Release the event-sink registration a control connection made at `generation`.
@@ -515,6 +536,30 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             command @ (Command::ForwardJoin { .. }
             | Command::ForwardLeave { .. }
             | Command::ForwardSetSource { .. }) => self.dispatch_forward(client, command).await,
+            Command::SendRtcpApp {
+                call_id,
+                conference_id,
+                from_tag,
+                except_from_tags,
+                stream,
+                ssrc,
+                name,
+                subtype,
+                payload,
+            } => {
+                self.send_rtcp_app(super::rtcp_app::AppSend {
+                    call_id,
+                    conference_id,
+                    from_tag,
+                    except_from_tags,
+                    stream,
+                    ssrc,
+                    name,
+                    subtype,
+                    payload,
+                })
+                .await
+            }
             Command::AttachWsTee {
                 call_id,
                 ws_uri,

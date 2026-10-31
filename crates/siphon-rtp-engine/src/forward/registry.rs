@@ -14,12 +14,16 @@ use dashmap::DashMap;
 
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket};
+
+use crate::media_pipeline::Outbound;
 use siphon_rtp_proto::Event;
 use siphon_rtp_srtp::leg::SecureLeg;
 use std::net::SocketAddr;
 
 use super::codec::RoomCodec;
-use super::room::{ForwardError, ForwardRoom, ForwardSeatConfig};
+use super::room::{
+    push_failure, AppRequest, AppSendError, AppTarget, ForwardError, ForwardRoom, ForwardSeatConfig,
+};
 use crate::conference::{ntp_now, send_all};
 
 /// Datagrams and control operations a room's mailbox holds before it sheds media.
@@ -28,6 +32,10 @@ const MAILBOX_CAPACITY: usize = 4096;
 /// How long a verb waits for the room actor's verdict. The actor answers between two datagrams, so
 /// this bounds a wedged room, not ordinary work.
 const VERDICT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long `send_rtcp_app` waits for the room to put a packet on the wire for every addressed
+/// seat: one datapath send per seat, so far longer than a verdict, still bounded.
+const APP_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The period of the per-seat RTCP Sender Reports (RFC 3550 §6.2 default interval, 5 s).
 pub const REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -44,6 +52,9 @@ pub enum ForwardRefusal {
     /// No such forwarding room.
     #[error("unknown forwarding room: {0}")]
     UnknownRoom(String),
+    /// The RTCP APP packet was refused, or not sent to every addressed seat.
+    #[error("{0}")]
+    App(#[from] AppSendError),
     /// The room actor is gone, or did not answer in time.
     #[error("the forwarding room did not answer within {} ms", VERDICT_TIMEOUT.as_millis())]
     NoVerdict,
@@ -65,6 +76,13 @@ pub enum ForwardControl {
         events: Option<flume::Sender<Event>>,
         reply: tokio::sync::oneshot::Sender<Result<(), ForwardError>>,
     },
+    /// Send one RTCP APP packet to the seats `target` names; the verdict goes back on `reply` once
+    /// the datapath has taken the datagram for every addressed seat.
+    SendApp {
+        target: AppTarget,
+        request: Box<AppRequest>,
+        reply: tokio::sync::oneshot::Sender<Result<(), AppSendError>>,
+    },
     /// Install a DTLS seat's key.
     AttachSecureLeg { tag: String, leg: Box<SecureLeg> },
     /// A seat's ICE agent selected a pair.
@@ -82,6 +100,8 @@ enum ForwardInput {
 struct Member {
     tag: String,
     endpoint: EndpointId,
+    /// The seat's MCPTT floor-control endpoint, when it has one.
+    floor_endpoint: Option<EndpointId>,
     /// The datapath tick the member was seated, the quiet baseline before it has sent anything.
     joined_tick: u64,
     /// Where this member's [`Event::ForwardSeatInactive`] goes: the client that seated it.
@@ -90,6 +110,15 @@ struct Member {
     /// from since, so it is not reported again. Hearing from it moves its last activity past this,
     /// which re-arms it, even between two scans.
     reported_quiet_since: Option<u64>,
+}
+
+impl Member {
+    /// Every endpoint the seat holds: audio first, then its floor stream.
+    fn endpoints(&self) -> Vec<EndpointId> {
+        let mut endpoints = vec![self.endpoint];
+        endpoints.extend(self.floor_endpoint);
+        endpoints
+    }
 }
 
 struct Handle {
@@ -153,7 +182,9 @@ impl ForwardRegistry {
         self.rooms.iter().find_map(|room| {
             room.members
                 .iter()
-                .find(|member| member.endpoint == endpoint)
+                .find(|member| {
+                    member.endpoint == endpoint || member.floor_endpoint == Some(endpoint)
+                })
                 .map(|member| (room.key().clone(), member.tag.clone()))
         })
     }
@@ -209,10 +240,12 @@ impl ForwardRegistry {
         D: Datapath + Clone + Send + 'static,
     {
         let endpoint = config.endpoint;
+        let floor_endpoint = config.floor.as_ref().map(|floor| floor.endpoint);
         let tag = config.tag.clone();
         let member = Member {
             tag: tag.clone(),
             endpoint,
+            floor_endpoint,
             joined_tick,
             events,
             reported_quiet_since: None,
@@ -266,6 +299,9 @@ impl ForwardRegistry {
             self.leave(room_id, &tag);
             return Err(refusal);
         }
+        if let Some(floor) = floor_endpoint {
+            self.routes.insert(floor, mailbox.clone());
+        }
         self.routes.insert(endpoint, mailbox);
         Ok(())
     }
@@ -283,7 +319,7 @@ impl ForwardRegistry {
     /// Unseat a member and return its endpoint to free (empty when there is no such seat). The last
     /// leave ends the room.
     pub fn leave(&self, room_id: &str, tag: &str) -> Vec<EndpointId> {
-        let (endpoint, empty) = {
+        let (endpoints, empty) = {
             let Some(mut room) = self.rooms.get_mut(room_id) else {
                 return Vec::new();
             };
@@ -296,13 +332,15 @@ impl ForwardRegistry {
                 .try_send(ForwardInput::Control(ForwardControl::Remove(
                     tag.to_string(),
                 )));
-            (member.endpoint, room.members.is_empty())
+            (member.endpoints(), room.members.is_empty())
         };
-        self.routes.remove(&endpoint);
+        for endpoint in &endpoints {
+            self.routes.remove(endpoint);
+        }
         if empty {
             self.end_room(room_id);
         }
-        vec![endpoint]
+        endpoints
     }
 
     /// Tear a whole room down, returning every seat endpoint to free.
@@ -314,8 +352,7 @@ impl ForwardRegistry {
             .mailbox
             .try_send(ForwardInput::Control(ForwardControl::Stop));
         room.task.abort();
-        let endpoints: Vec<EndpointId> =
-            room.members.iter().map(|member| member.endpoint).collect();
+        let endpoints: Vec<EndpointId> = room.members.iter().flat_map(Member::endpoints).collect();
         for endpoint in &endpoints {
             self.routes.remove(endpoint);
         }
@@ -350,6 +387,35 @@ impl ForwardRegistry {
         }
     }
 
+    /// Send one RTCP APP packet to the seats `target` names in `room_id`, and wait until the room
+    /// has put it on the wire for every addressed seat.
+    ///
+    /// # Errors
+    /// [`ForwardRefusal::UnknownRoom`], the packet or seat refusal, or the seats it could not be
+    /// sent to ([`ForwardRefusal::App`]).
+    pub async fn send_app(
+        &self,
+        room_id: &str,
+        target: AppTarget,
+        request: AppRequest,
+    ) -> Result<(), ForwardRefusal> {
+        let Some(mailbox) = self.rooms.get(room_id).map(|room| room.mailbox.clone()) else {
+            return Err(ForwardRefusal::UnknownRoom(room_id.to_string()));
+        };
+        let (reply, verdict) = tokio::sync::oneshot::channel();
+        mailbox
+            .try_send(ForwardInput::Control(ForwardControl::SendApp {
+                target,
+                request: Box::new(request),
+                reply,
+            }))
+            .map_err(|_| ForwardRefusal::NoVerdict)?;
+        match tokio::time::timeout(APP_SEND_TIMEOUT, verdict).await {
+            Ok(Ok(outcome)) => outcome.map_err(ForwardRefusal::from),
+            Ok(Err(_)) | Err(_) => Err(ForwardRefusal::NoVerdict),
+        }
+    }
+
     /// Raise [`Event::ForwardSeatInactive`] for every seat that has been quiet for `idle_ticks`,
     /// once, and re-arm a seat only after it was heard from again. Never frees a seat: a listener
     /// sends nothing for as long as others talk (3GPP TS 24.379), so silence is the controller's to
@@ -369,7 +435,12 @@ impl ForwardRegistry {
         for mut room in self.rooms.iter_mut() {
             let room_id = room.key().clone();
             for member in &mut room.members {
-                let last = last_activity(member.endpoint)
+                // Floor traffic is activity too: a seat that only ever sends floor control is alive.
+                let last = member
+                    .endpoints()
+                    .into_iter()
+                    .filter_map(&last_activity)
+                    .max()
                     .unwrap_or(0)
                     .max(member.joined_tick);
                 if now.saturating_sub(last) < idle_ticks
@@ -437,6 +508,11 @@ async fn run_forward_room<D: Datapath>(
                         }
                         let _ = reply.send(outcome);
                     }
+                    ForwardInput::Control(ForwardControl::SendApp { target, request, reply }) => {
+                        let _ = reply.send(
+                            send_app(&mut room, &datapath, &mut outbound, &target, &request).await,
+                        );
+                    }
                     ForwardInput::Control(ForwardControl::AttachSecureLeg { tag, leg }) => {
                         room.attach_secure_leg(&tag, *leg);
                     }
@@ -459,6 +535,49 @@ async fn run_forward_room<D: Datapath>(
                 send_all(&datapath, &mut outbound).await;
             }
         }
+    }
+}
+
+/// Build `request` for the seats `target` names and wait for the datapath to take every datagram.
+/// A datagram the datapath refuses is named by its seat, beside the seats the room itself could not
+/// address.
+async fn send_app<D: Datapath>(
+    room: &mut ForwardRoom,
+    datapath: &D,
+    outbound: &mut Vec<Outbound>,
+    target: &AppTarget,
+    request: &AppRequest,
+) -> Result<(), AppSendError> {
+    outbound.clear();
+    let built = room.send_app(target, request, |endpoint, dst, data| {
+        outbound.push(Outbound {
+            endpoint,
+            dst,
+            data: bytes::Bytes::copy_from_slice(data),
+        });
+    });
+    let mut failures = match built {
+        Ok(()) => String::new(),
+        Err(AppSendError::NotSent(failures)) => failures,
+        Err(other) => return Err(other),
+    };
+    for datagram in outbound.drain(..) {
+        if let Err(error) = datapath
+            .send(datagram.endpoint, datagram.dst, &datagram.data)
+            .await
+        {
+            tracing::warn!(
+                target: "siphon_rtp::media", room = room.room_id(), %error,
+                "forwarding room could not send an RTCP APP packet"
+            );
+            let tag = room.tag_at(datagram.endpoint).unwrap_or("?");
+            push_failure(&mut failures, tag, &format!("send failed: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AppSendError::NotSent(failures))
     }
 }
 

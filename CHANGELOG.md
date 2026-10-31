@@ -64,6 +64,22 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   DTLS and ICE gates) is now shared with the mixing conference. Fan-out costs about 18 ns per
   forwarded packet, allocation-free (`benches/forward_fanout_bench.rs`, `docs/cookbook/forwarding.md`).
 
+- **MCPTT floor-control stream and RTCP APP on forwarding-room seats (`send_rtcp_app`, `rtcp_app`;
+  `node_info` features `mcptt_floor`, `rtcp_app`).** An offered `m=application <port> udp MCPTT`
+  section is anchored on its own engine endpoint instead of declined, and answered with
+  `a=fmtp:MCPTT <profile.floor_fmtp>` verbatim (3GPP TS 24.380 §14.3.1; a line break in it refuses the
+  join). Every RTCP APP packet read from the floor stream or out of a seat's audio RTCP becomes one
+  `rtcp_app` event, in arrival order, and is never forwarded to another seat. The floor stream has no SSRC,
+  so it is gated by the signalled source plus a learn-once latch (`docs/security-and-nat.md` Layer 5h);
+  floor traffic counts as seat activity. `send_rtcp_app` builds the packet and sends it to one seat or
+  to every seat but `except_from_tags`, and answers `ok` only after the datapath took it for every
+  addressed seat. `rtcp_app` events travel in their own 4096-deep queue per controller that drops the
+  oldest on overflow with an `error!` and counts it in the new `statistics.rtcp_app_dropped_total`
+  (`siphon_rtp_rtcp_app_dropped_total` on `/metrics`; additive, absent from the wire when zero). The floor
+  stream is plain: media control security (TS 24.380 §13) is not negotiated. A floor message costs about
+  140 ns from the wire to its event, and a room-wide send to 500 seats about 3.5 µs, allocation-free
+  (`benches/forward_floor_bench.rs`).
+
 - **Control contract for push-to-talk forwarding rooms and RTCP APP (`siphon-rtp-proto`).** These
   are the wire types only, so a controller can build against them. The engine refuses every new verb
   by name (`unsupported command: forward_join`) until it serves it, and `node_info` advertises
@@ -71,7 +87,7 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   - Verbs: `forward_join`, `forward_offer`, `forward_answer`, `forward_leave` and
     `forward_set_source`. Like the other room verbs they take no `scope`.
   - `send_rtcp_app` is addressed by `call_id` + `from_tag`, by a room seat, or to a whole room with
-    `except_from_tags`.
+    `except_from_tags`. (A room is served; `call_id` is not yet.)
   - Events: `rtcp_app`, `forward_source_started` and `forward_seat_inactive`.
   - `profile.floor_fmtp` carries the `a=fmtp:MCPTT` parameters (3GPP TS 24.380 §14) verbatim.
   - Payloads are strict base64 (RFC 4648 §4).

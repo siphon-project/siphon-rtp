@@ -70,8 +70,61 @@ A seat's RTCP is consumed (Sender Report to LSR/DLSR, reception report blocks to
 never forwarded. Every 5 s the room sends each seat a Sender Report about the stream that seat
 receives: its fixed SSRC, the translator's packet and octet counts, and an RTP timestamp on the same
 line as the packets, so the NTP to RTP mapping is consistent. A seat that has sent the room RTP also
-gets a reception report block about it (loss, jitter, LSR and DLSR). RTCP APP packets (the TS 24.380
-floor messages) are not served yet and are consumed like the rest.
+gets a reception report block about it (loss, jitter, LSR and DLSR). RTCP APP packets are not
+relayed either: they go to the controller, see [Floor control](#floor-control-mcptt).
+
+## Floor control (MCPTT)
+
+Floor control (3GPP TS 24.380) is the controller's: the engine carries the messages and decides
+nothing. A seat that offers `m=application <port> udp MCPTT` gets that stream anchored on its own
+engine port, answered with the same transport and format and with the parameters you pass in
+`profile.floor_fmtp`:
+
+```json
+{"command":"forward_join","conference_id":"group-1","from_tag":"a7c31f","sdp":"...",
+ "profile":{"floor_fmtp":"mc_queueing;mc_priority=5;mc_granted"}}
+```
+
+The answer carries `m=application 30002 udp MCPTT` and `a=fmtp:MCPTT mc_queueing;mc_priority=5;mc_granted`,
+exactly as given. The offerer's own `a=fmtp:MCPTT` is not echoed (TS 24.380 §14.3.1 says an answer
+states the answerer's capabilities, and must not add parameters the offer lacked: declare only what you
+may). Without `floor_fmtp` the section is answered with no fmtp line. A value with a CR or LF is
+refused, and the join with it. Any other stream the engine does not carry is declined with port 0,
+including a second floor section.
+
+**Receiving.** Every RTCP APP packet that arrives on the floor stream, or inside a seat's audio RTCP,
+reaches the controller that seated it as one `rtcp_app` event, in arrival order per seat. Two APP
+packets in one datagram (TS 24.380 §8.1.1) are two events. `stream` says which stream it arrived on;
+a datagram the engine cannot read is counted and dropped, with no event.
+
+```json
+{"event":"rtcp_app","conference_id":"group-1","from_tag":"a7c31f","stream":"floor",
+ "ssrc":287454020,"name":"MCPT","subtype":0,"payload":"AAIFAA=="}
+```
+
+`rtcp_app` events have a queue of their own (4096 per controller). If a controller stops reading and
+it fills, the oldest event is dropped, logged at `error` and counted in
+`statistics.rtcp_app_dropped_total`; alert on any increase.
+
+**Sending.** `send_rtcp_app` with `conference_id` and `from_tag` sends to one seat; without `from_tag`
+it sends to every seat that has the stream, except those in `except_from_tags` (the talker, for a Floor
+Taken):
+
+```json
+{"command":"send_rtcp_app","conference_id":"group-1","stream":"floor","except_from_tags":["a7c31f"],
+ "name":"MCPT","subtype":17,"payload":"AQIAHg4GEjRWeAAA"}
+```
+
+`ok` comes back after the datapath has taken the datagram for every addressed seat. If a seat could
+not be sent to (no floor stream, the seat's path not open yet, a send failure) the answer is an error
+naming each such seat as `tag (reason)`; the others were still sent. `name` is four ASCII characters,
+`subtype` at most 31 (the TS 24.380 acknowledgement bit is the top of the five), and `payload` a
+multiple of four bytes, which the engine does not pad. With no `ssrc` the packet carries the engine's
+SSRC toward that seat, the same SSRC the seat's forwarded RTP is announced under; pass `ssrc` to
+use another (TS 24.380 §8.1.2 wants the SSRC the receiving party learnt at session establishment).
+`stream: "audio"` sends on the seat's audio endpoint (SRTCP-protected on a secure seat) instead.
+
+The floor stream is plain in this build: media control security (TS 24.380 §13) is not negotiated.
 
 ## Inactivity
 
@@ -89,7 +142,8 @@ source must be the signalled one (or the `received-from` hint, or any source for
 `symmetric` seat), media from a DTLS seat before its handshake or an ICE seat before its pair is
 selected is dropped, SRTP is checked before anything else, and the reply address follows the
 constrained SSRC latch. A secure receiver is sent SRTP under its own key. See
-[Layer 5c-ii of the security model](../security-and-nat.md).
+[Layer 5c-ii of the security model](../security-and-nat.md). The floor stream is gated the same way
+but learns its reply address once and never moves it (there is no SSRC to prove a rebind): Layer 5h.
 
 ## How far it goes
 

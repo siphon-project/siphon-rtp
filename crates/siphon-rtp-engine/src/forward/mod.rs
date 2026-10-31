@@ -17,5 +17,8 @@ pub mod registry;
 pub mod room;
 
 pub use codec::RoomCodec;
-pub use registry::{ForwardControl, ForwardRegistry};
-pub use room::{ForwardError, ForwardRoom, ForwardSeatConfig, ForwardSeatStats, MAX_SEATS};
+pub use registry::{ForwardControl, ForwardRefusal, ForwardRegistry};
+pub use room::{
+    AppRequest, AppSendError, AppTarget, FloorConfig, ForwardError, ForwardRoom, ForwardSeatConfig,
+    ForwardSeatStats, MAX_SEATS,
+};
