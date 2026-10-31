@@ -5,13 +5,13 @@ use super::*;
 use siphon_rtp_codec::factory::{self, CodecSpec};
 
 /// 8 kHz, 20 ms.
-const PCMU_FRAME: usize = 160;
+pub(super) const PCMU_FRAME: usize = 160;
 
-fn pcmu() -> CodecSpec {
+pub(super) fn pcmu() -> CodecSpec {
     CodecSpec::new(0, "PCMU", 8000, 1, 20)
 }
 
-fn pcma() -> CodecSpec {
+pub(super) fn pcma() -> CodecSpec {
     CodecSpec::new(8, "PCMA", 8000, 1, 20)
 }
 
@@ -19,12 +19,12 @@ fn g722() -> CodecSpec {
     CodecSpec::new(9, "G722", 8000, 1, 20)
 }
 
-fn opus() -> CodecSpec {
+pub(super) fn opus() -> CodecSpec {
     CodecSpec::new(111, "opus", 48_000, 2, 20)
 }
 
 /// A room whose codec is PCMU (always built, so these tests need no codec feature).
-fn pcmu_room() -> ForwardRoom {
+pub(super) fn pcmu_room() -> ForwardRoom {
     let text = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
                 m=audio 4000 RTP/AVP 0 101\r\na=rtpmap:101 telephone-event/8000\r\n";
     let offered = sdp::parse(text).unwrap().audio_codecs();
@@ -32,7 +32,7 @@ fn pcmu_room() -> ForwardRoom {
     ForwardRoom::new("group-1".to_string(), codec)
 }
 
-fn config_for(index: u8, payload_type: u8) -> ForwardSeatConfig {
+pub(super) fn config_for(index: u8, payload_type: u8) -> ForwardSeatConfig {
     ForwardSeatConfig {
         audio_payload_type: payload_type,
         ..seat_config(index)
@@ -47,11 +47,11 @@ fn with_events(mut config: ForwardSeatConfig, payload_type: u8, rate: u32) -> Fo
     config
 }
 
-fn add_same(room: &mut ForwardRoom, config: ForwardSeatConfig) {
+pub(super) fn add_same(room: &mut ForwardRoom, config: ForwardSeatConfig) {
     room.add_seat(config, 0).unwrap();
 }
 
-fn add_cross(room: &mut ForwardRoom, config: ForwardSeatConfig, spec: &CodecSpec) {
+pub(super) fn add_cross(room: &mut ForwardRoom, config: ForwardSeatConfig, spec: &CodecSpec) {
     let mut spec = spec.clone();
     spec.payload_type = config.audio_payload_type;
     room.add_cross_codec_seat(config, spec, 0).unwrap();
@@ -80,7 +80,7 @@ fn tone_payload(spec: &CodecSpec, frame_index: usize) -> Vec<u8> {
 
 /// `frames` consecutive 20 ms frames of the same tone through one encoder, so the stream is
 /// continuous the way a talker's is.
-fn tone_stream(spec: &CodecSpec, frames: usize) -> Vec<Vec<u8>> {
+pub(super) fn tone_stream(spec: &CodecSpec, frames: usize) -> Vec<Vec<u8>> {
     let mut encoder = factory::encoder_for(spec).unwrap();
     let rate = encoder.params().sample_rate_hz as usize;
     let frame = rate / 50;
@@ -100,7 +100,7 @@ fn tone_stream(spec: &CodecSpec, frames: usize) -> Vec<Vec<u8>> {
 }
 
 /// RMS of `payloads` decoded as `spec` by one decoder.
-fn decoded_rms(spec: &CodecSpec, payloads: &[Vec<u8>]) -> f64 {
+pub(super) fn decoded_rms(spec: &CodecSpec, payloads: &[Vec<u8>]) -> f64 {
     decoded_rms_after(spec, payloads, 0)
 }
 
@@ -125,7 +125,7 @@ fn decoded_rms_after(spec: &CodecSpec, payloads: &[Vec<u8>], skip: usize) -> f64
 }
 
 /// Ingest `packet` and return `(endpoint, datagram)` per receiver.
-fn fan_out(room: &mut ForwardRoom, packet: &RxPacket) -> Vec<(u64, Vec<u8>)> {
+pub(super) fn fan_out(room: &mut ForwardRoom, packet: &RxPacket) -> Vec<(u64, Vec<u8>)> {
     room.ingest(packet);
     forwarded(room, packet)
         .into_iter()
@@ -133,7 +133,7 @@ fn fan_out(room: &mut ForwardRoom, packet: &RxPacket) -> Vec<(u64, Vec<u8>)> {
         .collect()
 }
 
-fn datagram_for(sent: &[(u64, Vec<u8>)], endpoint: u64) -> &[u8] {
+pub(super) fn datagram_for(sent: &[(u64, Vec<u8>)], endpoint: u64) -> &[u8] {
     &sent
         .iter()
         .find(|(candidate, _)| *candidate == endpoint)

@@ -17,13 +17,15 @@ use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket};
 
 use crate::floor_channel::FloorChannelHandle;
 use crate::media_pipeline::Outbound;
-use siphon_rtp_proto::Event;
+use siphon_rtp_proto::{Event, ForwardMedia};
 use siphon_rtp_srtp::leg::SecureLeg;
+use siphon_rtp_srtp::srtcp_gcm::FloorMasterKey;
 use std::net::SocketAddr;
 
 use super::codec::RoomCodec;
 use super::room::{
-    push_failure, AppRequest, AppSendError, AppTarget, ForwardError, ForwardRoom, ForwardSeatConfig,
+    push_failure, AppRequest, AppSendError, AppTarget, FloorKeysError, ForwardError, ForwardRoom,
+    ForwardSeatConfig,
 };
 use crate::conference::{ntp_now, send_all};
 
@@ -56,9 +58,26 @@ pub enum ForwardRefusal {
     /// The RTCP APP packet was refused, or not sent to every addressed seat.
     #[error("{0}")]
     App(#[from] AppSendError),
+    /// The floor keys were refused (unknown seat, no floor stream, or an invalid key set).
+    #[error("{0}")]
+    FloorKeys(#[from] FloorKeysError),
     /// The room actor is gone, or did not answer in time.
     #[error("the forwarding room did not answer within {} ms", VERDICT_TIMEOUT.as_millis())]
     NoVerdict,
+}
+
+/// Why a seat asking for `asked` media is refused by a room carrying `carried`.
+#[must_use]
+pub fn media_mismatch(carried: ForwardMedia, asked: ForwardMedia) -> String {
+    let name = |media: ForwardMedia| match media {
+        ForwardMedia::Translate => "translate",
+        ForwardMedia::Preserve => "preserve",
+    };
+    format!(
+        "the room carries media: {} (fixed by its first seat) and the seat asked for media: {}",
+        name(carried),
+        name(asked)
+    )
 }
 
 /// A control operation on a room actor.
@@ -85,6 +104,12 @@ pub enum ForwardControl {
         target: AppTarget,
         request: Box<AppRequest>,
         reply: tokio::sync::oneshot::Sender<Result<(), AppSendError>>,
+    },
+    /// Replace a seat's floor SRTCP keys; the verdict goes back once the room applied them.
+    SetFloorKeys {
+        tag: String,
+        keys: Vec<FloorMasterKey>,
+        reply: tokio::sync::oneshot::Sender<Result<(), FloorKeysError>>,
     },
     /// Install a DTLS seat's key.
     AttachSecureLeg { tag: String, leg: Box<SecureLeg> },
@@ -369,6 +394,14 @@ impl ForwardRegistry {
             // first-seat racing the creation must be held to the codec that won. A transcoded seat
             // was checked against a codec, and is only taken while the room still has it.
             let admitted = match &admission {
+                // The first seat fixes the media mode as well as the codec: a seat asking for
+                // the other mode is refused, whichever of two racing first seats won.
+                Admission::RoomCodec { proposed, .. } if room.codec.media() != proposed.media() => {
+                    Err(ForwardRefusal::Codec(media_mismatch(
+                        room.codec.media(),
+                        proposed.media(),
+                    )))
+                }
                 Admission::RoomCodec { spec, .. } => room
                     .codec
                     .admit(std::slice::from_ref(*spec))
@@ -526,6 +559,34 @@ impl ForwardRegistry {
             }))
             .map_err(|_| ForwardRefusal::NoVerdict)?;
         match tokio::time::timeout(APP_SEND_TIMEOUT, verdict).await {
+            Ok(Ok(outcome)) => outcome.map_err(ForwardRefusal::from),
+            Ok(Err(_)) | Err(_) => Err(ForwardRefusal::NoVerdict),
+        }
+    }
+
+    /// Replace the floor SRTCP keys of seat `tag` in `room_id` and wait until the room applied
+    /// them: every datagram after the answer is protected (or verified) under the new set.
+    ///
+    /// # Errors
+    /// [`ForwardRefusal::UnknownRoom`], or the seat's refusal ([`ForwardRefusal::FloorKeys`]).
+    pub async fn set_floor_keys(
+        &self,
+        room_id: &str,
+        tag: &str,
+        keys: Vec<FloorMasterKey>,
+    ) -> Result<(), ForwardRefusal> {
+        let Some(mailbox) = self.rooms.get(room_id).map(|room| room.mailbox.clone()) else {
+            return Err(ForwardRefusal::UnknownRoom(room_id.to_string()));
+        };
+        let (reply, verdict) = tokio::sync::oneshot::channel();
+        mailbox
+            .try_send(ForwardInput::Control(ForwardControl::SetFloorKeys {
+                tag: tag.to_string(),
+                keys,
+                reply,
+            }))
+            .map_err(|_| ForwardRefusal::NoVerdict)?;
+        match tokio::time::timeout(VERDICT_TIMEOUT, verdict).await {
             Ok(Ok(outcome)) => outcome.map_err(ForwardRefusal::from),
             Ok(Err(_)) | Err(_) => Err(ForwardRefusal::NoVerdict),
         }
@@ -701,6 +762,9 @@ async fn run_forward_room<D: Datapath>(
                         let _ = reply.send(
                             send_app(&mut room, &datapath, &mut outbound, &target, &request).await,
                         );
+                    }
+                    ForwardInput::Control(ForwardControl::SetFloorKeys { tag, keys, reply }) => {
+                        let _ = reply.send(room.set_floor_keys(&tag, &keys));
                     }
                     ForwardInput::Control(ForwardControl::AttachSecureLeg { tag, leg }) => {
                         room.attach_secure_leg(&tag, *leg);

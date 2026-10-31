@@ -20,6 +20,7 @@ pub mod kdf;
 pub mod leg;
 pub mod sdes;
 pub mod srtcp;
+pub mod srtcp_gcm;
 
 use kdf::MASTER_SALT_LEN;
 use sdes::{Mki, SrtpKeyMaterial};
@@ -53,6 +54,16 @@ pub enum SrtpError {
     /// the MKI selects the key, so there is nothing to authenticate against).
     #[error("unknown MKI")]
     UnknownMki,
+    /// An AEAD key set was empty (RFC 7714 SRTCP needs at least one master key).
+    #[error("no keys")]
+    NoKeys,
+    /// Two keys in one AEAD key set carry the same MKI, so the MKI could not select between them.
+    #[error("duplicate MKI")]
+    DuplicateMki,
+    /// The 31-bit SRTCP index reached its last value; RFC 7714 §9.4 forbids wrapping it under the
+    /// same key, so nothing more is protected until the keys are replaced or the index reseeded.
+    #[error("SRTCP index exhausted")]
+    IndexExhausted,
 }
 
 /// Split the optional MKI field (RFC 3711 §3.1 / §3.4) off the end of `protected` — a packet with
@@ -129,6 +140,24 @@ impl ReplayWindow {
             // Older than `top` but inside the window (is_replay rejected anything below it): set its bit.
             self.mask |= 1u64 << (self.top - index);
         }
+    }
+
+    /// The highest index recorded, or `None` before any packet authenticated.
+    pub(crate) fn highest(&self) -> Option<u64> {
+        self.seen.then_some(self.top)
+    }
+
+    /// Resume after an HA failover: treat `index` and every index below it as received, so the
+    /// standby accepts only what the peer sends after the checkpointed highest (RFC 3711 §3.3.2).
+    /// What was received between the checkpoint and the failover is not known, which is why the
+    /// anchor is conservative: a few genuine packets the primary had already consumed past `index`
+    /// may be accepted once more, nothing at or below `index` ever is.
+    pub(crate) fn close_at(&mut self, index: u64) {
+        *self = Self {
+            top: index,
+            mask: u64::MAX,
+            seen: true,
+        };
     }
 
     /// Anchor the window at `index` with only that index marked received. Used when an HA standby seeds

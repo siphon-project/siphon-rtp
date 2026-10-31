@@ -24,7 +24,7 @@
 
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction, SourceFilter};
-use siphon_rtp_proto::{CmdResult, ProfileFlags};
+use siphon_rtp_proto::{CmdResult, ForwardMedia, ProfileFlags};
 
 use crate::forward::{FloorConfig, ForwardSeatConfig, RoomCodec};
 use crate::sdp::{self, TelephoneEvent};
@@ -52,6 +52,11 @@ pub(super) struct PendingForwardSeat {
     profile: ProfileFlags,
     /// The logical tick the offer was made at, the baseline its expiry is measured from.
     offered_tick: u64,
+    /// How the room the seat is offered for carries media.
+    media: ForwardMedia,
+    /// The offer's audio transport is `RTP/SAVP` (a preserve room signalling end-to-end SRTP), so
+    /// the answer must keep it (RFC 3264 §6).
+    offered_secure: bool,
 }
 
 /// What an answer negotiated for its seat.
@@ -79,6 +84,10 @@ const FALLBACK_DYNAMIC_PAYLOAD_TYPE: u8 = 104;
 /// a free dynamic one. Everything else (the AMR parameters, the `mode-set`) is the room's.
 fn room_codec_for_offer(room: &RoomCodec) -> CodecSpec {
     let mut spec = room.spec().clone();
+    if room.media() == ForwardMedia::Preserve {
+        // The packets are forwarded unchanged, so the member must read the number the talker sends.
+        return spec;
+    }
     let octet_aligned = |codec: &CodecSpec| codec.amr.is_some_and(|amr| amr.octet_aligned());
     let conventional = candidate_codecs().into_iter().find(|candidate| {
         candidate.encoding_name == spec.encoding_name
@@ -120,6 +129,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         room_id: &str,
         from_tag: String,
         profile: ProfileFlags,
+        media: ForwardMedia,
     ) -> CmdResult {
         if let Err(reason) = super::validate_sip_call_id(&profile) {
             return error_result("forward_offer", &reason);
@@ -155,6 +165,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
         let offered = match forward.room_codec(room_id) {
+            // The first seat fixed the room's media mode.
+            Some(room) if room.media() != media => {
+                return error_result(
+                    "forward_offer",
+                    &crate::forward::media_mismatch(room.media(), media),
+                );
+            }
             Some(room) => codecs_for_existing_room(&room, &profile),
             None => codecs_for_new_room(&profile),
         };
@@ -193,6 +210,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &offered,
             &events,
         );
+        // A preserve room signalling end-to-end SRTP (`key_mgmt`, RFC 4567) offers `RTP/SAVP` with no
+        // `a=crypto`: the engine holds no key, the UEs agree theirs (3GPP TS 33.180 §7.5.2).
+        let offered_secure = media == ForwardMedia::Preserve && profile.key_mgmt.is_some();
+        if offered_secure {
+            offer = offer.replacen("RTP/AVP", "RTP/SAVP", 1);
+        }
         if let Some(floor) = floor {
             offer.push_str(&sdp::floor::floor_offer_section(
                 floor.local_addr.port(),
@@ -200,6 +223,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 profile.floor_fmtp.as_deref(),
             ));
         }
+        let key_mgmt = profile.key_mgmt.clone();
         let seat = PendingForwardSeat {
             endpoint,
             floor,
@@ -207,6 +231,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             events,
             profile,
             offered_tick: self.datapath.now_ticks(),
+            media,
+            offered_secure,
         };
         // Inserted only if no concurrent offer took the key while the endpoints were allocated.
         let inserted = match self
@@ -229,6 +255,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &format!("from-tag {from_tag} already has an offer awaiting its answer"),
             );
         }
+        // The controller's `a=key-mgmt` (RFC 4567), written verbatim on the audio section.
+        let offer = sdp::apply_key_mgmt(&offer, key_mgmt.as_deref());
         ok_sdp(offer, Some(from_tag))
     }
 
@@ -331,8 +359,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if info.remote_rtp.port() == 0 {
             return Err("the answer rejected the audio stream (port 0)".to_string());
         }
-        // RFC 3264 §6: the answer keeps the offer's transport. The offer was plain RTP/AVP.
-        if info.secure || info.dtls {
+        // RFC 3264 §6: the answer keeps the offer's transport: plain RTP/AVP, or for a preserve room
+        // signalling end-to-end SRTP, RTP/SAVP with no key of the engine's to answer (a=crypto or
+        // DTLS-SRTP would make the engine terminate media the room forwards unchanged).
+        if pending.offered_secure {
+            if !info.secure || info.dtls || !info.crypto.is_empty() {
+                return Err(
+                    "the answer must be RTP/SAVP without a=crypto or DTLS-SRTP, as the offer was: \
+                     a preserve room forwards end-to-end SRTP the engine does not terminate"
+                        .to_string(),
+                );
+            }
+        } else if info.secure || info.dtls {
             return Err("the answer is secure, but the offer was RTP/AVP".to_string());
         }
         let family = AddressFamily::of(pending.endpoint.local_addr.ip());
@@ -352,7 +390,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // the room decides as it does for a join: its own codec is forwarded to untouched, another
         // is transcoded for, and the first seat fixes the codec.
         let answered = answered_codec(&info, &pending.offered)?;
-        let admission = self.forward_admission(room_id, std::slice::from_ref(&answered))?;
+        let admission =
+            self.forward_admission(room_id, std::slice::from_ref(&answered), pending.media)?;
         // The answer's event payload type, when it is one the offer listed.
         let telephone_event =
             TelephoneEvent::accompanying(&info.telephone_events(), Some(&admission.spec))
@@ -370,6 +409,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
         let remote_rtp = peer_media_address(info.remote_rtp, received_from);
+        // The seat's floor SRTCP keys are the offering profile's own (TS 33.180 §9.4).
+        let floor_keys = crate::floor_srtcp::master_keys(&pending.profile.floor_keys)
+            .map_err(|reason| format!("floor_keys: {reason}"))?;
         // The floor stream, when the answer accepts it (a port, not 0) in the seat's address family.
         let floor = pending
             .floor
@@ -382,6 +424,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     destination,
                     accepted_source: gate(destination),
                     ice_gated: false,
+                    keys: floor_keys,
                 }
             });
         Ok(Negotiated {

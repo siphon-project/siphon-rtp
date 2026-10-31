@@ -146,11 +146,20 @@ fn supported_features() -> Vec<String> {
         // encode once per codec group), where it used to be refused. A controller gates seating
         // mixed-codec members on this entry.
         "forward_transcode".to_string(),
+        // `media: preserve` on `forward_join` / `forward_offer`: the talker's RTP and audio SRTCP are
+        // forwarded byte for byte, so end-to-end SRTP (3GPP TS 33.180 §7.5.2) survives, and
+        // `profile.key_mgmt` is written as `a=key-mgmt` on the audio section. A controller gates
+        // secured MCPTT media on this entry.
+        "forward_preserve".to_string(),
         // The MCPTT floor-control stream (`m=application <port> udp MCPTT`, 3GPP TS 24.380) is
         // anchored on a forwarding-room seat, and RTCP APP packets travel both ways as
         // `send_rtcp_app` / `rtcp_app`. Controllers gate floor control on these entries.
         "mcptt_floor".to_string(),
         "rtcp_app".to_string(),
+        // The floor stream is protected with AEAD_AES_128_GCM SRTCP (3GPP TS 33.180 §9.4) under the
+        // `floor_keys` of the profile and `set_floor_keys`. Controllers gate keyed floor control on
+        // this entry.
+        "floor_srtcp".to_string(),
         // A browser seat's floor control runs over a WebRTC data channel labelled `mcptt-floor`
         // (`m=application … UDP/DTLS/SCTP webrtc-datachannel`, RFC 8841), because a browser cannot
         // send RTCP APP. The same `rtcp_app` / `send_rtcp_app` carry it. A controller gates offering

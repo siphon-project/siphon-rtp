@@ -130,14 +130,48 @@ seat arrives:
   timestamps and durations rescaled when its clock differs from the source's (RFC 4733 §2.3). A receiver
   that did not negotiate it is not sent it.
 
+### Lost source packets
+
+Inside one source run the room follows the RTP sequence numbers (RFC 3550 §5.1). When up to 120 ms of
+consecutive audio packets are missing and the timestamp advanced by exactly the missing frames, the
+decoder fed by the source conceals one frame per missing packet and every transcoded receiver is sent
+it, so it hears a concealed frame instead of a gap, with sequence numbers and timestamps continuous on
+its own stream. The concealed frame is encoded once per group, like a packet. For a cross-codec source
+the room-codec seats are sent it too, because the stream they hear is the transcoder's.
+
+* G.711 conceals with ITU-T G.711 Appendix I: the last pitch period is replayed, at full level for 10 ms,
+  then faded by 20 % per 10 ms and muted after 60 ms, and the first good frame is cross-faded in. (The
+  Appendix delays its output by 3.75 ms to smooth the start; a relay cannot hold samples back, so the
+  start is joined with a fading offset instead.) AMR-WB and Opus use their own concealment.
+* **AMR-NB has no concealment** (3GPP TS 26.091 is not ported): its concealed frame is silence.
+* A seat that is sent the source's packets as they came is not given a synthesized frame: it sees the
+  gap, as a same-codec seat always did, and its own decoder conceals. The same goes for a gap longer than
+  120 ms, a talk-spurt start (marker bit) and a silence-suppression gap (the timestamps advanced by more
+  than the missing frames); those are left as they are. Late and duplicate packets are not concealed
+  around.
+* Counted in the transcoder's `concealed` and `conceal_failed`.
+
+### Codec mode requests
+
+A cross-codec AMR or AMR-WB seat's Codec Mode Request (RFC 4867 §4.3.1) is read from the payloads the seat
+itself sends, whether or not it is talking, and caps the mode the room encodes for it: CMR 15 withdraws
+the request, and a request for a mode outside the seat's negotiated `mode-set` is ignored (§4.3.1), so a
+mode the seat did not negotiate is never sent (§8.1). Codec groups are keyed by codec **and** mode
+ceiling: seats with the same request share an encoder, a seat whose request changes moves to the group of
+its new ceiling (created on demand), and a group its last seat left is dropped. Each group costs one
+encode per packet, so a room whose seats ask for `n` different modes pays `n` encodes. A new group's
+encoder starts without history, so the seat hears one short re-convergence when its request changes.
+
+A seat that asked for nothing, in the same codec as the talker, is still sent the talker's packets as
+they came and so cannot be steered: their mode is the talker's. A seat that asked for a ceiling is
+re-encoded instead. Codecs without a mode request (G.711, Opus and the rest) have nothing to read.
+
 Limits, all explicit: the seat's packetization interval must equal the room's, so one inbound packet
 maps to one outbound packet (a seat offering another interval is refused with the reason, and a packet
 whose decoded length is not the negotiated frame is dropped and counted in the source's
-`transcode_dropped`, never re-framed: the room has no jitter buffer); there is no loss concealment, so
-a lost source packet is a gap at every receiver, as it is for a same-codec seat; a receiver's codec mode
-request (RFC 4867 CMR) is not applied, since one encoder output serves a whole group. The DSP is a few
-microseconds per frame and runs inline; nothing is allocated per packet (a counting-allocator test holds
-that), except that rebuilding the decoder at a source change allocates once per talk spurt.
+`transcode_dropped`, never re-framed: the room has no jitter buffer). The DSP is a few microseconds per
+frame and runs inline; nothing is allocated per packet, concealment included (a counting-allocator test
+holds that), except that rebuilding the decoder at a source change allocates once per talk spurt.
 
 ## RTCP
 
@@ -236,7 +270,8 @@ browser is an error until it has opened `mcptt-floor`, so wait for your own `ono
 
 The browser's audio is Opus (or whatever it negotiated) and crosses codecs like any other seat's; an
 Opus seat in an AMR-WB room needs a build with the `amr` feature. The two-party `offer` / `answer` pair
-does not answer a data channel yet. `scripts/check-floor-channel-chrome.sh` drives the whole flow from headless Chrome (CI runs it);
+answers the channel for a browser caller toward a plain callee (see the JSON reference).
+`scripts/check-floor-channel-chrome.sh` drives the whole flow from headless Chrome (CI runs it);
 acceptance in your own browser and controller is still yours.
 
 ### Two-party calls
@@ -277,6 +312,36 @@ client that seated it as a `media_timeout` (`no_media`, empty `call_id`, `confer
 event per seat), then the room and every endpoint are freed. A live group cannot trip it: receivers send
 RTCP receiver reports (RFC 3550 §6.2), so a room that has heard from none of them for an hour has no
 members left. Seats pending their answer are not counted, and a single seat is still never reaped.
+
+## Preserve rooms (end-to-end SRTP)
+
+MCPTT media is SRTP between the UEs, keyed with PCK/GMK and signalled with `a=key-mgmt:mikey`
+(3GPP TS 33.180 §7.5.2 NOTE 3). SRTP authenticates the SSRC and sequence number, so the translator above
+would break it. Create the room with `"media": "preserve"` on `forward_join` / `forward_offer` and the
+engine hands the talker's datagrams on byte for byte (RFC 3550 §7.1): same SSRC, sequence number,
+timestamp, payload and auth tag at every receiver, no translator, no SRTP re-protect, no transcoding.
+The first seat fixes the mode; a later join or offer in the other mode is refused.
+
+- Seats are `RTP/SAVP` (or `RTP/AVP`) **without** `a=crypto`; the answer keeps the transport. A seat that
+  offers `a=crypto` or DTLS-SRTP (WebRTC) is refused: the engine must not terminate end-to-end media.
+- All seats use one codec **and one payload type** (the packets are not rewritten); a mixed-codec seat is
+  refused with "preserve rooms forward the talker's packets unchanged".
+- Put the keying in the profile: `"key_mgmt": "mikey ..."` is written as `a=key-mgmt:mikey ...` on the
+  audio section of every SDP the engine produces (join answers, `forward_offer` offers, and the two-party
+  verbs). The engine never copies the offerer's line, never invents one and never drops yours. A
+  `forward_offer` into a preserve room with `key_mgmt` offers `RTP/SAVP`, and the member must answer
+  `RTP/SAVP` without `a=crypto`. `key_mgmt` is refused in a translate room (the translator would break the end-to-end SRTP it sets up), so a secured group call needs `media: preserve`.
+- RTCP: no engine SR, RR or BYE toward any seat, at room start or later. The talker's audio SRTCP is
+  forwarded byte for byte with its RTP; receivers' audio RTCP is dropped (`receiver_rtcp_dropped`). The
+  engine cannot read SRTCP, so RTCP APP is surfaced from the floor stream only.
+- `forward_set_source`, `forward_source_started` (once per switch), `forward_seat_inactive` and the idle
+  backstop behave as in a translating room. `node_info` lists `forward_preserve`.
+- Fan-out is a copy-free loop over the receivers. `cargo bench -p siphon-rtp --bench forward_fanout_bench`
+  has `per_inbound_packet_preserve` beside `per_inbound_packet`.
+
+The engine cannot verify the SRTP tag in a preserve room (it has no key), so the source-address gate and
+the controller's choice of source are what bound who can send: see
+[the security model](../security-and-nat.md) (preserve rooms).
 
 ## Security and NAT
 

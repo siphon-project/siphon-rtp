@@ -3,7 +3,9 @@
 //! plain relay, and the RFC 4103 text stream.
 
 use siphon_rtp_codec::factory::CodecSpec;
-use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, IceAgentMode, IceConfig, LatchPolicy};
+use siphon_rtp_datapath::{
+    Datapath, EndpointId, FlowAction, ForwardRule, IceAgentMode, IceConfig, LatchPolicy,
+};
 use siphon_rtp_dtls::DtlsRole;
 use siphon_rtp_proto::{CmdResult, Event, ProfileFlags};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
@@ -13,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ice::IceCredentials;
 use crate::media_pipeline::{DirectionConfig, EchoProfile, MediaCall, RtcpRelay};
+use crate::rtcp_relay::{RtcpRelayCall, RtcpRelayLeg};
 use crate::sdp;
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeLeg};
 use crate::text_pipeline::{TextCall, TextDirectionConfig};
@@ -71,6 +74,9 @@ pub(super) struct AnswerWiring<'a> {
     /// A terminated DTLS-SRTP offerer: A's fingerprint, which the handshake verifies, and the role
     /// the engine answered A with. `None` unless the call is a [`PipelineKind::DtlsOfferer`].
     pub(super) near_dtls: Option<(&'a sdp::Fingerprint, DtlsRole)>,
+    /// The terminated DTLS offerer bundled a WebRTC data channel with its audio and the engine
+    /// answered it: A's MCPTT floor rides it (`NearDtls`).
+    pub(super) near_data_channel: bool,
     /// Endpoints a full ICE agent runs on; a DTLS handshake waits for a selection only on those.
     pub(super) agent_endpoints: &'a [EndpointId],
 }
@@ -685,6 +691,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         wiring: &AnswerWiring<'_>,
     ) -> Result<Vec<(EndpointId, FlowAction)>, Box<CmdResult>> {
         let AnswerWiring {
+            call_id,
+            from_tag,
+            to_tag,
             profile,
             near,
             far,
@@ -700,54 +709,132 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_ice,
             ..
         } = *wiring;
+        // A call that carries an MCPTT floor stream has its audio RTCP read in userspace (RFC 3550
+        // §6.7: a client's floor control rides APP packets in it, 3GPP TS 24.380 §8), while RTP
+        // stays on the in-kernel relay. The flag goes on the rules that receive the RTCP: the
+        // companion RTCP endpoints, or the RTP endpoints when RTCP is muxed with RTP (RFC 5761).
+        let floor_call = near.floor.is_some() || far.floor.is_some();
+        let muxed = near.rtcp.is_none() || far.rtcp.is_none();
+        let rtcp_rule = |rule: ForwardRule| {
+            if floor_call {
+                rule.with_rtcp_to_userspace()
+            } else {
+                rule
+            }
+        };
         let mut relay_flows = Vec::new();
-        let near_action = FlowAction::Forward(ingress_rule(
+        let mut rtcp_legs = Vec::new();
+        let near_rule = ingress_rule(
             far.rtp.id,
             Some(far_media_dst),
             near_gate_rtp,
             profile,
             near_ice,
-        ));
+        );
+        let near_rule = if muxed {
+            rtcp_rule(near_rule)
+        } else {
+            near_rule
+        };
+        let near_action = FlowAction::Forward(near_rule);
         if let Err(error) = self.datapath.install_flow(near.rtp.id, near_action) {
             return Err(boxed_error_result("install near->far RTP flow", &error));
         }
         relay_flows.push((near.rtp.id, near_action));
-        let far_action = FlowAction::Forward(ingress_rule(
+        let far_rule = ingress_rule(
             near.rtp.id,
             near_media_dst,
             Some(far_gate_rtp),
             profile,
             far_ice,
-        ));
+        );
+        let far_rule = if muxed { rtcp_rule(far_rule) } else { far_rule };
+        let far_action = FlowAction::Forward(far_rule);
         if let Err(error) = self.datapath.install_flow(far.rtp.id, far_action) {
             return Err(boxed_error_result("install far->near RTP flow", &error));
         }
         relay_flows.push((far.rtp.id, far_action));
+        if muxed && floor_call {
+            rtcp_legs.push(RtcpRelayLeg::new(
+                RtcpRelay::new(
+                    near.rtp.id,
+                    near_rule.accepted_source,
+                    far.rtp.id,
+                    far_media_dst,
+                ),
+                from_tag,
+            ));
+            if let Some(egress_dst) = near_media_dst {
+                rtcp_legs.push(RtcpRelayLeg::new(
+                    RtcpRelay::new(
+                        far.rtp.id,
+                        far_rule.accepted_source,
+                        near.rtp.id,
+                        egress_dst,
+                    ),
+                    to_tag,
+                ));
+            }
+        }
 
         // Companion RTCP relay when not muxed. (Under mux, RTCP rides the RTP endpoints already.)
         if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
-            let near_rtcp_action = FlowAction::Forward(ingress_rule(
+            let near_rtcp_rule = rtcp_rule(ingress_rule(
                 far_rtcp.id,
                 Some(far_rtcp_dst),
                 near_gate_rtcp,
                 profile,
                 near_ice,
             ));
+            let near_rtcp_action = FlowAction::Forward(near_rtcp_rule);
             if let Err(error) = self.datapath.install_flow(near_rtcp.id, near_rtcp_action) {
                 return Err(boxed_error_result("install near->far RTCP flow", &error));
             }
             relay_flows.push((near_rtcp.id, near_rtcp_action));
-            let far_rtcp_action = FlowAction::Forward(ingress_rule(
+            let far_rtcp_rule = rtcp_rule(ingress_rule(
                 near_rtcp.id,
                 near_rtcp_dst,
                 Some(far_gate_rtcp),
                 profile,
                 far_ice,
             ));
+            let far_rtcp_action = FlowAction::Forward(far_rtcp_rule);
             if let Err(error) = self.datapath.install_flow(far_rtcp.id, far_rtcp_action) {
                 return Err(boxed_error_result("install far->near RTCP flow", &error));
             }
             relay_flows.push((far_rtcp.id, far_rtcp_action));
+            if floor_call {
+                rtcp_legs.push(RtcpRelayLeg::new(
+                    RtcpRelay::new(
+                        near_rtcp.id,
+                        near_rtcp_rule.accepted_source,
+                        far_rtcp.id,
+                        far_rtcp_dst,
+                    ),
+                    from_tag,
+                ));
+                if let Some(egress_dst) = near_rtcp_dst {
+                    rtcp_legs.push(RtcpRelayLeg::new(
+                        RtcpRelay::new(
+                            far_rtcp.id,
+                            far_rtcp_rule.accepted_source,
+                            near_rtcp.id,
+                            egress_dst,
+                        ),
+                        to_tag,
+                    ));
+                }
+            }
+        }
+        // The consumer of the RTCP those rules hand up. A re-answer replaces it; a call that no
+        // longer carries a floor stream drops the one it had.
+        if floor_call {
+            self.media.rtcp_relays().register(
+                RtcpRelayCall::new(call_id, rtcp_legs, self.call_app_queue(call_id)),
+                self.datapath.clone(),
+            );
+        } else {
+            self.media.rtcp_relays().deregister(call_id);
         }
         Ok(relay_flows)
     }

@@ -22,6 +22,7 @@ mod data_channel;
 mod decline;
 mod direction;
 pub(crate) mod floor;
+mod key_mgmt;
 mod offer;
 mod stream_identity;
 pub use offer::conference_seat_offer;
@@ -29,7 +30,8 @@ pub use offer::conference_seat_offer;
 pub(crate) use amr::offered as offered_amr;
 pub use amr::{set_policy as set_amr_policy, AmrFmtp, AmrPolicy};
 pub use data_channel::{
-    anchor_data_channel, parse_data_channel, DataChannelMedia, DATA_CHANNEL_SCTP_PORT,
+    anchor_data_channel, answer_terminated_data_channel, decline_data_channels, parse_data_channel,
+    DataChannelMedia, DATA_CHANNEL_SCTP_PORT,
 };
 pub use decline::{
     decline_unanswered_media, decline_unanswered_streams, decline_unanswered_with_data_channel,
@@ -39,6 +41,7 @@ pub use floor::{
     anchor_floor, decline_floor, parse_floor, validate_floor_fmtp, FloorFmtpError, FloorMediaInfo,
     FloorRewrite,
 };
+pub use key_mgmt::{apply_key_mgmt, terminates_keying};
 pub use stream_identity::{own_stream_identity, OwnSsrc};
 mod telephone_event;
 pub use telephone_event::TelephoneEvent;

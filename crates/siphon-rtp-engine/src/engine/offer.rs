@@ -16,7 +16,7 @@ use super::negotiate::{
 };
 use super::takeover::{ws_takeover_media_address, WsBridgeProcessing, WsBridgeSetup};
 use super::{
-    error_result, ok_sdp, unknown_call, Call, CallerMediaLeg, ClientId, Engine, Leg, PipelineKind,
+    error_result, unknown_call, Call, CallerMediaLeg, ClientId, Engine, Leg, PipelineKind,
 };
 
 /// The transport the **far** leg presents when the engine terminates a secure *offerer*.
@@ -162,6 +162,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 }
 
+/// A terminated DTLS offerer's WebRTC data channel carries its MCPTT floor; remember its mids.
+fn with_data_channel(near_dtls: Option<super::NearDtls>, offer: &str) -> Option<super::NearDtls> {
+    near_dtls.map(|mut keying| {
+        keying.data_channel =
+            sdp::parse_data_channel(offer).map(|channel| (channel.audio_mid, channel.mid));
+        keying
+    })
+}
+
+/// The data channel of a terminated DTLS offerer is answered to A by the engine (`answer`, when it is
+/// bundled with A's audio); B is a plain party and gets the section declined, never A's address.
+fn decline_terminated_data_channel(offer_to_far: String, terminated: bool) -> String {
+    if terminated {
+        sdp::decline_data_channels(&offer_to_far)
+    } else {
+        offer_to_far
+    }
+}
+
 /// The transport security an offer settles for both legs.
 struct OfferSecurity {
     /// `dtls: off` forced the far leg to plaintext `RTP/AVP`.
@@ -188,6 +207,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         profile: &ProfileFlags,
         info: &sdp::MediaInfo,
+        offer: &str,
     ) -> Result<OfferSecurity, Box<CmdResult>> {
         // Secure far leg: when the control profile asks for a secure far leg, either DTLS-SRTP
         // (`UDP/TLS/RTP/SAVP[F]`, RFC 5764) — advertise the engine's fingerprint + `a=setup` role,
@@ -317,6 +337,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     peer_tls_id: info.tls_id.clone(),
                     role: None,
                     local_tls_id: None,
+                    // Filled in by `offer`, which holds the offer text.
+                    data_channel: None,
                 })
             } else {
                 None
@@ -342,7 +364,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_local_crypto,
             near_remote_crypto,
             far_dtls_presentation,
-            near_dtls,
+            near_dtls: with_data_channel(near_dtls, offer),
         })
     }
 }
@@ -675,7 +697,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_remote_crypto,
             far_dtls_presentation,
             near_dtls,
-        } = match self.offer_security(profile, &info) {
+        } = match self.offer_security(profile, &info, sdp) {
             Ok(security) => security,
             Err(result) => return *result,
         };
@@ -815,7 +837,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &profile.replace,
             &call_id,
         ) {
-            Ok(rewritten) => rewritten,
+            Ok(rewritten) => decline_terminated_data_channel(rewritten, near_dtls.is_some()),
             Err(error) => {
                 self.free(&endpoints).await;
                 return CmdResult::Error {
@@ -891,10 +913,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The near (offerer) leg's signalled text address + the negotiated T.140/RED payload types,
         // captured only when we anchored a plaintext text stream (else `None`).
         let anchored_text = info.text.as_ref().filter(|_| anchor_text);
-        let near_text_remote = anchored_text.map(|text| text.remote_rtp);
         let text_t140_payload_type = anchored_text.and_then(|text| text.t140_payload_type);
         let text_red_payload_type = anchored_text.and_then(|text| text.red_payload_type);
 
+        self.hold_offer_floor_keys(&call_id, offer_floor.near_keys);
         self.calls.insert(
             call_id.clone(),
             Call {
@@ -926,7 +948,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     remote_rtcp: Some(info.remote_rtcp),
                     advertised_ip: near_advertised,
                     text: near_text_endpoint,
-                    text_remote_rtp: near_text_remote,
+                    text_remote_rtp: anchored_text.map(|text| text.remote_rtp),
                     image: offer_image.near_image_endpoint,
                     image_remote: info.image.as_ref().map(|image| image.remote),
                     floor: offer_floor.near,
@@ -1031,7 +1053,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        ok_sdp(rewritten, None)
+        self.ok_sdp_keyed(&call_id, rewritten, None, profile).await
     }
 }
 

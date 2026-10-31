@@ -51,11 +51,15 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 const SEATS: usize = 100;
 
 fn room() -> ForwardRoom {
+    room_with(siphon_rtp_proto::ForwardMedia::Translate)
+}
+
+fn room_with(media: siphon_rtp_proto::ForwardMedia) -> ForwardRoom {
     let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
                  m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
     let codecs = sdp::parse(offer).unwrap().audio_codecs();
     let (codec, _) = RoomCodec::from_offer(&codecs).unwrap();
-    let mut room = ForwardRoom::new("zero-alloc".to_string(), codec);
+    let mut room = ForwardRoom::new("zero-alloc".to_string(), codec.with_media(media));
     for index in 0..SEATS {
         room.add_seat(
             ForwardSeatConfig {
@@ -175,6 +179,36 @@ fn ingest_and_fan_out_make_no_heap_allocation() {
 }
 
 #[test]
+fn a_preserving_rooms_fan_out_makes_no_heap_allocation_and_forwards_the_same_buffer() {
+    let mut room = room_with(siphon_rtp_proto::ForwardMedia::Preserve);
+    let packets: Vec<RxPacket> = (1..=64).map(|sequence| packet(0, sequence)).collect();
+    room.set_source(Some("seat-0")).unwrap();
+    room.ingest(&packets[0]);
+    while room.next_datagram(&packets[0]).is_some() {}
+    room.drain_events().for_each(drop);
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut forwarded = 0usize;
+    for _ in 0..200 {
+        for packet in &packets {
+            room.ingest(packet);
+            while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                // The datagram lent out is the very buffer that arrived: nothing was copied.
+                assert!(std::ptr::eq(datagram.as_ptr(), packet.data.as_ptr()));
+                forwarded += std::hint::black_box(datagram).len();
+            }
+        }
+    }
+    let steady = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(forwarded > 0);
+    assert_eq!(
+        steady, 0,
+        "preserve fan-out allocated {steady} times (must be zero)"
+    );
+}
+
+#[test]
 fn a_room_wide_rtcp_app_send_makes_no_heap_allocation() {
     // The send path writes every seat's datagram into the room's own scratch and lends it out.
     let mut room = {
@@ -209,6 +243,7 @@ fn a_room_wide_rtcp_app_send_makes_no_heap_allocation() {
                         .unwrap(),
                     accepted_source: SourceFilter::Any,
                     ice_gated: false,
+                    keys: Vec::new(),
                 }),
                 app_events: None,
             },

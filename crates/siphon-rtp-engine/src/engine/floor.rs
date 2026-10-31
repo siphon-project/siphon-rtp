@@ -14,6 +14,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction};
 use siphon_rtp_proto::ProfileFlags;
+use siphon_rtp_srtp::srtcp_gcm::FloorMasterKey;
 
 use crate::call_floor::CallFloorLeg;
 use crate::floor_channel::{
@@ -42,6 +43,8 @@ pub(super) struct OfferFloor {
     pub(super) far: Option<Endpoint>,
     /// A's signalled floor address.
     pub(super) near_remote: Option<SocketAddr>,
+    /// The offerer's floor SRTCP keys from its own profile, held until the answer registers its leg.
+    pub(super) near_keys: Vec<FloorMasterKey>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -50,6 +53,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     pub(super) fn call_app_queue(&self, call_id: &str) -> Option<crate::app_events::AppEventQueue> {
         let owner = self.owned_call_internal(call_id, |call| call.owner)?;
         self.app_event_queue(owner)
+    }
+
+    /// The `floor_fmtp` a re-offer presents: the profile's, else the one the floor stream was set up
+    /// with, on a call restored from a checkpoint as on the one that set it up.
+    pub(super) fn reoffer_floor_fmtp(
+        &self,
+        call_id: &str,
+        tag: &str,
+        profile: &ProfileFlags,
+    ) -> Option<String> {
+        profile
+            .floor_fmtp
+            .clone()
+            .or_else(|| self.conference.floors().fmtp(call_id, tag))
     }
 
     /// Create the floor data channel of leg `tag` of `call_id` (a DTLS leg that offered a WebRTC data
@@ -75,6 +92,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         );
         plan
+    }
+
+    /// Hold the offerer's floor keys until the answer registers its floor leg (the offerer's keys
+    /// come from the offer's profile, the answerer's from the answer's).
+    pub(super) fn hold_offer_floor_keys(&self, call_id: &str, keys: Vec<FloorMasterKey>) {
+        self.conference.floors().hold_offer_keys(call_id, keys);
     }
 
     /// Anchor the floor stream an offer carries: one `Redirect`-bound endpoint per leg, in the
@@ -104,6 +127,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
             return OfferFloor::default();
         }
+        // Fail closed: keys the controller asked for that cannot be applied decline the stream rather
+        // than serve it in the clear (the profile was validated, so this does not happen).
+        let near_keys = match crate::floor_srtcp::master_keys(&profile.floor_keys) {
+            Ok(keys) => keys,
+            Err(reason) => {
+                tracing::error!(%reason, "the floor keys cannot be applied; the floor stream is declined");
+                return OfferFloor::default();
+            }
+        };
         let near = self.alloc_floor_endpoint(near_family, near_bind).await;
         let far = self.alloc_floor_endpoint(far_family, far_bind).await;
         let (Some(near), Some(far)) = (near, far) else {
@@ -116,6 +148,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near: Some(near),
             far: Some(far),
             near_remote: Some(offered.remote),
+            near_keys,
         }
     }
 
@@ -212,6 +245,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return;
         };
         let gate = apply_received_from(Some(signalled), profile.received_from).unwrap_or(signalled);
+        // The profile was validated before the call was set up; a set that still fails declines the
+        // protection loudly by not serving the stream, never by serving it in the clear.
+        let keys = match crate::floor_srtcp::master_keys(&profile.floor_keys) {
+            Ok(keys) => keys,
+            Err(reason) => {
+                tracing::error!(call_id, %reason, "the floor keys cannot be applied; the floor stream is not served");
+                return;
+            }
+        };
         self.conference.floors().register(
             &self.datapath,
             CallFloorLeg {
@@ -222,6 +264,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 accepted_source: bridge_source_filter(profile, gate),
                 ssrc: random_ssrc(),
                 events: self.app_event_queue(owner),
+                keys,
+                fmtp: profile.floor_fmtp.clone(),
+                restore: None,
             },
         );
     }
@@ -276,9 +321,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .unwrap_or(answered.remote);
         let events = self.app_event_queue(owner);
         let floors = self.conference.floors();
-        for (endpoint, tag, gate) in [
-            (near_endpoint, wiring.from_tag, near_gate),
-            (far_endpoint, wiring.to_tag, far_gate),
+        // Each party's keys are its own: the offerer's from its offer, the answerer's from its answer.
+        let near_keys = floors.take_offer_keys(call_id);
+        let far_keys = match crate::floor_srtcp::master_keys(&wiring.profile.floor_keys) {
+            Ok(keys) => keys,
+            Err(reason) => {
+                tracing::error!(call_id, %reason, "the answerer's floor keys cannot be applied; the floor stream is not served");
+                return;
+            }
+        };
+        for (endpoint, tag, gate, keys) in [
+            (near_endpoint, wiring.from_tag, near_gate, near_keys),
+            (far_endpoint, wiring.to_tag, far_gate, far_keys),
         ] {
             floors.register(
                 &self.datapath,
@@ -290,6 +344,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     accepted_source: bridge_source_filter(wiring.profile, gate),
                     ssrc: random_ssrc(),
                     events: events.clone(),
+                    keys,
+                    fmtp: wiring.profile.floor_fmtp.clone(),
+                    restore: None,
                 },
             );
         }

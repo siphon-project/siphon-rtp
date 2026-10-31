@@ -125,6 +125,22 @@ fn ice_bridge_source(
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Hand A's data channel plan to the bridge before A's association is registered (both offerer
+    /// installs below). A kept association (a re-answer) keeps its channel, so a second plan is never
+    /// attached.
+    fn attach_offerer_data_channel(&self, wiring: &AnswerWiring<'_>) {
+        let key = (wiring.call_id.to_string(), wiring.from_tag.to_string());
+        if !wiring.near_data_channel || self.call_floor_channels.contains_key(&key) {
+            return;
+        }
+        let Some(owner) = self.owned_call_internal(wiring.call_id, |call| call.owner) else {
+            return;
+        };
+        let plan = self.new_call_floor_channel(wiring.call_id, wiring.from_tag, owner);
+        self.dtls_bridge()
+            .attach_floor_channel(wiring.near.rtp.id, plan);
+    }
+
     /// DTLS-SRTP far (B) leg → userspace DTLS bridge: the handshake keys the leg, then SRTP/SRTCP is
     /// terminated on B and plaintext relayed on A. B's answer must carry its certificate fingerprint
     /// (RFC 5763 §5) to authenticate the handshake; the engine takes the DTLS role opposite the peer's
@@ -202,6 +218,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"near leg has no signalled address",
             ));
         };
+        self.attach_offerer_data_channel(wiring);
         let plan = wiring.offerer_dtls_call_plan(
             a_rtp,
             certificate,
@@ -346,6 +363,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let call = wiring.media_call(directions).with_caller_secure_pending();
         self.media
             .register(call, self.datapath.clone(), owner_events);
+        self.attach_offerer_data_channel(wiring);
         let plan = wiring.offerer_dtls_call_plan(
             inputs.a_rtp,
             certificate,

@@ -77,6 +77,7 @@ async fn seat(engine: &Engine<UdpLoopbackDatapath>, tag: &str, fmtp: Option<&str
         .handle(
             CLIENT,
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: tag.into(),
                 sdp: offer(audio_addr, Some(floor_addr)),
@@ -192,6 +193,7 @@ async fn a_floor_fmtp_with_a_line_break_refuses_the_join() {
         .handle(
             CLIENT,
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: "a".into(),
                 sdp: offer(audio, None),
@@ -219,6 +221,7 @@ async fn other_unknown_media_is_still_declined_and_a_second_floor_section_too() 
         .handle(
             CLIENT,
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: "a".into(),
                 sdp: text,
@@ -466,6 +469,7 @@ async fn floor_to_a_seat_without_a_floor_stream_is_an_error() {
         .handle(
             CLIENT,
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: "plain".into(),
                 sdp: offer(audio, None),

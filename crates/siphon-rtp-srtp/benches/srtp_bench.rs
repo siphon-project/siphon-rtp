@@ -12,6 +12,8 @@
 //!     (RFC 3711 §3.1): the extra cost is locating and comparing the field ahead of the tag.
 //!   - `srtcp_protect` / `srtcp_unprotect` — a compound RTCP SR (RFC 3711 §3.4): explicit index,
 //!     8-byte header in the clear; runs at RTCP rate, not media rate, but on the same datapath.
+//!   - `srtcp_gcm_protect` / `srtcp_gcm_unprotect` — the same SR under `AEAD_AES_128_GCM`
+//!     (RFC 7714 §9, MCPTT floor control): encrypted form, 4-octet MKI.
 //!   - `secure_leg_protect_rtp` / `secure_leg_unprotect_rtp` — the full leg path incl. the RFC 5761
 //!     RTP/RTCP demux dispatch, i.e. what the bridge adapter actually calls per packet.
 //!   - `srtp_context_new` — per-leg key setup (three RFC 3711 §4.3 KDF derives); call-setup cost,
@@ -27,6 +29,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::{Mki, SrtpKeyMaterial};
 use siphon_rtp_srtp::srtcp::SrtcpContext;
+use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
 use siphon_rtp_srtp::{kdf::MASTER_SALT_LEN, SrtpContext, MASTER_KEY_LEN};
 
 /// A test master key (`0x11` repeated) — fixed, not subscriber data.
@@ -279,10 +282,62 @@ fn bench_setup(criterion: &mut Criterion) {
     });
 }
 
+/// A floor-control GCM key (RFC 7714 SRTCP, 4-octet MKI): fixed test material, not subscriber data.
+fn gcm_key() -> FloorMasterKey {
+    FloorMasterKey {
+        mki: 0x0000_0001,
+        master_key: MASTER_KEY,
+        master_salt: MASTER_SALT,
+    }
+}
+
+fn bench_srtcp_gcm(criterion: &mut Criterion) {
+    let plain = rtcp_packet(0x0A0B_0C0D);
+
+    criterion.bench_function("srtcp_gcm_protect", |bencher| {
+        let mut context = SrtcpGcmContext::new(&[gcm_key()]).expect("context");
+        let mut out = Vec::with_capacity(256);
+        bencher.iter(|| {
+            context
+                .protect(black_box(&plain), true, &mut out)
+                .expect("protect");
+            black_box(out.len())
+        });
+    });
+
+    criterion.bench_function("srtcp_gcm_unprotect", |bencher| {
+        // Same monotone-ring shape as `srtcp_unprotect`: the replay window never sees a repeat.
+        let mut sender = SrtcpGcmContext::new(&[gcm_key()]).expect("context");
+        let ring: Vec<Vec<u8>> = (0..RING_LEN)
+            .map(|_| {
+                let mut sealed = Vec::with_capacity(256);
+                sender
+                    .protect(&plain, true, &mut sealed)
+                    .expect("seed protect");
+                sealed
+            })
+            .collect();
+        let mut receiver = SrtcpGcmContext::new(&[gcm_key()]).expect("context");
+        let mut out = Vec::with_capacity(256);
+        let mut index = 0usize;
+        bencher.iter(|| {
+            if index == 0 {
+                receiver = SrtcpGcmContext::new(&[gcm_key()]).expect("context");
+            }
+            receiver
+                .unprotect(black_box(&ring[index]), &mut out)
+                .expect("unprotect");
+            index = if index + 1 == RING_LEN { 0 } else { index + 1 };
+            black_box(out.len())
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_srtp,
     bench_srtcp,
+    bench_srtcp_gcm,
     bench_secure_leg,
     bench_transcrypt,
     bench_setup
