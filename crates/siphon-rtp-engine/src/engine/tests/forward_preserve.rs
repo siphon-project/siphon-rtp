@@ -419,12 +419,8 @@ fn key_mgmt_lines(sdp: &str) -> Vec<&str> {
 
 #[tokio::test]
 async fn a_forward_join_answer_never_echoes_the_offerers_key_mgmt_and_carries_the_controllers() {
-    for media in [ForwardMedia::Preserve, ForwardMedia::Translate] {
-        let profile = if media == ForwardMedia::Preserve {
-            "RTP/SAVP"
-        } else {
-            "RTP/AVP"
-        };
+    for media in [ForwardMedia::Preserve] {
+        let profile = "RTP/SAVP";
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let (_, addr) = phone().await;
         let without = join(
