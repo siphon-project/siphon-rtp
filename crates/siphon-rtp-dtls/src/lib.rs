@@ -26,10 +26,14 @@
 //! impersonation, but not the denial of service.
 #![forbid(unsafe_code)]
 
+mod datachannel;
 mod handshake;
 mod identity;
 mod session;
 
+pub use datachannel::{
+    DataChannelCounters, DataChannelError, DataChannelEvent, DataChannelHost, MAX_MESSAGE_SIZE,
+};
 pub use handshake::{DtlsRole, SrtpKeying};
 pub use identity::{DtlsCertificate, Fingerprint};
 pub use session::{DtlsEvent, DtlsSession};
@@ -58,6 +62,9 @@ pub enum DtlsError {
     /// Exporting or splitting the RFC 5764 §4.2 keying material failed.
     #[error("SRTP key export failed: {0}")]
     KeyExport(String),
+    /// Application data was written before the handshake completed and the peer was verified.
+    #[error("DTLS association is not established yet")]
+    NotEstablished,
     /// The session already failed, and every later call reports the same thing rather than
     /// re-entering the state machine on a association that is dead.
     #[error("DTLS session is closed")]

@@ -25,6 +25,9 @@ siphon-rtp-stun = { path = "../crates/siphon-rtp-stun" }
 siphon-rtp-ice = { path = "../crates/siphon-rtp-ice" }
 siphon-rtp-codec = { path = "../crates/siphon-rtp-codec", features = ["amr"] }
 siphon-rtp-li = { path = "../crates/siphon-rtp-li" }
+# The MCPTT floor data channel target drives a peer SCTP host against the engine channel driver.
+siphon-rtp-dtls = { path = "../crates/siphon-rtp-dtls" }
+bytes = "1"
 
 # RFC 3550/3551/5761 — RTP header, compound RTCP, rtcp-mux classifier.
 [[bin]]
@@ -130,6 +133,15 @@ bench = false
 [[bin]]
 name = "li_pdu_fuzz"
 path = "fuzz_targets/li_pdu_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# RFC 9260 / RFC 8832 / RFC 3550 6.7: the MCPTT floor data channel. A hostile (DTLS-authenticated)
+# browser channel label and floor messages, binary and string, into the engine channel driver.
+[[bin]]
+name = "floor_channel_fuzz"
+path = "fuzz_targets/floor_channel_fuzz.rs"
 test = false
 doc = false
 bench = false

@@ -151,6 +151,11 @@ fn supported_features() -> Vec<String> {
         // `send_rtcp_app` / `rtcp_app`. Controllers gate floor control on these entries.
         "mcptt_floor".to_string(),
         "rtcp_app".to_string(),
+        // A browser seat's floor control runs over a WebRTC data channel labelled `mcptt-floor`
+        // (`m=application … UDP/DTLS/SCTP webrtc-datachannel`, RFC 8841), because a browser cannot
+        // send RTCP APP. The same `rtcp_app` / `send_rtcp_app` carry it. A controller gates offering
+        // the data channel to a browser on this entry.
+        "webrtc_floor_channel".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

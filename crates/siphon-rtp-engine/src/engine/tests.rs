@@ -63,6 +63,7 @@ mod stream_identity;
 mod tee_sendonly;
 mod tee_undecodable;
 mod transcode_offer;
+mod webrtc_floor_channel;
 
 #[test]
 fn ws_vad_config_is_absent_unless_vad_or_barge_in_is_requested() {

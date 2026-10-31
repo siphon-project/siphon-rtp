@@ -416,6 +416,8 @@ walks the accept path packet by packet.
 
 ## See also
 
+- [Forwarding rooms](forwarding.md#a-browser-dispatcher): MCPTT floor control over a WebRTC data
+  channel, which rides the DTLS association this page sets up.
 - [Secure media with SRTP](secure-srtp.md), the SDES-keyed sibling; the secure
   leg the DTLS handshake installs is the same machinery.
 - [Recording & forking](recording.md); recording and SIPREC are not available

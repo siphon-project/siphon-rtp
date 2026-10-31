@@ -48,8 +48,9 @@ pub enum DtlsEvent {
     /// §5) and the SRTP keying material has been derived. Read it with [`DtlsSession::keying`] or
     /// [`DtlsSession::into_secure_leg`] — the event carries no secret.
     Keyed,
-    /// Decrypted DTLS application data. A DTLS-SRTP leg carries none (media rides SRTP beside the
-    /// association, RFC 5764), so the engine logs and drops it.
+    /// Decrypted DTLS application data. Media rides SRTP beside the association (RFC 5764), so on an
+    /// audio-only leg there is none and the engine drops it; on a leg that negotiated a WebRTC data
+    /// channel it is the SCTP packets of RFC 8261 (see [`crate::DataChannelHost`]).
     ApplicationData(Bytes),
 }
 
@@ -160,6 +161,22 @@ impl DtlsSession {
         }
         self.endpoint
             .handle_timeout(ASSOCIATION_REMOTE, now)
+            .map_err(|error| self.fail(&error.to_string()))
+    }
+
+    /// Send `data` to the peer as DTLS application data (RFC 6347 §4.1.1), for SCTP over DTLS
+    /// (RFC 8261 §5). Only after the handshake has completed and the peer was verified: before that
+    /// there is no association to protect it with, and a plaintext fallback does not exist. Drain
+    /// [`Self::poll_transmit`] afterwards.
+    pub fn write_application_data(&mut self, now: Instant, data: &[u8]) -> Result<(), DtlsError> {
+        if self.failed {
+            return Err(DtlsError::Closed);
+        }
+        if self.keying.is_none() {
+            return Err(DtlsError::NotEstablished);
+        }
+        self.endpoint
+            .write(now, ASSOCIATION_REMOTE, data)
             .map_err(|error| self.fail(&error.to_string()))
     }
 
@@ -296,6 +313,30 @@ mod tests {
             }
         }
         panic!("the handshake did not complete");
+    }
+
+    #[test]
+    fn application_data_is_refused_before_the_handshake_and_delivered_after_it() {
+        let now = Instant::now();
+        let (mut client, mut server) = pair();
+        assert!(matches!(
+            client.write_application_data(now, b"too early"),
+            Err(DtlsError::NotEstablished)
+        ));
+        complete(now, &mut client, &mut server);
+
+        client
+            .write_application_data(now, b"sctp packet")
+            .expect("keyed session writes");
+        let events = transfer(now, &mut client, &mut server);
+        let delivered: Vec<&[u8]> = events
+            .iter()
+            .filter_map(|event| match event {
+                DtlsEvent::ApplicationData(data) => Some(&data[..]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered, vec![&b"sctp packet"[..]]);
     }
 
     #[test]

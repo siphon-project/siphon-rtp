@@ -16,11 +16,22 @@ use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction};
 use siphon_rtp_proto::ProfileFlags;
 
 use crate::call_floor::CallFloorLeg;
+use crate::floor_channel::{
+    floor_channel, FloorChannelHandle, FloorChannelPlan, FloorScope, FloorSink,
+};
 use crate::sdp::{self, EngineMedia};
 
 use super::install::AnswerWiring;
 use super::negotiate::{apply_received_from, bridge_source_filter, random_ssrc};
-use super::Engine;
+use super::{ClientId, Engine};
+
+/// The floor data channel of one DTLS leg of a two-party call, and the SSRC the engine's floor
+/// messages to it carry when the controller names none (minted once per leg, RFC 3550 §8.1).
+#[derive(Clone)]
+pub(super) struct CallFloorChannel {
+    pub(super) handle: FloorChannelHandle,
+    pub(super) ssrc: u32,
+}
 
 /// What anchoring an offer's floor stream leaves for the call.
 #[derive(Default)]
@@ -39,6 +50,31 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     pub(super) fn call_app_queue(&self, call_id: &str) -> Option<crate::app_events::AppEventQueue> {
         let owner = self.owned_call_internal(call_id, |call| call.owner)?;
         self.app_event_queue(owner)
+    }
+
+    /// Create the floor data channel of leg `tag` of `call_id` (a DTLS leg that offered a WebRTC data
+    /// channel, RFC 8841): the handle is kept for `send_rtcp_app`, the plan goes to the DTLS driver of
+    /// the leg's endpoint ([`crate::dtls_bridge::DtlsBridge::attach_floor_channel`]) before it is
+    /// registered. Events go to the controller that owns the call.
+    pub(super) fn new_call_floor_channel(
+        &self,
+        call_id: &str,
+        tag: &str,
+        owner: ClientId,
+    ) -> FloorChannelPlan {
+        let (handle, plan) = floor_channel(FloorSink {
+            scope: FloorScope::Call(call_id.to_string()),
+            tag: tag.to_string(),
+            events: self.app_event_queue(owner),
+        });
+        self.call_floor_channels.insert(
+            (call_id.to_string(), tag.to_string()),
+            CallFloorChannel {
+                handle,
+                ssrc: random_ssrc(),
+            },
+        );
+        plan
     }
 
     /// Anchor the floor stream an offer carries: one `Redirect`-bound endpoint per leg, in the
@@ -137,6 +173,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         floor: Option<(Endpoint, SocketAddr)>,
         advertised: IpAddr,
         profile: &ProfileFlags,
+        data_channel: bool,
     ) -> String {
         let anchored = match floor {
             Some((endpoint, _)) => sdp::anchor_floor(
@@ -150,7 +187,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ),
             None => answer,
         };
-        sdp::decline_unanswered_streams(anchored, false, floor.is_some())
+        // RFC 8841: a DTLS caller's data channel is answered on the audio's own transport (BUNDLE).
+        let anchored = if data_channel {
+            sdp::anchor_data_channel(&anchored)
+        } else {
+            anchored
+        };
+        sdp::decline_unanswered_with_data_channel(anchored, false, floor.is_some(), data_channel)
     }
 
     /// Record a single-leg call's floor endpoint on its leg and start serving the stream, for the

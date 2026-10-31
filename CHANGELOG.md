@@ -50,6 +50,18 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **MCPTT floor control over a WebRTC data channel, for a browser seat (`node_info` feature
+  `webrtc_floor_channel`).** A browser cannot send RTCP APP, so `forward_join` and `answer_local` now answer an
+  `m=application <port> UDP/DTLS/SCTP webrtc-datachannel` section (RFC 8841) that is bundled with a DTLS-SRTP
+  audio section, on the audio's own port, and carry the floor on a channel the browser opens labelled
+  `mcptt-floor`. SCTP (RFC 9260) and DCEP (RFC 8832) run inside the seat's existing DTLS association (RFC 8261,
+  RFC 8831), so there is no new UDP ingress; the DTLS driver of the leg owns the association. One floor message
+  is one binary message encoded as the RTCP APP packet itself, raised as the same `rtcp_app` event and sent by
+  the same `send_rtcp_app` (`stream: "floor"`). TS 24.380 has no WebRTC binding: the convention is ours. A
+  data channel on a non-DTLS leg or outside the bundle is declined, and the two-party `offer` / `answer` pair
+  does not answer one yet. New dependencies `rtc-sctp` and `rtc-datachannel` (`docs/supply-chain.md`). About
+  1.2 µs per message each way (`benches/floor_channel_bench.rs`, `docs/cookbook/forwarding.md`).
+
 - **Dial-out, transcoding and a whole-room backstop for forwarding rooms (`forward_offer`,
   `forward_answer`; `node_info` features `forward_dialout`, `forward_transcode`; `--forward-room-idle-secs`).**
   `forward_offer` offers a pending seat to a member the room calls out to (the room's codec first with its

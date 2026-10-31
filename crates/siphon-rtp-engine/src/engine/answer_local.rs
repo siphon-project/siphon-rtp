@@ -910,8 +910,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
         // RFC 3264 §6: the engine is the answerer here, so every stream it does not carry is declined
         // with port 0 rather than handed back as the offer wrote it.
-        rewritten.sdp =
-            self.present_local_floor(rewritten.sdp, local_floor, near_advertised, profile);
+        // A DTLS caller that offered a WebRTC data channel (RFC 8841) carries its MCPTT floor on it.
+        let data_channel = matches!(offerer_security, WsTakeoverSecurity::Dtls { .. })
+            && sdp::parse_data_channel(sdp).is_some();
+        rewritten.sdp = self.present_local_floor(
+            rewritten.sdp,
+            local_floor,
+            near_advertised,
+            profile,
+            data_channel,
+        );
         // rtpengine `replace: [origin]`: hide the originator's real IP behind the engine's advertised
         // address (topology hiding).
         if profile.replace.iter().any(|field| field == "origin") {
@@ -924,6 +932,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.free(&endpoints).await;
             return refusal;
         }
+        let floor_channel_tag = from_tag.clone();
         self.register_local_call(
             client,
             call_id,
@@ -936,6 +945,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         );
         if let Some(floor) = local_floor {
             self.install_local_floor(call_id, profile, floor);
+        }
+        // The data channel's plan goes to the endpoint's DTLS driver before that driver is
+        // registered (below, in `key_local_pipeline` or the takeover).
+        if data_channel {
+            let plan = self.new_call_floor_channel(call_id, &floor_channel_tag, client);
+            self.dtls_bridge().attach_floor_channel(near_rtp.id, plan);
         }
 
         // Pick the ONE negotiated codec (RFC 3264 §6.1). The candidate set is the offerer's own

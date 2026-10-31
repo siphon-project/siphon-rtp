@@ -1242,6 +1242,40 @@ channel (TS 24.380 §13) is not implemented, so the answer never offers it.
   endpoint, and a re-offer never moves a floor leg's gate. APP parts in a party's audio RTCP are read
   after the pipeline's own gate, decrypt and latch, and the compound is relayed as before.
 
+### WebRTC data channel (floor control for a browser seat)
+
+A browser seat that bundles `m=application <port> UDP/DTLS/SCTP webrtc-datachannel` with its audio
+(RFC 8841, RFC 8843) carries its MCPTT floor control on a data channel (`mcptt-floor`, 3GPP TS 24.380
+has no WebRTC binding; the convention is siphon-rtp's own, docs/control/json.md). **This adds no UDP
+ingress.** The SCTP association is carried as DTLS application data (RFC 8261 §5) inside the DTLS
+association the seat's audio already runs, on the same `Redirect` endpoint:
+
+- **Layers 1 to 4 are unchanged and come first.** The datagram is demultiplexed (RFC 7983), gated on
+  the signalled or ICE-validated source and, on an ICE seat, held until the pair is validated, exactly
+  as a DTLS handshake record is. A data channel record from any other source never reaches the driver.
+- **Authenticated before parsed.** SCTP bytes are only handed to the SCTP stack after the DTLS record
+  layer has decrypted them, and the DTLS association only completes after the peer's certificate has
+  matched the `a=fingerprint` it signalled (RFC 5763 §5). Application data cannot arrive before that
+  (`DtlsSession::write_application_data` refuses to send until then, and the driver feeds SCTP only
+  from keyed-session events). An impersonator that cannot complete the handshake cannot reach the
+  SCTP parser, the DCEP parser or the floor parser.
+- **One owner.** The DTLS driver task of the seat's endpoint owns the DTLS session, the SCTP association
+  and the channel state; it is the single task that reads them. The controller reaches it only through
+  a bounded (64) mailbox, so a controller that outpaces the association gets `floor data channel
+  congested` rather than a growing queue.
+- **Bounded.** The advertised and enforced `a=max-message-size` is 65536, the receive window is twice
+  that, and a larger message is dropped and counted. A floor message is parsed by the same
+  `rtcp::app_packets` the UDP floor stream uses, which reads at most the message's own length fields.
+  A string message, a malformed binary one, a message on a channel that is not `mcptt-floor`, and a
+  message on a stream that never completed its DATA_CHANNEL_OPEN are counted and dropped with no event.
+- **Teardown.** The channel lives and dies with the leg's endpoint: `forward_leave`, `delete` and a
+  room's end drop the driver (and with it the association) and the channel plan together.
+- **What is relaxed.** A leg with a data channel keeps its DTLS driver for the life of the leg, not for
+  the 60 s last-flight retention window, and does not throttle its post-handshake DTLS output to the
+  200 ms retransmission guard, which would otherwise drop SCTP packets. The guard was a CPU and
+  bandwidth bound on a source that is already gated twice; SCTP's own congestion control bounds the
+  channel traffic.
+
 ### Layer 5e — The WebSocket-takeover Redirect path
 A **takeover** call (`ProfileFlags.ws_uri`, `PipelineKind::Ws`) points leg A's RTP endpoint at
 `FlowAction::Redirect` and makes an external WebSocket media server A's far side; the A↔B

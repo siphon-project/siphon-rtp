@@ -22,6 +22,7 @@ use siphon_rtp_srtp::leg::SecureLeg;
 use tokio::task::JoinHandle;
 
 use crate::dtls_bridge::{PipelineTarget, SecureDestination, SharedSecureLeg};
+use crate::floor_channel::{ChannelDriver, FloorChannelPlan, Outbound};
 
 /// The initial RFC 6347 §4.2.4 retransmission timeout. One second is the DTLS default and what the
 /// previous stack used; the state machine backs off from here.
@@ -113,6 +114,10 @@ pub(crate) struct DriverPlan<D: Datapath> {
     pub(crate) role: DtlsRole,
     pub(crate) peer_fingerprint: Fingerprint,
     pub(crate) outcome: SessionOutcome,
+    /// The leg negotiated a WebRTC data channel (RFC 8841): SCTP rides this DTLS association and
+    /// carries the MCPTT floor ([`crate::floor_channel`]). The association then lives for the leg,
+    /// not for the last-flight retention window.
+    pub(crate) floor_channel: Option<FloorChannelPlan>,
 }
 
 /// Spawn the driver for one leg. The handle is stored by the bridge and aborted on retire/teardown,
@@ -134,6 +139,7 @@ async fn run<D: Datapath + Clone + Send + Sync + 'static>(plan: DriverPlan<D>) {
         role,
         peer_fingerprint,
         outcome,
+        floor_channel,
     } = plan;
 
     // RFC 8445 §12: key the path ICE chose, not the signalled one. Records that arrive before that
@@ -162,15 +168,24 @@ async fn run<D: Datapath + Clone + Send + Sync + 'static>(plan: DriverPlan<D>) {
         &destination,
         &mut session,
         &mut last_response,
+        true,
     )
-    .await;
+    .await
+    .ok();
 
     let mut changed = destination.subscribe();
     let mut keyed_at: Option<Instant> = None;
+    let mut channel = floor_channel.map(|plan| ChannelDriver::new(role, plan));
 
     loop {
         let retransmit_at = session.poll_timeout();
-        let retire_at = keyed_at.map(|at| at + LAST_FLIGHT_RETENTION);
+        // A leg with a data channel keeps its association for as long as the leg lives: SCTP has
+        // no retention window, it ends when the flow is dropped or the driver is aborted.
+        let retire_at = keyed_at
+            .filter(|_| channel.is_none())
+            .map(|at| at + LAST_FLIGHT_RETENTION);
+        let sctp_at = channel.as_ref().and_then(ChannelDriver::poll_timeout);
+        let writer = channel.as_ref().and_then(ChannelDriver::writer);
 
         tokio::select! {
             // Cancellation-safe: `recv_async`, `sleep_until` and `changed` all are, and the sends
@@ -179,8 +194,20 @@ async fn run<D: Datapath + Clone + Send + Sync + 'static>(plan: DriverPlan<D>) {
                 let Ok(record) = record else {
                     return; // the flow was dropped: the leg is gone
                 };
-                if !handle_record(&mut session, &record, &outcome, &mut keyed_at) {
+                if !handle_record(&mut session, &record, &outcome, &mut keyed_at, channel.as_mut()) {
                     return;
+                }
+            }
+            () = sleep_until(sctp_at) => {
+                if let Some(channel) = channel.as_mut() {
+                    channel.on_timeout(Instant::now());
+                }
+            }
+            message = recv_or_pending(writer) => {
+                match (message, channel.as_mut()) {
+                    (Ok(outbound), Some(channel)) => channel.on_outbound(Instant::now(), outbound),
+                    (Err(_), Some(channel)) => channel.writer_closed(),
+                    (_, None) => {}
                 }
             }
             () = sleep_until(retransmit_at) => {
@@ -203,14 +230,35 @@ async fn run<D: Datapath + Clone + Send + Sync + 'static>(plan: DriverPlan<D>) {
             }
         }
 
-        transmit(
+        let queued = match channel.as_mut() {
+            Some(channel) => channel.drain(Instant::now(), &mut session),
+            None => Ok(()),
+        };
+        let sent = transmit(
             &datapath,
             secure_endpoint,
             &destination,
             &mut session,
             &mut last_response,
+            channel.is_none(),
         )
         .await;
+        // The controller's floor sends are answered only now: the association took them and the DTLS
+        // records they became have been handed to the datapath (or the reason they were not).
+        if let Some(channel) = channel.as_mut() {
+            channel.complete_sends(&queued.and(sent));
+        }
+    }
+}
+
+/// Wait for the next floor message, or forever when the leg has no data channel or its mailbox has
+/// closed — the "nothing to write" arm of the select. Cancellation-safe: `recv_async` is.
+async fn recv_or_pending(
+    writer: Option<flume::Receiver<Outbound>>,
+) -> Result<Outbound, flume::RecvError> {
+    match writer {
+        Some(writer) => writer.recv_async().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -221,6 +269,7 @@ fn handle_record(
     record: &[u8],
     outcome: &SessionOutcome,
     keyed_at: &mut Option<Instant>,
+    mut channel: Option<&mut ChannelDriver>,
 ) -> bool {
     let events = match session.handle_datagram(Instant::now(), record) {
         Ok(events) => events,
@@ -243,6 +292,9 @@ fn handle_record(
                 };
                 if outcome.apply(leg) {
                     *keyed_at = Some(Instant::now());
+                    if let Some(channel) = channel.as_deref_mut() {
+                        channel.on_keyed(Instant::now());
+                    }
                     tracing::info!(
                         target: "siphon_rtp::media",
                         "DTLS-SRTP handshake complete; leg keyed"
@@ -254,12 +306,14 @@ fn handle_record(
                     );
                 }
             }
-            DtlsEvent::ApplicationData(data) => {
-                tracing::debug!(
+            DtlsEvent::ApplicationData(data) => match channel.as_deref_mut() {
+                // RFC 8261 §5: SCTP packets are carried as DTLS application data.
+                Some(channel) => channel.on_packet(Instant::now(), &data),
+                None => tracing::debug!(
                     bytes = data.len(),
-                    "DTLS application data on a DTLS-SRTP leg; dropped"
-                );
-            }
+                    "DTLS application data on a DTLS-SRTP leg with no data channel; dropped"
+                ),
+            },
             // `DtlsEvent` is deliberately `#[non_exhaustive]`, so a future variant must not silently
             // change this leg's behaviour. A DTLS-SRTP leg expects `Keyed` and nothing else.
             other => {
@@ -281,8 +335,12 @@ async fn transmit<D: Datapath + Clone + Send + Sync + 'static>(
     destination: &SecureDestination,
     session: &mut DtlsSession,
     last_response: &mut Option<Instant>,
-) {
-    let keyed = session.is_keyed();
+    throttle_after_keying: bool,
+) -> Result<(), String> {
+    let mut outcome = Ok(());
+    // A leg with a data channel sends application data (SCTP) after keying, which is not a
+    // retransmitted flight and is not throttled.
+    let keyed = session.is_keyed() && throttle_after_keying;
     while let Some(record) = session.poll_transmit() {
         // Post-handshake output is a retransmitted last flight; rate-limit the answer.
         if keyed {
@@ -294,12 +352,19 @@ async fn transmit<D: Datapath + Clone + Send + Sync + 'static>(
         }
         let Some(address) = *destination.borrow() else {
             // No pair yet: a record with nowhere ICE has approved is dropped, never guessed at.
+            if outcome.is_ok() {
+                outcome = Err("no destination selected yet".to_owned());
+            }
             continue;
         };
         if let Err(error) = datapath.send(secure_endpoint, address, &record).await {
             tracing::debug!(%error, "DTLS record send failed");
+            if outcome.is_ok() {
+                outcome = Err(format!("datapath send failed: {error}"));
+            }
         }
     }
+    outcome
 }
 
 /// Sleep until `deadline`, or forever when there is none — the "no timer pending" arm of the select.

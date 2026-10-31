@@ -15,6 +15,7 @@ use dashmap::DashMap;
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket};
 
+use crate::floor_channel::FloorChannelHandle;
 use crate::media_pipeline::Outbound;
 use siphon_rtp_proto::Event;
 use siphon_rtp_srtp::leg::SecureLeg;
@@ -89,6 +90,11 @@ pub enum ForwardControl {
     AttachSecureLeg { tag: String, leg: Box<SecureLeg> },
     /// A seat's ICE agent selected a pair.
     IceSelected { tag: String, remote: SocketAddr },
+    /// Give a seat its floor data channel.
+    AttachFloorChannel {
+        tag: String,
+        channel: FloorChannelHandle,
+    },
     /// End the actor.
     Stop,
 }
@@ -226,6 +232,23 @@ impl ForwardRegistry {
                 .is_ok(),
             None => false,
         }
+    }
+
+    /// Give seat `tag` of `room_id` its floor data channel (a browser seat). `false` when the room
+    /// is gone or its mailbox is full.
+    pub fn attach_floor_channel(
+        &self,
+        room_id: &str,
+        tag: &str,
+        channel: FloorChannelHandle,
+    ) -> bool {
+        self.control(
+            room_id,
+            ForwardControl::AttachFloorChannel {
+                tag: tag.to_string(),
+                channel,
+            },
+        )
     }
 
     /// Open the seat on `endpoint` on the pair its ICE agent selected. `false` when the endpoint is
@@ -682,6 +705,11 @@ async fn run_forward_room<D: Datapath>(
                     ForwardInput::Control(ForwardControl::AttachSecureLeg { tag, leg }) => {
                         room.attach_secure_leg(&tag, *leg);
                     }
+                    ForwardInput::Control(ForwardControl::AttachFloorChannel { tag, channel }) => {
+                        if !room.attach_floor_channel(&tag, channel) {
+                            tracing::debug!(tag, "floor data channel for a seat that already left");
+                        }
+                    }
                     ForwardInput::Control(ForwardControl::IceSelected { tag, remote }) => {
                         room.ice_selected(&tag, remote);
                     }
@@ -738,6 +766,13 @@ async fn send_app<D: Datapath>(
             );
             let tag = room.tag_at(datagram.endpoint).unwrap_or("?");
             push_failure(&mut failures, tag, &format!("send failed: {error}"));
+        }
+    }
+    // A seat's data channel answers once its message is on the wire; bounded, so a stuck driver is an
+    // error and never a hang. The sends are all queued before the first wait, so they overlap.
+    for (tag, pending) in room.take_pending_channel_sends() {
+        if let Err(error) = pending.wait().await {
+            push_failure(&mut failures, &tag, &error.to_string());
         }
     }
     if failures.is_empty() {

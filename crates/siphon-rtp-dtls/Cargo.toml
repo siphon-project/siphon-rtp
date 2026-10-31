@@ -21,8 +21,13 @@ categories = ["network-programming", "cryptography"]
 # the 0.20/0.21 line moves fast. 0.21.1 carries the RFC 6347 §4.2.4 last-flight retransmission fix
 # (webrtc-rs/rtc#243).
 rtc-dtls = { version = "=0.21.1", default-features = false, features = ["crypto-ring"] }
-# `TransportProtocol` for the endpoint constructor. Its three features are empty markers, so none.
-rtc-shared = { version = "=0.21.1", default-features = false }
+# `TransportProtocol` for the endpoint constructor, and the `Marshal`/`Unmarshal` traits the DCEP messages
+# implement. Its features are empty markers.
+rtc-shared = { version = "=0.21.1", default-features = false, features = ["marshal"] }
+# SCTP association (RFC 9260) and DCEP data channels (RFC 8832) over the DTLS association (RFC 8261,
+# RFC 8831), for the MCPTT floor channel of a browser seat. Sans-I/O like rtc-dtls, pinned exactly.
+rtc-sctp = { version = "=0.21.1" }
+rtc-datachannel = { version = "=0.21.1" }
 # The SRTP secure leg the exported keying material is fed into (shared with the SDES path).
 siphon-rtp-srtp = { path = "../siphon-rtp-srtp" }
 # Certificate fingerprints (RFC 8122): SHA-256 default, SHA-384/512 + SHA-1 for interop.
