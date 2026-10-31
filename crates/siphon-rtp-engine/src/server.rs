@@ -280,7 +280,25 @@ where
         // Wait for more inbound data, an event to push, or a rate-limit refill tick. Every arm is
         // cancellation-safe: a read that loses the race drops without consuming, an unreceived event
         // stays queued, and the interval tick is idempotent.
+        //
+        // Biased, eviction first and the read (which sees the end of the stream) next, ahead of the
+        // events. A reconnect hands the new connection a receiver on the *same* event channel, so
+        // until this loop has noticed it was superseded it is a second consumer of it. Polled with
+        // its eviction, its end of stream and a new event all ready, an unbiased select picked one
+        // at random and sometimes took the event, writing it into the closed socket while the
+        // connection that replaced it never saw it: a lost call summary after every reconnect race.
         tokio::select! {
+            biased;
+            () = identity.evicted.cancelled() => {
+                // A newer connection claimed this connection's controller identity. Newest wins,
+                // so this one closes rather than two connections sharing one identity's calls.
+                tracing::warn!(
+                    target: "siphon_rtp::control",
+                    client = identity.client.0,
+                    "control connection superseded by a newer one on the same controller identity"
+                );
+                return Ok(());
+            }
             read = read_half.read(&mut chunk) => {
                 let read = read?;
                 if read == 0 {
@@ -323,16 +341,6 @@ where
                         Err(error) => tracing::error!(%error, "failed to encode control event"),
                     }
                 }
-            }
-            () = identity.evicted.cancelled() => {
-                // A newer connection claimed this connection's controller identity. Newest wins,
-                // so this one closes rather than two connections sharing one identity's calls.
-                tracing::warn!(
-                    target: "siphon_rtp::control",
-                    client = identity.client.0,
-                    "control connection superseded by a newer one on the same controller identity"
-                );
-                return Ok(());
             }
             _ = refill.tick() => {
                 rate_limiter.refill(1);
