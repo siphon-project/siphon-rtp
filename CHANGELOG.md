@@ -9,6 +9,14 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **Audio `rtcp_app` on a kernel-relayed floor call.** A two-party call that carries an MCPTT floor stream and
+  runs on the plain in-kernel relay now has its audio RTCP read by the engine: a client's APP packets arrive
+  as `rtcp_app` with `stream: "audio"`, and the compound is relayed to the other party unchanged. RTP stays in
+  the kernel. `ForwardRule` gains `rtcp_to_userspace` (the UDP backend and the XDP classifier hand an
+  RTCP datagram to the redirect stream after the source gate and latch have admitted it; the eBPF flow value
+  grows from 36 to 40 bytes), set only for a call with a floor stream; no new setting. A call without one is
+  unchanged. About 55 ns per datagram, 125 ns with an APP packet (`benches/rtcp_relay_bench.rs`).
+
 - **MCPTT floor control over a WebRTC data channel, for a browser seat (`node_info` feature
   `webrtc_floor_channel`).** A browser cannot send RTCP APP, so `forward_join` and `answer_local` now answer an
   `m=application <port> UDP/DTLS/SCTP webrtc-datachannel` section (RFC 8841) that is bundled with a DTLS-SRTP
