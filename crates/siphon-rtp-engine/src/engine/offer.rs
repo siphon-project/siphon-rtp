@@ -16,7 +16,7 @@ use super::negotiate::{
 };
 use super::takeover::{ws_takeover_media_address, WsBridgeProcessing, WsBridgeSetup};
 use super::{
-    error_result, ok_sdp, unknown_call, Call, CallerMediaLeg, ClientId, Engine, Leg, PipelineKind,
+    error_result, unknown_call, Call, CallerMediaLeg, ClientId, Engine, Leg, PipelineKind,
 };
 
 /// The transport the **far** leg presents when the engine terminates a secure *offerer*.
@@ -1053,7 +1053,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        ok_sdp(rewritten, None)
+        self.ok_sdp_keyed(&call_id, rewritten, None, profile).await
     }
 }
 

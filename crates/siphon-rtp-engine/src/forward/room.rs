@@ -28,7 +28,7 @@ use siphon_rtp_media::ingress::IngressStats;
 use siphon_rtp_media::rtcp;
 use siphon_rtp_media::rtp::RtpPacket;
 use siphon_rtp_media::translator::{Forwarded, Translator};
-use siphon_rtp_proto::Event;
+use siphon_rtp_proto::{Event, ForwardMedia};
 use siphon_rtp_srtp::leg::SecureLeg;
 
 use super::codec::RoomCodec;
@@ -125,6 +125,9 @@ pub struct ForwardSeatStats {
     /// cross-codec seats (a payload the decoder refused, or a frame of another length than the
     /// negotiated one). Same-codec seats were still sent them.
     pub transcode_dropped: u64,
+    /// Audio RTCP datagrams the seat sent while it was not the source, in a preserving room: counted
+    /// and dropped, never read (they are SRTCP end to end).
+    pub receiver_rtcp_dropped: u64,
 }
 
 struct Seat {
@@ -197,9 +200,21 @@ enum PlanKind {
     },
 }
 
+/// Whether the armed plan hands the source's datagram on untouched (a preserving room).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verbatim {
+    /// Translate the packet per receiver (a translating room).
+    No,
+    /// An RTP datagram, forwarded byte for byte.
+    Rtp,
+    /// An audio RTCP (SRTCP) datagram of the source, forwarded byte for byte.
+    Rtcp,
+}
+
 /// The fan-out of one inbound packet, walked by [`ForwardRoom::next_datagram`].
 #[derive(Clone, Copy)]
 struct Plan {
+    verbatim: Verbatim,
     source: usize,
     kind: PlanKind,
     /// The cleartext packet is in the room's decrypt buffer rather than in the datagram.
@@ -560,8 +575,15 @@ impl ForwardRoom {
     pub fn seat_stats(&self, tag: &str) -> Option<ForwardSeatStats> {
         let seat = &self.seats[self.index_of(tag)?];
         Some(ForwardSeatStats {
-            forwarded_packets: seat.translator.packets_sent(),
-            forwarded_octets: seat.translator.octets_sent(),
+            // A preserving room counts in `counters`; a translating one in the translator.
+            forwarded_packets: seat
+                .translator
+                .packets_sent()
+                .wrapping_add(seat.counters.forwarded_packets),
+            forwarded_octets: seat
+                .translator
+                .octets_sent()
+                .wrapping_add(seat.counters.forwarded_octets),
             ..seat.counters
         })
     }
@@ -609,6 +631,9 @@ impl ForwardRoom {
         if data.len() < 2 {
             return Ingress::Accepted; // gated in; too short to be media, but the path is alive
         }
+        if self.codec.media() == ForwardMedia::Preserve {
+            return self.ingest_preserved(index, packet);
+        }
         // RFC 5761 demux. The room terminates RTCP: it reads the seat's reports and drops the
         // datagram. Relaying one seat's reports to the others would describe streams the receivers
         // never saw (RFC 3550 §7.3: a translator rewrites reports, it does not echo them).
@@ -654,6 +679,7 @@ impl ForwardRoom {
             return Ingress::DroppedFromPeer;
         };
         let mut plan = Plan {
+            verbatim: Verbatim::No,
             source: index,
             kind,
             in_clear_buffer,
@@ -712,6 +738,118 @@ impl ForwardRoom {
         Ingress::Accepted
     }
 
+    /// Ingress for a preserving room, after the shared gate: the source's RTP and audio SRTCP are
+    /// armed to be handed on untouched, everything else is counted and dropped.
+    ///
+    /// The room is not an endpoint of this stream. The media is SRTP between the UEs, keyed outside
+    /// the engine (3GPP TS 33.180 §7.5.2 NOTE 3), and SRTP authenticates the header's SSRC and
+    /// sequence number (RFC 3711 §3.3), so nothing but the sender's own bytes verify at a receiver.
+    /// Only the cleartext RTP header (RFC 3711 §3.1) and the RTCP common header (RFC 3711 §3.4) are
+    /// read, to demux (RFC 5761 §4) and to check the payload type; the audio SRTCP is never parsed
+    /// (its body is encrypted and a report about the talker would be about a stream the receivers
+    /// never saw anyway, RFC 3550 §7.3).
+    fn ingest_preserved(&mut self, index: usize, packet: &RxPacket) -> Ingress {
+        let data: &[u8] = &packet.data;
+        let seat = &mut self.seats[index];
+        let is_source = self.source == Some(index);
+        let mut plan = Plan {
+            verbatim: Verbatim::Rtcp,
+            source: index,
+            kind: PlanKind::Audio,
+            in_clear_buffer: false,
+            domain_len: None,
+            source_group: None,
+            point: StreamPoint {
+                ssrc: 0,
+                sequence: 0,
+                timestamp: 0,
+                marker: false,
+            },
+            cursor: 0,
+            arrival: packet.arrival,
+            dropped_before: 0,
+        };
+        if seat_gate::is_rtcp(data) {
+            if !is_source {
+                seat.counters.receiver_rtcp_dropped += 1;
+                return Ingress::DroppedFromPeer;
+            }
+            self.plan = Some(plan);
+            return Ingress::Accepted;
+        }
+        let Ok(parsed) = RtpPacket::parse(data) else {
+            return Ingress::Accepted;
+        };
+        seat.stats
+            .on_rtp(parsed.ssrc, parsed.sequence, parsed.timestamp);
+        seat.stats.observe_arrival(packet.arrival);
+        if !is_source {
+            seat.counters.not_source_dropped += 1;
+            return Ingress::DroppedFromPeer;
+        }
+        // The payload type is in the clear and is the one the room forwards unchanged (every seat
+        // is admitted under the same number); anything else is not media this seat negotiated.
+        if parsed.payload_type != seat.audio_payload_type
+            && !seat
+                .telephone_event
+                .is_some_and(|event| event.payload_type == parsed.payload_type)
+        {
+            seat.counters.unknown_payload_type += 1;
+            return Ingress::DroppedFromPeer;
+        }
+        plan.verbatim = Verbatim::Rtp;
+        plan.point = StreamPoint {
+            ssrc: parsed.ssrc,
+            sequence: parsed.sequence,
+            timestamp: parsed.timestamp,
+            marker: parsed.marker,
+        };
+        self.plan = Some(plan);
+        Ingress::Accepted
+    }
+
+    /// The next receiver of a preserving room's armed datagram: the very buffer that arrived, lent
+    /// out again for each reachable seat. Nothing is rewritten, protected or allocated.
+    fn next_verbatim<'a>(
+        &mut self,
+        packet: &'a RxPacket,
+        mut plan: Plan,
+    ) -> Option<(EndpointId, SocketAddr, &'a [u8])> {
+        loop {
+            let index = plan.cursor;
+            if index >= self.seats.len() {
+                self.plan = None;
+                return None;
+            }
+            plan.cursor += 1;
+            self.plan = Some(plan);
+            if index == plan.source {
+                continue; // the source never hears itself
+            }
+            let receiver = &mut self.seats[index];
+            if !receiver.reachable() {
+                continue;
+            }
+            let (endpoint, destination) = (receiver.endpoint, receiver.egress_destination);
+            if plan.verbatim == Verbatim::Rtp {
+                receiver.counters.forwarded_packets =
+                    receiver.counters.forwarded_packets.wrapping_add(1);
+                receiver.counters.forwarded_octets = receiver
+                    .counters
+                    .forwarded_octets
+                    .wrapping_add(packet.data.len() as u32);
+                if self.announce_pending {
+                    self.announce_pending = false;
+                    self.events.push(Event::ForwardSourceStarted {
+                        conference_id: self.room_id.clone(),
+                        from_tag: self.seats[plan.source].tag.clone(),
+                    });
+                }
+            }
+            return Some((endpoint, destination, &packet.data[..]));
+        }
+    }
+
     /// The next datagram of the fan-out [`Self::ingest`] armed: the receiving seat's endpoint, its
     /// destination, and the bytes, borrowed from the room's scratch. `packet` must be the datagram
     /// that was just ingested. `None` when every seat has been considered.
@@ -725,6 +863,9 @@ impl ForwardRoom {
         packet: &'a RxPacket,
     ) -> Option<(EndpointId, SocketAddr, &'a [u8])> {
         let mut plan = self.plan?;
+        if plan.verbatim != Verbatim::No {
+            return self.next_verbatim(packet, plan);
+        }
         loop {
             let index = plan.cursor;
             if index >= self.seats.len() {
@@ -814,7 +955,14 @@ impl ForwardRoom {
     /// the same line as the packets (the last timestamp sent plus the clock elapsed since), so the NTP
     /// to RTP mapping is consistent. A seat that has sent the room RTP also gets a reception report
     /// block about that stream: loss, jitter, and the LSR/DLSR the seat measures its round trip with.
+    ///
+    /// A preserving room builds none: it is not an RTP endpoint of the end-to-end stream, and a
+    /// report under an SSRC the receivers never saw would describe a stream that does not exist
+    /// (RFC 3550 §7.3), or be injected into an SRTCP index space the engine does not hold.
     pub fn build_reports(&mut self, ntp_timestamp: u64, now_micros: u64, out: &mut Vec<Outbound>) {
+        if self.codec.media() == ForwardMedia::Preserve {
+            return;
+        }
         let mut buffer = [0u8; rtcp::SENDER_REPORT_LEN + rtcp::RECEPTION_REPORT_LEN];
         for seat in &mut self.seats {
             if !seat.reachable() {

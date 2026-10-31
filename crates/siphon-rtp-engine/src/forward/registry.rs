@@ -17,7 +17,7 @@ use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket};
 
 use crate::floor_channel::FloorChannelHandle;
 use crate::media_pipeline::Outbound;
-use siphon_rtp_proto::Event;
+use siphon_rtp_proto::{Event, ForwardMedia};
 use siphon_rtp_srtp::leg::SecureLeg;
 use std::net::SocketAddr;
 
@@ -59,6 +59,20 @@ pub enum ForwardRefusal {
     /// The room actor is gone, or did not answer in time.
     #[error("the forwarding room did not answer within {} ms", VERDICT_TIMEOUT.as_millis())]
     NoVerdict,
+}
+
+/// Why a seat asking for `asked` media is refused by a room carrying `carried`.
+#[must_use]
+pub fn media_mismatch(carried: ForwardMedia, asked: ForwardMedia) -> String {
+    let name = |media: ForwardMedia| match media {
+        ForwardMedia::Translate => "translate",
+        ForwardMedia::Preserve => "preserve",
+    };
+    format!(
+        "the room carries media: {} (fixed by its first seat) and the seat asked for media: {}",
+        name(carried),
+        name(asked)
+    )
 }
 
 /// A control operation on a room actor.
@@ -369,6 +383,14 @@ impl ForwardRegistry {
             // first-seat racing the creation must be held to the codec that won. A transcoded seat
             // was checked against a codec, and is only taken while the room still has it.
             let admitted = match &admission {
+                // The first seat fixes the media mode as well as the codec: a seat asking for
+                // the other mode is refused, whichever of two racing first seats won.
+                Admission::RoomCodec { proposed, .. } if room.codec.media() != proposed.media() => {
+                    Err(ForwardRefusal::Codec(media_mismatch(
+                        room.codec.media(),
+                        proposed.media(),
+                    )))
+                }
                 Admission::RoomCodec { spec, .. } => room
                     .codec
                     .admit(std::slice::from_ref(*spec))

@@ -19,9 +19,7 @@ use super::negotiate::{
 };
 use super::takeover::AnswerTakeover;
 use super::Leg;
-use super::{
-    error_result, ok_sdp, unknown_call, ClientId, Engine, Party, PipelineKind, PromotionReason,
-};
+use super::{error_result, unknown_call, ClientId, Engine, Party, PipelineKind, PromotionReason};
 
 /// A's answer to a re-offer from B, as [`Engine::answer`] carries it: the far party's SDP (B's
 /// re-offer) drives the media wiring as B's answer usually does, A's answer SDP is what gets
@@ -1364,7 +1362,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_codec.as_ref(),
             pipeline,
         );
-        ok_sdp(rewritten, Some(answer_to_tag))
+        self.ok_sdp_keyed(call_id, rewritten, Some(answer_to_tag), profile)
+            .await
     }
 }
 

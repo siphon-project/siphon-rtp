@@ -225,6 +225,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     return error_result("offer_far: SDP rewrite failed", &reason);
                 }
             };
+        // The controller's `a=key-mgmt` (RFC 4567). The caller is live, so a far leg that cannot carry
+        // it refuses this verb, frees only the far ports and leaves the call as it was.
+        let far_sdp = match super::key_mgmt::keyed_sdp(&far_sdp, profile) {
+            Ok(keyed) => keyed,
+            Err(reason) => {
+                self.free(&far_endpoints).await;
+                return error_result("offer_far: key_mgmt", &reason);
+            }
+        };
         let far_offered_codecs = sdp::parse(&far_sdp)
             .map(|offered| offered.audio_codecs())
             .unwrap_or_default();

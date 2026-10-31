@@ -26,16 +26,17 @@ use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::forward::{ForwardRoom, ForwardSeatConfig, RoomCodec};
 use siphon_rtp_engine::sdp;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader};
+use siphon_rtp_proto::ForwardMedia;
 
 /// An AMR-WB octet-aligned 20 ms frame at mode 8 (23.85 kbit/s): 1 + 61 octets.
 const PAYLOAD_BYTES: usize = 62;
 
-fn room_of(seats: usize) -> ForwardRoom {
+fn room_of(seats: usize, media: ForwardMedia) -> ForwardRoom {
     let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
                  m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
     let codecs = sdp::parse(offer).unwrap().audio_codecs();
     let (codec, _) = RoomCodec::from_offer(&codecs).unwrap();
-    let mut room = ForwardRoom::new("bench".to_string(), codec);
+    let mut room = ForwardRoom::new("bench".to_string(), codec.with_media(media));
     for index in 0..seats {
         let address: SocketAddr = format!("192.0.2.{}:{}", 1 + index % 250, 4000 + index)
             .parse()
@@ -86,15 +87,34 @@ fn inbound() -> RxPacket {
 
 fn fan_out(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("forward_fan_out");
-    for seats in [10usize, 100, 500, 1000] {
-        let mut room = room_of(seats);
+    // `translate` rewrites the packet per receiver; `preserve` lends the arrived datagram out
+    // unchanged, so the difference is the translator's cost.
+    for (mode, media) in [
+        ("per_inbound_packet", ForwardMedia::Translate),
+        ("per_inbound_packet_preserve", ForwardMedia::Preserve),
+    ] {
+        for seats in [10usize, 100, 500, 1000] {
+            bench_mode(&mut group, mode, media, seats);
+        }
+    }
+    group.finish();
+}
+
+fn bench_mode(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    mode: &str,
+    media: ForwardMedia,
+    seats: usize,
+) {
+    {
+        let mut room = room_of(seats, media);
         let packet = inbound();
         // Warm: the first packet starts the run and announces the source.
         room.ingest(&packet);
         while room.next_datagram(&packet).is_some() {}
         room.drain_events().for_each(drop);
         group.throughput(Throughput::Elements(seats as u64 - 1));
-        group.bench_function(BenchmarkId::new("per_inbound_packet", seats), |bencher| {
+        group.bench_function(BenchmarkId::new(mode, seats), |bencher| {
             bencher.iter(|| {
                 room.ingest(black_box(&packet));
                 let mut forwarded = 0usize;
@@ -105,7 +125,6 @@ fn fan_out(criterion: &mut Criterion) {
             });
         });
     }
-    group.finish();
 }
 
 criterion_group!(benches, fan_out);

@@ -278,6 +278,36 @@ event per seat), then the room and every endpoint are freed. A live group cannot
 RTCP receiver reports (RFC 3550 §6.2), so a room that has heard from none of them for an hour has no
 members left. Seats pending their answer are not counted, and a single seat is still never reaped.
 
+## Preserve rooms (end-to-end SRTP)
+
+MCPTT media is SRTP between the UEs, keyed with PCK/GMK and signalled with `a=key-mgmt:mikey`
+(3GPP TS 33.180 §7.5.2 NOTE 3). SRTP authenticates the SSRC and sequence number, so the translator above
+would break it. Create the room with `"media": "preserve"` on `forward_join` / `forward_offer` and the
+engine hands the talker's datagrams on byte for byte (RFC 3550 §7.1): same SSRC, sequence number,
+timestamp, payload and auth tag at every receiver, no translator, no SRTP re-protect, no transcoding.
+The first seat fixes the mode; a later join or offer in the other mode is refused.
+
+- Seats are `RTP/SAVP` (or `RTP/AVP`) **without** `a=crypto`; the answer keeps the transport. A seat that
+  offers `a=crypto` or DTLS-SRTP (WebRTC) is refused: the engine must not terminate end-to-end media.
+- All seats use one codec **and one payload type** (the packets are not rewritten); a mixed-codec seat is
+  refused with "preserve rooms forward the talker's packets unchanged".
+- Put the keying in the profile: `"key_mgmt": "mikey ..."` is written as `a=key-mgmt:mikey ...` on the
+  audio section of every SDP the engine produces (join answers, `forward_offer` offers, and the two-party
+  verbs). The engine never copies the offerer's line, never invents one and never drops yours. A
+  `forward_offer` into a preserve room with `key_mgmt` offers `RTP/SAVP`, and the member must answer
+  `RTP/SAVP` without `a=crypto`. `key_mgmt` beside engine-terminated SDES or DTLS-SRTP is refused.
+- RTCP: no engine SR, RR or BYE toward any seat, at room start or later. The talker's audio SRTCP is
+  forwarded byte for byte with its RTP; receivers' audio RTCP is dropped (`receiver_rtcp_dropped`). The
+  engine cannot read SRTCP, so RTCP APP is surfaced from the floor stream only.
+- `forward_set_source`, `forward_source_started` (once per switch), `forward_seat_inactive` and the idle
+  backstop behave as in a translating room. `node_info` lists `forward_preserve`.
+- Fan-out is a copy-free loop over the receivers. `cargo bench -p siphon-rtp --bench forward_fanout_bench`
+  has `per_inbound_packet_preserve` beside `per_inbound_packet`.
+
+The engine cannot verify the SRTP tag in a preserve room (it has no key), so the source-address gate and
+the controller's choice of source are what bound who can send: see
+[the security model](../security-and-nat.md) (preserve rooms).
+
 ## Security and NAT
 
 A dialled-out seat is gated by its answer's signalled source (or `received_from`) and is not offered
