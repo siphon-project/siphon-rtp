@@ -18,7 +18,7 @@
 //! The data channel is not a new ingress: its bytes arrive only inside the seat's authenticated DTLS
 //! association (docs/security-and-nat.md, "WebRTC data channel").
 //!
-//! The association is owned by the DTLS driver task of the seat's leg ([`crate::dtls_session`]),
+//! The association is owned by the DTLS driver task of the seat's leg (`dtls_session`),
 //! which already owns the DTLS session: one owner, no lock, no task per packet. The driver reaches
 //! the controller through the [`FloorSink`] it was given and the engine reaches the driver through a
 //! bounded mailbox behind a [`FloorChannelHandle`].
