@@ -105,6 +105,13 @@ pub struct FlowAction {
     /// AF_XDP queue index for `action::REDIRECT`. Also the queue a STUN datagram on an
     /// `action::FORWARD` **ICE** flow is redirected to.
     pub redirect_queue: u32,
+    /// Non-zero on an `action::FORWARD` flow whose RTCP goes to userspace (the same AF_XDP queue as
+    /// `action::REDIRECT`) instead of being forwarded in-kernel, once it has passed the source gate
+    /// and latch (RFC 3550 §6; RFC 5761 §4 demux). RTP is still forwarded in-kernel. Mirrors
+    /// `ForwardRule::rtcp_to_userspace`.
+    pub rtcp_to_userspace: u8,
+    /// Explicit tail padding so the layout is fully initialised, always zero.
+    pub reserved: [u8; 3],
 }
 
 // --- TURN channel-relay fast path (docs/security-and-nat.md §11, M-T8) -----------------------
@@ -309,7 +316,7 @@ mod tests {
 
     #[test]
     fn flow_action_abi_is_stable() {
-        assert_eq!(size_of::<FlowAction>(), 36);
+        assert_eq!(size_of::<FlowAction>(), 40);
         assert_eq!(align_of::<FlowAction>(), 4);
         assert_eq!(offset_of!(FlowAction, kind), 0);
         assert_eq!(offset_of!(FlowAction, source_ipv4), 4);
@@ -321,6 +328,8 @@ mod tests {
         assert_eq!(offset_of!(FlowAction, latched_ssrc), 24);
         assert_eq!(offset_of!(FlowAction, latched_port), 28);
         assert_eq!(offset_of!(FlowAction, redirect_queue), 32);
+        assert_eq!(offset_of!(FlowAction, rtcp_to_userspace), 36);
+        assert_eq!(offset_of!(FlowAction, reserved), 37);
     }
 
     #[test]
