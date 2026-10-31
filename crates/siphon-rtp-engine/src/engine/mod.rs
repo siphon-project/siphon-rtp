@@ -26,6 +26,7 @@ mod fax;
 mod floor;
 mod fork;
 mod forward;
+mod forward_dial_out;
 mod gather;
 mod inject;
 mod install;
@@ -1159,6 +1160,8 @@ pub struct Engine<D: Datapath> {
     /// Conference seats the engine offered (`conference_offer`) and the participant has not yet
     /// answered, by room and from-tag. Each holds one endpoint until it is answered, left or expired.
     pending_seats: DashMap<(String, String), dial_out::PendingSeat>,
+    /// The same for forwarding rooms (`forward_offer`), by room and from-tag.
+    pending_forward_seats: DashMap<(String, String), forward_dial_out::PendingForwardSeat>,
     /// The RFC 4103 Real-Time Text observability slow path: per-call text processors that RED/T.140
     /// observe a promoted `m=text` stream (recording / `text_events`) then forward it verbatim. Shared
     /// with the redirect dispatcher, which routes text-owned endpoints' datagrams here (see

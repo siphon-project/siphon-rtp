@@ -148,3 +148,52 @@ async fn a_forward_join_answer_echoes_no_stream_identity_in_the_floor_section_ei
     );
     assert!(!answer.contains("m=application 0"), "{answer}");
 }
+
+/// The engine's own `forward_offer` is written from nothing the member sent, so it carries no
+/// stream identity of anybody's (audio section and floor section alike), and the member's answer to
+/// it, which may carry a browser's identity, is consumed by `forward_answer` without any SDP coming
+/// back to echo it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forward_offer_carries_no_stream_identity_and_its_answer_echoes_none() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_member, member_addr) = phone().await;
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::ForwardOffer {
+                conference_id: ROOM.into(),
+                from_tag: "member".into(),
+                profile: ProfileFlags {
+                    floor_fmtp: Some("mc_granted".into()),
+                    ..ProfileFlags::default()
+                },
+            },
+        )
+        .await;
+    let offer = ok_sdp_text(&offered);
+    assert_nothing_of_the_offerer(&offer);
+    assert!(
+        !offer.contains("a=ssrc") && !offer.contains("a=extmap"),
+        "{offer}"
+    );
+    assert!(
+        offer.contains("udp MCPTT"),
+        "the floor is offered:\n{offer}"
+    );
+
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::ForwardAnswer {
+                conference_id: ROOM.into(),
+                from_tag: "member".into(),
+                sdp: browser_shaped_offer(member_addr),
+                received_from: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(answered, CmdResult::Ok { sdp: None, .. }),
+        "{answered:?}"
+    );
+}

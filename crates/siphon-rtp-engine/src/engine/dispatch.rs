@@ -372,6 +372,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     | Command::AnswerLocal { .. }
                     | Command::ConferenceJoin { .. }
                     | Command::ForwardJoin { .. }
+                    | Command::ForwardOffer { .. }
                     | Command::ConferenceOffer { .. }
                     // A seat is a new conference participant, even though its call is not new.
                     | Command::ConferenceSeat { .. }
@@ -534,6 +535,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.dispatch_conference(client, command).await
             }
             command @ (Command::ForwardJoin { .. }
+            | Command::ForwardOffer { .. }
+            | Command::ForwardAnswer { .. }
             | Command::ForwardLeave { .. }
             | Command::ForwardSetSource { .. }) => self.dispatch_forward(client, command).await,
             Command::SendRtcpApp {

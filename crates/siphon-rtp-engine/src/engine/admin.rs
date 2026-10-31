@@ -139,6 +139,13 @@ fn supported_features() -> Vec<String> {
         // `forward_set_source`. A controller gates the verbs on this entry, so it is advertised only
         // where they are served.
         "forward_room".to_string(),
+        // `forward_offer` / `forward_answer`: the room dials a member out (a group call's fan-out),
+        // on the same terms `conference_offer` / `conference_answer` dial out of a mixing room.
+        "forward_dialout".to_string(),
+        // A forwarding-room seat in another codec than the room's is transcoded for (decode once,
+        // encode once per codec group), where it used to be refused. A controller gates seating
+        // mixed-codec members on this entry.
+        "forward_transcode".to_string(),
         // The MCPTT floor-control stream (`m=application <port> udp MCPTT`, 3GPP TS 24.380) is
         // anchored on a forwarding-room seat, and RTCP APP packets travel both ways as
         // `send_rtcp_app` / `rtcp_app`. Controllers gate floor control on these entries.

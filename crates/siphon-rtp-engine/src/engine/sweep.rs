@@ -569,6 +569,30 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             })
     }
 
+    /// Free the forwarding rooms in which **every** seat has received nothing at all for
+    /// `idle_ticks` (`--forward-room-idle-secs`): each seat's client is told with a `media_timeout`
+    /// (`no_media`, an empty `call_id`, the room as `conference_id`), then the room, its sockets, flows
+    /// and DTLS and ICE state are freed. A seat pending its answer is not a seat and is not
+    /// measured. This is the only reaping a forwarding room gets; a single seat is never freed for
+    /// silence (see [`Self::scan_inactive_forward_seats`]). Driven by the datapath's logical clock,
+    /// so tests advance it with `advance_clock`. Returns how many rooms were freed.
+    pub async fn reap_idle_forward_rooms(&self, idle_ticks: u64) -> usize {
+        let now = self.datapath.now_ticks();
+        let forward = self.conference.forward();
+        let before = forward.room_count();
+        let freed = forward.reap_silent_rooms(now, idle_ticks, |endpoint| {
+            self.datapath.last_activity(endpoint)
+        });
+        self.stop_seat_ice_follow(&freed);
+        self.retire_dtls_endpoints(&freed);
+        for endpoint in &freed {
+            self.datapath.remove_endpoint(*endpoint).await;
+            self.endpoint_calls.remove(endpoint);
+            self.awaiting_media.remove(endpoint);
+        }
+        before.saturating_sub(forward.room_count())
+    }
+
     /// The call-id owning `endpoint`, if any — RTCP-telemetry correlation.
     #[must_use]
     pub fn call_for_endpoint(&self, endpoint: EndpointId) -> Option<String> {

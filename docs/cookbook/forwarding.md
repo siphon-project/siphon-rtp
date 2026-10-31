@@ -18,8 +18,10 @@ The verbs exist on the native JSON control channel only, and take no `scope`: pu
 | Verb | What it does |
 |---|---|
 | `forward_join` | Seat a member (creating the room on the first join) and answer its SDP |
+| `forward_offer` | Dial a member out: offer it a seat, pending until it answers |
+| `forward_answer` | Seat the member that answered a `forward_offer` |
 | `forward_set_source` | Choose whose audio is forwarded: a `from_tag`, or none |
-| `forward_leave` | Unseat a member; the room ends with its last member |
+| `forward_leave` | Unseat a member (or drop its unanswered offer); the room ends with its last member |
 
 ```json
 {"id":1,"command":"forward_join","conference_id":"group-1","from_tag":"a7c31f","sdp":"v=0\r\n..."}
@@ -35,7 +37,40 @@ packet has actually been forwarded. A `from_tag` no seat has is an error. Packet
 not the source are counted in that seat's endpoint `packets_dropped` and dropped; the source never
 hears itself. If the source leaves, nothing is forwarded until the next `forward_set_source`.
 
-Check `node_info` `features` for `forward_room` first. A draining node refuses `forward_join`.
+Check `node_info` `features` for `forward_room` first (`forward_dialout` for the offer and answer verbs,
+`forward_transcode` for mixed-codec rooms). A draining node refuses `forward_join` and `forward_offer`.
+
+## Dialling a member out
+
+`forward_join` answers a member who called the room. A group call also fans out the other way: the
+controller INVITEs each member, so the engine is the offerer (RFC 3264 §5). `forward_offer` allocates
+the seat's endpoints and returns the SDP offer; `forward_answer` takes the member's answer and seats it
+exactly as `forward_join` would have.
+
+```json
+{"id":1,"command":"forward_offer","conference_id":"group-1","from_tag":"b19e02",
+ "profile":{"floor_fmtp":"mc_queueing;mc_priority=5;mc_granted"}}
+{"id":2,"command":"forward_answer","conference_id":"group-1","from_tag":"b19e02","sdp":"v=0\r\n...",
+ "received_from":"203.0.113.9"}
+```
+
+The offer is plain `RTP/AVP`, `a=sendrecv`, `a=rtcp-mux`. When the room exists it lists the room's
+codec first, with its format parameters (AMR `octet-align` and `mode-set`, G.729 `annexb`), then every
+codec the engine can transcode to and from it, then telephone-event per clock rate. When the room does
+not exist yet the first seat fixes the codec, so the offer lists every codec a room could carry, widest
+band first, edited by the profile's codec flags; AMR and G.729 are listed on any build because
+forwarding needs no codec. With `profile.floor_fmtp` the offer carries an anchored
+`m=application <port> udp MCPTT` section with `a=fmtp:MCPTT <floor_fmtp>` verbatim, wired like the floor
+stream of a `forward_join`: an answer that accepts it (a port) gives the seat a floor stream, port 0
+leaves an audio-only seat.
+
+Until it is answered the seat is **pending**: it holds its endpoints but is not in the room, so nothing
+is forwarded to or from it. A pending seat ends one of four ways, each freeing its endpoints: answered
+(and seated, or refused), `forward_leave`, a refused answer, or the setup-timeout sweep
+(`--setup-timeout-secs`, else `--media-timeout-secs`). The answer's first audio format must be one the
+offer listed. SDES, DTLS-SRTP and ICE are not offered (`conference_offer` does not either); a profile
+asking for them is refused. An id that names a mixing conference is refused, as `conference_offer`
+refuses an id that names a forwarding room.
 
 ## The codec rule
 
@@ -52,17 +87,57 @@ with **its own** payload type for it. "That codec" means the same payload format
 The AMR `mode-set` is the room's (the first seat's). A later seat is answered with it (RFC 4867
 §8.3.1), so a seat whose own offer excludes a mode the room may send is refused.
 
-A seat that cannot is refused with a reason that names the room's codec and what it offered, for
-example `the room carries AMR-WB/16000 (octet-aligned) and the seat does not offer it: AMR-WB/16000
-payload type 96: bandwidth-efficient where the room is octet-aligned (RFC 4867 §4.4)`. Nothing is
-transcoded: a seat that cannot take the room codec as it is does not join.
+A seat that offers another codec is not refused any more: the room **transcodes** for it when the
+engine has a decoder and an encoder for both its codec and the room's, and the seat's packetization
+interval is the room's (see below). A seat the room can neither forward to nor transcode for is refused
+with a reason that names the room's codec and why each offered codec failed, for example
+`the room carries AMR-WB/16000 (octet-aligned) and the seat does not offer it: ...; and it cannot be
+transcoded to: PCMU/8000 payload type 0: this build lacks AMR transcoding (built without the amr
+feature)`. A seat that offers the room's codec as it is always wins over a transcode, whatever the
+offer's order, because forwarding it costs nothing.
 
 The room needs no encoder or decoder for its codec, so a codec this build cannot transcode forwards
-fine. AMR-WB works without the `amr` feature.
+fine. AMR-WB works without the `amr` feature. Transcoding AMR needs it (patent-licensed, see
+`docs/codec-licensing.md`); a build without it forwards an AMR room and refuses a seat in another codec,
+saying so.
 
 RFC 4733 telephone-event is forwarded from the source to a receiver that negotiated it at the same
 clock rate, under the receiver's own payload type. A receiver that did not is not sent it, which
 leaves a gap in that receiver's sequence numbers where the event packets were.
+
+## Seats in another codec
+
+Same-codec seats keep the zero-copy path above, unchanged. A seat in another codec (a PCMU or Opus
+member in an AMR-WB room, say) is handled by the room's transcoder, which is built when the first such
+seat arrives:
+
+* **Decode once.** The source's packet is decoded once per inbound packet, however many seats need it,
+  by one decoder per room. A decoder's state belongs to one stream, so it is rebuilt when the source
+  changes.
+* **Encode once per codec group.** Seats that share a codec, clock rate, packetization interval and
+  payload format parameters form a group, and their payload is byte-identical, so the group's one
+  encoder output serves them all. Between the decoder and each group the audio is resampled when the
+  rates differ (the same resampler the mixing conference uses). An encoder is shared by its group and
+  carries on across a source change.
+* **Packetize per seat.** Each seat is sent that payload through its own translator, so it gets its own
+  SSRC, sequence numbers and timestamps (on its own codec's RTP clock, RFC 3551 §4.5), a marker on the
+  first packet after a source change, and its own payload type.
+* **A cross-codec source** is decoded, resampled to the room codec's rate, encoded once in the room
+  codec and forwarded to the room-codec seats as if it were a room-codec source. A seat in the source's
+  own codec group is sent its packet as it arrived: nothing to transcode. Other groups get the decoded
+  audio encoded for them.
+* **Telephone-event** reaches every receiver that negotiated it, under its own payload type, with
+  timestamps and durations rescaled when its clock differs from the source's (RFC 4733 §2.3). A receiver
+  that did not negotiate it is not sent it.
+
+Limits, all explicit: the seat's packetization interval must equal the room's, so one inbound packet
+maps to one outbound packet (a seat offering another interval is refused with the reason, and a packet
+whose decoded length is not the negotiated frame is dropped and counted in the source's
+`transcode_dropped`, never re-framed: the room has no jitter buffer); there is no loss concealment, so
+a lost source packet is a gap at every receiver, as it is for a same-codec seat; a receiver's codec mode
+request (RFC 4867 CMR) is not applied, since one encoder output serves a whole group. The DSP is a few
+microseconds per frame and runs inline; nothing is allocated per packet (a counting-allocator test holds
+that), except that rebuilding the decoder at a source change allocates once per talk spurt.
 
 ## RTCP
 
@@ -148,20 +223,33 @@ before, never on the plain in-kernel relay.
 
 ## Inactivity
 
-A forwarding seat is **never freed for silence**. A listener sends nothing for as long as others
+A forwarding seat is **never freed for silence** on its own. A listener sends nothing for as long as others
 talk, and an RTCP keepalive is optional. Liveness is any accepted RTP or RTCP datagram on the seat's
 endpoint. When a seat has been quiet past `--media-timeout-secs`, the sweep sends `forward_seat_inactive`
 (`conference_id`, `from_tag`) to the client that seated it, once. The seat stays seated. It is
 reported again only after it has been heard from in between. What to do about it is the controller's
 call: `forward_leave` frees it.
 
+### The room backstop
+
+A room nobody ended (a controller that crashed, an operator that forgot) must not hold its sockets
+forever. `--forward-room-idle-secs` (default 3600, `0` disables) frees a room in which **every** seat
+has received nothing at all, no RTP, RTCP or floor packet, for that long. Each seat is reported to the
+client that seated it as a `media_timeout` (`no_media`, empty `call_id`, `conference_id` the room, one
+event per seat), then the room and every endpoint are freed. A live group cannot trip it: receivers send
+RTCP receiver reports (RFC 3550 §6.2), so a room that has heard from none of them for an hour has no
+members left. Seats pending their answer are not counted, and a single seat is still never reaped.
+
 ## Security and NAT
 
-A forwarding seat is gated exactly like a conference seat, because the same code gates both: the
+A dialled-out seat is gated by its answer's signalled source (or `received_from`) and is not offered
+SRTP or ICE. A forwarding seat is gated exactly like a conference seat, because the same code gates both: the
 source must be the signalled one (or the `received-from` hint, or any source for an ICE or
 `symmetric` seat), media from a DTLS seat before its handshake or an ICE seat before its pair is
 selected is dropped, SRTP is checked before anything else, and the reply address follows the
-constrained SSRC latch. A secure receiver is sent SRTP under its own key. See
+constrained SSRC latch. A secure receiver is sent SRTP under its own key. A cross-codec seat is gated
+by the same chain; only after the gate does its payload reach a decoder, so an unsigned source never
+feeds one. See
 [Layer 5c-ii of the security model](../security-and-nat.md). The floor stream is gated the same way
 but learns its reply address once and never moves it (there is no SSRC to prove a rebind): Layer 5h.
 
@@ -189,3 +277,15 @@ End to end on the UDP-loopback datapath (`tests/forward_500_seats.rs`, release b
 seated, one talking for 50 frames at 20 ms. Every one of the 499 listeners received all 50 frames,
 24,950 datagrams, byte for byte, in 0.98 s: the talk ran at the pace of the source, with nothing
 queued behind it.
+
+## Mixed-codec fan-out cost
+
+`cargo bench -p siphon-rtp --bench forward_transcode_bench` (release build, one core, no sockets): a
+100-seat room with one PCMU seat (the room codec), 50 PCMA seats and 49 Opus seats, one 20 ms frame in.
+
+| Source | Per inbound packet | Per forwarded packet |
+|---|---|---|
+| PCMU (the room codec) | 174 us | 1.76 us |
+| PCMA (a cross-codec seat) | 170 us | 1.72 us |
+
+At 50 packets per second that is under 1% of one core, against about 18 ns per forwarded packet when every seat reads the room codec (above).

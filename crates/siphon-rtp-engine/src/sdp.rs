@@ -20,7 +20,7 @@ use siphon_rtp_srtp::sdes::CryptoAttribute;
 mod amr;
 mod decline;
 mod direction;
-mod floor;
+pub(crate) mod floor;
 mod offer;
 mod stream_identity;
 pub use offer::conference_seat_offer;

@@ -455,28 +455,34 @@ async fn a_draining_node_admits_no_new_forwarding_seat() {
 }
 
 #[tokio::test]
-async fn a_seat_that_cannot_read_the_room_codec_is_refused_and_leaves_nothing_allocated() {
+async fn a_seat_in_a_codec_nobody_can_transcode_is_refused_and_leaves_nothing_allocated() {
     let engine = engine_with_dispatcher();
     let (_phone_a, _) = seat(&engine, "a", 96).await;
     let (_, addr) = phone().await;
-    // Bandwidth-efficient AMR-WB against an octet-aligned room (RFC 4867 §4.4).
-    let result = join_with(&engine, "b", amr_wb_sdp(addr, 96, "octet-align=0")).await;
+    // A codec the engine has neither a decoder nor an encoder for can be neither forwarded to the
+    // room's seats nor transcoded.
+    let offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 77\r\na=rtpmap:77 speex/8000\r\na=rtcp-mux\r\n",
+        ip = addr.ip(),
+        port = addr.port()
+    );
+    let result = join_with(&engine, "b", offer).await;
     let CmdResult::Error { reason } = result else {
         panic!("expected a refusal");
     };
-    assert!(reason.contains("AMR-WB/16000 (octet-aligned)"), "{reason}");
+    assert!(
+        reason.contains("the room carries AMR-WB/16000 (octet-aligned)"),
+        "{reason}"
+    );
+    assert!(reason.contains("cannot be transcoded"), "{reason}");
+    assert!(reason.contains("SPEEX/8000 payload type 77"), "{reason}");
     assert_eq!(engine.conference().forward().seat_count(), 1);
     assert_eq!(
         engine.endpoint_calls.len(),
         1,
         "the refused seat holds nothing"
     );
-    // PCMU is another codec altogether.
-    let result = join_with(&engine, "c", sdp_for(addr, true)).await;
-    let CmdResult::Error { reason } = result else {
-        panic!("expected a refusal");
-    };
-    assert!(reason.contains("the room carries AMR-WB/16000"), "{reason}");
 }
 
 #[tokio::test]
@@ -541,27 +547,6 @@ async fn a_forwarding_room_and_a_mixing_conference_do_not_share_an_id() {
         result,
         CmdResult::Error {
             reason: "forward_join: mix is a mixing conference; use conference_join".into()
-        }
-    );
-}
-
-#[tokio::test]
-async fn the_verbs_the_engine_does_not_serve_yet_are_still_refused_by_name() {
-    let engine = Engine::new(UdpLoopbackDatapath::new());
-    let result = engine
-        .handle(
-            CLIENT,
-            Command::ForwardOffer {
-                conference_id: ROOM.into(),
-                from_tag: "a".into(),
-                profile: ProfileFlags::default(),
-            },
-        )
-        .await;
-    assert_eq!(
-        result,
-        CmdResult::Error {
-            reason: "unsupported command: forward_offer".into()
         }
     );
 }
@@ -722,3 +707,5 @@ async fn a_nated_seat_is_gated_on_and_sent_to_its_received_from_address() {
         .expect("send");
     assert_eq!(hear(&phone_a).await.payload, [6]);
 }
+
+mod dial_out;

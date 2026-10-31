@@ -75,6 +75,12 @@ impl RoomCodec {
         ))
     }
 
+    /// The room's codec as its first seat offered it.
+    #[must_use]
+    pub fn spec(&self) -> &CodecSpec {
+        &self.reference
+    }
+
     /// The RTP clock rate the room's timestamps run at (RFC 3550 §5.1).
     #[must_use]
     pub fn clock_rate_hz(&self) -> u32 {
@@ -173,6 +179,34 @@ impl RoomCodec {
             "the room carries {} and the seat does not offer it: {offer}",
             self.describe()
         ))
+    }
+}
+
+impl RoomCodec {
+    /// The first of the `offered` codecs (offer order) a seat could be transcoded in: the engine has
+    /// a decoder and an encoder for both it and the room's codec, and its packetization interval is
+    /// the room's. The spec carries the seat's own payload type and parameters, which is what its
+    /// answer presents. Used for a seat that [`Self::admit`] refused: the room then decodes the
+    /// source once per packet and encodes once per codec group (see the transcode module).
+    ///
+    /// # Errors
+    /// A reason naming each offered codec and why it cannot be transcoded (a build without the `amr`
+    /// feature says so).
+    pub fn admit_cross(&self, offered: &[CodecSpec]) -> Result<CodecSpec, String> {
+        let mut reasons = Vec::new();
+        for spec in offered {
+            match super::transcode::check_pair(&self.reference, spec) {
+                Ok(()) => return Ok(spec.clone()),
+                Err(reason) => reasons.push(format!(
+                    "{}/{} payload type {}: {reason}",
+                    spec.encoding_name, spec.clock_rate_hz, spec.payload_type
+                )),
+            }
+        }
+        if reasons.is_empty() {
+            return Err("the offer has no audio codec".to_string());
+        }
+        Err(reasons.join("; "))
     }
 }
 

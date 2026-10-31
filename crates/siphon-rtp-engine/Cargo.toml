@@ -142,6 +142,12 @@ harness = false
 name = "forward_fanout_bench"
 harness = false
 
+# Cross-codec seats in a forwarding room: decode once, encode once per codec group, packetize per
+# seat, at 100 seats over two codec groups, with no sockets.
+[[bench]]
+name = "forward_transcode_bench"
+harness = false
+
 # The MCPTT floor stream in a forwarding room at 500 seats: one floor message from the wire to its
 # `rtcp_app` event, and one room-wide `send_rtcp_app`, with no sockets.
 [[bench]]

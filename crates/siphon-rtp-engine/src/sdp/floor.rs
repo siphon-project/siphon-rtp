@@ -170,6 +170,24 @@ pub fn anchor_floor(sdp: &str, engine: EngineMedia, fmtp: Option<&str>) -> Strin
     out.join(CRLF)
 }
 
+/// The floor-control section of an offer the engine writes (a `forward_offer`): `m=application
+/// <port> udp MCPTT` on the engine's floor endpoint, with its own media-level `c=` (RFC 4566 §5.7)
+/// so the session-level address stays the audio's, and the controller's `a=fmtp:MCPTT <fmtp>`
+/// verbatim (TS 24.380 §14; the answerer accepts the stream by answering it with a port, or
+/// declines it with port 0, RFC 3264 §6). `None` or an empty `fmtp` writes no fmtp line. The
+/// caller has validated `fmtp` ([`validate_floor_fmtp`]).
+#[must_use]
+pub fn floor_offer_section(rtp_port: u16, advertised: IpAddr, fmtp: Option<&str>) -> String {
+    let mut section = format!(
+        "m=application {rtp_port} udp {FLOOR_FORMAT}{CRLF}c=IN {} {advertised}{CRLF}",
+        addrtype(advertised)
+    );
+    if let Some(parameters) = fmtp.filter(|parameters| !parameters.is_empty()) {
+        section.push_str(&format!("a=fmtp:{FLOOR_FORMAT} {parameters}{CRLF}"));
+    }
+    section
+}
+
 /// How a presented SDP treats its MCPTT floor-control section, beside [`super::TextRewrite`] and
 /// [`super::ImageRewrite`]. There is no pass-through: an unanchored section would hand the other party
 /// the offerer's own, often private, floor address, so the section is anchored or declined.
@@ -445,6 +463,38 @@ mod tests {
                 "v=0\r\nc=IN IP6 2001:db8::1\r\n",
                 "m=application 30002 udp MCPTT\r\nc=IN IP6 2001:db8::7\r\n"
             )
+        );
+    }
+
+    #[test]
+    fn the_offered_section_is_anchored_with_its_own_connection_and_the_fmtp_verbatim() {
+        let section = floor_offer_section(
+            30002,
+            "198.51.100.7".parse().unwrap(),
+            Some("mc_queueing;mc_priority=5;mc_granted"),
+        );
+        assert_eq!(
+            section,
+            concat!(
+                "m=application 30002 udp MCPTT\r\n",
+                "c=IN IP4 198.51.100.7\r\n",
+                "a=fmtp:MCPTT mc_queueing;mc_priority=5;mc_granted\r\n",
+            )
+        );
+        // The engine's own parser reads it back as a live floor section on that address.
+        let offer = format!("v=0\r\nc=IN IP4 198.51.100.7\r\nm=audio 30000 RTP/AVP 0\r\n{section}");
+        assert_eq!(
+            parse_floor(&offer).unwrap().remote,
+            "198.51.100.7:30002".parse::<SocketAddr>().unwrap()
+        );
+        let bare = floor_offer_section(30002, "2001:db8::7".parse().unwrap(), None);
+        assert_eq!(
+            bare, "m=application 30002 udp MCPTT\r\nc=IN IP6 2001:db8::7\r\n",
+            "no fmtp line without parameters"
+        );
+        assert_eq!(
+            floor_offer_section(30002, "198.51.100.7".parse().unwrap(), Some("")),
+            "m=application 30002 udp MCPTT\r\nc=IN IP4 198.51.100.7\r\n"
         );
     }
 

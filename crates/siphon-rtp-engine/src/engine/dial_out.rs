@@ -52,7 +52,7 @@ fn pending_key(conference_id: &str, from_tag: &str) -> PendingKey {
 /// Dynamic payload types for the formats the offer lists that have no static one (RFC 3551 §6). The
 /// AMR pair follow 3GPP TS 26.114 Table A.1.2's layout (bandwidth-efficient first), Opus keeps the
 /// engine's conventional number, and none of them collide.
-const AMR_WB_PAYLOAD_TYPES: [u8; 2] = [96, 97];
+pub(super) const AMR_WB_PAYLOAD_TYPES: [u8; 2] = [96, 97];
 const AMR_PAYLOAD_TYPES: [u8; 2] = [98, 99];
 const G726_32_PAYLOAD_TYPE: u8 = 102;
 /// Telephone-event (RFC 4733) payload types, one per clock rate the codecs use.
@@ -62,7 +62,7 @@ const TELEPHONE_EVENT_PAYLOAD_TYPES: [(u32, u8); 3] = [(8000, 101), (16_000, 100
 /// wideband pair (AMR-WB, G.722), then the narrowband codecs. A format this build cannot decode,
 /// encode or hold in a room is filtered out by [`offerable_codecs`], so the list never promises a
 /// codec the answer would then fail to seat in.
-fn candidate_codecs() -> Vec<CodecSpec> {
+pub(super) fn candidate_codecs() -> Vec<CodecSpec> {
     let mut candidates = vec![CodecSpec::new(
         OPUS_DYNAMIC_PAYLOAD_TYPE,
         factory::OPUS_ENCODING_NAME,
@@ -84,7 +84,7 @@ fn candidate_codecs() -> Vec<CodecSpec> {
 /// The codecs a seat is offered in: [`candidate_codecs`] the room can mix in this build (the same
 /// [`build_seat_codec`] test a join's codec passes), edited by the profile's codec flags with the
 /// rules `conference_join` and `answer_local` apply to an offer's codecs.
-fn offerable_codecs(profile: &ProfileFlags) -> Vec<CodecSpec> {
+pub(super) fn offerable_codecs(profile: &ProfileFlags) -> Vec<CodecSpec> {
     // Which candidates this build can mix depends only on the build, so it is decided once per
     // process: building every codec (an Opus and an AMR-WB encoder among them) on each offer would
     // cost call setup far more than the offer itself.
@@ -104,7 +104,7 @@ fn offerable_codecs(profile: &ProfileFlags) -> Vec<CodecSpec> {
 }
 
 /// One telephone-event per clock rate among `codecs`, in the order the rates first appear.
-fn offered_events(codecs: &[CodecSpec]) -> Vec<TelephoneEvent> {
+pub(super) fn offered_events(codecs: &[CodecSpec]) -> Vec<TelephoneEvent> {
     let mut events: Vec<TelephoneEvent> = Vec::new();
     for codec in codecs {
         let Some(&(clock_rate_hz, payload_type)) = TELEPHONE_EVENT_PAYLOAD_TYPES
@@ -129,7 +129,7 @@ fn offered_events(codecs: &[CodecSpec]) -> Vec<TelephoneEvent> {
 /// Refuse a profile asking for what an offering seat cannot do. The offer is plain `RTP/AVP` with no
 /// ICE: SDES and DTLS-SRTP keying and ICE candidate gathering are all built around answering a
 /// peer's offer, and an offer that claimed them would have nothing behind it.
-fn refuse_unsupported_profile(profile: &ProfileFlags) -> Result<(), String> {
+pub(super) fn refuse_unsupported_profile(profile: &ProfileFlags) -> Result<(), String> {
     if let Some(protocol) = profile.transport_protocol.as_deref() {
         if !protocol.trim().eq_ignore_ascii_case("RTP/AVP") {
             return Err(format!(
@@ -152,12 +152,14 @@ fn refuse_unsupported_profile(profile: &ProfileFlags) -> Result<(), String> {
 
 /// The seat's codec from the answer: its first audio format (RFC 3264 §6.1, the answerer lists the
 /// one it will use first), which must be a payload type the offer listed under the same encoding.
-fn answered_codec(info: &sdp::MediaInfo, pending: &PendingSeat) -> Result<CodecSpec, String> {
+pub(super) fn answered_codec(
+    info: &sdp::MediaInfo,
+    offered: &[CodecSpec],
+) -> Result<CodecSpec, String> {
     let Some(answered) = info.audio_codecs().into_iter().next() else {
         return Err("the answer has no audio codec".to_string());
     };
-    let Some(offered) = pending
-        .offered
+    let Some(offered) = offered
         .iter()
         .find(|offered| offered.payload_type == answered.payload_type)
     else {
@@ -204,6 +206,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         if let Err(reason) = refuse_unsupported_profile(&profile) {
             return error_result("conference_offer", &reason);
+        }
+        // A forwarding room (push-to-talk) and a mixing room share no seats: the id names one kind.
+        if self.conference.forward().contains(conference_id) {
+            return error_result(
+                "conference_offer",
+                &format!("{conference_id} is a forwarding room; use forward_offer"),
+            );
         }
         if self.has_pending_seat(conference_id, &from_tag) {
             return error_result(
@@ -299,6 +308,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         };
         let endpoint = pending.endpoint;
+        // The id may have become a forwarding room since the offer; the seat would join the wrong
+        // kind of room, so it is refused and its endpoint freed.
+        if self.conference.forward().contains(conference_id) {
+            self.free(&[endpoint]).await;
+            return error_result(
+                "conference_answer",
+                &format!("{conference_id} is a forwarding room; use forward_answer"),
+            );
+        }
         let request = match self.answered_seat(from_tag, answer, received_from, pending) {
             Ok(request) => request,
             Err(reason) => {
@@ -345,7 +363,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 info.remote_rtp.ip()
             ));
         }
-        let codec = answered_codec(&info, &pending)?;
+        let codec = answered_codec(&info, &pending.offered)?;
         let codec = build_seat_codec(codec)?;
         // The answer's event payload type, when it is one the offer listed.
         let telephone_event =
@@ -424,7 +442,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .filter(|seat| now.saturating_sub(seat.offered_tick) >= budget)
             .map(|seat| seat.key().clone())
             .collect();
-        let mut reaped = 0;
+        let mut reaped = self.reap_pending_forward_seats(now, budget).await;
         for key in expired {
             // Re-checked on removal: an answer may have consumed the seat since the scan.
             if let Some((_, pending)) = self.pending_seats.remove_if(&key, |_, seat| {
@@ -440,7 +458,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Offered seats awaiting their answer (the leak soak gates on this draining to zero).
     #[must_use]
     pub fn pending_seat_count(&self) -> usize {
-        self.pending_seats.len()
+        self.pending_seats.len() + self.pending_forward_seat_count()
     }
 }
 
