@@ -31,6 +31,7 @@ mod gather;
 mod inject;
 mod install;
 mod intercept;
+mod key_mgmt;
 mod media_started;
 mod negotiate;
 

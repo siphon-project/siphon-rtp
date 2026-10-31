@@ -94,6 +94,27 @@ is months of work and its own attack surface. The exposure is bounded: SCTP byte
 after the DTLS record layer has authenticated them (see
 [security-and-nat.md](security-and-nat.md#webrtc-data-channel-floor-control)).
 
+### SRTCP `AEAD_AES_128_GCM` (`siphon-rtp-srtp`)
+
+MCPTT floor control is protected hop by hop with `AEAD_AES_128_GCM` (RFC 7714), which needs a GCM
+implementation next to the AES-CM one the crate already has. `aes-gcm` is the RustCrypto AEAD built on the
+same `aes` 0.8 / `cipher` 0.4 / `ctr` 0.9 line the crate pins on purpose (see the comment in its
+`Cargo.toml`), so the 0.10 series is used and 0.11 is not. `>= 0.10.3` is required: RUSTSEC-2023-0096
+(plaintext exposed by `decrypt_in_place_detached` on tag failure) is fixed there. Only the RTCP side is
+used, through the `AeadInPlace` detached API on caller-owned buffers. All five are `MIT/Apache-2.0` and
+published by the RustCrypto organisation.
+
+| Crate | Why | Review facts |
+| --- | --- | --- |
+| `aes-gcm` 0.10.3 | The AEAD itself. | 2023-09-21; owners tarcieri and the `github:rustcrypto:aeads` team; `#![deny(unsafe_code)]`; no `build.rs`; RUSTSEC-2023-0096 fixed in 0.10.3. |
+| `ghash` 0.5.1 | GCM's GHASH. | 2024-03-03; no `unsafe`; no `build.rs`. |
+| `polyval` 0.6.2 | The carry-less multiply under GHASH. | 2024-03-03; `unsafe` only in the CLMUL / PMULL intrinsic backends, selected at run time with `cpufeatures`; no `build.rs`; no assembly. |
+| `universal-hash` 0.5.1 | Trait under `ghash` / `polyval`. | 2023-05-19; 3 `unsafe` uses; no `build.rs`. |
+| `opaque-debug` 0.3.1 | Debug impl that hides key-dependent state. | 2024-03-01; no `unsafe`. |
+
+`aead` 0.5.2 was already in the tree. The fuzz/ and crates/siphon-rtp-xdp/ lockfiles gain the same four
+new crates; `cargo deny check` is green against all three lockfiles.
+
 ## Software Bill of Materials (SBOM)
 
 Every tagged release ships a full SBOM in **two industry formats**, generated from the exact

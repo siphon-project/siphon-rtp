@@ -10,7 +10,7 @@
 
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{Datapath, Endpoint, FlowAction, SourceFilter};
-use siphon_rtp_proto::{CmdResult, Command, ProfileFlags};
+use siphon_rtp_proto::{CmdResult, Command, ForwardMedia, ProfileFlags};
 
 use crate::dtls_bridge::PipelineTarget;
 use crate::floor_channel::{floor_channel, FloorScope, FloorSink};
@@ -21,6 +21,33 @@ use super::answer_local::answer_codec_candidates;
 use super::negotiate::{parse_codec_flags, peer_media_address, random_ssrc};
 use super::seat_transport::SeatTransport;
 use super::{boxed_error_result, error_result, ok_empty, ok_sdp, ClientId, Engine};
+
+/// `floor_keys` are part of the contract but not implemented by this build: refused loudly, before
+/// anything is allocated, rather than ignored.
+///
+/// `key_mgmt` is refused in a translate room: it sets up end-to-end SRTP between the UEs, which the
+/// translator breaks by rewriting the SSRC and sequence number (RFC 3711 §3.3 authenticates both;
+/// 3GPP TS 33.180 §7.5.2 NOTE 3). The call would connect and the audio be silently undecryptable.
+fn refuse_forward_security(profile: &ProfileFlags, media: ForwardMedia) -> Result<(), String> {
+    crate::media_pipeline::refuse_floor_keys(profile)?;
+    if profile.key_mgmt.is_some() && media == ForwardMedia::Translate {
+        return Err("key_mgmt sets up end-to-end SRTP, which a translate room rewrites; use \"media\": \"preserve\"".to_string());
+    }
+    Ok(())
+}
+
+/// Whether a seat can join a room carrying `media`, judged from its offer alone,
+/// before anything is allocated.
+///
+/// * A preserve room forwards SRTP keyed between the UEs (3GPP TS 33.180 §7.5.2 NOTE 3), so a seat
+///   whose media the engine would terminate (a=crypto, DTLS-SRTP) cannot be in it.
+fn refuse_seat_keying(info: &sdp::MediaInfo, media: ForwardMedia) -> Result<(), String> {
+    let preserve = media == ForwardMedia::Preserve;
+    if preserve && (info.dtls || info.fingerprint.is_some() || !info.crypto.is_empty()) {
+        return Err(super::seat_transport::preserve_keying_refusal(info));
+    }
+    Ok(())
+}
 
 /// How a seat joins its room: the room's codec as it stands (or as this seat fixes it), the codec
 /// the seat is answered in, and whether the room transcodes for the seat.
@@ -39,15 +66,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag,
                 sdp,
                 profile,
+                media,
             } => {
-                self.forward_join(client, &conference_id, from_tag, &sdp, &profile)
+                if let Err(reason) = refuse_forward_security(&profile, media) {
+                    return error_result("forward_join", &reason);
+                }
+                self.forward_join(client, &conference_id, from_tag, &sdp, &profile, media)
                     .await
             }
             Command::ForwardOffer {
                 conference_id,
                 from_tag,
                 profile,
-            } => self.forward_offer(&conference_id, from_tag, profile).await,
+                media,
+            } => {
+                if let Err(reason) = refuse_forward_security(&profile, media) {
+                    return error_result("forward_offer", &reason);
+                }
+                self.forward_offer(&conference_id, from_tag, profile, media)
+                    .await
+            }
             Command::ForwardAnswer {
                 conference_id,
                 from_tag,
@@ -90,6 +128,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         from_tag: String,
         offer: &str,
         profile: &ProfileFlags,
+        media: ForwardMedia,
     ) -> CmdResult {
         if let Err(reason) = super::validate_sip_call_id(profile) {
             return error_result("forward_join", &reason);
@@ -111,11 +150,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &format!("{room_id} is a mixing conference; use conference_join"),
             );
         }
+        if let Err(reason) = refuse_seat_keying(&info, media) {
+            return error_result("forward_join", &reason);
+        }
         // The codec, chosen before anything is allocated. A codec needs neither an encoder nor a
         // decoder here: the room forwards the payload as it came (RFC 3550 §7.1).
         let offered = answer_codec_candidates(&info, &parse_codec_flags(&profile.flags));
         let forward = self.conference.forward();
-        let admission = match self.forward_admission(room_id, &offered) {
+        let admission = match self.forward_admission(room_id, &offered, media) {
             Ok(admission) => admission,
             Err(reason) => return error_result("forward_join", &reason),
         };
@@ -123,7 +165,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let telephone_event =
             sdp::TelephoneEvent::accompanying(&info.telephone_events(), Some(&spec));
         let mut transport = match self
-            .open_seat_transport("forward_join", room_id, &info, profile)
+            .open_seat_transport("forward_join", room_id, &info, profile, media)
             .await
         {
             Ok(transport) => transport,
@@ -321,20 +363,30 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         room_id: &str,
         offered: &[CodecSpec],
+        media: ForwardMedia,
     ) -> Result<ForwardAdmission, String> {
         let Some(room) = self.conference.forward().room_codec(room_id) else {
             return RoomCodec::from_offer(offered).map(|(room, spec)| ForwardAdmission {
-                room,
+                room: room.with_media(media),
                 spec,
                 transcoded: false,
             });
         };
+        // The first seat fixed the room's media mode.
+        if room.media() != media {
+            return Err(crate::forward::media_mismatch(room.media(), media));
+        }
         match room.admit(offered) {
             Ok(spec) => Ok(ForwardAdmission {
                 room,
                 spec,
                 transcoded: false,
             }),
+            // A preserve room forwards the talker's packets unchanged: another codec or payload
+            // type is refused, never transcoded (RFC 3550 §7.1).
+            Err(forwarded) if media == ForwardMedia::Preserve => Err(format!(
+                "preserve rooms forward the talker's packets unchanged: {forwarded}"
+            )),
             Err(forwarded) => match room.admit_cross(offered) {
                 Ok(spec) => Ok(ForwardAdmission {
                     room,

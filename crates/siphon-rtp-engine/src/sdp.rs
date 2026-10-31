@@ -22,6 +22,7 @@ mod data_channel;
 mod decline;
 mod direction;
 pub(crate) mod floor;
+mod key_mgmt;
 mod offer;
 mod stream_identity;
 pub use offer::conference_seat_offer;
@@ -40,6 +41,7 @@ pub use floor::{
     anchor_floor, decline_floor, parse_floor, validate_floor_fmtp, FloorFmtpError, FloorMediaInfo,
     FloorRewrite,
 };
+pub use key_mgmt::{apply_key_mgmt, terminates_keying};
 pub use stream_identity::{own_stream_identity, OwnSsrc};
 mod telephone_event;
 pub use telephone_event::TelephoneEvent;

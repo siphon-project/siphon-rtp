@@ -147,7 +147,9 @@ impl Command {
             // Names a call (the leg it moves) as well as a room, so the frame's scope keys it.
             | Command::ConferenceSeat { call_id, .. } => Some(call_id),
             // A two-party send names a call; a room-wide one names a room and has no call.
-            Command::SendRtcpApp { call_id, .. } => call_id.as_mut(),
+            Command::SendRtcpApp { call_id, .. } | Command::SetFloorKeys { call_id, .. } => {
+                call_id.as_mut()
+            }
             Command::Ping
             | Command::List
             | Command::Statistics
@@ -199,6 +201,10 @@ impl Command {
                 | Command::ForwardLeave { .. }
                 | Command::ForwardSetSource { .. }
                 | Command::SendRtcpApp {
+                    conference_id: Some(_),
+                    ..
+                }
+                | Command::SetFloorKeys {
                     conference_id: Some(_),
                     ..
                 }

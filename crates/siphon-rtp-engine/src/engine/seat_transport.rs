@@ -11,7 +11,7 @@
 
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction, IceConfig, SourceFilter};
 use siphon_rtp_dtls::{DtlsCertificate, Fingerprint as DtlsFingerprint};
-use siphon_rtp_proto::{CmdResult, ProfileFlags};
+use siphon_rtp_proto::{CmdResult, ForwardMedia, ProfileFlags};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 use std::net::{IpAddr, SocketAddr};
@@ -27,6 +27,20 @@ use super::{boxed_error_result, Engine, Leg};
 pub(super) struct SeatDtls {
     certificate: DtlsCertificate,
     peer_fingerprint: sdp::Fingerprint,
+}
+
+/// Why a seat that keys its own media cannot join a preserve room.
+pub(super) fn preserve_keying_refusal(info: &sdp::MediaInfo) -> String {
+    if info.dtls || info.fingerprint.is_some() {
+        "a DTLS-SRTP (WebRTC) seat cannot join a preserve room: the engine would have to terminate \
+         its SRTP, and a preserve room forwards end-to-end SRTP unchanged (3GPP TS 33.180 §7.5.2 NOTE 3)"
+            .to_string()
+    } else {
+        "a seat that offers a=crypto cannot join a preserve room: the engine must not terminate \
+         end-to-end media, and a preserve room relays SRTP keyed between the UEs (a=key-mgmt, \
+         3GPP TS 33.180 §7.5.2 NOTE 3)"
+            .to_string()
+    }
 }
 
 /// An opened seat transport.
@@ -84,6 +98,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         room_id: &str,
         info: &sdp::MediaInfo,
         profile: &ProfileFlags,
+        media: ForwardMedia,
     ) -> Result<SeatTransport, Box<CmdResult>> {
         // ICE on a room leg (RFC 8445). The room, not a datapath forward rule, owns the seat's
         // egress, so a selection has to reach the room actor as well as the datapath
@@ -204,6 +219,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // it after this command returns, so the seat is taken **pending** and keyed later over the
         // room's control. Until then the room drops its ingress and sends it nothing, so an unkeyed
         // seat can neither inject noise nor receive the room in the clear.
+        let preserve = media == ForwardMedia::Preserve;
+        if preserve && (info.dtls || !info.crypto.is_empty()) {
+            // Refused by the caller before this point; kept here so no caller can open a seat the
+            // engine would have to terminate in a room that forwards end-to-end SRTP untouched.
+            self.free(&[endpoint]).await;
+            return Err(boxed_error_result(verb, &preserve_keying_refusal(info)));
+        }
         let dtls = if info.dtls {
             // The handshake needs the engine's certificate and the offer's fingerprint. Both are
             // bound here, once, and carried to the answer and to the handshake plan.
@@ -242,6 +264,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     tls_id: None,
                 }),
             )
+        } else if info.secure && preserve {
+            // 3GPP TS 33.180 §7.5.2 NOTE 3: the SRTP of a preserve room is end to end between the UEs,
+            // keyed outside the engine (`a=key-mgmt`, RFC 4567). The seat is `RTP/SAVP` with no
+            // `a=crypto`: no context is built, the room relays the datagrams opaquely, and the
+            // answer keeps the offer's transport profile (RFC 3264 §6).
+            (None, None)
         } else if info.secure {
             let Some(remote) = info.crypto.first().copied() else {
                 self.free(&[endpoint]).await;
@@ -370,5 +398,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // not told the seat is sent its own SSRC, and name the SSRC the room really sends
             // (`own`). `a=mid` and `a=group:BUNDLE` stay (RFC 8843 §7.3).
             .map(|rewritten| sdp::own_stream_identity(&rewritten.sdp, own))
+            // `a=key-mgmt` is the controller's (RFC 4567): the offerer's is never echoed.
+            .map(|stripped| sdp::apply_key_mgmt(&stripped, profile.key_mgmt.as_deref()))
     }
 }
