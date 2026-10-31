@@ -10,6 +10,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 ### Added
 
 - **Contract: floor keys, `key_mgmt` and `media: preserve` (proto, not yet implemented by the engine).** `profile.floor_keys` (at most two `{mki, key, salt}`: AEAD_AES_128_GCM SRTCP master key and salt for floor control, 3GPP TS 33.180 §9.4.6/§9.4.8, `mki` the KFC-ID; key bytes are redacted from `Debug`), `profile.key_mgmt` (the controller's `a=key-mgmt` value, a passthrough like `floor_fmtp`), the `set_floor_keys` verb (replaces a seat's key set, newest two kept) and `media: translate|preserve` on `forward_join`/`forward_offer` (preserve forwards RTP and audio SRTCP byte for byte, because end-to-end SRTP needs the sender's SSRC kept, TS 33.180 §7.5.2 NOTE 3). All are optional on the wire. This engine build refuses each with an error instead of ignoring it.
+- **SRTCP with `AEAD_AES_128_GCM` (RFC 7714) in `siphon-rtp-srtp`, for MCPTT floor control.** New
+  `srtcp_gcm::SrtcpGcmContext`: 16-octet tag before the `E|index` word, a 4-octet MKI after it, session key and
+  salt from the RFC 3711 AES-CM PRF at rate 0, encrypted or authenticated-only (E=0) sending, and
+  authenticated-only packets accepted on receive. A key set of at most two master keys is selected by MKI and
+  replaced as a whole on rekey (the newest protects, the previous one still decrypts). Replay window recorded
+  only after the tag verifies; the 31-bit send index never wraps and can be read and reseeded for an HA
+  failover. Validated against the RFC 7714 section 17 vectors. New dependency `aes-gcm` 0.10.3 and its
+  RustCrypto helpers (`docs/supply-chain.md`). About 240 ns protect and 150 ns unprotect per packet
+  (`benches/srtp_bench.rs`).
+
 - **MCPTT floor control over a WebRTC data channel, for a browser seat (`node_info` feature
   `webrtc_floor_channel`).** A browser cannot send RTCP APP, so `forward_join` and `answer_local` now answer an
   `m=application <port> UDP/DTLS/SCTP webrtc-datachannel` section (RFC 8841) that is bundled with a DTLS-SRTP
