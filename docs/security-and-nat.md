@@ -276,7 +276,7 @@ Latch state machine, per direction:
 - **The `Redirect` consumers drop on reject, as the `Forward` path does.** On the `Forward` path a
   latch rejection is a **drop**: `Inner::update_latch` returns `Reject` and `dispatch` discards the
   packet. The userspace consumers (`SrtpBridge::handle`, `MediaCall::process`, `Conference::ingest`
-  and its text path, the text pipeline, and the WebSocket takeover's `WsEgress`) do the same through
+  and its text path, `ForwardRoom::ingest`, the text pipeline, and the WebSocket takeover's `WsEgress`) do the same through
   `SymmetricLatch::admit`: they decide the latch after SRTP authentication and **before** the packet
   is teed, intercepted, relayed, decoded, mixed or forwarded, and a rejected packet is dropped without
   counting as media activity. They used to only decline to move the reply address and still consume
@@ -403,7 +403,7 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
   from its first packet — no first-source race. Enforcement: `Inner::dispatch` (the Forward-path ICE
   branch) in [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs); the rule + `set_ice` ordering in `engine::answer`.
 - **The same gate runs on the `Redirect` path, and it has to.** Every userspace consumer — a
-  conference seat, a promoted transcode/record/echo call, a WebSocket takeover leg, the SRTP and DTLS
+  conference seat, a forwarding-room seat, a promoted transcode/record/echo call, a WebSocket takeover leg, the SRTP and DTLS
   bridges — receives its media as `FlowAction::Redirect`, and each re-enforces the **layer-2**
   signalled-source gate itself (Layers 5a–5d). That is not enough for an ICE endpoint, because an ICE
   leg deliberately runs layer 2 **open** (`SourceFilter::Any`): the signalled address is not the
@@ -1026,6 +1026,34 @@ so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the 
   conference text (like DTLS conference audio) remains a follow-up. The text endpoint is part of the
   room's endpoint set for the idle reap (text activity keeps the seat) and is freed with the participant
   on leave/teardown.
+
+### Layer 5c-ii: The forwarding room (push-to-talk) Redirect path
+A forwarding room (`engine/src/forward/`, verbs `forward_join` / `forward_leave` /
+`forward_set_source`) is a `FlowAction::Redirect` consumer with the **same** RTPBleed posture as the
+conference seat, because it runs the same code: the per-seat ingress chain lives in
+`engine/src/seat_gate.rs` and both `Conference::ingest` and `ForwardRoom::ingest` call it, so the two
+cannot drift. The redirect dispatcher reaches it through the conference registry's slot
+(`ConferenceRegistry::owns` / `dispatch` / `ice_selected` fall through to the forward registry), so
+the routing order is unchanged: bridge → media → text → udptl → ws → conference (and forward) → TURN.
+
+- **Same gates, same order.** Layer-2 signalled-source gate (exact source, or the `received-from`
+  hint, or `Any` for an ICE or `symmetric` seat); a DTLS seat not yet keyed and a full-ICE seat not
+  yet selected are refused (`secure_pending`, `ice_pending`); SRTP `unprotect` (RFC 3711 §3.3);
+  the constrained SSRC-consistent latch (RFC 3550 §8). A refused datagram never reaches the translator
+  and is not liveness. `forward_join` opens the seat's transport with the helper `conference_join`
+  uses (`Engine::open_seat_transport`), so ICE, DTLS-SRTP and SDES seats are supported identically.
+- **Never into the void, never in the clear.** A receiver is sent a packet only when it has a resolved
+  destination, is keyed (DTLS) and has had its pair selected (ICE); a secure receiver gets SRTP under
+  its own key, one `protect` per receiver. The source never receives its own audio.
+- **RTCP is terminated.** A seat's RTCP is read (SR to LSR/DLSR, reception report blocks to RTT) and
+  dropped, never relayed to the other seats (RFC 3550 §7.3: a translator rewrites reports, it does not
+  echo them). The room sends each reachable seat its own SR every 5 s about the stream it is sent.
+- **Liveness, not reaping.** Any accepted RTP or RTCP stamps the seat's endpoint; RTP from a seat that
+  is not the source is dropped after the gate and counts in the endpoint's `packets_dropped` while
+  still stamping liveness. A seat is never freed for silence (a listener sends nothing while others
+  talk): the sweep raises `forward_seat_inactive` once per quiet spell
+  (`ForwardRegistry::scan_inactive`) and the controller decides. It is freed by `forward_leave`, by a
+  failed ICE checklist, and with its room.
 
 ### Layer 5f — The RFC 4103 Real-Time Text (RTT) relay path
 A VoLTE/IMS call may carry a second media stream: an `m=text` line (RFC 4103, T.140 over RTP, usually
