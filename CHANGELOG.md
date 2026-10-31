@@ -42,6 +42,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   - A forwarding seat is never reaped for silence, because a push-to-talk listener sends nothing
     while others talk. It is reported as `forward_seat_inactive` instead.
 
+### Changed
+
+- **`rtc-dtls`, `rtc-shared` and `rtc-crypto` move to crates.io 0.21.1; the last-flight fork is retired.** The
+  RFC 6347 §4.2.4 last-flight retransmission fix landed upstream (webrtc-rs/rtc#243) and ships in
+  0.21.1, so the `[patch.crates-io]` git entries and the `allow-git` exception in `deny.toml` are gone.
+
 ### Fixed
 
 - **A WebRTC participant in a conference hears the room.** A seat's answer is written from the
