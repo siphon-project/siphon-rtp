@@ -10,7 +10,7 @@
 
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{Datapath, Endpoint, FlowAction, SourceFilter};
-use siphon_rtp_proto::{CmdResult, Command, ProfileFlags};
+use siphon_rtp_proto::{CmdResult, Command, ForwardMedia, ProfileFlags};
 
 use crate::dtls_bridge::PipelineTarget;
 use crate::floor_channel::{floor_channel, FloorScope, FloorSink};
@@ -21,6 +21,15 @@ use super::answer_local::answer_codec_candidates;
 use super::negotiate::{parse_codec_flags, peer_media_address, random_ssrc};
 use super::seat_transport::SeatTransport;
 use super::{boxed_error_result, error_result, ok_empty, ok_sdp, ClientId, Engine};
+
+/// The contract carries `media: preserve`, `floor_keys` and `key_mgmt`, but this build implements
+/// none of them. Refused loudly, before anything is allocated, rather than ignored.
+fn refuse_forward_security(profile: &ProfileFlags, media: ForwardMedia) -> Result<(), String> {
+    if media == ForwardMedia::Preserve {
+        return Err("media: preserve is not supported by this engine build".to_string());
+    }
+    crate::media_pipeline::refuse_floor_security(profile)
+}
 
 /// How a seat joins its room: the room's codec as it stands (or as this seat fixes it), the codec
 /// the seat is answered in, and whether the room transcodes for the seat.
@@ -39,7 +48,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag,
                 sdp,
                 profile,
+                media,
             } => {
+                if let Err(reason) = refuse_forward_security(&profile, media) {
+                    return error_result("forward_join", &reason);
+                }
                 self.forward_join(client, &conference_id, from_tag, &sdp, &profile)
                     .await
             }
@@ -47,7 +60,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 conference_id,
                 from_tag,
                 profile,
-            } => self.forward_offer(&conference_id, from_tag, profile).await,
+                media,
+            } => {
+                if let Err(reason) = refuse_forward_security(&profile, media) {
+                    return error_result("forward_offer", &reason);
+                }
+                self.forward_offer(&conference_id, from_tag, profile).await
+            }
             Command::ForwardAnswer {
                 conference_id,
                 from_tag,

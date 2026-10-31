@@ -779,6 +779,9 @@ pub enum Command {
         sdp: String,
         #[serde(default)]
         profile: ProfileFlags,
+        /// How the room carries media; see [`ForwardMedia`]. The first seat fixes the room's mode.
+        #[serde(default, skip_serializing_if = "ForwardMedia::is_translate")]
+        media: ForwardMedia,
     },
     /// Offer a **new seat** in a forwarding room for a member the room calls out to (a group call's
     /// fan-out), as [`Command::ConferenceOffer`] does for a mixing room. The engine answers with an
@@ -790,6 +793,9 @@ pub enum Command {
         from_tag: String,
         #[serde(default)]
         profile: ProfileFlags,
+        /// How the room carries media; see [`ForwardMedia`]. The first seat fixes the room's mode.
+        #[serde(default, skip_serializing_if = "ForwardMedia::is_translate")]
+        media: ForwardMedia,
     },
     /// The member's answer to a [`Command::ForwardOffer`]: seats it as [`Command::ForwardJoin`]
     /// would have. `received_from` is the post-NAT source IP, as on [`Command::ConferenceAnswer`].
@@ -848,6 +854,22 @@ pub enum Command {
         /// multiple of four bytes (RFC 3550 §6.7); the engine does not pad it.
         #[serde(with = "base64::strict")]
         payload: Vec<u8>,
+    },
+    /// Replace the SRTCP floor-control keys of one seat (3GPP TS 33.180 §9.4.6, §9.4.8).
+    ///
+    /// Addresses a seat of a forwarding room with `conference_id` (no `scope`) or one leg of a
+    /// two-party call with `call_id` + `from_tag` (`scope` applies); naming both or neither is
+    /// refused. `keys` REPLACES the seat's whole key set: nothing from an earlier call survives. When
+    /// more than two are given the oldest (first) are dropped and the newest two are kept, so a
+    /// controller can send its rolling key list unchanged; outbound floor control uses the last.
+    /// An empty `keys` removes every key from the seat.
+    SetFloorKeys {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
+        from_tag: String,
+        keys: Vec<FloorKey>,
     },
     /// Attach a **WebSocket tee** to a live call: stream its decoded audio to `ws_uri` while the call
     /// keeps relaying. Unlike `ProfileFlags::ws_uri` (takeover — the WS server *becomes* leg A's far
@@ -1460,6 +1482,154 @@ pub enum PlayMediaSource {
     Http { url: String },
 }
 
+/// The octets of an SRTCP master key for AEAD_AES_128_GCM (RFC 7714 §12.1).
+pub const FLOOR_KEY_LEN: usize = 16;
+/// The octets of the 96-bit SRTCP master salt of AEAD_AES_128_GCM (RFC 7714 §12).
+pub const FLOOR_SALT_LEN: usize = 12;
+/// The octets of the 112-bit SRTP master salt (RFC 3711 §4.3.1), the other length a MIKEY SP
+/// policy can negotiate.
+pub const FLOOR_SALT_LEN_LONG: usize = 14;
+/// The most floor keys a seat holds at once ([`ProfileFlags::floor_keys`], [`Command::SetFloorKeys`]).
+pub const MAX_FLOOR_KEYS: usize = 2;
+
+/// Why a [`FloorKey`] or [`ProfileFlags`] was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorKeyError {
+    /// The master key is not [`FLOOR_KEY_LEN`] octets.
+    KeyLength(usize),
+    /// The master salt is neither [`FLOOR_SALT_LEN`] nor [`FLOOR_SALT_LEN_LONG`] octets.
+    SaltLength(usize),
+    /// More than [`MAX_FLOOR_KEYS`] keys in a profile.
+    TooMany(usize),
+    /// `key_mgmt` contains a CR or LF; it is written into an SDP line verbatim.
+    KeyMgmtLineBreak,
+}
+
+impl std::fmt::Display for FloorKeyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KeyLength(length) => write!(
+                formatter,
+                "floor key must be {FLOOR_KEY_LEN} octets, got {length}"
+            ),
+            Self::SaltLength(length) => write!(
+                formatter,
+                "floor salt must be {FLOOR_SALT_LEN} or {FLOOR_SALT_LEN_LONG} octets, got {length}"
+            ),
+            Self::TooMany(count) => write!(
+                formatter,
+                "at most {MAX_FLOOR_KEYS} floor keys are allowed in a profile, got {count}"
+            ),
+            Self::KeyMgmtLineBreak => formatter.write_str("key_mgmt must not contain a line break"),
+        }
+    }
+}
+
+impl std::error::Error for FloorKeyError {}
+
+/// One SRTCP master key and salt for floor control (3GPP TS 33.180 §9.4.6 and §9.4.8).
+///
+/// The cipher is AEAD_AES_128_GCM (RFC 7714) with key derivation rate 0. `mki` is the 32-bit
+/// KFC-ID the controller signalled, carried as the SRTCP MKI. `key` and `salt` are base64 on the
+/// wire (RFC 4648 §4) and exactly [`FLOOR_KEY_LEN`] octets and [`FLOOR_SALT_LEN`] (RFC 7714 §12, 96 bits) or
+/// [`FLOOR_SALT_LEN_LONG`] (RFC 3711, 112 bits) octets, since the MIKEY SP policy can negotiate either. A
+/// 12-octet salt is zero-extended on the right to 112 bits before the RFC 3711 AES-CM PRF, which is
+/// libsrtp's behaviour. Any other length
+/// is refused when the frame is read. [`std::fmt::Debug`] redacts both: key material never reaches a log.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "FloorKeyWire")]
+pub struct FloorKey {
+    pub mki: u32,
+    #[serde(with = "base64::strict")]
+    pub key: Vec<u8>,
+    #[serde(with = "base64::strict")]
+    pub salt: Vec<u8>,
+}
+
+impl std::fmt::Debug for FloorKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FloorKey")
+            .field("mki", &self.mki)
+            .field("key", &"<redacted>")
+            .field("salt", &"<redacted>")
+            .finish()
+    }
+}
+
+impl FloorKey {
+    /// Check the key and salt lengths (for a key built in code rather than read from the wire).
+    ///
+    /// # Errors
+    /// [`FloorKeyError::KeyLength`] or [`FloorKeyError::SaltLength`].
+    pub fn validate(&self) -> Result<(), FloorKeyError> {
+        if self.key.len() != FLOOR_KEY_LEN {
+            return Err(FloorKeyError::KeyLength(self.key.len()));
+        }
+        if self.salt.len() != FLOOR_SALT_LEN && self.salt.len() != FLOOR_SALT_LEN_LONG {
+            return Err(FloorKeyError::SaltLength(self.salt.len()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct FloorKeyWire {
+    mki: u32,
+    #[serde(with = "base64::strict")]
+    key: Vec<u8>,
+    #[serde(with = "base64::strict")]
+    salt: Vec<u8>,
+}
+
+impl TryFrom<FloorKeyWire> for FloorKey {
+    type Error = FloorKeyError;
+
+    fn try_from(wire: FloorKeyWire) -> Result<Self, Self::Error> {
+        let key = Self {
+            mki: wire.mki,
+            key: wire.key,
+            salt: wire.salt,
+        };
+        key.validate()?;
+        Ok(key)
+    }
+}
+
+fn deserialize_floor_keys<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<FloorKey>, D::Error> {
+    let keys = Vec::<FloorKey>::deserialize(deserializer)?;
+    if keys.len() > MAX_FLOOR_KEYS {
+        return Err(serde::de::Error::custom(FloorKeyError::TooMany(keys.len())));
+    }
+    Ok(keys)
+}
+
+/// How a forwarding room carries media ([`Command::ForwardJoin`], [`Command::ForwardOffer`]).
+///
+/// Deliberately **not** `#[non_exhaustive]`: the two modes differ in whether the engine may touch
+/// the packets, and a controller must not guess.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardMedia {
+    /// The default: an RTP translator (RFC 3550 §7). Each seat gets its own SSRC with continuous
+    /// sequence numbers and timestamps, and the engine may transcode.
+    #[default]
+    Translate,
+    /// Forward the talker's RTP and audio SRTCP byte for byte: no SSRC, sequence number or
+    /// timestamp rewrite, no transcoding, no engine-generated reports, and the receivers' RTCP is
+    /// dropped. End-to-end SRTP (3GPP TS 33.180 §7.5.2 NOTE 3) needs the sender's SSRC kept. The
+    /// first seat fixes the room's mode, and a WebRTC (DTLS-SRTP) seat is refused in a preserve room.
+    Preserve,
+}
+
+impl ForwardMedia {
+    fn is_translate(&self) -> bool {
+        *self == Self::Translate
+    }
+}
+
 /// Per-leg media-handling flags. JSON twin of SIPhon's `NgFlags` (rtpengine profile).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileFlags {
@@ -1766,6 +1936,43 @@ pub struct ProfileFlags {
     /// stream out of the offer. A line break inside is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_fmtp: Option<String>,
+    /// SRTCP keys for the floor-control stream, AEAD_AES_128_GCM (3GPP TS 33.180 §9.4.6, §9.4.8,
+    /// key derivation rate 0); see [`FloorKey`]. At most [`MAX_FLOOR_KEYS`]: more is refused when the
+    /// frame is read. Outbound floor control uses the last one. Absent: none.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_floor_keys"
+    )]
+    pub floor_keys: Vec<FloorKey>,
+    /// The controller's `a=key-mgmt` attribute value (RFC 4567) for the floor section. A pure
+    /// passthrough exactly like [`ProfileFlags::floor_fmtp`]: the engine never invents, echoes or
+    /// drops it. A line break inside is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_mgmt: Option<String>,
+}
+
+impl ProfileFlags {
+    /// Check the floor-security fields: at most [`MAX_FLOOR_KEYS`] keys of the right lengths, and
+    /// no line break in `key_mgmt`. Wire input already satisfies the first two; this is for a
+    /// profile built in code, and for the line-break rule, which the wire does not enforce.
+    ///
+    /// # Errors
+    /// The first [`FloorKeyError`] found.
+    pub fn validate(&self) -> Result<(), FloorKeyError> {
+        if self.floor_keys.len() > MAX_FLOOR_KEYS {
+            return Err(FloorKeyError::TooMany(self.floor_keys.len()));
+        }
+        for key in &self.floor_keys {
+            key.validate()?;
+        }
+        if let Some(key_mgmt) = &self.key_mgmt {
+            if key_mgmt.contains(['\r', '\n']) {
+                return Err(FloorKeyError::KeyMgmtLineBreak);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -3818,6 +4025,7 @@ mod tests {
                     floor_fmtp: Some("mc_queueing;mc_priority=5;mc_granted".into()),
                     ..Default::default()
                 },
+                media: ForwardMedia::default(),
             },
         };
         let json = serde_json::to_string(&request).expect("serialize");
@@ -3841,6 +4049,7 @@ mod tests {
                 conference_id: "group-1".into(),
                 from_tag: "b19e02".into(),
                 profile: ProfileFlags::default(),
+                media: ForwardMedia::default(),
             },
         };
         assert_eq!(
@@ -5358,5 +5567,225 @@ mod tests {
             prop_assert_eq!(decoded, request);
             prop_assert_eq!(consumed, bytes.len());
         }
+    }
+
+    const FLOOR_KEY_JSON: &str =
+        r#"{"mki":4660,"key":"AAECAwQFBgcICQoLDA0ODw==","salt":"EBESExQVFhcYGRob"}"#;
+
+    fn floor_key() -> FloorKey {
+        FloorKey {
+            mki: 0x1234,
+            key: (0..16).collect(),
+            salt: (16..28).collect(),
+        }
+    }
+
+    #[test]
+    fn a_floor_key_has_an_exact_wire_shape_and_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&floor_key()).expect("serialize"),
+            FLOOR_KEY_JSON
+        );
+        let decoded: FloorKey = serde_json::from_str(FLOOR_KEY_JSON).expect("deserialize");
+        assert_eq!(decoded, floor_key());
+    }
+
+    #[test]
+    fn a_floor_key_of_the_wrong_length_or_encoding_is_refused() {
+        for bad in [
+            // 15-octet key
+            r#"{"mki":1,"key":"AAECAwQFBgcICQoLDA0O","salt":"EBESExQVFhcYGRob"}"#,
+            // 11-octet salt
+            r#"{"mki":1,"key":"AAECAwQFBgcICQoLDA0ODw==","salt":"EBESExQVFhcYGR8="}"#,
+            // not base64
+            r#"{"mki":1,"key":"AAECAwQFBgcICQoLDA0ODw%=","salt":"EBESExQVFhcYGRob"}"#,
+            // no padding
+            r#"{"mki":1,"key":"AAECAwQFBgcICQoLDA0ODw","salt":"EBESExQVFhcYGRob"}"#,
+            // an array of bytes is not base64
+            r#"{"mki":1,"key":[0,1],"salt":"EBESExQVFhcYGRob"}"#,
+        ] {
+            assert!(serde_json::from_str::<FloorKey>(bad).is_err(), "{bad}");
+        }
+        let short = FloorKey {
+            key: vec![0; 15],
+            ..floor_key()
+        };
+        assert_eq!(short.validate(), Err(FloorKeyError::KeyLength(15)));
+        for (length, accepted) in [(12, true), (14, true), (13, false), (16, false)] {
+            let salty = FloorKey {
+                salt: vec![0; length],
+                ..floor_key()
+            };
+            let json = serde_json::to_string(&salty).expect("serialize");
+            assert_eq!(
+                serde_json::from_str::<FloorKey>(&json).is_ok(),
+                accepted,
+                "{length}"
+            );
+            assert_eq!(
+                salty.validate(),
+                if accepted {
+                    Ok(())
+                } else {
+                    Err(FloorKeyError::SaltLength(length))
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_floor_key_never_shows_its_bytes_in_debug() {
+        let shown = format!("{:?}", floor_key());
+        assert_eq!(
+            shown,
+            r#"FloorKey { mki: 4660, key: "<redacted>", salt: "<redacted>" }"#
+        );
+        let profile = ProfileFlags {
+            floor_keys: vec![floor_key()],
+            ..Default::default()
+        };
+        let shown = format!("{profile:?}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(
+            !shown.contains("AAECAw") && !shown.contains("[0, 1, 2"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn profile_floor_keys_and_key_mgmt_have_exact_wire_shapes() {
+        let profile = ProfileFlags {
+            floor_keys: vec![floor_key(), floor_key()],
+            key_mgmt: Some("mikey AQAFgM0XflABAAAAAAAAAAAAAAsAyONQ".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&profile).expect("serialize");
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"floor_keys":[{FLOOR_KEY_JSON},{FLOOR_KEY_JSON}],"key_mgmt":"mikey AQAFgM0XflABAAAAAAAAAAAAAAsAyONQ"}}"#
+            )
+        );
+        let decoded: ProfileFlags = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, profile);
+        assert_eq!(decoded.validate(), Ok(()));
+        // Absent on the wire (an older controller) means none.
+        let old: ProfileFlags =
+            serde_json::from_str(r#"{"floor_fmtp":"mc_granted"}"#).expect("old");
+        assert!(old.floor_keys.is_empty() && old.key_mgmt.is_none());
+        assert_eq!(
+            serde_json::to_string(&ProfileFlags::default()).expect("ser"),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn three_floor_keys_in_a_profile_are_refused() {
+        let json =
+            format!(r#"{{"floor_keys":[{FLOOR_KEY_JSON},{FLOOR_KEY_JSON},{FLOOR_KEY_JSON}]}}"#);
+        let error = serde_json::from_str::<ProfileFlags>(&json).expect_err("three keys");
+        assert!(error.to_string().contains("at most 2"), "{error}");
+        let built = ProfileFlags {
+            floor_keys: vec![floor_key(), floor_key(), floor_key()],
+            ..Default::default()
+        };
+        assert_eq!(built.validate(), Err(FloorKeyError::TooMany(3)));
+    }
+
+    #[test]
+    fn a_line_break_in_key_mgmt_is_refused_by_validate() {
+        for bad in ["mikey x\r\na=sendrecv", "mikey x\ny", "a\rb"] {
+            let profile = ProfileFlags {
+                key_mgmt: Some(bad.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                profile.validate(),
+                Err(FloorKeyError::KeyMgmtLineBreak),
+                "{bad:?}"
+            );
+        }
+        let fine = ProfileFlags {
+            key_mgmt: Some("mikey AQAF".into()),
+            ..Default::default()
+        };
+        assert_eq!(fine.validate(), Ok(()));
+    }
+
+    #[test]
+    fn set_floor_keys_has_an_exact_wire_shape_and_round_trips() {
+        let request = Request {
+            id: 18,
+            command: Command::SetFloorKeys {
+                call_id: None,
+                conference_id: Some("group-1".into()),
+                from_tag: "a7c31f".into(),
+                keys: vec![floor_key()],
+            },
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"id":18,"command":"set_floor_keys","conference_id":"group-1","from_tag":"a7c31f","keys":[{FLOOR_KEY_JSON}]}}"#
+            )
+        );
+        roundtrip(&request);
+        // More than two are accepted on the wire: the engine keeps the newest two.
+        let many = format!(
+            r#"{{"command":"set_floor_keys","conference_id":"g","from_tag":"f","keys":[{FLOOR_KEY_JSON},{FLOOR_KEY_JSON},{FLOOR_KEY_JSON}]}}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Command>(&many).expect("deserialize"),
+            Command::SetFloorKeys { keys, .. } if keys.len() == 3
+        ));
+        let bad = r#"{"command":"set_floor_keys","conference_id":"g","from_tag":"f","keys":[{"mki":1,"key":"AA==","salt":"AA=="}]}"#;
+        assert!(serde_json::from_str::<Command>(bad).is_err());
+    }
+
+    #[test]
+    fn forward_media_defaults_to_translate_is_not_written_and_preserve_is_explicit() {
+        let preserve = Request {
+            id: 19,
+            command: Command::ForwardJoin {
+                conference_id: "group-1".into(),
+                from_tag: "a7c31f".into(),
+                sdp: "v=0\r\n".into(),
+                profile: ProfileFlags::default(),
+                media: ForwardMedia::Preserve,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&preserve).expect("serialize"),
+            r#"{"id":19,"command":"forward_join","conference_id":"group-1","from_tag":"a7c31f","sdp":"v=0\r\n","profile":{},"media":"preserve"}"#
+        );
+        roundtrip(&preserve);
+        let offer = Request {
+            id: 20,
+            command: Command::ForwardOffer {
+                conference_id: "group-1".into(),
+                from_tag: "b19e02".into(),
+                profile: ProfileFlags::default(),
+                media: ForwardMedia::Translate,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&offer).expect("serialize"),
+            r#"{"id":20,"command":"forward_offer","conference_id":"group-1","from_tag":"b19e02","profile":{}}"#
+        );
+        roundtrip(&offer);
+        for old in [
+            r#"{"command":"forward_join","conference_id":"g","from_tag":"f","sdp":"v=0"}"#,
+            r#"{"command":"forward_offer","conference_id":"g","from_tag":"f"}"#,
+        ] {
+            let media = match serde_json::from_str::<Command>(old).expect("old frame") {
+                Command::ForwardJoin { media, .. } | Command::ForwardOffer { media, .. } => media,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(media, ForwardMedia::Translate);
+        }
+        let unknown =
+            r#"{"command":"forward_offer","conference_id":"g","from_tag":"f","media":"relay"}"#;
+        assert!(serde_json::from_str::<Command>(unknown).is_err());
     }
 }
