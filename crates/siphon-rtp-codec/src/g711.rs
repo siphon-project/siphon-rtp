@@ -6,6 +6,8 @@
 
 use crate::{CodecError, CodecParams, Decoder, Encoder};
 
+mod plc;
+
 const BIAS: i32 = 0x84;
 /// µ-law clip in the 14-bit domain.
 const ULAW_CLIP: i32 = 8159;
@@ -162,6 +164,8 @@ impl Variant {
 pub struct G711 {
     variant: Variant,
     params: CodecParams,
+    /// Packet loss concealment (ITU-T G.711 Appendix I), on a decoder that asked for it.
+    plc: Option<Box<plc::Concealer>>,
 }
 
 impl G711 {
@@ -175,7 +179,23 @@ impl G711 {
                 channels: 1,
                 ptime_ms,
             },
+            plc: None,
         }
+    }
+
+    /// The same codec as a decoder that conceals loss with ITU-T G.711 Appendix I: waveform
+    /// substitution from the last pitch period, attenuated from 10 ms on and muted after 60 ms,
+    /// cross-faded into the first good frame. Without it [`Decoder::conceal`] writes silence. The
+    /// state is allocated here, once, so decoding and concealing never allocate.
+    #[must_use]
+    pub fn with_concealment(mut self) -> Self {
+        self.plc = Some(Box::new(plc::Concealer::new()));
+        self
+    }
+
+    #[cfg(test)]
+    fn concealer(&self) -> Option<&plc::Concealer> {
+        self.plc.as_deref()
     }
 
     /// µ-law codec at the default 20 ms packetization.
@@ -223,14 +243,20 @@ impl Decoder for G711 {
         for (sample, &code) in out.iter_mut().zip(payload.iter()) {
             *sample = table[code as usize];
         }
+        if let Some(concealer) = self.plc.as_mut() {
+            concealer.good_frame(payload, &mut out[..payload.len()]);
+        }
         Ok(payload.len())
     }
 
     fn conceal(&mut self, out: &mut [i16]) -> Result<usize, CodecError> {
-        // Basic PLC: comfort silence. A waveform-similarity concealment (G.711 Appendix I)
-        // is a later refinement; silence is correct and artifact-free for short gaps.
         let count = self.frame_samples().min(out.len());
-        out[..count].fill(0);
+        match self.plc.as_mut() {
+            // ITU-T G.711 Appendix I waveform substitution.
+            Some(concealer) => concealer.conceal(self.variant.decode_table(), &mut out[..count])?,
+            // No concealer asked for: silence.
+            None => out[..count].fill(0),
+        }
         Ok(count)
     }
 }

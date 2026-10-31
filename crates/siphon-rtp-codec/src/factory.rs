@@ -483,8 +483,12 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
         return Ok(Box::new(G726::new(rate, spec.ptime_ms)));
     }
     match spec.encoding_name.as_str() {
-        "PCMU" => Ok(Box::new(G711::new(Variant::Ulaw, spec.ptime_ms))),
-        "PCMA" => Ok(Box::new(G711::new(Variant::Alaw, spec.ptime_ms))),
+        "PCMU" => Ok(Box::new(
+            G711::new(Variant::Ulaw, spec.ptime_ms).with_concealment(),
+        )),
+        "PCMA" => Ok(Box::new(
+            G711::new(Variant::Alaw, spec.ptime_ms).with_concealment(),
+        )),
         "G722" => Ok(Box::new(G722::new(spec.ptime_ms))),
         "GSM" => Ok(Box::new(GsmFr::new())),
         "L16" => Ok(Box::new(L16::new(spec.clock_rate_hz, spec.ptime_ms))),
@@ -597,7 +601,7 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
 ///   `mode-change-neighbor` are declarative, each side stating what it wants sent to it (§8.3.1).
 /// - **Frames per packet** from the negotiated `ptime`, at 20 ms a frame.
 #[cfg(feature = "amr")]
-fn amr_rtp_config(spec: &CodecSpec) -> Result<RtpConfig<'_>, CodecError> {
+pub(crate) fn amr_rtp_config(spec: &CodecSpec) -> Result<RtpConfig<'_>, CodecError> {
     if let Some(reason) = spec.amr_unsupported() {
         return Err(CodecError::Unsupported(reason));
     }
