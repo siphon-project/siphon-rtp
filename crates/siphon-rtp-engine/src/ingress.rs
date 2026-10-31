@@ -87,6 +87,8 @@ impl Refusal {
         use siphon_rtp_srtp::SrtpError;
         match error {
             SrtpError::Replayed => None,
+            // Key-set and send-side errors of the SRTCP GCM context; no media `unprotect` returns them.
+            SrtpError::NoKeys | SrtpError::DuplicateMki | SrtpError::IndexExhausted => None,
             SrtpError::TooShort | SrtpError::BadVersion => Some(Self::NotSrtp),
             SrtpError::UnknownMki => Some(Self::UnknownMki),
             SrtpError::AuthFailed => Some(Self::NotAuthenticated),

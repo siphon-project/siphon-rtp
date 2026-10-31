@@ -956,6 +956,7 @@ async fn forward_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usize) 
             .handle(
                 CLIENT,
                 Command::ForwardJoin {
+                    media: siphon_rtp_proto::ForwardMedia::Translate,
                     conference_id: conference_id.clone(),
                     from_tag: format!("p{participant}"),
                     sdp: amr_wb_sdp(40_000 + participant as u16),

@@ -82,6 +82,7 @@ async fn join(engine: &Engine<UdpLoopbackDatapath>, tag: &str, offer: String) ->
         .handle(
             CLIENT,
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: tag.into(),
                 sdp: offer,
