@@ -21,6 +21,7 @@ async fn forward_join(
         .handle(
             CLIENT,
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: from_tag.into(),
                 sdp,
@@ -130,6 +131,7 @@ async fn a_forward_join_answer_echoes_no_stream_identity_in_the_floor_section_ei
         .handle(
             CLIENT,
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: "listener".into(),
                 sdp: offer,
@@ -161,6 +163,7 @@ async fn a_forward_offer_carries_no_stream_identity_and_its_answer_echoes_none()
         .handle(
             CLIENT,
             Command::ForwardOffer {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: "member".into(),
                 profile: ProfileFlags {

@@ -969,6 +969,7 @@ pub(super) fn command_name(command: &Command) -> &'static str {
         Command::ForwardLeave { .. } => "forward_leave",
         Command::ForwardSetSource { .. } => "forward_set_source",
         Command::SendRtcpApp { .. } => "send_rtcp_app",
+        Command::SetFloorKeys { .. } => "set_floor_keys",
         // [`Command`] is `#[non_exhaustive]`. A verb this engine has no arm for still has to be
         // *named* in the log line and in the `unsupported command: …` error the dispatch returns,
         // so it gets a stable placeholder rather than nothing. The dispatch refuses it; this only
@@ -1025,6 +1026,11 @@ pub(super) fn command_call_id(command: &Command) -> Option<&str> {
         | Command::ForwardLeave { conference_id, .. }
         | Command::ForwardSetSource { conference_id, .. } => Some(conference_id),
         Command::SendRtcpApp {
+            call_id,
+            conference_id,
+            ..
+        }
+        | Command::SetFloorKeys {
             call_id,
             conference_id,
             ..

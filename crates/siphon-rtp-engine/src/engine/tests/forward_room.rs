@@ -42,6 +42,7 @@ async fn join_with(engine: &Engine<UdpLoopbackDatapath>, tag: &str, sdp: String)
         .handle(
             CLIENT,
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: tag.into(),
                 sdp,
@@ -426,6 +427,7 @@ async fn a_forwarding_room_takes_no_scope() {
             CLIENT,
             Some("tenant-a"),
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: "a".into(),
                 sdp: amr_wb_sdp("127.0.0.1:4000".parse().expect("addr"), 96, "octet-align=1"),
@@ -536,6 +538,7 @@ async fn a_forwarding_room_and_a_mixing_conference_do_not_share_an_id() {
         .handle(
             CLIENT,
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: "mix".into(),
                 from_tag: "a".into(),
                 sdp: amr_wb_sdp(addr, 96, "octet-align=1"),
@@ -675,6 +678,7 @@ async fn a_nated_seat_is_gated_on_and_sent_to_its_received_from_address() {
         .handle(
             CLIENT,
             Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
                 conference_id: ROOM.into(),
                 from_tag: "n".into(),
                 sdp: offer,

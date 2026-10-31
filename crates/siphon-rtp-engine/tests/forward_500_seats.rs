@@ -61,6 +61,7 @@ async fn five_hundred_seats_each_hear_every_frame_of_the_source() {
             .handle(
                 CLIENT,
                 Command::ForwardJoin {
+                    media: siphon_rtp_proto::ForwardMedia::Translate,
                     conference_id: ROOM.into(),
                     from_tag: format!("seat-{index}"),
                     sdp: offer(address),

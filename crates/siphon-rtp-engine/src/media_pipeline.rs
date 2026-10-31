@@ -275,6 +275,7 @@ pub(crate) fn validate_profile(profile: &ProfileFlags) -> Result<(), String> {
     validate_echo_delay_search_ms(profile)?;
     crate::engine::validate_sip_call_id(profile)?;
     validate_floor_fmtp(profile)?;
+    refuse_floor_security(profile)?;
     validate_fax_passthrough(profile)
 }
 
@@ -285,6 +286,23 @@ fn validate_floor_fmtp(profile: &ProfileFlags) -> Result<(), String> {
         Some(fmtp) => crate::sdp::validate_floor_fmtp(fmtp).map_err(|error| error.to_string()),
         None => Ok(()),
     }
+}
+
+/// `floor_keys` and `key_mgmt` are part of the control contract but this build has no SRTCP floor
+/// security: accepting them would leave the floor stream in the clear while the controller believes
+/// it is protected. Refused loudly instead of ignored.
+///
+/// # Errors
+/// The reason string, ready to return as a `CmdResult::Error`.
+pub(crate) fn refuse_floor_security(profile: &ProfileFlags) -> Result<(), String> {
+    profile.validate().map_err(|error| error.to_string())?;
+    if !profile.floor_keys.is_empty() {
+        return Err("floor_keys are not supported by this engine build".to_string());
+    }
+    if profile.key_mgmt.is_some() {
+        return Err("key_mgmt is not supported by this engine build".to_string());
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_fax_passthrough(profile: &ProfileFlags) -> Result<(), String> {
