@@ -114,6 +114,22 @@ impl FloorProtection {
         self.context.send_index()
     }
 
+    /// Resume after an HA failover: the outgoing index starts at `index` (RFC 7714 §9.4: the
+    /// caller has added the margin that keeps it past anything the primary sent), and the receive
+    /// side refuses what the checkpoint had already seen (RFC 3711 §3.3.2).
+    pub(crate) fn resume(&mut self, index: u32, received: &[(u32, u32)]) {
+        self.context.set_send_index(index);
+        for &(mki, highest) in received {
+            self.context.resume_received(mki, highest);
+        }
+    }
+
+    /// The highest index that authenticated under each held key, for an HA snapshot.
+    #[must_use]
+    pub(crate) fn received_indices(&self) -> Vec<(u32, u32)> {
+        self.context.received_indices()
+    }
+
     /// Verify and decrypt `wire` (RFC 7714 §9; TS 33.180 §9.4.1) into the scratch.
     pub(crate) fn open(&mut self, wire: &[u8]) -> Result<&[u8], SrtpError> {
         self.context.unprotect(wire, &mut self.plain)?;

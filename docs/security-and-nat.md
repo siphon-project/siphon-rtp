@@ -1273,6 +1273,20 @@ never offers it.
   latch of its own: the backend's is the one latch of the stream. The relay is registered with the call
   and removed at its teardown, and a re-answer that drops the floor stream removes it. Secure calls are
   not affected: their RTCP is already userspace.
+- **A floor stream survives an HA failover without reopening learning or reusing an IV.** `checkpoint`
+  reads the stream from the actor that owns it and records its gate, its reply address, its SSRC and, if
+  keyed, its keys with the outgoing SRTCP index and the highest index received per key. `restore`
+  re-binds the floor port, redirects it to the call-floor actor and registers the leg with the learn-once
+  latch **already pinned** to the recorded source: a standby never lets the first sender win the stream
+  (the RTPbleed rule), and a stream that had learned nothing learns once, as a new one does. The outgoing
+  index resumes 2^16 past the recorded one (`SEND_INDEX_MARGIN`): the primary keeps sending between the
+  checkpoint and its failure, and RFC 7714 §9.4 forbids protecting two packets under one key with one
+  index. A margin that would leave the 31-bit index space refuses the restore; the index never wraps. The
+  replay state of each key comes back closed at the highest received index (RFC 3711 §3.3.2), so the
+  phone's last packets are not accepted twice; only packets the primary consumed after the checkpoint can
+  be, once. The snapshot of a floor call carries its own version so a standby that predates this refuses
+  it instead of resuming without the stream. A DTLS or data-channel floor stream is not carried (its keys
+  come from the handshake) and the call is refused at `checkpoint`.
 
 ### WebRTC data channel (floor control for a browser seat)
 

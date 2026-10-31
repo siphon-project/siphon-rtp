@@ -9,6 +9,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **HA `checkpoint` and `restore` carry a call's MCPTT floor stream.** A two-party call with a floor stream
+  used to be refused at `checkpoint`. The snapshot now holds each party's floor stream (port, signalled
+  address, source gate, learned reply address, engine SSRC, `floor_fmtp`, SRTCP keys, outgoing index and the
+  highest index received per key) and `restore` serves it again on the same port with the learn-once latch
+  still pinned (no re-learning, RTPbleed). A keyed stream resumes its SRTCP index 2^16 past the checkpointed
+  one so no index the primary sent is reused (RFC 7714 §9.4); an index with no room for that margin refuses
+  the restore. A plain-relay floor call gets its `rtcp_to_userspace` rules and audio RTCP relay back. The
+  record has its own `version` (4, or 5 with a scope), so an older standby refuses it. DTLS and data-channel
+  floor calls are still refused. `SrtcpGcmContext` gains `received_indices` and `resume_received`. A
+  re-offer that names no `floor_fmtp` keeps the one the stream was set up with.
 - **The MCPTT floor stream is protected with AES-GCM SRTCP (`node_info` feature `floor_srtcp`).** A room seat
   or a two-party call leg keyed by `profile.floor_keys` (the offerer's from `offer`, the answerer's from
   `answer`, the only leg's from `answer_local`) or by the new `set_floor_keys` runs `AEAD_AES_128_GCM` SRTCP

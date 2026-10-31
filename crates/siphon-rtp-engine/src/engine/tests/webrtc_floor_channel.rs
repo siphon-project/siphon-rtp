@@ -996,3 +996,58 @@ async fn a_dtls_caller_with_an_unbundled_channel_gets_no_floor_channel_and_the_c
     assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
     assert_eq!(engine.dtls_bridge().floor_channel_count(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_with_a_data_channel_floor_is_still_refused_by_checkpoint() {
+    // The floor channel rides a DTLS association whose keys come from the handshake, so it cannot
+    // move to a standby: the pipeline kind refuses the whole call, floor stream included.
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let socket = Arc::new(
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind"),
+    );
+    let address = socket.local_addr().expect("addr");
+    let (_callee, callee_address) = phone().await;
+    let certificate = DtlsCertificate::generate().expect("browser certificate");
+    engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "dc-ha".into(),
+                from_tag: "browser".into(),
+                sdp: browser_offer(address, &certificate, "active", true),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/AVP".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "dc-ha".into(),
+                from_tag: "browser".into(),
+                to_tag: "callee".into(),
+                sdp: sdp_for(callee_address, true),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::Checkpoint {
+                call_id: "dc-ha".into(),
+                from_tag: "browser".into(),
+            },
+        )
+        .await;
+    let CmdResult::Error { reason } = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    assert!(reason.contains("DTLS-SRTP"), "{reason}");
+}

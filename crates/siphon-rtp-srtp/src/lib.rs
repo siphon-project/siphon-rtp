@@ -142,6 +142,24 @@ impl ReplayWindow {
         }
     }
 
+    /// The highest index recorded, or `None` before any packet authenticated.
+    pub(crate) fn highest(&self) -> Option<u64> {
+        self.seen.then_some(self.top)
+    }
+
+    /// Resume after an HA failover: treat `index` and every index below it as received, so the
+    /// standby accepts only what the peer sends after the checkpointed highest (RFC 3711 §3.3.2).
+    /// What was received between the checkpoint and the failover is not known, which is why the
+    /// anchor is conservative: a few genuine packets the primary had already consumed past `index`
+    /// may be accepted once more, nothing at or below `index` ever is.
+    pub(crate) fn close_at(&mut self, index: u64) {
+        *self = Self {
+            top: index,
+            mask: u64::MAX,
+            seen: true,
+        };
+    }
+
     /// Anchor the window at `index` with only that index marked received. Used when an HA standby seeds
     /// its replay state from the rollover anchor carried in a checkpoint (RFC 3711 §3.3.1): the
     /// per-index history below the anchor is not carried across the failover, only its top.
