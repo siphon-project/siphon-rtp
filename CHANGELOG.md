@@ -26,6 +26,22 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   loss is preserved, late packets of the previous source are dropped. Payload is copied unchanged;
   CSRCs and the header extension are dropped, padding is kept. Exposes SR counters.
 
+### Added
+
+- **Control contract for push-to-talk forwarding rooms and RTCP APP (`siphon-rtp-proto`).** These
+  are the wire types only, so a controller can build against them. The engine refuses every new verb
+  by name (`unsupported command: forward_join`) until it serves it, and `node_info` advertises
+  nothing new yet.
+  - Verbs: `forward_join`, `forward_offer`, `forward_answer`, `forward_leave` and
+    `forward_set_source`. Like the other room verbs they take no `scope`.
+  - `send_rtcp_app` is addressed by `call_id` + `from_tag`, by a room seat, or to a whole room with
+    `except_from_tags`.
+  - Events: `rtcp_app`, `forward_source_started` and `forward_seat_inactive`.
+  - `profile.floor_fmtp` carries the `a=fmtp:MCPTT` parameters (3GPP TS 24.380 §14) verbatim.
+  - Payloads are strict base64 (RFC 4648 §4).
+  - A forwarding seat is never reaped for silence, because a push-to-talk listener sends nothing
+    while others talk. It is reported as `forward_seat_inactive` instead.
+
 ### Fixed
 
 - **A WebRTC participant in a conference hears the room.** A seat's answer is written from the
