@@ -321,3 +321,43 @@ fn an_amr_wb_room_conceals_a_lost_packet_for_an_opus_and_a_g711_seat() {
     assert!(concealed > 1000.0, "and at the G.711 seat: {concealed:.0}");
     assert_eq!(room.transcode_stats().concealed, 1);
 }
+
+#[cfg(feature = "amr")]
+#[test]
+fn an_amr_nb_source_loss_is_concealed_to_audio_not_silence() {
+    let mut room = pcmu_room();
+    add_same(&mut room, config_for(1, 0)); // endpoint 1: room codec
+    let narrowband =
+        CodecSpec::new(97, "AMR", 8000, 1, 20).with_amr_params(Some(factory::AmrParams {
+            octet_align: Some(true),
+            ..Default::default()
+        }));
+    add_cross(&mut room, config_for(2, 97), &narrowband); // endpoint 2: the source
+    add_cross(&mut room, config_for(3, 111), &opus()); // endpoint 3: another group
+    room.set_source(Some("seat-2")).unwrap();
+    let stream = tone_stream(&narrowband, 14);
+    let (heard, per_ingest) = run(&mut room, 2, 97, &stream, 160, &[7], &[]);
+
+    assert_eq!(per_ingest[7][&1], 2, "concealed frame and the packet");
+    assert_eq!(heard[&1].len(), 14);
+    assert!(is_continuous(&heard[&1], 160));
+    assert_eq!(room.transcode_stats().concealed, 1);
+    assert_eq!(room.transcode_stats().conceal_failed, 0);
+
+    // TS 26.091 concealment continues the tone, attenuated by the bad-frame state machine; it is
+    // not the silence an unported concealment would give.
+    let payloads: Vec<&Vec<u8>> = heard[&1].iter().map(|h| &h.2).collect();
+    let levels = rms_per_frame(&pcmu(), &payloads);
+    assert!(
+        levels[7] > 0.3 * levels[6],
+        "concealed slot {:.0} against the frame before it {:.0}: {levels:?}",
+        levels[7],
+        levels[6]
+    );
+    let opus_payloads: Vec<&Vec<u8>> = heard[&3].iter().map(|h| &h.2).collect();
+    let opus_levels = rms_per_frame(&opus(), &opus_payloads);
+    assert!(
+        opus_levels[7] > 500.0,
+        "and at the Opus seat: {opus_levels:?}"
+    );
+}

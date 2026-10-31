@@ -7,8 +7,8 @@
 //! Every frame of a payload yields 20 ms of PCM:
 //!
 //! - A speech frame with Q set is decoded, whatever its mode.
-//! - A speech frame with Q clear is "severely damaged" (RFC 4867 §4.3.2) and concealed, as is a
-//!   SPEECH_LOST frame.
+//! - A speech frame with Q clear is "severely damaged" (RFC 4867 §4.3.2) and concealed (AMR-NB
+//!   still reads its bits as `RX_SPEECH_BAD`), as is a SPEECH_LOST frame.
 //! - A SID frame starts a silence period. This port has no comfort noise synthesis (3GPP
 //!   TS 26.092 / TS 26.192 are not implemented), so the period is rendered as silence: the SID
 //!   frame itself and every NO_DATA frame until speech returns.
@@ -144,8 +144,19 @@ impl RtpStream {
 pub(super) trait FrameCodec {
     /// Decode one good speech frame of `mode` from its bits in payload order into `pcm`.
     fn decode_speech(&mut self, mode: u8, frame: &[u8], pcm: &mut [i16]) -> Result<(), CodecError>;
-    /// Fill `pcm` for a frame that is lost or damaged.
+    /// Fill `pcm` for a frame that is lost.
     fn conceal_frame(&mut self, pcm: &mut [i16]);
+    /// Fill `pcm` for a frame that arrived with Q clear. The bits are of no use to a codec that
+    /// conceals without them, which is what the default does.
+    fn decode_damaged(
+        &mut self,
+        _mode: u8,
+        _frame: &[u8],
+        pcm: &mut [i16],
+    ) -> Result<(), CodecError> {
+        self.conceal_frame(pcm);
+        Ok(())
+    }
     /// Encode `pcm` at `mode` into `frame`, bits in payload order.
     fn encode_speech(
         &mut self,
@@ -184,7 +195,8 @@ pub(super) fn decode_payload<C: FrameCodec>(
                 codec.decode_speech(slot.frame_type, &frame, pcm)?;
                 stream.in_silence_period = false;
             } else {
-                codec.conceal_frame(pcm);
+                slot.copy_bits(payload, &mut frame);
+                codec.decode_damaged(slot.frame_type, &frame, pcm)?;
             }
         } else if slot.frame_type == NO_DATA && stream.in_silence_period {
             pcm.fill(0);

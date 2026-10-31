@@ -19,8 +19,10 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   dropped with their last seat, and a request outside the seat's `mode-set` is ignored. G.711 decoders
   built by the factory now conceal with ITU-T G.711 Appendix I waveform substitution (pitch replay, 20 %
   fade per 10 ms after the first, mute after 60 ms, cross-fade into the first good frame) instead of
-  silence, which also applies to the jitter-buffer concealment of a transcoded call. AMR-NB concealment
-  (3GPP TS 26.091) is not ported and stays silence. A concealed frame costs one decode-side conceal and
+  silence, which also applies to the jitter-buffer concealment of a transcoded call. AMR-NB conceals lost and
+  damaged frames per 3GPP TS 26.091, bit-exact against the TS 26.073 reference decoder (lag, LSF and gain
+  extrapolation, bad-frame state machine, background-noise detector, excitation control; DTX stays out of
+  scope), so a lost AMR-NB packet is no longer rendered as silence. A concealed frame costs one decode-side conceal and
   the group encodes, allocation-free; eight mode groups cost eight encodes per packet
   (`benches/forward_transcode_bench.rs`, `docs/cookbook/forwarding.md`).
 

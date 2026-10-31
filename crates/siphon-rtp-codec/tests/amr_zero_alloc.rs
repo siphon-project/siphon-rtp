@@ -108,6 +108,39 @@ fn amr_wb_encode_core_makes_no_heap_allocation() {
     );
 }
 
+/// Concealing a lost frame (3GPP TS 26.091) and decoding a damaged one run once per lost packet, on
+/// the same hot path as a good decode: they must not reach the allocator either, in any mode.
+#[test]
+fn amr_nb_concealment_makes_no_heap_allocation_in_any_mode() {
+    use siphon_rtp_codec::amr::nb::dec_main::SpeechDecoder;
+
+    let pcm: Vec<i16> = (0..160_i32)
+        .map(|i| (((i * 137) % 8000) - 4000) as i16)
+        .collect();
+    for mode in 0..8u8 {
+        let amr_mode = AmrNbMode::from_frame_type(mode).expect("mode");
+        let mut encoder = AmrNb::new();
+        let mut bits = [0i16; 244];
+        let mut decoder = SpeechDecoder::new();
+        let mut out = [0i16; 160];
+        for _ in 0..50 {
+            encoder
+                .encode_mode_bits(amr_mode, &pcm, &mut bits)
+                .expect("encode");
+            decoder.decode_frame(usize::from(mode), &bits, &mut out);
+        }
+        let allocations = count_allocations(20_000, || {
+            decoder.conceal_frame(&mut out);
+            decoder.decode_bad_frame(usize::from(mode), &bits, &mut out);
+            decoder.decode_frame(usize::from(mode), &bits, &mut out);
+        });
+        assert_eq!(
+            allocations, 0,
+            "mode {mode}: {allocations} allocations across 20k conceal + bad + good frames"
+        );
+    }
+}
+
 /// The whole RTP path of a negotiated stream, in both payload formats and both directions: framing
 /// a payload and taking one apart happen once per packet, so they must not reach the allocator.
 #[test]

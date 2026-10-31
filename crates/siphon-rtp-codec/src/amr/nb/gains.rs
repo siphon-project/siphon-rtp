@@ -163,6 +163,31 @@ pub fn gc_pred_update(st: &mut GcPredState, qua_ener_mr122: i16, qua_ener: i16) 
     st.past_qua_en[0] = qua_ener;
 }
 
+/// Average of the MA predictor's past quantized energies with a lower limit, used to advance the
+/// predictor while concealing a bad frame (`gc_pred.c` `gc_pred_average_limited`). Returns
+/// `(ener_avg_MR122, ener_avg)`, both Q10.
+#[must_use]
+pub fn gc_pred_average_limited(st: &GcPredState) -> (i16, i16) {
+    let mut average_mr122 = 0i16;
+    for &energy in &st.past_qua_en_mr122 {
+        average_mr122 = add(average_mr122, energy);
+    }
+    average_mr122 = mult(average_mr122, 8192); // 0.25 * sum
+    if sub(average_mr122, MIN_ENERGY_MR122) < 0 {
+        average_mr122 = MIN_ENERGY_MR122;
+    }
+
+    let mut average = 0i16;
+    for &energy in &st.past_qua_en {
+        average = add(average, energy);
+    }
+    average = mult(average, 8192);
+    if sub(average, MIN_ENERGY) < 0 {
+        average = MIN_ENERGY;
+    }
+    (average_mr122, average)
+}
+
 /// Decode pitch + code gain from the per-mode VQ (`dec_gain.c` `Dec_gain`), for MR475..MR102
 /// (excluding MR795/MR122). Returns `(gain_pit Q14, gain_cod)` and updates the predictor.
 #[must_use]
