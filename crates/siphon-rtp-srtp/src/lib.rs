@@ -20,6 +20,7 @@ pub mod kdf;
 pub mod leg;
 pub mod sdes;
 pub mod srtcp;
+pub mod srtcp_gcm;
 
 use kdf::MASTER_SALT_LEN;
 use sdes::{Mki, SrtpKeyMaterial};
@@ -53,6 +54,16 @@ pub enum SrtpError {
     /// the MKI selects the key, so there is nothing to authenticate against).
     #[error("unknown MKI")]
     UnknownMki,
+    /// An AEAD key set was empty (RFC 7714 SRTCP needs at least one master key).
+    #[error("no keys")]
+    NoKeys,
+    /// Two keys in one AEAD key set carry the same MKI, so the MKI could not select between them.
+    #[error("duplicate MKI")]
+    DuplicateMki,
+    /// The 31-bit SRTCP index reached its last value; RFC 7714 §9.4 forbids wrapping it under the
+    /// same key, so nothing more is protected until the keys are replaced or the index reseeded.
+    #[error("SRTCP index exhausted")]
+    IndexExhausted,
 }
 
 /// Split the optional MKI field (RFC 3711 §3.1 / §3.4) off the end of `protected` — a packet with
