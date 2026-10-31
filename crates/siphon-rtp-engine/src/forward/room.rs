@@ -331,7 +331,7 @@ impl ForwardRoom {
     }
 
     /// Seat a member whose codec `spec` is not the room's. The room decodes the source once per
-    /// packet and encodes once per codec group (see [`super::transcode`]); the seat is sent its own
+    /// packet and encodes once per codec group (see `transcode`); the seat is sent its own
     /// stream in `spec`, under `config.audio_payload_type`. Nothing is seated when the codec cannot
     /// be transcoded.
     ///
