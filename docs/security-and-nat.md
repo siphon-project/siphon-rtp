@@ -1072,42 +1072,6 @@ the routing order is unchanged: bridge → media → text → udptl → ws → c
   decoder refuses, or a frame of an unexpected length, is dropped and counted (`transcode_dropped`); it
   never reaches another seat. Nothing is allocated per packet, so a hostile source cannot grow memory.
 
-#### Preserve rooms (`media: preserve`): opaque end-to-end SRTP
-
-MCPTT secures group media end to end with SRTP keyed between the UEs (PCK/GMK) and signalled with
-`a=key-mgmt:mikey` (3GPP TS 33.180 §7.5.2 NOTE 3). SRTP authenticates the header's SSRC and sequence
-number (RFC 3711 §3.3), so the per-receiver translator of a normal room would break every packet. A
-room created with `media: preserve` therefore relays the datagrams opaquely (RFC 3550 §7.1, a translator
-that forwards unchanged). What that changes, and what it does not:
-
-- **Still enforced, same code, same order.** The Layer-2 signalled-source gate (exact source,
-  `received-from`, or `Any` for an ICE or `symmetric` seat), the ICE hold (`ice_pending`), the constrained
-  SSRC-consistent reply-address latch (RFC 3550 §8, the SSRC and sequence number are in the clear,
-  RFC 3711 §3.1), source selection by the controller (RTP from a non-source seat is dropped and counted),
-  and the payload-type check on the source. Never forward into the void: a seat with no resolved
-  destination is skipped. The source never receives its own audio.
-- **Not possible, by design.** The engine holds no SRTP context for the seat, so it cannot `unprotect`
-  (Layer 5): a packet that passes the gate is forwarded without an authenticity check, and a host that
-  wins the source-address gate (the signalled address, or any address on a `symmetric`/ICE seat) can put
-  bytes into the group as the chosen source. Receivers verify the SRTP tag with the group key, so forged
-  media is dropped there; the engine's gate bounds who may send, not what is true. Controllers should not
-  mark preserve seats `symmetric` unless the network needs it.
-- **No engine keying on a preserve seat.** A seat offering `a=crypto` (SDES) or a DTLS-SRTP fingerprint is
-  refused at join with a reason: the engine must not terminate end-to-end media. A seat is `RTP/SAVP`
-  without `a=crypto` (or `RTP/AVP`), and the answer keeps the offered transport profile (RFC 3264 §6).
-  `key_mgmt` is written by the controller, never learnt from an offer.
-- **RTCP.** The engine originates no SR, RR or BYE toward a preserve seat (it is not an endpoint of the
-  stream, RFC 3550 §7.3). The current talker's audio RTCP, SRTCP end to end, is forwarded byte for byte
-  with its RTP and never parsed; a receiver's audio RTCP is dropped and counted
-  (`receiver_rtcp_dropped`). RTCP APP is surfaced from the floor stream only, because audio SRTCP is not
-  readable. The floor stream is unaffected.
-- **No transcoding.** Every seat must use the room codec under the same payload type; a different codec is
-  refused. Liveness (`forward_seat_inactive`, the whole-room backstop) is packet-arrival based and works
-  as before: a receiver's dropped SRTCP still stamps the endpoint.
-- **`a=key-mgmt` (RFC 4567)** is a controller passthrough on every SDP the engine produces. The engine
-  removes the offerer's line, writes the controller's, and refuses the controller's beside keying the
-  engine terminates itself (SDES, RFC 4568, or DTLS-SRTP, RFC 5764): two key sources for one stream.
-
 ### Layer 5f — The RFC 4103 Real-Time Text (RTT) relay path
 A VoLTE/IMS call may carry a second media stream: an `m=text` line (RFC 4103, T.140 over RTP, usually
 RFC 2198 RED-wrapped) alongside the audio. The engine parses it (section-aware SDP), anchors it to a
@@ -1309,6 +1273,20 @@ never offers it.
   latch of its own: the backend's is the one latch of the stream. The relay is registered with the call
   and removed at its teardown, and a re-answer that drops the floor stream removes it. Secure calls are
   not affected: their RTCP is already userspace.
+- **A floor stream survives an HA failover without reopening learning or reusing an IV.** `checkpoint`
+  reads the stream from the actor that owns it and records its gate, its reply address, its SSRC and, if
+  keyed, its keys with the outgoing SRTCP index and the highest index received per key. `restore`
+  re-binds the floor port, redirects it to the call-floor actor and registers the leg with the learn-once
+  latch **already pinned** to the recorded source: a standby never lets the first sender win the stream
+  (the RTPbleed rule), and a stream that had learned nothing learns once, as a new one does. The outgoing
+  index resumes 2^16 past the recorded one (`SEND_INDEX_MARGIN`): the primary keeps sending between the
+  checkpoint and its failure, and RFC 7714 §9.4 forbids protecting two packets under one key with one
+  index. A margin that would leave the 31-bit index space refuses the restore; the index never wraps. The
+  replay state of each key comes back closed at the highest received index (RFC 3711 §3.3.2), so the
+  phone's last packets are not accepted twice; only packets the primary consumed after the checkpoint can
+  be, once. The snapshot of a floor call carries its own version so a standby that predates this refuses
+  it instead of resuming without the stream. A DTLS or data-channel floor stream is not carried (its keys
+  come from the handshake) and the call is refused at `checkpoint`.
 
 ### WebRTC data channel (floor control for a browser seat)
 

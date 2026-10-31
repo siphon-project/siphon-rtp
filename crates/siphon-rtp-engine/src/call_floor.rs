@@ -61,6 +61,43 @@ pub struct CallFloorLeg {
     /// Empty leaves the stream in the clear. The last protects what is sent, the newest two are
     /// accepted.
     pub keys: Vec<FloorMasterKey>,
+    /// The `a=fmtp:MCPTT` parameters the controller supplied for the stream, kept so a re-offer that
+    /// names none, and a standby restored from a checkpoint, present the same line.
+    pub fmtp: Option<String>,
+    /// What a standby resumes from a checkpoint; `None` for a leg that starts fresh.
+    pub restore: Option<FloorRestore>,
+}
+
+/// The live state of a floor leg that a standby resumes (HA, [`CallFloors::leg_state`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorRestore {
+    /// The source the learn-once latch had pinned, if any. It is pinned again as it was: the
+    /// standby never reopens learning to whoever sends first.
+    pub latched: Option<SocketAddr>,
+    /// The next outgoing SRTCP index to use, already moved past anything the primary may have sent
+    /// (RFC 7714 §9.4). Meaningful only for a keyed leg.
+    pub send_index: u32,
+    /// The highest SRTCP index that authenticated per `(mki, index)`; those are refused again.
+    pub received: Vec<(u32, u32)>,
+}
+
+/// What a leg holds that an HA checkpoint carries, read from the owning actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorLegState {
+    /// Where floor control is sent: the signalled address, or the latched source once learned.
+    pub destination: SocketAddr,
+    /// Layer 2: the sources the stream may come from.
+    pub accepted_source: SourceFilter,
+    /// The source the learn-once latch pinned, if any.
+    pub latched: Option<SocketAddr>,
+    /// The SSRC the engine's floor packets carry toward this party.
+    pub ssrc: u32,
+    /// The key set in force, oldest first (empty for a leg in the clear).
+    pub keys: Vec<FloorMasterKey>,
+    /// The next outgoing SRTCP index (0 for a leg in the clear).
+    pub send_index: u32,
+    /// The highest index received per key.
+    pub received: Vec<(u32, u32)>,
 }
 
 struct Leg {
@@ -119,13 +156,27 @@ pub struct CallFloors {
 
 impl CallFloors {
     /// Add a leg. A second registration for the endpoint replaces the first.
-    pub fn register(&mut self, config: CallFloorLeg) {
-        let protection = FloorProtection::new(&config.keys);
+    pub fn register(&mut self, mut config: CallFloorLeg) {
+        let mut protection = FloorProtection::new(&config.keys);
+        let restore = config.restore.take();
+        let latch = match restore {
+            Some(FloorRestore {
+                latched,
+                send_index,
+                received,
+            }) => {
+                if let Some(protection) = protection.as_mut() {
+                    protection.resume(send_index, &received);
+                }
+                latched.map_or_else(OpaqueLatch::default, OpaqueLatch::pinned)
+            }
+            None => OpaqueLatch::default(),
+        };
         self.legs.insert(
             config.endpoint,
             Leg {
                 config,
-                latch: OpaqueLatch::default(),
+                latch,
                 refusals: RefusalLog::default(),
                 raised: 0,
                 malformed: 0,
@@ -181,6 +232,32 @@ impl CallFloors {
             .find(|leg| leg.config.call_id == call_id && leg.config.tag == tag)?;
         let protection = leg.protection.as_ref()?;
         Some((protection.keys().to_vec(), protection.send_index()))
+    }
+
+    /// Everything an HA checkpoint reads of the leg `tag` of `call_id`. `None` for an unknown leg.
+    #[must_use]
+    pub fn leg_state(&self, call_id: &str, tag: &str) -> Option<FloorLegState> {
+        let leg = self
+            .legs
+            .values()
+            .find(|leg| leg.config.call_id == call_id && leg.config.tag == tag)?;
+        let (keys, send_index, received) = match leg.protection.as_ref() {
+            Some(protection) => (
+                protection.keys().to_vec(),
+                protection.send_index(),
+                protection.received_indices(),
+            ),
+            None => (Vec::new(), 0, Vec::new()),
+        };
+        Some(FloorLegState {
+            destination: leg.config.destination,
+            accepted_source: leg.config.accepted_source,
+            latched: leg.latch.latched(),
+            ssrc: leg.config.ssrc,
+            keys,
+            send_index,
+            received,
+        })
     }
 
     /// Datagrams the keyed leg on `endpoint` refused at its SRTCP gate.
@@ -318,6 +395,11 @@ enum Input {
     Packet(RxPacket),
     Register(Box<CallFloorLeg>),
     Deregister(String),
+    State {
+        call_id: String,
+        tag: String,
+        reply: tokio::sync::oneshot::Sender<Option<FloorLegState>>,
+    },
     SetKeys {
         call_id: String,
         tag: String,
@@ -338,7 +420,7 @@ enum Input {
 pub struct CallFloorRegistry {
     routes: DashMap<EndpointId, ()>,
     /// (call, leg tag) to the leg's endpoint, for a send to name its target without a round trip.
-    by_leg: DashMap<(String, String), EndpointId>,
+    by_leg: DashMap<(String, String), (EndpointId, Option<String>)>,
     /// The offerer's floor keys between its offer and the answer that registers its leg (the leg is
     /// registered only once the far party answers). Dropped with the call.
     offer_keys: DashMap<String, Vec<FloorMasterKey>>,
@@ -379,7 +461,11 @@ impl CallFloorRegistry {
     /// Add a leg and open its route. Datagrams for the endpoint are queued behind the registration,
     /// so none is seen by an actor that has not heard of the leg.
     pub fn register<D: Datapath + Clone + Send + 'static>(&self, datapath: &D, leg: CallFloorLeg) {
-        let (endpoint, key) = (leg.endpoint, (leg.call_id.clone(), leg.tag.clone()));
+        let (endpoint, key, fmtp) = (
+            leg.endpoint,
+            (leg.call_id.clone(), leg.tag.clone()),
+            leg.fmtp.clone(),
+        );
         if self
             .mailbox(datapath)
             .try_send(Input::Register(Box::new(leg)))
@@ -391,7 +477,7 @@ impl CallFloorRegistry {
             );
             return;
         }
-        self.by_leg.insert(key, endpoint);
+        self.by_leg.insert(key, (endpoint, fmtp));
         self.routes.insert(endpoint, ());
     }
 
@@ -414,7 +500,7 @@ impl CallFloorRegistry {
     /// Forget every floor leg of `call_id`.
     pub fn deregister_call(&self, call_id: &str) {
         self.offer_keys.remove(call_id);
-        self.by_leg.retain(|(call, _), endpoint| {
+        self.by_leg.retain(|(call, _), (endpoint, _)| {
             let keep = call != call_id;
             if !keep {
                 self.routes.remove(endpoint);
@@ -431,6 +517,36 @@ impl CallFloorRegistry {
     pub fn has_leg(&self, call_id: &str, tag: &str) -> bool {
         self.by_leg
             .contains_key(&(call_id.to_string(), tag.to_string()))
+    }
+
+    /// The `a=fmtp:MCPTT` parameters the controller supplied for the leg `tag` of `call_id`.
+    #[must_use]
+    pub fn fmtp(&self, call_id: &str, tag: &str) -> Option<String> {
+        self.by_leg
+            .get(&(call_id.to_string(), tag.to_string()))
+            .and_then(|entry| entry.1.clone())
+    }
+
+    /// The state of the leg `tag` of `call_id` as its actor holds it, for an HA checkpoint. The
+    /// actor answers over a oneshot: its state is never shared. `None` for an unknown leg or an
+    /// actor that did not answer in time.
+    pub async fn leg_state(&self, call_id: &str, tag: &str) -> Option<FloorLegState> {
+        if !self.has_leg(call_id, tag) {
+            return None;
+        }
+        let mailbox = self.mailbox.get()?;
+        let (reply, verdict) = tokio::sync::oneshot::channel();
+        mailbox
+            .try_send(Input::State {
+                call_id: call_id.to_string(),
+                tag: tag.to_string(),
+                reply,
+            })
+            .ok()?;
+        tokio::time::timeout(SEND_TIMEOUT, verdict)
+            .await
+            .ok()?
+            .ok()?
     }
 
     /// Replace the SRTCP keys of the leg `tag` of `call_id`, answering once the actor applied them.
@@ -510,6 +626,13 @@ async fn run_call_floors<D: Datapath>(inbox: flume::Receiver<Input>, datapath: D
             }
             Input::Register(leg) => floors.register(*leg),
             Input::Deregister(call_id) => floors.deregister_call(&call_id),
+            Input::State {
+                call_id,
+                tag,
+                reply,
+            } => {
+                let _ = reply.send(floors.leg_state(&call_id, &tag));
+            }
             Input::SetKeys {
                 call_id,
                 tag,
@@ -567,6 +690,8 @@ mod tests {
             ssrc: 0xE000_0001,
             events: Some(events.clone()),
             keys: Vec::new(),
+            fmtp: None,
+            restore: None,
         }
     }
 
@@ -783,6 +908,63 @@ mod tests {
         assert!(floors.key_state("call-1", "tag-b").is_some());
         floors.set_keys("call-1", "tag-b", &[]).unwrap();
         assert!(floors.key_state("call-1", "tag-b").is_none());
+    }
+
+    #[test]
+    fn a_restored_leg_keeps_its_latch_index_and_refuses_what_was_seen() {
+        let events = queue();
+        let mut primary = CallFloors::default();
+        let mut keyed = leg(1, "tag-a", &events);
+        keyed.keys = vec![floor_key(7)];
+        keyed.fmtp = Some("mc_granted".into());
+        primary.register(keyed);
+        let mut phone = SrtcpGcmContext::new(&[floor_key(7)]).unwrap();
+        let mut wire = Vec::new();
+        let app = [
+            0x80, 0xCC, 0x00, 0x03, 0x11, 0x22, 0x33, 0x44, 0x4D, 0x43, 0x50, 0x54, 0, 0, 0, 0,
+        ];
+        phone.protect(&app, true, &mut wire).unwrap();
+        let first = wire.clone();
+        assert_eq!(
+            primary.ingest(&rx(1, "192.0.2.1:4100", &first)),
+            Ingress::Accepted
+        );
+        let state = primary.leg_state("call-1", "tag-a").unwrap();
+        assert_eq!(state.latched, Some(address("192.0.2.1:4100")));
+        assert_eq!(state.received, vec![(7, 0)]);
+        assert_eq!(state.keys.len(), 1);
+        assert_eq!(state.ssrc, 0xE000_0001);
+
+        let mut standby = CallFloors::default();
+        let mut resumed = leg(2, "tag-a", &events);
+        resumed.keys = state.keys.clone();
+        resumed.restore = Some(FloorRestore {
+            latched: state.latched,
+            send_index: state.send_index + 1000,
+            received: state.received.clone(),
+        });
+        standby.register(resumed);
+        // The packet the primary consumed is a replay; a newer one from the pinned source is not.
+        assert_eq!(
+            standby.ingest(&rx(2, "192.0.2.1:4100", &first)),
+            Ingress::Refused
+        );
+        phone.protect(&app, true, &mut wire).unwrap();
+        let second = wire.clone();
+        // A newer packet from another host on the signalled address is refused: no re-learn.
+        assert_eq!(
+            standby.ingest(&rx(2, "192.0.2.1:4999", &second)),
+            Ingress::Refused
+        );
+        assert_eq!(
+            standby.ingest(&rx(2, "192.0.2.1:4100", &second)),
+            Ingress::Accepted
+        );
+        assert_eq!(
+            standby.key_state("call-1", "tag-a").unwrap().1,
+            1000,
+            "the standby resumes the outgoing index past the checkpoint"
+        );
     }
 
     #[test]

@@ -55,6 +55,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.app_event_queue(owner)
     }
 
+    /// The `floor_fmtp` a re-offer presents: the profile's, else the one the floor stream was set up
+    /// with, on a call restored from a checkpoint as on the one that set it up.
+    pub(super) fn reoffer_floor_fmtp(
+        &self,
+        call_id: &str,
+        tag: &str,
+        profile: &ProfileFlags,
+    ) -> Option<String> {
+        profile
+            .floor_fmtp
+            .clone()
+            .or_else(|| self.conference.floors().fmtp(call_id, tag))
+    }
+
     /// Create the floor data channel of leg `tag` of `call_id` (a DTLS leg that offered a WebRTC data
     /// channel, RFC 8841): the handle is kept for `send_rtcp_app`, the plan goes to the DTLS driver of
     /// the leg's endpoint ([`crate::dtls_bridge::DtlsBridge::attach_floor_channel`]) before it is
@@ -251,6 +265,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ssrc: random_ssrc(),
                 events: self.app_event_queue(owner),
                 keys,
+                fmtp: profile.floor_fmtp.clone(),
+                restore: None,
             },
         );
     }
@@ -329,6 +345,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ssrc: random_ssrc(),
                     events: events.clone(),
                     keys,
+                    fmtp: wiring.profile.floor_fmtp.clone(),
+                    restore: None,
                 },
             );
         }

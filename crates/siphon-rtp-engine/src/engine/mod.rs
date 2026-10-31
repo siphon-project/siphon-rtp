@@ -50,6 +50,7 @@ pub mod scope;
 mod seat_call;
 mod seat_transport;
 mod snapshot;
+mod snapshot_floor;
 mod sweep;
 mod takeover;
 mod teardown;
@@ -932,6 +933,7 @@ impl Call {
                     out_dst: rule.out_dst,
                     accepted_source: source_filter_snapshot(rule.accepted_source),
                     latch: latch_snapshot(rule.latch),
+                    rtcp_to_userspace: rule.rtcp_to_userspace,
                 })
             })
             .collect();

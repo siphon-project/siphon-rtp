@@ -273,8 +273,18 @@ bridge a T.38 leg to a G.711 one.
 
 | Verb | Fields | Result |
 |---|---|---|
-| `checkpoint` | `call_id`, `from_tag` | `{"result": "checkpoint", "snapshot": "..."}`. An opaque blob; store it verbatim, keyed by call. Ownership-gated. A call whose media path the snapshot cannot describe is **refused here**, naming what is missing, rather than returning a blob that fails at failover. |
+| `checkpoint` | `call_id`, `from_tag` | `{"result": "checkpoint", "snapshot": "..."}`. An opaque blob; store it verbatim, keyed by call. Ownership-gated. A call whose media path the snapshot cannot describe is **refused here**, naming what is missing, rather than returning a blob that fails at failover. A two-party call with an MCPTT floor stream is carried: each party's floor stream (its port, signalled address, source gate, learned reply address, engine SSRC, `floor_fmtp`, SRTCP keys and the highest SRTCP index received per key) is in the record, which then has a higher snapshot `version` that an older standby refuses instead of dropping the stream. The record holds the floor SRTCP keys, so treat the blob as a secret. A DTLS or data-channel floor stream is refused with the rest of its call. |
 | `restore` | `snapshot` | Rebuilds the call on this (standby) node at the snapshot's exact ports, so a floating-IP failover needs no re-INVITE. |
+
+`restore` also brings the floor streams of a checkpointed call back on their ports, with the
+latch pinned to the source the primary had learned and the SSRC unchanged, and registers the
+audio RTCP relay of a plain-relay floor call, so `rtcp_app` keeps flowing on the standby. A keyed
+floor stream resumes its outgoing SRTCP index 65536 past the checkpointed one, so the standby never
+reuses an index the primary sent after the checkpoint (RFC 7714 §9.4); a record whose index leaves
+no room for that margin in the 31-bit space is refused. The standby accepts nothing at or below
+the highest index the checkpoint saw per key. Packets the primary consumed after the checkpoint
+and the phone sent once are accepted once more, and the controller must be registered (its event
+queue exists) before it issues `restore`, because the restored stream reports to it.
 
 `restore` rebuilds four call shapes: a plain passthrough relay, an SDES-SRTP bridge, a
 plaintext transcode call, and a secure transcode call (`SrtpMedia`). Everything else is

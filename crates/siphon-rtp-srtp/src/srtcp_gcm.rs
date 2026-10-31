@@ -52,6 +52,8 @@ const INDEX_MASK: u32 = 0x7FFF_FFFF;
 /// The last index a sender may use: the index must not cycle back (RFC 7714 §9.4), so `2^31 - 1`
 /// is the final value and the counter then stops instead of wrapping.
 const LAST_INDEX: u32 = INDEX_MASK;
+/// The largest SRTCP index a sender may use (RFC 7714 §9.4: the 31-bit index never wraps).
+pub const MAX_SEND_INDEX: u32 = LAST_INDEX;
 /// Keys held at once: the current one plus its predecessor for rekey overlap.
 pub const MAX_KEYS: usize = 2;
 /// Smallest valid packet: header, tag, ESRTCP word, MKI (empty plaintext).
@@ -318,6 +320,28 @@ impl SrtcpGcmContext {
     #[must_use]
     pub fn send_index(&self) -> u32 {
         self.send_index
+    }
+
+    /// The highest SRTCP index that authenticated under each held key, as `(mki, index)`, for an HA
+    /// checkpoint. A key nothing has authenticated under is absent.
+    #[must_use]
+    pub fn received_indices(&self) -> Vec<(u32, u32)> {
+        self.keys
+            .iter()
+            .filter_map(|entry| {
+                let highest = u32::try_from(entry.replay.highest()?).ok()?;
+                Some((entry.master.mki, highest))
+            })
+            .collect()
+    }
+
+    /// Resume the anti-replay state of the key `mki` from a checkpoint: `index` and everything
+    /// below it count as received (RFC 3711 §3.3.2), so the standby does not accept the phone's
+    /// last packets a second time. A key this context does not hold is ignored.
+    pub fn resume_received(&mut self, mki: u32, index: u32) {
+        if let Some(entry) = self.keys.iter_mut().find(|entry| entry.master.mki == mki) {
+            entry.replay.close_at(u64::from(index & INDEX_MASK));
+        }
     }
 
     /// Resume the outgoing index from a checkpoint (masked to 31 bits). Callers pass the value
@@ -616,6 +640,37 @@ mod tests {
         receiver
             .unprotect(&wire, &mut out)
             .expect("genuine after forgery");
+    }
+
+    #[test]
+    fn a_resumed_receiver_refuses_the_indices_the_checkpoint_had_seen() {
+        let mut sender = SrtcpGcmContext::new(&[master(1, 0x11)]).expect("ctx");
+        let mut primary = SrtcpGcmContext::new(&[master(1, 0x11)]).expect("ctx");
+        let (mut out, mut plain) = (Vec::new(), Vec::new());
+        let mut wires = Vec::new();
+        for _ in 0..3 {
+            sender.protect(&rtcp(1), true, &mut out).expect("protect");
+            wires.push(out.clone());
+        }
+        // Only the first and the third arrive: the second stays a gap below the highest.
+        primary.unprotect(&wires[0], &mut plain).expect("first");
+        primary.unprotect(&wires[2], &mut plain).expect("third");
+        assert_eq!(primary.received_indices(), vec![(1, 2)]);
+
+        let mut standby = SrtcpGcmContext::new(&[master(1, 0x11)]).expect("ctx");
+        for (mki, index) in primary.received_indices() {
+            standby.resume_received(mki, index);
+        }
+        standby.resume_received(99, 7); // a key it does not hold is ignored
+        for wire in &wires {
+            assert_eq!(
+                standby.unprotect(wire, &mut plain),
+                Err(SrtpError::Replayed),
+                "nothing at or below the checkpointed highest is accepted again"
+            );
+        }
+        sender.protect(&rtcp(1), true, &mut out).expect("fourth");
+        standby.unprotect(&out, &mut plain).expect("a newer index");
     }
 
     #[test]
