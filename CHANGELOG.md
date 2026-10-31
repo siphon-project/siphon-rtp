@@ -9,7 +9,17 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
-- **Contract: floor keys, `key_mgmt` and `media: preserve` (proto, not yet implemented by the engine).** `profile.floor_keys` (at most two `{mki, key, salt}`: AEAD_AES_128_GCM SRTCP master key and salt for floor control, 3GPP TS 33.180 §9.4.6/§9.4.8, `mki` the KFC-ID; key bytes are redacted from `Debug`), `profile.key_mgmt` (the controller's `a=key-mgmt` value, a passthrough like `floor_fmtp`), the `set_floor_keys` verb (replaces a seat's key set, newest two kept) and `media: translate|preserve` on `forward_join`/`forward_offer` (preserve forwards RTP and audio SRTCP byte for byte, because end-to-end SRTP needs the sender's SSRC kept, TS 33.180 §7.5.2 NOTE 3). All are optional on the wire. This engine build refuses each with an error instead of ignoring it.
+- **Contract: floor keys, `key_mgmt` and `media: preserve` (proto).** `profile.floor_keys` (at most two `{mki, key, salt}`: AEAD_AES_128_GCM SRTCP master key and salt for floor control, 3GPP TS 33.180 §9.4.6/§9.4.8, `mki` the KFC-ID; key bytes are redacted from `Debug`), `profile.key_mgmt` (the controller's `a=key-mgmt` value, a passthrough like `floor_fmtp`), the `set_floor_keys` verb (replaces a seat's key set, newest two kept) and `media: translate|preserve` on `forward_join`/`forward_offer` (preserve forwards RTP and audio SRTCP byte for byte, because end-to-end SRTP needs the sender's SSRC kept, TS 33.180 §7.5.2 NOTE 3). All are optional on the wire. `media: preserve` and `key_mgmt` are served by the engine (next entry); `floor_keys` and `set_floor_keys` are refused with an error instead of ignored until implemented.
+- **Forwarding rooms with `media: preserve`, and `key_mgmt` passthrough (`node_info` feature `forward_preserve`).** End-to-end
+  MCPTT SRTP (3GPP TS 33.180 §7.5.2 NOTE 3) authenticates the SSRC and sequence number, which the per-receiver translator
+  rewrites. A preserve room forwards the talker's RTP and audio SRTCP byte for byte (RFC 3550 §7.1): no translator, no SRTP
+  re-protect, no transcoding, no engine SR/RR/BYE, receivers' audio RTCP dropped and counted. Seats are `RTP/SAVP` without
+  `a=crypto`; a seat offering `a=crypto` or DTLS-SRTP, a second codec or payload type, or the other media mode is refused.
+  `profile.key_mgmt` is written as `a=key-mgmt` on the audio section of every SDP the engine produces; the offerer's line is
+  never echoed, and `key_mgmt` is refused in a translate forwarding room (it sets up end-to-end SRTP that the translator breaks,
+  RFC 3711 §3.3) and on a mixing conference seat; the two-party verbs refuse it beside engine-terminated SDES or
+  DTLS-SRTP (RFC 4567 and RFC 4568 are alternative keying mechanisms for one stream). The engine cannot verify the SRTP tag in a preserve room: the source gate and the chosen
+  source bound who may send (docs/security-and-nat.md). `floor_keys` and `set_floor_keys` are still refused.
 - **MCPTT floor control over a WebRTC data channel, for a browser seat (`node_info` feature
   `webrtc_floor_channel`).** A browser cannot send RTCP APP, so `forward_join` and `answer_local` now answer an
   `m=application <port> UDP/DTLS/SCTP webrtc-datachannel` section (RFC 8841) that is bundled with a DTLS-SRTP
