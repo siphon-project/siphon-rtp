@@ -5,7 +5,48 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.16.0] — 2026-10-30
+
+### Added
+
+- **RTCP APP packets can be read and built (RFC 3550 §6.7).** This is groundwork for MCPTT floor
+  control (3GPP TS 24.380 §8), which sends each floor message as a standalone APP packet, never in
+  a compound, with several messages allowed in one datagram (§8.1.1). The compound parser kept only
+  the packet type of an APP packet. `rtcp::app_packets` now reads every APP packet in a datagram,
+  without allocating, and keeps the 5-bit subtype whole so the MCPTT acknowledgement bit survives.
+  `rtcp::write_app` builds one into a caller buffer. Application data that is not a whole number of
+  32-bit words is refused rather than padded, because its field coding (§8.1.3) belongs to the
+  caller. Nothing is wired to the control protocol yet.
+
+### Added
+
+- `siphon-rtp-media::translator::Translator`: a per-receiver RTP translator (RFC 3550 §7.1/§7.2) for
+  one-to-many forwarding. One stable egress SSRC per receiver; sequence numbers and timestamps stay
+  continuous across talker changes, the marker bit is set on the first packet of each run, in-source
+  loss is preserved, late packets of the previous source are dropped. Payload is copied unchanged;
+  CSRCs and the header extension are dropped, padding is kept. Exposes SR counters.
+
+### Added
+
+- **Control contract for push-to-talk forwarding rooms and RTCP APP (`siphon-rtp-proto`).** These
+  are the wire types only, so a controller can build against them. The engine refuses every new verb
+  by name (`unsupported command: forward_join`) until it serves it, and `node_info` advertises
+  nothing new yet.
+  - Verbs: `forward_join`, `forward_offer`, `forward_answer`, `forward_leave` and
+    `forward_set_source`. Like the other room verbs they take no `scope`.
+  - `send_rtcp_app` is addressed by `call_id` + `from_tag`, by a room seat, or to a whole room with
+    `except_from_tags`.
+  - Events: `rtcp_app`, `forward_source_started` and `forward_seat_inactive`.
+  - `profile.floor_fmtp` carries the `a=fmtp:MCPTT` parameters (3GPP TS 24.380 §14) verbatim.
+  - Payloads are strict base64 (RFC 4648 §4).
+  - A forwarding seat is never reaped for silence, because a push-to-talk listener sends nothing
+    while others talk. It is reported as `forward_seat_inactive` instead.
+
+### Changed
+
+- **`rtc-dtls`, `rtc-shared` and `rtc-crypto` move to crates.io 0.21.1; the last-flight fork is retired.** The
+  RFC 6347 §4.2.4 last-flight retransmission fix landed upstream (webrtc-rs/rtc#243) and ships in
+  0.21.1, so the `[patch.crates-io]` git entries and the `allow-git` exception in `deny.toml` are gone.
 
 ### Added
 
