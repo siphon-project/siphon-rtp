@@ -2136,7 +2136,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "siphon-rtp"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "bytes",
  "clap",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-codec"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "criterion",
  "iai-callgrind",
@@ -2195,7 +2195,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-datapath"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-dsp"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2221,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-dtls"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "bytes",
  "rtc-datachannel",
@@ -2236,21 +2236,21 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-ebpf-common"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "siphon-rtp-hep"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "siphon-rtp-ice"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-li"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "criterion",
  "tempfile",
@@ -2268,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-loadgen"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "clap",
  "futures-util",
@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-media"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-ngcompat"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "siphon-rtp-proto",
  "thiserror 2.0.21",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "proptest",
  "serde",
@@ -2326,14 +2326,14 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-simd"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "siphon-rtp-srtp"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2350,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-stun"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "criterion",
  "getrandom 0.3.4",
@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-turn"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "bytes",
  "criterion",
