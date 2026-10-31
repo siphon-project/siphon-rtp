@@ -3,7 +3,7 @@
 //! A call whose party offers or answers `m=application <port> udp MCPTT` gets that stream
 //! **terminated** on one engine endpoint per party: unlike audio it is not relayed to the other
 //! party, because the floor is the controller's to arbitrate. Every RTCP APP packet arriving on it
-//! becomes an [`Event::RtcpApp`] for the controller that owns the call, and `send_rtcp_app` sends one
+//! becomes an [`siphon_rtp_proto::Event::RtcpApp`] for the controller that owns the call, and `send_rtcp_app` sends one
 //! to a party.
 //!
 //! One actor owns the state of every call's floor legs (single-owner state, no lock over a leg): the
@@ -11,7 +11,7 @@
 //! The synchronous core, [`CallFloors`], has no sockets and no tasks, so it is unit-tested directly.
 //!
 //! The gate is the one the forwarding room's floor stream runs (docs/security-and-nat.md §4 layer
-//! 5h): the signalled source (layer 2), then the learn-once latch ([`OpaqueLatch`]) because the
+//! 5h): the signalled source (layer 2), then the learn-once latch (`OpaqueLatch`) because the
 //! stream has no SSRC to prove a rebind with.
 
 use std::collections::HashMap;
