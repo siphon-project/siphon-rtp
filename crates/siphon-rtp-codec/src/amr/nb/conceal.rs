@@ -22,7 +22,7 @@ const MEDIAN_MAX: usize = 9;
 
 /// Median of `values` (`gmed_n.c` `gmed_n`): the reference sorts indices by descending value with
 /// ties resolved to the last equal element, and returns the value at the middle rank. `values`
-/// holds an odd count of at most [`MEDIAN_MAX`] entries; anything longer is truncated and an
+/// holds an odd count of at most `MEDIAN_MAX` (9) entries; anything longer is truncated and an
 /// empty slice gives 0.
 #[must_use]
 pub fn gmed_n(values: &[i16]) -> i16 {
