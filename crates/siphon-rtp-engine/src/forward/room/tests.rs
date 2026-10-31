@@ -660,5 +660,7 @@ fn ice_selection_opens_a_pending_seat_and_aims_it_at_the_selected_pair() {
     assert_eq!(sent[0].1, address("198.51.100.20:5004"));
 }
 
+mod concealment;
 mod floor;
+mod mode_request;
 mod transcode;

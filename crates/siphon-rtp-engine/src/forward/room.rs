@@ -218,6 +218,44 @@ struct Plan {
     arrival: u64,
     /// The transcoder's drop count when the plan was armed, to see whether this packet added one.
     dropped_before: u64,
+    /// Source packets lost right before this one, whose concealed frames are fanned out first.
+    fill: Option<Fill>,
+    /// A cross-codec source's packet is decoded only after its concealed frames were (a decoder
+    /// conceals the loss before it decodes what came after it); see [`ForwardRoom::finish_uplink`].
+    uplink_pending: bool,
+}
+
+/// Concealed frames for source packets lost before the armed packet (RFC 3550 §5.1), each fanned
+/// out like a packet of its own, in order, before the packet itself.
+#[derive(Clone, Copy)]
+struct Fill {
+    /// Frames to conceal, and how many rounds are over.
+    total: u16,
+    done: u16,
+    /// The room-domain point of the first lost frame, and the timestamp ticks per frame.
+    first: StreamPoint,
+    step: u32,
+    /// Whether the current round's frame was asked for, and could be made.
+    started: bool,
+    made: bool,
+}
+
+impl Fill {
+    fn active(&self) -> bool {
+        self.done < self.total
+    }
+
+    /// The room-domain point of the frame of the current round.
+    fn point(&self) -> StreamPoint {
+        StreamPoint {
+            sequence: self.first.sequence.wrapping_add(self.done),
+            timestamp: self
+                .first
+                .timestamp
+                .wrapping_add(self.step.wrapping_mul(u32::from(self.done))),
+            ..self.first
+        }
+    }
 }
 
 /// Which packet a receiver's translator reads.
@@ -229,6 +267,8 @@ enum Feed {
     Domain(usize),
     /// A packet built for a cross-codec receiver.
     Synthesized(usize),
+    /// A cross-codec source's concealed frame, as a room-domain packet.
+    FillDomain,
 }
 
 /// `micros` of the monotonic clock as ticks of an RTP clock of `rate_hz` (RFC 3550 §5.1).
@@ -435,7 +475,10 @@ impl ForwardRoom {
         let Some(index) = self.index_of(tag) else {
             return false;
         };
-        let seat = self.seats.remove(index);
+        let mut seat = self.seats.remove(index);
+        if let (Some(leg), Some(transcoder)) = (seat.cross.take(), self.transcoder.as_mut()) {
+            transcoder.release(leg);
+        }
         tracing::info!(
             target: "siphon_rtp::media",
             room = %self.room_id,
@@ -635,6 +678,13 @@ impl ForwardRoom {
         seat.stats
             .on_rtp(parsed.ssrc, parsed.sequence, parsed.timestamp);
         seat.stats.observe_arrival(packet.arrival);
+        // RFC 4867 §4.3.1: the seat's codec mode request is in its own stream, whether or not it is
+        // the one being forwarded; a listener asks for a lower rate by sending it.
+        if parsed.payload_type == seat.audio_payload_type {
+            if let (Some(leg), Some(transcoder)) = (seat.cross.as_mut(), self.transcoder.as_mut()) {
+                transcoder.note_mode_request(leg, parsed.payload);
+            }
+        }
         if self.source != Some(index) {
             seat.counters.not_source_dropped += 1;
             return Ingress::DroppedFromPeer;
@@ -668,48 +718,98 @@ impl ForwardRoom {
             cursor: 0,
             arrival: packet.arrival,
             dropped_before: 0,
+            fill: None,
+            uplink_pending: false,
         };
         if let Some(transcoder) = self.transcoder.as_mut() {
             plan.dropped_before = transcoder.stats().dropped;
             transcoder.begin_packet();
             let new_run = transcoder.begin_run(parsed.ssrc, parsed.timestamp, seat.cross.is_some());
+            let audio = matches!(kind, PlanKind::Audio);
+            let missing = transcoder.note_packet(plan.point, seat.clock_rate_hz, audio, new_run);
+            if missing > 0 {
+                let (first, step) = transcoder.fill_start(
+                    plan.point,
+                    missing,
+                    seat.clock_rate_hz,
+                    seat.cross.is_some(),
+                );
+                plan.fill = Some(Fill {
+                    total: missing,
+                    done: 0,
+                    first,
+                    step,
+                    started: false,
+                    made: false,
+                });
+            }
             if let Some(leg) = seat.cross.as_mut() {
                 // A source in another codec is brought into the room codec first (see
                 // `transcode`); from here it is forwarded like any other.
                 if new_run {
                     leg.restart();
                 }
-                let converted = match kind {
-                    PlanKind::Audio => {
-                        transcoder.uplink_audio(leg, plan.point, seat.clock_rate_hz, parsed.payload)
-                    }
-                    PlanKind::Event { original_rate, .. } => transcoder.uplink_event(
-                        plan.point,
-                        seat.clock_rate_hz,
-                        original_rate,
-                        parsed.payload,
-                    ),
-                };
-                let Some(length) = converted else {
-                    seat.counters.transcode_dropped += 1;
-                    return Ingress::Accepted;
-                };
-                let Ok(domain) = RtpPacket::parse(transcoder.domain(length)) else {
-                    return Ingress::Accepted;
-                };
-                plan.point.timestamp = domain.timestamp;
-                plan.domain_len = Some(length);
                 plan.source_group = Some(leg.group());
-                if let PlanKind::Event { original_rate, .. } = kind {
-                    plan.kind = PlanKind::Event {
-                        original_rate,
-                        domain_rate: self.codec.clock_rate_hz(),
-                    };
+                if missing > 0 {
+                    plan.uplink_pending = true;
                 }
+            }
+            if seat.cross.is_some()
+                && !plan.uplink_pending
+                && !convert_source(
+                    transcoder,
+                    seat,
+                    &mut plan,
+                    parsed.payload,
+                    self.codec.clock_rate_hz(),
+                )
+            {
+                return Ingress::Accepted;
             }
         }
         self.plan = Some(plan);
         Ingress::Accepted
+    }
+
+    /// Bring a cross-codec source's packet into the room codec once its concealed frames have been
+    /// fanned out. `false` when it could not be (counted), and nothing more is sent for it.
+    fn finish_uplink(&mut self, plan: &mut Plan, packet: &RxPacket) -> bool {
+        plan.uplink_pending = false;
+        let original: &[u8] = if plan.in_clear_buffer {
+            &self.clear_in
+        } else {
+            &packet.data
+        };
+        let (Ok(parsed), Some(transcoder)) = (RtpPacket::parse(original), self.transcoder.as_mut())
+        else {
+            return false;
+        };
+        let seat = &mut self.seats[plan.source];
+        convert_source(
+            transcoder,
+            seat,
+            plan,
+            parsed.payload,
+            self.codec.clock_rate_hz(),
+        )
+    }
+
+    /// Ask for the concealed frame of the current round, if it is not asked for yet.
+    fn start_fill_round(&mut self, plan: &mut Plan) {
+        let Some(fill) = plan.fill.as_mut() else {
+            return;
+        };
+        if !fill.active() || fill.started {
+            return;
+        }
+        fill.started = true;
+        let point = fill.point();
+        fill.made = match self.transcoder.as_mut() {
+            Some(transcoder) => {
+                transcoder.begin_fill(self.seats[plan.source].cross.as_mut(), point)
+            }
+            None => false,
+        };
     }
 
     /// The next datagram of the fan-out [`Self::ingest`] armed: the receiving seat's endpoint, its
@@ -726,8 +826,27 @@ impl ForwardRoom {
     ) -> Option<(EndpointId, SocketAddr, &'a [u8])> {
         let mut plan = self.plan?;
         loop {
+            if plan.cursor == 0 {
+                self.start_fill_round(&mut plan);
+            }
             let index = plan.cursor;
             if index >= self.seats.len() {
+                if let Some(fill) = plan.fill.as_mut().filter(|fill| fill.active()) {
+                    // The round is over: the next lost frame, or at the end the packet itself.
+                    fill.done += 1;
+                    fill.started = false;
+                    plan.cursor = 0;
+                    if !plan.fill.is_some_and(|fill| fill.active())
+                        && plan.uplink_pending
+                        && !self.finish_uplink(&mut plan, packet)
+                    {
+                        self.plan = None;
+                        self.count_transcode_drop(&plan);
+                        return None;
+                    }
+                    self.plan = Some(plan);
+                    continue;
+                }
                 self.plan = None;
                 self.count_transcode_drop(&plan);
                 return None;
@@ -746,15 +865,22 @@ impl ForwardRoom {
             } else {
                 &packet.data
             };
-            let Some((feed, payload_type)) =
-                select_feed(&plan, receiver, original, &mut self.transcoder)
-            else {
+            let filling = plan.fill.filter(Fill::active);
+            let selected = match filling {
+                Some(fill) if fill.made => {
+                    select_fill_feed(&plan, fill.point(), receiver, &mut self.transcoder)
+                }
+                Some(_) => None,
+                None => select_feed(&plan, receiver, original, &mut self.transcoder),
+            };
+            let Some((feed, payload_type)) = selected else {
                 continue;
             };
             let inbound: &[u8] = match (feed, self.transcoder.as_ref()) {
                 (Feed::Original, _) => original,
                 (Feed::Domain(length), Some(transcoder)) => transcoder.domain(length),
                 (Feed::Synthesized(length), Some(transcoder)) => transcoder.synthesized(length),
+                (Feed::FillDomain, Some(transcoder)) => transcoder.fill_domain(),
                 (_, None) => continue,
             };
             // The translator's clock is the receiver's own RTP clock (RFC 3550 §5.1).
@@ -919,7 +1045,12 @@ fn select_feed(
             }
         };
     };
-    if plan.source_group == Some(group) {
+    let shares = plan.source_group.is_some_and(|source| {
+        transcoder
+            .as_ref()
+            .is_some_and(|transcoder| transcoder.shares_payload(source, group))
+    });
+    if shares {
         return match plan.kind {
             PlanKind::Audio => Some((Feed::Original, receiver.audio_payload_type)),
             PlanKind::Event { original_rate, .. } => {
@@ -936,7 +1067,8 @@ fn select_feed(
             if !transcoder.prepare_group(group, || payload_of(original)) {
                 return None;
             }
-            let length = transcoder.synthesize_audio(group, plan.point, receiver.clock_rate_hz)?;
+            let length =
+                transcoder.synthesize_audio(group, plan.point, receiver.clock_rate_hz, false)?;
             Some((Feed::Synthesized(length), receiver.audio_payload_type))
         }
         PlanKind::Event { domain_rate, .. } => {
@@ -955,6 +1087,76 @@ fn select_feed(
             Some((Feed::Synthesized(length), event.payload_type))
         }
     }
+}
+
+/// Bring the cross-codec source's packet (`payload`, of the armed `plan`) into the room codec and
+/// note where the room-domain packet is. `false` when it could not be transcoded (counted).
+fn convert_source(
+    transcoder: &mut Transcoder,
+    seat: &mut Seat,
+    plan: &mut Plan,
+    payload: &[u8],
+    room_clock_hz: u32,
+) -> bool {
+    let Some(leg) = seat.cross.as_mut() else {
+        return true;
+    };
+    let converted = match plan.kind {
+        PlanKind::Audio => transcoder.uplink_audio(leg, plan.point, seat.clock_rate_hz, payload),
+        PlanKind::Event { original_rate, .. } => {
+            transcoder.uplink_event(plan.point, seat.clock_rate_hz, original_rate, payload)
+        }
+    };
+    let Some(length) = converted else {
+        seat.counters.transcode_dropped += 1;
+        return false;
+    };
+    let Ok(domain) = RtpPacket::parse(transcoder.domain(length)) else {
+        return false;
+    };
+    plan.point.timestamp = domain.timestamp;
+    plan.domain_len = Some(length);
+    plan.source_group = Some(leg.group());
+    if let PlanKind::Event { original_rate, .. } = plan.kind {
+        plan.kind = PlanKind::Event {
+            original_rate,
+            domain_rate: room_clock_hz,
+        };
+    }
+    true
+}
+
+/// Decide what `receiver` is sent for one concealed frame of the armed `plan`, at `point`. `None`
+/// skips it.
+///
+/// * A seat in the room codec is sent a concealed frame only when the source is in another codec: its
+///   stream is the transcoder's, so the loss is in it. A room-codec source's own packets reach it as
+///   they came, and its own decoder conceals what it lost.
+/// * A cross-codec seat that is sent the source's packets as they came likewise conceals for itself.
+/// * Any other cross-codec seat reads its group's encode of the concealed frame.
+fn select_fill_feed(
+    plan: &Plan,
+    point: StreamPoint,
+    receiver: &Seat,
+    transcoder: &mut Option<Transcoder>,
+) -> Option<(Feed, u8)> {
+    let Some(group) = receiver.cross.as_ref().map(SeatLeg::group) else {
+        return plan
+            .source_group
+            .map(|_| (Feed::FillDomain, receiver.audio_payload_type));
+    };
+    let transcoder = transcoder.as_mut()?;
+    if plan
+        .source_group
+        .is_some_and(|source| transcoder.shares_payload(source, group))
+    {
+        return None;
+    }
+    if !transcoder.prepare_fill_group(group) {
+        return None;
+    }
+    let length = transcoder.synthesize_audio(group, point, receiver.clock_rate_hz, true)?;
+    Some((Feed::Synthesized(length), receiver.audio_payload_type))
 }
 
 /// DLSR (RFC 3550 §6.4.1): the time since the last SR arrived, in 1/65536 s; zero before any.
