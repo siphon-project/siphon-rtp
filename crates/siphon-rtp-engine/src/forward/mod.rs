@@ -9,7 +9,7 @@
 //!
 //! * [`codec`]: the room's one codec and which offered codecs may join it.
 //! * [`room`]: the synchronous core (seats, source, fan-out, reports). No sockets, no clock.
-//! * [`transcode`]: seats in another codec than the room's (decode once, encode once per codec
+//! * `transcode`: seats in another codec than the room's (decode once, encode once per codec
 //!   group).
 //! * [`registry`]: the actor that owns a core, its mailbox, and the registry the redirect
 //!   dispatcher and the engine verbs go through.
