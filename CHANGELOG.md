@@ -5,7 +5,42 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.16.0] — 2026-10-30
+
+### Added
+
+- **RTCP APP packets can be read and built (RFC 3550 §6.7).** This is groundwork for MCPTT floor
+  control (3GPP TS 24.380 §8), which sends each floor message as a standalone APP packet, never in
+  a compound, with several messages allowed in one datagram (§8.1.1). The compound parser kept only
+  the packet type of an APP packet. `rtcp::app_packets` now reads every APP packet in a datagram,
+  without allocating, and keeps the 5-bit subtype whole so the MCPTT acknowledgement bit survives.
+  `rtcp::write_app` builds one into a caller buffer. Application data that is not a whole number of
+  32-bit words is refused rather than padded, because its field coding (§8.1.3) belongs to the
+  caller. Nothing is wired to the control protocol yet.
+
+### Added
+
+- `siphon-rtp-media::translator::Translator`: a per-receiver RTP translator (RFC 3550 §7.1/§7.2) for
+  one-to-many forwarding. One stable egress SSRC per receiver; sequence numbers and timestamps stay
+  continuous across talker changes, the marker bit is set on the first packet of each run, in-source
+  loss is preserved, late packets of the previous source are dropped. Payload is copied unchanged;
+  CSRCs and the header extension are dropped, padding is kept. Exposes SR counters.
+
+### Added
+
+- **Control contract for push-to-talk forwarding rooms and RTCP APP (`siphon-rtp-proto`).** These
+  are the wire types only, so a controller can build against them. The engine refuses every new verb
+  by name (`unsupported command: forward_join`) until it serves it, and `node_info` advertises
+  nothing new yet.
+  - Verbs: `forward_join`, `forward_offer`, `forward_answer`, `forward_leave` and
+    `forward_set_source`. Like the other room verbs they take no `scope`.
+  - `send_rtcp_app` is addressed by `call_id` + `from_tag`, by a room seat, or to a whole room with
+    `except_from_tags`.
+  - Events: `rtcp_app`, `forward_source_started` and `forward_seat_inactive`.
+  - `profile.floor_fmtp` carries the `a=fmtp:MCPTT` parameters (3GPP TS 24.380 §14) verbatim.
+  - Payloads are strict base64 (RFC 4648 §4).
+  - A forwarding seat is never reaped for silence, because a push-to-talk listener sends nothing
+    while others talk. It is reported as `forward_seat_inactive` instead.
 
 ### Changed
 
@@ -23,6 +58,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   the participant, and the participant heard nothing. The answer now drops all of those lines and
   names the SSRC the room really sends (`a=ssrc:<ssrc> cname:<cname>`). `answer_local` drops them
   too, and names no SSRC of its own.
+- **An event raised just after a control reconnect reaches the new connection.** A reconnect gives
+  the new connection a receiver on the same event channel as the one it replaces, and until the old
+  connection's loop noticed it was superseded it was a second consumer. Woken with its eviction,
+  its end of stream and a new event all ready, it picked one at random, and sometimes took the event
+  and wrote it into the closed socket: a `call_summary` (or any event) lost to the controller. The
+  loop now checks eviction and end of stream first.
 
 ## [0.15.5] — 2026-10-29
 
