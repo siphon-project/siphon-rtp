@@ -18,13 +18,17 @@
 //! offer's), so it is refused if its own offer excludes a mode the room may send.
 
 use siphon_rtp_codec::factory::CodecSpec;
+use siphon_rtp_proto::ForwardMedia;
 
-/// The codec of a forwarding room, fixed by its first seat.
+/// The codec of a forwarding room, fixed by its first seat, and how the room carries media (also
+/// fixed by its first seat).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomCodec {
     /// The first seat's spec for the codec. Its payload type is that seat's own; every other seat
-    /// answers with its own number (RFC 3264 §6.1, payload types are per-direction names).
+    /// answers with its own number (RFC 3264 §6.1, payload types are per-direction names) in a
+    /// translating room, and with this very number in a preserving one.
     reference: CodecSpec,
+    media: ForwardMedia,
 }
 
 /// Whether the room can carry a codec at all.
@@ -56,6 +60,7 @@ impl RoomCodec {
                     return Ok((
                         Self {
                             reference: spec.clone(),
+                            media: ForwardMedia::Translate,
                         },
                         spec.clone(),
                     ));
@@ -73,6 +78,20 @@ impl RoomCodec {
             "no offered codec can be forwarded: {}",
             reasons.join("; ")
         ))
+    }
+
+    /// The same codec in a room that forwards the talker's packets unchanged
+    /// ([`ForwardMedia::Preserve`]); [`ForwardMedia::Translate`] is the default.
+    #[must_use]
+    pub fn with_media(mut self, media: ForwardMedia) -> Self {
+        self.media = media;
+        self
+    }
+
+    /// How the room carries media.
+    #[must_use]
+    pub fn media(&self) -> ForwardMedia {
+        self.media
     }
 
     /// The room's codec as its first seat offered it.
@@ -144,6 +163,15 @@ impl RoomCodec {
         if room.encoding_name == "G729" && offered.annex_b != room.annex_b {
             return Some("a different annexb setting (RFC 3555 §4.1.13)".to_string());
         }
+        // A preserving room hands the talker's packets on byte for byte, RTP header included, so
+        // every seat must read the payload type the talker sent (RFC 3550 §7.1: a translator that
+        // forwards unchanged).
+        if self.media == ForwardMedia::Preserve && offered.payload_type != room.payload_type {
+            return Some(format!(
+                "payload type {} where the preserve room forwards payload type {} unchanged",
+                offered.payload_type, room.payload_type
+            ));
+        }
         None
     }
 
@@ -193,6 +221,12 @@ impl RoomCodec {
     /// A reason naming each offered codec and why it cannot be transcoded (a build without the `amr`
     /// feature says so).
     pub fn admit_cross(&self, offered: &[CodecSpec]) -> Result<CodecSpec, String> {
+        if self.media == ForwardMedia::Preserve {
+            return Err(
+                "preserve rooms forward the talker's packets unchanged, so they never transcode"
+                    .to_string(),
+            );
+        }
         let mut reasons = Vec::new();
         for spec in offered {
             match super::transcode::check_pair(&self.reference, spec) {
@@ -338,5 +372,35 @@ mod tests {
                     m=audio 4000 RTP/AVP 8 0\r\n";
         let offered = sdp::parse(text).unwrap().audio_codecs();
         assert_eq!(room.admit(&offered).unwrap().payload_type, 0);
+    }
+
+    #[test]
+    fn a_preserve_room_admits_only_its_own_payload_type_and_never_transcodes() {
+        let (room, _) = RoomCodec::from_offer(&amr_wb_offer(96, "octet-align=1")).unwrap();
+        let room = room.with_media(ForwardMedia::Preserve);
+        assert_eq!(room.media(), ForwardMedia::Preserve);
+        assert_eq!(
+            room.admit(&amr_wb_offer(96, "octet-align=1"))
+                .unwrap()
+                .payload_type,
+            96
+        );
+        let reason = room.admit(&amr_wb_offer(111, "octet-align=1")).unwrap_err();
+        assert!(
+            reason.contains("payload type 111") && reason.contains("forwards payload type 96"),
+            "{reason}"
+        );
+        let reason = room.admit_cross(&g711_offer()).unwrap_err();
+        assert!(reason.contains("never transcode"), "{reason}");
+    }
+
+    #[test]
+    fn the_media_mode_is_part_of_the_rooms_identity() {
+        let (translate, _) = RoomCodec::from_offer(&g711_offer()).unwrap();
+        assert_eq!(translate.media(), ForwardMedia::Translate);
+        assert_ne!(
+            translate.clone(),
+            translate.with_media(ForwardMedia::Preserve)
+        );
     }
 }

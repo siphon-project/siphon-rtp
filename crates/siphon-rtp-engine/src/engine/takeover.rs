@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::sdp;
 
 use super::negotiate::{apply_received_from, bridge_source_filter, random_ssrc};
-use super::{error_result, ok_empty, ok_sdp, unknown_call, ClientId, Engine, Leg, PipelineKind};
+use super::{error_result, ok_empty, unknown_call, ClientId, Engine, Leg, PipelineKind};
 
 mod anchor;
 
@@ -1227,6 +1227,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 call.ice = None;
             }
         }
-        ok_sdp(rewritten, Some(answer_to_tag))
+        self.ok_sdp_keyed(call_id, rewritten, Some(answer_to_tag), profile)
+            .await
     }
 }

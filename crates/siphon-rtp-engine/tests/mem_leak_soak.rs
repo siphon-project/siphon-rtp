@@ -943,12 +943,22 @@ async fn conference_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usiz
 /// Churn one forwarding room through `join ×3 → set_source → set_source(None) → leave ×3` (the last
 /// leave ends the room actor and frees its endpoints), with the seat codec negotiated from an AMR-WB
 /// offer the build cannot transcode.
-async fn forward_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+async fn forward_join_leave(
+    engine: &Engine<UdpLoopbackDatapath>,
+    index: usize,
+    media: siphon_rtp_proto::ForwardMedia,
+) {
     let conference_id = format!("soak-forward-{index}");
+    // A preserve room's seats are end-to-end `RTP/SAVP` with no `a=crypto`.
+    let transport = if media == siphon_rtp_proto::ForwardMedia::Preserve {
+        "RTP/SAVP"
+    } else {
+        "RTP/AVP"
+    };
     let amr_wb_sdp = |port: u16| {
         format!(
             "v=0\r\no=- 1 1 IN IP4 198.51.100.1\r\ns=-\r\nc=IN IP4 198.51.100.1\r\nt=0 0\r\n\
-             m=audio {port} RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n"
+             m=audio {port} {transport} 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n"
         )
     };
     for participant in 0..3 {
@@ -956,7 +966,7 @@ async fn forward_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usize) 
             .handle(
                 CLIENT,
                 Command::ForwardJoin {
-                    media: siphon_rtp_proto::ForwardMedia::Translate,
+                    media,
                     conference_id: conference_id.clone(),
                     from_tag: format!("p{participant}"),
                     sdp: amr_wb_sdp(40_000 + participant as u16),
@@ -1452,16 +1462,33 @@ async fn conference_join_leave_does_not_leak() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forward_join_leave_does_not_leak() {
+    forward_soak(
+        siphon_rtp_proto::ForwardMedia::Translate,
+        "forwarding rooms",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forward_preserve_join_leave_does_not_leak() {
+    forward_soak(
+        siphon_rtp_proto::ForwardMedia::Preserve,
+        "preserve forwarding rooms",
+    )
+    .await;
+}
+
+async fn forward_soak(media: siphon_rtp_proto::ForwardMedia, name: &'static str) {
     let _serialized = SOAK.lock().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
 
     // Each cycle spawns a forwarding room actor and three seats (a translator and an endpoint each)
     // and frees them all on leave.
-    let mut gate = LeakGate::new("forwarding rooms", 100, 50).await;
+    let mut gate = LeakGate::new(name, 100, 50).await;
     let mut index = 0;
     while gate.needs_more_churn() {
         for _ in 0..gate.cycles_per_segment() {
-            forward_join_leave(&engine, index).await;
+            forward_join_leave(&engine, index, media).await;
             index += 1;
         }
         quiesce().await;

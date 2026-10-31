@@ -54,6 +54,7 @@ mod conference_seat_call;
 mod floor_call_rtcp;
 mod floor_security_refusals;
 mod forward_floor;
+mod forward_preserve;
 mod forward_room;
 mod forward_stream_identity;
 mod offer_far;
