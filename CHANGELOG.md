@@ -79,6 +79,20 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   RTCP datagram to the redirect stream after the source gate and latch have admitted it; the eBPF flow value
   grows from 36 to 40 bytes), set only for a call with a floor stream; no new setting. A call without one is
   unchanged. About 55 ns per datagram, 125 ns with an APP packet (`benches/rtcp_relay_bench.rs`).
+- **Loss concealment and codec mode requests for cross-codec seats in a forwarding room.** When up to
+  120 ms of a source's audio packets are lost (RFC 3550 §5.1 sequence gap, timestamps advanced by exactly
+  the missing frames, no marker), the decoder fed by the source conceals one frame per missing packet and
+  every transcoded receiver is sent it, so it hears a concealed frame with continuous sequence numbers and
+  timestamps instead of a gap; seats sent the source's packets as they came still see the gap and conceal
+  for themselves. A cross-codec AMR or AMR-WB seat's CMR (RFC 4867 §4.3.1) is now read from its own RTP and
+  caps the mode encoded for it: codec groups are keyed by codec and mode ceiling, created on demand and
+  dropped with their last seat, and a request outside the seat's `mode-set` is ignored. G.711 decoders
+  built by the factory now conceal with ITU-T G.711 Appendix I waveform substitution (pitch replay, 20 %
+  fade per 10 ms after the first, mute after 60 ms, cross-fade into the first good frame) instead of
+  silence, which also applies to the jitter-buffer concealment of a transcoded call. AMR-NB concealment
+  (3GPP TS 26.091) is not ported and stays silence. A concealed frame costs one decode-side conceal and
+  the group encodes, allocation-free; eight mode groups cost eight encodes per packet
+  (`benches/forward_transcode_bench.rs`, `docs/cookbook/forwarding.md`).
 
 - **MCPTT floor control over a WebRTC data channel, for a browser seat (`node_info` feature
   `webrtc_floor_channel`).** A browser cannot send RTCP APP, so `forward_join` and `answer_local` now answer an

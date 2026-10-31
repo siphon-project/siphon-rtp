@@ -92,11 +92,16 @@ fn room() -> ForwardRoom {
 
 /// 64 packets from `talker` in `spec`, a 440 Hz tone, built before arming.
 fn packets(talker: usize, spec: &CodecSpec) -> Vec<RxPacket> {
+    stream(talker, spec, 64)
+}
+
+/// `count` consecutive packets from `talker` in `spec`, a 440 Hz tone, built before arming.
+fn stream(talker: usize, spec: &CodecSpec, count: usize) -> Vec<RxPacket> {
     let mut encoder = factory::encoder_for(spec).unwrap();
     let rate = encoder.params().sample_rate_hz as usize;
     let frame = rate / 50;
     let clock_step = (spec.clock_rate_hz / 50) as usize;
-    (0..64usize)
+    (0..count)
         .map(|step| {
             let pcm: Vec<i16> = (0..frame)
                 .map(|n| {
@@ -188,4 +193,78 @@ fn transcoding_a_cross_codec_source_makes_no_heap_allocation() {
         "cross-codec source fan-out allocated {allocations} times across 6400 packets"
     );
     assert_eq!(room.transcode_stats().dropped, 0);
+}
+
+/// Every 8th packet of the stream is lost on the way, so the loop ingests the survivors and the room
+/// conceals the missing frame for every transcoded receiver before each one that follows a gap.
+fn survivors(talker: usize, spec: &CodecSpec, count: usize) -> Vec<RxPacket> {
+    stream(talker, spec, count)
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| index % 8 != 5)
+        .map(|(_, packet)| packet)
+        .collect()
+}
+
+fn measure_once(room: &mut ForwardRoom, packets: &[RxPacket]) -> (usize, usize) {
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut forwarded = 0usize;
+    for packet in packets {
+        room.ingest(packet);
+        while let Some((_, _, datagram)) = room.next_datagram(packet) {
+            forwarded += std::hint::black_box(datagram).len();
+        }
+    }
+    let allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    (allocations, forwarded)
+}
+
+#[test]
+fn concealing_lost_packets_for_a_room_codec_source_makes_no_heap_allocation() {
+    let mut room = room();
+    let from_source = survivors(0, &CodecSpec::new(0, "PCMU", 8000, 1, 20), 4000);
+    room.set_source(Some("seat-0")).unwrap();
+    for packet in &from_source[..8] {
+        room.ingest(packet);
+        while room.next_datagram(packet).is_some() {}
+    }
+    room.drain_events().for_each(drop);
+    let (allocations, forwarded) = measure_once(&mut room, &from_source[8..]);
+    assert!(forwarded > 0);
+    let stats = room.transcode_stats();
+    assert!(
+        stats.concealed >= 400,
+        "the loop concealed the lost frames: {stats:?}"
+    );
+    assert_eq!(stats.conceal_failed, 0);
+    assert_eq!(
+        allocations,
+        0,
+        "concealing allocated {allocations} times across {} packets with {} concealed frames",
+        from_source.len(),
+        stats.concealed
+    );
+}
+
+#[test]
+fn concealing_lost_packets_for_a_cross_codec_source_makes_no_heap_allocation() {
+    let mut room = room();
+    let from_source = survivors(1, &CodecSpec::new(8, "PCMA", 8000, 1, 20), 4000);
+    room.set_source(Some("seat-1")).unwrap();
+    for packet in &from_source[..8] {
+        room.ingest(packet);
+        while room.next_datagram(packet).is_some() {}
+    }
+    room.drain_events().for_each(drop);
+    let (allocations, forwarded) = measure_once(&mut room, &from_source[8..]);
+    assert!(forwarded > 0);
+    let stats = room.transcode_stats();
+    assert!(stats.concealed >= 400, "{stats:?}");
+    assert_eq!(stats.conceal_failed, 0);
+    assert_eq!(
+        allocations, 0,
+        "concealing a cross-codec source allocated {allocations} times"
+    );
 }

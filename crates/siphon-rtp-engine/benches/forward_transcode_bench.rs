@@ -9,6 +9,12 @@
 //! * `room_codec_source`: PCMU in; 1 decode, 2 encodes, 99 packets (50 PCMA + 49 Opus).
 //! * `cross_codec_source`: a PCMA seat in; its 49 group mates get its packet as it came, 1 decode and
 //!   1 PCMU encode for the room codec, 1 Opus encode, and 99 packets.
+//! * `room_codec_source_with_loss` / `cross_codec_source_with_loss`: the same rooms, every other
+//!   source packet lost on the way, so each packet taken in is preceded by one concealed frame (a
+//!   concealment, two encodes and 99 more packets) that the receivers are sent.
+//! * `amr_one_group` / `amr_eight_mode_groups` (with the `amr` feature): an AMR-WB room with 99 AMR-NB
+//!   seats, which the receivers' codec mode requests either leave in one codec group or spread over
+//!   eight, one per speech mode. The cost of a group is one encode, so eight groups are eight encodes.
 //!
 //! `cargo bench -p siphon-rtp --bench forward_transcode_bench`.
 
@@ -132,5 +138,186 @@ fn fan_out(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, fan_out);
+/// 4096 consecutive packets from `talker` in `spec` with every other one lost, to be cycled through.
+/// The sequence jumps back once per cycle, which the room treats as a late packet: one iteration in
+/// 2048 is cheaper by one concealment.
+fn lossy_stream(talker: usize, spec: &CodecSpec) -> Vec<RxPacket> {
+    let mut encoder = factory::encoder_for(spec).unwrap();
+    let rate = encoder.params().sample_rate_hz as usize;
+    let clock_step = (spec.clock_rate_hz / 50) as usize;
+    (0..4096usize)
+        .filter_map(|step| {
+            let pcm: Vec<i16> = (0..rate / 50)
+                .map(|n| {
+                    let t = (step * (rate / 50) + n) as f64 / rate as f64;
+                    ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16
+                })
+                .collect();
+            let mut payload = vec![0u8; 1500];
+            let length = encoder.encode(&pcm, &mut payload).unwrap();
+            if step % 2 == 1 {
+                return None; // lost on the way
+            }
+            let header = RtpHeader {
+                marker: false,
+                payload_type: spec.payload_type,
+                sequence: step as u16 + 1,
+                timestamp: (step * clock_step) as u32,
+                ssrc: 0xA0A0_A0A0,
+            };
+            let mut datagram = vec![0u8; 12 + length];
+            write_packet(&header, &payload[..length], &mut datagram).unwrap();
+            Some(RxPacket {
+                endpoint: EndpointId(talker as u64 + 1),
+                source: format!("192.0.2.{}:{}", 1 + talker % 250, 4000 + talker)
+                    .parse()
+                    .unwrap(),
+                arrival: (step as u64 + 1) * 20_000,
+                data: Bytes::from(datagram),
+            })
+        })
+        .collect()
+}
+
+fn fan_out_with_loss(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("forward_transcode");
+    group.throughput(Throughput::Elements(SEATS as u64 - 1));
+    for (name, talker, spec) in [
+        (
+            "room_codec_source_with_loss",
+            0usize,
+            CodecSpec::new(0, "PCMU", 8000, 1, 20),
+        ),
+        (
+            "cross_codec_source_with_loss",
+            1usize,
+            CodecSpec::new(8, "PCMA", 8000, 1, 20),
+        ),
+    ] {
+        let mut room = room();
+        room.set_source(Some(&format!("seat-{talker}"))).unwrap();
+        let packets = lossy_stream(talker, &spec);
+        for packet in &packets[..4] {
+            room.ingest(packet);
+            while room.next_datagram(packet).is_some() {}
+        }
+        room.drain_events().for_each(drop);
+        let mut next = 4usize;
+        group.bench_function(name, |bencher| {
+            bencher.iter(|| {
+                let packet = &packets[next];
+                next = if next + 1 == packets.len() {
+                    0
+                } else {
+                    next + 1
+                };
+                room.ingest(black_box(packet));
+                let mut forwarded = 0usize;
+                while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                    forwarded += black_box(datagram).len();
+                }
+                black_box(forwarded)
+            });
+        });
+    }
+    group.finish();
+}
+
+#[cfg(feature = "amr")]
+mod amr_modes {
+    use super::*;
+    use siphon_rtp_codec::amr::rtp::{write_payload, FrameSource, PayloadFormat, Variant};
+    use siphon_rtp_codec::factory::AmrParams;
+
+    const NARROWBAND_FIRST: usize = 1;
+
+    fn octet_aligned(spec: CodecSpec) -> CodecSpec {
+        spec.with_amr_params(Some(AmrParams {
+            octet_align: Some(true),
+            ..Default::default()
+        }))
+    }
+
+    /// An AMR-WB room: seat 0 (the source) and 99 AMR-NB seats. With `spread`, each narrowband seat
+    /// sends a codec mode request for one of the eight speech modes, which gives eight codec groups.
+    fn room(spread: bool) -> ForwardRoom {
+        let wideband = octet_aligned(CodecSpec::new(96, "AMR-WB", 16_000, 1, 20));
+        let (codec, _) = RoomCodec::from_offer(std::slice::from_ref(&wideband)).unwrap();
+        let mut room = ForwardRoom::new("bench-amr".to_string(), codec);
+        room.add_seat(config(0, 96), 0).unwrap();
+        let narrowband = octet_aligned(CodecSpec::new(97, "AMR", 8000, 1, 20));
+        for index in NARROWBAND_FIRST..SEATS {
+            room.add_cross_codec_seat(config(index, 97), narrowband.clone(), 0)
+                .unwrap();
+        }
+        if spread {
+            for index in NARROWBAND_FIRST..SEATS {
+                let mut payload = [0u8; 8];
+                let frame = FrameSource {
+                    frame_type: 15,
+                    quality_ok: true,
+                    data: &[],
+                };
+                let length = write_payload(
+                    PayloadFormat::OctetAligned,
+                    Variant::Narrowband,
+                    (index % 8) as u8,
+                    &[frame],
+                    &mut payload,
+                )
+                .unwrap();
+                let header = RtpHeader {
+                    marker: false,
+                    payload_type: 97,
+                    sequence: 1,
+                    timestamp: 0,
+                    ssrc: 0xB000_0000 + index as u32,
+                };
+                let mut datagram = vec![0u8; 12 + length];
+                write_packet(&header, &payload[..length], &mut datagram).unwrap();
+                room.ingest(&RxPacket {
+                    endpoint: EndpointId(index as u64 + 1),
+                    source: format!("192.0.2.{}:{}", 1 + index % 250, 4000 + index)
+                        .parse()
+                        .unwrap(),
+                    arrival: 1,
+                    data: Bytes::from(datagram),
+                });
+            }
+        }
+        room
+    }
+
+    pub fn fan_out(criterion: &mut Criterion) {
+        let mut group = criterion.benchmark_group("forward_transcode");
+        group.throughput(Throughput::Elements(SEATS as u64 - 1));
+        for (name, spread) in [("amr_one_group", false), ("amr_eight_mode_groups", true)] {
+            let mut room = room(spread);
+            room.set_source(Some("seat-0")).unwrap();
+            let packet = inbound(
+                0,
+                &octet_aligned(CodecSpec::new(96, "AMR-WB", 16_000, 1, 20)),
+            );
+            room.ingest(&packet);
+            while room.next_datagram(&packet).is_some() {}
+            room.drain_events().for_each(drop);
+            group.bench_function(name, |bencher| {
+                bencher.iter(|| {
+                    room.ingest(black_box(&packet));
+                    let mut forwarded = 0usize;
+                    while let Some((_, _, datagram)) = room.next_datagram(&packet) {
+                        forwarded += black_box(datagram).len();
+                    }
+                    black_box(forwarded)
+                });
+            });
+        }
+        group.finish();
+    }
+}
+
+#[cfg(feature = "amr")]
+criterion_group!(benches, fan_out, fan_out_with_loss, amr_modes::fan_out);
+#[cfg(not(feature = "amr"))]
+criterion_group!(benches, fan_out, fan_out_with_loss);
 criterion_main!(benches);
