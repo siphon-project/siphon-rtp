@@ -456,7 +456,7 @@ async fn a_forward_join_answer_never_echoes_the_offerers_key_mgmt_and_carries_th
 }
 
 #[tokio::test]
-async fn key_mgmt_is_refused_beside_keying_the_engine_terminates() {
+async fn key_mgmt_is_refused_in_a_translate_room_on_join_and_offer_allocating_nothing() {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_, addr) = phone().await;
     let refused = reason(
@@ -464,17 +464,29 @@ async fn key_mgmt_is_refused_beside_keying_the_engine_terminates() {
             &engine,
             ForwardMedia::Translate,
             "a",
-            offer(addr, "RTP/SAVP", false, true),
+            offer(addr, "RTP/AVP", false, false),
             key_mgmt_profile(Some(KEY_MGMT)),
         )
         .await,
     );
-    assert!(
-        refused.contains("RFC 4567") && refused.contains("RFC 4568"),
-        "{refused}"
+    assert!(refused.contains("\"media\": \"preserve\""), "{refused}");
+    let offered = reason(
+        engine
+            .handle(
+                CLIENT,
+                Command::ForwardOffer {
+                    conference_id: ROOM.into(),
+                    from_tag: "o".into(),
+                    profile: key_mgmt_profile(Some(KEY_MGMT)),
+                    media: ForwardMedia::Translate,
+                },
+            )
+            .await,
     );
+    assert!(offered.contains("\"media\": \"preserve\""), "{offered}");
     assert_eq!(engine.conference().forward().seat_count(), 0);
-    assert!(engine.endpoint_calls.is_empty());
+    assert_eq!(engine.pending_seat_count(), 0);
+    assert!(engine.endpoint_calls.is_empty(), "nothing was allocated");
 }
 
 #[tokio::test]

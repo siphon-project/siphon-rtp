@@ -295,7 +295,7 @@ The first seat fixes the mode; a later join or offer in the other mode is refuse
   audio section of every SDP the engine produces (join answers, `forward_offer` offers, and the two-party
   verbs). The engine never copies the offerer's line, never invents one and never drops yours. A
   `forward_offer` into a preserve room with `key_mgmt` offers `RTP/SAVP`, and the member must answer
-  `RTP/SAVP` without `a=crypto`. `key_mgmt` beside engine-terminated SDES or DTLS-SRTP is refused.
+  `RTP/SAVP` without `a=crypto`. `key_mgmt` is refused in a translate room (the translator would break the end-to-end SRTP it sets up), so a secured group call needs `media: preserve`.
 - RTCP: no engine SR, RR or BYE toward any seat, at room start or later. The talker's audio SRTCP is
   forwarded byte for byte with its RTP; receivers' audio RTCP is dropped (`receiver_rtcp_dropped`). The
   engine cannot read SRTCP, so RTCP APP is surfaced from the floor stream only.

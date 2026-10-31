@@ -24,33 +24,27 @@ use super::{boxed_error_result, error_result, ok_empty, ok_sdp, ClientId, Engine
 
 /// `floor_keys` are part of the contract but not implemented by this build: refused loudly, before
 /// anything is allocated, rather than ignored.
-fn refuse_forward_security(profile: &ProfileFlags) -> Result<(), String> {
-    crate::media_pipeline::refuse_floor_keys(profile)
+///
+/// `key_mgmt` is refused in a translate room: it sets up end-to-end SRTP between the UEs, which the
+/// translator breaks by rewriting the SSRC and sequence number (RFC 3711 §3.3 authenticates both;
+/// 3GPP TS 33.180 §7.5.2 NOTE 3). The call would connect and the audio be silently undecryptable.
+fn refuse_forward_security(profile: &ProfileFlags, media: ForwardMedia) -> Result<(), String> {
+    crate::media_pipeline::refuse_floor_keys(profile)?;
+    if profile.key_mgmt.is_some() && media == ForwardMedia::Translate {
+        return Err("key_mgmt sets up end-to-end SRTP, which a translate room rewrites; use \"media\": \"preserve\"".to_string());
+    }
+    Ok(())
 }
 
-/// Whether a seat can join a room carrying `media`, judged from its offer and the profile alone,
+/// Whether a seat can join a room carrying `media`, judged from its offer alone,
 /// before anything is allocated.
 ///
 /// * A preserve room forwards SRTP keyed between the UEs (3GPP TS 33.180 §7.5.2 NOTE 3), so a seat
 ///   whose media the engine would terminate (a=crypto, DTLS-SRTP) cannot be in it.
-/// * A controller's `a=key-mgmt` (RFC 4567) beside keying the engine terminates itself (SDES,
-///   RFC 4568, or DTLS-SRTP, RFC 5764) would advertise two sources of keys for one stream, the
-///   peer's choice between them deciding whether its SRTP is end to end or hop by hop.
-fn refuse_seat_keying(
-    info: &sdp::MediaInfo,
-    profile: &ProfileFlags,
-    media: ForwardMedia,
-) -> Result<(), String> {
+fn refuse_seat_keying(info: &sdp::MediaInfo, media: ForwardMedia) -> Result<(), String> {
     let preserve = media == ForwardMedia::Preserve;
     if preserve && (info.dtls || info.fingerprint.is_some() || !info.crypto.is_empty()) {
         return Err(super::seat_transport::preserve_keying_refusal(info));
-    }
-    if profile.key_mgmt.is_some() && (info.dtls || (info.secure && !preserve)) {
-        return Err(
-            "key_mgmt cannot be advertised on a seat whose SRTP the engine terminates (SDES or \
-             DTLS-SRTP): RFC 4567 and RFC 4568 are alternative keying mechanisms for one stream"
-                .to_string(),
-        );
     }
     Ok(())
 }
@@ -74,7 +68,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 profile,
                 media,
             } => {
-                if let Err(reason) = refuse_forward_security(&profile) {
+                if let Err(reason) = refuse_forward_security(&profile, media) {
                     return error_result("forward_join", &reason);
                 }
                 self.forward_join(client, &conference_id, from_tag, &sdp, &profile, media)
@@ -86,7 +80,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 profile,
                 media,
             } => {
-                if let Err(reason) = refuse_forward_security(&profile) {
+                if let Err(reason) = refuse_forward_security(&profile, media) {
                     return error_result("forward_offer", &reason);
                 }
                 self.forward_offer(&conference_id, from_tag, profile, media)
@@ -156,7 +150,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &format!("{room_id} is a mixing conference; use conference_join"),
             );
         }
-        if let Err(reason) = refuse_seat_keying(&info, profile, media) {
+        if let Err(reason) = refuse_seat_keying(&info, media) {
             return error_result("forward_join", &reason);
         }
         // The codec, chosen before anything is allocated. A codec needs neither an encoder nor a
