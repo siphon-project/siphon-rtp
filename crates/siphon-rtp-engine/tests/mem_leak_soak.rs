@@ -740,6 +740,92 @@ async fn offer_answer_delete_does_not_leak() {
     gate.assert_no_leak();
 }
 
+/// A plain two-party call carrying an MCPTT floor stream (3GPP TS 24.379 `m=application ... udp
+/// MCPTT`), churned through `offer → answer → delete`. It is the call shape that installs the
+/// userspace RTCP relay (an actor, its mailbox and its routes) on top of the plain relay's flows, so
+/// everything that relay holds has to come back with the call.
+async fn floor_call_offer_answer_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let call_id = format!("soak-floor-{index}");
+    let profile = || ProfileFlags {
+        floor_fmtp: Some("mc_queueing;mc_priority=5;mc_granted".to_string()),
+        ..ProfileFlags::default()
+    };
+    let with_floor = |host: &str, port: u16, floor_port: u16| {
+        format!(
+            "{}m=application {floor_port} udp MCPTT\r\na=fmtp:MCPTT mc_queueing\r\n",
+            sdp_for(host, port)
+        )
+    };
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: with_floor("198.51.100.1", 40_000, 40_010),
+                profile: profile(),
+            },
+        )
+        .await;
+    assert_ok(&offer, "floor offer");
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: with_floor("203.0.113.1", 41_000, 41_010),
+                profile: profile(),
+            },
+        )
+        .await;
+    assert_ok(&answer, "floor answer");
+    assert!(
+        engine.media().rtcp_relays().has_call(&call_id),
+        "the floor call installed its RTCP relay"
+    );
+    let delete = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id,
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert_ok(&delete, "floor delete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn floor_call_rtcp_relay_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    let mut gate = LeakGate::new("floor call rtcp relay", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            floor_call_offer_answer_delete(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(
+            engine.media().rtcp_relays().call_count(),
+            0,
+            "every RTCP relay went with its call"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// Churn one **transcoding** call through `offer → answer → delete`. A transcode call is heavier
 /// than a relay in exactly the way a leak likes: it builds a per-direction codec pair and a media
 /// actor on top of the endpoints a relay allocates, and a G.729 codec carries far more state than a
