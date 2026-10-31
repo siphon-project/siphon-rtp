@@ -22,11 +22,13 @@ use dashmap::DashMap;
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_media::rtcp::{self, AppWriteError};
 use siphon_rtp_proto::RtcpAppStream;
+use siphon_rtp_srtp::srtcp_gcm::FloorMasterKey;
 
 use crate::app_events::{surface_app_to_queue, AppEventQueue, AppScope};
+use crate::floor_srtcp::{self, FloorDrop, FloorProtection};
 use crate::forward::AppRequest;
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
-use crate::reply_latch::{OpaqueLatch, ReplyLatch};
+use crate::reply_latch::OpaqueLatch;
 
 /// Datagrams and control operations the actor's mailbox holds before it sheds datagrams.
 const MAILBOX_CAPACITY: usize = 4096;
@@ -55,6 +57,10 @@ pub struct CallFloorLeg {
     pub ssrc: u32,
     /// Where the party's APP events go: the queue of the controller that owns the call.
     pub events: Option<AppEventQueue>,
+    /// The leg's SRTCP master keys (3GPP TS 33.180 §9.4): each party's own, from its own profile.
+    /// Empty leaves the stream in the clear. The last protects what is sent, the newest two are
+    /// accepted.
+    pub keys: Vec<FloorMasterKey>,
 }
 
 struct Leg {
@@ -63,6 +69,10 @@ struct Leg {
     refusals: RefusalLog,
     raised: u64,
     malformed: u64,
+    /// Datagrams a keyed leg's SRTCP refused (plaintext, unknown MKI, failed tag, replay).
+    refused: u64,
+    /// `Some` once the leg is keyed: every datagram in and out is AEAD_AES_128_GCM SRTCP.
+    protection: Option<FloorProtection>,
 }
 
 /// Why a floor send was refused.
@@ -93,6 +103,9 @@ pub enum CallFloorError {
     /// The floor actor is gone, or did not answer in time.
     #[error("the floor stream did not answer within {} ms", SEND_TIMEOUT.as_millis())]
     NoVerdict,
+    /// The floor keys were refused (invalid set, or the protection could not be applied).
+    #[error("floor keys: {0}")]
+    Keys(String),
 }
 
 /// The synchronous core: every call's floor legs, ingress and the packet builder. No sockets.
@@ -100,11 +113,14 @@ pub enum CallFloorError {
 pub struct CallFloors {
     legs: HashMap<EndpointId, Leg>,
     scratch: Vec<u8>,
+    /// The protected form of the packet just built for a keyed leg.
+    protected: Vec<u8>,
 }
 
 impl CallFloors {
     /// Add a leg. A second registration for the endpoint replaces the first.
     pub fn register(&mut self, config: CallFloorLeg) {
+        let protection = FloorProtection::new(&config.keys);
         self.legs.insert(
             config.endpoint,
             Leg {
@@ -113,8 +129,64 @@ impl CallFloors {
                 refusals: RefusalLog::default(),
                 raised: 0,
                 malformed: 0,
+                refused: 0,
+                protection,
             },
         );
+    }
+
+    /// Replace the SRTCP keys of the leg `tag` of `call_id` (the newest two are kept, outbound uses
+    /// the last). An unkeyed leg becomes protected; an empty set removes the protection.
+    ///
+    /// # Errors
+    /// [`CallFloorError::UnknownLeg`], or [`CallFloorError::Keys`] when the set is refused.
+    pub fn set_keys(
+        &mut self,
+        call_id: &str,
+        tag: &str,
+        keys: &[FloorMasterKey],
+    ) -> Result<(), CallFloorError> {
+        let leg = self
+            .legs
+            .values_mut()
+            .find(|leg| leg.config.call_id == call_id && leg.config.tag == tag)
+            .ok_or_else(|| CallFloorError::UnknownLeg {
+                call_id: call_id.to_string(),
+                tag: tag.to_string(),
+            })?;
+        if keys.is_empty() {
+            leg.protection = None;
+            return Ok(());
+        }
+        match leg.protection.as_mut() {
+            Some(protection) => protection
+                .replace_keys(keys)
+                .map_err(|error| CallFloorError::Keys(error.to_string())),
+            None => {
+                leg.protection = Some(FloorProtection::new(keys).ok_or_else(|| {
+                    CallFloorError::Keys("the key set could not be applied".to_string())
+                })?);
+                Ok(())
+            }
+        }
+    }
+
+    /// The SRTCP state of a leg for an HA snapshot: the key set in force (oldest first) and the
+    /// next outgoing index. `None` for an unkeyed or unknown leg.
+    #[must_use]
+    pub fn key_state(&self, call_id: &str, tag: &str) -> Option<(Vec<FloorMasterKey>, u32)> {
+        let leg = self
+            .legs
+            .values()
+            .find(|leg| leg.config.call_id == call_id && leg.config.tag == tag)?;
+        let protection = leg.protection.as_ref()?;
+        Some((protection.keys().to_vec(), protection.send_index()))
+    }
+
+    /// Datagrams the keyed leg on `endpoint` refused at its SRTCP gate.
+    #[must_use]
+    pub fn refused(&self, endpoint: EndpointId) -> Option<u64> {
+        self.legs.get(&endpoint).map(|leg| leg.refused)
     }
 
     /// Forget every leg of `call_id`.
@@ -160,21 +232,33 @@ impl CallFloors {
             leg.refusals.log(Refusal::UnsignalledSource, context);
             return Ingress::Refused;
         }
-        // Layer 5h: learn the reply address once, never move it.
-        match leg.latch.admit(packet.source) {
-            ReplyLatch::Reject => {
-                leg.refusals.log(Refusal::NewSource, context);
+        // Layer 5h: learn the reply address once, never move it. A keyed leg authenticates first
+        // (TS 33.180 §9.4.1), so only a verified packet can latch.
+        let data = match floor_srtcp::admit(
+            &mut leg.protection,
+            &mut leg.latch,
+            &leg.refusals,
+            context,
+            packet,
+        ) {
+            Ok((data, learned)) => {
+                if let Some(destination) = learned {
+                    leg.config.destination = destination;
+                }
+                data
+            }
+            Err(FloorDrop::Latch) => return Ingress::Refused,
+            Err(FloorDrop::Unauthenticated) => {
+                leg.refused += 1;
                 return Ingress::Refused;
             }
-            ReplyLatch::Accept(Some(destination)) => leg.config.destination = destination,
-            ReplyLatch::Accept(None) => {}
-        }
+        };
         surface_app_to_queue(
             AppScope::Call(&leg.config.call_id),
             &leg.config.tag,
             leg.config.events.as_ref(),
             RtcpAppStream::Floor,
-            &packet.data,
+            data,
             &mut leg.raised,
             &mut leg.malformed,
         );
@@ -194,7 +278,7 @@ impl CallFloors {
     ) -> Result<(EndpointId, SocketAddr, &[u8]), CallFloorError> {
         let leg = self
             .legs
-            .values()
+            .values_mut()
             .find(|leg| leg.config.call_id == call_id && leg.config.tag == tag)
             .ok_or_else(|| CallFloorError::UnknownLeg {
                 call_id: call_id.to_string(),
@@ -219,6 +303,13 @@ impl CallFloors {
         if destination.ip().is_unspecified() || destination.port() == 0 {
             return Err(CallFloorError::NoDestination(tag.to_string()));
         }
+        // TS 33.180 §9.4.1: floor RTCP to a keyed leg is always protected (RFC 7714 §9.2, E=1).
+        if let Some(protection) = leg.protection.as_mut() {
+            protection
+                .seal(&self.scratch[..length], &mut self.protected)
+                .map_err(|error| CallFloorError::Keys(error.to_string()))?;
+            return Ok((endpoint, destination, &self.protected));
+        }
         Ok((endpoint, destination, &self.scratch[..length]))
     }
 }
@@ -227,6 +318,12 @@ enum Input {
     Packet(RxPacket),
     Register(Box<CallFloorLeg>),
     Deregister(String),
+    SetKeys {
+        call_id: String,
+        tag: String,
+        keys: Vec<FloorMasterKey>,
+        reply: tokio::sync::oneshot::Sender<Result<(), CallFloorError>>,
+    },
     Send {
         call_id: String,
         tag: String,
@@ -242,6 +339,9 @@ pub struct CallFloorRegistry {
     routes: DashMap<EndpointId, ()>,
     /// (call, leg tag) to the leg's endpoint, for a send to name its target without a round trip.
     by_leg: DashMap<(String, String), EndpointId>,
+    /// The offerer's floor keys between its offer and the answer that registers its leg (the leg is
+    /// registered only once the far party answers). Dropped with the call.
+    offer_keys: DashMap<String, Vec<FloorMasterKey>>,
     mailbox: OnceLock<flume::Sender<Input>>,
 }
 
@@ -295,8 +395,25 @@ impl CallFloorRegistry {
         self.routes.insert(endpoint, ());
     }
 
+    /// Hold the offerer's floor keys until its leg is registered by the answer.
+    pub fn hold_offer_keys(&self, call_id: &str, keys: Vec<FloorMasterKey>) {
+        if !keys.is_empty() {
+            self.offer_keys.insert(call_id.to_string(), keys);
+        }
+    }
+
+    /// Take the offerer's floor keys held by [`Self::hold_offer_keys`] (empty when it had none).
+    #[must_use]
+    pub fn take_offer_keys(&self, call_id: &str) -> Vec<FloorMasterKey> {
+        self.offer_keys
+            .remove(call_id)
+            .map(|(_, keys)| keys)
+            .unwrap_or_default()
+    }
+
     /// Forget every floor leg of `call_id`.
     pub fn deregister_call(&self, call_id: &str) {
+        self.offer_keys.remove(call_id);
         self.by_leg.retain(|(call, _), endpoint| {
             let keep = call != call_id;
             if !keep {
@@ -314,6 +431,39 @@ impl CallFloorRegistry {
     pub fn has_leg(&self, call_id: &str, tag: &str) -> bool {
         self.by_leg
             .contains_key(&(call_id.to_string(), tag.to_string()))
+    }
+
+    /// Replace the SRTCP keys of the leg `tag` of `call_id`, answering once the actor applied them.
+    ///
+    /// # Errors
+    /// [`CallFloorError`].
+    pub async fn set_keys(
+        &self,
+        call_id: &str,
+        tag: &str,
+        keys: Vec<FloorMasterKey>,
+    ) -> Result<(), CallFloorError> {
+        let unknown = || CallFloorError::UnknownLeg {
+            call_id: call_id.to_string(),
+            tag: tag.to_string(),
+        };
+        if !self.has_leg(call_id, tag) {
+            return Err(unknown());
+        }
+        let mailbox = self.mailbox.get().ok_or_else(unknown)?;
+        let (reply, verdict) = tokio::sync::oneshot::channel();
+        mailbox
+            .try_send(Input::SetKeys {
+                call_id: call_id.to_string(),
+                tag: tag.to_string(),
+                keys,
+                reply,
+            })
+            .map_err(|_| CallFloorError::NoVerdict)?;
+        match tokio::time::timeout(SEND_TIMEOUT, verdict).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) | Err(_) => Err(CallFloorError::NoVerdict),
+        }
     }
 
     /// Send an APP packet on the floor stream of the leg `tag` of `call_id`, answering once the
@@ -360,6 +510,14 @@ async fn run_call_floors<D: Datapath>(inbox: flume::Receiver<Input>, datapath: D
             }
             Input::Register(leg) => floors.register(*leg),
             Input::Deregister(call_id) => floors.deregister_call(&call_id),
+            Input::SetKeys {
+                call_id,
+                tag,
+                keys,
+                reply,
+            } => {
+                let _ = reply.send(floors.set_keys(&call_id, &tag, &keys));
+            }
             Input::Send {
                 call_id,
                 tag,
@@ -389,6 +547,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use siphon_rtp_proto::Event;
+    use siphon_rtp_srtp::srtcp_gcm::SrtcpGcmContext;
 
     fn address(text: &str) -> SocketAddr {
         text.parse().unwrap()
@@ -407,6 +566,7 @@ mod tests {
             accepted_source: SourceFilter::Exact(address("192.0.2.1:4100").ip()),
             ssrc: 0xE000_0001,
             events: Some(events.clone()),
+            keys: Vec::new(),
         }
     }
 
@@ -548,6 +708,81 @@ mod tests {
             floors.build("call-1", "tag-b", &granted()).unwrap_err(),
             CallFloorError::NoDestination("tag-b".into())
         );
+    }
+
+    fn floor_key(mki: u32) -> FloorMasterKey {
+        FloorMasterKey::from_salt_96(mki, [0x11; 16], &[0x22; 12])
+    }
+
+    #[test]
+    fn a_keyed_leg_counts_what_it_refuses_and_reports_only_what_authenticates() {
+        let events = queue();
+        let mut floors = CallFloors::default();
+        let mut keyed = leg(7, "tag-a", &events);
+        keyed.keys = vec![floor_key(5)];
+        floors.register(keyed);
+        // Plaintext, and the right MKI under a key that does not match.
+        assert_eq!(
+            floors.ingest(&rx(7, "192.0.2.1:4100", &FLOOR_REQUEST)),
+            Ingress::Refused
+        );
+        let mut stranger =
+            SrtcpGcmContext::new(&[FloorMasterKey::from_salt_96(5, [0x99; 16], &[0x22; 12])])
+                .unwrap();
+        let mut wire = Vec::new();
+        stranger.protect(&FLOOR_REQUEST, true, &mut wire).unwrap();
+        assert_eq!(
+            floors.ingest(&rx(7, "192.0.2.1:4100", &wire)),
+            Ingress::Refused
+        );
+        assert!(events.is_empty());
+        assert_eq!(floors.refused(EndpointId(7)), Some(2));
+        // The refused packets did not latch a source: the genuine peer, on another port, is learned.
+        let mut phone = SrtcpGcmContext::new(&[floor_key(5)]).unwrap();
+        phone.protect(&FLOOR_REQUEST, true, &mut wire).unwrap();
+        assert_eq!(
+            floors.ingest(&rx(7, "192.0.2.1:5000", &wire)),
+            Ingress::Accepted
+        );
+        assert_eq!(events.len(), 1);
+        let (_, destination, _) = floors.build("call-1", "tag-a", &granted()).unwrap();
+        assert_eq!(destination, address("192.0.2.1:5000"));
+    }
+
+    #[test]
+    fn a_keyed_leg_builds_a_protected_packet_the_phone_opens_and_keys_replace() {
+        let events = queue();
+        let mut floors = CallFloors::default();
+        let mut keyed = leg(7, "tag-a", &events);
+        keyed.keys = vec![floor_key(5)];
+        floors.register(keyed);
+        let (_, _, wire) = floors.build("call-1", "tag-a", &granted()).unwrap();
+        let wire = wire.to_vec();
+        let mut phone = SrtcpGcmContext::new(&[floor_key(5)]).unwrap();
+        let mut plain = Vec::new();
+        phone.unprotect(&wire, &mut plain).unwrap();
+        assert_eq!(plain[8..12], *b"MCPT");
+        assert_eq!(floors.key_state("call-1", "tag-a").unwrap().1, 1);
+
+        floors
+            .set_keys("call-1", "tag-a", &[floor_key(5), floor_key(6)])
+            .unwrap();
+        let (_, _, wire) = floors.build("call-1", "tag-a", &granted()).unwrap();
+        assert_eq!(wire[wire.len() - 4..], 6u32.to_be_bytes());
+        assert_eq!(floors.key_state("call-1", "tag-a").unwrap().1, 2);
+        assert!(matches!(
+            floors.set_keys("call-1", "nobody", &[floor_key(1)]),
+            Err(CallFloorError::UnknownLeg { .. })
+        ));
+        // An unkeyed leg becomes protected; an empty set removes the protection again.
+        let mut plain_leg = leg(8, "tag-b", &events);
+        plain_leg.destination = address("192.0.2.2:4100");
+        floors.register(plain_leg);
+        assert!(floors.key_state("call-1", "tag-b").is_none());
+        floors.set_keys("call-1", "tag-b", &[floor_key(9)]).unwrap();
+        assert!(floors.key_state("call-1", "tag-b").is_some());
+        floors.set_keys("call-1", "tag-b", &[]).unwrap();
+        assert!(floors.key_state("call-1", "tag-b").is_none());
     }
 
     #[test]
