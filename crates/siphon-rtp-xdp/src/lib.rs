@@ -820,6 +820,8 @@ fn to_kernel_action(
         latch_valid: 0,
         ice: 0,
         redirect_queue,
+        rtcp_to_userspace: 0,
+        reserved: [0; 3],
     };
     match action {
         DpFlowAction::Drop => kernel,
@@ -835,6 +837,7 @@ fn to_kernel_action(
                 siphon_rtp_datapath::LatchPolicy::SignalledOnly => latch::SIGNALLED,
                 siphon_rtp_datapath::LatchPolicy::Symmetric => latch::SYMMETRIC,
             };
+            kernel.rtcp_to_userspace = u8::from(rule.rtcp_to_userspace);
             apply_forward_target(&mut kernel, &rule, endpoints, local_ip);
             kernel
         }
@@ -1582,12 +1585,35 @@ mod tests {
     }
 
     #[test]
+    fn forward_rtcp_to_userspace_flag_reaches_the_kernel_action() {
+        let mut rule = ForwardRule::symmetric(EndpointId(2), None);
+        let off = to_kernel_action(
+            DpFlowAction::Forward(rule),
+            &empty_endpoints(),
+            Ipv4Addr::LOCALHOST,
+            0,
+        );
+        assert_eq!(off.rtcp_to_userspace, 0);
+        rule.rtcp_to_userspace = true;
+        let on = to_kernel_action(
+            DpFlowAction::Forward(rule),
+            &empty_endpoints(),
+            Ipv4Addr::LOCALHOST,
+            0,
+        );
+        assert_eq!(on.rtcp_to_userspace, 1);
+        assert_eq!(on.kind, action::FORWARD);
+        assert_eq!(on.reserved, [0; 3]);
+    }
+
+    #[test]
     fn forward_subnet_gate_encodes_prefix() {
         let rule = ForwardRule {
             out_endpoint: EndpointId(2),
             out_dst: None,
             accepted_source: SourceFilter::Subnet(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
             latch: LatchPolicy::SignalledOnly,
+            rtcp_to_userspace: false,
         };
         let kernel = to_kernel_action(
             DpFlowAction::Forward(rule),
@@ -1674,6 +1700,7 @@ mod tests {
             out_dst: None,
             accepted_source: SourceFilter::Exact(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             latch: LatchPolicy::Off,
+            rtcp_to_userspace: false,
         };
         let kernel = to_kernel_action(
             DpFlowAction::Forward(rule),
@@ -1777,6 +1804,8 @@ mod tests {
             latch_valid,
             ice: 0,
             redirect_queue: 0,
+            rtcp_to_userspace: 0,
+            reserved: [0; 3],
         }
     }
 

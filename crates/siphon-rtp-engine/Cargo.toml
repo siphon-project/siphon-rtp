@@ -154,6 +154,11 @@ harness = false
 name = "forward_floor_bench"
 harness = false
 
+# The per-datagram cost of the userspace RTCP relay a kernel-relayed floor call pays for its audio RTCP.
+[[bench]]
+name = "rtcp_relay_bench"
+harness = false
+
 # MCPTT floor control over a WebRTC data channel, per message with no sockets: one Floor Request from
 # the browser's SCTP packet to its `rtcp_app` event, and one send_rtcp_app to the browser's SCTP packet.
 [[bench]]

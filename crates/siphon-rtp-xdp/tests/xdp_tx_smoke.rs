@@ -159,6 +159,8 @@ fn run_smoke() -> Result<SmokeOutcome, String> {
         latch_valid: 0,
         ice: 0,
         redirect_queue: 0,
+        rtcp_to_userspace: 0,
+        reserved: [0; 3],
     };
     loader
         .set_flow(key, flow)
