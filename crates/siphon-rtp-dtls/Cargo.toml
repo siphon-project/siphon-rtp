@@ -1,5 +1,5 @@
 # siphon-rtp-dtls — pure-Rust DTLS-SRTP (RFC 5764) keying for secure WebRTC legs. The handshake runs
-# on webrtc-dtls (pure RustCrypto, zero C — no ring/aws-lc-rs/openssl), and the exported keying
+# on the sans-I/O rtc-dtls crate (ring crypto, zero C libraries), and the exported keying
 # material feeds the existing siphon-rtp-srtp SecureLeg, so DTLS-keyed and SDES-keyed legs share one
 # media path.
 [package]
@@ -10,7 +10,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "siphon-rtp pure-Rust DTLS-SRTP (RFC 5764) keying: webrtc-dtls handshake → SRTP SecureLeg, zero C deps"
+description = "siphon-rtp pure-Rust DTLS-SRTP (RFC 5764) keying: rtc-dtls handshake → SRTP SecureLeg, zero C deps"
 readme = "README.md"
 keywords = ["dtls", "srtp", "webrtc", "rtp", "voip"]
 categories = ["network-programming", "cryptography"]
@@ -18,11 +18,11 @@ categories = ["network-programming", "cryptography"]
 [dependencies]
 # Sans-I/O DTLS handshake + RFC 5764 key export: it owns no socket, reads no clock and spawns no
 # task, so the engine drives it and the handshake's lifetime is ours to control. Pinned exactly —
-# the 0.20/0.21 line moves fast, and a `[patch.crates-io]` in the workspace root points this at the
-# fork carrying the RFC 6347 §4.2.4 last-flight retransmission fix until upstream takes it.
-rtc-dtls = { version = "=0.21.0-rc.2", default-features = false, features = ["crypto-ring"] }
+# the 0.20/0.21 line moves fast. 0.21.1 carries the RFC 6347 §4.2.4 last-flight retransmission fix
+# (webrtc-rs/rtc#243).
+rtc-dtls = { version = "=0.21.1", default-features = false, features = ["crypto-ring"] }
 # `TransportProtocol` for the endpoint constructor. Its three features are empty markers, so none.
-rtc-shared = { version = "=0.21.0-rc.2", default-features = false }
+rtc-shared = { version = "=0.21.1", default-features = false }
 # The SRTP secure leg the exported keying material is fed into (shared with the SDES path).
 siphon-rtp-srtp = { path = "../siphon-rtp-srtp" }
 # Certificate fingerprints (RFC 8122): SHA-256 default, SHA-384/512 + SHA-1 for interop.
