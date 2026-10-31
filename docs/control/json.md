@@ -713,8 +713,9 @@ whose channel is not open yet.
 The audio of such a seat is whatever it negotiated, usually Opus, carried across codecs by the room's
 cross-codec path (an Opus seat in an AMR-WB room needs a build with the `amr` feature).
 
-**Browser acceptance is the controller's to run.** The engine's tests drive the channel with an
-in-process DTLS, SCTP and DCEP peer over UDP loopback; there is no headless browser in this repository.
+The engine's unit tests drive the channel with an in-process DTLS, SCTP and DCEP peer over UDP
+loopback, and `scripts/check-floor-channel-chrome.sh` drives it from headless Chrome (a CI job).
+Acceptance in your own browser and controller is still yours to run.
 
 ## Worked examples
 

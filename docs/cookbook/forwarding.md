@@ -236,8 +236,8 @@ browser is an error until it has opened `mcptt-floor`, so wait for your own `ono
 
 The browser's audio is Opus (or whatever it negotiated) and crosses codecs like any other seat's; an
 Opus seat in an AMR-WB room needs a build with the `amr` feature. The two-party `offer` / `answer` pair
-does not answer a data channel yet. There is no headless browser in this repository: acceptance in a real
-browser is yours to run against a controller.
+does not answer a data channel yet. `scripts/check-floor-channel-chrome.sh` drives the whole flow from headless Chrome (CI runs it);
+acceptance in your own browser and controller is still yours.
 
 ### Two-party calls
 
