@@ -24,6 +24,10 @@ ctr = "0.9"
 hmac = "0.12"
 sha1 = "0.10"
 subtle = "2.6"
+# AEAD_AES_128_GCM for SRTCP floor control (RFC 7714). 0.10.x stays on aes 0.8 / cipher 0.4 / ctr 0.9
+# like the rest of this crate (0.11 would pull the cipher 0.5 wave, see above). >= 0.10.3 is required:
+# RUSTSEC-2023-0096 (decrypt-in-place-detached exposed unauthenticated plaintext) is fixed there.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"] }
 base64 = "0.23"
 getrandom = { workspace = true }
 thiserror = { workspace = true }
