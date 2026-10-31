@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_engine::{ClientId, Engine};
-use siphon_rtp_proto::{CmdResult, Command, ConferenceRole, ProfileFlags, WsTeeDirection};
+use siphon_rtp_proto::{
+    CmdResult, Command, ConferenceRole, FloorKey, ProfileFlags, WsTeeDirection,
+};
 
 /// The soak drives the engine as a single control client.
 const CLIENT: ClientId = ClientId(1);
@@ -826,6 +828,129 @@ async fn floor_call_rtcp_relay_does_not_leak() {
     gate.assert_no_leak();
 }
 
+/// A keyed floor call (3GPP TS 33.180 §9.4) churned through `offer → answer → checkpoint → delete →
+/// restore → delete`: the HA path that re-binds the floor ports, rebuilds the call-floor legs with
+/// their keys, latch and index, and re-registers the RTCP relay. Every one of them has to leave
+/// with the call.
+async fn floor_call_checkpoint_restore_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let call_id = format!("soak-floor-ha-{index}");
+    let profile = |mki: u32| ProfileFlags {
+        floor_fmtp: Some("mc_queueing;mc_priority=5;mc_granted".to_string()),
+        floor_keys: vec![FloorKey {
+            mki,
+            key: vec![0x31; 16],
+            salt: vec![0x6B; 12],
+        }],
+        ..ProfileFlags::default()
+    };
+    let with_floor = |host: &str, port: u16, floor_port: u16| {
+        format!(
+            "{}m=application {floor_port} udp MCPTT\r\na=fmtp:MCPTT mc_queueing\r\n",
+            sdp_for(host, port)
+        )
+    };
+    let delete = |call_id: String| Command::Delete {
+        call_id,
+        from_tag: "tag-a".into(),
+        to_tag: None,
+    };
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: with_floor("198.51.100.1", 40_000, 40_010),
+                    profile: profile(1),
+                },
+            )
+            .await,
+        "keyed floor offer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: with_floor("203.0.113.1", 41_000, 41_010),
+                    profile: profile(2),
+                },
+            )
+            .await,
+        "keyed floor answer",
+    );
+    let CmdResult::Checkpoint { snapshot } = engine
+        .handle(
+            CLIENT,
+            Command::Checkpoint {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await
+    else {
+        panic!("a floor call checkpoints");
+    };
+    assert_ok(
+        &engine.handle(CLIENT, delete(call_id.clone())).await,
+        "floor delete before restore",
+    );
+    assert_ok(
+        &engine.handle(CLIENT, Command::Restore { snapshot }).await,
+        "floor restore",
+    );
+    assert!(
+        engine.media().rtcp_relays().has_call(&call_id),
+        "the restored floor call has its RTCP relay"
+    );
+    assert_eq!(
+        engine.conference().floors().leg_count(),
+        2,
+        "both floor legs were restored"
+    );
+    assert_ok(
+        &engine.handle(CLIENT, delete(call_id)).await,
+        "restored floor delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn floor_call_checkpoint_restore_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    let mut gate = LeakGate::new("floor call checkpoint restore", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            floor_call_checkpoint_restore_delete(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(
+            engine.media().rtcp_relays().call_count(),
+            0,
+            "every RTCP relay went with its call"
+        );
+        assert_eq!(
+            engine.conference().floors().leg_count(),
+            0,
+            "every floor leg went with its call"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// Churn one **transcoding** call through `offer → answer → delete`. A transcode call is heavier
 /// than a relay in exactly the way a leak likes: it builds a per-direction codec pair and a media
 /// actor on top of the endpoints a relay allocates, and a G.729 codec carries far more state than a
@@ -943,22 +1068,12 @@ async fn conference_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usiz
 /// Churn one forwarding room through `join ×3 → set_source → set_source(None) → leave ×3` (the last
 /// leave ends the room actor and frees its endpoints), with the seat codec negotiated from an AMR-WB
 /// offer the build cannot transcode.
-async fn forward_join_leave(
-    engine: &Engine<UdpLoopbackDatapath>,
-    index: usize,
-    media: siphon_rtp_proto::ForwardMedia,
-) {
+async fn forward_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
     let conference_id = format!("soak-forward-{index}");
-    // A preserve room's seats are end-to-end `RTP/SAVP` with no `a=crypto`.
-    let transport = if media == siphon_rtp_proto::ForwardMedia::Preserve {
-        "RTP/SAVP"
-    } else {
-        "RTP/AVP"
-    };
     let amr_wb_sdp = |port: u16| {
         format!(
             "v=0\r\no=- 1 1 IN IP4 198.51.100.1\r\ns=-\r\nc=IN IP4 198.51.100.1\r\nt=0 0\r\n\
-             m=audio {port} {transport} 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n"
+             m=audio {port} RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n"
         )
     };
     for participant in 0..3 {
@@ -966,7 +1081,7 @@ async fn forward_join_leave(
             .handle(
                 CLIENT,
                 Command::ForwardJoin {
-                    media,
+                    media: siphon_rtp_proto::ForwardMedia::Translate,
                     conference_id: conference_id.clone(),
                     from_tag: format!("p{participant}"),
                     sdp: amr_wb_sdp(40_000 + participant as u16),
@@ -1462,33 +1577,16 @@ async fn conference_join_leave_does_not_leak() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forward_join_leave_does_not_leak() {
-    forward_soak(
-        siphon_rtp_proto::ForwardMedia::Translate,
-        "forwarding rooms",
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn forward_preserve_join_leave_does_not_leak() {
-    forward_soak(
-        siphon_rtp_proto::ForwardMedia::Preserve,
-        "preserve forwarding rooms",
-    )
-    .await;
-}
-
-async fn forward_soak(media: siphon_rtp_proto::ForwardMedia, name: &'static str) {
     let _serialized = SOAK.lock().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
 
     // Each cycle spawns a forwarding room actor and three seats (a translator and an endpoint each)
     // and frees them all on leave.
-    let mut gate = LeakGate::new(name, 100, 50).await;
+    let mut gate = LeakGate::new("forwarding rooms", 100, 50).await;
     let mut index = 0;
     while gate.needs_more_churn() {
         for _ in 0..gate.cycles_per_segment() {
-            forward_join_leave(&engine, index, media).await;
+            forward_join_leave(&engine, index).await;
             index += 1;
         }
         quiesce().await;

@@ -87,6 +87,7 @@ async fn floor_traffic_counts_as_the_seat_being_heard_from() {
         destination: "192.0.2.1:4002".parse().unwrap(),
         accepted_source: SourceFilter::Any,
         ice_gated: false,
+        keys: Vec::new(),
     });
     let offer = offered("octet-align=1");
     let (proposed, _) = RoomCodec::from_offer(&offer).unwrap();

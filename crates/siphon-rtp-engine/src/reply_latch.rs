@@ -97,6 +97,16 @@ impl OpaqueLatch {
     pub(crate) fn latched(&self) -> Option<SocketAddr> {
         self.latch.map(|latch| latch.source)
     }
+
+    /// A latch already pinned to `source`, for an HA standby resuming a stream the primary had
+    /// learned. It is the same state [`Self::admit`] reaches after the first accepted datagram, so
+    /// the learn-once rule holds across the failover: a different source is rejected, never learned
+    /// (docs/security-and-nat.md §4 layer 5h; the RTPbleed rule).
+    pub(crate) fn pinned(source: SocketAddr) -> Self {
+        Self {
+            latch: Some(SourceLatch { source, ssrc: None }),
+        }
+    }
 }
 
 #[cfg(test)]

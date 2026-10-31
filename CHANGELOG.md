@@ -7,8 +7,26 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [0.16.0] — 2026-10-30
 
+### Security
+
+- **Floor SRTCP master keys are wiped from memory when dropped.** `FloorMasterKey`, the derived GCM session
+  salt, the expanded AES cipher, `FloorKey` (`siphon-rtp-proto`, which gains a `zeroize` dependency and a
+  `Drop` impl, so its fields can no longer be moved out), the checkpoint's `FloorKeySnapshot` and the
+  temporaries on the way in overwrite their secrets, so a key replaced past the two-key cap or a torn-down
+  stream leaves nothing readable behind.
+
 ### Added
 
+- **HA `checkpoint` and `restore` carry a call's MCPTT floor stream.** A two-party call with a floor stream
+  used to be refused at `checkpoint`. The snapshot now holds each party's floor stream (port, signalled
+  address, source gate, learned reply address, engine SSRC, `floor_fmtp`, SRTCP keys, outgoing index and the
+  highest index received per key) and `restore` serves it again on the same port with the learn-once latch
+  still pinned (no re-learning, RTPbleed). A keyed stream resumes its SRTCP index 2^16 past the checkpointed
+  one so no index the primary sent is reused (RFC 7714 §9.4); an index with no room for that margin refuses
+  the restore. A plain-relay floor call gets its `rtcp_to_userspace` rules and audio RTCP relay back. The
+  record has its own `version` (4, or 5 with a scope), so an older standby refuses it. DTLS and data-channel
+  floor calls are still refused. `SrtcpGcmContext` gains `received_indices` and `resume_received`. A
+  re-offer that names no `floor_fmtp` keeps the one the stream was set up with.
 - **Contract: floor keys, `key_mgmt` and `media: preserve` (proto).** `profile.floor_keys` (at most two `{mki, key, salt}`: AEAD_AES_128_GCM SRTCP master key and salt for floor control, 3GPP TS 33.180 §9.4.6/§9.4.8, `mki` the KFC-ID; key bytes are redacted from `Debug`), `profile.key_mgmt` (the controller's `a=key-mgmt` value, a passthrough like `floor_fmtp`), the `set_floor_keys` verb (replaces a seat's key set, newest two kept) and `media: translate|preserve` on `forward_join`/`forward_offer` (preserve forwards RTP and audio SRTCP byte for byte, because end-to-end SRTP needs the sender's SSRC kept, TS 33.180 §7.5.2 NOTE 3). All are optional on the wire. `media: preserve` and `key_mgmt` are served by the engine (next entry); `floor_keys` and `set_floor_keys` are refused with an error instead of ignored until implemented.
 - **Forwarding rooms with `media: preserve`, and `key_mgmt` passthrough (`node_info` feature `forward_preserve`).** End-to-end
   MCPTT SRTP (3GPP TS 33.180 §7.5.2 NOTE 3) authenticates the SSRC and sequence number, which the per-receiver translator
@@ -20,6 +38,17 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   RFC 3711 §3.3) and on a mixing conference seat; the two-party verbs refuse it beside engine-terminated SDES or
   DTLS-SRTP (RFC 4567 and RFC 4568 are alternative keying mechanisms for one stream). The engine cannot verify the SRTP tag in a preserve room: the source gate and the chosen
   source bound who may send (docs/security-and-nat.md). `floor_keys` and `set_floor_keys` are still refused.
+- **The MCPTT floor stream is protected with AES-GCM SRTCP (`node_info` feature `floor_srtcp`).** A room seat
+  or a two-party call leg keyed by `profile.floor_keys` (the offerer's from `offer`, the answerer's from
+  `answer`, the only leg's from `answer_local`) or by the new `set_floor_keys` runs `AEAD_AES_128_GCM` SRTCP
+  (RFC 7714; 3GPP TS 33.180 §9.4): TS 33.180 §9.4.1 requires RTCP protection between the UE and the server, so
+  a keyed stream drops plaintext, an unknown MKI, a failed tag and a replay, counts them, and never raises an
+  `rtcp_app` event from an unauthenticated datagram. The reply address latches only from an authenticated
+  packet. Outbound floor control is always protected under the newest key. `set_floor_keys` replaces a seat or
+  leg's key set (newest two kept) and answers `ok` after the owning actor applied it; the audio stream's RTCP
+  never uses the floor keys. `key_mgmt` and `media: preserve` are still refused. Cost per packet is in
+  `benches/forward_floor_bench.rs` (`floor_request_to_event_keyed`, `send_rtcp_app_room_wide_500_seats_keyed`).
+- **Contract: floor keys, `key_mgmt` and `media: preserve` (`key_mgmt` and `media: preserve` not yet implemented by the engine).** `profile.floor_keys` (at most two `{mki, key, salt}`: AEAD_AES_128_GCM SRTCP master key and salt for floor control, 3GPP TS 33.180 §9.4.6/§9.4.8, `mki` the KFC-ID; key bytes are redacted from `Debug`), `profile.key_mgmt` (the controller's `a=key-mgmt` value, a passthrough like `floor_fmtp`), the `set_floor_keys` verb (replaces a seat's key set, newest two kept) and `media: translate|preserve` on `forward_join`/`forward_offer` (preserve forwards RTP and audio SRTCP byte for byte, because end-to-end SRTP needs the sender's SSRC kept, TS 33.180 §7.5.2 NOTE 3). All are optional on the wire. This engine build refuses `key_mgmt` and `media: preserve` with an error instead of ignoring them.
 - **RTCP APP packets can be read and built (RFC 3550 §6.7).** This is groundwork for MCPTT floor
   control (3GPP TS 24.380 §8), which sends each floor message as a standalone APP packet, never in
   a compound, with several messages allowed in one datagram (§8.1.1). The compound parser kept only
@@ -70,6 +99,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   failover. Validated against the RFC 7714 section 17 vectors. New dependency `aes-gcm` 0.10.3 and its
   RustCrypto helpers (`docs/supply-chain.md`). About 240 ns protect and 150 ns unprotect per packet
   (`benches/srtp_bench.rs`).
+- **Audio `rtcp_app` on a kernel-relayed floor call.** A two-party call that carries an MCPTT floor stream and
+  runs on the plain in-kernel relay now has its audio RTCP read by the engine: a client's APP packets arrive
+  as `rtcp_app` with `stream: "audio"`, and the compound is relayed to the other party unchanged. RTP stays in
+  the kernel. `ForwardRule` gains `rtcp_to_userspace` (the UDP backend and the XDP classifier hand an
+  RTCP datagram to the redirect stream after the source gate and latch have admitted it; the eBPF flow value
+  grows from 36 to 40 bytes), set only for a call with a floor stream; no new setting. A call without one is
+  unchanged. About 55 ns per datagram, 125 ns with an APP packet (`benches/rtcp_relay_bench.rs`).
 
 - **Contract: floor keys, `key_mgmt` and `media: preserve` (proto, not yet implemented by the engine).** `profile.floor_keys` (at most two `{mki, key, salt}`: AEAD_AES_128_GCM SRTCP master key and salt for floor control, 3GPP TS 33.180 §9.4.6/§9.4.8, `mki` the KFC-ID; key bytes are redacted from `Debug`), `profile.key_mgmt` (the controller's `a=key-mgmt` value, a passthrough like `floor_fmtp`), the `set_floor_keys` verb (replaces a seat's key set, newest two kept) and `media: translate|preserve` on `forward_join`/`forward_offer` (preserve forwards RTP and audio SRTCP byte for byte, because end-to-end SRTP needs the sender's SSRC kept, TS 33.180 §7.5.2 NOTE 3). All are optional on the wire. This engine build refuses each with an error instead of ignoring it.
 - **Audio `rtcp_app` on a kernel-relayed floor call.** A two-party call that carries an MCPTT floor stream and

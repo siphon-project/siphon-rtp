@@ -38,6 +38,18 @@ pub const SNAPSHOT_VERSION: u16 = 2;
 /// had, so a mixed-version pair still fails over every call that names no scope.
 pub const SNAPSHOT_VERSION_SCOPED: u16 = 3;
 
+/// The version a snapshot of an unscoped call that carries an MCPTT floor stream has
+/// ([`LegSnapshot::floor`]).
+///
+/// A build from before floor streams were checkpointed ignores a key it does not know, so a floor
+/// call written at version [`SNAPSHOT_VERSION`] would restore there as a call whose floor stream is
+/// gone, which is the silent loss `checkpoint` used to refuse. Under its own version such a standby
+/// refuses the blob instead. A call without a floor stream keeps the bytes and versions it had.
+pub const SNAPSHOT_VERSION_FLOOR: u16 = 4;
+
+/// The version of a snapshot of a **scoped** call that carries a floor stream.
+pub const SNAPSHOT_VERSION_SCOPED_FLOOR: u16 = 5;
+
 /// A portable snapshot of one live call's negotiated state (see the module docs). All fields are
 /// plain data (strings / integers / enums / `std::net` addresses), so the whole thing round-trips
 /// through JSON and compares exactly.
@@ -129,6 +141,98 @@ pub struct LegSnapshot {
     /// the source gate or latch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advertised_ip: Option<IpAddr>,
+    /// The MCPTT floor stream this party offered or answered (3GPP TS 24.380 §8), terminated on an
+    /// engine endpoint of its own. Absent for a call without one, and in a snapshot written before
+    /// floor streams were checkpointed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<FloorSnapshot>,
+}
+
+/// One party's floor stream: everything a standby needs to serve it exactly where the primary left
+/// it. The learned reply address and the outgoing SRTCP index are the parts a restore must not
+/// guess: the first keeps the learn-once latch closed (RTPbleed), the second keeps a GCM IV from
+/// being reused (RFC 7714 §9.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloorSnapshot {
+    /// The engine floor socket the standby re-binds, port included.
+    pub local: SocketAddr,
+    /// The party's signalled floor address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<SocketAddr>,
+    /// The source gate (layer 2) of the stream.
+    pub accepted_source: SourceFilterSnapshot,
+    /// Where floor control is sent: the signalled address until a source latched, then that source.
+    pub destination: SocketAddr,
+    /// The source the learn-once latch had pinned. Restored pinned, never reopened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latched: Option<SocketAddr>,
+    /// The SSRC the engine's floor packets carry toward this party (RFC 3550 §8.1).
+    pub ssrc: u32,
+    /// The controller's `a=fmtp:MCPTT` parameters, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fmtp: Option<String>,
+    /// The SRTCP master keys in force, oldest first; empty for a stream in the clear. Secret
+    /// material, hex-encoded like the SDES keys of a [`CryptoSnapshot`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<FloorKeySnapshot>,
+    /// The next outgoing SRTCP index at the checkpoint. A standby resumes past it by a margin.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub send_index: u32,
+    /// The highest SRTCP index that authenticated under each key at the checkpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub received: Vec<FloorReceivedSnapshot>,
+}
+
+/// One SRTCP master key of a floor stream (3GPP TS 33.180 §9.4): hex-encoded, 16-octet key and
+/// 14-octet salt. [`std::fmt::Debug`] redacts both.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloorKeySnapshot {
+    /// The MKI that names the key on the wire.
+    pub mki: u32,
+    /// 16-byte master key, hex.
+    pub master_key_hex: String,
+    /// 14-byte master salt, hex (a 96-bit salt is already zero-extended).
+    pub master_salt_hex: String,
+}
+
+impl zeroize::Zeroize for FloorKeySnapshot {
+    /// Wipe both hex strings (they are emptied). The MKI is wire data and stays.
+    fn zeroize(&mut self) {
+        self.master_key_hex.zeroize();
+        self.master_salt_hex.zeroize();
+    }
+}
+
+/// A snapshot held in memory (restore input, checkpoint output) must not leave the key in freed pages.
+impl Drop for FloorKeySnapshot {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
+}
+
+impl std::fmt::Debug for FloorKeySnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FloorKeySnapshot")
+            .field("mki", &self.mki)
+            .field("master_key_hex", &"<redacted>")
+            .field("master_salt_hex", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The highest SRTCP index received under one key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloorReceivedSnapshot {
+    /// The key's MKI.
+    pub mki: u32,
+    /// The highest index that authenticated under it.
+    pub index: u32,
+}
+
+/// `skip_serializing_if` predicate for a zero counter.
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Mirror of the engine's pipeline kind (kept in step with `engine::PipelineKind`).
@@ -297,6 +401,10 @@ pub enum EndpointRole {
     FarRtp,
     /// Far leg's RTCP endpoint.
     FarRtcp,
+    /// Near leg's MCPTT floor endpoint.
+    NearFloor,
+    /// Far leg's MCPTT floor endpoint.
+    FarFloor,
 }
 
 /// A portable forward rule: which endpoint it is installed on, which it forwards to, and the
@@ -315,6 +423,10 @@ pub struct FlowSnapshot {
     pub accepted_source: SourceFilterSnapshot,
     /// The latch lifecycle.
     pub latch: LatchSnapshot,
+    /// RTCP admitted by the backend is handed up to userspace (a call with a floor stream reads
+    /// the APP packets of its audio RTCP). Absent means off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rtcp_to_userspace: bool,
 }
 
 /// Mirror of `siphon_rtp_datapath::SourceFilter`.
@@ -444,7 +556,7 @@ impl CallSnapshot {
     /// [`SNAPSHOT_VERSION`] without.
     pub fn from_json(blob: &str) -> Result<Self, SnapshotError> {
         let snapshot: Self = serde_json::from_str(blob)?;
-        let expected = Self::version_for(snapshot.scope.as_deref());
+        let expected = Self::version_for(snapshot.scope.as_deref(), snapshot.has_floor());
         if snapshot.version != expected {
             return Err(SnapshotError::Version {
                 found: snapshot.version,
@@ -454,12 +566,20 @@ impl CallSnapshot {
         Ok(snapshot)
     }
 
-    /// The format version a snapshot of a call in `scope` carries.
+    /// Whether either party of the call has a floor stream in this record.
     #[must_use]
-    pub fn version_for(scope: Option<&str>) -> u16 {
-        match scope {
-            Some(_) => SNAPSHOT_VERSION_SCOPED,
-            None => SNAPSHOT_VERSION,
+    pub fn has_floor(&self) -> bool {
+        self.near.floor.is_some() || self.far.floor.is_some()
+    }
+
+    /// The format version a snapshot of a call in `scope` carries, with or without a floor stream.
+    #[must_use]
+    pub fn version_for(scope: Option<&str>, has_floor: bool) -> u16 {
+        match (scope, has_floor) {
+            (Some(_), true) => SNAPSHOT_VERSION_SCOPED_FLOOR,
+            (Some(_), false) => SNAPSHOT_VERSION_SCOPED,
+            (None, true) => SNAPSHOT_VERSION_FLOOR,
+            (None, false) => SNAPSHOT_VERSION,
         }
     }
 }
@@ -550,6 +670,7 @@ mod tests {
                 remote_rtp: Some("198.51.100.1:5000".parse().unwrap()),
                 remote_rtcp: Some("198.51.100.1:5001".parse().unwrap()),
                 advertised_ip: None,
+                floor: None,
             },
             far: LegSnapshot {
                 rtp_local: "203.0.113.10:30002".parse().unwrap(),
@@ -557,6 +678,7 @@ mod tests {
                 remote_rtp: Some("192.0.2.1:7000".parse().unwrap()),
                 remote_rtcp: None,
                 advertised_ip: None,
+                floor: None,
             },
             flows: vec![FlowSnapshot {
                 installed_on: EndpointRole::NearRtp,
@@ -566,6 +688,7 @@ mod tests {
                     198, 51, 100, 1,
                 ))),
                 latch: LatchSnapshot::SignalledOnly,
+                rtcp_to_userspace: false,
             }],
             secure: Some(SecureSnapshot {
                 far_remote_crypto: CryptoSnapshot {
@@ -664,7 +787,7 @@ mod tests {
     fn a_scoped_snapshot_carries_its_scope_under_its_own_version() {
         let mut snapshot = sample();
         snapshot.scope = Some("bgcf".into());
-        snapshot.version = CallSnapshot::version_for(snapshot.scope.as_deref());
+        snapshot.version = CallSnapshot::version_for(snapshot.scope.as_deref(), false);
         let blob = snapshot.to_json().expect("serialize");
         assert!(
             blob.starts_with(r#"{"version":3,"call_id":"call-abc@host","scope":"bgcf","#),
@@ -675,6 +798,74 @@ mod tests {
 
     /// What a standby from before scopes does with a scoped blob: its only accepted version is
     /// [`SNAPSHOT_VERSION`], so it refuses rather than restoring the call unscoped.
+    fn floor_leg() -> FloorSnapshot {
+        FloorSnapshot {
+            local: "203.0.113.10:30010".parse().unwrap(),
+            remote: Some("198.51.100.1:5010".parse().unwrap()),
+            accepted_source: SourceFilterSnapshot::Any,
+            destination: "198.51.100.1:5010".parse().unwrap(),
+            latched: Some("198.51.100.1:5010".parse().unwrap()),
+            ssrc: 0x1234_5678,
+            fmtp: Some("mc_granted".into()),
+            keys: vec![FloorKeySnapshot {
+                mki: 9,
+                master_key_hex: to_hex(&[0x55; 16]),
+                master_salt_hex: to_hex(&[0x66; 14]),
+            }],
+            send_index: 12,
+            received: vec![FloorReceivedSnapshot { mki: 9, index: 4 }],
+        }
+    }
+
+    #[test]
+    fn a_snapshot_without_a_floor_stream_has_no_floor_field_and_its_old_version() {
+        let blob = sample().to_json().expect("serialize");
+        assert!(!blob.contains("floor"), "{blob}");
+        assert!(!blob.contains("rtcp_to_userspace"), "{blob}");
+        // An old blob, written before the field existed, parses with no floor.
+        let parsed = CallSnapshot::from_json(&blob).expect("parse");
+        assert!(!parsed.has_floor());
+    }
+
+    #[test]
+    fn a_floor_snapshot_round_trips_under_its_own_version() {
+        let mut snapshot = sample();
+        snapshot.near.floor = Some(floor_leg());
+        snapshot.version = CallSnapshot::version_for(None, snapshot.has_floor());
+        assert_eq!(snapshot.version, SNAPSHOT_VERSION_FLOOR);
+        let blob = snapshot.to_json().expect("serialize");
+        assert_eq!(CallSnapshot::from_json(&blob).expect("parse"), snapshot);
+        snapshot.scope = Some("bgcf".into());
+        snapshot.version = CallSnapshot::version_for(snapshot.scope.as_deref(), true);
+        assert_eq!(snapshot.version, SNAPSHOT_VERSION_SCOPED_FLOOR);
+        let blob = snapshot.to_json().expect("serialize");
+        assert_eq!(CallSnapshot::from_json(&blob).expect("parse"), snapshot);
+    }
+
+    /// A standby from before floor streams were checkpointed reads [`SNAPSHOT_VERSION`] only, so it
+    /// refuses a floor blob instead of restoring the call without its floor stream; and this build
+    /// refuses a floor blob that claims the old version.
+    #[test]
+    fn a_floor_snapshot_is_not_readable_at_the_version_without_floor() {
+        let mut snapshot = sample();
+        snapshot.near.floor = Some(floor_leg());
+        let blob = snapshot.to_json().expect("serialize");
+        assert!(matches!(
+            CallSnapshot::from_json(&blob).expect_err("a floor stream needs its version"),
+            SnapshotError::Version {
+                found: SNAPSHOT_VERSION,
+                expected: SNAPSHOT_VERSION_FLOOR
+            }
+        ));
+    }
+
+    #[test]
+    fn a_floor_key_never_prints_its_material() {
+        let text = format!("{:?}", floor_leg());
+        assert!(!text.contains("5555"), "{text}");
+        assert!(!text.contains("6666"), "{text}");
+    }
+
     #[test]
     fn a_scoped_snapshot_is_not_readable_at_the_unscoped_version() {
         let mut snapshot = sample();

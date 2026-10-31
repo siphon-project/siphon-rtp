@@ -442,7 +442,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.cluster.set_draining(false);
                 ok_empty()
             }
-            Command::Checkpoint { call_id, .. } => self.checkpoint(client, &call_id),
+            Command::Checkpoint { call_id, .. } => self.checkpoint(client, &call_id).await,
             Command::Restore { snapshot } => self.restore(client, &snapshot).await,
             Command::Offer {
                 call_id,
@@ -565,6 +565,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     },
                 )
                 .await
+            }
+            Command::SetFloorKeys {
+                call_id,
+                conference_id,
+                from_tag,
+                keys,
+            } => {
+                self.set_floor_keys(client, call_id, conference_id, &from_tag, &keys)
+                    .await
             }
             Command::AttachWsTee {
                 call_id,

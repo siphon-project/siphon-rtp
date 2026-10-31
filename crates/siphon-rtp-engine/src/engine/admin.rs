@@ -156,6 +156,10 @@ fn supported_features() -> Vec<String> {
         // `send_rtcp_app` / `rtcp_app`. Controllers gate floor control on these entries.
         "mcptt_floor".to_string(),
         "rtcp_app".to_string(),
+        // The floor stream is protected with AEAD_AES_128_GCM SRTCP (3GPP TS 33.180 §9.4) under the
+        // `floor_keys` of the profile and `set_floor_keys`. Controllers gate keyed floor control on
+        // this entry.
+        "floor_srtcp".to_string(),
         // A browser seat's floor control runs over a WebRTC data channel labelled `mcptt-floor`
         // (`m=application … UDP/DTLS/SCTP webrtc-datachannel`, RFC 8841), because a browser cannot
         // send RTCP APP. The same `rtcp_app` / `send_rtcp_app` carry it. A controller gates offering

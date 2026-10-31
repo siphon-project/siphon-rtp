@@ -505,6 +505,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let presented_media = presented_leg.engine_media();
         let mux_override = reoffer_mux_override(&presented_leg, &info, profile);
         let codec_policy = parse_codec_flags(&profile.flags);
+        let floor_fmtp = self.reoffer_floor_fmtp(call_id, from_tag, profile);
+        let floor_fmtp = floor_fmtp.as_deref();
         let presentation = match presented_party {
             // Delivered to B: the far leg, presented as the original offer presented it.
             Party::Far => {
@@ -534,7 +536,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 LegPresentation {
                     engine: presented_media,
                     image: presented_leg.image_rewrite(info.image.is_some()),
-                    floor: presented_leg.floor_rewrite(profile.floor_fmtp.as_deref()),
+                    floor: presented_leg.floor_rewrite(floor_fmtp),
                     ice: offer_ice_rewrite(
                         ice_creds.as_ref(),
                         &presented_candidates,
@@ -580,7 +582,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 LegPresentation {
                     engine: presented_media,
                     image: presented_leg.image_rewrite(info.image.is_some()),
-                    floor: presented_leg.floor_rewrite(profile.floor_fmtp.as_deref()),
+                    floor: presented_leg.floor_rewrite(floor_fmtp),
                     ice: answer_ice_rewrite(ice_creds.as_ref(), &presented_candidates),
                     security: near_security(
                         state.near_local_crypto,

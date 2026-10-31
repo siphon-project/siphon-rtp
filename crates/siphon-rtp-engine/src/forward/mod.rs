@@ -26,7 +26,7 @@ mod transcode;
 pub use codec::RoomCodec;
 pub use registry::{media_mismatch, ForwardControl, ForwardRefusal, ForwardRegistry};
 pub use room::{
-    AppRequest, AppSendError, AppTarget, FloorConfig, ForwardError, ForwardRoom, ForwardSeatConfig,
-    ForwardSeatStats, MAX_SEATS,
+    AppRequest, AppSendError, AppTarget, FloorConfig, FloorKeysError, ForwardError, ForwardRoom,
+    ForwardSeatConfig, ForwardSeatStats, MAX_SEATS,
 };
 pub use transcode::TranscodeStats;
