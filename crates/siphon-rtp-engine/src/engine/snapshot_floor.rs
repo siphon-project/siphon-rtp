@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 
 use siphon_rtp_datapath::Datapath;
 use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, MAX_SEND_INDEX};
+use zeroize::Zeroize;
 
 use crate::call_floor::{CallFloorLeg, FloorRestore};
 use crate::ha::{self, FloorKeySnapshot, FloorReceivedSnapshot, FloorSnapshot};
@@ -53,20 +54,33 @@ pub(super) fn key_snapshots(keys: &[FloorMasterKey]) -> Vec<FloorKeySnapshot> {
         .collect()
 }
 
+/// Decode `N` octets of secret hex. The intermediate buffer is wiped before it is freed, and a
+/// length mismatch yields `None` (3GPP TS 33.180 §9.4: the keys are secrets).
+fn secret_from_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let mut bytes = ha::from_hex(text)?;
+    let array = <[u8; N]>::try_from(bytes.as_slice()).ok();
+    bytes.zeroize();
+    array
+}
+
 fn restore_keys(keys: &[FloorKeySnapshot]) -> Result<Vec<FloorMasterKey>, String> {
     keys.iter()
         .map(|key| {
-            let master_key = ha::from_hex(&key.master_key_hex)
-                .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+            let mut master_key = secret_from_hex::<16>(&key.master_key_hex)
                 .ok_or("floor key is not 16 octets of hex")?;
-            let master_salt = ha::from_hex(&key.master_salt_hex)
-                .and_then(|bytes| <[u8; 14]>::try_from(bytes).ok())
-                .ok_or("floor salt is not 14 octets of hex")?;
-            Ok(FloorMasterKey {
+            let Some(mut master_salt) = secret_from_hex::<14>(&key.master_salt_hex) else {
+                master_key.zeroize();
+                return Err("floor salt is not 14 octets of hex".to_string());
+            };
+            let restored = FloorMasterKey {
                 mki: key.mki,
                 master_key,
                 master_salt,
-            })
+            };
+            // The struct holds copies; wipe the locals they came from.
+            master_key.zeroize();
+            master_salt.zeroize();
+            Ok(restored)
         })
         .collect()
 }
@@ -238,6 +252,26 @@ mod tests {
         let mut odd = snapshot(0, true);
         odd.keys[0].master_salt_hex = "abc".into();
         assert!(prepare(&odd).is_err());
+    }
+
+    #[test]
+    fn secrets_decode_to_a_fixed_array_and_refuse_a_wrong_length() {
+        let key: [u8; 16] = secret_from_hex(&ha::to_hex(&[0x11; 16])).unwrap();
+        assert_eq!(key, [0x11; 16]);
+        assert!(secret_from_hex::<16>(&ha::to_hex(&[0x11; 15])).is_none());
+        assert!(secret_from_hex::<16>("zz").is_none());
+        assert!(secret_from_hex::<16>("abc").is_none());
+    }
+
+    #[test]
+    fn zeroizing_a_key_snapshot_empties_both_hex_strings() {
+        use zeroize::Zeroize as _;
+        let mut keys = snapshot(0, true).keys;
+        assert_eq!(keys[0].master_key_hex.len(), 32);
+        keys[0].zeroize();
+        assert!(keys[0].master_key_hex.is_empty());
+        assert!(keys[0].master_salt_hex.is_empty());
+        assert_eq!(keys[0].mki, 3, "the MKI is wire data and stays");
     }
 
     #[test]

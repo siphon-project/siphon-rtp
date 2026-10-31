@@ -1557,6 +1557,21 @@ impl std::fmt::Debug for FloorKey {
     }
 }
 
+impl zeroize::Zeroize for FloorKey {
+    /// Overwrite the key and salt octets in place (length kept). The MKI is wire data and stays.
+    fn zeroize(&mut self) {
+        self.key.as_mut_slice().zeroize();
+        self.salt.as_mut_slice().zeroize();
+    }
+}
+
+/// The controller-derived key (3GPP TS 33.180 §9.4) must not linger in freed memory.
+impl Drop for FloorKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
+}
+
 impl FloorKey {
     /// Check the key and salt lengths (for a key built in code rather than read from the wire).
     ///
@@ -1582,14 +1597,34 @@ struct FloorKeyWire {
     salt: Vec<u8>,
 }
 
+impl FloorKeyWire {
+    /// Move the decoded key and salt out, leaving the wire form empty.
+    fn take_secrets(&mut self) -> (Vec<u8>, Vec<u8>) {
+        (
+            std::mem::take(&mut self.key),
+            std::mem::take(&mut self.salt),
+        )
+    }
+}
+
+/// A frame whose key fails validation must not leave the decoded octets behind.
+impl Drop for FloorKeyWire {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self.key.as_mut_slice());
+        zeroize::Zeroize::zeroize(self.salt.as_mut_slice());
+    }
+}
+
 impl TryFrom<FloorKeyWire> for FloorKey {
     type Error = FloorKeyError;
 
-    fn try_from(wire: FloorKeyWire) -> Result<Self, Self::Error> {
+    fn try_from(mut wire: FloorKeyWire) -> Result<Self, Self::Error> {
+        let (key, salt) = wire.take_secrets();
+        // A failing key is dropped here, and `Drop for FloorKey` wipes it.
         let key = Self {
             mki: wire.mki,
-            key: wire.key,
-            salt: wire.salt,
+            key,
+            salt,
         };
         key.validate()?;
         Ok(key)
@@ -5607,14 +5642,16 @@ mod tests {
             assert!(serde_json::from_str::<FloorKey>(bad).is_err(), "{bad}");
         }
         let short = FloorKey {
+            mki: 0x1234,
             key: vec![0; 15],
-            ..floor_key()
+            salt: (16..28).collect(),
         };
         assert_eq!(short.validate(), Err(FloorKeyError::KeyLength(15)));
         for (length, accepted) in [(12, true), (14, true), (13, false), (16, false)] {
             let salty = FloorKey {
+                mki: 0x1234,
+                key: (0..16).collect(),
                 salt: vec![0; length],
-                ..floor_key()
             };
             let json = serde_json::to_string(&salty).expect("serialize");
             assert_eq!(
@@ -5631,6 +5668,33 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn zeroizing_a_floor_key_overwrites_key_and_salt_in_place() {
+        use zeroize::Zeroize as _;
+        let mut key = floor_key();
+        key.zeroize();
+        assert_eq!(key.key, vec![0u8; 16], "same length, every octet zero");
+        assert_eq!(key.salt, vec![0u8; 12]);
+        assert_eq!(key.mki, 0x1234, "the MKI is wire data and stays");
+    }
+
+    #[test]
+    fn the_wire_form_hands_its_secrets_over_and_keeps_none() {
+        // A 15-octet key fails validation after the bytes were decoded; the wire form wipes them.
+        let mut wire = FloorKeyWire {
+            mki: 1,
+            key: vec![0x55; 15],
+            salt: vec![0x66; 12],
+        };
+        let taken = wire.take_secrets();
+        assert_eq!(taken.0, vec![0x55; 15]);
+        assert_eq!(wire.key, Vec::<u8>::new(), "moved out, nothing left behind");
+        assert!(serde_json::from_str::<FloorKey>(
+            r#"{"mki":1,"key":"AAECAwQFBgcICQoLDA0O","salt":"EBESExQVFhcYGRob"}"#
+        )
+        .is_err());
     }
 
     #[test]

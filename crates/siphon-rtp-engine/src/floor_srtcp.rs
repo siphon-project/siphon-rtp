@@ -22,6 +22,7 @@ use siphon_rtp_datapath::RxPacket;
 use siphon_rtp_proto::{FloorKey, FLOOR_SALT_LEN};
 use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
 use siphon_rtp_srtp::SrtpError;
+use zeroize::Zeroize;
 
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{OpaqueLatch, ReplyLatch};
@@ -35,18 +36,20 @@ pub fn master_keys(keys: &[FloorKey]) -> Result<Vec<FloorMasterKey>, String> {
     let mut converted = Vec::with_capacity(keys.len());
     for key in keys {
         key.validate().map_err(|error| error.to_string())?;
-        let master_key: [u8; 16] = key
+        let mut master_key: [u8; 16] = key
             .key
             .as_slice()
             .try_into()
             .map_err(|_| "floor key is not 16 octets".to_string())?;
         let master = if key.salt.len() == FLOOR_SALT_LEN {
-            let salt: [u8; FLOOR_SALT_LEN] = key
+            let mut salt: [u8; FLOOR_SALT_LEN] = key
                 .salt
                 .as_slice()
                 .try_into()
                 .map_err(|_| "floor salt is not 12 octets".to_string())?;
-            FloorMasterKey::from_salt_96(key.mki, master_key, &salt)
+            let master = FloorMasterKey::from_salt_96(key.mki, master_key, &salt);
+            salt.zeroize();
+            master
         } else {
             FloorMasterKey {
                 mki: key.mki,
@@ -58,6 +61,8 @@ pub fn master_keys(keys: &[FloorKey]) -> Result<Vec<FloorMasterKey>, String> {
                     .map_err(|_| "floor salt is not 14 octets".to_string())?,
             }
         };
+        // The master key now owns its copy; wipe the stack temporary.
+        master_key.zeroize();
         converted.push(master);
     }
     // Build the context once so a duplicate MKI is refused before anything is allocated.

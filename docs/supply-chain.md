@@ -115,6 +115,15 @@ published by the RustCrypto organisation.
 `aead` 0.5.2 was already in the tree. The fuzz/ and crates/siphon-rtp-xdp/ lockfiles gain the same four
 new crates; `cargo deny check` is green against all three lockfiles.
 
+### Wiping floor keys (`zeroize`)
+
+The floor SRTCP master keys are secrets, so they are overwritten when dropped. `zeroize` 1.x is the RustCrypto
+wipe primitive (`MIT/Apache-2.0`, owner tarcieri, `no_std`, no `build.rs`, no dependencies of its own); it was
+already in the tree through `rustls` and `rtc-srtp`, so no new package enters any of the three lockfiles, only
+the dependency lists of `siphon-rtp-srtp`, `siphon-rtp-proto`, `siphon-rtp`, `aes` and `aes-gcm` change. The
+`derive` feature is off (the impls are hand-written, so no proc-macro). The existing `zeroize` features of
+`aes` 0.8 (wipes the expanded round keys) and `aes-gcm` 0.10 (wipes the GHASH subkey while it is built) are on.
+
 ## Software Bill of Materials (SBOM)
 
 Every tagged release ships a full SBOM in **two industry formats**, generated from the exact
