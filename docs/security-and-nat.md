@@ -1277,6 +1277,17 @@ channel (TS 24.380 §13) is not implemented, so the answer never offers it.
   so call teardown, the idle sweep's liveness reading and re-offers treat them like any other stream's
   endpoint, and a re-offer never moves a floor leg's gate. APP parts in a party's audio RTCP are read
   after the pipeline's own gate, decrypt and latch, and the compound is relayed as before.
+- **Audio RTCP of a floor call on the in-kernel relay leaves the kernel, behind the same gate.** A
+  plain-relay call that carries a floor stream installs its relay rules with `rtcp_to_userspace`: RTP
+  keeps forwarding in the backend, while an RTCP datagram (RFC 5761 §4 demux, muxed or on its own port)
+  is handed to the `Redirect` stream **only after** layers 1 to 4 admitted it, in the UDP backend's
+  `Forward` arm and in the XDP classifier alike. An unadmitted source is dropped there and never reaches
+  userspace. The consumer (`rtcp_relay`) re-checks the rule's signalled-source filter, reads the APP
+  parts (RFC 3550 §6.7), offers the datagram to the telemetry tap and relays it unchanged toward the
+  peer's latched source, else its signalled RTCP address, as the backend's own arm does. It owns no
+  latch of its own: the backend's is the one latch of the stream. The relay is registered with the call
+  and removed at its teardown, and a re-answer that drops the floor stream removes it. Secure calls are
+  not affected: their RTCP is already userspace.
 
 ### WebRTC data channel (floor control for a browser seat)
 

@@ -731,6 +731,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 out_dst: flow.out_dst,
                 accepted_source: restore_source_filter(flow.accepted_source),
                 latch: restore_latch(flow.latch),
+                rtcp_to_userspace: false,
             });
             if let Err(error) = self.datapath.install_flow(installed_on.id, action) {
                 return Err(boxed_error_result("restore: install forward flow", &error));

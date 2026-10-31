@@ -51,6 +51,7 @@ mod conference_dial_out;
 mod conference_received_from;
 mod conference_seat;
 mod conference_seat_call;
+mod floor_call_rtcp;
 mod floor_security_refusals;
 mod forward_floor;
 mod forward_preserve;
