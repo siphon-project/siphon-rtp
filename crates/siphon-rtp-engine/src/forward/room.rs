@@ -5,7 +5,7 @@
 //! a caller-supplied microsecond value (the datapath's receive-time stamp), never `Instant::now()`.
 //!
 //! # The fan-out
-//! [`ForwardRoom::ingest`] runs the shared ingress chain on a datagram ([`crate::seat_gate`]),
+//! [`ForwardRoom::ingest`] runs the shared ingress chain on a datagram (`seat_gate`),
 //! consumes RTCP, and, when the datagram is RTP from the chosen source, arms a *plan*. The actor then
 //! calls [`ForwardRoom::next_datagram`] until it returns `None`: each call rewrites the packet for
 //! the next receiving seat through that seat's [`Translator`] (RFC 3550 §7), SRTP-protects it for a
