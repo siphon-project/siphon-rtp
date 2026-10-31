@@ -96,6 +96,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Errors / logging
 thiserror = "2"
+# Wipes floor SRTCP master keys on drop (TS 33.180 §9.4). No `derive` feature: impls are hand-written.
+zeroize = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # CLI / config

@@ -28,6 +28,7 @@ use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::AesGcm;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroize;
 
 use crate::kdf::{self, MASTER_SALT_LEN};
 use crate::{ReplayWindow, SrtpError, MASTER_KEY_LEN};
@@ -90,6 +91,22 @@ impl FloorMasterKey {
     }
 }
 
+impl Zeroize for FloorMasterKey {
+    /// Overwrite the master key and salt with zeros. The MKI is wire data (RFC 3711 §3.1) and stays.
+    fn zeroize(&mut self) {
+        self.master_key.zeroize();
+        self.master_salt.zeroize();
+    }
+}
+
+/// A master key never outlives its owner in memory (3GPP TS 33.180 §9.4: the keys are
+/// controller-derived secrets). Every clone wipes itself.
+impl Drop for FloorMasterKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
 impl std::fmt::Debug for FloorMasterKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print key material.
@@ -102,16 +119,33 @@ impl std::fmt::Debug for FloorMasterKey {
 
 /// One GCM session: the expanded cipher plus the session salt. MKI-free; the key ring adds and
 /// strips the MKI.
+///
+/// Wiping: the `aes` crate's `zeroize` feature (enabled in this crate's manifest) makes the expanded
+/// AES round keys inside `cipher` wipe themselves on drop, and the GHASH subkey is zeroized while the
+/// `aes-gcm` `zeroize` feature builds the cipher. The session salt is wiped by the `Drop` below.
 struct GcmSession {
     cipher: Aes128Gcm,
     salt: [u8; SESSION_SALT_LEN],
 }
 
+impl Zeroize for GcmSession {
+    /// Wipe the session salt. The cipher wipes itself on drop (see the type docs).
+    fn zeroize(&mut self) {
+        self.salt.zeroize();
+    }
+}
+
+impl Drop for GcmSession {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
 impl GcmSession {
-    fn from_session_keys(key: &[u8; 16], salt: [u8; SESSION_SALT_LEN]) -> Self {
+    fn from_session_keys(key: &[u8; 16], salt: &[u8; SESSION_SALT_LEN]) -> Self {
         Self {
             cipher: Aes128Gcm::new(GenericArray::from_slice(key)),
-            salt,
+            salt: *salt,
         }
     }
 
@@ -131,7 +165,11 @@ impl GcmSession {
             kdf::label::RTCP_SALT,
             &mut salt,
         );
-        Self::from_session_keys(&key, salt)
+        let session = Self::from_session_keys(&key, &salt);
+        // The derived session key and salt are copied into the session; wipe the temporaries.
+        key.zeroize();
+        salt.zeroize();
+        session
     }
 
     /// RFC 7714 §9.1 IV.
@@ -156,7 +194,7 @@ impl GcmSession {
         out: &mut Vec<u8>,
     ) -> Result<(), SrtpError> {
         let ssrc = u32::from_be_bytes([rtcp[4], rtcp[5], rtcp[6], rtcp[7]]);
-        let iv = self.iv(ssrc, index);
+        let mut iv = self.iv(ssrc, index);
         let nonce = GenericArray::from_slice(&iv);
         let word = if encrypt { ENCRYPT_FLAG } else { 0 } | index;
         out.clear();
@@ -167,17 +205,21 @@ impl GcmSession {
             aad[CLEAR_HEADER_LEN..].copy_from_slice(&word.to_be_bytes());
             self.cipher
                 .encrypt_in_place_detached(nonce, &aad, &mut out[CLEAR_HEADER_LEN..])
-                .map_err(|_| SrtpError::AuthFailed)?
+                .map_err(|_| SrtpError::AuthFailed)
         } else {
             // §9.3: everything, then the ESRTCP word, is AAD; there is no plaintext.
             out.extend_from_slice(&word.to_be_bytes());
             let tag = self
                 .cipher
                 .encrypt_in_place_detached(nonce, out, &mut [])
-                .map_err(|_| SrtpError::AuthFailed)?;
+                .map_err(|_| SrtpError::AuthFailed);
             out.truncate(out.len() - ESRTCP_LEN);
             tag
         };
+        // The IV is the session salt XOR public fields, so it reveals the salt: wipe it, on the
+        // error path too.
+        iv.zeroize();
+        let tag = tag?;
         out.extend_from_slice(&tag);
         out.extend_from_slice(&word.to_be_bytes());
         Ok(())
@@ -207,7 +249,7 @@ impl GcmSession {
         let tag_at = word_at - GCM_TAG_LEN;
         let tag = GenericArray::from_slice(&body[tag_at..word_at]);
         let ssrc = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
-        let iv = self.iv(ssrc, index);
+        let mut iv = self.iv(ssrc, index);
         let nonce = GenericArray::from_slice(&iv);
 
         out.clear();
@@ -226,6 +268,8 @@ impl GcmSession {
             out.truncate(out.len() - ESRTCP_LEN);
             result
         };
+        // The IV is the session salt XOR public fields, so it reveals the salt: wipe it.
+        iv.zeroize();
         if verified.is_err() {
             out.clear();
             return Err(SrtpError::AuthFailed);
@@ -239,6 +283,40 @@ struct KeyEntry {
     master: FloorMasterKey,
     session: GcmSession,
     replay: ReplayWindow,
+}
+
+impl Zeroize for KeyEntry {
+    /// Wipe both stored copies of the key: the master key and salt, and the derived session salt.
+    fn zeroize(&mut self) {
+        self.master.zeroize();
+        self.session.zeroize();
+    }
+}
+
+impl Drop for KeyEntry {
+    fn drop(&mut self) {
+        let mki = self.master.mki;
+        self.zeroize();
+        #[cfg(test)]
+        record_wiped(mki, self);
+        #[cfg(not(test))]
+        let _ = mki;
+    }
+}
+
+// Test hook: the MKI of every `KeyEntry` dropped on this thread, with whether all of its stored
+// secrets were zero after the wipe. Freed memory cannot be inspected, so the drop reports it.
+#[cfg(test)]
+thread_local! {
+    static WIPED: std::cell::RefCell<Vec<(u32, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_wiped(mki: u32, entry: &KeyEntry) {
+    let all_zero = entry.master.master_key == [0u8; 16]
+        && entry.master.master_salt == [0u8; MASTER_SALT_LEN]
+        && entry.session.salt == [0u8; SESSION_SALT_LEN];
+    WIPED.with(|log| log.borrow_mut().push((mki, all_zero)));
 }
 
 impl KeyEntry {
@@ -436,10 +514,18 @@ mod tests {
                           deadbeef deadbeef deadbeef deadbeef deadbeef 841dd968 3dd78ec9 2ae58790 \
                           125f62b3 000005d4";
 
+    fn wiped() -> Vec<(u32, bool)> {
+        WIPED.with(|log| log.borrow().clone())
+    }
+
+    fn clear_wiped() {
+        WIPED.with(|log| log.borrow_mut().clear());
+    }
+
     fn kat_session() -> GcmSession {
         let key: [u8; 16] = hex(KEY).try_into().expect("16");
         let salt: [u8; 12] = hex(SALT).try_into().expect("12");
-        GcmSession::from_session_keys(&key, salt)
+        GcmSession::from_session_keys(&key, &salt)
     }
 
     #[test]
@@ -522,6 +608,78 @@ mod tests {
         );
     }
 
+    // ----- key wiping -----
+
+    #[test]
+    fn zeroize_clears_master_key_and_salt() {
+        let mut key = master(7, 0x11);
+        key.zeroize();
+        assert_eq!(key.master_key, [0u8; 16]);
+        assert_eq!(key.master_salt, [0u8; MASTER_SALT_LEN]);
+        assert_eq!(key.mki, 7, "the MKI is public wire data");
+    }
+
+    #[test]
+    fn zeroize_clears_the_session_salt() {
+        let mut session = GcmSession::derive(&master(1, 0x11));
+        assert_ne!(session.salt, [0u8; SESSION_SALT_LEN]);
+        session.zeroize();
+        assert_eq!(session.salt, [0u8; SESSION_SALT_LEN]);
+    }
+
+    #[test]
+    fn zeroize_clears_every_stored_copy_in_a_key_entry() {
+        let mut entry = KeyEntry::new(master(1, 0x11));
+        entry.zeroize();
+        assert_eq!(entry.master.master_key, [0u8; 16]);
+        assert_eq!(entry.master.master_salt, [0u8; MASTER_SALT_LEN]);
+        assert_eq!(entry.session.salt, [0u8; SESSION_SALT_LEN]);
+    }
+
+    #[test]
+    fn dropping_a_key_entry_wipes_it_first() {
+        clear_wiped();
+        drop(KeyEntry::new(master(0x42, 0x11)));
+        assert_eq!(wiped(), vec![(0x42, true)]);
+    }
+
+    #[test]
+    fn replace_keys_past_the_cap_wipes_the_evicted_key() {
+        let mut context = SrtcpGcmContext::new(&[master(1, 0x11), master(2, 0x22)]).expect("ctx");
+        clear_wiped();
+        context
+            .replace_keys(&[master(1, 0x11), master(2, 0x22), master(3, 0x33)])
+            .expect("replace");
+        // Three offered, newest two kept: key 1 is evicted and wiped, key 2 survives as is.
+        assert_eq!(wiped(), vec![(1, true)]);
+        assert_eq!(context.sending_mki(), Some(3));
+        clear_wiped();
+        context
+            .replace_keys(&[master(3, 0x33), master(4, 0x44)])
+            .expect("replace");
+        assert_eq!(wiped(), vec![(2, true)]);
+    }
+
+    #[test]
+    fn dropping_a_context_wipes_every_key() {
+        let context = SrtcpGcmContext::new(&[master(1, 0x11), master(2, 0x22)]).expect("ctx");
+        clear_wiped();
+        drop(context);
+        let mut log = wiped();
+        log.sort_unstable();
+        assert_eq!(log, vec![(1, true), (2, true)]);
+    }
+
+    #[test]
+    fn debug_still_redacts_key_material() {
+        let text = format!("{:?}", master(5, 0xAB));
+        assert!(text.contains("mki"));
+        assert!(!text.contains("171"), "0xAB as decimal must not appear");
+        assert!(!text.to_lowercase().contains("ab, ab"));
+        assert!(!text.contains("master_key"));
+        assert!(!text.contains("master_salt"));
+    }
+
     // ----- key ring -----
 
     fn master(mki: u32, seed: u8) -> FloorMasterKey {
@@ -548,7 +706,7 @@ mod tests {
         let mut expected_salt = [0u8; 12];
         kdf::derive(&key.master_key, &key.master_salt, 0x05, &mut expected_salt);
         assert_eq!(session.salt, expected_salt);
-        let reference = GcmSession::from_session_keys(&expected_key, expected_salt);
+        let reference = GcmSession::from_session_keys(&expected_key, &expected_salt);
         let (mut left, mut right) = (Vec::new(), Vec::new());
         session.seal(&rtcp(7), true, 3, &mut left).expect("seal");
         reference.seal(&rtcp(7), true, 3, &mut right).expect("seal");

@@ -195,6 +195,21 @@ pub struct FloorKeySnapshot {
     pub master_salt_hex: String,
 }
 
+impl zeroize::Zeroize for FloorKeySnapshot {
+    /// Wipe both hex strings (they are emptied). The MKI is wire data and stays.
+    fn zeroize(&mut self) {
+        self.master_key_hex.zeroize();
+        self.master_salt_hex.zeroize();
+    }
+}
+
+/// A snapshot held in memory (restore input, checkpoint output) must not leave the key in freed pages.
+impl Drop for FloorKeySnapshot {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
+}
+
 impl std::fmt::Debug for FloorKeySnapshot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter

@@ -7,6 +7,14 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Security
+
+- **Floor SRTCP master keys are wiped from memory when dropped.** `FloorMasterKey`, the derived GCM session
+  salt, the expanded AES cipher, `FloorKey` (`siphon-rtp-proto`, which gains a `zeroize` dependency and a
+  `Drop` impl, so its fields can no longer be moved out), the checkpoint's `FloorKeySnapshot` and the
+  temporaries on the way in overwrite their secrets, so a key replaced past the two-key cap or a torn-down
+  stream leaves nothing readable behind.
+
 ### Added
 
 - **HA `checkpoint` and `restore` carry a call's MCPTT floor stream.** A two-party call with a floor stream
