@@ -1,19 +1,12 @@
-//! The contract carries `profile.key_mgmt` and `media: preserve`, which this build does not
-//! implement: each is refused, never ignored, and nothing is allocated for the refused request.
-//! (`floor_keys` and `set_floor_keys` are implemented; see `floor_srtcp.rs`.)
+//! What is still refused of the floor-security contract. `floor_keys`, `set_floor_keys`,
+//! `key_mgmt` and `media: preserve` are all served (see `floor_srtcp` and `forward_preserve`); a
+//! `key_mgmt` value that would break the SDP line is refused for that reason, before anything is
+//! allocated.
 
 use super::*;
 use siphon_rtp_proto::{FloorKey, ForwardMedia};
 
 const ROOM: &str = "group-1";
-
-fn floor_key() -> FloorKey {
-    FloorKey {
-        mki: 7,
-        key: vec![0x11; 16],
-        salt: vec![0x22; 12],
-    }
-}
 
 fn reason(result: CmdResult) -> String {
     match result {
@@ -57,97 +50,6 @@ async fn join(
             },
         )
         .await
-}
-
-#[tokio::test]
-async fn a_preserve_room_is_refused_on_join_and_offer() {
-    let engine = Engine::new(UdpLoopbackDatapath::new());
-    let (_, audio) = phone().await;
-    let joined = reason(
-        join(
-            &engine,
-            audio,
-            ProfileFlags::default(),
-            ForwardMedia::Preserve,
-        )
-        .await,
-    );
-    assert!(
-        joined.contains("preserve") && joined.contains("not supported"),
-        "{joined}"
-    );
-    let offered = reason(
-        engine
-            .handle(
-                CLIENT,
-                Command::ForwardOffer {
-                    conference_id: ROOM.into(),
-                    from_tag: "b".into(),
-                    profile: ProfileFlags::default(),
-                    media: ForwardMedia::Preserve,
-                },
-            )
-            .await,
-    );
-    assert!(
-        offered.contains("preserve") && offered.contains("not supported"),
-        "{offered}"
-    );
-    assert_eq!(engine.conference().forward().seat_count(), 0);
-    assert!(engine.endpoint_calls.is_empty(), "nothing was allocated");
-}
-
-#[tokio::test]
-async fn key_mgmt_is_refused_on_join_and_offer_even_beside_floor_keys() {
-    let engine = Engine::new(UdpLoopbackDatapath::new());
-    let (_, audio) = phone().await;
-    for (profile, needle) in [
-        (secured(vec![], Some("mikey AQAF")), "key_mgmt"),
-        (secured(vec![floor_key()], Some("mikey AQAF")), "key_mgmt"),
-    ] {
-        let joined = reason(join(&engine, audio, profile.clone(), ForwardMedia::Translate).await);
-        assert!(joined.contains(needle), "{joined}");
-        let offered = reason(
-            engine
-                .handle(
-                    CLIENT,
-                    Command::ForwardOffer {
-                        conference_id: ROOM.into(),
-                        from_tag: "b".into(),
-                        profile,
-                        media: ForwardMedia::Translate,
-                    },
-                )
-                .await,
-        );
-        assert!(offered.contains(needle), "{offered}");
-    }
-    assert_eq!(engine.conference().forward().seat_count(), 0);
-    assert!(engine.endpoint_calls.is_empty(), "nothing was allocated");
-}
-
-#[tokio::test]
-async fn key_mgmt_is_refused_on_a_two_party_offer() {
-    let engine = Engine::new(UdpLoopbackDatapath::new());
-    let (_, audio) = phone().await;
-    for profile in [
-        secured(vec![], Some("mikey AQAF")),
-        secured(vec![floor_key()], Some("mikey AQAF")),
-    ] {
-        let result = engine
-            .handle(
-                CLIENT,
-                Command::Offer {
-                    call_id: "call-1".into(),
-                    from_tag: "ft".into(),
-                    sdp: offer_text(audio),
-                    profile,
-                },
-            )
-            .await;
-        assert!(reason(result).contains("key_mgmt"));
-    }
-    assert!(engine.endpoint_calls.is_empty(), "nothing was allocated");
 }
 
 #[tokio::test]

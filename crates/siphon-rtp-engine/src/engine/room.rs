@@ -270,6 +270,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &format!("from-tag {from_tag} has a conference_offer awaiting its answer"),
             );
         }
+        // A mixing room decodes and re-encodes every seat's media, so there is no end-to-end keying
+        // for a controller's `a=key-mgmt` to describe (RFC 4567): refused, not advertised.
+        if profile.key_mgmt.is_some() {
+            return error_result(
+                "conference_join",
+                &"key_mgmt does not apply to a mixing conference seat: the engine terminates its media",
+            );
+        }
         // The participant's codec, chosen before anything is allocated, so a seat the room could not
         // hold is refused here with the reason for each offered codec.
         let seat = match seat_codec(&info, profile) {
@@ -280,7 +288,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let telephone_event =
             sdp::TelephoneEvent::accompanying(&info.telephone_events(), Some(&codec));
         let mut transport = match self
-            .open_seat_transport("conference_join", conference_id, &info, profile)
+            .open_seat_transport(
+                "conference_join",
+                conference_id,
+                &info,
+                profile,
+                siphon_rtp_proto::ForwardMedia::Translate,
+            )
             .await
         {
             Ok(transport) => transport,
