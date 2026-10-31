@@ -458,7 +458,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // promoted media actor, which a takeover call does not have. Advertising CN the bridge can
         // never send would be an answer the media path cannot back, so the answer stays silent
         // about it (`force_answer_codec` already dropped it from the m-line).
-        ok_sdp(answer_sdp, None)
+        self.ok_sdp_keyed(call_id, answer_sdp, None, profile).await
     }
 
     /// Key the single-leg pipeline for a secure offerer. The answer above already advertises the
@@ -1022,6 +1022,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(cn_pt) = comfort_noise_payload_type {
             answer_sdp = sdp::add_comfort_noise(&answer_sdp, cn_pt, chosen.clock_rate_hz);
         }
+        // The controller's `a=key-mgmt`, before the answer is kept for `offer_far` to hand back.
+        answer_sdp = match self.keyed_or_teardown(call_id, &answer_sdp, profile).await {
+            Ok(keyed) => keyed,
+            Err(refusal) => return *refusal,
+        };
 
         // Engage the transcoder now (single-leg, no far side). After this answer the offerer sends the
         // chosen codec, so set `near_codec = chosen` *before* promoting: `promote_to_processing`'s

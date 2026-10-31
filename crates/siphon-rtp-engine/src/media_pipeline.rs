@@ -289,18 +289,15 @@ fn validate_floor_fmtp(profile: &ProfileFlags) -> Result<(), String> {
 }
 
 /// `floor_keys` protect the floor stream with AEAD_AES_128_GCM SRTCP (3GPP TS 33.180 §9.4,
-/// [`crate::floor_srtcp`]) and are checked here, before anything is allocated. `key_mgmt` is part of
-/// the control contract but this build does not implement it: accepting it would leave the floor
-/// stream unkeyed while the controller believes it is protected. Refused loudly instead of ignored.
+/// [`crate::floor_srtcp`]) and are checked here, before anything is allocated. (`key_mgmt` is not
+/// refused: it is an SDP attribute the controller owns and the engine writes verbatim, see
+/// [`crate::sdp::apply_key_mgmt`].)
 ///
 /// # Errors
 /// The reason string, ready to return as a `CmdResult::Error`.
 pub(crate) fn refuse_floor_security(profile: &ProfileFlags) -> Result<(), String> {
     profile.validate().map_err(|error| error.to_string())?;
     crate::floor_srtcp::master_keys(&profile.floor_keys)?;
-    if profile.key_mgmt.is_some() {
-        return Err("key_mgmt is not supported by this engine build".to_string());
-    }
     Ok(())
 }
 

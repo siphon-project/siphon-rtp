@@ -55,6 +55,7 @@ pub mod g729;
 #[cfg(feature = "evs")]
 pub mod evs;
 pub mod l16;
+pub mod mode_request;
 pub mod opus;
 
 /// Codec configuration: native sample rate, channel count, and packetization time.

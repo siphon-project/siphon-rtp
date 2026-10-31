@@ -16,7 +16,7 @@ use super::negotiate::{
     peer_ice_credentials, present_leg, same_codec, CodecPresentation, IceDirective,
     LegPresentation,
 };
-use super::{error_result, ok_sdp, unknown_call, Call, ClientId, Engine, Leg, Party};
+use super::{error_result, unknown_call, Call, ClientId, Engine, Leg, Party};
 
 /// What a re-offer needs from its call, copied out from under the registry guard: which party is
 /// re-offering, both legs, and everything either leg has already been presented with — a re-offer
@@ -626,7 +626,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             "re-offer"
         );
         match present_leg(sdp, presentation, &profile.replace, call_id) {
-            Ok(presented) => ok_sdp(presented, None),
+            Ok(presented) => super::key_mgmt::ok_sdp_keyed_in_place(&presented, profile),
             Err(error) => error_result("re-offer rewrite", &error),
         }
     }

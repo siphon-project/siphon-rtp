@@ -101,8 +101,12 @@ DTMF) is not an audio codec; the media path detects and repacketizes it out of b
 ## Per-codec notes
 
 **G.711.** 8 kHz mono, one byte per sample; decode is a 256-entry table lookup. Packet
-loss is concealed with comfort silence today; ITU-T G.711 Appendix I waveform
-concealment is planned.
+loss is concealed by ITU-T G.711 Appendix I waveform substitution in every decoder the
+factory builds: the last pitch period is replayed (pitch searched between 66 and 200 Hz),
+faded by 20 % per 10 ms after the first 10 ms, muted after 60 ms, and cross-faded into the
+first good frame. A decoder built bare (`G711::ulaw()`) still writes silence. No
+bit-exact vectors exist for it; the tests check the pitch found, the fade and the joins.
+The 3.75 ms output delay of the Appendix is not taken, since a relay cannot hold samples back.
 
 **G.722.** Carries 16 kHz audio but the RTP clock stays 8000 by the RFC 3551 §4.5.2
 historical quirk; the engine gets this right in both SDP and timestamps. Mode 1
