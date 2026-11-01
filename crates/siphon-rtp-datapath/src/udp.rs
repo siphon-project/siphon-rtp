@@ -2356,7 +2356,16 @@ mod tests {
                 local_pwd: "localpassword0123456789".into(),
             }),
         );
-        let check = stun::binding_request(&[3u8; 12], "lufrag:rufrag", b"localpassword0123456789");
+        // A nominating check: on an ICE-lite leg only USE-CANDIDATE selects the pair (RFC 8445
+        // §7.3.1.5), so a plain one would be answered over the stream but adopt nothing.
+        let check = stun::client::binding_request_ice(
+            &[3u8; 12],
+            "lufrag:rufrag",
+            b"localpassword0123456789",
+            NOMINATED_PRIORITY,
+            stun::client::IceRole::Controlling(1),
+            true,
+        );
         let frame = siphon_rtp_stun::turn::encode_channel_data(0x4001, &check, true);
         assert!(datapath.ingest_relayed(leg.id, &frame).await);
         let answer = timeout(SHORT, queue.recv_async())
