@@ -1248,6 +1248,13 @@ impl Datapath for UdpLoopbackDatapath {
         }
     }
 
+    fn turn_relay(&self, endpoint: EndpointId) -> Option<crate::TurnRelay> {
+        self.inner
+            .turn_relay
+            .get(&endpoint)
+            .map(|relay| relay.value().clone())
+    }
+
     fn supports_turn_relay(&self) -> bool {
         true
     }
@@ -2318,6 +2325,19 @@ mod tests {
         let response = stun::parse(framed.data).expect("a STUN response");
         assert_eq!(response.transaction_id, [3u8; 12]);
         assert_eq!(datapath.ice_validated_source(leg.id), Some(peer_addr));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_installed_relay_can_be_read_back_and_clearing_it_removes_it() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let (_peer_socket, peer_addr) = phone().await;
+        assert_eq!(datapath.turn_relay(leg.id), None);
+        let (_server, relay) = permission_only_relay_for(peer_addr).await;
+        datapath.set_turn_relay(leg.id, Some(relay.clone()));
+        assert_eq!(datapath.turn_relay(leg.id), Some(relay));
+        datapath.set_turn_relay(leg.id, None);
+        assert_eq!(datapath.turn_relay(leg.id), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

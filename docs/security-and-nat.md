@@ -417,7 +417,7 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
   arms call, so the two paths cannot drift): an endpoint carrying ICE credentials hands the consumer
   only the source a connectivity check validated — nothing before one has, nothing from another
   source after. Only the source is gated, never the packet class: a redirected endpoint is entitled
-  to non-RTP (Layer 1), and STUN never reaches the arm at all because `recv_loop` routes it to the
+  to non-RTP (Layer 1), and STUN never reaches the arm at all because `recv_loop` (`Inner::receive`) routes it to the
   responder or the full agent first, which is what lets a check through and lets the latch form. A
   non-ICE `Redirect` endpoint is untouched — the TURN relay path in particular still receives
   everything raw. Enforcement: `Inner::{ice_gate, dispatch}` in `udp.rs`.
@@ -526,7 +526,7 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     consent checks, only responds to them, and `a=ice-lite` is what the engine advertises today.
     Initiating them while claiming lite is a deviation, so it is an operator opt-in; the full-agent
     work turns it on for legs that no longer claim lite.
-  - **Backend support.** Both datapaths implement the seam — the UDP one in its `recv_loop`, the XDP
+  - **Backend support.** Both datapaths implement the seam — the UDP one in its `recv_loop` (`Inner::receive`), the XDP
     one in the datapath thread's ICE demux, on STUN the kernel redirects up for exactly this purpose.
     A backend that did not would take the defaulted `set_ice_agent`, which **logs a warning per
     endpoint** and keeps responder-only behaviour — the degradation stays loud, never silent, for any
@@ -1904,7 +1904,7 @@ void, and bound the resources.
   (the concurrency rules). Peer datagrams arrive on the relay endpoint via `FlowAction::Redirect`
   and are routed to the actor by a single dispatcher that owns the shared `Datapath::rx()` stream.
 - **Datapath relaxation (cited at the enforcement point).** A relay endpoint must forward *whatever*
-  the peer sends, including STUN/TURN-shaped bytes a media socket would drop at layer 1. So `recv_loop`
+  the peer sends, including STUN/TURN-shaped bytes a media socket would drop at layer 1. So `recv_loop` (`Inner::receive`)
   delivers raw datagrams to a non-ICE `Redirect` endpoint instead of swallowing first-byte ≤3
   (`udp.rs`). This **never** weakens the media plane: the layer-1 demux still drops ChannelData/STUN on
   *media* (`Forward`) sockets; ChannelData is only ever expected on the TURN server's **own** listener

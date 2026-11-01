@@ -107,6 +107,18 @@ fn tls_pair() -> (TlsAcceptor, Arc<rustls::ClientConfig>) {
 }
 
 async fn stream_turn(wire: Wire, max_lifetime: u32) -> StreamTurn {
+    let (acceptor, client_tls) = tls_pair();
+    stream_turn_with(wire, max_lifetime, acceptor, client_tls).await
+}
+
+/// [`stream_turn`] serving TLS with `acceptor`; `client_tls` is what the fixture hands out for
+/// tests that inject a client configuration.
+async fn stream_turn_with(
+    wire: Wire,
+    max_lifetime: u32,
+    acceptor: TlsAcceptor,
+    client_tls: Arc<rustls::ClientConfig>,
+) -> StreamTurn {
     let datapath = UdpLoopbackDatapath::new();
     let mut config = TurnConfig::new(REALM, SECRET);
     config.max_lifetime = max_lifetime;
@@ -126,7 +138,6 @@ async fn stream_turn(wire: Wire, max_lifetime: u32) -> StreamTurn {
         .await
         .expect("bind turn listener");
     let upstream = listener.local_addr().expect("turn address");
-    let (acceptor, client_tls) = tls_pair();
     let serving = turn.clone();
     tokio::spawn(async move {
         let _ = match wire {
@@ -149,10 +160,18 @@ async fn relayed_stream_call(
     server: &StreamTurn,
     remote: SocketAddr,
 ) -> (Engine<UdpLoopbackDatapath>, EndpointId, UdpSocket, String) {
+    relayed_call_with(server.client_config(), remote).await
+}
+
+/// [`relayed_stream_call`] against an arbitrary TURN client configuration.
+async fn relayed_call_with(
+    config: TurnClientConfig,
+    remote: SocketAddr,
+) -> (Engine<UdpLoopbackDatapath>, EndpointId, UdpSocket, String) {
     let (far, far_addr) = phone().await;
     let engine = Engine::new(UdpLoopbackDatapath::new())
         .with_full_ice()
-        .with_turn_client(server.client_config());
+        .with_turn_client(config);
     let offer = engine
         .handle(
             CLIENT,
@@ -522,4 +541,218 @@ async fn a_dead_udp_first_server_does_not_delay_a_live_stream_server() {
     assert!(ok_sdp_text(&offer).contains("typ relay"));
     assert!(started.elapsed() < Duration::from_millis(1_000));
     drop(silent);
+}
+
+/// A CA and a `localhost` server certificate it signed: the acceptor serves the leaf, and the CA
+/// alone is returned as PEM for `--turn-client-ca-file`. The leaf is not itself trusted by anything.
+fn private_ca_acceptor() -> (TlsAcceptor, String) {
+    siphon_rtp_turn::tls::install_crypto_provider();
+    let ca_params = || {
+        let mut params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("certificate params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "test turn ca");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+    };
+    let ca_key = rcgen::KeyPair::generate().expect("ca key");
+    let ca_pem = ca_params().self_signed(&ca_key).expect("ca").pem();
+    let issuer = rcgen::Issuer::new(ca_params(), ca_key);
+    let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+    let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .expect("leaf params")
+        .signed_by(&leaf_key, &issuer)
+        .expect("leaf certificate");
+    let server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(leaf.der().to_vec())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+        )
+        .expect("server config");
+    (TlsAcceptor::from(Arc::new(server)), ca_pem)
+}
+
+/// Resolve `turns:localhost` through the real settings path with `ca_file`, then point the address
+/// at the test listener (the name, which the certificate is verified against, is kept).
+async fn client_config_from_settings(
+    server: &StreamTurn,
+    ca_file: &std::path::Path,
+) -> TurnClientConfig {
+    let secret = tempfile::NamedTempFile::new().expect("secret file");
+    std::fs::write(secret.path(), SECRET).expect("write secret");
+    let mut config = crate::turn_client_settings::resolve_turn_client(
+        &["turns:localhost".to_string()],
+        Some(secret.path()),
+        3_600,
+        true,
+        "node-a",
+        Some(ca_file),
+    )
+    .await
+    .expect("settings resolve")
+    .expect("configured");
+    config.servers[0].address = server.proxy.address;
+    config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_private_ca_file_from_the_settings_path_authenticates_the_turns_server() {
+    let (acceptor, ca_pem) = private_ca_acceptor();
+    // The injected client configuration the fixture would hand out is never used here.
+    let (_unused, unused_tls) = tls_pair();
+    let server = stream_turn_with(Wire::Tls, 600, acceptor, unused_tls).await;
+    let ca_file = tempfile::NamedTempFile::new().expect("ca file");
+    std::fs::write(ca_file.path(), ca_pem).expect("write ca");
+    let config = client_config_from_settings(&server, ca_file.path()).await;
+    assert!(config.tls.is_some(), "built from the CA file, not injected");
+
+    let (_remote, remote_addr) = phone().await;
+    let (engine, near_rtp, _far, offered) = relayed_call_with(config, remote_addr).await;
+    assert!(offered.contains("typ relay"), "{offered}");
+    assert!(server.turn.allocation_count().await >= 1);
+    assert!(engine
+        .ice_relays
+        .get(&near_rtp)
+        .is_some_and(|allocation| allocation.stream.is_some()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ca_file_that_did_not_sign_the_turns_server_gets_no_relay() {
+    let (acceptor, _signing_ca) = private_ca_acceptor();
+    let (_unused, unused_tls) = tls_pair();
+    let server = stream_turn_with(Wire::Tls, 600, acceptor, unused_tls).await;
+    let (_other_acceptor, other_ca) = private_ca_acceptor();
+    let ca_file = tempfile::NamedTempFile::new().expect("ca file");
+    std::fs::write(ca_file.path(), other_ca).expect("write ca");
+    let config = client_config_from_settings(&server, ca_file.path()).await;
+
+    let (_remote, remote_addr) = phone().await;
+    let (_engine, _near, _far, offered) = relayed_call_with(config, remote_addr).await;
+    assert!(!offered.contains("typ relay"), "{offered}");
+    assert_eq!(server.turn.allocation_count().await, 0);
+}
+
+/// A UDP forwarder in front of the real server that swallows every ChannelBind request, so a peer
+/// gets its permission but never a channel (RFC 8656 §12: the client then relies on indications).
+async fn channel_bind_dropping_proxy(upstream: SocketAddr) -> SocketAddr {
+    use std::collections::HashMap;
+    let front = Arc::new(
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind proxy"),
+    );
+    let address = front.local_addr().expect("proxy address");
+    tokio::spawn(async move {
+        let mut upstreams: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
+        let mut buffer = [0u8; 2048];
+        while let Ok((len, client)) = front.recv_from(&mut buffer).await {
+            let datagram = &buffer[..len];
+            if let Ok(message) = siphon_rtp_stun::parse(datagram) {
+                if siphon_rtp_stun::turn::method_of(message.message_type)
+                    == siphon_rtp_stun::turn::METHOD_CHANNEL_BIND
+                {
+                    continue;
+                }
+            }
+            // One upstream socket per client, so the server sees a stable 5-tuple for each.
+            let toward_server = match upstreams.get(&client) {
+                Some(socket) => socket.clone(),
+                None => {
+                    let Ok(socket) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await else {
+                        continue;
+                    };
+                    let socket = Arc::new(socket);
+                    let back = socket.clone();
+                    let reply_to = front.clone();
+                    tokio::spawn(async move {
+                        let mut reply = [0u8; 2048];
+                        while let Ok((len, _)) = back.recv_from(&mut reply).await {
+                            let _ = reply_to.send_to(&reply[..len], client).await;
+                        }
+                    });
+                    upstreams.insert(client, socket.clone());
+                    socket
+                }
+            };
+            let _ = toward_server.send_to(datagram, upstream).await;
+        }
+    });
+    address
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_permitted_peer_reaches_the_datapath_before_any_channel_and_is_sent_to_as_an_indication()
+{
+    let server = super::turn_client::real_turn_server().await;
+    let proxy = channel_bind_dropping_proxy(server.address).await;
+    let config = TurnClientConfig {
+        servers: vec![proxy.into()],
+        credentials: TurnCredentialSource::Rest {
+            secret: SECRET.to_string(),
+            identity: "node-a".to_string(),
+            ttl_secs: 3_600,
+        },
+        tls: None,
+    };
+    let (remote, remote_addr) = phone().await;
+    let (engine, near_rtp, _far, offered) = relayed_call_with(config, remote_addr).await;
+    assert!(offered.contains("typ relay"), "{offered}");
+    let relayed = engine
+        .ice_relays
+        .get(&near_rtp)
+        .and_then(|allocation| allocation.client.relayed_address())
+        .expect("allocated");
+
+    // The permission is confirmed; the ChannelBind is held back by the proxy and never answered.
+    assert!(
+        drive_until(&engine, 0, 20_000, || {
+            engine
+                .ice_relays
+                .get(&near_rtp)
+                .is_some_and(|allocation| allocation.client.may_send_to(remote_addr))
+        })
+        .await,
+        "the server granted the permission"
+    );
+    engine.drive_ice_agents(30_000).await;
+    assert_eq!(
+        engine
+            .ice_relays
+            .get(&near_rtp)
+            .and_then(|allocation| allocation.client.channel_for(remote_addr)),
+        None,
+        "no channel is bound"
+    );
+
+    // The permission set, not just the channels, was published to the datapath.
+    let installed = engine
+        .datapath()
+        .turn_relay(near_rtp)
+        .expect("a relay is installed on the endpoint");
+    assert!(installed.permitted.contains(&remote_addr), "{installed:?}");
+    assert!(installed.channels.is_empty(), "{installed:?}");
+
+    // A send to it leaves as a Send indication, which the real server relays to the peer from the
+    // allocation's relayed address.
+    engine
+        .datapath()
+        .send(near_rtp, remote_addr, b"as-an-indication")
+        .await
+        .expect("send");
+    let mut buffer = [0u8; 2048];
+    let mut arrived = false;
+    for _ in 0..20 {
+        let (len, from) = timeout(Duration::from_secs(2), remote.recv_from(&mut buffer))
+            .await
+            .expect("a relayed datagram arrives")
+            .expect("recv");
+        if &buffer[..len] == b"as-an-indication" {
+            assert_eq!(from, relayed, "relayed by the server, not sent directly");
+            arrived = true;
+            break;
+        }
+    }
+    assert!(arrived, "the Send indication was relayed to the peer");
 }

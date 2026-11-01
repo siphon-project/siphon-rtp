@@ -857,6 +857,14 @@ pub trait Datapath: Send + Sync {
         async { false }
     }
 
+    /// The TURN relay currently installed on `endpoint` by [`Self::set_turn_relay`], if any. A
+    /// read-back for tests and diagnostics: which peers are permitted and which have a channel.
+    /// Default: `None`.
+    fn turn_relay(&self, endpoint: EndpointId) -> Option<TurnRelay> {
+        let _ = endpoint;
+        None
+    }
+
     /// Whether this backend can actually relay through a TURN allocation ([`Self::set_turn_relay`]).
     ///
     /// Gathering consults this **before** it advertises a relayed candidate: on a backend that

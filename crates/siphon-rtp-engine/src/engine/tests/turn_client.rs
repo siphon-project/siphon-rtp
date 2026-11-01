@@ -10,13 +10,13 @@ use siphon_rtp_turn::{FixedUnixClock, PeerIpPolicy, Turn, TurnConfig};
 pub(super) const REALM: &str = "turn.test";
 pub(super) const SECRET: &str = "static-auth-secret";
 
-struct RealTurn {
-    datapath: UdpLoopbackDatapath,
-    turn: Turn,
-    address: SocketAddr,
+pub(super) struct RealTurn {
+    pub(super) datapath: UdpLoopbackDatapath,
+    pub(super) turn: Turn,
+    pub(super) address: SocketAddr,
 }
 
-async fn real_turn_server() -> RealTurn {
+pub(super) async fn real_turn_server() -> RealTurn {
     real_turn_server_granting(TurnConfig::new(REALM, SECRET).max_lifetime).await
 }
 
