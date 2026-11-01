@@ -1,6 +1,8 @@
 // Drives the MCPTT floor data channel with a real browser (headless Chrome) against the engine, in
-// both directions: the browser calls the room (forward_join) and the room calls the browser
-// (forward_offer with a UDP/TLS/RTP/SAVPF profile, then forward_answer).
+// three scenarios: the browser calls the room (forward_join), the room calls the browser
+// (forward_offer with a UDP/TLS/RTP/SAVPF profile, then forward_answer), and the same offer direction
+// with the browser limited to relay candidates (iceTransportPolicy "relay") through the daemon's own
+// built-in TURN server, the engine running a full ICE agent and allocating from that server too.
 // Dependency free: Node's built-in WebSocket speaks the DevTools protocol, node:net the engine's
 // length-prefixed JSON control protocol, node:dgram plays a plain RTP listener seat.
 //
@@ -8,6 +10,7 @@
 
 import { spawn } from "node:child_process";
 import dgram from "node:dgram";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -161,16 +164,19 @@ class Control {
   }
 }
 
-async function startEngine(address) {
+async function startEngine(address, extraArgs = [], extraEnv = {}) {
   const controlPort = await freePort();
   const engine = spawn(
     process.env.ENGINE_BIN,
-    ["--control", `127.0.0.1:${controlPort}`, "--relay-bind-ip", address],
-    { stdio: ["ignore", "inherit", "inherit"], env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? "info" } },
+    ["--control", `127.0.0.1:${controlPort}`, "--relay-bind-ip", address, ...extraArgs],
+    {
+      stdio: ["ignore", "inherit", "inherit"],
+      env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? "info", ...extraEnv },
+    },
   );
   cleanups.push(() => engine.kill("SIGKILL"));
   engine.once("exit", (code, signal) => {
-    if (!cleaned) {
+    if (!cleaned && !engine.stoppedOnPurpose) {
       console.log(`FAIL engine exited early (code ${code}, signal ${signal})`);
       cleanup();
       process.exit(1);
@@ -183,7 +189,13 @@ async function startEngine(address) {
         connection.once("error", reject);
       });
       cleanups.push(() => socket.destroy());
-      return new Control(socket);
+      const control = new Control(socket);
+      control.stop = () => {
+        engine.stoppedOnPurpose = true;
+        socket.destroy();
+        engine.kill("SIGKILL");
+      };
+      return control;
     } catch {
       await sleep(100);
     }
@@ -267,7 +279,7 @@ async function startChrome() {
 // ---------------------------------------------------------------- the scenario
 
 // The page's audio source and the floor channel plumbing both directions share.
-const PAGE_PRELUDE = `
+const pagePrelude = (rtcConfiguration) => `
   const context = new AudioContext();
   const oscillator = context.createOscillator();
   oscillator.type = "sawtooth";
@@ -276,7 +288,7 @@ const PAGE_PRELUDE = `
   oscillator.connect(destination);
   oscillator.start();
   await context.resume();
-  const pc = new RTCPeerConnection({});
+  const pc = new RTCPeerConnection(${rtcConfiguration});
   window.pc = pc;
   window.messages = [];
   window.channelState = "connecting";
@@ -299,7 +311,7 @@ const PAGE_PRELUDE = `
 
 // forward_join: the browser offers.
 const PAGE_OFFER = `(async () => {
-  ${PAGE_PRELUDE}
+  ${pagePrelude("{}")}
   pc.addTrack(track, destination.stream);
   attachFloor();
   await pc.setLocalDescription(await pc.createOffer());
@@ -310,8 +322,8 @@ const PAGE_OFFER = `(async () => {
 // forward_offer: the browser answers. It sets the engine's offer, then opens the floor channel on the
 // section the offer carries (createDataChannel after setRemoteDescription reuses the offered
 // m=application) and sends audio on the offered audio section.
-const pageAnswer = (offer) => `(async () => {
-  ${PAGE_PRELUDE}
+const pageAnswer = (offer, rtcConfiguration = "{}") => `(async () => {
+  ${pagePrelude(rtcConfiguration)}
   await pc.setRemoteDescription({ type: "offer", sdp: ${JSON.stringify(offer)} });
   const audio = pc.getTransceivers().find((transceiver) => transceiver.receiver.track.kind === "audio");
   audio.direction = "sendrecv";
@@ -321,6 +333,41 @@ const pageAnswer = (offer) => `(async () => {
   await gathered;
   return pc.localDescription.sdp;
 })()`;
+
+const TURN_REALM = "floor-chrome.test";
+
+// coturn use-auth-secret REST credentials (the scheme the daemon's TURN server and TURN client share):
+// username "<unix expiry>:<id>", password base64(HMAC-SHA1(secret, username)).
+function restCredentials(secret) {
+  const username = `${Math.floor(Date.now() / 1000) + 3600}:chrome`;
+  const credential = crypto.createHmac("sha1", secret).update(username).digest("base64");
+  return { username, credential };
+}
+
+// An engine of its own for the relay scenario: a full ICE agent (a lite one advertises host candidates
+// only), the built-in TURN server on loopback, and the engine's TURN client pointed at it. Peers of the
+// relay are on this host's private network, which the server refuses unless told otherwise.
+async function startRelayEngine(address) {
+  const secret = crypto.randomBytes(16).toString("hex");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "floor-turn-"));
+  cleanups.push(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const secretFile = path.join(directory, "turn-secret");
+  fs.writeFileSync(secretFile, secret, { mode: 0o600 });
+  const turnPort = await freePort();
+  const turnAddress = `127.0.0.1:${turnPort}`;
+  const control = await startEngine(
+    address,
+    [
+      "--ice-full",
+      "--turn-udp", turnAddress,
+      "--turn-permit-private-peers",
+      "--turn-client", `turn:${turnAddress}`,
+      "--turn-client-secret-file", secretFile,
+    ],
+    { SIPHON_RTP_TURN_REALM: TURN_REALM, SIPHON_RTP_TURN_SECRET: secret },
+  );
+  return { control, turnAddress, secret };
+}
 
 async function main() {
   if (!process.env.ENGINE_BIN || !process.env.CHROME_BIN) {
@@ -344,12 +391,23 @@ async function main() {
     console.log(`--- ${direction === "join" ? "the browser calls the room (forward_join)" : "the room calls the browser (forward_offer)"}`);
     await scenario(direction, control, chrome);
   }
+
+  // Relay only: its own engine, so the two above keep running against the default ICE-lite one.
+  console.log("--- the room calls the browser, relay candidates only (forward_offer through the built-in TURN server)");
+  control.stop();
+  const relay = await startRelayEngine(address);
+  const credentials = restCredentials(relay.secret);
+  const rtcConfiguration = JSON.stringify({
+    iceTransportPolicy: "relay",
+    iceServers: [{ urls: `turn:${relay.turnAddress}?transport=udp`, ...credentials }],
+  });
+  await scenario("relay", relay.control, chrome, rtcConfiguration);
 }
 
 // The floor parameters that mark a room as carrying floor control (3GPP TS 24.380 section 14).
 const FLOOR_FMTP = "mc_queueing;mc_priority=5;mc_granted";
 
-async function scenario(direction, control, chrome) {
+async function scenario(direction, control, chrome, rtcConfiguration = "{}") {
   const ROOM = `${ROOM_PREFIX}-${direction}`;
   const label = (name) => `${direction}: ${name}`;
   let answer;
@@ -381,10 +439,21 @@ async function scenario(direction, control, chrome) {
       throw new Error(`forward_offer for the browser failed: ${JSON.stringify(offered)}`);
     }
     const engineOffer = offered.sdp;
-    for (const required of ["UDP/TLS/RTP/SAVPF", "a=ice-lite", "a=setup:actpass", "webrtc-datachannel"]) {
-      if (!engineOffer.includes(required)) throw new Error(`the engine's offer lacks ${required}:\n${engineOffer}`);
+    // The default engine is an ICE-lite one; the relay engine runs a full agent and says so by not
+    // claiming lite, and must carry its allocation's relayed candidate (RFC 8839 section 5.1).
+    const required = ["UDP/TLS/RTP/SAVPF", "a=setup:actpass", "webrtc-datachannel"];
+    required.push(direction === "relay" ? "typ relay raddr" : "a=ice-lite");
+    for (const needle of required) {
+      if (!engineOffer.includes(needle)) throw new Error(`the engine's offer lacks ${needle}:\n${engineOffer}`);
     }
-    const browserAnswer = await chrome.evaluate(pageAnswer(engineOffer));
+    const browserAnswer = await chrome.evaluate(pageAnswer(engineOffer, rtcConfiguration));
+    if (direction === "relay") {
+      const kinds = [...browserAnswer.matchAll(/^a=candidate:.* typ (\w+)/gm)].map((match) => match[1]);
+      console.log(`browser answer candidates: ${kinds.join(",") || "none"}`);
+      if (kinds.length === 0 || kinds.some((kind) => kind !== "relay")) {
+        throw new Error(`the relay-only browser answer must carry relay candidates only:\n${browserAnswer}`);
+      }
+    }
     const accepted = (browserAnswer.match(/^m=application [1-9]/gm) ?? []).length;
     console.log(`browser answer: ${browserAnswer.split("\r\n").length} lines, data channel section ${accepted ? "kept" : "DECLINED"}`);
     const seated = await control.call({
@@ -532,6 +601,30 @@ async function scenario(direction, control, chrome) {
     pass(label("browser audio RTP reaches the engine"), `${received.packets} packets forwarded, payload type(s) ${[...received.payloadTypes].join(",")}`);
   } catch (error) {
     fail(label("browser audio RTP reaches the engine"), `${error.message}; ${received.packets} packets`);
+  }
+
+  // 5. relay only: the pair the page selected is relayed on its side.
+  if (direction === "relay") {
+    const selected = await chrome.evaluate(`(async () => {
+      const stats = await window.pc.getStats();
+      const byId = new Map();
+      stats.forEach((report) => byId.set(report.id, report));
+      let pair;
+      byId.forEach((report) => {
+        if (report.type === "transport" && report.selectedCandidatePairId) pair = byId.get(report.selectedCandidatePairId);
+      });
+      if (!pair) byId.forEach((report) => { if (report.type === "candidate-pair" && report.nominated && report.state === "succeeded") pair = report; });
+      if (!pair) return null;
+      return {
+        local: byId.get(pair.localCandidateId)?.candidateType,
+        remote: byId.get(pair.remoteCandidateId)?.candidateType,
+      };
+    })()`);
+    if (selected?.local === "relay") {
+      pass(label("the page's selected candidate pair is relayed"), `local ${selected.local}, remote ${selected.remote}`);
+    } else {
+      fail(label("the page's selected candidate pair is relayed"), JSON.stringify(selected));
+    }
   }
 }
 

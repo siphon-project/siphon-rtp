@@ -193,6 +193,8 @@ pub struct FileConfig {
     pub turn_tls_key: Option<PathBuf>,
     /// Public IP to advertise in XOR-RELAYED-ADDRESS (`--turn-relay-ip`).
     pub turn_relay_ip: Option<IpAddr>,
+    /// Let the TURN server relay to loopback and private peers (`--turn-permit-private-peers`).
+    pub turn_permit_private_peers: Option<bool>,
     /// Bound on a WebSocket dial (connect, TLS and upgrade), milliseconds
     /// (`--ws-connect-timeout-ms`).
     pub ws_connect_timeout_ms: Option<u64>,
@@ -336,6 +338,7 @@ mod tests {
             "turn_tls_cert = \"/etc/siphon-rtp/turn.pem\"\n",
             "turn_tls_key = \"/etc/siphon-rtp/turn.key\"\n",
             "turn_relay_ip = \"203.0.113.7\"\n",
+            "turn_permit_private_peers = true\n",
             "log_filter = \"info,siphon_rtp_engine=debug\"\n",
             "node_id = \"rtp-ams-3\"\n",
             "max_sessions = 4000\n",
@@ -386,6 +389,7 @@ mod tests {
             config.turn_relay_ip,
             Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
         );
+        assert_eq!(config.turn_permit_private_peers, Some(true));
         assert_eq!(
             config.log_filter.as_deref(),
             Some("info,siphon_rtp_engine=debug")
