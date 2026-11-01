@@ -210,6 +210,10 @@ struct Inner {
     /// Per-endpoint TURN allocation the leg relays through (RFC 5766 §11 ChannelData). Present only
     /// for a leg whose ICE selected a **relayed** local candidate.
     turn_relay: DashMap<EndpointId, crate::TurnRelay>,
+    /// How many endpoints have a [`Self::turn_relay`] entry. The relay-forward path reads this one
+    /// relaxed atomic before touching the map, so a node with no TURN allocation (the default)
+    /// pays nothing per packet for the egress check.
+    turn_relay_count: AtomicUsize,
     /// Per-endpoint ICE-lite credentials; when present, STUN checks are answered and the validated
     /// source is adopted as the media path (RFC 8445).
     ice: DashMap<EndpointId, IceConfig>,
@@ -344,7 +348,27 @@ impl Inner {
                         return;
                     }
                 };
-                match out.0.send_to(payload, destination).await {
+                // RFC 8656 §12: a destination with a bound channel on the out leg's allocation is
+                // reached through the TURN server, so it goes out as ChannelData addressed to the
+                // server — the same framing `send` applies. Free when no allocation is installed.
+                let relayed = if self.turn_relay_count.load(Ordering::Relaxed) == 0 {
+                    None
+                } else {
+                    self.turn_relay.get(&rule.out_endpoint).and_then(|relay| {
+                        relay
+                            .channel_for(destination)
+                            .map(|channel| (channel, relay.server))
+                    })
+                };
+                let sent = match relayed {
+                    Some((channel, server)) => {
+                        let wire =
+                            siphon_rtp_stun::turn::encode_channel_data(channel, payload, false);
+                        out.0.send_to(&wire, server).await
+                    }
+                    None => out.0.send_to(payload, destination).await,
+                };
+                match sent {
                     Ok(sent) => {
                         out.1.packets_out.fetch_add(1, Ordering::Relaxed);
                         out.1.bytes_out.fetch_add(sent as u64, Ordering::Relaxed);
@@ -611,6 +635,7 @@ impl UdpLoopbackDatapath {
                 latched: DashMap::new(),
                 ice: DashMap::new(),
                 turn_relay: DashMap::new(),
+                turn_relay_count: AtomicUsize::new(0),
                 ice_events: DashMap::new(),
                 ice_forward_only: DashMap::new(),
                 ice_validated: DashMap::new(),
@@ -1140,6 +1165,9 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner.ice.remove(&endpoint);
         self.inner.ice_events.remove(&endpoint);
         self.inner.ice_validated.remove(&endpoint);
+        if self.inner.turn_relay.remove(&endpoint).is_some() {
+            self.inner.turn_relay_count.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     async fn send(
@@ -1220,10 +1248,14 @@ impl Datapath for UdpLoopbackDatapath {
     fn set_turn_relay(&self, endpoint: EndpointId, relay: Option<crate::TurnRelay>) {
         match relay {
             Some(relay) => {
-                self.inner.turn_relay.insert(endpoint, relay);
+                if self.inner.turn_relay.insert(endpoint, relay).is_none() {
+                    self.inner.turn_relay_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
             None => {
-                self.inner.turn_relay.remove(&endpoint);
+                if self.inner.turn_relay.remove(&endpoint).is_some() {
+                    self.inner.turn_relay_count.fetch_sub(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1850,6 +1882,67 @@ mod tests {
             &payload[..],
             "the payload rides the channel intact"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarded_media_toward_a_channel_bound_peer_is_wrapped_for_the_server() {
+        // The kernel-style relay path (`FlowAction::Forward`) must honour the out endpoint's
+        // allocation exactly as `send` does: a peer behind the allocation is not reachable directly.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (source, _) = phone().await;
+        let (_peer_socket, peer_addr) = phone().await;
+        let (server, relay, channel) = turn_relay_for(peer_addr).await;
+        datapath.set_turn_relay(leg_b.id, Some(relay));
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(peer_addr))),
+            )
+            .expect("flow");
+
+        let payload = rtp(0x1010_1010, 1);
+        source
+            .send_to(&payload, leg_a.local_addr)
+            .await
+            .expect("media in");
+
+        let (wire, from) = recv(&server).await;
+        assert_eq!(from.port(), leg_b.local_addr.port(), "from the out leg");
+        let framed = siphon_rtp_stun::turn::parse_channel_data(&wire).expect("ChannelData");
+        assert_eq!(framed.channel, channel);
+        assert_eq!(framed.data, &payload[..]);
+        let stats = datapath.stats(leg_b.id).expect("stats");
+        assert_eq!(stats.packets_out, 1);
+        assert_eq!(stats.bytes_out, wire.len() as u64, "counts the wire bytes");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarded_media_to_a_peer_without_a_channel_still_goes_direct() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (source, _) = phone().await;
+        let (bound_socket, bound_peer) = phone().await;
+        let (direct, direct_addr) = phone().await;
+        let (_server, relay, _) = turn_relay_for(bound_peer).await;
+        drop(bound_socket);
+        datapath.set_turn_relay(leg_b.id, Some(relay));
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(direct_addr))),
+            )
+            .expect("flow");
+
+        let payload = rtp(0x1111_1111, 1);
+        source
+            .send_to(&payload, leg_a.local_addr)
+            .await
+            .expect("media in");
+        let (wire, _) = recv(&direct).await;
+        assert_eq!(wire, payload, "an unbound destination is untouched");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
