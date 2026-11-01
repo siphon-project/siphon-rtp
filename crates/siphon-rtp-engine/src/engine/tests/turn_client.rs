@@ -10,13 +10,13 @@ use siphon_rtp_turn::{FixedUnixClock, PeerIpPolicy, Turn, TurnConfig};
 const REALM: &str = "turn.test";
 const SECRET: &str = "static-auth-secret";
 
-struct RealTurn {
-    datapath: UdpLoopbackDatapath,
-    turn: Turn,
-    address: SocketAddr,
+pub(super) struct RealTurn {
+    pub(super) datapath: UdpLoopbackDatapath,
+    pub(super) turn: Turn,
+    pub(super) address: SocketAddr,
 }
 
-async fn real_turn_server() -> RealTurn {
+pub(super) async fn real_turn_server() -> RealTurn {
     real_turn_server_granting(TurnConfig::new(REALM, SECRET).max_lifetime).await
 }
 
@@ -52,7 +52,7 @@ async fn real_turn_server_granting(max_lifetime: u32) -> RealTurn {
     }
 }
 
-fn rest_client(server: SocketAddr) -> TurnClientConfig {
+pub(super) fn rest_client(server: SocketAddr) -> TurnClientConfig {
     TurnClientConfig {
         servers: vec![server],
         credentials: TurnCredentialSource::Rest {
@@ -107,7 +107,7 @@ async fn relayed_call(
 }
 
 /// Drive the ICE tick from `from_ms` to `to_ms` in 20 ms steps until `done` holds.
-async fn drive_until(
+pub(super) async fn drive_until(
     engine: &Engine<UdpLoopbackDatapath>,
     from_ms: u64,
     to_ms: u64,
