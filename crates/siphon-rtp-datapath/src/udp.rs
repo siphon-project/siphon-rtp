@@ -220,6 +220,10 @@ struct Inner {
     /// Per-endpoint ICE-lite credentials; when present, STUN checks are answered and the validated
     /// source is adopted as the media path (RFC 8445).
     ice: DashMap<EndpointId, IceConfig>,
+    /// PRIORITY of the nominated pair the ice-lite responder selected per endpoint (RFC 8445
+    /// §7.3.1.5): written by a USE-CANDIDATE check that [`crate::nomination_supersedes`] the stored
+    /// one, cleared with the credentials (an ICE restart brings new ones, §9.1.1.1).
+    ice_nominated: DashMap<EndpointId, u32>,
     /// Per-endpoint **full-agent** STUN forwarding sink. Present only for endpoints promoted via
     /// [`Datapath::set_ice_agent`]; a STUN datagram on such an endpoint is forwarded here (in
     /// addition to the responder answering inbound checks) so the engine's consent checker can
@@ -633,6 +637,7 @@ impl UdpLoopbackDatapath {
                 flows: DashMap::new(),
                 latched: DashMap::new(),
                 ice: DashMap::new(),
+                ice_nominated: DashMap::new(),
                 turn_relay: DashMap::new(),
                 turn_relay_count: AtomicUsize::new(0),
                 ice_events: DashMap::new(),
@@ -915,19 +920,42 @@ async fn handle_stun(
     // The USERNAME must address us (our ufrag first) and MESSAGE-INTEGRITY must verify with our
     // local password — a challenge an off-path attacker cannot forge without the SDP it never saw.
     // Shared with the XDP backend so the two datapaths cannot drift on what authenticates a check.
-    let response = match crate::respond_to_stun_check(datagram, ice, source) {
-        crate::StunCheckOutcome::Respond(response) => response,
+    let (response, nomination) = match crate::respond_to_stun_check(datagram, ice, source) {
+        crate::StunCheckOutcome::Respond {
+            response,
+            nomination,
+        } => (response, nomination),
         crate::StunCheckOutcome::Drop => {
             stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
     };
-    // Valid check: ICE supersedes blind latching — adopt the validated source, and count the check
-    // as activity so the media-timeout sweep treats the path as alive.
-    inner
-        .latched
-        .insert(endpoint, SourceLatch { source, ssrc: None });
-    inner.publish_ice_validated(endpoint);
+    // Valid check: answered (RFC 8445 §7.3), but a lite agent selects a pair only on a USE-CANDIDATE
+    // check (§7.3.1.5 / §6.1.3.2), and among several nominations the highest PRIORITY wins (§8.1.1) —
+    // so a browser checking from every interface moves the path only for the pair it nominates, and a
+    // lower-priority later nomination never moves an established one.
+    if let Some(priority) = nomination {
+        let selects = match inner.ice_nominated.entry(endpoint) {
+            dashmap::mapref::entry::Entry::Occupied(mut selected) => {
+                let supersedes = crate::nomination_supersedes(Some(*selected.get()), priority);
+                if supersedes {
+                    selected.insert(priority);
+                }
+                supersedes
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(priority);
+                true
+            }
+        };
+        if selects {
+            inner
+                .latched
+                .insert(endpoint, SourceLatch { source, ssrc: None });
+            inner.publish_ice_validated(endpoint);
+        }
+    }
+    // The check also counts as activity so the media-timeout sweep treats the path as alive.
     stats
         .last_seen
         .store(inner.clock.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1129,6 +1157,7 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner.flows.remove(&endpoint);
         self.inner.latched.remove(&endpoint);
         self.inner.ice.remove(&endpoint);
+        self.inner.ice_nominated.remove(&endpoint);
         self.inner.ice_events.remove(&endpoint);
         self.inner.ice_validated.remove(&endpoint);
         if self.inner.turn_relay.remove(&endpoint).is_some() {
@@ -1262,10 +1291,23 @@ impl Datapath for UdpLoopbackDatapath {
     fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>) {
         match config {
             Some(config) => {
+                // RFC 8445 §9.1.1.1: new credentials are a new ICE session, so a pair nominated in
+                // the old one no longer orders (or blocks) the new session's nominations. The
+                // latch itself stays: media continues on the old pair until the new session
+                // nominates one (§9.3).
+                let restarted = self
+                    .inner
+                    .ice
+                    .get(&endpoint)
+                    .is_some_and(|previous| previous.local_ufrag != config.local_ufrag);
+                if restarted {
+                    self.inner.ice_nominated.remove(&endpoint);
+                }
                 self.inner.ice.insert(endpoint, config);
             }
             None => {
                 self.inner.ice.remove(&endpoint);
+                self.inner.ice_nominated.remove(&endpoint);
                 self.inner.ice_events.remove(&endpoint);
                 self.inner.ice_forward_only.remove(&endpoint);
                 self.inner.ice_validated.remove(&endpoint);
@@ -1296,7 +1338,7 @@ impl Datapath for UdpLoopbackDatapath {
     }
 
     fn adopt_source(&self, endpoint: EndpointId, source: SocketAddr) {
-        // Same write the responder performs on a validated check — relocated to the agent, which on a
+        // Same write the responder performs on a nominating check — relocated to the agent, which on a
         // full-agent endpoint is the only thing entitled to make it.
         self.inner
             .latched
@@ -1701,7 +1743,7 @@ mod tests {
 
         // A valid connectivity check from the real peer adopts its source.
         let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
-        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        let check = nominating_check(&[9u8; 12], NOMINATED_PRIORITY);
         peer.send_to(&check, leg.local_addr)
             .await
             .expect("send check");
@@ -1751,7 +1793,7 @@ mod tests {
         let rx = datapath.rx();
 
         let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
-        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        let check = nominating_check(&[9u8; 12], NOMINATED_PRIORITY);
         peer.send_to(&check, leg.local_addr)
             .await
             .expect("send check");
@@ -2602,6 +2644,34 @@ mod tests {
 
     /// A minimal RTP packet (V=2, PT=0/PCMU) carrying `ssrc` and `sequence` — enough for the latch
     /// to read an SSRC (RFC 3550 §5.1).
+    /// PRIORITY a test's nominating check carries unless the test is about ordering.
+    const NOMINATED_PRIORITY: u32 = 0x7E00_00FF;
+
+    /// A valid connectivity check for the `ENG` endpoint that nominates its pair (USE-CANDIDATE,
+    /// RFC 8445 §7.1.1) with the given PRIORITY.
+    fn nominating_check(transaction: &[u8; 12], priority: u32) -> Vec<u8> {
+        stun::client::binding_request_ice(
+            transaction,
+            "ENG:remote",
+            b"engpass",
+            priority,
+            stun::client::IceRole::Controlling(1),
+            true,
+        )
+    }
+
+    /// The same check without USE-CANDIDATE: answered, but it selects nothing.
+    fn plain_check(transaction: &[u8; 12], priority: u32) -> Vec<u8> {
+        stun::client::binding_request_ice(
+            transaction,
+            "ENG:remote",
+            b"engpass",
+            priority,
+            stun::client::IceRole::Controlling(1),
+            false,
+        )
+    }
+
     fn rtp(ssrc: u32, sequence: u16) -> Vec<u8> {
         let mut packet = vec![0x80, 0x00];
         packet.extend_from_slice(&sequence.to_be_bytes());
@@ -3452,7 +3522,7 @@ mod tests {
 
         let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
         // A valid connectivity check addressed to us, signed with our password.
-        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        let check = nominating_check(&[9u8; 12], NOMINATED_PRIORITY);
         peer.send_to(&check, leg_a.local_addr)
             .await
             .expect("send check");
@@ -3521,7 +3591,7 @@ mod tests {
 
         // A valid connectivity check from the real peer adopts its source.
         let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
-        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        let check = nominating_check(&[9u8; 12], NOMINATED_PRIORITY);
         peer.send_to(&check, leg_a.local_addr)
             .await
             .expect("send check");
@@ -3648,7 +3718,7 @@ mod tests {
 
         // The real peer's valid check does.
         let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
-        let check = stun::binding_request(&[4u8; 12], "ENG:remote", b"engpass");
+        let check = nominating_check(&[4u8; 12], NOMINATED_PRIORITY);
         peer.send_to(&check, leg.local_addr)
             .await
             .expect("send check");
@@ -3661,9 +3731,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watch_ice_validated_follows_each_validated_source_until_ice_is_cleared() {
+    async fn watch_ice_validated_follows_the_nominated_source_until_ice_is_cleared() {
         // The push side of `ice_validated_source`, for a consumer that owns a leg's egress in userspace:
         // RFC 8445 §12.1.1 has an ice-lite leg send nothing before a valid pair, and then send to it.
+        // The selected pair is the nominated one (§7.3.1.5), so only a USE-CANDIDATE check publishes.
         let datapath = UdpLoopbackDatapath::new();
         let plain = datapath.alloc_endpoint().await.expect("alloc plain");
         assert!(
@@ -3701,14 +3772,25 @@ mod tests {
             "a check failing MESSAGE-INTEGRITY publishes nothing"
         );
 
-        // The peer's valid check publishes its source.
+        // A valid check without USE-CANDIDATE is answered and publishes nothing (§7.3.1.5).
         let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
-        peer.send_to(
-            &stun::binding_request(&[4u8; 12], "ENG:remote", b"engpass"),
-            leg.local_addr,
-        )
-        .await
-        .expect("send check");
+        peer.send_to(&plain_check(&[4u8; 12], 100), leg.local_addr)
+            .await
+            .expect("send plain check");
+        let answer = recv(&peer).await.0;
+        assert_eq!(
+            stun::parse(&answer).expect("parse").message_type,
+            stun::BINDING_SUCCESS
+        );
+        assert!(
+            timeout(NEGATIVE, validated.changed()).await.is_err(),
+            "a non-nominating check is answered but selects no pair"
+        );
+
+        // The nominating check publishes its source.
+        peer.send_to(&nominating_check(&[4u8; 12], 100), leg.local_addr)
+            .await
+            .expect("send check");
         timeout(std::time::Duration::from_secs(1), validated.changed())
             .await
             .expect("published")
@@ -3716,7 +3798,7 @@ mod tests {
         assert_eq!(*validated.borrow_and_update(), Some(peer_addr));
         let _ = recv(&peer).await;
 
-        // A later subscriber starts at the validated source instead of waiting for the next check.
+        // A later subscriber starts at the nominated source instead of waiting for the next check.
         assert_eq!(
             *datapath
                 .watch_ice_validated(leg.id)
@@ -3725,13 +3807,10 @@ mod tests {
             Some(peer_addr)
         );
 
-        // A valid check from another transport re-points it, exactly as the responder re-adopts.
+        // A higher-priority nomination from another transport re-points it (§8.1.1).
         let (moved, moved_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
         moved
-            .send_to(
-                &stun::binding_request(&[5u8; 12], "ENG:remote", b"engpass"),
-                leg.local_addr,
-            )
+            .send_to(&nominating_check(&[5u8; 12], 200), leg.local_addr)
             .await
             .expect("send check");
         timeout(std::time::Duration::from_secs(1), validated.changed())
@@ -3748,6 +3827,176 @@ mod tests {
                 .expect("closed promptly")
                 .is_err(),
             "the publisher is dropped with the endpoint's ICE state"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_multi_interface_peer_checking_from_every_address_selects_only_the_nominated_one() {
+        // The lab bug: a browser with several interfaces checks from each local address and nominates
+        // one. Every check is answered, but the path (latch, validated source, media gate) follows the
+        // nominated pair only — not whichever address checked last (RFC 8445 §7.3.1.5).
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        datapath.set_ice(
+            leg_a.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        let (callee, callee_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(callee_addr))),
+            )
+            .expect("flow");
+        let mut validated = datapath.watch_ice_validated(leg_a.id).expect("ice");
+
+        let (first, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (nominated, nominated_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let (last, _) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+
+        // Before any nomination: answered, nothing selected, media from the checking source dropped.
+        first
+            .send_to(&plain_check(&[1u8; 12], 300), leg_a.local_addr)
+            .await
+            .expect("check");
+        let _ = recv(&first).await;
+        assert_eq!(datapath.ice_validated_source(leg_a.id), None);
+        first
+            .send_to(&rtp(0x1111_1111, 1), leg_a.local_addr)
+            .await
+            .expect("rtp");
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, callee.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "no pair is selected before a nomination, so media is not forwarded"
+        );
+
+        // The nominated source checks in the middle of two plain checks from other addresses.
+        nominated
+            .send_to(&nominating_check(&[2u8; 12], 200), leg_a.local_addr)
+            .await
+            .expect("nominate");
+        let _ = recv(&nominated).await;
+        last.send_to(&plain_check(&[3u8; 12], 400), leg_a.local_addr)
+            .await
+            .expect("check");
+        let answer = recv(&last).await.0;
+        assert_eq!(
+            stun::parse(&answer).expect("parse").message_type,
+            stun::BINDING_SUCCESS,
+            "a non-nominating check is still answered (RFC 8445 §7.3)"
+        );
+
+        assert_eq!(
+            datapath.ice_validated_source(leg_a.id),
+            Some(nominated_addr),
+            "the path follows the nominated pair, not the last check"
+        );
+        assert_eq!(*validated.borrow_and_update(), Some(nominated_addr));
+        nominated
+            .send_to(&rtp(0x2222_2222, 1), leg_a.local_addr)
+            .await
+            .expect("rtp");
+        assert_eq!(recv(&callee).await.0, rtp(0x2222_2222, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_highest_priority_nomination_wins_and_a_lower_one_never_moves_the_path() {
+        // RFC 8445 §8.1.1: with several nominated pairs the highest priority is selected. Equal
+        // priority may move (RFC 5245 aggressive nomination sets USE-CANDIDATE on every check).
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        datapath.set_ice(
+            leg.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        let (high, high_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (low, _) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let (equal, equal_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+
+        high.send_to(&nominating_check(&[1u8; 12], 500), leg.local_addr)
+            .await
+            .expect("nominate");
+        let _ = recv(&high).await;
+        assert_eq!(datapath.ice_validated_source(leg.id), Some(high_addr));
+
+        low.send_to(&nominating_check(&[2u8; 12], 100), leg.local_addr)
+            .await
+            .expect("nominate low");
+        let _ = recv(&low).await;
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            Some(high_addr),
+            "a lower-priority later nomination must not move an established path"
+        );
+
+        equal
+            .send_to(&nominating_check(&[3u8; 12], 500), leg.local_addr)
+            .await
+            .expect("nominate equal");
+        let _ = recv(&equal).await;
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            Some(equal_addr),
+            "an equal-priority nomination may move the path (aggressive nomination)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ice_restart_clears_the_nomination_so_a_lower_priority_pair_can_be_selected() {
+        // RFC 8445 §9.1.1.1: new credentials are a new session; the old session's nomination priority
+        // must not block it. Same credentials re-installed (no restart) keep the nomination.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let config = |ufrag: &str| IceConfig {
+            local_ufrag: ufrag.into(),
+            local_pwd: "engpass".into(),
+        };
+        datapath.set_ice(leg.id, Some(config("ENG")));
+        let (old, old_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (new, new_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        old.send_to(&nominating_check(&[1u8; 12], 500), leg.local_addr)
+            .await
+            .expect("nominate");
+        let _ = recv(&old).await;
+
+        datapath.set_ice(leg.id, Some(config("ENG")));
+        new.send_to(&nominating_check(&[2u8; 12], 100), leg.local_addr)
+            .await
+            .expect("nominate");
+        let _ = recv(&new).await;
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            Some(old_addr),
+            "re-installing the same credentials is not a restart"
+        );
+
+        datapath.set_ice(leg.id, Some(config("ENG2")));
+        let restarted = stun::client::binding_request_ice(
+            &[3u8; 12],
+            "ENG2:remote",
+            b"engpass",
+            100,
+            stun::client::IceRole::Controlling(1),
+            true,
+        );
+        new.send_to(&restarted, leg.local_addr)
+            .await
+            .expect("nominate after restart");
+        let _ = recv(&new).await;
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            Some(new_addr),
+            "the restarted session starts with no nomination"
         );
     }
 
@@ -3841,7 +4090,7 @@ mod tests {
         );
 
         let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
-        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        let check = nominating_check(&[9u8; 12], NOMINATED_PRIORITY);
         peer.send_to(&check, leg.local_addr)
             .await
             .expect("send check");
@@ -3879,7 +4128,7 @@ mod tests {
 
         let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
         // A perfectly valid check — one the responder would have answered and latched.
-        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        let check = nominating_check(&[9u8; 12], NOMINATED_PRIORITY);
         peer.send_to(&check, leg.local_addr)
             .await
             .expect("send check");

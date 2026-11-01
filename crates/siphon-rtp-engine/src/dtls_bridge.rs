@@ -1281,10 +1281,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_ice_lite_leg_follows_the_source_its_checks_validate() {
+    async fn an_ice_lite_leg_follows_the_source_the_datapath_publishes() {
         // RFC 8445 §12.1.1: an ice-lite leg sends nothing before a valid pair, then sends to that pair's
-        // remote candidate. The datapath publishes the validated source and the bridge follows it, with
-        // no selection event from an agent.
+        // remote candidate. The datapath publishes the nominated source (RFC 8445 §7.3.1.5) and the
+        // bridge follows whatever it publishes, with no selection event from an agent.
         let datapath = UdpLoopbackDatapath::new();
         let plain = datapath.alloc_endpoint().await.expect("alloc plain");
         let secure = datapath.alloc_endpoint().await.expect("alloc secure");
@@ -1339,7 +1339,103 @@ mod tests {
         assert_eq!(
             *destination.borrow_and_update(),
             Some(moved),
-            "a later validated source re-points it"
+            "a later published source re-points it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ice_lite_leg_keys_dtls_toward_the_nominated_pair_not_the_last_check() {
+        // The multi-interface case end to end through the real responder: a peer checks from every
+        // local address and nominates one (USE-CANDIDATE). The handshake must target the nominated
+        // pair (RFC 8445 §7.3.1.5), stay shut before any nomination, and ignore later plain checks
+        // from other addresses.
+        use siphon_rtp_datapath::IceConfig;
+        use std::net::Ipv4Addr;
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        datapath.set_ice(
+            secure.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        let validated = datapath.watch_ice_validated(secure.id).expect("ice leg");
+
+        let bridge = DtlsBridge::new(datapath.clone());
+        bridge.register(DtlsCallPlan {
+            plain_endpoint: plain.id,
+            plain_source: SourceFilter::Any,
+            plain_dst: "192.0.2.1:20000".parse().expect("addr"),
+            secure_endpoint: secure.id,
+            secure_source: SourceFilter::Any,
+            secure_dst: "192.0.2.7:30000".parse().expect("addr"),
+            secure_local: secure.local_addr,
+            certificate: DtlsCertificate::generate().expect("cert"),
+            role: DtlsRole::Server,
+            peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
+            gate_on_ice: true,
+            ice_validated: Some(validated),
+            plain_rtcp: None,
+        });
+        let mut destination = bridge
+            .destinations
+            .get(&secure.id)
+            .map(|entry| entry.subscribe())
+            .expect("the leg is registered");
+
+        let check = |nominate: bool, transaction: u8| {
+            siphon_rtp_stun::client::binding_request_ice(
+                &[transaction; 12],
+                "ENG:remote",
+                b"engpass",
+                100,
+                siphon_rtp_stun::client::IceRole::Controlling(1),
+                nominate,
+            )
+        };
+        let mut sockets = Vec::new();
+        for octet in [2u8, 3, 4] {
+            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::new(127, 0, 0, octet), 0))
+                .await
+                .expect("bind");
+            sockets.push(socket);
+        }
+        let nominated = sockets[1].local_addr().expect("addr");
+        let mut scratch = [0u8; 1500];
+
+        sockets[0]
+            .send_to(&check(false, 1), secure.local_addr)
+            .await
+            .expect("check");
+        sockets[0].recv_from(&mut scratch).await.expect("answered");
+        assert_eq!(
+            *destination.borrow_and_update(),
+            None,
+            "the DTLS gate stays shut until a pair is nominated"
+        );
+
+        sockets[1]
+            .send_to(&check(true, 2), secure.local_addr)
+            .await
+            .expect("nominate");
+        sockets[1].recv_from(&mut scratch).await.expect("answered");
+        tokio::time::timeout(std::time::Duration::from_secs(1), destination.changed())
+            .await
+            .expect("followed")
+            .expect("leg alive");
+        assert_eq!(*destination.borrow_and_update(), Some(nominated));
+
+        sockets[2]
+            .send_to(&check(false, 3), secure.local_addr)
+            .await
+            .expect("check");
+        sockets[2].recv_from(&mut scratch).await.expect("answered");
+        assert_eq!(
+            *destination.borrow(),
+            Some(nominated),
+            "a later plain check from another address does not re-point the handshake"
         );
     }
 

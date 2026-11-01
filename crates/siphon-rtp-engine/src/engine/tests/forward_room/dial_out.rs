@@ -722,7 +722,12 @@ async fn node_info_advertises_dial_out_and_transcoding() {
     let CmdResult::NodeInfo { node } = engine.handle(CLIENT, Command::NodeInfo).await else {
         panic!("node_info answers a node");
     };
-    for feature in ["forward_dialout", "forward_transcode", "forward_preserve"] {
+    for feature in [
+        "forward_dialout",
+        "forward_transcode",
+        "forward_preserve",
+        "forward_offer_webrtc",
+    ] {
         assert!(
             node.features.iter().any(|name| name == feature),
             "{feature}"

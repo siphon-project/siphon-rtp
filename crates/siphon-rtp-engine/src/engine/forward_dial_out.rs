@@ -21,6 +21,9 @@
 //! this build cannot transcode (AMR without the `amr` feature) is listed too. With
 //! `profile.floor_fmtp` set the offer carries an anchored `m=application <port> udp MCPTT` section
 //! (3GPP TS 24.380 §14) with `a=fmtp:MCPTT` verbatim.
+//!
+//! A profile with `transport_protocol: "UDP/TLS/RTP/SAVPF"` offers a browser a WebRTC seat instead
+//! ([`super::forward_webrtc`]).
 
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction, SourceFilter};
@@ -30,10 +33,9 @@ use crate::forward::{FloorConfig, ForwardSeatConfig, RoomCodec};
 use crate::sdp::{self, TelephoneEvent};
 
 use super::answer_local::order_codec_candidates;
-use super::dial_out::{
-    answered_codec, candidate_codecs, offerable_codecs, offered_events, refuse_unsupported_profile,
-};
+use super::dial_out::{answered_codec, candidate_codecs, offerable_codecs, offered_events};
 use super::forward::ForwardAdmission;
+use super::forward_webrtc::{self, AnsweredWebrtc, OfferedWebrtc};
 use super::negotiate::{parse_codec_flags, peer_media_address, random_ssrc};
 use super::offer::far_address_family;
 use super::{error_result, ok_empty, ok_sdp, ClientId, Engine};
@@ -57,6 +59,9 @@ pub(super) struct PendingForwardSeat {
     /// The offer's audio transport is `RTP/SAVP` (a preserve room signalling end-to-end SRTP), so
     /// the answer must keep it (RFC 3264 §6).
     offered_secure: bool,
+    /// The offer was a WebRTC one ([`super::forward_webrtc`]): DTLS-SRTP, ICE and, with floor, a data
+    /// channel. What it fixed is kept for the answer.
+    webrtc: Option<OfferedWebrtc>,
 }
 
 /// What an answer negotiated for its seat.
@@ -67,6 +72,8 @@ struct Negotiated {
     accepted_source: SourceFilter,
     /// The floor stream, when the answer accepted it.
     floor: Option<FloorConfig>,
+    /// What a WebRTC offer's answer settled: the DTLS role, the peer's fingerprint and the channel.
+    webrtc: Option<AnsweredWebrtc>,
 }
 
 type PendingKey = (String, String);
@@ -134,11 +141,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Err(reason) = super::validate_sip_call_id(&profile) {
             return error_result("forward_offer", &reason);
         }
-        // The same posture as `conference_offer`: plain RTP/AVP, no ICE. SDES, DTLS-SRTP and
-        // candidate gathering are built around answering a peer's offer.
-        if let Err(reason) = refuse_unsupported_profile(&profile) {
-            return error_result("forward_offer", &reason);
-        }
+        // The same posture as `conference_offer` (plain RTP/AVP, no ICE) unless the profile asks
+        // for a WebRTC offer, which only a translate room can carry.
+        let want_webrtc = match forward_webrtc::requested(&profile, media) {
+            Ok(webrtc) => webrtc,
+            Err(reason) => return error_result("forward_offer", &reason),
+        };
         if let Some(fmtp) = &profile.floor_fmtp {
             if let Err(error) = sdp::validate_floor_fmtp(fmtp) {
                 return error_result("forward_offer", &error);
@@ -191,7 +199,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(mut endpoints) => endpoints.remove(0),
             Err(reason) => return error_result("forward_offer", &reason),
         };
-        let floor = if profile.floor_fmtp.is_some() {
+        // A WebRTC seat carries its floor control on a data channel of the one transport, not on a
+        // UDP stream of its own.
+        let floor = if profile.floor_fmtp.is_some() && !want_webrtc {
             match self.alloc_endpoints(1, family, bind).await {
                 Ok(mut endpoints) => Some(endpoints.remove(0)),
                 Err(reason) => {
@@ -203,13 +213,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None
         };
         let advertised = advertised_override.unwrap_or_else(|| endpoint.local_addr.ip());
-        let mut offer = sdp::conference_seat_offer(
-            endpoint.local_addr,
-            advertised,
-            random_ssrc(),
-            &offered,
-            &events,
-        );
+        let (mut offer, webrtc) = if want_webrtc {
+            match self
+                .write_webrtc_offer(
+                    endpoint,
+                    advertised,
+                    &offered,
+                    &events,
+                    profile.floor_fmtp.is_some(),
+                )
+                .await
+            {
+                Ok((offer, webrtc)) => (offer, Some(webrtc)),
+                Err(reason) => {
+                    self.free(&[endpoint]).await;
+                    return error_result("forward_offer", &reason);
+                }
+            }
+        } else {
+            let offer = sdp::conference_seat_offer(
+                endpoint.local_addr,
+                advertised,
+                random_ssrc(),
+                &offered,
+                &events,
+            );
+            (offer, None)
+        };
         // A preserve room signalling end-to-end SRTP (`key_mgmt`, RFC 4567) offers `RTP/SAVP` with no
         // `a=crypto`: the engine holds no key, the UEs agree theirs (3GPP TS 33.180 §7.5.2).
         let offered_secure = media == ForwardMedia::Preserve && profile.key_mgmt.is_some();
@@ -233,6 +263,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             offered_tick: self.datapath.now_ticks(),
             media,
             offered_secure,
+            webrtc,
         };
         // Inserted only if no concurrent offer took the key while the endpoints were allocated.
         let inserted = match self
@@ -310,6 +341,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result("forward_answer: install redirect", &error);
             }
         }
+        // A WebRTC seat is taken `secure_pending` (and `ice_pending` under a full agent) like a
+        // joined browser seat: nothing is forwarded to or from it until the handshake keys it and
+        // ICE selects its pair. The ICE agent reads the member's credentials and candidates from the
+        // answer, so it is armed now and not when the offer was written (RFC 8445 §6.1.1).
+        let mut ice_pending = false;
+        if let (Some(offered), Some(answered)) = (&pending.webrtc, &negotiated.webrtc) {
+            let ice_config = offered.ice_config();
+            ice_pending = self.arm_seat_ice(
+                room_id,
+                endpoint,
+                &answered.info,
+                answered.info.is_ice().then_some(&ice_config),
+                &offered.candidates,
+            );
+        }
         let config = ForwardSeatConfig {
             tag: from_tag.to_string(),
             endpoint: endpoint.id,
@@ -319,8 +365,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             audio_payload_type: negotiated.admission.spec.payload_type,
             telephone_event: negotiated.telephone_event,
             secure: None,
-            secure_pending: false,
-            ice_pending: false,
+            secure_pending: negotiated.webrtc.is_some(),
+            ice_pending,
             egress_ssrc: random_ssrc(),
             // RFC 3550 §5.1: the initial sequence number and timestamp are random.
             initial_sequence: random_ssrc() as u16,
@@ -329,7 +375,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             app_events: self.app_event_queue(client),
         };
         // From here a refusal frees the endpoints itself.
-        match self
+        if let Err(refusal) = self
             .seat_forward_member(
                 client,
                 room_id,
@@ -340,9 +386,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             )
             .await
         {
-            Ok(()) => ok_empty(),
-            Err(refusal) => error_result("forward_answer", &refusal),
+            return error_result("forward_answer", &refusal);
         }
+        if let (Some(offered), Some(answered)) = (pending.webrtc, negotiated.webrtc) {
+            if let Err(reason) = self
+                .start_webrtc_seat(
+                    client,
+                    room_id,
+                    from_tag,
+                    endpoint,
+                    negotiated.remote_rtp,
+                    negotiated.accepted_source,
+                    ice_pending,
+                    offered,
+                    answered,
+                )
+                .await
+            {
+                return error_result("forward_answer", &reason);
+            }
+        }
+        ok_empty()
     }
 
     /// Read the member's answer into the seat it negotiates, refusing an answer the offer does not
@@ -361,8 +425,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         // RFC 3264 §6: the answer keeps the offer's transport: plain RTP/AVP, or for a preserve room
         // signalling end-to-end SRTP, RTP/SAVP with no key of the engine's to answer (a=crypto or
-        // DTLS-SRTP would make the engine terminate media the room forwards unchanged).
-        if pending.offered_secure {
+        // DTLS-SRTP would make the engine terminate media the room forwards unchanged), or for a
+        // WebRTC offer, UDP/TLS/RTP/SAVPF with the member's fingerprint and DTLS role.
+        let webrtc = match &pending.webrtc {
+            Some(offered) => Some(offered.read_answer(info.clone(), answer)?),
+            None => None,
+        };
+        if webrtc.is_some() {
+            // ICE decides the address family of a WebRTC seat's transport, not the answer's `c=`
+            // (a browser answers `0.0.0.0` and lets the candidates speak, RFC 8839 §4.2.1.2).
+        } else if pending.offered_secure {
             if !info.secure || info.dtls || !info.crypto.is_empty() {
                 return Err(
                     "the answer must be RTP/SAVP without a=crypto or DTLS-SRTP, as the offer was: \
@@ -374,7 +446,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return Err("the answer is secure, but the offer was RTP/AVP".to_string());
         }
         let family = AddressFamily::of(pending.endpoint.local_addr.ip());
-        if AddressFamily::of(info.remote_rtp.ip()) != family {
+        if webrtc.is_none() && AddressFamily::of(info.remote_rtp.ip()) != family {
             return Err(format!(
                 "the answer's address {} is not in the offered seat's address family",
                 info.remote_rtp.ip()
@@ -408,7 +480,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 SourceFilter::Exact(address.ip())
             }
         };
-        let remote_rtp = peer_media_address(info.remote_rtp, received_from);
+        // An ICE seat keeps the signalled address and runs the gate open: the connectivity checks,
+        // not the SDP, say where media comes from (RFC 8445 §7.3.1.3; docs/security-and-nat.md §4).
+        let ice = webrtc.is_some() && info.is_ice();
+        let remote_rtp = if ice {
+            info.remote_rtp
+        } else {
+            peer_media_address(info.remote_rtp, received_from)
+        };
         // The seat's floor SRTCP keys are the offering profile's own (TS 33.180 §9.4).
         let floor_keys = crate::floor_srtcp::master_keys(&pending.profile.floor_keys)
             .map_err(|reason| format!("floor_keys: {reason}"))?;
@@ -431,8 +510,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             admission,
             telephone_event,
             remote_rtp,
-            accepted_source: gate(remote_rtp),
+            accepted_source: if ice {
+                SourceFilter::Any
+            } else {
+                gate(remote_rtp)
+            },
             floor,
+            webrtc,
         })
     }
 
