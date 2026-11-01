@@ -168,6 +168,13 @@ pub struct FileConfig {
     pub stun_server: Option<Vec<SocketAddr>>,
     /// Run a full RFC 8445 ICE agent on ICE legs (`--ice-full`).
     pub ice_full: Option<bool>,
+    /// TURN servers to allocate relayed ICE candidates from, as `turn:host[:port]` URIs in failover
+    /// order (`--turn-client`). Requires `ice_full`.
+    pub turn_client: Option<Vec<String>>,
+    /// File holding the TURN server's `static-auth-secret` (`--turn-client-secret-file`).
+    pub turn_client_secret_file: Option<PathBuf>,
+    /// Seconds a minted TURN username stays valid (`--turn-client-ttl`).
+    pub turn_client_ttl: Option<u64>,
     /// Actively run RFC 7675 consent freshness on ICE legs (`--ice-consent`).
     pub ice_consent: Option<bool>,
     /// Seconds between ICE consent checks (`--consent-interval-secs`).
@@ -387,6 +394,30 @@ mod tests {
         assert_eq!(config.max_sessions, Some(4000));
         assert_eq!(config.xdp_interface.as_deref(), Some("eth0"));
         assert_eq!(config.xdp_queue, Some(2));
+    }
+
+    /// The TURN client keys parse, including the repeatable server list.
+    #[test]
+    fn deserializes_the_turn_client_keys() {
+        let toml = concat!(
+            "ice_full = true\n",
+            "turn_client = [\"turn:relay-a.example.com:3478\", \"turn:192.0.2.7\"]\n",
+            "turn_client_secret_file = \"/run/secrets/siphon-rtp-turn-secret\"\n",
+            "turn_client_ttl = 7200\n",
+        );
+        let config = FileConfig::parse_str(toml).expect("valid TOML deserializes");
+        assert_eq!(
+            config.turn_client,
+            Some(vec![
+                "turn:relay-a.example.com:3478".to_string(),
+                "turn:192.0.2.7".to_string()
+            ])
+        );
+        assert_eq!(
+            config.turn_client_secret_file,
+            Some(PathBuf::from("/run/secrets/siphon-rtp-turn-secret"))
+        );
+        assert_eq!(config.turn_client_ttl, Some(7_200));
     }
 
     /// Every `play_media` URL-fetch bound deserializes, including the host allow-list array.

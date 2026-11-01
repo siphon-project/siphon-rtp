@@ -94,9 +94,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// dispatcher routes a call only to a node that can serve it (codecs, features, capacity).
     pub(super) fn node_info(&self) -> CmdResult {
         CmdResult::NodeInfo {
-            node: self
-                .cluster
-                .info(engine_version(), supported_codecs(), supported_features()),
+            node: self.cluster.info(
+                engine_version(),
+                supported_codecs(),
+                self.supported_features(),
+            ),
         }
     }
 }
@@ -125,8 +127,23 @@ pub(super) fn supported_codecs() -> Vec<String> {
     codecs
 }
 
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// The capability flags this node advertises in `node_info`: what the build ships, plus what
+    /// the operator configured on this node.
+    fn supported_features(&self) -> Vec<String> {
+        let mut features = build_features();
+        // `turn_client`: relayed candidates are allocated from a TURN server this node was
+        // configured with and offered on ICE legs, so a controller can tell a node that can serve
+        // a peer behind a UDP-blocking NAT from one that only offers host candidates.
+        if self.turn_client.is_some() {
+            features.push("turn_client".to_string());
+        }
+        features
+    }
+}
+
 /// The capability flags this build ships, advertised in `node_info`.
-fn supported_features() -> Vec<String> {
+fn build_features() -> Vec<String> {
     vec![
         "relay".to_string(),
         "transcode".to_string(),

@@ -232,7 +232,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
         if !attached {
-            self.datapath.remove_endpoint(subscriber_endpoint.id).await;
+            self.release_endpoint(subscriber_endpoint.id).await;
             return error_result("subscribe_answer", &"media call is no longer active");
         }
 
@@ -297,8 +297,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 },
             );
         }
-        self.datapath
-            .remove_endpoint(subscription.subscriber_endpoint.id)
+        self.release_endpoint(subscription.subscriber_endpoint.id)
             .await;
     }
 

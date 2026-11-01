@@ -67,6 +67,7 @@ mod stream_identity;
 mod tee_sendonly;
 mod tee_undecodable;
 mod transcode_offer;
+mod turn_client;
 mod webrtc_floor_channel;
 
 #[test]

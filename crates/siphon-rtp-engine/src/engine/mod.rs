@@ -56,6 +56,7 @@ mod takeover;
 mod teardown;
 mod tee;
 mod telemetry;
+mod turn_relay;
 mod ws_dial;
 
 pub use ws_dial::DEFAULT_WS_CONNECT_TIMEOUT;
@@ -99,6 +100,7 @@ use snapshot::{
 use takeover::WsBridge;
 use tee::WsTee;
 use telemetry::HepExport;
+pub use turn_relay::{TurnClientConfig, TurnCredentialSource};
 
 /// Where relayed ICE candidates are allocated from (RFC 5766), and the long-term credentials to do
 /// it with. A coturn REST deployment supplies a timestamped username and its derived password here.
@@ -1241,10 +1243,11 @@ pub struct Engine<D: Datapath> {
     /// Empty (the default) ⇒ host-only gathering, which is correct for a directly-addressable engine
     /// and costs no network round trip at call setup.
     stun_servers: Vec<SocketAddr>,
-    /// The TURN server relayed candidates are allocated against (RFC 5766), with its long-term
-    /// credentials. `None` disables relayed gathering entirely, which is the right default for a
-    /// directly-addressable engine — a relay adds a hop and no reachability there.
-    turn_server: Option<TurnServerConfig>,
+    /// The TURN servers relayed candidates are allocated against (RFC 8656), in failover order, with
+    /// the source of their long-term credentials. `None` disables relayed gathering entirely, which
+    /// is the right default for a directly-addressable engine — a relay adds a hop and no
+    /// reachability there.
+    turn_client: Option<TurnClientConfig>,
     /// Live TURN allocations, one per gathering endpoint that got one. Driven on the ICE tick:
     /// refreshed before they lapse, and given a permission + channel for every remote candidate the
     /// checklist may probe.
@@ -1379,7 +1382,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     async fn free(&self, endpoints: &[Endpoint]) {
         for endpoint in endpoints {
-            self.datapath.remove_endpoint(endpoint.id).await;
+            self.release_endpoint(endpoint.id).await;
         }
     }
 

@@ -45,8 +45,8 @@ Rust, at different levels of maturity. This page says exactly which level.
 
 - Relayed (TURN) candidates: the engine can act as a TURN *client* as well as a
   server, allocating a relayed candidate and ChannelData-framing media through it.
-  Wired at the engine API level (`Engine::with_turn_server`); it is not yet exposed
-  as a daemon CLI flag.
+  Configured with `--turn-client`; see [Relayed candidates through a TURN
+  server](#relayed-candidates-through-a-turn-server).
 
 **Planned, not shipped:** HA checkpoint/restore of a DTLS leg (the handshake-derived
 keys cannot be recovered from a snapshot).
@@ -280,6 +280,49 @@ trickle-receive as the *answerer* (a `reoffer` with fresh credentials restarts I
 `ice_candidate` feeds trickled remote candidates), but it does not yet drive the agent
 from the *offerer* side. If you need the engine to be an ICE client for outbound WebRTC
 trunking, that is a follow-up.
+
+## Relayed candidates through a TURN server
+
+For an engine that WebRTC peers cannot reach directly (behind a NAT or a firewall that
+only passes traffic to a relay), allocate a relayed candidate from an external TURN
+server such as coturn:
+
+```
+siphon-rtp --ice-full \
+  --turn-client turn:turn.example.com:3478 \
+  --turn-client-secret-file /run/secrets/siphon-rtp-turn-secret
+```
+
+`--turn-client` is repeatable. Servers are tried in the order given and the first that
+allocates wins for each endpoint (a dead one costs one bounded delay, never a failed
+call). Hostnames are resolved once at startup. It is UDP only for now: `turns:` and
+`?transport=tcp` are refused at startup. It also requires `--ice-full`, and the daemon
+refuses to start without it: a relayed candidate is only usable once every remote
+candidate has a permission on the allocation, which only the full agent's checklist
+knows, and an ICE-lite agent advertises host candidates only (RFC 8445 §2.5).
+
+Credentials follow the coturn `use-auth-secret` (TURN REST) scheme. The file holds the
+server's `static-auth-secret`; every allocation mints the username
+`<unix expiry>:<node id>` and the password `base64(HMAC-SHA1(secret, username))`.
+Matching coturn configuration:
+
+```
+use-auth-secret
+static-auth-secret=<the same secret as in the file>
+realm=turn.example.com
+```
+
+`--turn-client-ttl` (seconds, default 86400) is how far past the allocation the username
+stays valid. A TURN allocation cannot change its username (RFC 8656 §7.2, `441 Wrong
+Credentials`), and the allocation is refreshed with that same username for as long as
+the call lives, so the TTL has to outlive your longest call. Each new allocation mints a
+fresh username, so it only needs to cover one call, not the process.
+
+What the client does per leg: allocates while gathering and advertises the relayed
+candidate with its related address (RFC 8839 §5.1), refreshes the allocation before it
+lapses, creates a permission and binds a channel for every remote candidate, and deletes
+the allocation (Refresh with lifetime 0) when the call or seat is released. `node_info`
+lists the `turn_client` feature on a node configured this way.
 
 ## Consent freshness (RFC 7675)
 

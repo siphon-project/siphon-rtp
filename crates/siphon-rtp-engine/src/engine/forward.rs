@@ -475,7 +475,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         for endpoint in endpoints {
             self.endpoint_calls.remove(&endpoint);
             self.awaiting_media.remove(&endpoint);
-            self.datapath.remove_endpoint(endpoint).await;
+            self.release_endpoint(endpoint).await;
         }
         true
     }

@@ -223,7 +223,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             self.retire_dtls_endpoints(&[seat_endpoint]);
                             self.endpoint_calls.remove(&seat_endpoint);
                             self.awaiting_media.remove(&seat_endpoint);
-                            self.datapath.remove_endpoint(seat_endpoint).await;
+                            self.release_endpoint(seat_endpoint).await;
                         }
                         tracing::warn!(
                             target: "siphon_rtp::media",
@@ -296,6 +296,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 let Some(mut allocation) = self.ice_relays.get_mut(&endpoint) else {
                     continue;
                 };
+                allocation.last_driven_ms = now_ms;
                 for peer in peers {
                     allocation.client.add_peer(peer);
                 }
@@ -548,7 +549,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.stop_seat_ice_follow(&freed);
         self.retire_dtls_endpoints(&freed);
         for endpoint in &freed {
-            self.datapath.remove_endpoint(*endpoint).await;
+            self.release_endpoint(*endpoint).await;
             self.endpoint_calls.remove(endpoint);
             self.awaiting_media.remove(endpoint);
         }
@@ -586,7 +587,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.stop_seat_ice_follow(&freed);
         self.retire_dtls_endpoints(&freed);
         for endpoint in &freed {
-            self.datapath.remove_endpoint(*endpoint).await;
+            self.release_endpoint(*endpoint).await;
             self.endpoint_calls.remove(endpoint);
             self.awaiting_media.remove(endpoint);
         }

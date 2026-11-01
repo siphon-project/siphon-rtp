@@ -78,7 +78,7 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **SRTP (SDES)** | RFC 3711 / 4568 | Implemented — AES-CM + HMAC-SHA1, RFC 3711 anti-replay |
 | **DTLS-SRTP** | RFC 5764 | Implemented — pure-RustCrypto handshake keying (webrtc-dtls) |
 | **ICE / STUN** | RFC 8445 / 5389 / 8839 / 8838 | Implemented — ICE-lite default plus a full RFC 8445 agent (`--ice-full`: gathering, checklists, connectivity checks, nomination), ICE restart via the `reoffer` verb, and trickle-ICE receive |
-| **TURN server + client** | RFC 5766 / 8656 | Implemented — `turn:` / `turns:` (UDP/TCP/TLS), coturn REST credentials; plus a TURN client for relayed ICE candidates (RFC 5766 ChannelData), wired at the engine API (`Engine::with_turn_server`), not yet a daemon flag |
+| **TURN server + client** | RFC 5766 / 8656 | Implemented — `turn:` / `turns:` (UDP/TCP/TLS), coturn REST credentials; plus a TURN client for relayed ICE candidates (RFC 5766 ChannelData), configured with `--turn-client` (UDP, coturn REST credentials, needs `--ice-full`) |
 | **NAT traversal (symmetric RTP, advertised IP, named interfaces)** | RFC 3550 §8 | Implemented — RTPbleed-gated symmetric latch, `--advertise-ip` for a 1:1-NAT / Elastic-IP host, and rtpengine-style `[[interface]]` + `direction` per-leg selection ([docs](docs/security-and-nat.md)) |
 | **QoS marking (DSCP) on media** | RFC 2474 / RFC 3246 / RFC 4594 | Implemented — **EF by default** on every egress path (UDP sockets, AF_XDP TX, in-kernel `XDP_TX`); `--media-dscp` takes a name or a raw code point ([docs](docs/datapath.md#qos-marking-dscp)) |
 | **Jitter buffer + PLC + resampler** | RFC 3550 | Implemented (resampler AVX2, PLC drives decoder concealment) |
@@ -311,7 +311,7 @@ latching), the IMS-priority codecs (G.711, G.722, G.726, GSM-FR, comfort noise, 
 AMR-NB/AMR-WB behind the `amr` feature), G.729 behind the `g729` feature, Opus (SILK / CELT / Hybrid,
 decode and encode), SRTP-SDES
 and DTLS-SRTP (including DTLS-SRTP transcoding), ICE-lite plus the full RFC 8445 ICE agent
-(`--ice-full`), a built-in TURN server and a TURN client at the engine API (`Engine::with_turn_server`),
+(`--ice-full`), a built-in TURN server and a TURN client (`--turn-client`),
 RFC 4103 / 9071 real-time text, RTCP with G.107 MOS plus HEP/Homer export, the jitter buffer / PLC /
 resampler, energy and neural VAD, single-channel noise suppression and echo cancellation (on the transcode and
 WebSocket-bridge paths), SIPREC forking, the N-party conferencing MCU, the RTP↔WebSocket bridge,

@@ -293,6 +293,28 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = false)]
     pub ice_full: bool,
 
+    /// TURN server to allocate relayed ICE candidates from, `turn:host[:port][?transport=udp]`
+    /// (RFC 7064). Repeat the flag for several: they are tried in the order given and the first
+    /// that allocates wins for each endpoint. Hostnames are resolved once at startup.
+    ///
+    /// UDP only for now: `turns:` and `?transport=tcp` are refused. Requires `--ice-full` (an
+    /// ICE-lite agent advertises host candidates only, RFC 8445 §2.5) and
+    /// `--turn-client-secret-file`.
+    #[arg(long, value_name = "URI")]
+    pub turn_client: Vec<String>,
+
+    /// File holding the TURN server's `static-auth-secret` (coturn `use-auth-secret`). Each
+    /// allocation mints `<unix expiry>:<node id>` with password `base64(HMAC-SHA1(secret,
+    /// username))`. Read once at startup; never passed in argv.
+    #[arg(long, value_name = "PATH")]
+    pub turn_client_secret_file: Option<PathBuf>,
+
+    /// Seconds a minted TURN username stays valid past the allocation. The username cannot change
+    /// during an allocation (RFC 8656 §7.2), so this must outlive the longest call; every new
+    /// allocation mints a fresh one.
+    #[arg(long, default_value_t = crate::turn_client_settings::DEFAULT_TURN_CLIENT_TTL_SECS)]
+    pub turn_client_ttl: u64,
+
     /// Actively probe ICE legs for consent freshness (RFC 7675) instead of only answering their
     /// checks, tearing a call down when its peer stops responding on the validated path.
     ///
@@ -386,6 +408,13 @@ pub struct RunConfig {
     pub stun_servers: Vec<SocketAddr>,
     /// Run a full RFC 8445 ICE agent on ICE legs (off ⇒ the ICE-lite responder posture).
     pub ice_full: bool,
+    /// `turn:` URIs of the TURN servers to allocate relayed candidates from, in failover order;
+    /// empty ⇒ no relayed gathering. Validated and resolved at startup.
+    pub turn_client: Vec<String>,
+    /// File holding the TURN server's `static-auth-secret`.
+    pub turn_client_secret_file: Option<PathBuf>,
+    /// Seconds a minted TURN username stays valid.
+    pub turn_client_ttl: u64,
     /// Actively run RFC 7675 consent freshness on ICE legs (off ⇒ the ICE-lite responder posture).
     pub ice_consent: bool,
     /// Seconds between consent checks on a validated pair.
@@ -522,6 +551,21 @@ impl RunConfig {
                 args.stun_server
             },
             ice_full: resolve_defaulted(args.ice_full, explicit("ice_full"), file.ice_full, false),
+            turn_client: if args.turn_client.is_empty() {
+                file.turn_client.unwrap_or_default()
+            } else {
+                args.turn_client
+            },
+            turn_client_secret_file: resolve_optional(
+                args.turn_client_secret_file,
+                file.turn_client_secret_file,
+            ),
+            turn_client_ttl: resolve_defaulted(
+                args.turn_client_ttl,
+                explicit("turn_client_ttl"),
+                file.turn_client_ttl,
+                crate::turn_client_settings::DEFAULT_TURN_CLIENT_TTL_SECS,
+            ),
             ice_consent: resolve_defaulted(
                 args.ice_consent,
                 explicit("ice_consent"),
@@ -952,6 +996,23 @@ where
             "full RFC 8445 ICE enabled — ICE legs run checklists and connectivity checks; media waits for a selected pair"
         );
         engine = engine.with_full_ice();
+    }
+    if let Some(turn_client) = crate::turn_client_settings::resolve_turn_client(
+        &config.turn_client,
+        config.turn_client_secret_file.as_deref(),
+        config.turn_client_ttl,
+        config.ice_full,
+        &node_id,
+    )
+    .await?
+    {
+        tracing::info!(
+            target: "siphon_rtp::control",
+            servers = ?turn_client.servers,
+            ttl_secs = config.turn_client_ttl,
+            "ICE gathering will allocate relayed candidates from these TURN servers (UDP), in order"
+        );
+        engine = engine.with_turn_client(turn_client);
     }
     if config.ice_consent {
         tracing::info!(
@@ -1537,6 +1598,55 @@ mod tests {
         assert_eq!(flag.ws_connect_timeout, Duration::from_millis(800));
     }
 
+    #[test]
+    fn turn_client_defaults_to_off_with_a_day_of_credential_lifetime() {
+        let config = resolve_from(&["siphon-rtp"], FileConfig::default());
+        assert!(config.turn_client.is_empty());
+        assert_eq!(config.turn_client_secret_file, None);
+        assert_eq!(config.turn_client_ttl, 86_400);
+    }
+
+    #[test]
+    fn turn_client_options_come_from_the_file_and_the_command_line_wins() {
+        let file = || FileConfig {
+            turn_client: Some(vec!["turn:192.0.2.1:3478".to_string()]),
+            turn_client_secret_file: Some(PathBuf::from("/run/secrets/from-file")),
+            turn_client_ttl: Some(600),
+            ..FileConfig::default()
+        };
+        let from_file = resolve_from(&["siphon-rtp"], file());
+        assert_eq!(from_file.turn_client, vec!["turn:192.0.2.1:3478"]);
+        assert_eq!(
+            from_file.turn_client_secret_file,
+            Some(PathBuf::from("/run/secrets/from-file"))
+        );
+        assert_eq!(from_file.turn_client_ttl, 600);
+
+        let from_flags = resolve_from(
+            &[
+                "siphon-rtp",
+                "--turn-client",
+                "turn:192.0.2.2:3478",
+                "--turn-client",
+                "turn:192.0.2.3:3478",
+                "--turn-client-secret-file",
+                "/run/secrets/from-flag",
+                "--turn-client-ttl",
+                "900",
+            ],
+            file(),
+        );
+        assert_eq!(
+            from_flags.turn_client,
+            vec!["turn:192.0.2.2:3478", "turn:192.0.2.3:3478"]
+        );
+        assert_eq!(
+            from_flags.turn_client_secret_file,
+            Some(PathBuf::from("/run/secrets/from-flag"))
+        );
+        assert_eq!(from_flags.turn_client_ttl, 900);
+    }
+
     /// Resolve a `RunConfig` from a command line + a config file, the way the binaries do.
     fn resolve_from(argv: &[&str], file: FileConfig) -> RunConfig {
         let matches = <TestCommandLine as clap::CommandFactory>::command()
@@ -1743,6 +1853,9 @@ mod tests {
             shutdown_grace_secs: 25,
             stun_servers: Vec::new(),
             ice_full: false,
+            turn_client: Vec::new(),
+            turn_client_secret_file: None,
+            turn_client_ttl: crate::turn_client_settings::DEFAULT_TURN_CLIENT_TTL_SECS,
             ice_consent: false,
             consent_interval_secs: 5,
             consent_timeout_secs: 30,

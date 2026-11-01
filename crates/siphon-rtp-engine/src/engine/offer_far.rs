@@ -369,7 +369,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let endpoints: Vec<_> = far.all_endpoint_ids().collect();
         self.bridge.deregister(endpoints.iter().copied());
         for endpoint in endpoints {
-            self.datapath.remove_endpoint(endpoint).await;
+            self.release_endpoint(endpoint).await;
             self.endpoint_calls.remove(&endpoint);
             self.awaiting_media.remove(&endpoint);
         }

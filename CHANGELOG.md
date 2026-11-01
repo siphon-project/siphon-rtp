@@ -5,6 +5,32 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Added
+
+- **The TURN client is a daemon option: `--turn-client`, `--turn-client-secret-file`, `--turn-client-ttl`
+  (and the matching config keys).** Until now it was reachable only through `Engine::with_turn_server`
+  with one server and static credentials. `--turn-client turn:host[:port]` is repeatable, servers are
+  tried in order and the first that allocates wins per endpoint, hostnames resolve at startup. UDP only:
+  `turns:` and `?transport=tcp` are refused (the client shares the media 5-tuple). Credentials are the
+  coturn `use-auth-secret` scheme, minted per allocation as `<unix expiry>:<node id>` with password
+  `base64(HMAC-SHA1(secret, username))`; the username cannot change during an allocation (RFC 8656 §7.2),
+  so the TTL has to outlive a call, and every new allocation gets a fresh one. It requires `--ice-full`
+  and the daemon refuses to start without it: a lite agent advertises host candidates only (RFC 8445 §2.5)
+  and only the full agent's checklist knows which remote candidates need a permission. `node_info` lists
+  `turn_client` on a node configured this way.
+
+### Fixed
+
+- **A relayed ICE candidate now works end to end.** The agent was registered after gathering with no
+  knowledge of the allocation, so the server's responses were fed to the checklist and the allocation was
+  never refreshed and never got a permission. The allocation's server is now remembered per endpoint and
+  attached to whichever agent registers (including after a re-offer). The relayed candidate also carries
+  `raddr`/`rport` (RFC 8839 §5.1), and every endpoint release (call delete or reap, forward and conference
+  seat release) now deletes the allocation (Refresh with lifetime 0) instead of leaving it to lapse on the
+  server.
+
 ## [0.17.0] — 2026-10-31
 
 ### Security
