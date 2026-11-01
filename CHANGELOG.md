@@ -12,7 +12,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 - **The TURN client is a daemon option: `--turn-client`, `--turn-client-secret-file`, `--turn-client-ttl`
   (and the matching config keys).** Until now it was reachable only through `Engine::with_turn_server`
   with one server and static credentials. `--turn-client turn:host[:port]` is repeatable, servers are
-  tried in order and the first that allocates wins per endpoint, hostnames resolve at startup. UDP only:
+  raced inside one gathering window (a dead one costs the offer nothing), the first to allocate wins per
+  endpoint and the others are deleted, hostnames resolve at startup. UDP only:
   `turns:` and `?transport=tcp` are refused (the client shares the media 5-tuple). Credentials are the
   coturn `use-auth-secret` scheme, minted per allocation as `<unix expiry>:<node id>` with password
   `base64(HMAC-SHA1(secret, username))`; the username cannot change during an allocation (RFC 8656 §7.2),

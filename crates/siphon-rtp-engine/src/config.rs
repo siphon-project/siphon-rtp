@@ -168,8 +168,8 @@ pub struct FileConfig {
     pub stun_server: Option<Vec<SocketAddr>>,
     /// Run a full RFC 8445 ICE agent on ICE legs (`--ice-full`).
     pub ice_full: Option<bool>,
-    /// TURN servers to allocate relayed ICE candidates from, as `turn:host[:port]` URIs in failover
-    /// order (`--turn-client`). Requires `ice_full`.
+    /// TURN servers to allocate relayed ICE candidates from, as `turn:host[:port]` URIs, raced
+    /// (`--turn-client`). Requires `ice_full`.
     pub turn_client: Option<Vec<String>>,
     /// File holding the TURN server's `static-auth-secret` (`--turn-client-secret-file`).
     pub turn_client_secret_file: Option<PathBuf>,

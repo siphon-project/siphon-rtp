@@ -341,6 +341,84 @@ async fn the_first_server_that_allocates_wins_and_a_dead_one_is_skipped() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_first_server_does_not_delay_a_live_second_one() {
+    // The servers are raced inside one gathering window, not tried one after another: a first
+    // server that swallows every datagram must not cost its own deadline before the second is asked.
+    let server = real_turn_server().await;
+    let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind silent server");
+    let silent_addr = silent.local_addr().expect("silent address");
+    let engine = Engine::new(UdpLoopbackDatapath::new())
+        .with_full_ice()
+        .with_turn_client(TurnClientConfig {
+            servers: vec![silent_addr, server.address],
+            ..rest_client(server.address)
+        });
+    let (_remote, remote_addr) = phone().await;
+    let started = std::time::Instant::now();
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "race".into(),
+                from_tag: "a".into(),
+                sdp: ice_offer_with_candidate(remote_addr),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    let elapsed = started.elapsed();
+    assert!(ok_sdp_text(&offer).contains("typ relay"));
+    assert!(
+        elapsed < Duration::from_millis(1_000),
+        "a dead first server delayed the offer by {elapsed:?}; the servers are not raced"
+    );
+    drop(silent);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_two_live_servers_deletes_the_losing_allocation() {
+    let first = real_turn_server().await;
+    let second = real_turn_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new())
+        .with_full_ice()
+        .with_turn_client(TurnClientConfig {
+            servers: vec![first.address, second.address],
+            ..rest_client(first.address)
+        });
+    let (_remote, remote_addr) = phone().await;
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "race-two".into(),
+                from_tag: "a".into(),
+                sdp: ice_offer_with_candidate(remote_addr),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(ok_sdp_text(&offer).contains("typ relay"));
+    // The loser's allocation is deleted (lifetime 0) as soon as the winner is known, so the
+    // servers hold exactly the allocations the engine kept: one per gathered endpoint.
+    let kept = engine.ice_relays.len();
+    assert!(kept >= 1);
+    let mut total = usize::MAX;
+    for _ in 0..100 {
+        total = first.turn.allocation_count().await + second.turn.allocation_count().await;
+        if total == kept {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        total, kept,
+        "the others are deleted; only the winners remain"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_info_lists_turn_client_only_when_it_is_configured() {
     let features = |result: CmdResult| match result {
         CmdResult::NodeInfo { node } => node.features,

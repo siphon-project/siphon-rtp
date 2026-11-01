@@ -1243,7 +1243,7 @@ pub struct Engine<D: Datapath> {
     /// Empty (the default) ⇒ host-only gathering, which is correct for a directly-addressable engine
     /// and costs no network round trip at call setup.
     stun_servers: Vec<SocketAddr>,
-    /// The TURN servers relayed candidates are allocated against (RFC 8656), in failover order, with
+    /// The TURN servers relayed candidates are allocated against (RFC 8656), raced (the first to allocate wins), with
     /// the source of their long-term credentials. `None` disables relayed gathering entirely, which
     /// is the right default for a directly-addressable engine — a relay adds a hop and no
     /// reachability there.

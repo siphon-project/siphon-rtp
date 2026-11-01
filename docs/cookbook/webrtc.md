@@ -293,9 +293,9 @@ siphon-rtp --ice-full \
   --turn-client-secret-file /run/secrets/siphon-rtp-turn-secret
 ```
 
-`--turn-client` is repeatable. Servers are tried in the order given and the first that
-allocates wins for each endpoint (a dead one costs one bounded delay, never a failed
-call). Hostnames are resolved once at startup. It is UDP only for now: `turns:` and
+`--turn-client` is repeatable. Servers are raced inside one bounded window and the first to
+allocate wins for each endpoint; the others are deleted (a dead one costs nothing, never a
+failed call). Hostnames are resolved once at startup. It is UDP only for now: `turns:` and
 `?transport=tcp` are refused at startup. It also requires `--ice-full`, and the daemon
 refuses to start without it: a relayed candidate is only usable once every remote
 candidate has a permission on the allocation, which only the full agent's checklist
