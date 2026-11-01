@@ -24,6 +24,8 @@ pub(crate) struct IceDemux {
     /// `Datapath::adopt_source` on the control plane; the kernel flow's latch fields are the
     /// enforcement copy of the same decision.
     pub(crate) adopted: Arc<DashMap<EndpointId, SocketAddr>>,
+    /// PRIORITY of the nominated pair behind `adopted` per endpoint — see `Inner::ice_nominated`.
+    pub(crate) nominated: Arc<DashMap<EndpointId, u32>>,
     /// Tick of the last validated check per endpoint — see `Inner::ice_last_check`.
     pub(crate) last_check: Arc<DashMap<EndpointId, u64>>,
     /// Subscribers to `adopted` — see `Inner::ice_validated`.
@@ -110,15 +112,38 @@ impl IceDemux {
             };
         };
         match siphon_rtp_datapath::respond_to_stun_check(datagram, &config, source) {
-            siphon_rtp_datapath::StunCheckOutcome::Respond(response) => {
+            siphon_rtp_datapath::StunCheckOutcome::Respond {
+                response,
+                nomination,
+            } => {
                 // An authenticated check proves the path is alive, so it counts as activity for the
                 // media-timeout sweep exactly as it does on the loopback backend — otherwise a leg
                 // still establishing (or held, exchanging only consent checks) would be reaped.
                 self.last_check.insert(endpoint, tick);
-                // A check that authenticated: ICE supersedes blind latching, so this source becomes
-                // the media path (RFC 8445 §7.3). Report the adoption only when it *changes*, so the
-                // kernel map is written once per path rather than on every repeated check.
-                let changed = self.adopted.get(&endpoint).map(|entry| *entry) != Some(source);
+                // Every authenticated check is answered (RFC 8445 §7.3), but a lite agent selects a
+                // pair only on a USE-CANDIDATE check (§7.3.1.5 / §6.1.3.2), and the highest
+                // nominated PRIORITY wins (§8.1.1): a peer checking from every interface moves the
+                // path only for the pair it nominates. Report the adoption only when it *changes*,
+                // so the kernel map is written once per path rather than on every repeated check.
+                let selects =
+                    nomination.is_some_and(|priority| match self.nominated.entry(endpoint) {
+                        dashmap::mapref::entry::Entry::Occupied(mut selected) => {
+                            let supersedes = siphon_rtp_datapath::nomination_supersedes(
+                                Some(*selected.get()),
+                                priority,
+                            );
+                            if supersedes {
+                                selected.insert(priority);
+                            }
+                            supersedes
+                        }
+                        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                            vacant.insert(priority);
+                            true
+                        }
+                    });
+                let changed =
+                    selects && self.adopted.get(&endpoint).map(|entry| *entry) != Some(source);
                 if changed {
                     self.adopted.insert(endpoint, source);
                 }

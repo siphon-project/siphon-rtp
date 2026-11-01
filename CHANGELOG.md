@@ -25,6 +25,17 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   end to end, 3GPP TS 33.180 §7.5.2 NOTE 3), as are `ice: remove` and a pinned `dtls` role.
   `conference_offer` stays plain `RTP/AVP`. `scripts/check-floor-channel-chrome.sh` now also drives this
   direction from headless Chrome.
+### Fixed
+
+- **An ICE-lite leg selects only the nominated pair.** The responder moved the media path on every
+  authenticated Binding request, so a browser checking from each of its interfaces sent the DTLS
+  handshake and the seat egress to whichever address checked last, often one the engine cannot reach,
+  and logged "ICE selected a candidate pair" once per check. Per RFC 8445 §7.3.1.5 and §6.1.3.2 every
+  valid check is still answered, but only one carrying `USE-CANDIDATE` selects a pair. With several
+  nominations the highest `PRIORITY` wins (§8.1.1); a lower one never moves an established path, an
+  equal or higher one may (RFC 5245 aggressive nomination keeps working). A peer that never nominates
+  gets no path, and an ICE restart clears the stored nomination. Both the loopback and the XDP
+  datapath share the decision.
 
 ## [0.17.0] — 2026-10-31
 
