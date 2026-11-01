@@ -467,9 +467,15 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     from any other source are left untouched, so the seam cannot be used to forge a peer address; a
     message on a channel this allocation never bound is dropped rather than passed up as if it came
     from the server.
-  - **A destination with no channel is sent directly and untouched** — that is what keeps the
-    allocation's own requests (addressed to the server) and any peer reached over a host or
-    server-reflexive candidate on the direct path.
+  - **Both egress paths wrap.** `Datapath::send` and the `Forward` relay path share one framing
+    decision, so media forwarded toward a peer behind the allocation never leaves unwrapped. A
+    permitted peer with no channel yet (bind in flight or failed) is reached with a Send indication
+    (RFC 8656 §11.1); the check costs one relaxed atomic load when no allocation is installed.
+  - **Data indications are accepted only for a permitted peer** (RFC 8656 §11.4, §9): an indication
+    from the server naming a peer the allocation holds no permission for is dropped, never attributed.
+  - **A destination with no channel and no permission is sent directly and untouched** — that is
+    what keeps the allocation's own requests (addressed to the server) and any peer reached over a
+    host or server-reflexive candidate on the direct path.
   - **The candidate is not advertised unless it can be carried.** Gathering consults
     `Datapath::supports_turn_relay` and the allocation's actual state; a backend without the seam, or
     a TURN server that never answers, yields no relayed candidate at all. An advertised relay the peer

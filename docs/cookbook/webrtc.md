@@ -44,7 +44,7 @@ Rust, at different levels of maturity. This page says exactly which level.
   [A WebRTC caller toward a plain callee](#a-webrtc-caller-toward-a-plain-callee).
 
 - Relayed (TURN) candidates: the engine can act as a TURN *client* as well as a
-  server, allocating a relayed candidate and ChannelData-framing media through it.
+  server, allocating a relayed candidate and ChannelData-framing media through it (and Send/Data indications until a channel is bound).
   Configured with `--turn-client`; see [Relayed candidates through a TURN
   server](#relayed-candidates-through-a-turn-server).
 

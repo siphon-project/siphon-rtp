@@ -24,6 +24,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **A TURN allocation now carries relay-forwarded media and Data indications.** The `Forward` relay path
+  sent media toward a peer behind the allocation straight to the peer, unwrapped (only `Datapath::send`
+  framed it), and a peer's packets that arrived as Data indications, before ChannelBind completed or after
+  it failed, were dropped. Forwarded media is now framed exactly like `send`: ChannelData for a bound peer,
+  a Send indication for a permitted peer with no channel yet (RFC 8656 §11.1). A Data indication is
+  unwrapped for a permitted peer and dropped for any other. The permitted peers are published to the
+  datapath with the channels. The egress check is one relaxed atomic load when no allocation is installed.
 - **A relayed ICE candidate now works end to end.** The agent was registered after gathering with no
   knowledge of the allocation, so the server's responses were fed to the checklist and the allocation was
   never refreshed and never got a permission. The allocation's server is now remembered per endpoint and

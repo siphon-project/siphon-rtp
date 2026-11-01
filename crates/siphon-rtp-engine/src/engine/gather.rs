@@ -21,6 +21,8 @@ pub(super) struct TurnAllocation {
     /// The channels last pushed to the datapath, so a redundant `set_turn_relay` is not issued on
     /// every tick — only when the bindings actually change.
     pub(super) published: Vec<(SocketAddr, u16)>,
+    /// The permitted peers last pushed to the datapath, for the same reason.
+    pub(super) published_permitted: Vec<SocketAddr>,
     /// The millisecond of the last ICE tick that drove this allocation, so a release outside the
     /// tick can still poll the client on the clock it was last driven by.
     pub(super) last_driven_ms: u64,
@@ -425,6 +427,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Some(siphon_rtp_datapath::TurnRelay {
                 server,
                 channels: Vec::new(),
+                permitted: Vec::new(),
             }),
         );
         // Recorded for the agent whenever it registers: the agent is armed after gathering on
@@ -437,6 +440,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             TurnAllocation {
                 client,
                 published: Vec::new(),
+                published_permitted: Vec::new(),
                 last_driven_ms: 0,
             },
         );

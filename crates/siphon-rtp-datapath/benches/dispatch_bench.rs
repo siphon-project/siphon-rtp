@@ -184,6 +184,7 @@ fn bench_dispatch(criterion: &mut Criterion) {
             Some(siphon_rtp_datapath::TurnRelay {
                 server: server_addr,
                 channels: vec![(far_addr, 0x4001)],
+                permitted: vec![far_addr],
             }),
         );
         datapath
