@@ -302,8 +302,8 @@ pub struct EngineArgs {
     pub ice_full: bool,
 
     /// TURN server to allocate relayed ICE candidates from, `turn:host[:port][?transport=udp]`
-    /// (RFC 7064). Repeat the flag for several: they are tried in the order given and the first
-    /// that allocates wins for each endpoint. Hostnames are resolved once at startup.
+    /// (RFC 7064). Repeat the flag for several: they are raced and the first to allocate
+    /// wins for each endpoint; the others are deleted. Hostnames are resolved once at startup.
     ///
     /// UDP only for now: `turns:` and `?transport=tcp` are refused. Requires `--ice-full` (an
     /// ICE-lite agent advertises host candidates only, RFC 8445 §2.5) and
@@ -416,7 +416,7 @@ pub struct RunConfig {
     pub stun_servers: Vec<SocketAddr>,
     /// Run a full RFC 8445 ICE agent on ICE legs (off ⇒ the ICE-lite responder posture).
     pub ice_full: bool,
-    /// `turn:` URIs of the TURN servers to allocate relayed candidates from, in failover order;
+    /// `turn:` URIs of the TURN servers to allocate relayed candidates from, raced (the first to allocate wins);
     /// empty ⇒ no relayed gathering. Validated and resolved at startup.
     pub turn_client: Vec<String>,
     /// File holding the TURN server's `static-auth-secret`.
@@ -1026,7 +1026,7 @@ where
             target: "siphon_rtp::control",
             servers = ?turn_client.servers,
             ttl_secs = config.turn_client_ttl,
-            "ICE gathering will allocate relayed candidates from these TURN servers (UDP), in order"
+            "ICE gathering will allocate relayed candidates from these TURN servers (UDP), raced"
         );
         engine = engine.with_turn_client(turn_client);
     }

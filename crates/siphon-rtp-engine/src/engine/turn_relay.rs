@@ -12,12 +12,12 @@ use siphon_rtp_stun::turn_client::{TurnAction, TurnCredentials};
 
 use super::Engine;
 
-/// Where relayed ICE candidates are allocated from (RFC 8656), in failover order, and how the
+/// Where relayed ICE candidates are allocated from (RFC 8656), raced, and how the
 /// long-term credentials for each allocation are produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnClientConfig {
-    /// Candidate servers. The first that grants an allocation wins for an endpoint; the rest are
-    /// only tried when the one before it did not answer or refused.
+    /// Candidate servers, raced for every endpoint. The first to grant an allocation wins; the
+    /// others are deleted.
     pub servers: Vec<SocketAddr>,
     /// How the credentials are produced.
     pub credentials: TurnCredentialSource,

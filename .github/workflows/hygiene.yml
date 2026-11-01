@@ -58,7 +58,7 @@ jobs:
           crates/siphon-rtp-codec/src/amr/nb/enc_cb.rs 1905 # reference port
           crates/siphon-rtp-codec/src/amr/wb/enc_acelp.rs 1850 # reference port
           crates/siphon-rtp-codec/src/opus/enc/encoder.rs 1806 # reference port; +15 for OPUS_GET_LOOKAHEAD, which an Ogg muxer needs for pre-skip
-          crates/siphon-rtp-xdp/src/lib.rs 1533 # the Datapath impl for the whole backend; +15 for the userspace drop counter that redirect-path refusals are added to; +16 for the consumer RTCP tap; +3 for the rtcp_to_userspace flag of the kernel flow value, +3 for the rtcp_to_userspace flag of the kernel flow value
+          crates/siphon-rtp-xdp/src/lib.rs 1552 # the Datapath impl for the whole backend; +15 for the userspace drop counter that redirect-path refusals are added to; +16 for the consumer RTCP tap; +3 for the rtcp_to_userspace flag of the kernel flow value, +3 for the rtcp_to_userspace flag of the kernel flow value, +19 for the nominated priority an ice-lite endpoint keeps and clears on an ICE restart
           '
           status=0
           while IFS= read -r file; do

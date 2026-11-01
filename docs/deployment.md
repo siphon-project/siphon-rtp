@@ -100,7 +100,7 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 | `--turn-relay-ip <IP>` | datapath-assigned | Public IP advertised in XOR-RELAYED-ADDRESS when the bound IP is not the reachable one (NAT'd host). |
 | `--turn-permit-private-peers` | off | Let the built-in TURN server relay to loopback and RFC 1918 / unique-local peers, which it refuses by default (anti-SSRF, RFC 8656 §21). Link-local and multicast stay refused. For a private lab or CI only, never a TURN server reachable by untrusted clients; logs a warning at startup. |
 | `--stun-server <ADDR>` | none | STUN server probed for a server-reflexive ICE candidate (RFC 8445 §5.1.1). Repeatable. |
-| `--turn-client <URI>` | none | TURN server to allocate relayed ICE candidates from, `turn:host[:port]`. Repeatable, tried in order. UDP only (`turns:` and `?transport=tcp` are refused). Requires `--ice-full` and `--turn-client-secret-file`. |
+| `--turn-client <URI>` | none | TURN server to allocate relayed ICE candidates from, `turn:host[:port]`. Repeatable, raced; the first to allocate wins and the others are deleted. UDP only (`turns:` and `?transport=tcp` are refused). Requires `--ice-full` and `--turn-client-secret-file`. |
 | `--turn-client-secret-file <PATH>` | none | File holding the TURN server's `static-auth-secret` (coturn `use-auth-secret`); each allocation mints `<expiry>:<node id>` credentials from it. |
 | `--turn-client-ttl <SECS>` | `86400` | How long a minted TURN username stays valid. Must outlive the longest call (RFC 8656 §7.2). |
 | `--ice-full` | off | Run the full RFC 8445 ICE agent (checklists, connectivity checks, nomination) instead of ICE-lite responder-only. |

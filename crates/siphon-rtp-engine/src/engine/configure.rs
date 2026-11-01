@@ -148,7 +148,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self
     }
 
-    /// Allocate ICE **relayed** candidates against these TURN servers, tried in order, with
+    /// Allocate ICE **relayed** candidates against these TURN servers, raced (the first to allocate wins), with
     /// credentials minted per allocation (RFC 8656).
     ///
     /// Requires the full ICE agent ([`Self::with_full_ice`]): a relayed candidate is only usable

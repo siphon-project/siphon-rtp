@@ -169,6 +169,60 @@ fn bench_dispatch(criterion: &mut Criterion) {
             });
         });
     });
+    // --- The same relay with the far peer behind a TURN allocation: the egress is ChannelData-wrapped
+    // and addressed to the server (RFC 8656 §12). The extra cost over `forward_relay_160` is the
+    // wrap; with no allocation installed the check itself is one relaxed atomic load.
+    let (turn_datapath, turn_in, turn_peer, turn_server) = runtime.block_on(async {
+        let datapath = UdpLoopbackDatapath::new();
+        let ingress = datapath.alloc_endpoint().await.expect("alloc ingress");
+        let egress = datapath.alloc_endpoint().await.expect("alloc egress");
+        let (peer, peer_addr) = phone().await;
+        let (server, server_addr) = phone().await;
+        let far_addr: SocketAddr = (Ipv4Addr::new(192, 0, 2, 7), 4000).into();
+        datapath.set_turn_relay(
+            egress.id,
+            Some(siphon_rtp_datapath::TurnRelay {
+                server: server_addr,
+                channels: vec![(far_addr, 0x4001)],
+                permitted: vec![far_addr],
+            }),
+        );
+        datapath
+            .install_flow(
+                ingress.id,
+                FlowAction::Forward(ForwardRule {
+                    out_endpoint: egress.id,
+                    out_dst: Some(far_addr),
+                    accepted_source: SourceFilter::Exact(peer_addr.ip()),
+                    latch: LatchPolicy::SignalledOnly,
+                    rtcp_to_userspace: false,
+                }),
+            )
+            .expect("forward flow");
+        (datapath, ingress, peer, server)
+    });
+    let _ = &turn_datapath;
+    group.bench_function("forward_relay_turn_channel_160", |bencher| {
+        bencher.iter(|| {
+            runtime.block_on(async {
+                let mut scratch = [0u8; 2048];
+                for _ in 0..BURST {
+                    turn_peer
+                        .send_to(black_box(&packet), turn_in.local_addr)
+                        .await
+                        .expect("send");
+                }
+                for _ in 0..BURST {
+                    black_box(
+                        turn_server
+                            .recv_from(&mut scratch)
+                            .await
+                            .expect("wrapped packet"),
+                    );
+                }
+            });
+        });
+    });
     group.finish();
 
     // --- The gate's own lookups, isolated from the syscalls above.
@@ -178,6 +232,33 @@ fn bench_dispatch(criterion: &mut Criterion) {
     criterion.bench_function("ice_gate_validated_hit", |bencher| {
         bencher.iter(|| black_box(ice_datapath.ice_validated_source(black_box(ice_endpoint.id))));
     });
+
+    // --- The ice-lite responder's per-check cost: authenticate, build the signed response, and read
+    // the nomination (RFC 8445 §7.3.1.5). Plain and nominating checks cost the same parse and HMAC.
+    let responder = IceConfig {
+        local_ufrag: "ENG".into(),
+        local_pwd: "engpass".into(),
+    };
+    let source: SocketAddr = "198.51.100.10:5000".parse().unwrap();
+    for (name, use_candidate) in [("stun_check_plain", false), ("stun_check_nominating", true)] {
+        let check = siphon_rtp_stun::client::binding_request_ice(
+            &[7u8; 12],
+            "ENG:remote",
+            b"engpass",
+            0x7E00_00FF,
+            siphon_rtp_stun::client::IceRole::Controlling(1),
+            use_candidate,
+        );
+        criterion.bench_function(name, |bencher| {
+            bencher.iter(|| {
+                black_box(siphon_rtp_datapath::respond_to_stun_check(
+                    black_box(&check),
+                    black_box(&responder),
+                    black_box(source),
+                ))
+            });
+        });
+    }
 }
 
 criterion_group!(benches, bench_dispatch);

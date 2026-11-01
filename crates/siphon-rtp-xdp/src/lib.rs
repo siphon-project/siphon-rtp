@@ -422,6 +422,9 @@ struct Inner {
     /// The source ICE adopted per endpoint (see [`Datapath::ice_validated_source`]). Shared with the
     /// datapath thread, which writes it when the ice-lite responder validates a check.
     ice_adopted: Arc<DashMap<EndpointId, SocketAddr>>,
+    /// PRIORITY of the pair the ice-lite responder selected per endpoint (RFC 8445 §7.3.1.5, §8.1.1):
+    /// shared with the datapath thread, cleared with the credentials (an ICE restart, §9.1.1.1).
+    ice_nominated: Arc<DashMap<EndpointId, u32>>,
     /// Tick of the last **validated** connectivity check per ICE endpoint, folded into
     /// [`Datapath::last_activity`]. The kernel stamps `last_seen_ns` only on accepted *media*, so
     /// without this an ICE leg that is exchanging checks but has not started media yet — the whole
@@ -527,6 +530,7 @@ impl XdpDatapath {
         let ice_agents: Arc<DashMap<EndpointId, IceAgentRegistration>> = Arc::new(DashMap::new());
         let ice_adopted: Arc<DashMap<EndpointId, SocketAddr>> = Arc::new(DashMap::new());
         let ice_last_check: Arc<DashMap<EndpointId, u64>> = Arc::new(DashMap::new());
+        let ice_nominated: Arc<DashMap<EndpointId, u32>> = Arc::new(DashMap::new());
         let ice_validated: Arc<
             DashMap<EndpointId, tokio::sync::watch::Sender<Option<SocketAddr>>>,
         > = Arc::new(DashMap::new());
@@ -547,6 +551,7 @@ impl XdpDatapath {
             ice: ice.clone(),
             ice_agents: ice_agents.clone(),
             ice_adopted: ice_adopted.clone(),
+            ice_nominated: ice_nominated.clone(),
             ice_last_check: ice_last_check.clone(),
             userspace_dropped: DashMap::new(),
             ice_validated: ice_validated.clone(),
@@ -590,6 +595,7 @@ impl XdpDatapath {
                         ice,
                         ice_agents,
                         adopted: ice_adopted,
+                        nominated: ice_nominated,
                         last_check: ice_last_check,
                         validated: ice_validated,
                     },
@@ -1314,6 +1320,7 @@ impl Datapath for XdpDatapath {
         self.inner.ice_agents.remove(&endpoint);
         self.inner.userspace_dropped.remove(&endpoint);
         self.inner.ice_adopted.remove(&endpoint);
+        self.inner.ice_nominated.remove(&endpoint);
         self.inner.ice_last_check.remove(&endpoint);
         self.inner.ice_validated.remove(&endpoint);
     }
@@ -1437,10 +1444,22 @@ impl Datapath for XdpDatapath {
     fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>) {
         match config {
             Some(config) => {
+                // RFC 8445 §9.1.1.1: new credentials are a new ICE session, so the old session's
+                // nomination no longer orders the new one's. The adopted source stays: media
+                // continues on the old pair until the new session nominates one (§9.3).
+                let restarted = self
+                    .inner
+                    .ice
+                    .get(&endpoint)
+                    .is_some_and(|previous| previous.local_ufrag != config.local_ufrag);
+                if restarted {
+                    self.inner.ice_nominated.remove(&endpoint);
+                }
                 self.inner.ice.insert(endpoint, config);
             }
             None => {
                 self.inner.ice.remove(&endpoint);
+                self.inner.ice_nominated.remove(&endpoint);
                 self.inner.ice_agents.remove(&endpoint);
                 self.inner.ice_adopted.remove(&endpoint);
                 self.inner.ice_last_check.remove(&endpoint);
@@ -1857,15 +1876,25 @@ mod tests {
     /// A real MESSAGE-INTEGRITY-signed Binding request addressed to `ice_config()` — built by the
     /// STUN encoder, not hand-rolled, so the responder is exercised against a genuine check.
     fn signed_check(config: &IceConfig) -> Vec<u8> {
-        siphon_rtp_stun::binding_request(
+        nomination_check(config, 100, true)
+    }
+
+    /// A signed check carrying PRIORITY, with or without USE-CANDIDATE (RFC 8445 §7.1.1). Only the
+    /// nominating one selects a pair on an ice-lite endpoint.
+    fn nomination_check(config: &IceConfig, priority: u32, use_candidate: bool) -> Vec<u8> {
+        siphon_rtp_stun::client::binding_request_ice(
             &[1u8; 12],
             &format!("{}:peerUfrag", config.local_ufrag),
             config.local_pwd.as_bytes(),
+            priority,
+            siphon_rtp_stun::client::IceRole::Controlling(1),
+            use_candidate,
         )
     }
 
     fn demux() -> IceDemux {
         IceDemux {
+            nominated: Arc::new(DashMap::new()),
             ice: Arc::new(DashMap::new()),
             ice_agents: Arc::new(DashMap::new()),
             adopted: Arc::new(DashMap::new()),
@@ -1905,6 +1934,103 @@ mod tests {
         ));
         assert_eq!(adopt, Some(peer()));
         assert_eq!(demux.adopted.get(&ICE_ENDPOINT).map(|e| *e), Some(peer()));
+    }
+
+    fn source_at(last_octet: u8) -> SocketAddr {
+        SocketAddr::from(([198, 51, 100, last_octet], 5000))
+    }
+
+    #[test]
+    fn a_check_without_use_candidate_is_answered_but_adopts_nothing() {
+        // RFC 8445 §7.3.1.5 / §6.1.3.2: a lite agent answers every valid check and selects only the
+        // pair a USE-CANDIDATE check nominates.
+        let demux = demux();
+        let config = ice_config();
+        demux.ice.insert(ICE_ENDPOINT, config.clone());
+
+        let StunDisposition::Consumed { respond, adopt } = demux.classify(
+            ICE_ENDPOINT,
+            peer(),
+            &nomination_check(&config, 100, false),
+            0,
+        ) else {
+            panic!("an ICE endpoint must consume STUN");
+        };
+        assert!(respond.is_some(), "the check is still answered");
+        assert_eq!(adopt, None);
+        assert!(demux.adopted.get(&ICE_ENDPOINT).is_none());
+    }
+
+    #[test]
+    fn a_multi_interface_peer_moves_the_path_only_for_the_nominated_pair() {
+        // The lab bug: checks from every local address, one nominated. The path follows the nominated
+        // source, not whichever checked last.
+        let demux = demux();
+        let config = ice_config();
+        demux.ice.insert(ICE_ENDPOINT, config.clone());
+        let plain = nomination_check(&config, 300, false);
+        let nominating = nomination_check(&config, 200, true);
+
+        demux.classify(ICE_ENDPOINT, source_at(1), &plain, 0);
+        let StunDisposition::Consumed { adopt, .. } =
+            demux.classify(ICE_ENDPOINT, source_at(2), &nominating, 1)
+        else {
+            panic!("consumed");
+        };
+        assert_eq!(adopt, Some(source_at(2)));
+        demux.classify(ICE_ENDPOINT, source_at(3), &plain, 2);
+        assert_eq!(
+            demux.adopted.get(&ICE_ENDPOINT).map(|e| *e),
+            Some(source_at(2)),
+            "a later plain check from another address must not move the nominated path"
+        );
+    }
+
+    #[test]
+    fn the_highest_priority_nomination_wins_and_equal_priority_may_move() {
+        // RFC 8445 §8.1.1; equal priority keeps RFC 5245 aggressive nomination working.
+        let demux = demux();
+        let config = ice_config();
+        demux.ice.insert(ICE_ENDPOINT, config.clone());
+        let at = |priority| nomination_check(&config, priority, true);
+
+        demux.classify(ICE_ENDPOINT, source_at(1), &at(500), 0);
+        demux.classify(ICE_ENDPOINT, source_at(2), &at(100), 1);
+        assert_eq!(
+            demux.adopted.get(&ICE_ENDPOINT).map(|e| *e),
+            Some(source_at(1)),
+            "a lower-priority nomination never moves an established path"
+        );
+        demux.classify(ICE_ENDPOINT, source_at(3), &at(500), 2);
+        assert_eq!(
+            demux.adopted.get(&ICE_ENDPOINT).map(|e| *e),
+            Some(source_at(3))
+        );
+    }
+
+    #[test]
+    fn clearing_the_nomination_lets_a_restarted_session_select_a_lower_priority_pair() {
+        let demux = demux();
+        let config = ice_config();
+        demux.ice.insert(ICE_ENDPOINT, config.clone());
+        demux.classify(
+            ICE_ENDPOINT,
+            source_at(1),
+            &nomination_check(&config, 500, true),
+            0,
+        );
+        // What `Datapath::set_ice` does on new credentials.
+        demux.nominated.remove(&ICE_ENDPOINT);
+        demux.classify(
+            ICE_ENDPOINT,
+            source_at(2),
+            &nomination_check(&config, 100, true),
+            1,
+        );
+        assert_eq!(
+            demux.adopted.get(&ICE_ENDPOINT).map(|e| *e),
+            Some(source_at(2))
+        );
     }
 
     #[test]

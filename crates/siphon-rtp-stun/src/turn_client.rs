@@ -260,6 +260,14 @@ impl TurnClient {
         }
     }
 
+    /// Whether the server has answered the unauthenticated probe with its `401` challenge (RFC 8656
+    /// §7.2). Before that the server cannot hold an allocation for us, because it only allocates for
+    /// the authenticated Allocate, which is sent after the challenge.
+    #[must_use]
+    pub fn is_challenged(&self) -> bool {
+        self.realm.is_some()
+    }
+
     /// Whether the allocation is live.
     #[must_use]
     pub fn is_allocated(&self) -> bool {
@@ -853,6 +861,19 @@ mod tests {
             turn::requested_transport(&message),
             Some(turn::TRANSPORT_UDP)
         );
+    }
+
+    #[test]
+    fn a_client_is_challenged_only_once_the_server_answered_the_probe() {
+        let mut client = client();
+        assert!(!client.is_challenged());
+        let probe = take_send(&mut client, 0);
+        assert!(
+            !client.is_challenged(),
+            "an unanswered probe is not a challenge"
+        );
+        assert!(client.on_datagram(&challenge(&probe), 0));
+        assert!(client.is_challenged());
     }
 
     #[test]

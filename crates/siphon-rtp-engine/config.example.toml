@@ -173,8 +173,8 @@ control = "127.0.0.1:8080"
 # checklist knows; an ICE-lite agent advertises host candidates only (RFC 8445 §2.5). The daemon
 # refuses to start otherwise.
 #
-# Servers are `turn:host[:port]` URIs, tried in the order given; the first that allocates wins for an
-# endpoint. Hostnames are resolved once at startup. UDP only for now: `turns:` and
+# Servers are `turn:host[:port]` URIs, raced; the first to allocate wins for an
+# endpoint and the others are deleted. Hostnames are resolved once at startup. UDP only for now: `turns:` and
 # `?transport=tcp` are refused.
 #
 # Credentials follow the coturn `use-auth-secret` (TURN REST) scheme: the file holds the server's

@@ -44,7 +44,7 @@ Rust, at different levels of maturity. This page says exactly which level.
   [A WebRTC caller toward a plain callee](#a-webrtc-caller-toward-a-plain-callee).
 
 - Relayed (TURN) candidates: the engine can act as a TURN *client* as well as a
-  server, allocating a relayed candidate and ChannelData-framing media through it.
+  server, allocating a relayed candidate and ChannelData-framing media through it (and Send/Data indications until a channel is bound).
   Configured with `--turn-client`; see [Relayed candidates through a TURN
   server](#relayed-candidates-through-a-turn-server).
 
@@ -152,7 +152,8 @@ a=setup:active
 - **ICE.** A caller that offers ICE is answered with the engine's ICE
   credentials and candidates as on any ICE leg. The handshake waits for ICE:
   under `--ice-full` for the selected pair, and on the default ICE-lite
-  responder for the first connectivity check it validates. Records and media
+  responder for the connectivity check that nominates a pair (`USE-CANDIDATE`,
+  RFC 8445 §7.3.1.5; the highest `PRIORITY` wins if several do). Records and media
   then go to that address, not to the caller's `c=` (RFC 8445 §12.1.1), which
   is what a browser behind NAT needs.
 - **No directive.** Without a plaintext far leg asked for, the caller's keying
@@ -177,6 +178,12 @@ a=ice-ufrag:mJq2X9dK
 a=ice-pwd:H7f2kQ91bXcR3sT8wLpZv0Ay
 a=candidate:1 1 UDP 2130706431 203.0.113.10 40002 typ host
 ```
+
+An ICE-lite engine answers every valid connectivity check but selects only the
+pair a check nominates with `USE-CANDIDATE` (RFC 8445 §7.3.1.5). A browser with
+several interfaces checks from each of its addresses and nominates one; media and
+the DTLS handshake follow that pair, not the last address that checked. A peer
+that never nominates gets no media path.
 
 The candidate list is **gathered** (RFC 8445 §5.1.1), not hardcoded: a host
 candidate per component — RTP, plus RTCP when the leg is not muxed — carrying the
@@ -293,9 +300,9 @@ siphon-rtp --ice-full \
   --turn-client-secret-file /run/secrets/siphon-rtp-turn-secret
 ```
 
-`--turn-client` is repeatable. Servers are tried in the order given and the first that
-allocates wins for each endpoint (a dead one costs one bounded delay, never a failed
-call). Hostnames are resolved once at startup. It is UDP only for now: `turns:` and
+`--turn-client` is repeatable. Servers are raced inside one bounded window and the first to
+allocate wins for each endpoint; the others are deleted (a dead one costs nothing, never a
+failed call). Hostnames are resolved once at startup. It is UDP only for now: `turns:` and
 `?transport=tcp` are refused at startup. It also requires `--ice-full`, and the daemon
 refuses to start without it: a relayed candidate is only usable once every remote
 candidate has a permission on the allocation, which only the full agent's checklist

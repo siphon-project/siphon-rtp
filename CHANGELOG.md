@@ -17,7 +17,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 - **The TURN client is a daemon option: `--turn-client`, `--turn-client-secret-file`, `--turn-client-ttl`
   (and the matching config keys).** Until now it was reachable only through `Engine::with_turn_server`
   with one server and static credentials. `--turn-client turn:host[:port]` is repeatable, servers are
-  tried in order and the first that allocates wins per endpoint, hostnames resolve at startup. UDP only:
+  raced inside one gathering window (a dead one costs the offer nothing), the first to allocate wins per
+  endpoint and the others are deleted, hostnames resolve at startup. UDP only:
   `turns:` and `?transport=tcp` are refused (the client shares the media 5-tuple). Credentials are the
   coturn `use-auth-secret` scheme, minted per allocation as `<unix expiry>:<node id>` with password
   `base64(HMAC-SHA1(secret, username))`; the username cannot change during an allocation (RFC 8656 §7.2),
@@ -45,6 +46,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **A TURN allocation now carries relay-forwarded media and Data indications.** The `Forward` relay path
+  sent media toward a peer behind the allocation straight to the peer, unwrapped (only `Datapath::send`
+  framed it), and a peer's packets that arrived as Data indications, before ChannelBind completed or after
+  it failed, were dropped. Forwarded media is now framed exactly like `send`: ChannelData for a bound peer,
+  a Send indication for a permitted peer with no channel yet (RFC 8656 §11.1). A Data indication is
+  unwrapped for a permitted peer and dropped for any other. The permitted peers are published to the
+  datapath with the channels. The egress check is one relaxed atomic load when no allocation is installed.
 - **A relayed ICE candidate now works end to end.** The agent was registered after gathering with no
   knowledge of the allocation, so the server's responses were fed to the checklist and the allocation was
   never refreshed and never got a permission. The allocation's server is now remembered per endpoint and
@@ -52,6 +60,33 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   `raddr`/`rport` (RFC 8839 §5.1), and every endpoint release (call delete or reap, forward and conference
   seat release) now deletes the allocation (Refresh with lifetime 0) instead of leaving it to lapse on the
   server.
+- **`forward_offer` can offer a browser a seat (`node_info` feature `forward_offer_webrtc`).** With
+  `profile.transport_protocol: "UDP/TLS/RTP/SAVPF"` the offer is a WebRTC one: DTLS-SRTP with the engine's
+  fingerprint and `a=setup:actpass` (RFC 5763 §5), `a=ice-lite` with credentials and candidates minted
+  for the seat (RFC 8445 §2.5, so the browser controls), `a=rtcp-mux`, and everything in one
+  `a=group:BUNDLE` (RFC 8843). A profile with `floor_fmtp` carries the floor control as a bundled
+  `m=application … UDP/DTLS/SCTP webrtc-datachannel` section (RFC 8841) in place of the UDP floor
+  section. `forward_answer` then reads the browser's answer: it must be `UDP/TLS/RTP/SAVPF` with an
+  `a=fingerprint` and an `active` or `passive` `a=setup` (the engine takes the complement as its DTLS
+  role, RFC 5763 §5), and it seats the member `secure_pending` / `ice_pending` exactly as `forward_join`
+  does, so nothing is forwarded until the handshake keys it and ICE validates the peer. The browser opens
+  the `mcptt-floor` channel itself. A plain answer to a WebRTC offer, a DTLS answer to a plain one, an
+  answer with no fingerprint and an `actpass` answer are refused and free the pending seat. A WebRTC
+  offer on a `media: preserve` room is refused (the engine would have to terminate SRTP the room forwards
+  end to end, 3GPP TS 33.180 §7.5.2 NOTE 3), as are `ice: remove` and a pinned `dtls` role.
+  `conference_offer` stays plain `RTP/AVP`. `scripts/check-floor-channel-chrome.sh` now also drives this
+  direction from headless Chrome.
+### Fixed
+
+- **An ICE-lite leg selects only the nominated pair.** The responder moved the media path on every
+  authenticated Binding request, so a browser checking from each of its interfaces sent the DTLS
+  handshake and the seat egress to whichever address checked last, often one the engine cannot reach,
+  and logged "ICE selected a candidate pair" once per check. Per RFC 8445 §7.3.1.5 and §6.1.3.2 every
+  valid check is still answered, but only one carrying `USE-CANDIDATE` selects a pair. With several
+  nominations the highest `PRIORITY` wins (§8.1.1); a lower one never moves an established path, an
+  equal or higher one may (RFC 5245 aggressive nomination keeps working). A peer that never nominates
+  gets no path, and an ICE restart clears the stored nomination. Both the loopback and the XDP
+  datapath share the decision.
 
 ## [0.17.0] — 2026-10-31
 

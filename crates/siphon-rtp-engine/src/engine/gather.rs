@@ -21,6 +21,8 @@ pub(super) struct TurnAllocation {
     /// The channels last pushed to the datapath, so a redundant `set_turn_relay` is not issued on
     /// every tick — only when the bindings actually change.
     pub(super) published: Vec<(SocketAddr, u16)>,
+    /// The permitted peers last pushed to the datapath, for the same reason.
+    pub(super) published_permitted: Vec<SocketAddr>,
     /// The millisecond of the last ICE tick that drove this allocation, so a release outside the
     /// tick can still poll the client on the clock it was last driven by.
     pub(super) last_driven_ms: u64,
@@ -268,8 +270,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// empty list when there is no TURN server configured, the backend cannot relay, or no
     /// configured server grants an allocation inside its gathering deadline.
     ///
-    /// Servers are tried in the order given and the first that allocates wins; each gets its own
-    /// bounded window, so a dead server costs one deadline before the next is tried.
+    /// Every configured server is raced inside one [`TURN_GATHER_DEADLINE_MS`] window, so a dead
+    /// server costs the offer nothing; the first to allocate wins and the others are deleted.
     ///
     /// The allocation is **kept** on success (in `ice_relays`): it needs refreshing for the life of
     /// the leg, and each remote candidate needs a permission before it can reach us.
@@ -292,49 +294,70 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
             return Vec::new();
         }
-        for server in turn.servers.iter().copied() {
-            if let Some(candidate) = self
-                .allocate_from(endpoint, component, events_rx, server, &turn.credentials)
-                .await
-            {
-                return vec![candidate];
-            }
-        }
-        Vec::new()
+        self.allocate_from_any(endpoint, component, events_rx, &turn)
+            .await
+            .into_iter()
+            .collect()
     }
 
-    /// Try one TURN `server` for `endpoint`: a relayed candidate when it grants an allocation inside
-    /// [`TURN_GATHER_DEADLINE_MS`], otherwise `None` and nothing kept.
-    async fn allocate_from(
+    /// Race one [`TurnClient`] per configured server for `endpoint`.
+    ///
+    /// Replies are demultiplexed from the shared `events_rx` by their source address. The first
+    /// client to reach `Allocated` (in configuration order when several land in one pass) wins.
+    /// A loser that never answered its unauthenticated probe is dropped at once: the server only
+    /// allocates for the authenticated Allocate, which is sent after the `401` challenge
+    /// (RFC 8656 §7.2), so it cannot hold anything. A loser that did answer is driven inside the
+    /// same window, and if it allocates anyway it is deleted with a `Refresh` of lifetime 0
+    /// (RFC 8656 §7.1) so the server frees the relay port now.
+    async fn allocate_from_any(
         &self,
         endpoint: EndpointId,
         component: u16,
         events_rx: &flume::Receiver<siphon_rtp_datapath::IceDatapathEvent>,
-        server: SocketAddr,
-        credentials: &super::TurnCredentialSource,
+        turn: &super::TurnClientConfig,
     ) -> Option<siphon_rtp_ice::Candidate> {
         let started = tokio::time::Instant::now();
         let elapsed_ms = |start: tokio::time::Instant| start.elapsed().as_millis() as u64;
         // A fresh username per allocation: it cannot change during one (RFC 8656 §7.2), so the
         // credential lifetime only has to cover this allocation.
-        let mut client = TurnClient::new(
-            server,
-            credentials.credentials_now(),
-            siphon_rtp_ice::gather::DEFAULT_RTO_MS,
-        );
-        // Bounded exactly like STUN gathering: a dead TURN server costs one deadline and a
+        let mut contenders: Vec<TurnClient> = turn
+            .servers
+            .iter()
+            .map(|server| {
+                TurnClient::new(
+                    *server,
+                    turn.credentials.credentials_now(),
+                    siphon_rtp_ice::gather::DEFAULT_RTO_MS,
+                )
+            })
+            .collect();
+        // Bounded exactly like STUN gathering: dead TURN servers cost one deadline in total and a
         // host-only candidate list, never a hung offer.
-        while elapsed_ms(started) < TURN_GATHER_DEADLINE_MS && !client.is_terminal() {
-            if client.is_allocated() {
-                break;
+        let winner = loop {
+            let winner = contenders.iter().position(TurnClient::is_allocated);
+            // Once a winner exists, only losers that already answered still need to be resolved.
+            let pending = contenders.iter().enumerate().any(|(index, client)| {
+                !client.is_terminal()
+                    && !client.is_allocated()
+                    && (winner.is_none() || client.is_challenged())
+                    && Some(index) != winner
+            });
+            if !pending || elapsed_ms(started) >= TURN_GATHER_DEADLINE_MS {
+                break winner;
             }
-            if let TurnAction::Send { datagram } = client.poll(elapsed_ms(started)) {
-                if let Err(error) = self.datapath.send(endpoint, server, &datagram).await {
-                    tracing::debug!(
-                        target: "siphon_rtp::control",
-                        ?endpoint, %server, %error,
-                        "failed to transmit a TURN allocation request"
-                    );
+            for client in &mut contenders {
+                if client.is_terminal() || client.is_allocated() {
+                    continue;
+                }
+                let server = client.server();
+                if let TurnAction::Send { datagram } = client.poll(elapsed_ms(started)) {
+                    if let Err(error) = self.datapath.send(endpoint, server, &datagram).await {
+                        tracing::debug!(
+                            target: "siphon_rtp::control",
+                            ?endpoint, %server, %error,
+                            "failed to transmit a TURN allocation request"
+                        );
+                    }
                 }
             }
             if let Ok(Ok(event)) = tokio::time::timeout(
@@ -343,25 +366,58 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             )
             .await
             {
-                // Only the server's own datagrams are the allocation's; a peer's early check on this
+                // Only a server's own datagrams are an allocation's; a peer's early check on this
                 // endpoint is not, and feeding it in would be uncorrelated noise.
-                if event.source == server {
+                if let Some(client) = contenders
+                    .iter_mut()
+                    .find(|client| client.server() == event.source)
+                {
                     client.on_datagram(&event.datagram, elapsed_ms(started));
                 }
             }
-        }
-        let Some(relayed_addr) = client.relayed_address() else {
-            // Say why, rather than silently shipping a smaller candidate list.
-            tracing::warn!(
-                target: "siphon_rtp::control",
-                ?endpoint,
-                %server,
-                state = ?client.state(),
-                elapsed_ms = elapsed_ms(started),
-                "TURN allocation did not come up — advertising without a relayed candidate from this server"
-            );
-            return None;
         };
+        let elapsed = elapsed_ms(started);
+        let mut winning = None;
+        for (index, mut client) in contenders.into_iter().enumerate() {
+            if Some(index) == winner {
+                winning = Some(client);
+                continue;
+            }
+            let server = client.server();
+            // A challenged loser may hold an allocation: either it is up, or its authenticated
+            // Allocate is still in flight and the server may yet grant it after we stop listening.
+            if client.is_allocated() || (client.is_challenged() && !client.is_terminal()) {
+                // RFC 8656 §7.1: free the loser's relay port now rather than at lifetime expiry.
+                client.close();
+                if let TurnAction::Send { datagram } = client.poll(elapsed) {
+                    if let Err(error) = self.datapath.send(endpoint, server, &datagram).await {
+                        tracing::debug!(
+                            target: "siphon_rtp::control",
+                            ?endpoint, %server, %error,
+                            "failed to transmit the delete of a losing TURN allocation"
+                        );
+                    }
+                }
+                tracing::debug!(
+                    target: "siphon_rtp::control",
+                    ?endpoint, %server,
+                    "TURN allocation raced and lost — deleted"
+                );
+            } else if winner.is_none() {
+                // Say why, rather than silently shipping a smaller candidate list.
+                tracing::warn!(
+                    target: "siphon_rtp::control",
+                    ?endpoint,
+                    %server,
+                    state = ?client.state(),
+                    elapsed_ms = elapsed,
+                    "TURN allocation did not come up — advertising without a relayed candidate from this server"
+                );
+            }
+        }
+        let client = winning?;
+        let server = client.server();
+        let relayed_addr = client.relayed_address()?;
         // RFC 8839 §5.1: a relayed candidate carries the mapped address as its related address.
         let mapped = client.mapped_address();
         // The allocation is live: install it on the datapath (no channels yet — they arrive as
@@ -371,6 +427,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Some(siphon_rtp_datapath::TurnRelay {
                 server,
                 channels: Vec::new(),
+                permitted: Vec::new(),
             }),
         );
         // Recorded for the agent whenever it registers: the agent is armed after gathering on
@@ -383,6 +440,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             TurnAllocation {
                 client,
                 published: Vec::new(),
+                published_permitted: Vec::new(),
                 last_driven_ms: 0,
             },
         );

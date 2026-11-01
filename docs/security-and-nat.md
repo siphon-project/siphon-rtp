@@ -314,11 +314,12 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > vectors) **plus the datapath connectivity-check responder**: on an ICE endpoint
 > (`Datapath::set_ice`), a STUN Binding check whose `USERNAME` addresses us and whose
 > `MESSAGE-INTEGRITY` verifies with our local password is answered with a signed Binding success
-> response and **adopts the validated source as the media path** (superseding blind latching); a
-> forged check is dropped. **Engine wiring (landed):** `sdp::parse`/`rewrite` carry ICE, `engine::ice`
+> response, and the source of a check that carries **USE-CANDIDATE** (a nomination, RFC 8445
+> §7.3.1.5) becomes the media path (superseding blind latching); a plain check is answered but
+> selects nothing, and a forged check is dropped. **Engine wiring (landed):** `sdp::parse`/`rewrite` carry ICE, `engine::ice`
 > mints credentials from the OS CSPRNG, and at offer/answer the engine re-originates ICE as
 > **ICE-lite** — advertising `a=ice-lite` + its own ufrag/pwd + a host candidate and calling
-> `set_ice` on the ICE legs, which then answer checks and adopt the validated source; end-to-end
+> `set_ice` on the ICE legs, which then answer checks and adopt the nominated source; end-to-end
 > tested. **Consent freshness (RFC 7675) is now wired and runnable** — see the bullet below.
 > **Candidate gathering (RFC 8445 §5.1.1) is wired**: the advertised candidate list is gathered per
 > leg and per component rather than being one hardcoded host line — host always, plus a
@@ -337,7 +338,24 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
-  never saw. The validated candidate pair, not "first packet wins", becomes the path.
+  never saw. The **nominated** candidate pair, not "first packet wins" and not "the last check", becomes
+  the path.
+- **An ice-lite leg selects only the nominated pair** (RFC 8445 §7.3.1.5, §6.1.3.2). A lite agent
+  answers every authenticated Binding request (§7.3) but a request moves the path only when it carries
+  `USE-CANDIDATE`. A browser with several interfaces checks from every local address and nominates one;
+  following each check sent the DTLS handshake and the seat egress to whichever address checked last,
+  often one the engine cannot reach. When several pairs are nominated the highest pair priority wins
+  (§8.1.1); a lite agent has one host candidate per component, so the request's `PRIORITY` orders them.
+  A lower-priority later nomination never moves an established path, an equal-or-higher one may (RFC
+  5245 aggressive nomination sets `USE-CANDIDATE` on every check, and keeps working). A peer that never
+  nominates gets no path: nothing is forwarded to or accepted from it and the DTLS handshake stays
+  held, which is strict per RFC and what every browser's controlling agent does. An ICE restart (new
+  local credentials through `set_ice`) clears the stored nomination, so the new session's first
+  nomination is taken whatever its priority, while the old path keeps carrying media until then (§9.3).
+  **Enforcement:** `datapath::respond_to_stun_check` reads the attribute and returns the priority as
+  `StunCheckOutcome::Respond { nomination }`, `datapath::nomination_supersedes` is the one ordering
+  rule, `handle_stun` (UDP) and `IceDemux::classify` (XDP) are the only callers that move the latch
+  or the adopted source, and both keep the per-endpoint nominated priority.
 - **Candidate gathering** (RFC 8445 §5.1.1) decides what we advertise as reachable, so it is part of
   the same story:
   - **Host** candidates come from the leg's own endpoints — one per component (RTP, plus RTCP when the
@@ -380,8 +398,9 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     selection without being told.
   - **A DTLS-SRTP leg keys the selected pair, not the signalled address** (RFC 8445 §12). Its
     handshake is held until ICE selects, then released and pointed at the chosen pair; records and
-    media follow it. Gated only when a full agent is actually running on that leg — otherwise no
-    selection is coming and waiting would hang a working leg.
+    media follow it. Gated on any ICE leg, full agent or ice-lite: under ice-lite the selection is the
+    peer's USE-CANDIDATE check, published through `Datapath::watch_ice_validated`. A leg without ICE
+    is not gated, since no selection is coming and waiting would hang a working leg.
   - **The engine's own pipeline follows the selection too.** A call `answer_local` terminates itself
     (IVR, announcement, echo, voicemail) runs the agent on its one leg when the engine runs agents.
     Its pipeline starts with the layer-2 gate open (the datapath's layer-4 gate admits only the
@@ -415,7 +434,7 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
   `Redirect` leg it must too, or an ICE endpoint ends up with *no* source gate at all. The
   `Redirect` arm therefore consults the identical verdict (`Inner::ice_gate`, the one definition both
   arms call, so the two paths cannot drift): an endpoint carrying ICE credentials hands the consumer
-  only the source a connectivity check validated — nothing before one has, nothing from another
+  only the source a nominating connectivity check selected — nothing before one has, nothing from another
   source after. Only the source is gated, never the packet class: a redirected endpoint is entitled
   to non-RTP (Layer 1), and STUN never reaches the arm at all because `recv_loop` routes it to the
   responder or the full agent first, which is what lets a check through and lets the latch form. A
@@ -436,7 +455,7 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     peer-reflexive check legitimately arrives from a transport the SDP never carried (RFC 8445
     §7.3.1.3), and MESSAGE-INTEGRITY — which the agent verifies — is a stronger gate than the address.
   - **Layers 2 and 3 are replaced by the adopted-source gate** (`rewrite::ice_media_allowed`): media
-    is forwarded only from the source ICE adopted, and nothing at all before a check has validated
+    is forwarded only from the source ICE adopted, and nothing at all before a check has nominated
     one. Without this an ICE leg on XDP would blind-latch the first RTP sender through
     `LatchPolicy::Symmetric` — exactly the RTPbleed hole ICE exists to close. The same-SSRC re-latch
     escape hatch layer 3 grants a plain relay is absent here on purpose: only an authenticated check
@@ -467,9 +486,15 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     from any other source are left untouched, so the seam cannot be used to forge a peer address; a
     message on a channel this allocation never bound is dropped rather than passed up as if it came
     from the server.
-  - **A destination with no channel is sent directly and untouched** — that is what keeps the
-    allocation's own requests (addressed to the server) and any peer reached over a host or
-    server-reflexive candidate on the direct path.
+  - **Both egress paths wrap.** `Datapath::send` and the `Forward` relay path share one framing
+    decision, so media forwarded toward a peer behind the allocation never leaves unwrapped. A
+    permitted peer with no channel yet (bind in flight or failed) is reached with a Send indication
+    (RFC 8656 §11.1); the check costs one relaxed atomic load when no allocation is installed.
+  - **Data indications are accepted only for a permitted peer** (RFC 8656 §11.4, §9): an indication
+    from the server naming a peer the allocation holds no permission for is dropped, never attributed.
+  - **A destination with no channel and no permission is sent directly and untouched** — that is
+    what keeps the allocation's own requests (addressed to the server) and any peer reached over a
+    host or server-reflexive candidate on the direct path.
   - **The candidate is not advertised unless it can be carried.** Gathering consults
     `Datapath::supports_turn_relay` and the allocation's actual state; a backend without the seam, or
     a TURN server that never answers, yields no relayed candidate at all. An advertised relay the peer
@@ -595,7 +620,7 @@ is wrong, and encryption defeats A2 eavesdrop.
 > and records them for a renegotiation. Both bridge endpoints re-enforce `bridge_source_filter` before
 > any crypto, exactly as on the far-leg bridge, except that an ICE-gated caller's endpoint runs that
 > filter open and leaves the discrimination to the datapath's layer-4 gate (see the source gate below).
-> The handshake, and the records and SRTP toward the caller, go to the source ICE validated rather than
+> The handshake, and the records and SRTP toward the caller, go to the pair ICE selected (nominated) rather than
 > to the caller's `c=`. A secure far leg, a caller that does not multiplex
 > RTCP, and a call that needs the decoded audio are refused (`secure-offerer-unsupported`), and a
 > caller with no `a=fingerprint` is refused as unkeyable, rather than any of them being relayed in
@@ -698,13 +723,13 @@ is wrong, and encryption defeats A2 eavesdrop.
   re-forwarded. The window is recorded only *after* authentication, so a forged packet can never
   advance or poison it; on an HA takeover the standby anchors the window at the checkpointed rollover
   index and keeps rejecting the primary's last-seen packet.
-- **An ICE DTLS leg keys the path ICE validated** (RFC 8445 §12, §12.1.1; `DtlsCallPlan::gate_on_ice`).
+- **An ICE DTLS leg keys the path ICE selected** (RFC 8445 §12, §12.1.1; `DtlsCallPlan::gate_on_ice`).
   The handshake is held until ICE has chosen the peer's transport: a full agent's selection, or on the
-  ICE-lite responder the source of the first check it validates. The datapath publishes that source
+  ICE-lite responder the source of the check that nominates a pair (`USE-CANDIDATE`). The datapath publishes that source
   per endpoint (`Datapath::watch_ice_validated`), from the same writes that set the adopted source:
   `handle_stun` and `adopt_source` on UDP, `IceDemux` and `adopt_source` on XDP. The bridge follows it
   for the life of the association, so records and SRTP never go to a NATed peer's unusable `c=`, and a
-  later validated source re-points them. A backend without the seam starts at the signalled address as
+  later equal-or-higher-priority nomination re-points them. A backend without the seam starts at the signalled address as
   before, since nothing would release the wait. Proven by
   `a_full_ice_dtls_offerer_is_keyed_on_the_pair_ice_selected_not_its_connection_address` and
   `an_ice_lite_dtls_offerer_is_keyed_on_the_source_its_check_validated`.
@@ -905,8 +930,8 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
     seat, and must not be read as one; it is deliberately open so the *datapath* gate can be the
     discriminator. Both halves are armed by the credentials `conference_join` installs
     (`set_ice` / `set_ice_agent`) — without them an ICE seat would fall back to that open filter alone.
-  - **An ice-lite seat's egress follows the validated source too** (RFC 8445 §12.1.1: data goes to the
-    valid pair's remote candidate). It has no agent to call `ice_selected`, so the daemon subscribes to
+  - **An ice-lite seat's egress follows the nominated source too** (RFC 8445 §12.1.1: data goes to the
+    valid pair's remote candidate; §7.3.1.5: only a `USE-CANDIDATE` check selects it). It has no agent to call `ice_selected`, so the daemon subscribes to
     `Datapath::watch_ice_validated` when it seats the participant and hands the room the same
     `ConferenceControl::IceSelected` a full agent's selection would — re-pointing `egress_dst` and
     narrowing the gate to the validated transport. Before that the room aimed the mix at the signalled
@@ -939,7 +964,7 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
     room down if it was the last member) rather than leaving it seated behind a gate that can never
     open.
   - **A DTLS-SRTP seat holds its handshake for ICE** (RFC 8445 §12, §12.1.1, `gate_on_ice`): a full
-    agent's selection, or on an ice-lite seat the source of the check the responder validated, both
+    agent's selection, or on an ice-lite seat the source of the check that nominated a pair, both
     published through `Datapath::watch_ice_validated`, and the handshake records follow that source. A
     seat without ICE starts at once, since nothing would release the wait. A secure WS takeover runs
     ICE only under a full agent, so its handshake always waits for the selection. Proven by
