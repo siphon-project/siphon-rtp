@@ -17,8 +17,14 @@ struct RealTurn {
 }
 
 async fn real_turn_server() -> RealTurn {
+    real_turn_server_granting(TurnConfig::new(REALM, SECRET).max_lifetime).await
+}
+
+/// The real server, granting at most `max_lifetime` seconds per allocation.
+async fn real_turn_server_granting(max_lifetime: u32) -> RealTurn {
     let datapath = UdpLoopbackDatapath::new();
     let mut config = TurnConfig::new(REALM, SECRET);
+    config.max_lifetime = max_lifetime;
     // The peers in these tests live on loopback, which the secure default denies.
     config.denied_peers = PeerIpPolicy::permissive();
     let unix_now = std::time::SystemTime::now()
@@ -217,7 +223,10 @@ async fn a_datagram_leaves_through_the_allocation_to_the_remote_candidate() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_allocation_is_refreshed_before_it_lapses_on_the_server() {
-    let server = real_turn_server().await;
+    // A 30 s grant puts the refresh (75 % of the lifetime) inside the window where the call is still
+    // up: the remote here never answers checks, so the agent fails and the call is reaped well
+    // before the default 600 s grant would fall due — and a reaped call deletes its allocation.
+    let server = real_turn_server_granting(30).await;
     let (_remote, remote_addr) = phone().await;
     let (_far, far_addr) = phone().await;
     let (engine, near_rtp, _offered) = relayed_call(&server, remote_addr, far_addr).await;
@@ -233,16 +242,17 @@ async fn the_allocation_is_refreshed_before_it_lapses_on_the_server() {
     let allocations = server.turn.allocation_count().await;
     assert!(allocations >= 1);
 
-    // Server clock 500 s in (default lifetime 600 s): still alive. The client's refresh falls due
-    // at 80 % of the granted lifetime on the ICE clock, so tick past it and let it round-trip.
-    server.datapath.advance_clock(500);
-    engine.drive_ice_agents(481_000).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    engine.drive_ice_agents(481_020).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Server clock 20 s in (granted 30 s): still alive. The client's refresh falls due at 75 % of
+    // the grant on the ICE clock, so tick through it in 20 ms steps and let it round-trip.
+    server.datapath.advance_clock(20);
+    drive_until(&engine, 20_000, 24_000, || false).await;
+    assert!(
+        engine.calls.contains_key("relayed"),
+        "the call is still up, so the allocation was refreshed, not deleted"
+    );
 
-    // 500 s further the original lifetime is long gone; only a refresh keeps the allocation.
-    server.datapath.advance_clock(500);
+    // 20 s further the original 30 s grant is gone; only the refresh keeps the allocation.
+    server.datapath.advance_clock(20);
     server.turn.reap();
     assert_eq!(
         server.turn.allocation_count().await,
@@ -250,10 +260,10 @@ async fn the_allocation_is_refreshed_before_it_lapses_on_the_server() {
         "the refresh extended the allocation past its original expiry"
     );
     assert!(
-        !engine
+        engine
             .ice_relays
             .get(&near_rtp)
-            .is_some_and(|allocation| allocation.client.is_terminal()),
+            .is_some_and(|allocation| !allocation.client.is_terminal()),
         "the client still holds a live allocation"
     );
 }

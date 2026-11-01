@@ -105,9 +105,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Delete `endpoint`'s TURN allocation, if it has one (RFC 8656 §7.1: a Refresh with
     /// `LIFETIME` 0), so the server frees the relay port now instead of when the lifetime lapses.
     ///
-    /// Best effort: the delete is one datagram sent on the leg's own socket just before it goes
-    /// away, so it is not retransmitted. When another request is still in flight on the client the
-    /// delete cannot be sent yet and the server reclaims the allocation when its lifetime lapses.
+    /// The delete is one datagram sent on the leg's own socket just before it goes away, so it is
+    /// not retransmitted: if it is lost the server reclaims the allocation when its lifetime lapses.
+    /// A request still in flight does not hold it back, because `close` abandons that request.
     pub(super) async fn release_turn_allocation(&self, endpoint: EndpointId) {
         if let Some(agents) = &self.ice_agents {
             agents.set_turn_server(endpoint, None);
