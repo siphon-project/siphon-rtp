@@ -405,11 +405,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.retire_dtls_endpoints(&[endpoint.id]);
                 self.endpoint_calls.remove(&endpoint.id);
                 self.awaiting_media.remove(&endpoint.id);
-                self.datapath.remove_endpoint(endpoint.id).await;
+                self.release_endpoint(endpoint.id).await;
                 if let Some(text_endpoint) = text_endpoint {
                     self.endpoint_calls.remove(&text_endpoint.id);
                     self.awaiting_media.remove(&text_endpoint.id);
-                    self.datapath.remove_endpoint(text_endpoint.id).await;
+                    self.release_endpoint(text_endpoint.id).await;
                 }
                 error_result("conference_join: SDP rewrite", &error)
             }
@@ -573,7 +573,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         for endpoint in endpoints {
             self.endpoint_calls.remove(&endpoint);
             self.awaiting_media.remove(&endpoint);
-            self.datapath.remove_endpoint(endpoint).await;
+            self.release_endpoint(endpoint).await;
         }
         ok_empty()
     }

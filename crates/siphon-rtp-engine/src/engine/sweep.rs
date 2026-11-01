@@ -223,7 +223,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             self.retire_dtls_endpoints(&[seat_endpoint]);
                             self.endpoint_calls.remove(&seat_endpoint);
                             self.awaiting_media.remove(&seat_endpoint);
-                            self.datapath.remove_endpoint(seat_endpoint).await;
+                            self.release_endpoint(seat_endpoint).await;
                         }
                         tracing::warn!(
                             target: "siphon_rtp::media",
@@ -292,10 +292,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .map(|agents| agents.remote_addresses(endpoint))
                 .unwrap_or_default();
 
-            let (server, datagrams, channels, terminal) = {
+            let (server, datagrams, relay_update, terminal) = {
                 let Some(mut allocation) = self.ice_relays.get_mut(&endpoint) else {
                     continue;
                 };
+                allocation.last_driven_ms = now_ms;
                 for peer in peers {
                     allocation.client.add_peer(peer);
                 }
@@ -314,19 +315,37 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .iter()
                     .filter_map(|binding| binding.channel.map(|channel| (binding.peer, channel)))
                     .collect();
-                let changed = channels != allocation.published;
+                let permitted: Vec<SocketAddr> = allocation
+                    .client
+                    .peers()
+                    .iter()
+                    .filter(|binding| binding.permitted)
+                    .map(|binding| binding.peer)
+                    .collect();
+                let changed =
+                    channels != allocation.published || permitted != allocation.published_permitted;
                 if changed {
                     allocation.published.clone_from(&channels);
+                    allocation.published_permitted.clone_from(&permitted);
                 }
                 let terminal = allocation.client.is_terminal();
-                (server, datagrams, changed.then_some(channels), terminal)
+                (
+                    server,
+                    datagrams,
+                    changed.then_some((channels, permitted)),
+                    terminal,
+                )
             };
 
-            // A newly bound (or lost) channel changes how the datapath frames this leg's traffic.
-            if let Some(channels) = channels {
+            // A newly bound (or lost) channel, or a new permission, changes how the datapath frames this leg's traffic.
+            if let Some((channels, permitted)) = relay_update {
                 self.datapath.set_turn_relay(
                     endpoint,
-                    Some(siphon_rtp_datapath::TurnRelay { server, channels }),
+                    Some(siphon_rtp_datapath::TurnRelay {
+                        server,
+                        channels,
+                        permitted,
+                    }),
                 );
             }
             for datagram in datagrams {
@@ -548,7 +567,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.stop_seat_ice_follow(&freed);
         self.retire_dtls_endpoints(&freed);
         for endpoint in &freed {
-            self.datapath.remove_endpoint(*endpoint).await;
+            self.release_endpoint(*endpoint).await;
             self.endpoint_calls.remove(endpoint);
             self.awaiting_media.remove(endpoint);
         }
@@ -586,7 +605,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.stop_seat_ice_follow(&freed);
         self.retire_dtls_endpoints(&freed);
         for endpoint in &freed {
-            self.datapath.remove_endpoint(*endpoint).await;
+            self.release_endpoint(*endpoint).await;
             self.endpoint_calls.remove(endpoint);
             self.awaiting_media.remove(endpoint);
         }

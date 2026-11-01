@@ -260,6 +260,14 @@ impl TurnClient {
         }
     }
 
+    /// Whether the server has answered the unauthenticated probe with its `401` challenge (RFC 8656
+    /// §7.2). Before that the server cannot hold an allocation for us, because it only allocates for
+    /// the authenticated Allocate, which is sent after the challenge.
+    #[must_use]
+    pub fn is_challenged(&self) -> bool {
+        self.realm.is_some()
+    }
+
     /// Whether the allocation is live.
     #[must_use]
     pub fn is_allocated(&self) -> bool {
@@ -332,9 +340,21 @@ impl TurnClient {
     /// Queued like any other request so it is retransmitted if lost; the state becomes
     /// [`TurnState::Closed`] when the server confirms. Calling this rather than just dropping the
     /// client is what stops the server holding a relay port until the lifetime lapses.
+    ///
+    /// Any other request still in flight is abandoned so the delete goes out on the next poll: once
+    /// the allocation is being deleted its answer no longer matters, and a client may stop
+    /// retransmitting a transaction it has given up on (RFC 8489 §6.2.1). A late answer to it no
+    /// longer matches the transaction in flight and is ignored.
     pub fn close(&mut self) {
         if self.is_terminal() {
             return;
+        }
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.pending != Pending::Refresh { lifetime: 0 })
+        {
+            self.in_flight = None;
         }
         self.queue
             .retain(|pending| matches!(pending, Pending::Refresh { lifetime: 0 }));
@@ -844,6 +864,19 @@ mod tests {
     }
 
     #[test]
+    fn a_client_is_challenged_only_once_the_server_answered_the_probe() {
+        let mut client = client();
+        assert!(!client.is_challenged());
+        let probe = take_send(&mut client, 0);
+        assert!(
+            !client.is_challenged(),
+            "an unanswered probe is not a challenge"
+        );
+        assert!(client.on_datagram(&challenge(&probe), 0));
+        assert!(client.is_challenged());
+    }
+
+    #[test]
     fn the_challenge_is_answered_with_a_signed_allocate() {
         let mut client = client();
         let probe = take_send(&mut client, 0);
@@ -1222,6 +1255,27 @@ mod tests {
         assert_eq!(client.state(), &TurnState::Closed);
         assert!(client.is_terminal());
         assert_eq!(client.poll(1_000), TurnAction::Idle);
+    }
+
+    #[test]
+    fn close_sends_the_delete_at_once_even_with_a_request_in_flight() {
+        // The engine closes the client just before the leg's socket goes away, so the delete gets one
+        // poll. Queued behind an unanswered CreatePermission it would never leave, and the server
+        // would hold the relay port until the lifetime lapsed.
+        let mut client = allocated();
+        client.add_peer(addr("198.51.100.21:40000"));
+        let permission = take_send(&mut client, 0);
+        client.close();
+        let delete = take_send(&mut client, 0);
+        assert_ne!(transaction_id_of(&delete), transaction_id_of(&permission));
+        let message = parse(&delete).expect("parse");
+        assert_eq!(method_of(message.message_type), turn::METHOD_REFRESH);
+        assert_eq!(turn::lifetime(&message), Some(0));
+
+        // A late answer to the abandoned request is ignored; the delete's own answer closes.
+        client.on_datagram(&success_for(&permission, turn::METHOD_CREATE_PERMISSION), 0);
+        client.on_datagram(&success_for(&delete, turn::METHOD_REFRESH), 0);
+        assert_eq!(client.state(), &TurnState::Closed);
     }
 
     #[test]

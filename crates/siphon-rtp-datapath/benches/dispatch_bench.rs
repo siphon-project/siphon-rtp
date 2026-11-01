@@ -169,6 +169,60 @@ fn bench_dispatch(criterion: &mut Criterion) {
             });
         });
     });
+    // --- The same relay with the far peer behind a TURN allocation: the egress is ChannelData-wrapped
+    // and addressed to the server (RFC 8656 §12). The extra cost over `forward_relay_160` is the
+    // wrap; with no allocation installed the check itself is one relaxed atomic load.
+    let (turn_datapath, turn_in, turn_peer, turn_server) = runtime.block_on(async {
+        let datapath = UdpLoopbackDatapath::new();
+        let ingress = datapath.alloc_endpoint().await.expect("alloc ingress");
+        let egress = datapath.alloc_endpoint().await.expect("alloc egress");
+        let (peer, peer_addr) = phone().await;
+        let (server, server_addr) = phone().await;
+        let far_addr: SocketAddr = (Ipv4Addr::new(192, 0, 2, 7), 4000).into();
+        datapath.set_turn_relay(
+            egress.id,
+            Some(siphon_rtp_datapath::TurnRelay {
+                server: server_addr,
+                channels: vec![(far_addr, 0x4001)],
+                permitted: vec![far_addr],
+            }),
+        );
+        datapath
+            .install_flow(
+                ingress.id,
+                FlowAction::Forward(ForwardRule {
+                    out_endpoint: egress.id,
+                    out_dst: Some(far_addr),
+                    accepted_source: SourceFilter::Exact(peer_addr.ip()),
+                    latch: LatchPolicy::SignalledOnly,
+                    rtcp_to_userspace: false,
+                }),
+            )
+            .expect("forward flow");
+        (datapath, ingress, peer, server)
+    });
+    let _ = &turn_datapath;
+    group.bench_function("forward_relay_turn_channel_160", |bencher| {
+        bencher.iter(|| {
+            runtime.block_on(async {
+                let mut scratch = [0u8; 2048];
+                for _ in 0..BURST {
+                    turn_peer
+                        .send_to(black_box(&packet), turn_in.local_addr)
+                        .await
+                        .expect("send");
+                }
+                for _ in 0..BURST {
+                    black_box(
+                        turn_server
+                            .recv_from(&mut scratch)
+                            .await
+                            .expect("wrapped packet"),
+                    );
+                }
+            });
+        });
+    });
     group.finish();
 
     // --- The gate's own lookups, isolated from the syscalls above.

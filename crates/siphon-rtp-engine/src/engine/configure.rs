@@ -20,7 +20,7 @@ use crate::udptl_pipeline::UdptlRegistry;
 use crate::ws_bridge::WsRegistry;
 use crate::x3::X3Config;
 
-use super::{Engine, TurnServerConfig};
+use super::{Engine, TurnClientConfig, TurnCredentialSource, TurnServerConfig};
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Create an engine over `datapath` with no per-client call quota.
@@ -88,7 +88,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_agents: None,
             // Host-only gathering unless the operator names a STUN server.
             stun_servers: Vec::new(),
-            turn_server: None,
+            turn_client: None,
             ice_relays: Arc::new(DashMap::new()),
             ws_tees: DashMap::new(),
             prompts: Arc::new(crate::prompt_cache::PromptCache::new(
@@ -138,7 +138,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// server-reflexive candidates and pays nothing for the relay it never uses.
     #[must_use]
     pub fn with_turn_server(mut self, config: TurnServerConfig) -> Self {
-        self.turn_server = Some(config);
+        self.turn_client = Some(TurnClientConfig {
+            servers: vec![config.server],
+            credentials: TurnCredentialSource::Static {
+                username: config.username,
+                password: config.password,
+            },
+        });
+        self
+    }
+
+    /// Allocate ICE **relayed** candidates against these TURN servers, raced (the first to allocate wins), with
+    /// credentials minted per allocation (RFC 8656).
+    ///
+    /// Requires the full ICE agent ([`Self::with_full_ice`]): a relayed candidate is only usable
+    /// once the remote candidates have a permission on the allocation, which only the checklist
+    /// knows (RFC 8445 §2.5: a lite agent advertises host candidates only). The daemon refuses
+    /// the combination at startup; building it here would advertise an allocation nothing refreshes.
+    #[must_use]
+    pub fn with_turn_client(mut self, config: TurnClientConfig) -> Self {
+        self.turn_client = Some(config);
         self
     }
 

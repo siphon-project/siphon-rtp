@@ -58,7 +58,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 agents.unregister_call(call_id);
             }
             for endpoint in endpoints {
-                self.datapath.remove_endpoint(endpoint).await;
+                self.release_endpoint(endpoint).await;
                 self.endpoint_calls.remove(&endpoint);
                 self.awaiting_media.remove(&endpoint);
             }
@@ -319,7 +319,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             agents.unregister_call(call_id);
         }
         for endpoint in endpoints {
-            self.datapath.remove_endpoint(endpoint).await;
+            self.release_endpoint(endpoint).await;
             self.endpoint_calls.remove(&endpoint);
             self.awaiting_media.remove(&endpoint);
         }

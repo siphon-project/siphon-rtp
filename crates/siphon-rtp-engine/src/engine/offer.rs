@@ -503,7 +503,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let far_text = match self.alloc_endpoints(1, far_family, far_bind).await {
                 Ok(mut allocated) => allocated.remove(0),
                 Err(reason) => {
-                    self.datapath.remove_endpoint(near_text.id).await;
+                    self.release_endpoint(near_text.id).await;
                     self.free(endpoints).await;
                     return Err(Box::new(CmdResult::Error { reason }));
                 }
@@ -624,7 +624,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let far_image = match self.alloc_endpoints(1, far_family, far_bind).await {
             Ok(mut allocated) => allocated.remove(0),
             Err(reason) => {
-                self.datapath.remove_endpoint(near_image.id).await;
+                self.release_endpoint(near_image.id).await;
                 self.free(endpoints).await;
                 return Err(Box::new(CmdResult::Error { reason }));
             }

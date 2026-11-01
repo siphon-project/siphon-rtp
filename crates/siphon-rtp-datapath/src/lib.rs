@@ -448,9 +448,9 @@ pub fn respond_to_stun_check(
 /// reverse. Without this the candidate would be advertised, possibly nominated, and then blackhole
 /// media — worse than never offering it.
 ///
-/// Only **ChannelData** framing (§11) is carried here, not Send/Data indications (§10): the client
-/// binds a channel for every peer before it sends, and 4 bytes of per-packet overhead on a 20 ms
-/// audio stream is the difference worth having over 36.
+/// A bound peer rides **ChannelData** (RFC 8656 §12, 4 bytes of overhead on a 20 ms audio stream).
+/// A peer that has a permission but no channel yet (the bind is still in flight, or failed) rides
+/// Send and Data indications (§11), the fallback the RFC requires clients to support.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnRelay {
     /// The TURN server's transport address — where every wrapped datagram is actually sent, and the
@@ -460,9 +460,21 @@ pub struct TurnRelay {
     /// this list is **not** relayed: it is sent directly, which is correct for the TURN server itself
     /// (allocation requests) and for a peer we reach over a host or server-reflexive candidate.
     pub channels: Vec<(SocketAddr, u16)>,
+    /// Peers the server holds a permission for (RFC 8656 §9), channel-bound or not. Egress to a
+    /// permitted peer with no channel goes out as a Send indication, and a Data indication is only
+    /// accepted from a permitted peer: the server relays nothing else, so an indication naming any
+    /// other peer is not from an allocation we made.
+    pub permitted: Vec<SocketAddr>,
 }
 
 impl TurnRelay {
+    /// Whether the server relays `peer`'s traffic to us: it has a permission, or a bound channel
+    /// (a channel binding installs a permission as a side effect, RFC 8656 §12).
+    #[must_use]
+    pub fn is_permitted(&self, peer: SocketAddr) -> bool {
+        self.permitted.contains(&peer) || self.channel_for(peer).is_some()
+    }
+
     /// The channel bound for `peer`, if any — i.e. whether traffic to it must be relay-wrapped.
     #[must_use]
     pub fn channel_for(&self, peer: SocketAddr) -> Option<u16> {

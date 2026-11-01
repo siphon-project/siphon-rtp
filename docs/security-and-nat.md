@@ -5,7 +5,7 @@
 > built-in TURN server, SRTP-SDES (RFC 3711 / 4568), and DTLS-SRTP (RFC 5764) all ship today, as does
 > RFC 7675 consent freshness (opt-in, `--ice-consent` — §4.4). Candidate gathering, the full RFC 8445
 > agent (`--ice-full`), ICE restart (the `reoffer` verb, RFC 8445 §9), trickle-receive (RFC 8838), and
-> a TURN **client** (wired at the engine API, `Engine::with_turn_server`, not a daemon flag) all ship
+> a TURN **client** (`--turn-client`, which requires `--ice-full`) all ship
 > too; ICE-lite is the **default** responder posture, not the only one. Crypto posture: secure legs
 > stay secure end to end, and a plaintext leg can
 > still run behind network-layer security (IPsec / SBC / private bearer) where a deployment prefers
@@ -328,10 +328,13 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > resolution, peer-reflexive discovery, and regular nomination — with media gated on the selected
 > pair. **ICE restart (§9) and trickle-receive (RFC 8838) are wired**, and the **XDP kernel datapath
 > now enforces the same layer-4 gate** as the userspace one (see the bullet below).
-> **Relayed candidates are wired too** (via a TURN *client* at the engine API,
-> `Engine::with_turn_server`, not a daemon flag): the engine can act as a TURN client as well as a
-> server, and a relayed candidate is advertised only when the allocation actually came up and the
-> datapath can relay through it. RTCP-port ICE under non-mux is wired.
+> **Relayed candidates are wired too** (a TURN *client*, `--turn-client`, which requires `--ice-full`
+> because only the full agent's checklist knows which remote candidates need a permission, and an
+> ICE-lite agent advertises host candidates only, RFC 8445 §2.5): the engine can act as a TURN client
+> as well as a server, and a relayed candidate is advertised only when the allocation actually came up
+> and the datapath can relay through it. Each allocation is refreshed for the life of the leg, gets a
+> permission and channel for every remote candidate, and is deleted (Refresh with lifetime 0) when
+> its endpoint is released. RTCP-port ICE under non-mux is wired.
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
@@ -483,9 +486,15 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     from any other source are left untouched, so the seam cannot be used to forge a peer address; a
     message on a channel this allocation never bound is dropped rather than passed up as if it came
     from the server.
-  - **A destination with no channel is sent directly and untouched** — that is what keeps the
-    allocation's own requests (addressed to the server) and any peer reached over a host or
-    server-reflexive candidate on the direct path.
+  - **Both egress paths wrap.** `Datapath::send` and the `Forward` relay path share one framing
+    decision, so media forwarded toward a peer behind the allocation never leaves unwrapped. A
+    permitted peer with no channel yet (bind in flight or failed) is reached with a Send indication
+    (RFC 8656 §11.1); the check costs one relaxed atomic load when no allocation is installed.
+  - **Data indications are accepted only for a permitted peer** (RFC 8656 §11.4, §9): an indication
+    from the server naming a peer the allocation holds no permission for is dropped, never attributed.
+  - **A destination with no channel and no permission is sent directly and untouched** — that is
+    what keeps the allocation's own requests (addressed to the server) and any peer reached over a
+    host or server-reflexive candidate on the direct path.
   - **The candidate is not advertised unless it can be carried.** Gathering consults
     `Datapath::supports_turn_relay` and the allocation's actual state; a backend without the seam, or
     a TURN server that never answers, yields no relayed candidate at all. An advertised relay the peer

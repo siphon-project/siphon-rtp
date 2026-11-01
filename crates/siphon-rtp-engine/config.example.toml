@@ -161,6 +161,32 @@ control = "127.0.0.1:8080"
 # behaviour; a full agent runs its own checks).
 # ice_full = false
 
+# --- TURN client: relayed ICE candidates (RFC 8656) ----------------------------------------------
+#
+# Allocate a relayed candidate on each ICE endpoint from an external TURN server such as coturn
+# (CLI: --turn-client, --turn-client-secret-file, --turn-client-ttl). Default: none, i.e. host (and
+# optional server-reflexive) candidates only.
+#
+# For a media engine that sits behind a NAT or firewall that WebRTC peers cannot reach directly, or
+# for peers that can only send to a relay. Requires `ice_full = true`: a relayed candidate is only
+# usable once the remote candidates have a permission on the allocation, which only the full agent's
+# checklist knows; an ICE-lite agent advertises host candidates only (RFC 8445 §2.5). The daemon
+# refuses to start otherwise.
+#
+# Servers are `turn:host[:port]` URIs, raced; the first to allocate wins for an
+# endpoint and the others are deleted. Hostnames are resolved once at startup. UDP only for now: `turns:` and
+# `?transport=tcp` are refused.
+#
+# Credentials follow the coturn `use-auth-secret` (TURN REST) scheme: the file holds the server's
+# `static-auth-secret`, and every allocation mints the username `<unix expiry>:<node_id>` with
+# password base64(HMAC-SHA1(secret, username)). TURN forbids changing the username during an
+# allocation (RFC 8656 §7.2), so `turn_client_ttl` (seconds, default 86400) must outlive the longest
+# call; each new allocation gets a fresh one. Matching coturn config: `use-auth-secret` and
+# `static-auth-secret=<the same secret>`.
+# turn_client = ["turn:turn.example.com:3478"]
+# turn_client_secret_file = "/run/secrets/siphon-rtp-turn-secret"
+# turn_client_ttl = 86400
+
 # --- ICE consent freshness (RFC 7675) -----------------------------------------------------------
 #
 # Actively probe ICE legs on their validated candidate pair and tear a call down when the peer stops

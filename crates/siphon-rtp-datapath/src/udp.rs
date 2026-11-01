@@ -210,6 +210,10 @@ struct Inner {
     /// Per-endpoint TURN allocation the leg relays through (RFC 5766 §11 ChannelData). Present only
     /// for a leg whose ICE selected a **relayed** local candidate.
     turn_relay: DashMap<EndpointId, crate::TurnRelay>,
+    /// How many endpoints have a [`Self::turn_relay`] entry. The relay-forward path reads this one
+    /// relaxed atomic before touching the map, so a node with no TURN allocation (the default)
+    /// pays nothing per packet for the egress check.
+    turn_relay_count: AtomicUsize,
     /// Per-endpoint ICE-lite credentials; when present, STUN checks are answered and the validated
     /// source is adopted as the media path (RFC 8445).
     ice: DashMap<EndpointId, IceConfig>,
@@ -348,7 +352,26 @@ impl Inner {
                         return;
                     }
                 };
-                match out.0.send_to(payload, destination).await {
+                // RFC 8656 §11.1 / §12: a destination behind the out leg's allocation is reached
+                // through the TURN server, so it goes out framed and addressed to the server, the
+                // same framing `send` applies. Free when no allocation is installed.
+                let egress = if self.turn_relay_count.load(Ordering::Relaxed) == 0 {
+                    RelayEgress::Direct
+                } else {
+                    match self.turn_relay.get(&rule.out_endpoint) {
+                        Some(relay) => relay_egress(&relay, destination, payload),
+                        None => RelayEgress::Direct,
+                    }
+                };
+                let sent = match egress {
+                    RelayEgress::Direct => out.0.send_to(payload, destination).await,
+                    RelayEgress::Wrapped { wire, server } => out.0.send_to(&wire, server).await,
+                    RelayEgress::Unavailable => {
+                        in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
+                match sent {
                     Ok(sent) => {
                         out.1.packets_out.fetch_add(1, Ordering::Relaxed);
                         out.1.bytes_out.fetch_add(sent as u64, Ordering::Relaxed);
@@ -616,6 +639,7 @@ impl UdpLoopbackDatapath {
                 ice: DashMap::new(),
                 ice_nominated: DashMap::new(),
                 turn_relay: DashMap::new(),
+                turn_relay_count: AtomicUsize::new(0),
                 ice_events: DashMap::new(),
                 ice_forward_only: DashMap::new(),
                 ice_validated: DashMap::new(),
@@ -956,10 +980,86 @@ enum RelayIngress {
         range: std::ops::Range<usize>,
         peer: SocketAddr,
     },
+    /// A Data indication from the allocation's server (RFC 8656 §11.4): `payload` is its DATA,
+    /// attributed to the permitted `peer` named by its XOR-PEER-ADDRESS.
+    Indication { payload: Vec<u8>, peer: SocketAddr },
     /// Relayed-looking traffic we cannot attribute — a malformed ChannelData message, or one on a
     /// channel this allocation never bound. Dropped rather than passed up as if it came from the
     /// server, which would let the TURN server's address reach the media gate.
     Drop,
+}
+
+/// Whether `datagram` is a STUN Data indication (RFC 8656 §11.4): method DATA, class indication.
+fn is_data_indication(datagram: &[u8]) -> bool {
+    use siphon_rtp_stun::turn;
+    let expected = turn::message_type(turn::METHOD_DATA, turn::CLASS_INDICATION).to_be_bytes();
+    datagram.len() >= 20 && datagram[..2] == expected
+}
+
+/// Unwrap a Data indication from the allocation's server. Dropped unless it is well formed and names
+/// a peer the server holds a permission for (RFC 8656 §9): the server relays nothing else, so any
+/// other peer address did not come from our allocation.
+fn unwrap_data_indication(relay: &crate::TurnRelay, datagram: &[u8]) -> RelayIngress {
+    use siphon_rtp_stun::turn;
+    let Ok(message) = siphon_rtp_stun::parse(datagram) else {
+        return RelayIngress::Drop;
+    };
+    let (Some(peer), Some(payload)) = (turn::xor_peer_address(&message), turn::data(&message))
+    else {
+        return RelayIngress::Drop;
+    };
+    if !relay.is_permitted(peer) {
+        return RelayIngress::Drop;
+    }
+    RelayIngress::Indication {
+        payload: payload.to_vec(),
+        peer,
+    }
+}
+
+/// How a datagram for `dst` leaves a leg that relays through a TURN allocation.
+enum RelayEgress {
+    /// Not a relayed destination: send the bytes to `dst` untouched.
+    Direct,
+    /// Send `wire` to the TURN server instead.
+    Wrapped { wire: Vec<u8>, server: SocketAddr },
+    /// A relayed destination whose framing could not be built (no OS randomness for the Send
+    /// indication's transaction id). Never fall back to sending it direct: the peer is only
+    /// reachable through the allocation.
+    Unavailable,
+}
+
+/// Frame `payload` for `dst` through `relay`: ChannelData for a bound peer (RFC 8656 §12), a Send
+/// indication for a permitted peer with no channel (§11.1), nothing for anyone else.
+fn relay_egress(relay: &crate::TurnRelay, dst: SocketAddr, payload: &[u8]) -> RelayEgress {
+    use siphon_rtp_stun::turn;
+    if let Some(channel) = relay.channel_for(dst) {
+        return RelayEgress::Wrapped {
+            wire: turn::encode_channel_data(channel, payload, false),
+            server: relay.server,
+        };
+    }
+    if !relay.permitted.contains(&dst) {
+        return RelayEgress::Direct;
+    }
+    // RFC 8489 §6.3.2 / §5: the transaction id of an indication is still random.
+    let Some(id) = siphon_rtp_stun::client::TransactionId::new() else {
+        return RelayEgress::Unavailable;
+    };
+    let id = id.as_bytes();
+    RelayEgress::Wrapped {
+        wire: siphon_rtp_stun::MessageBuilder::new(
+            turn::message_type(turn::METHOD_SEND, turn::CLASS_INDICATION),
+            id,
+        )
+        .attribute(
+            turn::ATTR_XOR_PEER_ADDRESS,
+            &turn::xor_address_value(dst, id),
+        )
+        .attribute(turn::ATTR_DATA, payload)
+        .finish(None, false),
+        server: relay.server,
+    }
 }
 
 /// Strip RFC 5766 §11 ChannelData framing from a datagram that arrived on a relaying endpoint.
@@ -984,6 +1084,12 @@ fn relay_unwrap(
     // The server also sends us STUN on this 5-tuple (allocation responses); those are not
     // ChannelData and must reach the client state machine untouched.
     if !siphon_rtp_stun::turn::is_channel_data(first) {
+        // RFC 8656 §11.4: a peer's data also arrives as a Data indication until the channel is
+        // bound (and for good when ChannelBind fails). Every other STUN message is the client
+        // state machine's.
+        if is_data_indication(datagram) {
+            return unwrap_data_indication(relay.value(), datagram);
+        }
         return RelayIngress::Direct;
     }
     let Some(message) = siphon_rtp_stun::turn::parse_channel_data(datagram) else {
@@ -1037,6 +1143,11 @@ async fn recv_loop(
         let (payload_range, source) = match relay_unwrap(&inner, endpoint, source, &buffer[..len]) {
             RelayIngress::Direct => (0..len, source),
             RelayIngress::Unwrapped { range, peer } => (range, peer),
+            RelayIngress::Indication { payload, peer } => {
+                // The DATA is smaller than the datagram it arrived in, so it fits the buffer.
+                buffer[..payload.len()].copy_from_slice(&payload);
+                (0..payload.len(), peer)
+            }
             RelayIngress::Drop => {
                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -1169,6 +1280,9 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner.ice_nominated.remove(&endpoint);
         self.inner.ice_events.remove(&endpoint);
         self.inner.ice_validated.remove(&endpoint);
+        if self.inner.turn_relay.remove(&endpoint).is_some() {
+            self.inner.turn_relay_count.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     async fn send(
@@ -1185,17 +1299,18 @@ impl Datapath for UdpLoopbackDatapath {
         // wrapped in ChannelData and addressed to the server — the peer is not reachable from here
         // directly, that is the whole reason the allocation exists. A destination with no channel
         // (the server itself, or a peer we reach over a host/srflx candidate) is sent untouched.
-        let (wire, target) = match self.inner.turn_relay.get(&endpoint) {
-            Some(relay) => match relay.channel_for(dst) {
-                Some(channel) => (
-                    std::borrow::Cow::Owned(siphon_rtp_stun::turn::encode_channel_data(
-                        channel, data, false,
-                    )),
-                    relay.server,
-                ),
-                None => (std::borrow::Cow::Borrowed(data), dst),
-            },
-            None => (std::borrow::Cow::Borrowed(data), dst),
+        let egress = match self.inner.turn_relay.get(&endpoint) {
+            Some(relay) => relay_egress(&relay, dst, data),
+            None => RelayEgress::Direct,
+        };
+        let (wire, target) = match egress {
+            RelayEgress::Direct => (std::borrow::Cow::Borrowed(data), dst),
+            RelayEgress::Wrapped { wire, server } => (std::borrow::Cow::Owned(wire), server),
+            RelayEgress::Unavailable => {
+                return Err(DatapathError::Send(std::io::Error::other(
+                    "no randomness for a TURN Send indication",
+                )))
+            }
         };
         let sent = socket
             .send_to(&wire, target)
@@ -1249,10 +1364,14 @@ impl Datapath for UdpLoopbackDatapath {
     fn set_turn_relay(&self, endpoint: EndpointId, relay: Option<crate::TurnRelay>) {
         match relay {
             Some(relay) => {
-                self.inner.turn_relay.insert(endpoint, relay);
+                if self.inner.turn_relay.insert(endpoint, relay).is_none() {
+                    self.inner.turn_relay_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
             None => {
-                self.inner.turn_relay.remove(&endpoint);
+                if self.inner.turn_relay.remove(&endpoint).is_some() {
+                    self.inner.turn_relay_count.fetch_sub(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1859,6 +1978,7 @@ mod tests {
         let relay = crate::TurnRelay {
             server: server_addr,
             channels: vec![(peer, CHANNEL)],
+            permitted: vec![peer],
         };
         (server, relay, CHANNEL)
     }
@@ -1892,6 +2012,288 @@ mod tests {
             &payload[..],
             "the payload rides the channel intact"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarded_media_toward_a_channel_bound_peer_is_wrapped_for_the_server() {
+        // The kernel-style relay path (`FlowAction::Forward`) must honour the out endpoint's
+        // allocation exactly as `send` does: a peer behind the allocation is not reachable directly.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (source, _) = phone().await;
+        let (_peer_socket, peer_addr) = phone().await;
+        let (server, relay, channel) = turn_relay_for(peer_addr).await;
+        datapath.set_turn_relay(leg_b.id, Some(relay));
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(peer_addr))),
+            )
+            .expect("flow");
+
+        let payload = rtp(0x1010_1010, 1);
+        source
+            .send_to(&payload, leg_a.local_addr)
+            .await
+            .expect("media in");
+
+        let (wire, from) = recv(&server).await;
+        assert_eq!(from.port(), leg_b.local_addr.port(), "from the out leg");
+        let framed = siphon_rtp_stun::turn::parse_channel_data(&wire).expect("ChannelData");
+        assert_eq!(framed.channel, channel);
+        assert_eq!(framed.data, &payload[..]);
+        let stats = datapath.stats(leg_b.id).expect("stats");
+        assert_eq!(stats.packets_out, 1);
+        assert_eq!(stats.bytes_out, wire.len() as u64, "counts the wire bytes");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarded_media_to_a_peer_without_a_channel_still_goes_direct() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (source, _) = phone().await;
+        let (bound_socket, bound_peer) = phone().await;
+        let (direct, direct_addr) = phone().await;
+        let (_server, relay, _) = turn_relay_for(bound_peer).await;
+        drop(bound_socket);
+        datapath.set_turn_relay(leg_b.id, Some(relay));
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(direct_addr))),
+            )
+            .expect("flow");
+
+        let payload = rtp(0x1111_1111, 1);
+        source
+            .send_to(&payload, leg_a.local_addr)
+            .await
+            .expect("media in");
+        let (wire, _) = recv(&direct).await;
+        assert_eq!(wire, payload, "an unbound destination is untouched");
+    }
+
+    /// A relay whose only knowledge of `peer` is a permission: no channel is bound.
+    async fn permission_only_relay_for(peer: SocketAddr) -> (UdpSocket, crate::TurnRelay) {
+        let (server, server_addr) = phone().await;
+        let relay = crate::TurnRelay {
+            server: server_addr,
+            channels: Vec::new(),
+            permitted: vec![peer],
+        };
+        (server, relay)
+    }
+
+    fn data_indication(peer: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        use siphon_rtp_stun::turn;
+        let id = [7u8; 12];
+        siphon_rtp_stun::MessageBuilder::new(
+            turn::message_type(turn::METHOD_DATA, turn::CLASS_INDICATION),
+            &id,
+        )
+        .attribute(
+            turn::ATTR_XOR_PEER_ADDRESS,
+            &turn::xor_address_value(peer, &id),
+        )
+        .attribute(turn::ATTR_DATA, payload)
+        .finish(None, false)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_data_indication_from_the_server_is_unwrapped_for_a_permitted_peer() {
+        // RFC 8656 §11.4: before ChannelBind completes (or after it failed) a peer's packets reach
+        // us as Data indications. They must be attributed to the peer exactly like ChannelData.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (_peer_socket, peer_addr) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        let (server, relay) = permission_only_relay_for(peer_addr).await;
+        datapath.set_turn_relay(leg_a.id, Some(relay));
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::signalled(
+                    leg_b.id,
+                    Some(callee_addr),
+                    peer_addr.ip(),
+                )),
+            )
+            .expect("flow");
+
+        let payload = rtp(0x2020_2020, 1);
+        server
+            .send_to(&data_indication(peer_addr, &payload), leg_a.local_addr)
+            .await
+            .expect("indication in");
+
+        let (relayed, _) = recv(&callee).await;
+        assert_eq!(relayed, payload, "the indication's DATA is the media");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_data_indication_naming_an_unpermitted_peer_is_dropped() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (_peer_socket, peer_addr) = phone().await;
+        let (_stranger_socket, stranger_addr) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        let (server, relay) = permission_only_relay_for(peer_addr).await;
+        datapath.set_turn_relay(leg_a.id, Some(relay));
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(callee_addr))),
+            )
+            .expect("flow");
+
+        server
+            .send_to(
+                &data_indication(stranger_addr, &rtp(0x2121_2121, 1)),
+                leg_a.local_addr,
+            )
+            .await
+            .expect("indication in");
+
+        let mut buffer = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, callee.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "the server relays only permitted peers, so any other peer address is not trusted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_data_indication_from_anywhere_but_the_allocation_server_is_not_unwrapped() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (_peer_socket, peer_addr) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        let (attacker, _) = phone().await;
+        let (_server, relay) = permission_only_relay_for(peer_addr).await;
+        datapath.set_turn_relay(leg_a.id, Some(relay));
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::signalled(
+                    leg_b.id,
+                    Some(callee_addr),
+                    peer_addr.ip(),
+                )),
+            )
+            .expect("flow");
+
+        attacker
+            .send_to(
+                &data_indication(peer_addr, &rtp(0x2222_2222, 1)),
+                leg_a.local_addr,
+            )
+            .await
+            .expect("forged");
+
+        let mut buffer = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, callee.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "a forged indication must not be attributed to the permitted peer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_malformed_data_indication_is_dropped_not_passed_up() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (_peer_socket, peer_addr) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        let (server, relay) = permission_only_relay_for(peer_addr).await;
+        datapath.set_turn_relay(leg_a.id, Some(relay));
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(callee_addr))),
+            )
+            .expect("flow");
+
+        // A Data indication type with a header that claims more attributes than it carries.
+        let mut broken = data_indication(peer_addr, &rtp(0x2323_2323, 1));
+        broken.truncate(broken.len() - 6);
+        server
+            .send_to(&broken, leg_a.local_addr)
+            .await
+            .expect("broken in");
+
+        let mut buffer = [0u8; MAX_DATAGRAM];
+        assert!(timeout(NEGATIVE, callee.recv_from(&mut buffer))
+            .await
+            .is_err());
+        assert_eq!(datapath.stats(leg_a.id).expect("stats").packets_dropped, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn egress_to_a_permitted_peer_without_a_channel_is_a_send_indication() {
+        // RFC 8656 §11.1: with a permission but no channel, data to the peer goes to the server as
+        // a Send indication carrying XOR-PEER-ADDRESS and DATA.
+        use siphon_rtp_stun::turn;
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let (_peer_socket, peer_addr) = phone().await;
+        let (server, relay) = permission_only_relay_for(peer_addr).await;
+        datapath.set_turn_relay(leg.id, Some(relay));
+
+        let payload = rtp(0x2424_2424, 1);
+        datapath
+            .send(leg.id, peer_addr, &payload)
+            .await
+            .expect("send");
+
+        let (wire, from) = recv(&server).await;
+        assert_eq!(from.port(), leg.local_addr.port());
+        let message = siphon_rtp_stun::parse(&wire).expect("a STUN message");
+        assert_eq!(
+            message.message_type,
+            turn::message_type(turn::METHOD_SEND, turn::CLASS_INDICATION)
+        );
+        assert_eq!(turn::xor_peer_address(&message), Some(peer_addr));
+        assert_eq!(turn::data(&message), Some(&payload[..]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarded_media_to_a_permitted_peer_without_a_channel_is_a_send_indication() {
+        use siphon_rtp_stun::turn;
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (source, _) = phone().await;
+        let (_peer_socket, peer_addr) = phone().await;
+        let (server, relay) = permission_only_relay_for(peer_addr).await;
+        datapath.set_turn_relay(leg_b.id, Some(relay));
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(peer_addr))),
+            )
+            .expect("flow");
+
+        let payload = rtp(0x2525_2525, 1);
+        source
+            .send_to(&payload, leg_a.local_addr)
+            .await
+            .expect("media in");
+
+        let (wire, _) = recv(&server).await;
+        let message = siphon_rtp_stun::parse(&wire).expect("a STUN message");
+        assert_eq!(
+            message.message_type,
+            turn::message_type(turn::METHOD_SEND, turn::CLASS_INDICATION)
+        );
+        assert_eq!(turn::data(&message), Some(&payload[..]));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

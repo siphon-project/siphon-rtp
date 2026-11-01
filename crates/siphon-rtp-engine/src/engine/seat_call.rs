@@ -859,10 +859,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             if let Some(agents) = &self.ice_agents {
                 agents.unregister(endpoint);
             }
-            self.ice_relays.remove(&endpoint);
             self.endpoint_calls.remove(&endpoint);
             self.awaiting_media.remove(&endpoint);
-            self.datapath.remove_endpoint(endpoint).await;
+            self.release_endpoint(endpoint).await;
         }
     }
 

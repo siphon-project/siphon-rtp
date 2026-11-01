@@ -567,6 +567,10 @@ struct AgentEntry {
 #[derive(Debug)]
 pub struct AgentSupervisor {
     agents: DashMap<EndpointId, AgentEntry>,
+    /// The TURN server each endpoint relays through, kept apart from the agents. An allocation is
+    /// made while gathering, before the endpoint's agent is registered (and re-registered on a
+    /// re-offer), so the routing must survive and attach to whichever agent is registered later.
+    turn_servers: DashMap<EndpointId, SocketAddr>,
     events_tx: flume::Sender<IceDatapathEvent>,
     events_rx: flume::Receiver<IceDatapathEvent>,
 }
@@ -584,6 +588,7 @@ impl AgentSupervisor {
         let (events_tx, events_rx) = flume::bounded(EVENT_QUEUE_DEPTH);
         Self {
             agents: DashMap::new(),
+            turn_servers: DashMap::new(),
             events_tx,
             events_rx,
         }
@@ -616,6 +621,9 @@ impl AgentSupervisor {
         config: AgentConfig,
         now_ms: u64,
     ) {
+        // RFC 8656: an allocation gathered before this agent existed shares its 5-tuple, so its
+        // responses must reach the allocation, not this agent's checklist.
+        let turn_server = self.turn_servers.get(&endpoint).map(|server| *server);
         self.agents.insert(
             endpoint,
             AgentEntry {
@@ -623,7 +631,7 @@ impl AgentSupervisor {
                 local,
                 agent: IceAgent::new(config, now_ms),
                 announced: false,
-                turn_server: None,
+                turn_server,
             },
         );
     }
@@ -696,9 +704,17 @@ impl AgentSupervisor {
     }
 
     /// Declare the TURN server `endpoint` relays through, so its datagrams are routed to the
-    /// allocation instead of the checklist. Called once the allocation is live; a no-op for an
-    /// endpoint with no registered agent.
+    /// allocation instead of the checklist. Called once the allocation is live, and it holds for an
+    /// agent registered afterwards as well as one already running.
     pub fn set_turn_server(&self, endpoint: EndpointId, server: Option<SocketAddr>) {
+        match server {
+            Some(server) => {
+                self.turn_servers.insert(endpoint, server);
+            }
+            None => {
+                self.turn_servers.remove(&endpoint);
+            }
+        }
         if let Some(mut entry) = self.agents.get_mut(&endpoint) {
             entry.turn_server = server;
         }
