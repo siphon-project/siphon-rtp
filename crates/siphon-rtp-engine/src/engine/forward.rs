@@ -229,7 +229,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             room_id: room_id.to_string(),
             tag: from_tag.clone(),
         };
-        if let Err(error) = self.start_seat_dtls(&transport, &info, target) {
+        if let Err(error) = self.start_seat_dtls(
+            &transport,
+            super::seat_transport::answerer_dtls_role(info.setup),
+            target,
+        ) {
             self.release_forward_seat(room_id, &from_tag).await;
             return error_result("forward_join: install DTLS redirect", &error);
         }
