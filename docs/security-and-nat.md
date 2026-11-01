@@ -1914,6 +1914,9 @@ void, and bound the resources.
 | R7 | **Stateless nonce** = `base64(issued_tick ‖ HMAC(secret, issued_tick ‖ client_ip))`, bound to the client and validated by an age check against the logical clock → 438 Stale Nonce. No per-nonce map to exhaust. | RFC 5389 §10.2 | `credentials::NonceFactory` |
 | R8 | **Allocation isolation** — 437 Allocation Mismatch for a second Allocate on a live 5-tuple or a non-Allocate verb without one; an Allocate retransmission (same transaction id) replays the cached response, never a 437. The 5-tuple includes the server transport + protocol, so a client's UDP/TCP/TLS allocations never collide. | RFC 5766 §6.2 | `handle_allocate` |
 
+
+**R3 opt-out.** `--turn-permit-private-peers` (config key `turn_permit_private_peers`) lifts only the loopback and private-range (RFC 1918 / unique-local) denials, for a lab or CI run where the peers genuinely live on a private network (the browser-in-CI relay-only scenario is one). Link-local and multicast stay refused, and the daemon logs a warning at startup because the flag weakens the default. It is off unless set, and must not be set on a server untrusted clients can reach.
+
 ### 11.3 Scope / deviations
 - **Credentials:** the RFC 5766 long-term mechanism (MESSAGE-INTEGRITY = HMAC-SHA1, key =
   `MD5(username:realm:password)`). RFC 8656 MESSAGE-INTEGRITY-SHA256 is a deferred seam.

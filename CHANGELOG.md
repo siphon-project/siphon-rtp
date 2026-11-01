@@ -9,6 +9,11 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **`--turn-permit-private-peers` lets the built-in TURN server relay to loopback and private peers.** The
+  default stays the anti-SSRF denylist (RFC 8656 §21); the flag lifts only the loopback and RFC 1918 /
+  unique-local denials (link-local and multicast stay refused) for private labs and CI, and logs a warning
+  at startup. Config key `turn_permit_private_peers`.
+
 - **The TURN client is a daemon option: `--turn-client`, `--turn-client-secret-file`, `--turn-client-ttl`
   (and the matching config keys).** Until now it was reachable only through `Engine::with_turn_server`
   with one server and static credentials. `--turn-client turn:host[:port]` is repeatable, servers are
