@@ -28,6 +28,7 @@ mod floor_keys;
 mod fork;
 mod forward;
 mod forward_dial_out;
+mod forward_webrtc;
 mod gather;
 mod inject;
 mod install;

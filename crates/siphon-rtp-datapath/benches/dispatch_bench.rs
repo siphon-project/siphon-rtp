@@ -232,6 +232,33 @@ fn bench_dispatch(criterion: &mut Criterion) {
     criterion.bench_function("ice_gate_validated_hit", |bencher| {
         bencher.iter(|| black_box(ice_datapath.ice_validated_source(black_box(ice_endpoint.id))));
     });
+
+    // --- The ice-lite responder's per-check cost: authenticate, build the signed response, and read
+    // the nomination (RFC 8445 §7.3.1.5). Plain and nominating checks cost the same parse and HMAC.
+    let responder = IceConfig {
+        local_ufrag: "ENG".into(),
+        local_pwd: "engpass".into(),
+    };
+    let source: SocketAddr = "198.51.100.10:5000".parse().unwrap();
+    for (name, use_candidate) in [("stun_check_plain", false), ("stun_check_nominating", true)] {
+        let check = siphon_rtp_stun::client::binding_request_ice(
+            &[7u8; 12],
+            "ENG:remote",
+            b"engpass",
+            0x7E00_00FF,
+            siphon_rtp_stun::client::IceRole::Controlling(1),
+            use_candidate,
+        );
+        criterion.bench_function(name, |bencher| {
+            bencher.iter(|| {
+                black_box(siphon_rtp_datapath::respond_to_stun_check(
+                    black_box(&check),
+                    black_box(&responder),
+                    black_box(source),
+                ))
+            });
+        });
+    }
 }
 
 criterion_group!(benches, bench_dispatch);
