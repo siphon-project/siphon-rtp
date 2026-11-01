@@ -26,7 +26,7 @@ pub const DATA_CHANNEL_SCTP_PORT: u16 = 5000;
 
 /// The largest SCTP user message the engine accepts and advertises (`a=max-message-size`,
 /// RFC 8841 §5). Must equal `siphon_rtp_dtls::MAX_MESSAGE_SIZE`, which the SCTP stack enforces.
-const MAX_MESSAGE_SIZE: usize = siphon_rtp_dtls::MAX_MESSAGE_SIZE;
+pub(super) const MAX_MESSAGE_SIZE: usize = siphon_rtp_dtls::MAX_MESSAGE_SIZE;
 
 /// The transport and format tokens of the data channel section (RFC 8841 §5).
 const TRANSPORT: &str = "UDP/DTLS/SCTP";

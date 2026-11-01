@@ -566,19 +566,33 @@ mod tests {
         );
     }
 
+    fn refused(profile: ProfileFlags) -> String {
+        refuse_unsupported_profile(&profile).unwrap_err()
+    }
+
     #[test]
-    fn a_profile_asking_for_security_or_ice_is_refused() {
-        let refused = |profile: ProfileFlags| refuse_unsupported_profile(&profile).unwrap_err();
+    fn a_secure_transport_is_refused_on_a_plain_offered_seat() {
         assert!(refused(ProfileFlags {
             transport_protocol: Some("RTP/SAVP".into()),
             ..Default::default()
         })
         .contains("RTP/SAVP"));
+    }
+
+    /// `conference_offer` stays plain: only `forward_offer` can offer WebRTC
+    /// ([`super::super::forward_webrtc::requested`]), because only a forwarding room has the data
+    /// channel and the DTLS plumbing behind it.
+    #[test]
+    fn a_webrtc_transport_is_still_refused_where_only_a_plain_offer_is_built() {
         assert!(refused(ProfileFlags {
             transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
             ..Default::default()
         })
         .contains("only RTP/AVP"));
+    }
+
+    #[test]
+    fn ice_and_dtls_directives_are_refused_on_a_plain_offered_seat() {
         assert!(refused(ProfileFlags {
             ice: Some("force".into()),
             ..Default::default()
@@ -589,6 +603,10 @@ mod tests {
             ..Default::default()
         })
         .contains("DTLS"));
+    }
+
+    #[test]
+    fn a_plain_profile_is_allowed_on_a_plain_offered_seat() {
         for allowed in [
             ProfileFlags::default(),
             ProfileFlags {

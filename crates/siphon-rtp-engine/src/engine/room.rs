@@ -356,7 +356,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             conference_id: conference_id.to_string(),
             tag: from_tag.clone(),
         };
-        if let Err(error) = self.start_seat_dtls(&transport, &info, dtls_target) {
+        if let Err(error) = self.start_seat_dtls(
+            &transport,
+            super::seat_transport::answerer_dtls_role(info.setup),
+            dtls_target,
+        ) {
             self.conference.leave(conference_id, &from_tag);
             self.stop_seat_ice_follow(&[endpoint.id]);
             let mut to_free = vec![endpoint];

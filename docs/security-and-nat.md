@@ -1082,7 +1082,17 @@ the routing order is unchanged: bridge → media → text → udptl → ws → c
   holds its endpoints outside the room, the answer's `c=` (or `received_from`) is the signalled-source
   gate, a `symmetric` profile opens it as on a join, and the Redirect flow is installed only when the
   answer is accepted. Every path out of the pending state frees its endpoints (answer, refusal,
-  `forward_leave`, setup-timeout sweep).
+  `forward_leave`, setup-timeout sweep). A dial-out seat whose profile asks for
+  `transport_protocol: "UDP/TLS/RTP/SAVPF"` is the engine-offers form of the DTLS-SRTP join: the offer is
+  ICE-lite (RFC 8445 §2.5, the browser controls) with `a=setup:actpass` and the engine's fingerprint
+  (RFC 5763 §5), and the pending seat keeps the certificate and ICE credentials it advertised. The answer
+  is accepted only as `UDP/TLS/RTP/SAVPF` with an `a=fingerprint` (the handshake is trusted against it,
+  RFC 5763 §5) and an `active`/`passive` `a=setup` (the engine's DTLS role is its complement); a plain
+  answer, a DTLS answer to a plain offer, a missing fingerprint and an `actpass` answer free the seat.
+  The seat then takes exactly the join gates: `secure_pending` (nothing forwarded either way until keyed),
+  the ICE gate left open on the signalled address and narrowed by the first authenticated check or the
+  full agent's selection, and the DTLS handshake held until ICE validates the peer (RFC 8445 §12). A
+  preserve room refuses it, because the engine would have to terminate SRTP the room forwards end to end.
 - **Cross-codec seats put a decoder behind the gate.** A seat whose codec is not the room's has its
   payload decoded (when it is the source) and re-encoded. That is a new consumer of untrusted bytes, but
   it sits strictly after the gate above (signalled source, SRTP, the SSRC latch, source selected by the

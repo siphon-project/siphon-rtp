@@ -1,4 +1,6 @@
-// Drives the MCPTT floor data channel with a real browser (headless Chrome) against the engine.
+// Drives the MCPTT floor data channel with a real browser (headless Chrome) against the engine, in
+// both directions: the browser calls the room (forward_join) and the room calls the browser
+// (forward_offer with a UDP/TLS/RTP/SAVPF profile, then forward_answer).
 // Dependency free: Node's built-in WebSocket speaks the DevTools protocol, node:net the engine's
 // length-prefixed JSON control protocol, node:dgram plays a plain RTP listener seat.
 //
@@ -11,7 +13,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-const ROOM = "chrome-room";
+const ROOM_PREFIX = "chrome-room";
 const BROWSER_TAG = "browser";
 const LISTENER_TAG = "listener";
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS ?? 90000);
@@ -264,7 +266,8 @@ async function startChrome() {
 
 // ---------------------------------------------------------------- the scenario
 
-const PAGE_SETUP = `(async () => {
+// The page's audio source and the floor channel plumbing both directions share.
+const PAGE_PRELUDE = `
   const context = new AudioContext();
   const oscillator = context.createOscillator();
   oscillator.type = "sawtooth";
@@ -277,20 +280,44 @@ const PAGE_SETUP = `(async () => {
   window.pc = pc;
   window.messages = [];
   window.channelState = "connecting";
-  pc.addTrack(destination.stream.getAudioTracks()[0], destination.stream);
-  const floor = pc.createDataChannel("mcptt-floor");
-  floor.binaryType = "arraybuffer";
-  floor.onopen = () => { window.channelState = "open"; };
-  floor.onclose = () => { window.channelState = "closed"; };
-  floor.onmessage = (event) => {
-    window.messages.push({ binary: event.data instanceof ArrayBuffer, bytes: Array.from(new Uint8Array(event.data)) });
+  const track = destination.stream.getAudioTracks()[0];
+  const attachFloor = () => {
+    const floor = pc.createDataChannel("mcptt-floor");
+    floor.binaryType = "arraybuffer";
+    floor.onopen = () => { window.channelState = "open"; };
+    floor.onclose = () => { window.channelState = "closed"; };
+    floor.onmessage = (event) => {
+      window.messages.push({ binary: event.data instanceof ArrayBuffer, bytes: Array.from(new Uint8Array(event.data)) });
+    };
+    window.floor = floor;
   };
-  window.floor = floor;
   const gathered = new Promise((resolve) => {
     pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === "complete") resolve(); };
     setTimeout(resolve, 5000);
   });
+`;
+
+// forward_join: the browser offers.
+const PAGE_OFFER = `(async () => {
+  ${PAGE_PRELUDE}
+  pc.addTrack(track, destination.stream);
+  attachFloor();
   await pc.setLocalDescription(await pc.createOffer());
+  await gathered;
+  return pc.localDescription.sdp;
+})()`;
+
+// forward_offer: the browser answers. It sets the engine's offer, then opens the floor channel on the
+// section the offer carries (createDataChannel after setRemoteDescription reuses the offered
+// m=application) and sends audio on the offered audio section.
+const pageAnswer = (offer) => `(async () => {
+  ${PAGE_PRELUDE}
+  await pc.setRemoteDescription({ type: "offer", sdp: ${JSON.stringify(offer)} });
+  const audio = pc.getTransceivers().find((transceiver) => transceiver.receiver.track.kind === "audio");
+  audio.direction = "sendrecv";
+  await audio.sender.replaceTrack(track);
+  attachFloor();
+  await pc.setLocalDescription(await pc.createAnswer());
   await gathered;
   return pc.localDescription.sdp;
 })()`;
@@ -305,27 +332,72 @@ async function main() {
   const chrome = await startChrome();
 
   const node = await control.call({ command: "node_info" });
-  const features = node.node?.features ?? node.features ?? [];
-  if (!JSON.stringify(features).includes("webrtc_floor_channel")) {
-    throw new Error(`engine lacks webrtc_floor_channel: ${JSON.stringify(node).slice(0, 300)}`);
+  const features = JSON.stringify(node.node?.features ?? node.features ?? []);
+  for (const feature of ["webrtc_floor_channel", "forward_offer_webrtc"]) {
+    if (!features.includes(feature)) {
+      throw new Error(`engine lacks ${feature}: ${JSON.stringify(node).slice(0, 300)}`);
+    }
   }
 
-  const offer = await chrome.evaluate(PAGE_SETUP);
-  const mdns = (offer.match(/a=candidate:.* [0-9a-f-]+\.local /g) ?? []).length;
-  console.log(`browser offer: ${offer.split("\r\n").length} lines, ${mdns} mDNS candidate(s)`);
-  if (mdns === 0) console.log("note: this Chrome offered no mDNS host candidate");
-
-  const joined = await control.call({
-    command: "forward_join",
-    conference_id: ROOM,
-    from_tag: BROWSER_TAG,
-    sdp: offer,
-    profile: {},
-  });
-  if (joined.result !== "ok" || !joined.sdp) {
-    throw new Error(`forward_join for the browser failed: ${JSON.stringify(joined)}`);
+  // Each direction runs in a room of its own, on the same engine and browser.
+  for (const direction of ["join", "offer"]) {
+    console.log(`--- ${direction === "join" ? "the browser calls the room (forward_join)" : "the room calls the browser (forward_offer)"}`);
+    await scenario(direction, control, chrome);
   }
-  const answer = joined.sdp;
+}
+
+// The floor parameters that mark a room as carrying floor control (3GPP TS 24.380 section 14).
+const FLOOR_FMTP = "mc_queueing;mc_priority=5;mc_granted";
+
+async function scenario(direction, control, chrome) {
+  const ROOM = `${ROOM_PREFIX}-${direction}`;
+  const label = (name) => `${direction}: ${name}`;
+  let answer;
+  if (direction === "join") {
+    const offer = await chrome.evaluate(PAGE_OFFER);
+    const mdns = (offer.match(/a=candidate:.* [0-9a-f-]+\.local /g) ?? []).length;
+    console.log(`browser offer: ${offer.split("\r\n").length} lines, ${mdns} mDNS candidate(s)`);
+    if (mdns === 0) console.log("note: this Chrome offered no mDNS host candidate");
+
+    const joined = await control.call({
+      command: "forward_join",
+      conference_id: ROOM,
+      from_tag: BROWSER_TAG,
+      sdp: offer,
+      profile: {},
+    });
+    if (joined.result !== "ok" || !joined.sdp) {
+      throw new Error(`forward_join for the browser failed: ${JSON.stringify(joined)}`);
+    }
+    answer = joined.sdp;
+  } else {
+    const offered = await control.call({
+      command: "forward_offer",
+      conference_id: ROOM,
+      from_tag: BROWSER_TAG,
+      profile: { transport_protocol: "UDP/TLS/RTP/SAVPF", floor_fmtp: FLOOR_FMTP },
+    });
+    if (offered.result !== "ok" || !offered.sdp) {
+      throw new Error(`forward_offer for the browser failed: ${JSON.stringify(offered)}`);
+    }
+    const engineOffer = offered.sdp;
+    for (const required of ["UDP/TLS/RTP/SAVPF", "a=ice-lite", "a=setup:actpass", "webrtc-datachannel"]) {
+      if (!engineOffer.includes(required)) throw new Error(`the engine's offer lacks ${required}:\n${engineOffer}`);
+    }
+    const browserAnswer = await chrome.evaluate(pageAnswer(engineOffer));
+    const accepted = (browserAnswer.match(/^m=application [1-9]/gm) ?? []).length;
+    console.log(`browser answer: ${browserAnswer.split("\r\n").length} lines, data channel section ${accepted ? "kept" : "DECLINED"}`);
+    const seated = await control.call({
+      command: "forward_answer",
+      conference_id: ROOM,
+      from_tag: BROWSER_TAG,
+      sdp: browserAnswer,
+    });
+    if (seated.result !== "ok") {
+      throw new Error(`forward_answer for the browser failed: ${JSON.stringify(seated)}\n${browserAnswer}`);
+    }
+    answer = engineOffer;
+  }
 
   // A plain RTP listener seat in the room's codec (Opus, fixed by the first seat), so the browser's
   // audio can be seen to arrive at the far end of the engine.
@@ -365,9 +437,11 @@ async function main() {
   const source = await control.call({ command: "forward_set_source", conference_id: ROOM, from_tag: BROWSER_TAG });
   if (source.result !== "ok") throw new Error(`forward_set_source failed: ${JSON.stringify(source)}`);
 
-  await chrome.evaluate(
-    `window.pc.setRemoteDescription({ type: "answer", sdp: ${JSON.stringify(answer)} }).then(() => "ok")`,
-  );
+  if (direction === "join") {
+    await chrome.evaluate(
+      `window.pc.setRemoteDescription({ type: "answer", sdp: ${JSON.stringify(answer)} }).then(() => "ok")`,
+    );
+  }
 
   // 1. the data channel opens (ICE, DTLS, SCTP and DCEP all completed with the browser).
   try {
@@ -378,9 +452,9 @@ async function main() {
       30000,
       "the data channel to open",
     );
-    pass("data channel reaches open");
+    pass(label("data channel reaches open"));
   } catch (error) {
-    fail("data channel reaches open", error.message);
+    fail(label("data channel reaches open"), error.message);
     console.log(`browser connection state: ${await chrome.evaluate("window.pc.connectionState + ' ice=' + window.pc.iceConnectionState")}`);
     console.log(`engine answer:\n${answer}`);
     return;
@@ -401,12 +475,12 @@ async function main() {
     };
     const wrong = Object.entries(expected).filter(([key, value]) => event[key] !== value);
     if (wrong.length === 0 && hex(payload) === hex(FLOOR_REQUEST.slice(12))) {
-      pass("floor request reaches the controller as rtcp_app", `subtype 0, name MCPT, payload ${hex(payload)}`);
+      pass(label("floor request reaches the controller as rtcp_app"), `subtype 0, name MCPT, payload ${hex(payload)}`);
     } else {
-      fail("floor request reaches the controller as rtcp_app", JSON.stringify(event));
+      fail(label("floor request reaches the controller as rtcp_app"), JSON.stringify(event));
     }
   } catch (error) {
-    fail("floor request reaches the controller as rtcp_app", error.message);
+    fail(label("floor request reaches the controller as rtcp_app"), error.message);
   }
 
   // 3. the controller's Floor Granted arrives in the page byte for byte.
@@ -421,7 +495,7 @@ async function main() {
     payload: Buffer.from(FLOOR_GRANTED_PAYLOAD).toString("base64"),
   });
   if (sent.result !== "ok") {
-    fail("floor granted arrives in the page byte-identical", `send_rtcp_app: ${JSON.stringify(sent)}`);
+    fail(label("floor granted arrives in the page byte-identical"), `send_rtcp_app: ${JSON.stringify(sent)}`);
   } else {
     try {
       const messages = await withTimeout(
@@ -437,12 +511,12 @@ async function main() {
       );
       const [message] = messages;
       if (messages.length === 1 && message.binary && hex(message.bytes) === hex(FLOOR_GRANTED)) {
-        pass("floor granted arrives in the page byte-identical", hex(message.bytes));
+        pass(label("floor granted arrives in the page byte-identical"), hex(message.bytes));
       } else {
-        fail("floor granted arrives in the page byte-identical", `got ${JSON.stringify(messages)}, want ${hex(FLOOR_GRANTED)}`);
+        fail(label("floor granted arrives in the page byte-identical"), `got ${JSON.stringify(messages)}, want ${hex(FLOOR_GRANTED)}`);
       }
     } catch (error) {
-      fail("floor granted arrives in the page byte-identical", error.message);
+      fail(label("floor granted arrives in the page byte-identical"), error.message);
     }
   }
 
@@ -455,9 +529,9 @@ async function main() {
       15000,
       "audio at the listener seat",
     );
-    pass("browser audio RTP reaches the engine", `${received.packets} packets forwarded, payload type(s) ${[...received.payloadTypes].join(",")}`);
+    pass(label("browser audio RTP reaches the engine"), `${received.packets} packets forwarded, payload type(s) ${[...received.payloadTypes].join(",")}`);
   } catch (error) {
-    fail("browser audio RTP reaches the engine", `${error.message}; ${received.packets} packets`);
+    fail(label("browser audio RTP reaches the engine"), `${error.message}; ${received.packets} packets`);
   }
 }
 
