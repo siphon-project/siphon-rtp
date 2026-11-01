@@ -44,6 +44,10 @@ use crate::{parse, MessageBuilder, StunMessage};
 /// shorten it, and the granted value is what the refresh schedule uses).
 pub const DEFAULT_LIFETIME_SECONDS: u32 = 600;
 
+/// How long a request over a reliable stream waits for its answer before the allocation is given
+/// up on: the `Ti` timer of RFC 8489 §6.2.1, 39.5 s, since the transport does the retransmitting.
+pub const STREAM_REQUEST_TIMEOUT_MS: u64 = 39_500;
+
 /// How far inside the granted lifetime a refresh is sent, as a percentage. RFC 5766 §7 says a client
 /// should refresh "before expiration"; 75 % leaves room for a full RFC 8489 retransmission run before
 /// the allocation would actually lapse.
@@ -108,6 +112,9 @@ pub enum TurnFailure {
     /// A response arrived that we could not use — unparseable, or a success with no
     /// XOR-RELAYED-ADDRESS (RFC 5766 §6.3 requires one).
     Malformed(&'static str),
+    /// The TCP or TLS connection the allocation rides on ended (EOF or an error). The server keeps
+    /// the allocation until its lifetime lapses, but this client can no longer reach it.
+    TransportClosed,
     /// The OS RNG was unavailable, so no transaction id could be drawn. Never `unwrap`ed.
     NoRandomness,
 }
@@ -196,6 +203,8 @@ pub struct TurnClient {
     /// Millisecond at which the allocation must be refreshed.
     refresh_at_ms: u64,
     schedule: RetransmitSchedule,
+    /// Whether the transport is a reliable stream (no retransmission).
+    reliable: bool,
     /// The lifetime the server last granted, in seconds.
     granted_lifetime: u32,
     /// Whether a request has already been re-sent after a `438 Stale Nonce`. Cleared on any success,
@@ -223,8 +232,35 @@ impl TurnClient {
             next_channel: FIRST_CHANNEL,
             refresh_at_ms: u64::MAX,
             schedule: RetransmitSchedule::new(rto_ms),
+            reliable: false,
             granted_lifetime: DEFAULT_LIFETIME_SECONDS,
             stale_nonce_retried: false,
+        }
+    }
+
+    /// Start an allocation over a **reliable** stream (TCP or TLS, RFC 8656 §3.1). The relay leg to
+    /// peers stays UDP (REQUESTED-TRANSPORT), only the client-to-server leg differs. The transport
+    /// does the retransmitting, so a request is sent once and fails after `Ti` (RFC 8489 §6.2.1).
+    #[must_use]
+    pub fn new_reliable(server: SocketAddr, credentials: TurnCredentials) -> Self {
+        let mut client = Self::new(server, credentials, STREAM_REQUEST_TIMEOUT_MS);
+        client.schedule = RetransmitSchedule::reliable(STREAM_REQUEST_TIMEOUT_MS);
+        client.reliable = true;
+        client
+    }
+
+    /// Whether this client rides a reliable stream ([`Self::new_reliable`]).
+    #[must_use]
+    pub fn is_reliable(&self) -> bool {
+        self.reliable
+    }
+
+    /// The stream under this allocation ended. The allocation can no longer be driven, so it is
+    /// terminal: the owner clears the relay and the leg falls back to its other candidates.
+    pub fn on_transport_closed(&mut self) {
+        if !self.is_terminal() {
+            self.in_flight = None;
+            self.state = TurnState::Failed(TurnFailure::TransportClosed);
         }
     }
 
@@ -1289,6 +1325,60 @@ mod tests {
             now += 500;
         }
         assert_eq!(client.state(), &TurnState::Failed(TurnFailure::Timeout));
+    }
+
+    fn reliable_client() -> TurnClient {
+        TurnClient::new_reliable(addr(SERVER), TurnCredentials::new(USER, PASSWORD))
+    }
+
+    #[test]
+    fn a_reliable_client_sends_a_request_once_and_never_retransmits() {
+        let mut client = reliable_client();
+        assert!(client.is_reliable());
+        let _probe = take_send(&mut client, 0);
+        // The datagram client would retransmit at 500 ms, 1.5 s, 3.5 s, ...
+        for now in [500, 1_500, 3_500, 7_500, 15_500, 31_500, 39_000] {
+            assert_eq!(client.poll(now), TurnAction::Idle, "no resend at {now} ms");
+        }
+        assert!(!client.is_terminal());
+        // RFC 8489 §6.2.1: Ti = 39.5 s.
+        let _ = client.poll(39_500);
+        assert_eq!(client.state(), &TurnState::Failed(TurnFailure::Timeout));
+    }
+
+    #[test]
+    fn a_reliable_client_runs_the_same_allocate_exchange() {
+        let mut client = reliable_client();
+        let probe = take_send(&mut client, 0);
+        assert!(client.on_datagram(&challenge(&probe), 10));
+        let authed = take_send(&mut client, 10);
+        assert!(client.on_datagram(&allocate_success(&authed, 600), 20));
+        assert_eq!(client.relayed_address(), Some(addr(RELAYED)));
+        // REQUESTED-TRANSPORT stays UDP: only the client-to-server leg is a stream.
+        let message = parse(&probe).expect("parse");
+        assert_eq!(
+            turn::requested_transport(&message),
+            Some(turn::TRANSPORT_UDP)
+        );
+    }
+
+    #[test]
+    fn a_closed_transport_fails_the_allocation_and_stops_the_client() {
+        let mut client = allocated();
+        client.on_transport_closed();
+        assert_eq!(
+            client.state(),
+            &TurnState::Failed(TurnFailure::TransportClosed)
+        );
+        assert!(client.is_terminal());
+        assert_eq!(client.poll(1), TurnAction::Idle);
+        // Already terminal: a second close does not rewrite the reason.
+        let mut closed = allocated();
+        closed.close();
+        let delete = take_send(&mut closed, 0);
+        assert!(closed.on_datagram(&success_for(&delete, turn::METHOD_REFRESH), 0));
+        closed.on_transport_closed();
+        assert_eq!(closed.state(), &TurnState::Closed);
     }
 
     #[test]

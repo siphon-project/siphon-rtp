@@ -486,9 +486,22 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     peer-reflexive ones discovered mid-session) gets a permission and a channel, because the server
     drops traffic from a peer it holds no permission for (§9). An allocation that dies is torn out and
     the datapath's relay cleared, so the leg falls back to its direct candidates.
+  - **The client-to-server leg can be a TCP or TLS stream** (RFC 8656 §3.1; the leg to peers is UDP
+    either way). The engine owns one connection per allocation. Its bytes are framed with the one
+    shared `siphon_rtp_stun::turn::stream_frame_len` (ChannelData padded to four bytes, §12.5), and a
+    framing desync closes the connection. A `turns:` server is verified against the hostname in its
+    URI with the public web roots, or only against `--turn-client-ca-file` when that is set; there is
+    no option to skip verification, and `turns:` with `transport=udp` (DTLS) is refused rather than
+    downgraded. Inbound ChannelData and Data indications reach the datapath through
+    `Datapath::ingest_relayed`, which unwraps them against the installed `TurnRelay` (unbound
+    channels and unpermitted peers dropped) and then runs the same ICE gate, source gate, latch and
+    flows as a datagram off the socket; egress is queued on a bounded stream queue that sheds on
+    full. A losing server's connection never delivers relayed data (the relay is not active for it).
+    The end of the stream, or a write error, fails the allocation and clears the relay.
   - **Enforcement:** `siphon-rtp-stun/src/turn_client.rs` (the pure allocation state machine),
-    `Engine::gather_relayed_candidate` + `Engine::drive_turn_allocations` (its I/O), `set_turn_relay`
-    and the `relay_unwrap` ingress hook in `udp.rs`.
+    `Engine::gather_relayed_candidate` + `Engine::drive_turn_allocations` (its I/O, in
+    `engine/turn_gather.rs` and `engine/turn_stream.rs`), `set_turn_relay` and the relay seam in
+    `udp_relay.rs`.
 - **Consent freshness** (RFC 7675): periodic STUN checks on the established pair; on consent loss the
   call is torn down. This is also the anti-hijack *and* the dead-path detector.
   - **Responder half (always on).** A valid inbound check stamps the endpoint's activity, so the

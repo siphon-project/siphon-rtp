@@ -16,6 +16,9 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
 use crate::dscp::Dscp;
+use crate::udp_relay::{
+    emit, is_data_indication, relay_egress, relay_unwrap, RelayEgress, RelayIngress,
+};
 use crate::{
     classify, rtp_media_ssrc, signalled_peer_moved, source_latch_verdict, AddressFamily, Datapath,
     DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction, ForwardRule, IceAgentMode,
@@ -359,18 +362,15 @@ impl Inner {
                         None => RelayEgress::Direct,
                     }
                 };
-                let sent = match egress {
-                    RelayEgress::Direct => out.0.send_to(payload, destination).await,
-                    RelayEgress::Wrapped { wire, server } => out.0.send_to(&wire, server).await,
-                    RelayEgress::Unavailable => {
-                        in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                };
-                match sent {
+                match emit(&out.0, egress, destination, payload).await {
                     Ok(sent) => {
                         out.1.packets_out.fetch_add(1, Ordering::Relaxed);
                         out.1.bytes_out.fetch_add(sent as u64, Ordering::Relaxed);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // A stalled TURN stream sheds media instead of queueing it.
+                        tracing::debug!(?endpoint, "forward dropped: TURN stream queue full");
+                        in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(error) => {
                         tracing::warn!(?endpoint, %error, "forward send failed");
@@ -931,7 +931,12 @@ async fn handle_stun(
     stats
         .last_seen
         .store(inner.clock.load(Ordering::Relaxed), Ordering::Relaxed);
-    match socket.send_to(&response, source).await {
+    // The answer to a check that arrived through the allocation goes back through it.
+    let egress = match inner.turn_relay.get(&endpoint) {
+        Some(relay) => relay_egress(&relay, source, &response),
+        None => RelayEgress::Direct,
+    };
+    match emit(socket, egress, source, &response).await {
         Ok(sent) => {
             stats.packets_out.fetch_add(1, Ordering::Relaxed);
             stats.bytes_out.fetch_add(sent as u64, Ordering::Relaxed);
@@ -942,141 +947,89 @@ async fn handle_stun(
     }
 }
 
-/// What the TURN de-encapsulation decided about one inbound datagram.
-enum RelayIngress {
-    /// Not relayed traffic — use the datagram and source as they arrived.
-    Direct,
-    /// A ChannelData message from the allocation's server: use `range` of the buffer as the payload
-    /// and attribute it to `peer` rather than the server.
-    Unwrapped {
-        range: std::ops::Range<usize>,
-        peer: SocketAddr,
-    },
-    /// A Data indication from the allocation's server (RFC 8656 §11.4): `payload` is its DATA,
-    /// attributed to the permitted `peer` named by its XOR-PEER-ADDRESS.
-    Indication { payload: Vec<u8>, peer: SocketAddr },
-    /// Relayed-looking traffic we cannot attribute — a malformed ChannelData message, or one on a
-    /// channel this allocation never bound. Dropped rather than passed up as if it came from the
-    /// server, which would let the TURN server's address reach the media gate.
-    Drop,
-}
-
-/// Whether `datagram` is a STUN Data indication (RFC 8656 §11.4): method DATA, class indication.
-fn is_data_indication(datagram: &[u8]) -> bool {
-    use siphon_rtp_stun::turn;
-    let expected = turn::message_type(turn::METHOD_DATA, turn::CLASS_INDICATION).to_be_bytes();
-    datagram.len() >= 20 && datagram[..2] == expected
-}
-
-/// Unwrap a Data indication from the allocation's server. Dropped unless it is well formed and names
-/// a peer the server holds a permission for (RFC 8656 §9): the server relays nothing else, so any
-/// other peer address did not come from our allocation.
-fn unwrap_data_indication(relay: &crate::TurnRelay, datagram: &[u8]) -> RelayIngress {
-    use siphon_rtp_stun::turn;
-    let Ok(message) = siphon_rtp_stun::parse(datagram) else {
-        return RelayIngress::Drop;
-    };
-    let (Some(peer), Some(payload)) = (turn::xor_peer_address(&message), turn::data(&message))
-    else {
-        return RelayIngress::Drop;
-    };
-    if !relay.is_permitted(peer) {
-        return RelayIngress::Drop;
-    }
-    RelayIngress::Indication {
-        payload: payload.to_vec(),
-        peer,
-    }
-}
-
-/// How a datagram for `dst` leaves a leg that relays through a TURN allocation.
-enum RelayEgress {
-    /// Not a relayed destination: send the bytes to `dst` untouched.
-    Direct,
-    /// Send `wire` to the TURN server instead.
-    Wrapped { wire: Vec<u8>, server: SocketAddr },
-    /// A relayed destination whose framing could not be built (no OS randomness for the Send
-    /// indication's transaction id). Never fall back to sending it direct: the peer is only
-    /// reachable through the allocation.
-    Unavailable,
-}
-
-/// Frame `payload` for `dst` through `relay`: ChannelData for a bound peer (RFC 8656 §12), a Send
-/// indication for a permitted peer with no channel (§11.1), nothing for anyone else.
-fn relay_egress(relay: &crate::TurnRelay, dst: SocketAddr, payload: &[u8]) -> RelayEgress {
-    use siphon_rtp_stun::turn;
-    if let Some(channel) = relay.channel_for(dst) {
-        return RelayEgress::Wrapped {
-            wire: turn::encode_channel_data(channel, payload, false),
-            server: relay.server,
+impl Inner {
+    /// Everything a datagram that arrived on `endpoint` goes through after the socket read: the
+    /// RFC 8656 de-encapsulation of anything the TURN server relayed, the full-agent STUN seam,
+    /// the ICE-lite responder, and the installed flow. Shared by the UDP receive loop and by
+    /// [`Datapath::ingest_relayed`], so a datagram that reached us over a TURN stream passes the
+    /// same ICE gate, source gate, latch, stats and flows as one that arrived on the socket.
+    async fn receive(
+        &self,
+        endpoint: EndpointId,
+        socket: &UdpSocket,
+        stats: &StatsAtomic,
+        source: SocketAddr,
+        buffer: &mut [u8],
+        len: usize,
+    ) {
+        // RFC 5766 §11 de-encapsulation, **before every other layer**. On a leg relaying through a
+        // TURN allocation the peer's traffic arrives from the TURN server wrapped in ChannelData, so
+        // unwrapping here — and rewriting the source back to the peer the channel belongs to — is
+        // what lets the ICE responder, the source gate, the latch and the relay all keep working in
+        // terms of the peer's own address, with no idea a relay is in the path.
+        //
+        // Scoped to datagrams actually from the allocation's server: ChannelData-shaped bytes from
+        // anywhere else are left alone, so this can never be used to spoof a peer address.
+        let ingress = {
+            let relay = self.turn_relay.get(&endpoint);
+            relay_unwrap(relay.as_deref(), source, &buffer[..len])
         };
-    }
-    if !relay.permitted.contains(&dst) {
-        return RelayEgress::Direct;
-    }
-    // RFC 8489 §6.3.2 / §5: the transaction id of an indication is still random.
-    let Some(id) = siphon_rtp_stun::client::TransactionId::new() else {
-        return RelayEgress::Unavailable;
-    };
-    let id = id.as_bytes();
-    RelayEgress::Wrapped {
-        wire: siphon_rtp_stun::MessageBuilder::new(
-            turn::message_type(turn::METHOD_SEND, turn::CLASS_INDICATION),
-            id,
-        )
-        .attribute(
-            turn::ATTR_XOR_PEER_ADDRESS,
-            &turn::xor_address_value(dst, id),
-        )
-        .attribute(turn::ATTR_DATA, payload)
-        .finish(None, false),
-        server: relay.server,
-    }
-}
+        let (payload_range, source) = match ingress {
+            RelayIngress::Direct => (0..len, source),
+            RelayIngress::Unwrapped { range, peer } => (range, peer),
+            RelayIngress::Indication { payload, peer } => {
+                // The DATA is smaller than the datagram it arrived in, so it fits the buffer.
+                buffer[..payload.len()].copy_from_slice(&payload);
+                (0..payload.len(), peer)
+            }
+            RelayIngress::Drop => {
+                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        // Shadow the raw datagram with the de-encapsulated view; everything below is unchanged.
+        let len = {
+            let start = payload_range.start;
+            let end = payload_range.end;
+            if start > 0 {
+                buffer.copy_within(start..end, 0);
+            }
+            end - start
+        };
 
-/// Strip RFC 5766 §11 ChannelData framing from a datagram that arrived on a relaying endpoint.
-///
-/// Only datagrams **from the allocation's own server** are considered, so ChannelData-shaped bytes
-/// from any other source stay untouched and cannot be used to forge a peer address.
-fn relay_unwrap(
-    inner: &Inner,
-    endpoint: EndpointId,
-    source: SocketAddr,
-    datagram: &[u8],
-) -> RelayIngress {
-    let Some(relay) = inner.turn_relay.get(&endpoint) else {
-        return RelayIngress::Direct;
-    };
-    if source != relay.server {
-        return RelayIngress::Direct;
-    }
-    let Some(&first) = datagram.first() else {
-        return RelayIngress::Direct;
-    };
-    // The server also sends us STUN on this 5-tuple (allocation responses); those are not
-    // ChannelData and must reach the client state machine untouched.
-    if !siphon_rtp_stun::turn::is_channel_data(first) {
-        // RFC 8656 §11.4: a peer's data also arrives as a Data indication until the channel is
-        // bound (and for good when ChannelBind fails). Every other STUN message is the client
-        // state machine's.
-        if is_data_indication(datagram) {
-            return unwrap_data_indication(relay.value(), datagram);
+        // RFC 7983 demux for ICE: STUN (first byte 0..=3) drives connectivity checks on endpoints
+        // that carry ICE credentials.
+        if classify(&buffer[..len]) == PacketClass::Stun {
+            // Full-agent seam (RFC 7675 consent): forward the raw STUN to the engine's checker so it
+            // can correlate its own Binding responses — which the responder below otherwise drops.
+            // Bounded sink, drop-on-full; forwarded for requests too (the checker ignores those).
+            if let Some(sender) = self.ice_events.get(&endpoint).map(|entry| entry.clone()) {
+                let _ = sender.try_send(IceDatapathEvent {
+                    endpoint,
+                    source,
+                    arrival_tick: self.clock.load(Ordering::Relaxed),
+                    datagram: Bytes::copy_from_slice(&buffer[..len]),
+                });
+            }
+            // A full-agent endpoint answers nothing here: the engine's RFC 8445 agent owns request
+            // handling (it needs the role, the checklist, and the nomination state to answer
+            // correctly) and is the only thing that may adopt a source. Forwarding above already
+            // handed it the datagram; stop, so the responder cannot also answer and latch behind the
+            // agent's back.
+            if self.ice_forward_only.contains_key(&endpoint) {
+                return;
+            }
+            if let Some(ice) = self.ice.get(&endpoint).map(|config| config.clone()) {
+                handle_stun(socket, endpoint, source, &buffer[..len], &ice, self, stats).await;
+                return;
+            }
+            // No ICE credentials: do *not* drop here — fall through to the installed flow. A TURN
+            // relay endpoint (`FlowAction::Redirect`, docs/security-and-nat.md §11) must hand
+            // whatever the peer sends — including STUN-shaped bytes — to the allocation actor. A
+            // media `Forward` endpoint still drops non-RTP inside `dispatch` (the layer-1 demux), so
+            // this never lets STUN reach the media latch.
         }
-        return RelayIngress::Direct;
-    }
-    let Some(message) = siphon_rtp_stun::turn::parse_channel_data(datagram) else {
-        return RelayIngress::Drop;
-    };
-    let Some(peer) = relay.peer_for_channel(message.channel) else {
-        return RelayIngress::Drop;
-    };
-    // `parse_channel_data` validated the declared length against the buffer, so this range is in
-    // bounds by construction.
-    let start = 4;
-    let end = start + message.data.len();
-    RelayIngress::Unwrapped {
-        range: start..end,
-        peer,
+        self.dispatch(endpoint, source, &buffer[..len], stats).await;
     }
 }
 
@@ -1104,81 +1057,8 @@ async fn recv_loop(
             return;
         };
 
-        // RFC 5766 §11 de-encapsulation, **before every other layer**. On a leg relaying through a
-        // TURN allocation the peer's traffic arrives from the TURN server wrapped in ChannelData, so
-        // unwrapping here — and rewriting the source back to the peer the channel belongs to — is
-        // what lets the ICE responder, the source gate, the latch and the relay all keep working in
-        // terms of the peer's own address, with no idea a relay is in the path.
-        //
-        // Scoped to datagrams actually from the allocation's server: ChannelData-shaped bytes from
-        // anywhere else are left alone, so this can never be used to spoof a peer address.
-        let (payload_range, source) = match relay_unwrap(&inner, endpoint, source, &buffer[..len]) {
-            RelayIngress::Direct => (0..len, source),
-            RelayIngress::Unwrapped { range, peer } => (range, peer),
-            RelayIngress::Indication { payload, peer } => {
-                // The DATA is smaller than the datagram it arrived in, so it fits the buffer.
-                buffer[..payload.len()].copy_from_slice(&payload);
-                (0..payload.len(), peer)
-            }
-            RelayIngress::Drop => {
-                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-        // Shadow the raw datagram with the de-encapsulated view; everything below is unchanged.
-        let buffer = &mut buffer[..];
-        let (len, buffer) = {
-            let start = payload_range.start;
-            let end = payload_range.end;
-            if start > 0 {
-                buffer.copy_within(start..end, 0);
-            }
-            (end - start, buffer)
-        };
-
-        // RFC 7983 demux for ICE: STUN (first byte 0..=3) drives connectivity checks on endpoints
-        // that carry ICE credentials.
-        if classify(&buffer[..len]) == PacketClass::Stun {
-            // Full-agent seam (RFC 7675 consent): forward the raw STUN to the engine's checker so it
-            // can correlate its own Binding responses — which the responder below otherwise drops.
-            // Bounded sink, drop-on-full; forwarded for requests too (the checker ignores those).
-            if let Some(sender) = inner.ice_events.get(&endpoint).map(|entry| entry.clone()) {
-                let _ = sender.try_send(IceDatapathEvent {
-                    endpoint,
-                    source,
-                    arrival_tick: inner.clock.load(Ordering::Relaxed),
-                    datagram: Bytes::copy_from_slice(&buffer[..len]),
-                });
-            }
-            // A full-agent endpoint answers nothing here: the engine's RFC 8445 agent owns request
-            // handling (it needs the role, the checklist, and the nomination state to answer
-            // correctly) and is the only thing that may adopt a source. Forwarding above already
-            // handed it the datagram; stop, so the responder cannot also answer and latch behind the
-            // agent's back.
-            if inner.ice_forward_only.contains_key(&endpoint) {
-                continue;
-            }
-            if let Some(ice) = inner.ice.get(&endpoint).map(|config| config.clone()) {
-                handle_stun(
-                    &socket,
-                    endpoint,
-                    source,
-                    &buffer[..len],
-                    &ice,
-                    &inner,
-                    &stats,
-                )
-                .await;
-                continue;
-            }
-            // No ICE credentials: do *not* drop here — fall through to the installed flow. A TURN
-            // relay endpoint (`FlowAction::Redirect`, docs/security-and-nat.md §11) must hand
-            // whatever the peer sends — including STUN-shaped bytes — to the allocation actor. A
-            // media `Forward` endpoint still drops non-RTP inside `dispatch` (the layer-1 demux), so
-            // this never lets STUN reach the media latch.
-        }
         inner
-            .dispatch(endpoint, source, &buffer[..len], &stats)
+            .receive(endpoint, &socket, &stats, source, &mut buffer, len)
             .await;
     }
 }
@@ -1274,17 +1154,7 @@ impl Datapath for UdpLoopbackDatapath {
             Some(relay) => relay_egress(&relay, dst, data),
             None => RelayEgress::Direct,
         };
-        let (wire, target) = match egress {
-            RelayEgress::Direct => (std::borrow::Cow::Borrowed(data), dst),
-            RelayEgress::Wrapped { wire, server } => (std::borrow::Cow::Owned(wire), server),
-            RelayEgress::Unavailable => {
-                return Err(DatapathError::Send(std::io::Error::other(
-                    "no randomness for a TURN Send indication",
-                )))
-            }
-        };
-        let sent = socket
-            .send_to(&wire, target)
+        let sent = emit(&socket, egress, dst, data)
             .await
             .map_err(DatapathError::Send)?;
         stats.packets_out.fetch_add(1, Ordering::Relaxed);
@@ -1330,6 +1200,37 @@ impl Datapath for UdpLoopbackDatapath {
                 .last_seen
                 .store(self.inner.clock.load(Ordering::Relaxed), Ordering::Relaxed);
         }
+    }
+
+    async fn ingest_relayed(&self, endpoint: EndpointId, frame: &[u8]) -> bool {
+        // Only the allocation's own stream may deliver here, and only relayed message shapes.
+        let Some(first) = frame.first().copied() else {
+            return false;
+        };
+        if !(siphon_rtp_stun::turn::is_channel_data(first) || is_data_indication(frame)) {
+            return false;
+        }
+        let Some(server) = self
+            .inner
+            .turn_relay
+            .get(&endpoint)
+            .map(|relay| relay.server)
+        else {
+            return false;
+        };
+        let (socket, stats) = match self.inner.endpoints.get(&endpoint) {
+            Some(entry) => (entry.socket.clone(), entry.stats.clone()),
+            None => return false,
+        };
+        stats.packets_in.fetch_add(1, Ordering::Relaxed);
+        stats
+            .bytes_in
+            .fetch_add(frame.len() as u64, Ordering::Relaxed);
+        let mut buffer = frame.to_vec();
+        self.inner
+            .receive(endpoint, &socket, &stats, server, &mut buffer, frame.len())
+            .await;
+        true
     }
 
     fn set_turn_relay(&self, endpoint: EndpointId, relay: Option<crate::TurnRelay>) {
@@ -1934,6 +1835,7 @@ mod tests {
         let (server, server_addr) = phone().await;
         const CHANNEL: u16 = 0x4001;
         let relay = crate::TurnRelay {
+            carrier: crate::TurnCarrier::Udp,
             server: server_addr,
             channels: vec![(peer, CHANNEL)],
             permitted: vec![peer],
@@ -2037,6 +1939,7 @@ mod tests {
     async fn permission_only_relay_for(peer: SocketAddr) -> (UdpSocket, crate::TurnRelay) {
         let (server, server_addr) = phone().await;
         let relay = crate::TurnRelay {
+            carrier: crate::TurnCarrier::Udp,
             server: server_addr,
             channels: Vec::new(),
             permitted: vec![peer],
@@ -2252,6 +2155,169 @@ mod tests {
             turn::message_type(turn::METHOD_SEND, turn::CLASS_INDICATION)
         );
         assert_eq!(turn::data(&message), Some(&payload[..]));
+    }
+
+    // --- Stream carrier (RFC 8656 §3.1, §12.5) ------------------------------------------------
+
+    fn stream_relay_for(
+        peer: SocketAddr,
+        depth: usize,
+    ) -> (flume::Receiver<Bytes>, crate::TurnRelay, u16) {
+        let (sender, receiver) = flume::bounded(depth);
+        let relay = crate::TurnRelay {
+            carrier: crate::TurnCarrier::Stream(sender),
+            server: "192.0.2.1:3478".parse().expect("server"),
+            channels: vec![(peer, 0x4001)],
+            permitted: vec![peer],
+        };
+        (receiver, relay, 0x4001)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_egress_is_padded_channel_data_queued_on_the_stream() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let (_peer_socket, peer_addr) = phone().await;
+        let (queue, relay, channel) = stream_relay_for(peer_addr, 8);
+        datapath.set_turn_relay(leg.id, Some(relay));
+
+        // 13 bytes: the frame is 4 + 13 padded to 20, with the padding outside Length.
+        let payload = [0x80u8; 13];
+        datapath
+            .send(leg.id, peer_addr, &payload)
+            .await
+            .expect("send");
+        let wire = queue.try_recv().expect("queued on the stream");
+        assert_eq!(
+            wire.len(),
+            20,
+            "RFC 8656 §12.5: padded to a multiple of four"
+        );
+        let framed = siphon_rtp_stun::turn::parse_channel_data(&wire).expect("ChannelData");
+        assert_eq!(framed.channel, channel);
+        assert_eq!(framed.data, &payload[..]);
+        assert_eq!(&wire[17..], &[0, 0, 0], "zero padding");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarded_media_toward_a_stream_relay_is_queued_and_a_full_queue_sheds_it() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (source, _) = phone().await;
+        let (_peer_socket, peer_addr) = phone().await;
+        let (queue, relay, _) = stream_relay_for(peer_addr, 1);
+        datapath.set_turn_relay(leg_b.id, Some(relay));
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(peer_addr))),
+            )
+            .expect("flow");
+
+        for sequence in 1..=3 {
+            source
+                .send_to(&rtp(0x3030_3030, sequence), leg_a.local_addr)
+                .await
+                .expect("media in");
+        }
+        // The queue holds one frame; the others were shed rather than queued without bound.
+        let first = timeout(SHORT, queue.recv_async())
+            .await
+            .expect("a frame is queued")
+            .expect("open");
+        assert!(siphon_rtp_stun::turn::parse_channel_data(&first).is_some());
+        tokio::time::sleep(NEGATIVE).await;
+        assert!(queue.len() <= 1, "bounded: late media is dropped");
+        let dropped = datapath.stats(leg_a.id).expect("stats").packets_dropped;
+        assert!(dropped >= 1, "shed packets are counted, got {dropped}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_channel_data_frame_ingested_from_the_stream_flows_like_a_received_datagram() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (_peer_socket, peer_addr) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        let (_queue, relay, channel) = stream_relay_for(peer_addr, 8);
+        datapath.set_turn_relay(leg_a.id, Some(relay));
+        // Gated to the peer: passes only if the ingest rewrote the source to the peer.
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::signalled(
+                    leg_b.id,
+                    Some(callee_addr),
+                    peer_addr.ip(),
+                )),
+            )
+            .expect("flow");
+
+        let payload = rtp(0x3131_3131, 1);
+        // The stream pads ChannelData (RFC 8656 §12.5); the padding must not reach the media.
+        let mut frame = siphon_rtp_stun::turn::encode_channel_data(channel, &payload, true);
+        assert!(datapath.ingest_relayed(leg_a.id, &frame).await);
+        let (relayed, _) = recv(&callee).await;
+        assert_eq!(relayed, payload);
+        let stats = datapath.stats(leg_a.id).expect("stats");
+        assert_eq!(stats.packets_in, 1);
+        assert_eq!(stats.bytes_in, frame.len() as u64);
+
+        // An unbound channel is dropped, not passed up as the server's.
+        frame[1] ^= 0x7F;
+        assert!(datapath.ingest_relayed(leg_a.id, &frame).await);
+        let mut buffer = [0u8; MAX_DATAGRAM];
+        assert!(timeout(NEGATIVE, callee.recv_from(&mut buffer))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_refuses_an_endpoint_without_a_relay_and_a_stun_response() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let (_peer_socket, peer_addr) = phone().await;
+        let frame = siphon_rtp_stun::turn::encode_channel_data(0x4001, &rtp(1, 1), true);
+        assert!(
+            !datapath.ingest_relayed(leg.id, &frame).await,
+            "no allocation, nothing to deliver for"
+        );
+        let (_queue, relay, _) = stream_relay_for(peer_addr, 1);
+        datapath.set_turn_relay(leg.id, Some(relay));
+        let response = stun::binding_request(&[1u8; 12], "user", b"key");
+        assert!(
+            !datapath.ingest_relayed(leg.id, &response).await,
+            "allocation responses belong to the client, not the media path"
+        );
+        assert!(!datapath.ingest_relayed(leg.id, &[]).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_ice_answer_to_a_check_that_arrived_over_the_stream_goes_back_through_it() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let (_peer_socket, peer_addr) = phone().await;
+        let (queue, relay, _) = stream_relay_for(peer_addr, 8);
+        datapath.set_turn_relay(leg.id, Some(relay));
+        datapath.set_ice(
+            leg.id,
+            Some(IceConfig {
+                local_ufrag: "lufrag".into(),
+                local_pwd: "localpassword0123456789".into(),
+            }),
+        );
+        let check = stun::binding_request(&[3u8; 12], "lufrag:rufrag", b"localpassword0123456789");
+        let frame = siphon_rtp_stun::turn::encode_channel_data(0x4001, &check, true);
+        assert!(datapath.ingest_relayed(leg.id, &frame).await);
+        let answer = timeout(SHORT, queue.recv_async())
+            .await
+            .expect("an answer is queued on the stream")
+            .expect("open");
+        let framed = siphon_rtp_stun::turn::parse_channel_data(&answer).expect("ChannelData");
+        let response = stun::parse(framed.data).expect("a STUN response");
+        assert_eq!(response.transaction_id, [3u8; 12]);
+        assert_eq!(datapath.ice_validated_source(leg.id), Some(peer_addr));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

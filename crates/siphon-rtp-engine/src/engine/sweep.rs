@@ -292,11 +292,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .map(|agents| agents.remote_addresses(endpoint))
                 .unwrap_or_default();
 
-            let (server, datagrams, relay_update, terminal) = {
+            let (server, datagrams, relay_update, terminal, writer) = {
                 let Some(mut allocation) = self.ice_relays.get_mut(&endpoint) else {
                     continue;
                 };
                 allocation.last_driven_ms = now_ms;
+                // A stream allocation's replies come off its own connection, not the datapath.
+                // The client is told first, so a closed stream is terminal this very tick.
+                if let Some(handle) = allocation.stream.as_ref().map(|s| s.handle().clone()) {
+                    for message in handle.drain_responses() {
+                        allocation.client.on_datagram(&message, now_ms);
+                    }
+                    if handle.is_closed() {
+                        allocation.client.on_transport_closed();
+                    }
+                }
                 for peer in peers {
                     allocation.client.add_peer(peer);
                 }
@@ -329,19 +339,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     allocation.published_permitted.clone_from(&permitted);
                 }
                 let terminal = allocation.client.is_terminal();
+                let writer = allocation.stream.as_ref().map(|s| s.handle().clone());
                 (
                     server,
                     datagrams,
                     changed.then_some((channels, permitted)),
                     terminal,
+                    writer,
                 )
             };
 
-            // A newly bound (or lost) channel, or a new permission, changes how the datapath frames this leg's traffic.
+            // A newly bound (or lost) channel, or a new permission, changes how the datapath frames
+            // this leg's traffic.
             if let Some((channels, permitted)) = relay_update {
                 self.datapath.set_turn_relay(
                     endpoint,
                     Some(siphon_rtp_datapath::TurnRelay {
+                        carrier: writer
+                            .as_ref()
+                            .map_or(siphon_rtp_datapath::TurnCarrier::Udp, |handle| {
+                                handle.carrier()
+                            }),
                         server,
                         channels,
                         permitted,
@@ -349,7 +367,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 );
             }
             for datagram in datagrams {
-                if let Err(error) = self.datapath.send(endpoint, server, &datagram).await {
+                if let Some(handle) = &writer {
+                    if !handle.send(&datagram) {
+                        tracing::debug!(
+                            target: "siphon_rtp::media",
+                            ?endpoint, %server,
+                            "TURN stream is not accepting a request"
+                        );
+                    }
+                } else if let Err(error) = self.datapath.send(endpoint, server, &datagram).await {
                     // Transient: the RFC 8489 retransmission covers it, and the client's own timeout
                     // covers a server that has genuinely gone away.
                     tracing::debug!(

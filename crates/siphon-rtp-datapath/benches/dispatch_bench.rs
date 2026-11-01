@@ -182,6 +182,7 @@ fn bench_dispatch(criterion: &mut Criterion) {
         datapath.set_turn_relay(
             egress.id,
             Some(siphon_rtp_datapath::TurnRelay {
+                carrier: siphon_rtp_datapath::TurnCarrier::Udp,
                 server: server_addr,
                 channels: vec![(far_addr, 0x4001)],
                 permitted: vec![far_addr],
@@ -219,6 +220,56 @@ fn bench_dispatch(criterion: &mut Criterion) {
                             .await
                             .expect("wrapped packet"),
                     );
+                }
+            });
+        });
+    });
+    // --- The same relay with the TURN allocation on a TCP/TLS stream: the egress is ChannelData
+    // padded to four bytes (RFC 8656 §12.5) and queued for the engine's stream task instead of
+    // being sent from the socket, so there is no egress syscall at all; what is measured is the
+    // wrap, the bounded-queue push and the ingress.
+    let (stream_datapath, stream_in, stream_peer, stream_queue) = runtime.block_on(async {
+        let datapath = UdpLoopbackDatapath::new();
+        let ingress = datapath.alloc_endpoint().await.expect("alloc ingress");
+        let egress = datapath.alloc_endpoint().await.expect("alloc egress");
+        let (peer, peer_addr) = phone().await;
+        let far_addr: SocketAddr = (Ipv4Addr::new(192, 0, 2, 7), 4000).into();
+        let (queue_tx, queue_rx) = flume::bounded(256);
+        datapath.set_turn_relay(
+            egress.id,
+            Some(siphon_rtp_datapath::TurnRelay {
+                carrier: siphon_rtp_datapath::TurnCarrier::Stream(queue_tx),
+                server: (Ipv4Addr::new(192, 0, 2, 1), 3478).into(),
+                channels: vec![(far_addr, 0x4001)],
+                permitted: vec![far_addr],
+            }),
+        );
+        datapath
+            .install_flow(
+                ingress.id,
+                FlowAction::Forward(ForwardRule {
+                    out_endpoint: egress.id,
+                    out_dst: Some(far_addr),
+                    accepted_source: SourceFilter::Exact(peer_addr.ip()),
+                    latch: LatchPolicy::SignalledOnly,
+                    rtcp_to_userspace: false,
+                }),
+            )
+            .expect("forward flow");
+        (datapath, ingress, peer, queue_rx)
+    });
+    let _ = &stream_datapath;
+    group.bench_function("forward_relay_turn_stream_160", |bencher| {
+        bencher.iter(|| {
+            runtime.block_on(async {
+                for _ in 0..BURST {
+                    stream_peer
+                        .send_to(black_box(&packet), stream_in.local_addr)
+                        .await
+                        .expect("send");
+                }
+                for _ in 0..BURST {
+                    black_box(stream_queue.recv_async().await.expect("queued frame"));
                 }
             });
         });

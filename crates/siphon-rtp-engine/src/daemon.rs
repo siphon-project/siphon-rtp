@@ -293,13 +293,14 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = false)]
     pub ice_full: bool,
 
-    /// TURN server to allocate relayed ICE candidates from, `turn:host[:port][?transport=udp]`
-    /// (RFC 7064). Repeat the flag for several: they are raced and the first to allocate
-    /// wins for each endpoint; the others are deleted. Hostnames are resolved once at startup.
-    ///
-    /// UDP only for now: `turns:` and `?transport=tcp` are refused. Requires `--ice-full` (an
-    /// ICE-lite agent advertises host candidates only, RFC 8445 §2.5) and
-    /// `--turn-client-secret-file`.
+    /// TURN server to allocate relayed ICE candidates from: `turn:host[:port]` (UDP, port 3478),
+    /// `turn:host[:port]?transport=tcp` (TCP) or `turns:host[:port]` (TLS over TCP, port 5349)
+    /// (RFC 7064, RFC 7065, RFC 8656 §3.1). The leg from the server to peers is UDP either way.
+    /// Repeat the flag for several: they are raced and the first to allocate wins for each
+    /// endpoint; the others are deleted. Hostnames are resolved once at startup; a `turns:` name
+    /// is also the name the server certificate is verified against. `turns:` with
+    /// `?transport=udp` (DTLS) is refused. Requires `--ice-full` (an ICE-lite agent advertises
+    /// host candidates only, RFC 8445 §2.5) and `--turn-client-secret-file`.
     #[arg(long, value_name = "URI")]
     pub turn_client: Vec<String>,
 
@@ -308,6 +309,12 @@ pub struct EngineArgs {
     /// username))`. Read once at startup; never passed in argv.
     #[arg(long, value_name = "PATH")]
     pub turn_client_secret_file: Option<PathBuf>,
+
+    /// PEM file with the CA certificate(s) a `turns:` server must chain to. Replaces the public
+    /// web roots (which are the default), for a TURN server with a private CA. Refused unless a
+    /// `turns:` server is configured.
+    #[arg(long, value_name = "PATH")]
+    pub turn_client_ca_file: Option<PathBuf>,
 
     /// Seconds a minted TURN username stays valid past the allocation. The username cannot change
     /// during an allocation (RFC 8656 §7.2), so this must outlive the longest call; every new
@@ -413,6 +420,8 @@ pub struct RunConfig {
     pub turn_client: Vec<String>,
     /// File holding the TURN server's `static-auth-secret`.
     pub turn_client_secret_file: Option<PathBuf>,
+    /// CA bundle for `turns:` servers.
+    pub turn_client_ca_file: Option<PathBuf>,
     /// Seconds a minted TURN username stays valid.
     pub turn_client_ttl: u64,
     /// Actively run RFC 7675 consent freshness on ICE legs (off ⇒ the ICE-lite responder posture).
@@ -559,6 +568,10 @@ impl RunConfig {
             turn_client_secret_file: resolve_optional(
                 args.turn_client_secret_file,
                 file.turn_client_secret_file,
+            ),
+            turn_client_ca_file: resolve_optional(
+                args.turn_client_ca_file,
+                file.turn_client_ca_file,
             ),
             turn_client_ttl: resolve_defaulted(
                 args.turn_client_ttl,
@@ -1003,6 +1016,7 @@ where
         config.turn_client_ttl,
         config.ice_full,
         &node_id,
+        config.turn_client_ca_file.as_deref(),
     )
     .await?
     {
@@ -1010,7 +1024,7 @@ where
             target: "siphon_rtp::control",
             servers = ?turn_client.servers,
             ttl_secs = config.turn_client_ttl,
-            "ICE gathering will allocate relayed candidates from these TURN servers (UDP), raced"
+            "ICE gathering will allocate relayed candidates from these TURN servers (UDP, TCP or TLS), raced"
         );
         engine = engine.with_turn_client(turn_client);
     }
@@ -1603,6 +1617,7 @@ mod tests {
         let config = resolve_from(&["siphon-rtp"], FileConfig::default());
         assert!(config.turn_client.is_empty());
         assert_eq!(config.turn_client_secret_file, None);
+        assert_eq!(config.turn_client_ca_file, None);
         assert_eq!(config.turn_client_ttl, 86_400);
     }
 
@@ -1612,6 +1627,7 @@ mod tests {
             turn_client: Some(vec!["turn:192.0.2.1:3478".to_string()]),
             turn_client_secret_file: Some(PathBuf::from("/run/secrets/from-file")),
             turn_client_ttl: Some(600),
+            turn_client_ca_file: Some(PathBuf::from("/etc/from-file-ca.pem")),
             ..FileConfig::default()
         };
         let from_file = resolve_from(&["siphon-rtp"], file());
@@ -1621,6 +1637,10 @@ mod tests {
             Some(PathBuf::from("/run/secrets/from-file"))
         );
         assert_eq!(from_file.turn_client_ttl, 600);
+        assert_eq!(
+            from_file.turn_client_ca_file,
+            Some(PathBuf::from("/etc/from-file-ca.pem"))
+        );
 
         let from_flags = resolve_from(
             &[
@@ -1633,6 +1653,8 @@ mod tests {
                 "/run/secrets/from-flag",
                 "--turn-client-ttl",
                 "900",
+                "--turn-client-ca-file",
+                "/etc/from-flag-ca.pem",
             ],
             file(),
         );
@@ -1645,6 +1667,10 @@ mod tests {
             Some(PathBuf::from("/run/secrets/from-flag"))
         );
         assert_eq!(from_flags.turn_client_ttl, 900);
+        assert_eq!(
+            from_flags.turn_client_ca_file,
+            Some(PathBuf::from("/etc/from-flag-ca.pem"))
+        );
     }
 
     /// Resolve a `RunConfig` from a command line + a config file, the way the binaries do.
@@ -1855,6 +1881,7 @@ mod tests {
             ice_full: false,
             turn_client: Vec::new(),
             turn_client_secret_file: None,
+            turn_client_ca_file: None,
             turn_client_ttl: crate::turn_client_settings::DEFAULT_TURN_CLIENT_TTL_SECS,
             ice_consent: false,
             consent_interval_secs: 5,

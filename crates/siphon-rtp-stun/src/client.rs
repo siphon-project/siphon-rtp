@@ -117,6 +117,18 @@ impl RetransmitSchedule {
         }
     }
 
+    /// The schedule for a request over a **reliable** transport (RFC 8489 §6.2.1: no
+    /// retransmission over TCP or TLS): one send, then failure `timeout_ticks` later, the `Ti`
+    /// timer of 39.5 s.
+    #[must_use]
+    pub fn reliable(timeout_ticks: u64) -> Self {
+        Self {
+            rto_ticks: timeout_ticks,
+            rc: 1,
+            rm: 1,
+        }
+    }
+
     /// A schedule with explicit limits (for tests / non-default policy).
     #[must_use]
     pub fn with_limits(rto_ticks: u64, rc: u32, rm: u32) -> Self {
@@ -343,6 +355,18 @@ pub fn has_use_candidate(message: &StunMessage) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reliable_schedule_sends_once_and_fails_at_the_timeout() {
+        let schedule = super::RetransmitSchedule::reliable(39_500);
+        assert_eq!(schedule.send_offset(0), Some(0));
+        assert_eq!(
+            schedule.send_offset(1),
+            None,
+            "no retransmission over a stream"
+        );
+        assert_eq!(schedule.timeout_offset(), 39_500);
+    }
+
     use super::*;
     use crate::{parse, verify_message_integrity};
 

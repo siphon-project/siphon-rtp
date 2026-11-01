@@ -295,11 +295,19 @@ siphon-rtp --ice-full \
 
 `--turn-client` is repeatable. Servers are raced inside one bounded window and the first to
 allocate wins for each endpoint; the others are deleted (a dead one costs nothing, never a
-failed call). Hostnames are resolved once at startup. It is UDP only for now: `turns:` and
-`?transport=tcp` are refused at startup. It also requires `--ice-full`, and the daemon
+failed call). Hostnames are resolved once at startup. It also requires `--ice-full`, and the daemon
 refuses to start without it: a relayed candidate is only usable once every remote
 candidate has a permission on the allocation, which only the full agent's checklist
 knows, and an ICE-lite agent advertises host candidates only (RFC 8445 §2.5).
+
+The client reaches a server over UDP (`turn:host`), TCP (`turn:host?transport=tcp`) or TLS
+(`turns:host`, port 5349), for a network that blocks UDP. The leg from the server to the
+peers is UDP whichever you choose (RFC 8656 §3.1). A `turns:` certificate is verified against
+the hostname in the URI, using the public web roots; for a TURN server with a private CA, add
+`--turn-client-ca-file /path/to/ca.pem`, which then replaces the web roots. `turns:` with
+`?transport=udp` (TURN over DTLS) is refused. If the stream drops, the allocation fails, the
+relayed candidate stops being used and the leg falls back to its other candidates. A relay
+reached over a stream gets a lower candidate priority than one reached over UDP.
 
 Credentials follow the coturn `use-auth-secret` (TURN REST) scheme. The file holds the
 server's `static-auth-secret`; every allocation mints the username

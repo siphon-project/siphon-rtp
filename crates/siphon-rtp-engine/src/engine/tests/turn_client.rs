@@ -7,8 +7,8 @@
 use super::*;
 use siphon_rtp_turn::{FixedUnixClock, PeerIpPolicy, Turn, TurnConfig};
 
-const REALM: &str = "turn.test";
-const SECRET: &str = "static-auth-secret";
+pub(super) const REALM: &str = "turn.test";
+pub(super) const SECRET: &str = "static-auth-secret";
 
 struct RealTurn {
     datapath: UdpLoopbackDatapath,
@@ -54,12 +54,13 @@ async fn real_turn_server_granting(max_lifetime: u32) -> RealTurn {
 
 fn rest_client(server: SocketAddr) -> TurnClientConfig {
     TurnClientConfig {
-        servers: vec![server],
+        servers: vec![server.into()],
         credentials: TurnCredentialSource::Rest {
             secret: SECRET.to_string(),
             identity: "node-a".to_string(),
             ttl_secs: 3_600,
         },
+        tls: None,
     }
 }
 
@@ -107,7 +108,7 @@ async fn relayed_call(
 }
 
 /// Drive the ICE tick from `from_ms` to `to_ms` in 20 ms steps until `done` holds.
-async fn drive_until(
+pub(super) async fn drive_until(
     engine: &Engine<UdpLoopbackDatapath>,
     from_ms: u64,
     to_ms: u64,
@@ -318,7 +319,7 @@ async fn the_first_server_that_allocates_wins_and_a_dead_one_is_skipped() {
     let engine = Engine::new(UdpLoopbackDatapath::new())
         .with_full_ice()
         .with_turn_client(TurnClientConfig {
-            servers: vec![dead, server.address],
+            servers: vec![dead.into(), server.address.into()],
             ..rest_client(server.address)
         });
     let (_remote, remote_addr) = phone().await;
@@ -352,7 +353,7 @@ async fn a_silent_first_server_does_not_delay_a_live_second_one() {
     let engine = Engine::new(UdpLoopbackDatapath::new())
         .with_full_ice()
         .with_turn_client(TurnClientConfig {
-            servers: vec![silent_addr, server.address],
+            servers: vec![silent_addr.into(), server.address.into()],
             ..rest_client(server.address)
         });
     let (_remote, remote_addr) = phone().await;
@@ -384,7 +385,7 @@ async fn racing_two_live_servers_deletes_the_losing_allocation() {
     let engine = Engine::new(UdpLoopbackDatapath::new())
         .with_full_ice()
         .with_turn_client(TurnClientConfig {
-            servers: vec![first.address, second.address],
+            servers: vec![first.address.into(), second.address.into()],
             ..rest_client(first.address)
         });
     let (_remote, remote_addr) = phone().await;

@@ -355,6 +355,59 @@ pub fn encode_channel_data(channel: u16, data: &[u8], pad_to_four: bool) -> Vec<
     out
 }
 
+// --- Stream framing (RFC 8656 §3.1, §12.5) ------------------------------------------------------
+
+/// What [`stream_frame_len`] found at the head of a TCP/TLS receive buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamFrame {
+    /// Not enough bytes yet for a complete message.
+    Need,
+    /// A complete message of this many bytes (padding included) is buffered.
+    Ready(usize),
+    /// A protocol desync (bad STUN cookie, unaligned length, neither STUN nor ChannelData): the
+    /// peer is hostile or broken and the connection must be closed.
+    Invalid,
+}
+
+/// Find the next message boundary in a TURN byte stream (RFC 8656 §3.1: a stream carries STUN
+/// messages and ChannelData back to back, told apart by the first two bits). A STUN message is its
+/// 20-byte header plus its declared length, which is a multiple of 4 (RFC 8489 §5); a ChannelData
+/// message is its 4-byte header plus payload, padded to a multiple of 4 (RFC 8656 §12.5). Never
+/// reads past `buffer`.
+#[must_use]
+pub fn stream_frame_len(buffer: &[u8]) -> StreamFrame {
+    let Some(&first) = buffer.first() else {
+        return StreamFrame::Need;
+    };
+    if is_channel_data(first) {
+        if buffer.len() < 4 {
+            return StreamFrame::Need;
+        }
+        let length = u16::from_be_bytes([buffer[2], buffer[3]]) as usize;
+        let total = channel_data_frame_len(length, true);
+        if buffer.len() < total {
+            return StreamFrame::Need;
+        }
+        StreamFrame::Ready(total)
+    } else if first & 0xC0 == 0 {
+        if buffer.len() < 20 {
+            return StreamFrame::Need;
+        }
+        let cookie = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+        let length = u16::from_be_bytes([buffer[2], buffer[3]]) as usize;
+        if cookie != crate::MAGIC_COOKIE || !length.is_multiple_of(4) {
+            return StreamFrame::Invalid;
+        }
+        let total = 20 + length;
+        if buffer.len() < total {
+            return StreamFrame::Need;
+        }
+        StreamFrame::Ready(total)
+    } else {
+        StreamFrame::Invalid
+    }
+}
+
 // --- Long-term credential key + primitives ----------------------------------------------------
 
 /// The long-term-credential key `MD5(username ":" realm ":" password)` (RFC 5389 §15.4, RFC 5766
@@ -570,6 +623,76 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stream_frames_split_a_message_across_reads_and_back_to_back_messages() {
+        let stun_message = crate::binding_request(&[1u8; 12], "a", b"k");
+        let channel_data = super::encode_channel_data(0x4002, b"odd", true);
+        // A ChannelData message with 3 payload bytes is 4 + 3 padded to 8.
+        assert_eq!(channel_data.len(), 8);
+        let mut buffer = stun_message.clone();
+        buffer.extend_from_slice(&channel_data);
+        // Every strict prefix of the first message needs more bytes.
+        for cut in 0..stun_message.len() {
+            assert_eq!(
+                super::stream_frame_len(&buffer[..cut]),
+                super::StreamFrame::Need
+            );
+        }
+        assert_eq!(
+            super::stream_frame_len(&buffer),
+            super::StreamFrame::Ready(stun_message.len())
+        );
+        let rest = &buffer[stun_message.len()..];
+        for cut in 0..rest.len() {
+            assert_eq!(
+                super::stream_frame_len(&rest[..cut]),
+                super::StreamFrame::Need
+            );
+        }
+        assert_eq!(super::stream_frame_len(rest), super::StreamFrame::Ready(8));
+    }
+
+    #[test]
+    fn stream_framing_counts_the_padding_of_a_channel_data_message() {
+        // RFC 8656 §12.5: padded to four bytes over a stream, and the padding is not in Length.
+        for payload in 0..=9usize {
+            let message = super::encode_channel_data(0x4001, &vec![0xAA; payload], true);
+            assert_eq!(message.len() % 4, 0);
+            assert_eq!(
+                super::stream_frame_len(&message),
+                super::StreamFrame::Ready(message.len())
+            );
+            // Unpadded, a payload that is not a multiple of 4 is still waiting for its padding.
+            let unpadded = super::encode_channel_data(0x4001, &vec![0xAA; payload], false);
+            if !unpadded.len().is_multiple_of(4) {
+                assert_eq!(super::stream_frame_len(&unpadded), super::StreamFrame::Need);
+            }
+        }
+    }
+
+    #[test]
+    fn stream_framing_rejects_a_desynchronised_stream() {
+        let mut bad_cookie = crate::binding_request(&[0u8; 12], "user", b"key");
+        bad_cookie[4] ^= 0xFF;
+        assert_eq!(
+            super::stream_frame_len(&bad_cookie),
+            super::StreamFrame::Invalid
+        );
+        // Top bits 11 are neither STUN nor ChannelData.
+        assert_eq!(
+            super::stream_frame_len(&[0xC0, 0, 0, 0]),
+            super::StreamFrame::Invalid
+        );
+        // An unaligned STUN length (RFC 8489 §5).
+        let mut unaligned = crate::binding_request(&[0u8; 12], "user", b"key");
+        unaligned[3] |= 1;
+        assert_eq!(
+            super::stream_frame_len(&unaligned),
+            super::StreamFrame::Invalid
+        );
+        assert_eq!(super::stream_frame_len(&[]), super::StreamFrame::Need);
+    }
+
     use super::super::{parse, verify_message_integrity, MessageBuilder, BINDING_REQUEST};
     use super::*;
 

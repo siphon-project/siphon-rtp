@@ -56,7 +56,9 @@ mod takeover;
 mod teardown;
 mod tee;
 mod telemetry;
+mod turn_gather;
 mod turn_relay;
+mod turn_stream;
 mod ws_dial;
 
 pub use ws_dial::DEFAULT_WS_CONNECT_TIMEOUT;
@@ -100,7 +102,7 @@ use snapshot::{
 use takeover::WsBridge;
 use tee::WsTee;
 use telemetry::HepExport;
-pub use turn_relay::{TurnClientConfig, TurnCredentialSource};
+pub use turn_relay::{TurnClientConfig, TurnCredentialSource, TurnServer, TurnTransport};
 
 /// Where relayed ICE candidates are allocated from (RFC 5766), and the long-term credentials to do
 /// it with. A coturn REST deployment supplies a timestamped username and its derived password here.
