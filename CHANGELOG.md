@@ -18,8 +18,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   (and the matching config keys).** Until now it was reachable only through `Engine::with_turn_server`
   with one server and static credentials. `--turn-client turn:host[:port]` is repeatable, servers are
   raced inside one gathering window (a dead one costs the offer nothing), the first to allocate wins per
-  endpoint and the others are deleted, hostnames resolve at startup. UDP only:
-  `turns:` and `?transport=tcp` are refused (the client shares the media 5-tuple). Credentials are the
+  endpoint and the others are deleted, hostnames resolve at startup. UDP, TCP or TLS to the
+  server (see Changed). Credentials are the
   coturn `use-auth-secret` scheme, minted per allocation as `<unix expiry>:<node id>` with password
   `base64(HMAC-SHA1(secret, username))`; the username cannot change during an allocation (RFC 8656 §7.2),
   so the TTL has to outlive a call, and every new allocation gets a fresh one. It requires `--ice-full`
@@ -43,6 +43,26 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   end to end, 3GPP TS 33.180 §7.5.2 NOTE 3), as are `ice: remove` and a pinned `dtls` role.
   `conference_offer` stays plain `RTP/AVP`. `scripts/check-floor-channel-chrome.sh` now also drives this
   direction from headless Chrome.
+### Changed
+
+- **The TURN client reaches a server over TCP and TLS, not only UDP.** `--turn-client` accepts
+  `turn:host?transport=tcp` and `turns:host` (default port 5349) beside `turn:host`; the leg from the
+  server to peers stays UDP (RFC 8656 §3.1, REQUESTED-TRANSPORT 17). The engine owns one connection per
+  allocation, framed with `siphon_rtp_stun::turn::stream_frame_len` (moved out of the in-tree server so
+  both ends share it; ChannelData padded to four bytes, §12.5). A `turns:` server is verified against the
+  hostname in the URI with the public web roots, or against `--turn-client-ca-file` for a private CA (a
+  new flag and `turn_client_ca_file` key, replacing the roots; refused without a `turns:` server).
+  `turns:` with `transport=udp` is TURN over DTLS and is refused, as is the old `turn:?transport=tls`
+  spelling. A stream request is sent once and fails after `Ti` (RFC 8489 §6.2.1); the end of the stream
+  fails the allocation and clears the relay. The gathering window for a stream server is 5 s (connect and
+  handshake), its relayed candidate has its own foundation and a lower local preference than a UDP one.
+  Datapath: `TurnRelay` gains a `carrier` (UDP socket or a bounded stream queue that sheds on full) and
+  a trait method `Datapath::ingest_relayed` delivers what the server sends on the stream through the same
+  ICE gate, source gate, latch and flows as a received datagram. The in-tree server does not delete an
+  allocation when its client's connection closes: RFC 8656 does not require it (the 5-tuple identifies the
+  allocation and it lives out its lifetime), so the client deletes explicitly on release.
+  The `turn_client` config type changes: `servers` is a list of `TurnServer` (address plus transport) and
+  the config carries an optional TLS client configuration.
 
 ### Fixed
 

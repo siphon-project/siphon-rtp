@@ -139,11 +139,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     #[must_use]
     pub fn with_turn_server(mut self, config: TurnServerConfig) -> Self {
         self.turn_client = Some(TurnClientConfig {
-            servers: vec![config.server],
+            servers: vec![config.server.into()],
             credentials: TurnCredentialSource::Static {
                 username: config.username,
                 password: config.password,
             },
+            tls: None,
         });
         self
     }

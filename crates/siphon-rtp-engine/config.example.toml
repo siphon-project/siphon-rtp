@@ -173,9 +173,11 @@ control = "127.0.0.1:8080"
 # checklist knows; an ICE-lite agent advertises host candidates only (RFC 8445 §2.5). The daemon
 # refuses to start otherwise.
 #
-# Servers are `turn:host[:port]` URIs, raced; the first to allocate wins for an
-# endpoint and the others are deleted. Hostnames are resolved once at startup. UDP only for now: `turns:` and
-# `?transport=tcp` are refused.
+# Servers are URIs, raced; the first to allocate wins for an endpoint and the others are deleted:
+# `turn:host[:port]` (UDP), `turn:host[:port]?transport=tcp` (TCP) or `turns:host[:port]` (TLS,
+# default port 5349). The leg from the server to peers is UDP in every case. Hostnames are resolved
+# once at startup, and a `turns:` server is verified against that name. `turns:...?transport=udp`
+# (DTLS) is refused.
 #
 # Credentials follow the coturn `use-auth-secret` (TURN REST) scheme: the file holds the server's
 # `static-auth-secret`, and every allocation mints the username `<unix expiry>:<node_id>` with
@@ -186,6 +188,10 @@ control = "127.0.0.1:8080"
 # turn_client = ["turn:turn.example.com:3478"]
 # turn_client_secret_file = "/run/secrets/siphon-rtp-turn-secret"
 # turn_client_ttl = 86400
+#
+# PEM CA bundle a `turns:` server must chain to (CLI: --turn-client-ca-file). Replaces the public web
+# roots, which are the default. Refused unless a `turns:` server is configured.
+# turn_client_ca_file = "/etc/siphon-rtp/turn-ca.pem"
 
 # --- ICE consent freshness (RFC 7675) -----------------------------------------------------------
 #

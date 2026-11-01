@@ -168,11 +168,13 @@ pub struct FileConfig {
     pub stun_server: Option<Vec<SocketAddr>>,
     /// Run a full RFC 8445 ICE agent on ICE legs (`--ice-full`).
     pub ice_full: Option<bool>,
-    /// TURN servers to allocate relayed ICE candidates from, as `turn:host[:port]` URIs, raced
-    /// (`--turn-client`). Requires `ice_full`.
+    /// TURN servers to allocate relayed ICE candidates from, as `turn:host[:port][?transport=tcp]`
+    /// or `turns:host[:port]` URIs, raced (`--turn-client`). Requires `ice_full`.
     pub turn_client: Option<Vec<String>>,
     /// File holding the TURN server's `static-auth-secret` (`--turn-client-secret-file`).
     pub turn_client_secret_file: Option<PathBuf>,
+    /// CA bundle a `turns:` TURN server must chain to (`--turn-client-ca-file`).
+    pub turn_client_ca_file: Option<PathBuf>,
     /// Seconds a minted TURN username stays valid (`--turn-client-ttl`).
     pub turn_client_ttl: Option<u64>,
     /// Actively run RFC 7675 consent freshness on ICE legs (`--ice-consent`).
@@ -407,6 +409,7 @@ mod tests {
             "ice_full = true\n",
             "turn_client = [\"turn:relay-a.example.com:3478\", \"turn:192.0.2.7\"]\n",
             "turn_client_secret_file = \"/run/secrets/siphon-rtp-turn-secret\"\n",
+            "turn_client_ca_file = \"/etc/siphon-rtp/turn-ca.pem\"\n",
             "turn_client_ttl = 7200\n",
         );
         let config = FileConfig::parse_str(toml).expect("valid TOML deserializes");
@@ -420,6 +423,10 @@ mod tests {
         assert_eq!(
             config.turn_client_secret_file,
             Some(PathBuf::from("/run/secrets/siphon-rtp-turn-secret"))
+        );
+        assert_eq!(
+            config.turn_client_ca_file,
+            Some(PathBuf::from("/etc/siphon-rtp/turn-ca.pem"))
         );
         assert_eq!(config.turn_client_ttl, Some(7_200));
     }

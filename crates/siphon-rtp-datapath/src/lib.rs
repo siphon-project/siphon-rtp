@@ -23,6 +23,7 @@ use bytes::Bytes;
 pub mod conformance;
 pub mod dscp;
 pub mod udp;
+mod udp_relay;
 
 pub use dscp::{Dscp, DscpParseError};
 /// The SSRC-consistent latch state machine (docs/security-and-nat.md §4 layer 3) and the RTP SSRC
@@ -438,6 +439,32 @@ pub fn respond_to_stun_check(
     }
 }
 
+/// The transport of the client-to-server leg of a TURN allocation (RFC 8656 §3.1). The leg from the
+/// server to peers is always UDP; only this one differs.
+#[derive(Clone, Debug, Default)]
+pub enum TurnCarrier {
+    /// Datagrams to and from the TURN server share the endpoint's own UDP socket (the default).
+    #[default]
+    Udp,
+    /// A TCP or TLS stream the engine owns. Wrapped egress is queued here as already-framed bytes
+    /// (ChannelData padded to four bytes, RFC 8656 §12.5) and written by the engine's stream
+    /// task. The queue is bounded and drop-on-full: late media is worthless, so a stalled stream
+    /// sheds packets instead of growing a queue.
+    Stream(flume::Sender<bytes::Bytes>),
+}
+
+impl PartialEq for TurnCarrier {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Udp, Self::Udp) => true,
+            (Self::Stream(left), Self::Stream(right)) => left.same_channel(right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TurnCarrier {}
+
 /// A live TURN allocation an endpoint relays through (RFC 5766), installed by
 /// [`Datapath::set_turn_relay`].
 ///
@@ -453,6 +480,9 @@ pub fn respond_to_stun_check(
 /// Send and Data indications (§11), the fallback the RFC requires clients to support.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnRelay {
+    /// How the client-to-server leg is carried: the endpoint's own UDP socket, or a TCP/TLS stream
+    /// owned by the engine (RFC 8656 §3.1).
+    pub carrier: TurnCarrier,
     /// The TURN server's transport address — where every wrapped datagram is actually sent, and the
     /// only source inbound relayed traffic is accepted from.
     pub server: SocketAddr,
@@ -839,6 +869,31 @@ pub trait Datapath: Send + Sync {
                  media on this backend and must not be advertised"
             );
         }
+    }
+
+    /// Deliver a datagram the TURN server sent on the allocation's own TCP/TLS stream (a ChannelData
+    /// message or a Data indication, RFC 8656 §11.4, §12) as if it had arrived on `endpoint`'s
+    /// socket from the server: it is de-encapsulated against the installed [`TurnRelay`] (unbound
+    /// channels and unpermitted peers are dropped) and then passes the same ICE gate, STUN
+    /// routing, source gate, latch, stats and flows as any received datagram. Returns whether the
+    /// datagram was accepted for processing.
+    ///
+    /// Default: `false`. Only a backend with a TURN relay seam delivers a stream's datagrams.
+    fn ingest_relayed(
+        &self,
+        endpoint: EndpointId,
+        frame: &[u8],
+    ) -> impl std::future::Future<Output = bool> + Send {
+        let _ = (endpoint, frame);
+        async { false }
+    }
+
+    /// The TURN relay currently installed on `endpoint` by [`Self::set_turn_relay`], if any. A
+    /// read-back for tests and diagnostics: which peers are permitted and which have a channel.
+    /// Default: `None`.
+    fn turn_relay(&self, endpoint: EndpointId) -> Option<TurnRelay> {
+        let _ = endpoint;
+        None
     }
 
     /// Whether this backend can actually relay through a TURN allocation ([`Self::set_turn_relay`]).

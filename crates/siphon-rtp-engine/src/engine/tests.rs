@@ -70,6 +70,7 @@ mod tee_sendonly;
 mod tee_undecodable;
 mod transcode_offer;
 mod turn_client;
+mod turn_client_stream;
 mod webrtc_floor_channel;
 
 /// A connectivity check that nominates its pair (USE-CANDIDATE, RFC 8445 §7.1.1): the only kind an

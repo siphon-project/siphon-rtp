@@ -12,15 +12,82 @@ use siphon_rtp_stun::turn_client::{TurnAction, TurnCredentials};
 
 use super::Engine;
 
+/// How the client reaches a TURN server (RFC 8656 §3.1). The relay leg to peers is UDP either way
+/// (REQUESTED-TRANSPORT, §7.1); only the client-to-server leg differs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnTransport {
+    /// UDP, on the media endpoint's own socket.
+    Udp,
+    /// TCP, a stream the engine owns.
+    Tcp,
+    /// TLS over TCP (`turns:`), verified against `server_name`.
+    Tls {
+        /// The name the server certificate must carry (SNI and verification), kept from the URI
+        /// because the address is resolved at startup.
+        server_name: String,
+    },
+}
+
+impl TurnTransport {
+    /// Whether the transport is a byte stream (TCP or TLS) rather than datagrams.
+    #[must_use]
+    pub fn is_stream(&self) -> bool {
+        !matches!(self, Self::Udp)
+    }
+}
+
+/// One configured TURN server: where it is and how to reach it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnServer {
+    /// The resolved transport address.
+    pub address: SocketAddr,
+    /// How the client talks to it.
+    pub transport: TurnTransport,
+}
+
+impl TurnServer {
+    /// A TLS server whose certificate must carry `server_name`.
+    #[must_use]
+    pub fn tls(address: SocketAddr, server_name: impl Into<String>) -> Self {
+        Self {
+            address,
+            transport: TurnTransport::Tls {
+                server_name: server_name.into(),
+            },
+        }
+    }
+
+    /// A TCP server.
+    #[must_use]
+    pub fn tcp(address: SocketAddr) -> Self {
+        Self {
+            address,
+            transport: TurnTransport::Tcp,
+        }
+    }
+}
+
+impl From<SocketAddr> for TurnServer {
+    fn from(address: SocketAddr) -> Self {
+        Self {
+            address,
+            transport: TurnTransport::Udp,
+        }
+    }
+}
+
 /// Where relayed ICE candidates are allocated from (RFC 8656), raced, and how the
 /// long-term credentials for each allocation are produced.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct TurnClientConfig {
     /// Candidate servers, raced for every endpoint. The first to grant an allocation wins; the
     /// others are deleted.
-    pub servers: Vec<SocketAddr>,
+    pub servers: Vec<TurnServer>,
     /// How the credentials are produced.
     pub credentials: TurnCredentialSource,
+    /// The TLS client configuration for `turns:` servers. `None` verifies against the public web
+    /// roots, the same store the `wss://` bridge uses; a private CA is supplied here.
+    pub tls: Option<std::sync::Arc<rustls::ClientConfig>>,
 }
 
 /// Source of the long-term credentials (RFC 8656 §9.2) an allocation authenticates with.
@@ -117,22 +184,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let server = allocation.client.server();
         allocation.client.close();
-        let released = match allocation.client.poll(allocation.last_driven_ms) {
-            TurnAction::Send { datagram } => {
-                match self.datapath.send(endpoint, server, &datagram).await {
-                    Ok(_) => true,
+        let mut released = false;
+        if let TurnAction::Send { datagram } = allocation.client.poll(allocation.last_driven_ms) {
+            match &allocation.stream {
+                // Over a stream the delete is written, then the stream is closed (below).
+                Some(stream) => released = stream.handle().send(&datagram),
+                None => match self.datapath.send(endpoint, server, &datagram).await {
+                    Ok(_) => released = true,
                     Err(error) => {
                         tracing::debug!(
                             target: "siphon_rtp::media",
                             ?endpoint, %server, %error,
                             "failed to transmit a TURN allocation delete"
                         );
-                        false
                     }
-                }
+                },
             }
-            TurnAction::Idle => false,
-        };
+        }
+        // The relay is gone with the allocation: nothing may be wrapped for it any more.
+        self.datapath.set_turn_relay(endpoint, None);
+        if let Some(stream) = allocation.stream.take() {
+            stream.close().await;
+        }
         tracing::debug!(
             target: "siphon_rtp::media",
             ?endpoint, %server, released,
