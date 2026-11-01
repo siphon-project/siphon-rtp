@@ -69,6 +69,24 @@ mod tee_undecodable;
 mod transcode_offer;
 mod webrtc_floor_channel;
 
+/// A connectivity check that nominates its pair (USE-CANDIDATE, RFC 8445 §7.1.1): the only kind an
+/// ice-lite leg selects a media path from (§7.3.1.5). Plain `binding_request` checks are answered
+/// but adopt nothing.
+fn nominating_binding_request(
+    transaction_id: &[u8; 12],
+    username: &str,
+    integrity_key: &[u8],
+) -> Vec<u8> {
+    siphon_rtp_stun::client::binding_request_ice(
+        transaction_id,
+        username,
+        integrity_key,
+        0x7E00_00FF,
+        siphon_rtp_stun::client::IceRole::Controlling(1),
+        true,
+    )
+}
+
 #[test]
 fn ws_vad_config_is_absent_unless_vad_or_barge_in_is_requested() {
     assert!(WsVadConfig::from_profile(&ProfileFlags::default()).is_none());
@@ -16958,7 +16976,7 @@ async fn ice_offer_advertises_lite_and_the_endpoint_answers_checks() {
     // A runs a valid connectivity check against the engine's A-facing endpoint, signed with the
     // engine's advertised password.
     let username = format!("{engine_ufrag}:AAAAAA");
-    let check = siphon_rtp_stun::binding_request(&[7u8; 12], &username, engine_pwd.as_bytes());
+    let check = nominating_binding_request(&[7u8; 12], &username, engine_pwd.as_bytes());
     phone_a
         .send_to(&check, near.remote_rtp)
         .await
@@ -17384,7 +17402,7 @@ async fn ice_remove_strips_the_far_leg_and_keeps_the_offerers_ice() {
 
     // A's connectivity check against the near leg is answered under the engine's credentials.
     let username = format!("{engine_ufrag}:{A_UFRAG}");
-    let check = siphon_rtp_stun::binding_request(&[9u8; 12], &username, engine_pwd.as_bytes());
+    let check = nominating_binding_request(&[9u8; 12], &username, engine_pwd.as_bytes());
     phone_a
         .send_to(&check, near.remote_rtp)
         .await
@@ -21013,7 +21031,7 @@ async fn an_ice_lite_dtls_offerer_is_keyed_on_the_source_its_check_validated() {
     let engine_pwd = answered.ice_pwd.clone().expect("engine pwd");
 
     // A, the full agent of the pair, checks the engine from its real transport.
-    let check = siphon_rtp_stun::binding_request(
+    let check = nominating_binding_request(
         &[7u8; 12],
         &format!("{engine_ufrag}:{A_UFRAG}"),
         engine_pwd.as_bytes(),
@@ -21143,7 +21161,7 @@ async fn an_ice_lite_dtls_conference_seat_is_keyed_on_the_source_its_check_valid
     let engine_pwd = answer.ice_pwd.clone().expect("engine pwd");
 
     // The participant checks the seat from its real transport.
-    let check = siphon_rtp_stun::binding_request(
+    let check = nominating_binding_request(
         &[7u8; 12],
         &format!("{engine_ufrag}:{A_UFRAG}"),
         engine_pwd.as_bytes(),
@@ -21271,7 +21289,7 @@ async fn an_ice_lite_conference_seat_is_sent_the_mix_at_the_source_its_check_val
     let engine_pwd = answer.ice_pwd.clone().expect("engine pwd");
 
     // It validates its real transport with one check, then stays silent, as a listening seat does.
-    let check = siphon_rtp_stun::binding_request(
+    let check = nominating_binding_request(
         &[7u8; 12],
         &format!("{engine_ufrag}:{A_UFRAG}"),
         engine_pwd.as_bytes(),
@@ -21410,7 +21428,7 @@ async fn a_reoffer_that_adds_ice_to_a_kept_dtls_association_follows_the_validate
     let engine_pwd = reanswered.ice_pwd.clone().expect("engine pwd");
 
     // The new ICE session validates A's new transport.
-    let check = siphon_rtp_stun::binding_request(
+    let check = nominating_binding_request(
         &[9u8; 12],
         &format!("{engine_ufrag}:{A_UFRAG}"),
         engine_pwd.as_bytes(),
@@ -21738,7 +21756,7 @@ async fn an_ice_lite_conference_seat_mixes_only_a_stun_validated_source() {
     // from then on its audio is mixed exactly as before — the gate narrows the seat, it does not
     // close it.
     let username = format!("{engine_ufrag}:{A_UFRAG}");
-    let check = siphon_rtp_stun::binding_request(&[5u8; 12], &username, engine_pwd.as_bytes());
+    let check = nominating_binding_request(&[5u8; 12], &username, engine_pwd.as_bytes());
     phone_b.send_to(&check, engine_b).await.expect("send check");
     // The seat is already receiving the room's 20 ms egress on this socket, so skip past the
     // mix frames to the Binding success response.
@@ -22122,7 +22140,7 @@ async fn ice_call_with_validated_a(
 
     // A's connectivity check: this is what makes its source the *validated* path.
     let username = format!("{engine_ufrag}:{A_UFRAG}");
-    let check = siphon_rtp_stun::binding_request(&[7u8; 12], &username, engine_pwd.as_bytes());
+    let check = nominating_binding_request(&[7u8; 12], &username, engine_pwd.as_bytes());
     phone_a
         .send_to(&check, near.remote_rtp)
         .await
@@ -22411,7 +22429,7 @@ async fn each_ice_leg_is_probed_with_its_own_peer_credentials() {
         (&phone_a, near_answer.remote_rtp, A_UFRAG),
         (&phone_b, far_offer.remote_rtp, B_UFRAG),
     ] {
-        let check = siphon_rtp_stun::binding_request(
+        let check = nominating_binding_request(
             &[8u8; 12],
             &format!("{engine_ufrag}:{ufrag}"),
             engine_pwd.as_bytes(),

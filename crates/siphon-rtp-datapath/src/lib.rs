@@ -366,17 +366,41 @@ pub enum StunCheckOutcome {
     /// request, its USERNAME does not lead with our ufrag, or its MESSAGE-INTEGRITY does not verify
     /// with our local password.
     Drop,
-    /// A check that authenticated: adopt the datagram's source as the media path and send these
-    /// response bytes back to it.
-    Respond(Vec<u8>),
+    /// A check that authenticated: send `response` back to the datagram's source (RFC 8445 §7.3 —
+    /// a lite agent answers every valid check). The source becomes the media path only when
+    /// `nomination` is `Some`.
+    Respond {
+        /// The signed Binding success response.
+        response: Vec<u8>,
+        /// `Some(priority)` when the check carried USE-CANDIDATE: the controlling agent nominates
+        /// the pair this check came in on (RFC 8445 §7.3.1.5 / §6.1.3.2 for a lite agent), and
+        /// `priority` is the check's PRIORITY attribute (`0` when absent), the pair priority
+        /// that orders several nominations (§8.1.1). `None` for a plain check, which is answered
+        /// and selects nothing.
+        nomination: Option<u32>,
+    },
+}
+
+/// Whether a nomination of PRIORITY `candidate` may replace the pair already selected with
+/// `current` (`None` = nothing selected yet).
+///
+/// An ice-lite agent has one host candidate per component, so the pair priority is decided by the
+/// remote candidate and the check's PRIORITY attribute orders the pairs (RFC 8445 §6.1.2.3, §8.1.1:
+/// the highest-priority nominated pair is selected). A lower-priority later nomination never moves
+/// an established path; an equal-or-higher one may, which keeps RFC 5245 aggressive nomination
+/// (USE-CANDIDATE on every check) working.
+#[must_use]
+pub fn nomination_supersedes(current: Option<u32>, candidate: u32) -> bool {
+    current.is_none_or(|selected| candidate >= selected)
 }
 
 /// The ice-lite STUN responder (RFC 8445 §7.3, RFC 5389), as a pure function of the datagram and the
 /// endpoint's credentials — no socket, no state.
 ///
 /// Both backends run *this* code rather than their own copy, so the loopback and XDP datapaths can
-/// never drift on what authenticates a check. The caller does the two side-effects: adopt `source` as
-/// the media path, and transmit the returned bytes to it.
+/// never drift on what authenticates a check or what nominates. The caller does the side-effects:
+/// transmit the response to `source`, and, only when the outcome carries a nomination that
+/// [`nomination_supersedes`] the current one, adopt `source` as the media path (RFC 8445 §7.3.1.5).
 ///
 /// The check must be a Binding **request** whose USERNAME leads with our local ufrag (RFC 8445
 /// §7.3: `<local>:<remote>`) and whose MESSAGE-INTEGRITY verifies under our local password — a
@@ -400,11 +424,18 @@ pub fn respond_to_stun_check(
     {
         return StunCheckOutcome::Drop;
     }
-    StunCheckOutcome::Respond(siphon_rtp_stun::binding_success_response(
-        &request.transaction_id,
-        source,
-        Some(ice.local_pwd.as_bytes()),
-    ))
+    // RFC 8445 §7.3.1.5 / §6.1.3.2: only USE-CANDIDATE nominates; a lite agent selects the pair of
+    // a nominating check and nothing else.
+    let nomination = siphon_rtp_stun::client::has_use_candidate(&request)
+        .then(|| siphon_rtp_stun::client::priority(&request).unwrap_or(0));
+    StunCheckOutcome::Respond {
+        response: siphon_rtp_stun::binding_success_response(
+            &request.transaction_id,
+            source,
+            Some(ice.local_pwd.as_bytes()),
+        ),
+        nomination,
+    }
 }
 
 /// A live TURN allocation an endpoint relays through (RFC 5766), installed by
@@ -986,16 +1017,65 @@ mod tests {
             &format!("{}:peerUfrag", config.local_ufrag),
             config.local_pwd.as_bytes(),
         );
-        let StunCheckOutcome::Respond(response) =
-            respond_to_stun_check(&check, &config, responder_peer())
+        let StunCheckOutcome::Respond {
+            response,
+            nomination,
+        } = respond_to_stun_check(&check, &config, responder_peer())
         else {
             panic!("a valid check must be answered");
         };
+        // A plain check (no USE-CANDIDATE) is answered but nominates nothing (RFC 8445 §7.3.1.5).
+        assert_eq!(nomination, None);
         // The response is itself signed, so the peer can authenticate us in turn (RFC 5389 §15.4).
         assert!(siphon_rtp_stun::verify_message_integrity(
             &response,
             config.local_pwd.as_bytes()
         ));
+    }
+
+    fn nominating_check(config: &IceConfig, priority: u32, use_candidate: bool) -> Vec<u8> {
+        siphon_rtp_stun::client::binding_request_ice(
+            &[2u8; 12],
+            &format!("{}:peerUfrag", config.local_ufrag),
+            config.local_pwd.as_bytes(),
+            priority,
+            siphon_rtp_stun::client::IceRole::Controlling(7),
+            use_candidate,
+        )
+    }
+
+    #[test]
+    fn responder_reports_the_priority_of_a_use_candidate_check() {
+        let config = responder_config();
+        let check = nominating_check(&config, 0x7E00_01FF, true);
+        let StunCheckOutcome::Respond { nomination, .. } =
+            respond_to_stun_check(&check, &config, responder_peer())
+        else {
+            panic!("a valid check must be answered");
+        };
+        assert_eq!(nomination, Some(0x7E00_01FF));
+    }
+
+    #[test]
+    fn responder_answers_but_does_not_nominate_a_check_without_use_candidate() {
+        let config = responder_config();
+        let check = nominating_check(&config, 0x7E00_01FF, false);
+        let StunCheckOutcome::Respond { nomination, .. } =
+            respond_to_stun_check(&check, &config, responder_peer())
+        else {
+            panic!("a valid check must be answered");
+        };
+        assert_eq!(nomination, None, "PRIORITY alone is not a nomination");
+    }
+
+    #[test]
+    fn a_nomination_supersedes_nothing_lower_and_everything_equal_or_higher() {
+        // RFC 8445 §8.1.1: the highest-priority nominated pair wins; equal may move (aggressive
+        // nomination re-nominates on every check).
+        assert!(nomination_supersedes(None, 0));
+        assert!(nomination_supersedes(Some(100), 101));
+        assert!(nomination_supersedes(Some(100), 100));
+        assert!(!nomination_supersedes(Some(100), 99));
     }
 
     #[test]

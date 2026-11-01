@@ -152,7 +152,8 @@ a=setup:active
 - **ICE.** A caller that offers ICE is answered with the engine's ICE
   credentials and candidates as on any ICE leg. The handshake waits for ICE:
   under `--ice-full` for the selected pair, and on the default ICE-lite
-  responder for the first connectivity check it validates. Records and media
+  responder for the connectivity check that nominates a pair (`USE-CANDIDATE`,
+  RFC 8445 §7.3.1.5; the highest `PRIORITY` wins if several do). Records and media
   then go to that address, not to the caller's `c=` (RFC 8445 §12.1.1), which
   is what a browser behind NAT needs.
 - **No directive.** Without a plaintext far leg asked for, the caller's keying
@@ -177,6 +178,12 @@ a=ice-ufrag:mJq2X9dK
 a=ice-pwd:H7f2kQ91bXcR3sT8wLpZv0Ay
 a=candidate:1 1 UDP 2130706431 203.0.113.10 40002 typ host
 ```
+
+An ICE-lite engine answers every valid connectivity check but selects only the
+pair a check nominates with `USE-CANDIDATE` (RFC 8445 §7.3.1.5). A browser with
+several interfaces checks from each of its addresses and nominates one; media and
+the DTLS handshake follow that pair, not the last address that checked. A peer
+that never nominates gets no media path.
 
 The candidate list is **gathered** (RFC 8445 §5.1.1), not hardcoded: a host
 candidate per component — RTP, plus RTCP when the leg is not muxed — carrying the
