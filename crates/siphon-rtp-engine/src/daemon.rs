@@ -24,7 +24,7 @@ use clap::parser::ValueSource;
 use clap::ArgMatches;
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::{Datapath, Dscp, RxPacket};
-use siphon_rtp_turn::{tls, NoFastPath, SystemUnixClock, Turn, TurnConfig};
+use siphon_rtp_turn::{tls, NoFastPath, PeerIpPolicy, SystemUnixClock, Turn, TurnConfig};
 use tokio::net::{TcpListener, UdpSocket};
 use tracing_subscriber::EnvFilter;
 
@@ -76,6 +76,14 @@ pub struct EngineArgs {
     /// reachable one (e.g. a NAT'd host). Defaults to the datapath-assigned address.
     #[arg(long)]
     pub turn_relay_ip: Option<IpAddr>,
+    /// Let the built-in TURN server relay to loopback and private (RFC 1918 / unique-local) peers.
+    ///
+    /// Off by default: the server refuses those peers so a client cannot steer the relay at the
+    /// operator's own network (RFC 8656 §21 / docs/security-and-nat.md §11, R3). Turn it on only
+    /// where the peers genuinely live on a private network (an all-private lab, or a CI run), never
+    /// on a TURN server reachable by untrusted clients. Link-local and multicast stay refused.
+    #[arg(long, default_value_t = false)]
+    pub turn_permit_private_peers: bool,
     /// PEM certificate chain presented to the lawful-interception Mediation Function (ETSI
     /// TS 103 221-2 X3). Interception needs this, `--x3-client-key` and `--x3-ca`; without all
     /// three, `attach_x3` is refused rather than silently delivering nowhere.
@@ -442,6 +450,8 @@ pub struct RunConfig {
     pub turn_tls_key: Option<PathBuf>,
     /// Public IP advertised in XOR-RELAYED-ADDRESS when the bound IP differs.
     pub turn_relay_ip: Option<IpAddr>,
+    /// Relay to loopback and private peers (`--turn-permit-private-peers`).
+    pub turn_permit_private_peers: bool,
     /// Lawful-interception content delivery (ETSI TS 103 221-2 X3). `None` ⇒ this node is not
     /// provisioned for interception and `attach_x3` is refused.
     pub x3: Option<crate::x3::X3Config>,
@@ -603,6 +613,12 @@ impl RunConfig {
             turn_tls_cert: resolve_optional(args.turn_tls_cert, file.turn_tls_cert),
             turn_tls_key: resolve_optional(args.turn_tls_key, file.turn_tls_key),
             turn_relay_ip: resolve_optional(args.turn_relay_ip, file.turn_relay_ip),
+            turn_permit_private_peers: resolve_defaulted(
+                args.turn_permit_private_peers,
+                explicit("turn_permit_private_peers"),
+                file.turn_permit_private_peers,
+                false,
+            ),
             // Interception is provisioned only when all three PEM paths are present. Anything less
             // is treated as "not configured" rather than half-configured: a partially-provisioned
             // node would accept a warrant it cannot deliver on.
@@ -1327,6 +1343,30 @@ where
     }
 }
 
+/// The built-in TURN server's configuration for `settings`: the realm and secret, the advertised
+/// relay address, and the peer denylist.
+///
+/// The denylist is the secure default (loopback, private, link-local and multicast peers refused,
+/// RFC 8656 §21) unless `--turn-permit-private-peers` is set, which lifts only the loopback and
+/// private-range denials; link-local and multicast stay refused.
+fn turn_config(realm: String, secret: Vec<u8>, settings: &RunConfig) -> TurnConfig {
+    let mut config = TurnConfig::new(realm, secret);
+    config.relay_address = settings.turn_relay_ip;
+    if settings.turn_permit_private_peers {
+        config.denied_peers = PeerIpPolicy {
+            deny_loopback: false,
+            deny_private: false,
+            ..PeerIpPolicy::default()
+        };
+        tracing::warn!(
+            "--turn-permit-private-peers: the TURN server will relay to loopback and private \
+             peers, which weakens the anti-SSRF default (RFC 8656 §21, security-and-nat.md §11 \
+             R3). Never enable it on a server reachable by untrusted clients."
+        );
+    }
+    config
+}
+
 /// Build and start the TURN server when `SIPHON_RTP_TURN_REALM` + `SIPHON_RTP_TURN_SECRET` are set,
 /// spawning whichever of the UDP/TCP/TLS listeners are configured. Returns `None` when TURN is off.
 /// Generic over the datapath backend so TURN shares whichever one the daemon selected.
@@ -1344,8 +1384,7 @@ where
         return Ok((None, None));
     };
 
-    let mut config = TurnConfig::new(realm.clone(), secret.into_bytes());
-    config.relay_address = settings.turn_relay_ip;
+    let config = turn_config(realm.clone(), secret.into_bytes(), settings);
     // TURN's relay packets are fed by the redirect dispatcher (it shares datapath.rx() with the SRTP
     // bridge), not drained by TURN directly. Drop-newest on a full mailbox — late media is worthless.
     let (relay_tx, relay_rx) = flume::bounded(2048);
@@ -1673,6 +1712,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn private_turn_peers_are_refused_unless_the_flag_is_set() {
+        let none = resolve_from(&["siphon-rtp"], FileConfig::default());
+        assert!(!none.turn_permit_private_peers);
+        let from_file = resolve_from(
+            &["siphon-rtp"],
+            FileConfig {
+                turn_permit_private_peers: Some(true),
+                ..FileConfig::default()
+            },
+        );
+        assert!(from_file.turn_permit_private_peers);
+        let from_flag = resolve_from(
+            &["siphon-rtp", "--turn-permit-private-peers"],
+            FileConfig::default(),
+        );
+        assert!(from_flag.turn_permit_private_peers);
+    }
+
+    #[test]
+    fn the_built_in_turn_server_denies_private_peers_by_default_and_permits_them_with_the_flag() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let private = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7));
+        let unique_local = IpAddr::V6("fd00::7".parse().expect("ula"));
+        let link_local = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1));
+        let multicast = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1));
+        let secure = super::turn_config(
+            "realm".into(),
+            b"secret".to_vec(),
+            &resolve_from(&["siphon-rtp"], FileConfig::default()),
+        );
+        for peer in [loopback, private, unique_local] {
+            assert!(
+                !secure.denied_peers.permits(peer),
+                "{peer} denied by default"
+            );
+        }
+        let lab = super::turn_config(
+            "realm".into(),
+            b"secret".to_vec(),
+            &resolve_from(
+                &["siphon-rtp", "--turn-permit-private-peers"],
+                FileConfig::default(),
+            ),
+        );
+        for peer in [loopback, private, unique_local] {
+            assert!(
+                lab.denied_peers.permits(peer),
+                "{peer} permitted with the flag"
+            );
+        }
+        for peer in [link_local, multicast] {
+            assert!(!lab.denied_peers.permits(peer), "{peer} stays denied");
+        }
+    }
+
     /// Resolve a `RunConfig` from a command line + a config file, the way the binaries do.
     fn resolve_from(argv: &[&str], file: FileConfig) -> RunConfig {
         let matches = <TestCommandLine as clap::CommandFactory>::command()
@@ -1892,6 +1987,7 @@ mod tests {
             turn_tls_cert: None,
             turn_tls_key: None,
             turn_relay_ip: None,
+            turn_permit_private_peers: false,
             x3: None,
             media_fetch: MediaFetchLimits::default(),
             ws_connect_timeout: crate::engine::DEFAULT_WS_CONNECT_TIMEOUT,

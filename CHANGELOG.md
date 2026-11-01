@@ -9,6 +9,11 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **`--turn-permit-private-peers` lets the built-in TURN server relay to loopback and private peers.** The
+  default stays the anti-SSRF denylist (RFC 8656 §21); the flag lifts only the loopback and RFC 1918 /
+  unique-local denials (link-local and multicast stay refused) for private labs and CI, and logs a warning
+  at startup. Config key `turn_permit_private_peers`.
+
 - **The TURN client is a daemon option: `--turn-client`, `--turn-client-secret-file`, `--turn-client-ttl`
   (and the matching config keys).** Until now it was reachable only through `Engine::with_turn_server`
   with one server and static credentials. `--turn-client turn:host[:port]` is repeatable, servers are
@@ -22,6 +27,22 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   and only the full agent's checklist knows which remote candidates need a permission. `node_info` lists
   `turn_client` on a node configured this way.
 
+- **`forward_offer` can offer a browser a seat (`node_info` feature `forward_offer_webrtc`).** With
+  `profile.transport_protocol: "UDP/TLS/RTP/SAVPF"` the offer is a WebRTC one: DTLS-SRTP with the engine's
+  fingerprint and `a=setup:actpass` (RFC 5763 §5), `a=ice-lite` with credentials and candidates minted
+  for the seat (RFC 8445 §2.5, so the browser controls), `a=rtcp-mux`, and everything in one
+  `a=group:BUNDLE` (RFC 8843). A profile with `floor_fmtp` carries the floor control as a bundled
+  `m=application … UDP/DTLS/SCTP webrtc-datachannel` section (RFC 8841) in place of the UDP floor
+  section. `forward_answer` then reads the browser's answer: it must be `UDP/TLS/RTP/SAVPF` with an
+  `a=fingerprint` and an `active` or `passive` `a=setup` (the engine takes the complement as its DTLS
+  role, RFC 5763 §5), and it seats the member `secure_pending` / `ice_pending` exactly as `forward_join`
+  does, so nothing is forwarded until the handshake keys it and ICE validates the peer. The browser opens
+  the `mcptt-floor` channel itself. A plain answer to a WebRTC offer, a DTLS answer to a plain one, an
+  answer with no fingerprint and an `actpass` answer are refused and free the pending seat. A WebRTC
+  offer on a `media: preserve` room is refused (the engine would have to terminate SRTP the room forwards
+  end to end, 3GPP TS 33.180 §7.5.2 NOTE 3), as are `ice: remove` and a pinned `dtls` role.
+  `conference_offer` stays plain `RTP/AVP`. `scripts/check-floor-channel-chrome.sh` now also drives this
+  direction from headless Chrome.
 ### Changed
 
 - **The TURN client reaches a server over TCP and TLS, not only UDP.** `--turn-client` accepts

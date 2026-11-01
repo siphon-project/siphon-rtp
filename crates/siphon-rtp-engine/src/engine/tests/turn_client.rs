@@ -52,7 +52,7 @@ async fn real_turn_server_granting(max_lifetime: u32) -> RealTurn {
     }
 }
 
-fn rest_client(server: SocketAddr) -> TurnClientConfig {
+pub(super) fn rest_client(server: SocketAddr) -> TurnClientConfig {
     TurnClientConfig {
         servers: vec![server.into()],
         credentials: TurnCredentialSource::Rest {
