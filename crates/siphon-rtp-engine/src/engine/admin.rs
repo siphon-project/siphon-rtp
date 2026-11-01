@@ -182,6 +182,11 @@ fn build_features() -> Vec<String> {
         // send RTCP APP. The same `rtcp_app` / `send_rtcp_app` carry it. A controller gates offering
         // the data channel to a browser on this entry.
         "webrtc_floor_channel".to_string(),
+        // `forward_offer` with a `transport_protocol` of `UDP/TLS/RTP/SAVPF` offers a browser a seat:
+        // a WebRTC offer (DTLS-SRTP, ICE-lite, and the `mcptt-floor` data channel when the profile
+        // carries `floor_fmtp`), which `forward_answer` seats on the browser's answer. A controller
+        // gates inviting a browser member to a group on this entry.
+        "forward_offer_webrtc".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

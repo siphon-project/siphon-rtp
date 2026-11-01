@@ -56,6 +56,7 @@ mod floor_checkpoint;
 mod floor_security_refusals;
 mod floor_srtcp;
 mod forward_floor;
+mod forward_offer_webrtc;
 mod forward_room;
 mod forward_stream_identity;
 mod offer_far;

@@ -237,6 +237,44 @@ use another (TS 24.380 §8.1.2 wants the SSRC the receiving party learnt at sess
 
 The floor stream is plain in this build: media control security (TS 24.380 §13) is not negotiated.
 
+### Inviting a browser into the group
+
+A browser can be a pre-arranged member the room calls, not only one that calls the room. Ask
+`forward_offer` for a WebRTC offer with the transport in the profile (check `node_info` `features` for
+`forward_offer_webrtc`):
+
+```json
+{"id":1,"command":"forward_offer","conference_id":"group-1","from_tag":"b19e02",
+ "profile":{"transport_protocol":"UDP/TLS/RTP/SAVPF",
+            "floor_fmtp":"mc_queueing;mc_priority=5;mc_granted"}}
+```
+
+The offer is `UDP/TLS/RTP/SAVPF` with the engine's `a=fingerprint`, `a=setup:actpass`, `a=ice-lite`
+with the seat's credentials and candidates, `a=rtcp-mux`, and one `a=group:BUNDLE`. Because the profile
+carries `floor_fmtp` the floor control is the bundled `m=application … webrtc-datachannel` section; leave
+`floor_fmtp` out for an audio-only seat. Hand the SDP to the page, then send its answer back:
+
+```js
+await pc.setRemoteDescription({ type: "offer", sdp: offerFromEngine });
+const audio = pc.getTransceivers().find((t) => t.receiver.track.kind === "audio");
+audio.direction = "sendrecv";
+await audio.sender.replaceTrack(microphoneTrack);
+const floor = pc.createDataChannel("mcptt-floor");   // after setRemoteDescription: reuses the offered section
+await pc.setLocalDescription(await pc.createAnswer());
+// wait for ICE gathering, then send pc.localDescription.sdp to the controller
+```
+
+```json
+{"id":2,"command":"forward_answer","conference_id":"group-1","from_tag":"b19e02","sdp":"v=0\r\n..."}
+```
+
+The answer must keep `UDP/TLS/RTP/SAVPF`, carry the browser's `a=fingerprint`, and pick a DTLS role
+(`active` or `passive`; `actpass` is refused). The seat joins the room waiting for its handshake and ICE,
+exactly like a browser that called in, and the floor control then runs as in the next section. A
+`media: preserve` room refuses a WebRTC offer (the engine would have to terminate the SRTP the room
+forwards end to end), and so do `ice: remove` and a pinned `dtls` role. `conference_offer` does not
+offer WebRTC. `scripts/check-floor-channel-chrome.sh` drives this direction from headless Chrome too.
+
 ### A browser dispatcher
 
 A browser cannot send RTCP APP, so a web dispatcher console runs the same floor control over a WebRTC

@@ -13,19 +13,19 @@ use siphon_rtp_media::rtcp;
 use siphon_rtp_proto::RtcpAppStream;
 use std::time::Instant;
 
-const ROOM: &str = "browser-group";
-const SHORT: Duration = Duration::from_secs(5);
-const NEGATIVE: Duration = Duration::from_millis(300);
+pub(super) const ROOM: &str = "browser-group";
+pub(super) const SHORT: Duration = Duration::from_secs(5);
+pub(super) const NEGATIVE: Duration = Duration::from_millis(300);
 
 /// TS 24.380 §8.2.4 Floor Request: SSRC 0x11223344, name MCPT, subtype 0.
-const FLOOR_REQUEST: [u8; 16] = [
+pub(super) const FLOOR_REQUEST: [u8; 16] = [
     0x80, 0xCC, 0x00, 0x03, 0x11, 0x22, 0x33, 0x44, 0x4D, 0x43, 0x50, 0x54, 0x00, 0x02, 0x05, 0x00,
 ];
 const FLOOR_GRANTED_PAYLOAD: [u8; 12] = [
     0x01, 0x02, 0x00, 0x1E, 0x0E, 0x06, 0x12, 0x34, 0x56, 0x78, 0x00, 0x00,
 ];
 
-fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
+pub(super) fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     tokio::spawn(run_redirect_dispatcher(
         engine.datapath().rx(),
@@ -50,7 +50,7 @@ fn fingerprint_line(certificate: &DtlsCertificate) -> String {
 }
 
 /// A Chrome-shaped offer: audio and a data channel in one BUNDLE group, DTLS on both.
-fn browser_offer(
+pub(super) fn browser_offer(
     address: SocketAddr,
     certificate: &DtlsCertificate,
     setup: &str,
@@ -92,7 +92,7 @@ async fn join(engine: &Engine<UdpLoopbackDatapath>, tag: &str, offer: String) ->
         .await
 }
 
-enum Order {
+pub(super) enum Order {
     Open(&'static str),
     Binary(Vec<u8>),
     Text(&'static str),
@@ -100,14 +100,14 @@ enum Order {
 
 /// The in-process browser: DTLS + SCTP + DCEP over `socket`, driven by [`Order`]s, reporting what the
 /// SCTP side saw.
-struct Browser {
+pub(super) struct Browser {
     orders: flume::Sender<Order>,
     events: flume::Receiver<DataChannelEvent>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Browser {
-    fn start(
+    pub(super) fn start(
         socket: Arc<UdpSocket>,
         engine: SocketAddr,
         certificate: DtlsCertificate,
@@ -203,7 +203,10 @@ impl Browser {
     }
 
     /// Wait for an SCTP event satisfying `wanted`, skipping the others.
-    async fn expect(&self, wanted: impl Fn(&DataChannelEvent) -> bool) -> DataChannelEvent {
+    pub(super) async fn expect(
+        &self,
+        wanted: impl Fn(&DataChannelEvent) -> bool,
+    ) -> DataChannelEvent {
         let deadline = tokio::time::Instant::now() + SHORT;
         loop {
             let event = tokio::time::timeout_at(deadline, self.events.recv_async())
@@ -216,7 +219,7 @@ impl Browser {
         }
     }
 
-    fn order(&self, order: Order) {
+    pub(super) fn order(&self, order: Order) {
         self.orders.send(order).expect("browser task alive");
     }
 }
@@ -254,7 +257,7 @@ async fn seat_browser(
     Seated { browser, answer }
 }
 
-async fn send_floor(
+pub(super) async fn send_floor(
     engine: &Engine<UdpLoopbackDatapath>,
     tag: &str,
     ssrc: Option<u32>,
@@ -277,7 +280,7 @@ async fn send_floor(
         .await
 }
 
-async fn next_app(events: &flume::Receiver<Event>) -> Event {
+pub(super) async fn next_app(events: &flume::Receiver<Event>) -> Event {
     tokio::time::timeout(SHORT, events.recv_async())
         .await
         .expect("an rtcp_app event")

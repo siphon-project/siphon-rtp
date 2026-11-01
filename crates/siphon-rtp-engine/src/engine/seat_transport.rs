@@ -10,7 +10,7 @@
 //! [`Engine::answer_seat_sdp`] writes the answer.
 
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction, IceConfig, SourceFilter};
-use siphon_rtp_dtls::{DtlsCertificate, Fingerprint as DtlsFingerprint};
+use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_proto::{CmdResult, ForwardMedia, ProfileFlags};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
@@ -29,12 +29,15 @@ pub(super) struct SeatDtls {
     peer_fingerprint: sdp::Fingerprint,
 }
 
+/// Why a DTLS-SRTP (WebRTC) seat cannot be in a preserve room.
+pub(super) const PRESERVE_DTLS_REFUSAL: &str =
+    "a DTLS-SRTP (WebRTC) seat cannot join a preserve room: the engine would have to terminate \
+     its SRTP, and a preserve room forwards end-to-end SRTP unchanged (3GPP TS 33.180 §7.5.2 NOTE 3)";
+
 /// Why a seat that keys its own media cannot join a preserve room.
 pub(super) fn preserve_keying_refusal(info: &sdp::MediaInfo) -> String {
     if info.dtls || info.fingerprint.is_some() {
-        "a DTLS-SRTP (WebRTC) seat cannot join a preserve room: the engine would have to terminate \
-         its SRTP, and a preserve room forwards end-to-end SRTP unchanged (3GPP TS 33.180 §7.5.2 NOTE 3)"
-            .to_string()
+        PRESERVE_DTLS_REFUSAL.to_string()
     } else {
         "a seat that offers a=crypto cannot join a preserve room: the engine must not terminate \
          end-to-end media, and a preserve room relays SRTP keyed between the UEs (a=key-mgmt, \
@@ -69,6 +72,45 @@ pub(super) struct SeatTransport {
 }
 
 impl SeatTransport {
+    /// The transport of a DTLS-SRTP seat the engine **offered** (`forward_offer` with a WebRTC
+    /// profile) and the member has now answered: the endpoint, ICE and certificate were fixed when
+    /// the offer was written, and the answer supplies the peer's fingerprint and where it is.
+    /// There is no SDP left to write, so no ICE or keying advertisement is kept.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one constructor for the answered seat"
+    )]
+    pub(super) fn answered_dtls(
+        endpoint: Endpoint,
+        family: AddressFamily,
+        bind: Option<IpAddr>,
+        advertised: IpAddr,
+        seat_remote: SocketAddr,
+        accepted_source: SourceFilter,
+        ice_pending: bool,
+        certificate: DtlsCertificate,
+        peer_fingerprint: sdp::Fingerprint,
+    ) -> Self {
+        Self {
+            endpoint,
+            family,
+            bind,
+            advertised,
+            seat_remote,
+            accepted_source,
+            ice_pending,
+            ice_credentials: None,
+            ice_candidates: Vec::new(),
+            ice_mismatch: false,
+            dtls: Some(SeatDtls {
+                certificate,
+                peer_fingerprint,
+            }),
+            secure: None,
+            security: None,
+        }
+    }
+
     /// Whether the seat is a DTLS-SRTP leg whose handshake is still to run.
     pub(super) fn dtls_pending(&self) -> bool {
         self.dtls.is_some()
@@ -86,6 +128,29 @@ impl SeatTransport {
             (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
             (None, _) => IceRewrite::Keep,
         }
+    }
+}
+
+/// The engine's DTLS role on a seat whose member **offered** (`forward_join`): the complement of the
+/// offer's `a=setup`, the one the answer advertises (RFC 4145 §4.1, RFC 5763 §5).
+pub(super) fn answerer_dtls_role(offered: Option<sdp::Setup>) -> DtlsRole {
+    super::negotiate::answerer_dtls_setup(offered, None).1
+}
+
+/// The engine's DTLS role on a seat whose member **answered** the engine's `actpass` offer
+/// (`forward_answer`): the complement of the answer's `a=setup`. RFC 5763 §5 has the answerer pick
+/// `active` or `passive`; an `actpass` or `holdconn` answer picks nothing, so the seat is refused
+/// rather than guessed at.
+pub(super) fn offerer_dtls_role(answered: Option<sdp::Setup>) -> Result<DtlsRole, String> {
+    match answered {
+        // The member is the DTLS client: the engine waits for the handshake.
+        Some(sdp::Setup::Active) => Ok(DtlsRole::Server),
+        // The member waits: the engine starts it.
+        Some(sdp::Setup::Passive) => Ok(DtlsRole::Client),
+        Some(sdp::Setup::Actpass | sdp::Setup::Holdconn) | None => Err(
+            "the answer must carry a=setup:active or a=setup:passive (RFC 5763 §5): the offer was actpass"
+                .to_string(),
+        ),
     }
 }
 
@@ -318,20 +383,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// encrypted, which decrypts it on the seat's own `SecureLeg` once keyed (`target`). A no-op for
     /// a seat that is not DTLS. The seat must already be taken `secure_pending`.
     ///
+    /// `role` is the engine's DTLS role, matching the `a=setup` it signalled or accepted (RFC 4145
+    /// §4.1, RFC 5763 §5): [`answerer_dtls_role`] when the member offered, [`offerer_dtls_role`] when
+    /// the engine did.
+    ///
     /// # Errors
     /// The datapath's refusal to (re-)install the redirect.
     pub(super) fn start_seat_dtls(
         &self,
         transport: &SeatTransport,
-        info: &sdp::MediaInfo,
+        role: DtlsRole,
         target: PipelineTarget,
     ) -> Result<(), siphon_rtp_datapath::DatapathError> {
         let Some(dtls) = transport.dtls.as_ref() else {
             return Ok(());
         };
         let endpoint = transport.endpoint;
-        // The role matching the `a=setup` advertised in the answer (RFC 4145 §4.1, RFC 5763 §5).
-        let (_, role) = super::negotiate::answerer_dtls_setup(info.setup, None);
         self.datapath
             .install_flow(endpoint.id, FlowAction::Redirect)?;
         // The seat's validated source as the datapath publishes it: a full agent's selection, or the
