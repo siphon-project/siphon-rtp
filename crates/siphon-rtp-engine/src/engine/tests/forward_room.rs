@@ -512,6 +512,7 @@ async fn a_forwarding_room_and_a_mixing_conference_do_not_share_an_id() {
                 sdp: sdp_for(addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -531,6 +532,7 @@ async fn a_forwarding_room_and_a_mixing_conference_do_not_share_an_id() {
                 sdp: sdp_for(addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;

@@ -123,7 +123,8 @@ profile flag), the reply address is latched only from a gated source, and a pack
 else never enters the mix. See [Security & NAT](../security-and-nat.md).
 
 RFC 4733 telephone-events are filtered out of the mix (DTMF would mangle the audio) and surfaced
-as `dtmf` events on the control channel instead.
+as `dtmf` events on the control channel instead. A seat can also have its digits sent on to the
+other seats: see [Forwarding digits to the other seats](#forwarding-digits-to-the-other-seats).
 
 ## Joining a room
 
@@ -399,6 +400,39 @@ Silent monitoring, with an optional whisper path to the same agent (listen and c
 Each replies `{ "id": N, "result": "ok" }`, or `"result": "error"` with a reason if the room or
 participant is gone.
 
+## Forwarding digits to the other seats
+
+By default a seat's digits are only `dtmf` events. Set `dtmf` to `forward` on `conference_join`,
+`conference_offer` or `conference_seat` and the room also regenerates that seat's telephone-events
+toward every other seat, so an owner app can drive an IVR on a merged call:
+
+```json
+{ "id": 6, "command": "conference_join", "conference_id": "room-1", "from_tag": "owner",
+  "dtmf": "forward", "sdp": "v=0\r\n... opus + telephone-event ..." }
+```
+
+`conference_route` switches it live, with or without a new role. Without `dtmf` it leaves the
+setting alone:
+
+```json
+{ "id": 7, "command": "conference_route", "conference_id": "room-1", "from_tag": "owner",
+  "role": { "role": "talker" }, "dtmf": "events" }
+```
+
+Each target gets the event in its own telephone-event payload type and clock, on its own stream: its
+SSRC, the next sequence number of its audio, and a timestamp taken from its audio clock when the
+event starts and held for the whole event (RFC 4733 §2.5.1.2). The first packet carries the marker,
+the three closing packets carry the End bit, and the durations are rescaled to the target's clock, so
+an owner at 48 kHz reaches a carrier at 8 kHz as 8 kHz durations. Packets are forwarded as they
+arrive, so the tone lasts as long as the key is held. Only the seat set to `forward` forwards; the
+other seats' digits stay events. The mix itself never carries the tone.
+
+A seat gets nothing when it negotiated no telephone-event, when its telephone-event clock is not its
+audio clock (RFC 4733 §2.1), or while it is blocked, silenced, unkeyed (DTLS or ICE pending) or has
+no destination. The seat the digit came from is never sent its own digit. The `dtmf` event is raised
+as before, with `duration_ms` counted in the seat's own event clock. `node_info` lists
+`conference_dtmf` on an engine that serves the option.
+
 ## Bridging two rooms
 
 `conference_bridge` links two live rooms so each hears the other's participants, in one or both
@@ -447,7 +481,7 @@ goes silent. Drives floor control or speaker highlighting.
   "duration_ms": 120, "volume": -8 }
 ```
 
-One event per completed RFC 4733 key press. For a joined participant the conference id arrives in
+One event per completed RFC 4733 key press, whether or not the seat forwards it. For a joined participant the conference id arrives in
 the `call_id` field, the same shape as two-party DTMF events, and again in `conference_id`. For a leg
 seated with `conference_seat`, `call_id` and `from_tag` are its call's own, with `conference_id`
 beside them.

@@ -378,6 +378,35 @@ impl MediaLeg {
         Ok(total)
     }
 
+    /// Frame a **telephone-event** payload (RFC 4733) into an RTP packet on this leg's own stream:
+    /// its SSRC and the next sequence number, but the caller's `payload_type` and `timestamp`.
+    ///
+    /// Only the sequence advances. The audio timestamp is a sampling instant the event does not own
+    /// (RFC 4733 §2.5.1.2: the event carries the timestamp of its start, held for every packet of
+    /// it), so the next audio packet keeps the clock it would have had. The packet and octet counters
+    /// grow, since the event is sent on this SSRC (RFC 3550 §6.4.1 sender report).
+    pub fn packetize_event(
+        &mut self,
+        payload: &[u8],
+        payload_type: u8,
+        timestamp: u32,
+        marker: bool,
+        out: &mut [u8],
+    ) -> Result<usize, LegError> {
+        let header = RtpHeader {
+            marker,
+            payload_type,
+            sequence: self.egress_sequence,
+            timestamp,
+            ssrc: self.egress_ssrc,
+        };
+        let total = write_packet(&header, payload, out)?;
+        self.egress_sequence = self.egress_sequence.wrapping_add(1);
+        self.egress_packets = self.egress_packets.wrapping_add(1);
+        self.egress_octets = self.egress_octets.wrapping_add(payload.len() as u32);
+        Ok(total)
+    }
+
     /// Advance the egress clock past one frame that is **not** being sent, for a codec in
     /// discontinuous transmission (G.729 Annex B).
     ///
@@ -454,6 +483,39 @@ mod tests {
         let len = write_packet(&header, &payload, &mut buffer).expect("write");
         buffer.truncate(len);
         buffer
+    }
+
+    #[test]
+    fn packetize_event_uses_the_event_header_and_advances_only_the_sequence() {
+        let mut leg = ulaw_leg();
+        let mut audio = [0u8; 256];
+        leg.packetize(&[0u8; 160], false, &mut audio)
+            .expect("audio");
+        let timestamp_before = leg.egress_timestamp();
+        let packets_before = leg.egress_packets();
+        let mut out = [0u8; 64];
+        let length = leg
+            .packetize_event(&[5, 10, 0x01, 0x40], 101, 0xDEAD_0000, true, &mut out)
+            .expect("event");
+        assert_eq!(length, 16);
+        let parsed = crate::rtp::RtpPacket::parse(&out[..length]).expect("parse");
+        assert_eq!(parsed.payload_type, 101);
+        assert!(parsed.marker);
+        assert_eq!(parsed.sequence, 1, "continues the audio stream's sequence");
+        assert_eq!(parsed.timestamp, 0xDEAD_0000);
+        assert_eq!(parsed.ssrc, 0xABCD_1234);
+        assert_eq!(parsed.payload, &[5, 10, 0x01, 0x40]);
+        assert_eq!(
+            leg.egress_timestamp(),
+            timestamp_before,
+            "an event does not move the audio clock"
+        );
+        assert_eq!(leg.egress_packets(), packets_before + 1);
+        let next = leg
+            .packetize(&[0u8; 160], false, &mut audio)
+            .expect("audio");
+        let next = crate::rtp::RtpPacket::parse(&audio[..next]).expect("parse");
+        assert_eq!(next.sequence, 2, "audio resumes after the event packet");
     }
 
     #[test]

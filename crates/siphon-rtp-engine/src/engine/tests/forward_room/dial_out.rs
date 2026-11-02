@@ -587,6 +587,7 @@ async fn a_forwarding_room_and_a_mixing_conference_do_not_share_an_id_in_either_
                 from_tag: "m".into(),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -607,6 +608,7 @@ async fn a_forwarding_room_and_a_mixing_conference_do_not_share_an_id_in_either_
                 sdp: sdp_for(addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -657,6 +659,7 @@ async fn an_id_that_changed_kind_between_offer_and_answer_is_refused_and_freed()
                 sdp: sdp_for(addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -692,6 +695,7 @@ async fn a_forwarding_room_that_appeared_after_a_mixing_offer_refuses_its_answer
                     from_tag: "c".into(),
                     role: ConferenceRole::Talker,
                     profile: ProfileFlags::default(),
+                    dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
                 },
             )
             .await,

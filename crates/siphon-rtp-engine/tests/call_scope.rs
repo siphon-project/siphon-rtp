@@ -813,6 +813,7 @@ async fn a_scope_on_a_conference_verb_is_refused() {
         sdp: sdp_for(addr),
         role: ConferenceRole::Talker,
         profile: Default::default(),
+        dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
     };
     assert_eq!(
         error_reason(&control.request(Some("mrf"), join.clone()).await),

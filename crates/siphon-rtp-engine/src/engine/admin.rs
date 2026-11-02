@@ -218,5 +218,11 @@ fn build_features() -> Vec<String> {
         // call must not get — and a controller has no other way to tell, since the behaviour is the
         // engine's, not the contract crate's.
         "answer_local_direction".to_string(),
+        // `conference_join`, `conference_offer` and `conference_seat` take `dtmf: "forward"`, and
+        // `conference_route` can switch it live: the room regenerates that seat's RFC 4733
+        // telephone-events toward every other seat, in each seat's own payload type and clock. A
+        // controller gates sending the option on this entry; an older engine would ignore the field
+        // and drop the digits.
+        "conference_dtmf".to_string(),
     ]
 }

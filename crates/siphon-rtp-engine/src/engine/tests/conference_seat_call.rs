@@ -105,6 +105,7 @@ async fn seat(
                 from_tag: tag.into(),
                 conference_id: room.into(),
                 role: ConferenceRole::Talker,
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await
@@ -126,6 +127,7 @@ async fn join_third_party(
                 sdp: sdp_for(addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;

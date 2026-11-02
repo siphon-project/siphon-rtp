@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, SourceFilter};
-use siphon_rtp_proto::{CmdResult, ConferenceRole, Event, MediaTimeoutReason, RecordingEndReason};
+use siphon_rtp_proto::{CmdResult, Event, MediaTimeoutReason, RecordingEndReason};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
@@ -117,7 +117,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         call_id: &str,
         from_tag: &str,
         conference_id: &str,
-        role: ConferenceRole,
+        placement: super::room::SeatPlacement,
     ) -> CmdResult {
         let plan = match self.plan_seat(client, call_id, from_tag) {
             Ok(plan) => plan,
@@ -190,10 +190,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             secure_pending: true,
             ice_pending: false,
             mos_codec: crate::conference::hep_codec_for_name(&plan.codec.encoding_name),
-            telephone_event_in: plan.telephone_event.map(|event| event.payload_type),
+            telephone_event: plan.telephone_event,
+            dtmf: placement.dtmf,
             secure: None,
             text: None,
-            routing: routing_of(role),
+            routing: routing_of(placement.role),
             telemetry: SeatTelemetry {
                 local: Some(plan.leg.rtp.local_addr),
                 sip_call_id: plan.sip_call_id.clone(),

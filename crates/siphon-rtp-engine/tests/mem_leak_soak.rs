@@ -1046,6 +1046,7 @@ async fn conference_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usiz
                     sdp: sdp_for("198.51.100.1", 40_000 + participant as u16),
                     role: ConferenceRole::Talker,
                     profile: Default::default(),
+                    dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
                 },
             )
             .await;
@@ -1129,6 +1130,7 @@ async fn conference_dial_out(engine: &Engine<UdpLoopbackDatapath>, index: usize)
         from_tag: from_tag.to_string(),
         role: ConferenceRole::Talker,
         profile: Default::default(),
+        dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
     };
     let leave = |conference_id: &str, from_tag: &str| Command::ConferenceLeave {
         conference_id: conference_id.to_string(),
@@ -1144,6 +1146,7 @@ async fn conference_dial_out(engine: &Engine<UdpLoopbackDatapath>, index: usize)
                     sdp: sdp_for("198.51.100.1", port),
                     role: ConferenceRole::Talker,
                     profile: Default::default(),
+                    dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
                 },
             )
             .await;
@@ -1641,6 +1644,7 @@ async fn conference_seat_leave_delete(
         from_tag: "tag-b".into(),
         conference_id: room.clone(),
         role: ConferenceRole::Talker,
+        dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
     };
     let leave = |tag: &str| Command::ConferenceLeave {
         conference_id: room.clone(),
@@ -1673,6 +1677,7 @@ async fn conference_seat_leave_delete(
                 sdp: sdp_for("203.0.113.2", 42_000),
                 role: ConferenceRole::Talker,
                 profile: Default::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
             "conference_join",
         ),

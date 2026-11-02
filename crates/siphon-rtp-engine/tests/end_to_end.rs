@@ -1527,6 +1527,7 @@ async fn conference_distributes_multiparty_text_with_per_source_csrc() {
             sdp: audio_text_sdp(a_audio_addr, a_text_addr),
             role: ConferenceRole::Talker,
             profile: Default::default(),
+            dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
         })
         .await;
     let a_engine_text = text_engine_addr(&a_join);
@@ -1542,6 +1543,7 @@ async fn conference_distributes_multiparty_text_with_per_source_csrc() {
                 sdp: audio_text_sdp(audio, text),
                 role: ConferenceRole::Talker,
                 profile: Default::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             })
             .await;
         // Every join anchors an `m=text` stream to the engine (RFC 9071 conference text).
@@ -1648,6 +1650,7 @@ async fn conference_secures_multiparty_text_per_participant() {
             sdp: secure_text_sdp(a_audio_addr, a_text_addr, &a_text_key),
             role: ConferenceRole::Talker,
             profile: Default::default(),
+            dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
         })
         .await;
     let a_engine_text = text_engine_addr(&a_join);
@@ -1670,6 +1673,7 @@ async fn conference_secures_multiparty_text_per_participant() {
             sdp: secure_text_sdp(b_audio_addr, b_text_addr, &b_text_key),
             role: ConferenceRole::Talker,
             profile: Default::default(),
+            dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
         })
         .await;
     let engine_b_text_key = text_engine_crypto(&b_join);
@@ -2737,6 +2741,7 @@ async fn conference_dial_out_over_tcp_control() {
             sdp: sdp_for(alice_addr),
             role: ConferenceRole::Talker,
             profile: Default::default(),
+            dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
         })
         .await;
     let _ = engine_addr(&joined);

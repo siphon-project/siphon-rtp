@@ -82,6 +82,7 @@ async fn join(
                     flags: flags.iter().map(|flag| (*flag).to_string()).collect(),
                     ..Default::default()
                 },
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await
