@@ -188,6 +188,12 @@ harness = false
 name = "media_started_bench"
 harness = false
 
+# The per-packet cost of forwarding one telephone-event from a conference seat to every other seat,
+# at 2 and 63 targets, with no sockets.
+[[bench]]
+name = "conference_dtmf_bench"
+harness = false
+
 [lints]
 workspace = true
 

@@ -143,6 +143,29 @@ impl DtmfDetector {
     }
 }
 
+/// RFC 4733 §2.3: a telephone-event payload is one or more 4-octet blocks, the duration in the last
+/// two octets of each.
+const EVENT_BLOCK_LEN: usize = 4;
+
+/// Copy a telephone-event `payload` into `out`, rescaling the duration of each event block from
+/// `from_hz` to `to_hz` ticks (RFC 4733 §2.3.5: the duration is in timestamp units of the event
+/// stream's clock). A duration that does not fit in 16 bits saturates, which RFC 4733 §2.5.1.5
+/// handles by ending the event and starting another; the receiver just sees a long event.
+pub fn rescale_event(payload: &[u8], from_hz: u32, to_hz: u32, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(payload);
+    if from_hz == 0 || from_hz == to_hz {
+        return;
+    }
+    let (blocks, _) = out.as_chunks_mut::<EVENT_BLOCK_LEN>();
+    for block in blocks {
+        let duration = u32::from(u16::from_be_bytes([block[2], block[3]]));
+        let scaled = (u64::from(duration) * u64::from(to_hz) / u64::from(from_hz))
+            .min(u64::from(u16::MAX)) as u16;
+        block[2..4].copy_from_slice(&scaled.to_be_bytes());
+    }
+}
+
 /// Default telephone-event volume in -dBm0 (RFC 4733 §2.3.4 recommends ≤ 0; -10 dBm0 is a common
 /// playout level for generated digits).
 pub const DEFAULT_DTMF_VOLUME_DBM0: u8 = 10;
@@ -448,6 +471,24 @@ impl DtmfSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_durations_are_rescaled_per_block_and_saturate() {
+        let mut out = Vec::new();
+        // Two blocks: event 5 for 800 ticks, event 6 for 60 000 ticks, both at 8 kHz.
+        let payload = [5, 10, 0x03, 0x20, 6, 10, 0xEA, 0x60];
+        rescale_event(&payload, 8000, 48_000, &mut out);
+        assert_eq!(&out[..4], &[5, 10, 0x12, 0xC0]);
+        assert_eq!(&out[4..], &[6, 10, 0xFF, 0xFF], "saturates at 16 bits");
+        rescale_event(&payload, 8000, 8000, &mut out);
+        assert_eq!(out, payload, "the same clock copies the payload");
+        rescale_event(&payload[..6], 8000, 16_000, &mut out);
+        assert_eq!(
+            &out[4..],
+            &[6, 10],
+            "a trailing partial block is carried, not scaled"
+        );
+    }
 
     /// Build a telephone-event payload.
     fn payload(event: u8, end: bool, volume: u8, duration: u16) -> [u8; 4] {

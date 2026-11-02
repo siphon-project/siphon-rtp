@@ -45,7 +45,7 @@ use siphon_rtp_media::t140::T140Reassembler;
 use siphon_rtp_media::text_mixer::{
     TextMixer, TextSourceConfig, MAX_PENDING_TEXT_BYTES, MAX_TEXT_REDUNDANCY,
 };
-use siphon_rtp_proto::{Event, PlayEndReason};
+use siphon_rtp_proto::{ConferenceDtmf, Event, PlayEndReason};
 use siphon_rtp_srtp::leg::SecureLeg;
 
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
@@ -53,6 +53,7 @@ use crate::media_pipeline::{Outbound, PlayRequest};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 
 mod bridge;
+mod dtmf_forward;
 pub mod seat;
 mod seating;
 pub use bridge::UnbridgeRefusal;
@@ -229,8 +230,14 @@ pub struct ParticipantConfig {
     /// the negotiated encoding name — so an AMR-WB / G.722 leg is scored on its own impairment, not
     /// the G.711 default. See `hep_codec_for_name`.
     pub mos_codec: siphon_rtp_hep::mos::Codec,
-    /// The participant's RFC 4733 telephone-event PT, if negotiated (filtered out of the mix).
-    pub telephone_event_in: Option<u8>,
+    /// The participant's RFC 4733 telephone-event format (payload type and clock), if negotiated.
+    /// Its events are filtered out of the mix, and regenerated toward the other seats when
+    /// [`ParticipantConfig::dtmf`] is [`ConferenceDtmf::Forward`]. A joined seat answers with the
+    /// payload type it sends, so one format serves both directions (RFC 4733 §2.3).
+    pub telephone_event: Option<crate::sdp::TelephoneEvent>,
+    /// Whether this seat's telephone-events are forwarded to the other seats or only raised as
+    /// `dtmf` events.
+    pub dtmf: ConferenceDtmf,
     /// SDES-SRTP crypto for a secure (`RTP/SAVP`) participant: decrypt ingress / encrypt egress with
     /// this leg's keys. `None` for a plain `RTP/AVP` participant.
     pub secure: Option<SecureLeg>,
@@ -345,7 +352,16 @@ struct Participant {
     /// Whether this participant's encoder is stateless (G.711 / L16) and so can share one encode of
     /// the listener mix with every other listener on the same codec.
     stateless: bool,
-    telephone_event_in: Option<u8>,
+    /// The seat's RFC 4733 format: the payload type filtered out of the mix and, for a forwarded
+    /// event, the clock its durations are counted in.
+    telephone_event: Option<crate::sdp::TelephoneEvent>,
+    /// The RTP clock of this seat's audio egress stream (RFC 3551 §4.5): the clock a telephone-event
+    /// toward it must use (RFC 4733 §2.1).
+    egress_clock_hz: u32,
+    /// Whether this seat's telephone-events are regenerated toward the other seats.
+    dtmf_mode: ConferenceDtmf,
+    /// The event this seat is currently being sent on behalf of another seat ([`dtmf_forward`]).
+    forwarded: Option<dtmf_forward::ForwardedEvent>,
     /// native → room (None when the participant already runs at the room rate).
     to_room: Option<Resampler>,
     /// room → native (None when the participant already runs at the room rate).
@@ -471,6 +487,11 @@ pub struct Conference {
     /// (`secure_out`). Reused per packet — `SecureLeg::protect`/`unprotect` append to a `Vec`.
     clear_in: Vec<u8>,
     secure_out: Vec<u8>,
+    /// Telephone-event packets regenerated for the other seats by [`Conference::ingest`], handed to
+    /// the actor by [`Conference::drain_forwarded`] (ingest has no outbound queue of its own).
+    forwarded: Vec<Outbound>,
+    /// The rescaled event payload of the packet being forwarded, reused per packet.
+    event_scratch: Vec<u8>,
     /// The dominant speaker's tag as of the previous tick (for change detection).
     last_dominant_tag: Option<String>,
     /// RFC 9071 multiparty real-time text mix bus, kept **index-aligned** with `participants` (a text
@@ -536,6 +557,8 @@ impl Conference {
             tap_silence: vec![0i16; (MAX_ROOM_RATE_HZ as usize / 1000) * ROOM_TICK_MS],
             clear_in: Vec::with_capacity(MAX_RTP),
             secure_out: Vec::with_capacity(MAX_RTP),
+            forwarded: Vec::new(),
+            event_scratch: Vec::with_capacity(dtmf_forward::MAX_EVENT_PAYLOAD),
             last_dominant_tag: None,
             text_mixer: TextMixer::new(TEXT_FLUSH_INTERVAL_MS),
             text_flush_counter: 0,
@@ -611,6 +634,7 @@ impl Conference {
             );
         })?;
         let stateless = config.encoder.is_stateless();
+        let egress_clock_hz = config.encoder.rtp_clock_rate_hz();
         let egress_payload_type = config.egress_payload_type;
         // A leg whose packetization interval is not the 20 ms room tick needs a carry on each side —
         // both sized for "whatever a tick leaves over, plus one whole codec frame". A 20 ms leg (all
@@ -684,7 +708,10 @@ impl Conference {
             egress_payload_type,
             mos_codec: config.mos_codec,
             stateless,
-            telephone_event_in: config.telephone_event_in,
+            telephone_event: config.telephone_event,
+            egress_clock_hz,
+            dtmf_mode: config.dtmf,
+            forwarded: None,
             to_room,
             from_room,
             vad: EnergyVad::new(VAD_THRESHOLD, VAD_HANGOVER_FRAMES),
@@ -795,13 +822,14 @@ impl Conference {
             return self.ingest_text(index, packet);
         }
         let conference_id = &self.conference_id;
-        let Some(participant) = self
+        let Some(source_index) = self
             .participants
-            .iter_mut()
-            .find(|participant| participant.ingress_endpoint == packet.endpoint)
+            .iter()
+            .position(|participant| participant.ingress_endpoint == packet.endpoint)
         else {
             return Ingress::Refused;
         };
+        let participant = &mut self.participants[source_index];
         // The shared per-seat ingress chain (source gate, DTLS/ICE pending gates, SRTP unprotect,
         // constrained latch): `crate::seat_gate`, the same one the forwarding room runs.
         let data = match crate::seat_gate::admit(
@@ -862,8 +890,21 @@ impl Conference {
         };
         // RFC 4733 telephone-event: never feed DTMF to the audio decoder (it would mangle the mix);
         // detect the key press and surface it on the control channel instead.
-        if Some(parsed.payload_type) == participant.telephone_event_in {
+        if participant.telephone_event.map(|event| event.payload_type) == Some(parsed.payload_type)
+        {
             if let Ok(Some(event)) = participant.dtmf.on_packet(parsed.timestamp, parsed.payload) {
+                // RFC 4733 §2.3.5: the duration counts in the clock of the seat's event stream,
+                // which is not 8 kHz for a wideband or full-band seat.
+                let clock = u64::from(
+                    participant
+                        .telephone_event
+                        .map_or(crate::sdp::TelephoneEvent::DEFAULT_CLOCK_RATE_HZ, |event| {
+                            event.clock_rate_hz
+                        })
+                        .max(1),
+                );
+                let duration_ms =
+                    u32::try_from(u64::from(event.duration) * 1000 / clock).unwrap_or(u32::MAX);
                 // A seated call leg's digit names its call (the controller's correlation key), with
                 // the room beside it; a joined seat's names the room, as it always has.
                 let digit = Event::Dtmf {
@@ -872,12 +913,18 @@ impl Conference {
                     to_tag: None,
                     conference_id: Some(conference_id.to_string()),
                     digit: event.digit.to_string(),
-                    // RTP timestamp units are samples at the 8 kHz telephone-event clock (RFC 4733).
-                    duration_ms: u32::from(event.duration) / 8,
+                    duration_ms,
                     volume: -i32::from(event.volume),
                     source: None,
                 };
                 participant.call_seat.route(&mut self.pending_events, digit);
+            }
+            if participant.dtmf_mode == ConferenceDtmf::Forward {
+                let timestamp = parsed.timestamp;
+                let mut block = [0u8; dtmf_forward::MAX_EVENT_PAYLOAD];
+                let length = parsed.payload.len().min(block.len());
+                block[..length].copy_from_slice(&parsed.payload[..length]);
+                self.forward_telephone_event(source_index, timestamp, &block[..length]);
             }
             return Ingress::Accepted;
         }
@@ -2021,8 +2068,14 @@ pub enum ConferenceControl {
     },
     /// Remove a participant by tag.
     Remove(String),
-    /// Live-update a participant's role / routing.
-    Route(String, Routing),
+    /// Live-update a participant's role / routing and, when given, its telephone-event forwarding.
+    /// `reply` carries whether the tag is seated, so an unknown tag is answered as an error.
+    Route {
+        tag: String,
+        routing: Routing,
+        dtmf: Option<ConferenceDtmf>,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     /// Set the active-speaker cap.
     SetTopM(usize),
     /// Attach an inbound bridge channel — hear the named room (plan §7 room bridging).
@@ -2104,6 +2157,10 @@ async fn run_conference<D>(
                         // Stamp media activity for the timeout sweep only when the packet passes the
                         // source gate (a spoofed spray must not keep an idle path alive).
                         conference.ingest(&packet).record(&datapath, packet.endpoint);
+                        // A forwarded telephone-event (RFC 4733) goes out now, not on the next
+                        // audio tick: the tone must follow the key press.
+                        conference.drain_forwarded(&mut outbound);
+                        send_all(&datapath, &mut outbound).await;
                         // Forward any detected DTMF (RFC 4733) to the control channel.
                         for event in conference.drain_events() {
                             if let Some(sink) = &events {
@@ -2123,8 +2180,12 @@ async fn run_conference<D>(
                             break; // last leaver tears the room down
                         }
                     }
-                    ConferenceInput::Control(ConferenceControl::Route(tag, routing)) => {
-                        conference.set_routing(&tag, routing);
+                    ConferenceInput::Control(ConferenceControl::Route { tag, routing, dtmf, reply }) => {
+                        let seated = conference.set_routing(&tag, routing);
+                        if let (true, Some(mode)) = (seated, dtmf) {
+                            conference.set_dtmf(&tag, mode);
+                        }
+                        let _ = reply.send(seated);
                     }
                     ConferenceInput::Control(ConferenceControl::SetTopM(top_m)) => {
                         conference.set_top_m(top_m);
@@ -2549,18 +2610,36 @@ impl ConferenceRegistry {
         }
     }
 
-    /// Live-update a participant's role / routing. Returns `false` if the room is gone.
-    pub fn route(&self, conference_id: &str, tag: &str, routing: Routing) -> bool {
-        match self.rooms.get(conference_id) {
-            Some(handle) => handle
-                .mailbox
-                .try_send(ConferenceInput::Control(ConferenceControl::Route(
-                    tag.to_string(),
-                    routing,
-                )))
-                .is_ok(),
-            None => false,
+    /// Live-update a participant's role / routing and, when `dtmf` is given, its telephone-event
+    /// forwarding. Returns `false` if the room is gone, did not answer, or has no such participant.
+    pub async fn route(
+        &self,
+        conference_id: &str,
+        tag: &str,
+        routing: Routing,
+        dtmf: Option<ConferenceDtmf>,
+    ) -> bool {
+        let (reply, seated) = tokio::sync::oneshot::channel();
+        let Some(mailbox) = self
+            .rooms
+            .get(conference_id)
+            .map(|handle| handle.mailbox.clone())
+        else {
+            return false;
+        };
+        let route = ConferenceControl::Route {
+            tag: tag.to_string(),
+            routing,
+            dtmf,
+            reply,
+        };
+        if mailbox.try_send(ConferenceInput::Control(route)).is_err() {
+            return false;
         }
+        matches!(
+            tokio::time::timeout(SEAT_VERDICT_TIMEOUT, seated).await,
+            Ok(Ok(true))
+        )
     }
 
     /// Bridge two existing rooms (plan §7), wiring a one-frame-latency channel for each enabled
@@ -2756,7 +2835,11 @@ mod tests {
             egress_ssrc: 0xC000_0000 + index as u32,
             egress_payload_type: PCMU,
             mos_codec: siphon_rtp_hep::mos::Codec::G711,
-            telephone_event_in: Some(101),
+            telephone_event: Some(crate::sdp::TelephoneEvent {
+                payload_type: 101,
+                clock_rate_hz: 8000,
+            }),
+            dtmf: ConferenceDtmf::Events,
             secure: None,
             secure_pending: false,
             text: None,
@@ -2959,7 +3042,8 @@ mod tests {
             egress_ssrc: 0xD000_0000 + index as u32,
             egress_payload_type: 111,
             mos_codec: siphon_rtp_hep::mos::Codec::Opus,
-            telephone_event_in: None,
+            telephone_event: None,
+            dtmf: ConferenceDtmf::Events,
             secure: None,
             secure_pending: false,
             text: None,
@@ -2997,7 +3081,8 @@ mod tests {
             egress_ssrc: 0xE000_0000 + index as u32,
             egress_payload_type: 111,
             mos_codec: siphon_rtp_hep::mos::Codec::Opus,
-            telephone_event_in: None,
+            telephone_event: None,
+            dtmf: ConferenceDtmf::Events,
             secure: None,
             secure_pending: false,
             text: None,
@@ -3160,7 +3245,8 @@ mod tests {
             egress_ssrc: 0xF000_0000 + index as u32,
             egress_payload_type: 111,
             mos_codec: siphon_rtp_hep::mos::Codec::Opus,
-            telephone_event_in: None,
+            telephone_event: None,
+            dtmf: ConferenceDtmf::Events,
             secure: None,
             secure_pending: false,
             text: None,
@@ -6489,6 +6575,333 @@ mod tests {
                 conference.tick(&mut out);
                 let _ = conference.drain_events().count();
             }
+        }
+    }
+
+    /// Telephone-event forwarding (RFC 4733): the owner's digits regenerated toward the other seats.
+    mod dtmf_forward {
+        use super::*;
+        use crate::sdp::TelephoneEvent as EventFormat;
+
+        const OWNER_EVENT_CLOCK: u32 = 48_000;
+        const OWNER_SSRC_SEED: u32 = 0x2000_0000;
+
+        /// A telephone-event RTP packet from the owner (endpoint 1), at its 48 kHz event clock.
+        fn event_packet(
+            sequence: u16,
+            timestamp: u32,
+            marker: bool,
+            end: bool,
+            duration: u16,
+        ) -> Vec<u8> {
+            let [high, low] = duration.to_be_bytes();
+            let payload = [5u8, (u8::from(end) << 7) | 10, high, low];
+            let header = RtpHeader {
+                marker,
+                payload_type: 101,
+                sequence,
+                timestamp,
+                ssrc: OWNER_SSRC_SEED,
+            };
+            let mut buffer = vec![0u8; 16];
+            let length = write_packet(&header, &payload, &mut buffer).expect("write");
+            buffer.truncate(length);
+            buffer
+        }
+
+        /// The owner: Opus with `telephone-event/48000`, forwarding or not.
+        fn owner(dtmf: ConferenceDtmf) -> ParticipantConfig {
+            ParticipantConfig {
+                telephone_event: Some(EventFormat {
+                    payload_type: 101,
+                    clock_rate_hz: OWNER_EVENT_CLOCK,
+                }),
+                dtmf,
+                accepted_source: SourceFilter::Exact("192.0.2.1".parse().expect("ip")),
+                egress_dst: addr("192.0.2.1:4000"),
+                ..opus_config(0)
+            }
+        }
+
+        /// A G.711 target on `endpoint` index `index` (endpoint `index + 1`).
+        fn target(index: usize) -> ParticipantConfig {
+            ulaw_config(
+                index,
+                &format!("192.0.2.{}", index + 1),
+                &format!("192.0.2.{}:4000", index + 1),
+            )
+        }
+
+        /// A room with the owner (endpoint 1) and G.711 targets at endpoints 2 and 3, after three
+        /// ticks of audio so each target's egress clock has moved off zero. Returns the last audio
+        /// packet each target was sent.
+        fn room(dtmf: ConferenceDtmf) -> (Conference, Vec<Outbound>) {
+            let mut conference = Conference::new("room".into(), 0);
+            conference.add_participant(owner(dtmf)).expect("owner");
+            conference.add_participant(target(1)).expect("target");
+            conference.add_participant(target(2)).expect("target");
+            let mut audio = Vec::new();
+            for _ in 0..3 {
+                audio.clear();
+                conference.tick(&mut audio);
+            }
+            (conference, audio)
+        }
+
+        fn owner_sends(conference: &mut Conference, packet: Vec<u8>) {
+            assert!(conference
+                .ingest(&rx(1, "192.0.2.1:5000", packet))
+                .is_live());
+        }
+
+        fn forwarded(conference: &mut Conference) -> Vec<Outbound> {
+            let mut out = Vec::new();
+            conference.drain_forwarded(&mut out);
+            out
+        }
+
+        fn parsed(outbound: &Outbound) -> RtpPacket<'_> {
+            RtpPacket::parse(&outbound.data).expect("parse")
+        }
+
+        fn to_endpoint(out: &[Outbound], endpoint: u64) -> Vec<&Outbound> {
+            out.iter()
+                .filter(|outbound| outbound.endpoint == EndpointId(endpoint))
+                .collect()
+        }
+
+        /// The owner holds `5` for 60 ms and releases it: start, one update, three E-bit ends.
+        fn owner_presses_five(conference: &mut Conference, start_timestamp: u32) {
+            owner_sends(
+                conference,
+                event_packet(1, start_timestamp, true, false, 960),
+            );
+            owner_sends(
+                conference,
+                event_packet(2, start_timestamp, false, false, 1920),
+            );
+            for sequence in 3..6 {
+                owner_sends(
+                    conference,
+                    event_packet(sequence, start_timestamp, false, true, 2880),
+                );
+            }
+        }
+
+        #[test]
+        fn forwards_the_owners_digit_to_each_target_in_its_own_format_and_stream() {
+            let (mut conference, audio) = room(ConferenceDtmf::Forward);
+            let last_audio: Vec<(u32, u16)> = [2u64, 3]
+                .iter()
+                .map(|endpoint| {
+                    let packets = to_endpoint(&audio, *endpoint);
+                    let packet = parsed(packets.last().expect("audio"));
+                    (packet.timestamp, packet.sequence)
+                })
+                .collect();
+            owner_presses_five(&mut conference, 96_000);
+            let out = forwarded(&mut conference);
+            assert!(
+                to_endpoint(&out, 1).is_empty(),
+                "nothing is sent back to the source"
+            );
+            for (position, endpoint) in [2u64, 3].iter().enumerate() {
+                let (audio_timestamp, audio_sequence) = last_audio[position];
+                let packets = to_endpoint(&out, *endpoint);
+                assert_eq!(packets.len(), 5, "every packet of the event is regenerated");
+                let expected_durations = [160u16, 320, 480, 480, 480];
+                for (index, outbound) in packets.iter().enumerate() {
+                    let packet = parsed(outbound);
+                    assert_eq!(
+                        packet.payload_type, 101,
+                        "the target's own event payload type"
+                    );
+                    assert_eq!(
+                        packet.ssrc,
+                        0xC000_0000 + *endpoint as u32 - 1,
+                        "the target's own SSRC"
+                    );
+                    assert_eq!(
+                        packet.timestamp,
+                        audio_timestamp.wrapping_add(160),
+                        "the event start is the target's next audio timestamp, held for the event"
+                    );
+                    assert_eq!(
+                        packet.sequence,
+                        audio_sequence.wrapping_add(1 + index as u16),
+                        "the sequence continues the target's audio stream"
+                    );
+                    assert_eq!(packet.marker, index == 0, "marker on the first packet only");
+                    let event = siphon_rtp_media::dtmf::TelephoneEvent::parse(packet.payload)
+                        .expect("event");
+                    assert_eq!(event.event, 5);
+                    assert_eq!(event.volume, 10);
+                    assert_eq!(event.end, index >= 2, "the three redundant ends carry E");
+                    assert_eq!(
+                        event.duration, expected_durations[index],
+                        "duration rescaled 48 kHz to 8 kHz"
+                    );
+                    assert_eq!(packet.payload[1] & 0x40, 0, "R stays 0");
+                }
+            }
+            let events: Vec<Event> = conference.drain_events().collect();
+            match events.as_slice() {
+                [Event::Dtmf {
+                    from_tag,
+                    digit,
+                    duration_ms,
+                    volume,
+                    ..
+                }] => {
+                    assert_eq!(from_tag, "opus-0");
+                    assert_eq!(digit, "5");
+                    assert_eq!(*duration_ms, 60, "2880 ticks at the seat's 48 kHz clock");
+                    assert_eq!(*volume, -10);
+                }
+                other => panic!("expected one dtmf event, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_second_press_starts_a_new_event_with_a_fresh_base() {
+            let (mut conference, _) = room(ConferenceDtmf::Forward);
+            owner_presses_five(&mut conference, 96_000);
+            let first = forwarded(&mut conference);
+            let mut audio = Vec::new();
+            conference.tick(&mut audio);
+            conference.tick(&mut audio);
+            owner_presses_five(&mut conference, 200_000);
+            let second = forwarded(&mut conference);
+            let first_base = parsed(to_endpoint(&first, 2)[0]).timestamp;
+            let second_packets = to_endpoint(&second, 2);
+            assert!(parsed(second_packets[0]).marker, "a new event is marked");
+            assert_eq!(
+                parsed(second_packets[0]).timestamp,
+                first_base.wrapping_add(160 * 2),
+                "the base follows the target's audio clock, two ticks later"
+            );
+        }
+
+        #[test]
+        fn events_mode_raises_the_event_and_forwards_nothing() {
+            let (mut conference, _) = room(ConferenceDtmf::Events);
+            owner_presses_five(&mut conference, 96_000);
+            assert!(forwarded(&mut conference).is_empty());
+            assert_eq!(conference.drain_events().count(), 1);
+        }
+
+        #[test]
+        fn another_seats_digit_stays_an_event_while_the_owner_forwards() {
+            let (mut conference, _) = room(ConferenceDtmf::Forward);
+            assert!(conference
+                .ingest(&rx(2, "192.0.2.2:5000", digit_five(1)))
+                .is_live());
+            assert!(forwarded(&mut conference).is_empty());
+            assert_eq!(conference.drain_events().count(), 1);
+        }
+
+        #[test]
+        fn a_seat_that_cannot_take_the_event_gets_nothing() {
+            let mut conference = Conference::new("room".into(), 0);
+            conference
+                .add_participant(owner(ConferenceDtmf::Forward))
+                .expect("owner");
+            conference.add_participant(target(1)).expect("good target");
+            let mut without_event = target(2);
+            without_event.telephone_event = None;
+            conference.add_participant(without_event).expect("seated");
+            let mut mismatched = target(3);
+            mismatched.telephone_event = Some(EventFormat {
+                payload_type: 101,
+                clock_rate_hz: 16_000,
+            });
+            conference.add_participant(mismatched).expect("seated");
+            let mut pending = target(4);
+            pending.secure_pending = true;
+            conference.add_participant(pending).expect("seated");
+            let mut blocked = target(5);
+            blocked.call = Some(SeatedCall {
+                call_id: "call-5".into(),
+                events: None,
+                rtcp_mux: true,
+            });
+            conference.add_participant(blocked).expect("seated");
+            assert!(conference.set_egress_gate("party-5", None, Some(true)));
+            let mut silenced = target(6);
+            silenced.call = Some(SeatedCall {
+                call_id: "call-6".into(),
+                events: None,
+                rtcp_mux: true,
+            });
+            conference.add_participant(silenced).expect("seated");
+            assert!(conference.set_egress_gate("party-6", Some(true), None));
+            let mut unresolved = target(7);
+            unresolved.egress_dst = addr("0.0.0.0:0");
+            conference.add_participant(unresolved).expect("seated");
+
+            owner_presses_five(&mut conference, 96_000);
+            let out = forwarded(&mut conference);
+            assert_eq!(
+                to_endpoint(&out, 2).len(),
+                5,
+                "the one seat that can take it"
+            );
+            for endpoint in 3..=8 {
+                assert!(
+                    to_endpoint(&out, endpoint).is_empty(),
+                    "endpoint {endpoint} must get no event"
+                );
+            }
+        }
+
+        #[test]
+        fn a_secure_seat_gets_an_srtp_protected_event() {
+            use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+            use siphon_rtp_srtp::SrtpContext;
+
+            let local =
+                CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("local key");
+            let remote =
+                CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("remote key");
+            let mut conference = Conference::new("room".into(), 0);
+            conference
+                .add_participant(owner(ConferenceDtmf::Forward))
+                .expect("owner");
+            let mut secure = target(1);
+            secure.secure = Some(SecureLeg::new(&local.key, &remote.key));
+            conference.add_participant(secure).expect("seated");
+            owner_sends(&mut conference, event_packet(1, 96_000, true, true, 2880));
+            let out = forwarded(&mut conference);
+            let wire = to_endpoint(&out, 2);
+            assert_eq!(wire.len(), 1);
+            let mut peer = SrtpContext::from_key_material(&local.key);
+            let mut clear = Vec::new();
+            peer.unprotect(&wire[0].data, &mut clear)
+                .expect("the event is SRTP under the seat's key");
+            let packet = RtpPacket::parse(&clear).expect("parse");
+            assert_eq!(packet.payload_type, 101);
+            assert_eq!(packet.payload, &[5, 0x80 | 10, 0x01, 0xE0]);
+        }
+
+        #[test]
+        fn forwarding_can_be_switched_on_and_off_live() {
+            let (mut conference, _) = room(ConferenceDtmf::Events);
+            owner_presses_five(&mut conference, 96_000);
+            assert!(forwarded(&mut conference).is_empty());
+            assert!(conference.set_dtmf("opus-0", ConferenceDtmf::Forward));
+            owner_presses_five(&mut conference, 200_000);
+            assert_eq!(
+                forwarded(&mut conference).len(),
+                10,
+                "5 packets to 2 targets"
+            );
+            assert!(conference.set_dtmf("opus-0", ConferenceDtmf::Events));
+            owner_presses_five(&mut conference, 300_000);
+            assert!(forwarded(&mut conference).is_empty());
+            assert!(
+                !conference.set_dtmf("nobody", ConferenceDtmf::Forward),
+                "an unknown tag is reported"
+            );
         }
     }
 }

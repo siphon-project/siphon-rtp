@@ -32,6 +32,7 @@ async fn offer_seat(
                 from_tag: from_tag.into(),
                 role: ConferenceRole::Talker,
                 profile,
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await
@@ -71,6 +72,7 @@ async fn join_seat(
                 sdp: sdp_for(rtp, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await

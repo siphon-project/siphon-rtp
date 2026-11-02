@@ -93,6 +93,7 @@ async fn metrics_and_health_endpoint_over_tcp() {
                 sdp: sdp_for(host, 4100),
                 role: Default::default(),
                 profile: Default::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;

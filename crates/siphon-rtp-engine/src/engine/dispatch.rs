@@ -393,8 +393,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag,
                 conference_id,
                 role,
+                dtmf,
             } => {
-                self.conference_seat(client, &call_id, &from_tag, &conference_id, role)
+                let placement = super::room::SeatPlacement { role, dtmf };
+                self.conference_seat(client, &call_id, &from_tag, &conference_id, placement)
                     .await
             }
             Command::Reoffer {
@@ -781,8 +783,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sdp,
                 role,
                 profile,
+                dtmf,
             } => {
-                self.conference_join(client, &conference_id, from_tag, &sdp, role, &profile)
+                let placement = super::room::SeatPlacement { role, dtmf };
+                self.conference_join(client, &conference_id, from_tag, &sdp, placement, &profile)
                     .await
             }
             Command::ConferenceOffer {
@@ -790,8 +794,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag,
                 role,
                 profile,
+                dtmf,
             } => {
-                self.conference_offer(&conference_id, from_tag, role, profile)
+                let placement = super::room::SeatPlacement { role, dtmf };
+                self.conference_offer(&conference_id, from_tag, placement, profile)
                     .await
             }
             Command::ConferenceAnswer {
@@ -814,7 +820,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 conference_id,
                 from_tag,
                 role,
-            } => self.conference_route(&conference_id, &from_tag, role),
+                dtmf,
+            } => {
+                self.conference_route(&conference_id, &from_tag, role, dtmf)
+                    .await
+            }
             Command::ConferenceBridge {
                 conference_id_a,
                 conference_id_b,

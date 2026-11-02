@@ -5,6 +5,31 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Added
+
+- **`dtmf: "forward"` on `conference_join`, `conference_offer` and `conference_seat` makes the room regenerate
+  that seat's RFC 4733 telephone-events toward every other seat; `conference_route` switches it live.** An
+  owner app can drive an IVR on a merged call by sending digits into the conference. Each target gets the
+  events in its own negotiated telephone-event payload type and clock, on its own egress stream (its SSRC,
+  the next sequence number of its audio, a timestamp taken from its audio clock when the event starts and
+  held for the whole event, the marker on the first packet, the three End packets). Packets are forwarded
+  live as they arrive, so the tone lasts as long as the key is held. A seat with no telephone-event, a seat
+  whose event clock is not its audio clock, a blocked, silenced, unkeyed or unresolved seat, and the source
+  itself get nothing. The default `"events"` is the old behaviour: digits are only raised as `dtmf` events.
+  `conference_route` takes an optional `dtmf`; absent, it leaves the seat's setting alone. Advertised in
+  `node_info` as `conference_dtmf`. The wire change adds a field to three `Command` variants and one to
+  `conference_route`, so it needs a minor release of `siphon-rtp-proto`.
+
+### Fixed
+
+- **A conference `dtmf` event reported the wrong `duration_ms` on a seat whose telephone-event clock is not
+  8 kHz.** The duration was always divided by 8; an Opus seat at 48 kHz reported six times the real length.
+  It now uses the seat's own event clock (RFC 4733 §2.3.5).
+- **`conference_route` on a tag the room does not have answered `ok`.** The room's verdict was ignored; it
+  is now the `no such conference or participant` error the verb already promised.
+
 ## [0.18.0] — 2026-11-01
 
 ### Added

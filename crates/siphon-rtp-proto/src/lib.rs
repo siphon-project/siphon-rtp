@@ -614,6 +614,10 @@ pub enum Command {
         role: ConferenceRole,
         #[serde(default)]
         profile: ProfileFlags,
+        /// Whether the seat's RFC 4733 telephone-events are regenerated toward every other seat
+        /// ([`ConferenceDtmf::Forward`]) or only raised as `dtmf` events (the default).
+        #[serde(default)]
+        dtmf: ConferenceDtmf,
     },
     /// Offer a **new seat** for a participant the room calls out to (RFC 4579 §5.5 dial-out): the
     /// engine allocates the seat's endpoint and answers with an SDP offer (RFC 3264 §5) listing the
@@ -626,6 +630,10 @@ pub enum Command {
         role: ConferenceRole,
         #[serde(default)]
         profile: ProfileFlags,
+        /// Whether the seat's RFC 4733 telephone-events are regenerated toward every other seat
+        /// ([`ConferenceDtmf::Forward`]) or only raised as `dtmf` events (the default).
+        #[serde(default)]
+        dtmf: ConferenceDtmf,
     },
     /// The participant's answer to a [`Command::ConferenceOffer`]: seats it in the room exactly as
     /// [`Command::ConferenceJoin`] would have.
@@ -664,6 +672,10 @@ pub enum Command {
         conference_id: String,
         #[serde(default)]
         role: ConferenceRole,
+        /// Whether the seat's RFC 4733 telephone-events are regenerated toward every other seat
+        /// ([`ConferenceDtmf::Forward`]) or only raised as `dtmf` events (the default).
+        #[serde(default)]
+        dtmf: ConferenceDtmf,
     },
     /// Leave a conference (by participant `from_tag`). The room is torn down when its last participant
     /// leaves. A leg seated by [`Command::ConferenceSeat`] is not freed: it returns to its call as a
@@ -677,6 +689,10 @@ pub enum Command {
         conference_id: String,
         from_tag: String,
         role: ConferenceRole,
+        /// Switch the seat's telephone-event forwarding. Absent leaves it as it is, so a role-only
+        /// route keeps working.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dtmf: Option<ConferenceDtmf>,
     },
     /// Bridge two conferences (plan §7 room bridging) so each room hears the other's participants,
     /// in the given direction(s).
@@ -1231,6 +1247,22 @@ pub enum ConferenceRole {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         whisper_target: Option<String>,
     },
+}
+
+/// What a conference seat's RFC 4733 telephone-events do ([`Command::ConferenceJoin`],
+/// [`Command::ConferenceRoute`]).
+///
+/// Deliberately **not** `#[non_exhaustive]`: the value decides whether a seat's digits reach the
+/// other seats, and a consumer must handle a new mode explicitly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConferenceDtmf {
+    /// The digits stay events: raised as `dtmf` and never sent on to another seat (the default).
+    #[default]
+    Events,
+    /// The room also regenerates the seat's telephone-events toward every other seat, each in that
+    /// seat's own payload type, clock and stream (RFC 4733).
+    Forward,
 }
 
 /// Which of a party's streams an RTCP APP packet travels on ([`Command::SendRtcpApp`],
@@ -3913,6 +3945,7 @@ mod tests {
                 from_tag: "f".into(),
                 role: ConferenceRole::Listener,
                 profile: ProfileFlags::default(),
+                dtmf: ConferenceDtmf::Events,
             },
             Command::ConferenceAnswer {
                 conference_id: "room".into(),
@@ -3934,6 +3967,74 @@ mod tests {
     }
 
     #[test]
+    fn conference_dtmf_defaults_to_events_when_absent() {
+        let join =
+            r#"{"command":"conference_join","conference_id":"room","from_tag":"f","sdp":"v=0"}"#;
+        match serde_json::from_str::<Command>(join).expect("deserialize") {
+            Command::ConferenceJoin { dtmf, .. } => assert_eq!(dtmf, ConferenceDtmf::Events),
+            other => panic!("expected conference_join, got {other:?}"),
+        }
+        let offer = r#"{"command":"conference_offer","conference_id":"room","from_tag":"f"}"#;
+        match serde_json::from_str::<Command>(offer).expect("deserialize") {
+            Command::ConferenceOffer { dtmf, .. } => assert_eq!(dtmf, ConferenceDtmf::Events),
+            other => panic!("expected conference_offer, got {other:?}"),
+        }
+        let seat =
+            r#"{"command":"conference_seat","call_id":"c","from_tag":"f","conference_id":"room"}"#;
+        match serde_json::from_str::<Command>(seat).expect("deserialize") {
+            Command::ConferenceSeat { dtmf, .. } => assert_eq!(dtmf, ConferenceDtmf::Events),
+            other => panic!("expected conference_seat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conference_dtmf_forward_wire_shape_round_trips() {
+        let join = r#"{"command":"conference_join","conference_id":"room","from_tag":"f","sdp":"v=0","dtmf":"forward"}"#;
+        let parsed = serde_json::from_str::<Command>(join).expect("deserialize");
+        match &parsed {
+            Command::ConferenceJoin { dtmf, .. } => assert_eq!(*dtmf, ConferenceDtmf::Forward),
+            other => panic!("expected conference_join, got {other:?}"),
+        }
+        roundtrip(&Request {
+            id: 2,
+            command: parsed,
+        });
+        assert_eq!(
+            serde_json::to_string(&ConferenceDtmf::Events).expect("serialize"),
+            r#""events""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ConferenceDtmf::Forward).expect("serialize"),
+            r#""forward""#
+        );
+    }
+
+    #[test]
+    fn conference_route_dtmf_is_optional_and_omitted_when_none() {
+        let role_only = r#"{"command":"conference_route","conference_id":"room","from_tag":"f","role":{"role":"muted"}}"#;
+        let parsed = serde_json::from_str::<Command>(role_only).expect("deserialize");
+        match &parsed {
+            Command::ConferenceRoute { dtmf, role, .. } => {
+                assert_eq!(*dtmf, None, "an absent dtmf leaves the seat alone");
+                assert_eq!(*role, ConferenceRole::Muted);
+            }
+            other => panic!("expected conference_route, got {other:?}"),
+        }
+        let encoded = serde_json::to_string(&parsed).expect("serialize");
+        assert!(
+            !encoded.contains("dtmf"),
+            "None is not serialized: {encoded}"
+        );
+        let with_dtmf = r#"{"command":"conference_route","conference_id":"room","from_tag":"f","role":{"role":"talker"},"dtmf":"forward"}"#;
+        match serde_json::from_str::<Command>(with_dtmf).expect("deserialize") {
+            Command::ConferenceRoute { dtmf, .. } => {
+                assert_eq!(dtmf, Some(ConferenceDtmf::Forward));
+            }
+            other => panic!("expected conference_route, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn conference_seat_wire_shape_and_defaults() {
         let json = r#"{"command":"conference_seat","call_id":"c1@example.com","from_tag":"far-1","conference_id":"room-1"}"#;
         match serde_json::from_str::<Command>(json).expect("deserialize") {
@@ -3942,6 +4043,7 @@ mod tests {
                 from_tag,
                 conference_id,
                 role,
+                ..
             } => {
                 assert_eq!(call_id, "c1@example.com");
                 assert_eq!(from_tag, "far-1");
@@ -3957,11 +4059,12 @@ mod tests {
                 from_tag: "far-1".into(),
                 conference_id: "room-1".into(),
                 role: ConferenceRole::Talker,
+                dtmf: ConferenceDtmf::Events,
             },
         };
         assert_eq!(
             serde_json::to_string(&request).expect("serialize"),
-            r#"{"id":7,"command":"conference_seat","call_id":"c1@example.com","from_tag":"far-1","conference_id":"room-1","role":{"role":"talker"}}"#
+            r#"{"id":7,"command":"conference_seat","call_id":"c1@example.com","from_tag":"far-1","conference_id":"room-1","role":{"role":"talker"},"dtmf":"events"}"#
         );
         roundtrip(&request);
     }
@@ -3973,6 +4076,7 @@ mod tests {
             from_tag: "f".into(),
             conference_id: "room".into(),
             role: ConferenceRole::Talker,
+            dtmf: ConferenceDtmf::Events,
         };
         assert!(
             !command.is_conference(),
@@ -4262,6 +4366,7 @@ mod tests {
                 from_tag,
                 role,
                 profile,
+                ..
             } => {
                 assert_eq!(conference_id, "room-1");
                 assert_eq!(from_tag, "carol");
@@ -4284,11 +4389,12 @@ mod tests {
                     flags: vec!["codec-strip-OPUS".into()],
                     ..Default::default()
                 },
+                dtmf: ConferenceDtmf::Events,
             },
         };
         assert_eq!(
             serde_json::to_string(&request).expect("serialize"),
-            r#"{"id":4,"command":"conference_offer","conference_id":"room-1","from_tag":"carol","role":{"role":"muted"},"profile":{"flags":["codec-strip-OPUS"]}}"#
+            r#"{"id":4,"command":"conference_offer","conference_id":"room-1","from_tag":"carol","role":{"role":"muted"},"profile":{"flags":["codec-strip-OPUS"]},"dtmf":"events"}"#
         );
     }
 
@@ -4342,6 +4448,7 @@ mod tests {
                 from_tag: "f".into(),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: ConferenceDtmf::Events,
             },
             Command::ConferenceAnswer {
                 conference_id: "room".into(),

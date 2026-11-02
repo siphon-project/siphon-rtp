@@ -386,6 +386,7 @@ async fn conference_offer_still_refuses_a_webrtc_profile() {
                 from_tag: "a".into(),
                 role: siphon_rtp_proto::ConferenceRole::default(),
                 profile: webrtc_profile(false),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;

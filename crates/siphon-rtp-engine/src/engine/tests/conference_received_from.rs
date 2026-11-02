@@ -73,6 +73,7 @@ async fn join_talker(engine: &Engine<UdpLoopbackDatapath>, room: &str) -> (UdpSo
                 sdp: sdp_for(addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -112,6 +113,7 @@ async fn seat_natted(
                             received_from: hint,
                             ..Default::default()
                         },
+                        dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
                     },
                 )
                 .await;
@@ -128,6 +130,7 @@ async fn seat_natted(
                         from_tag: "natted".into(),
                         role: ConferenceRole::Talker,
                         profile: ProfileFlags::default(),
+                        dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
                     },
                 )
                 .await;
@@ -264,6 +267,7 @@ async fn the_hint_does_not_aim_an_ice_seat() {
                     received_from: Some(IpAddr::V4(PUBLIC)),
                     ..Default::default()
                 },
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;

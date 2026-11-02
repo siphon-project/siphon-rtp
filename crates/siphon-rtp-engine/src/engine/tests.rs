@@ -48,6 +48,7 @@ const CLIENT: ClientId = ClientId(1);
 
 mod call_floor;
 mod conference_dial_out;
+mod conference_dtmf;
 mod conference_received_from;
 mod conference_seat;
 mod conference_seat_call;
@@ -2822,6 +2823,7 @@ async fn conference_mixes_two_participants_end_to_end() {
                 sdp: sdp_for(addr_a, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -2837,6 +2839,7 @@ async fn conference_mixes_two_participants_end_to_end() {
                 sdp: sdp_for(addr_b, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -2946,6 +2949,7 @@ async fn conference_bridge_command_wires_two_rooms() {
                     sdp: sdp_for(addr, true),
                     role: ConferenceRole::Talker,
                     profile: ProfileFlags::default(),
+                    dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
                 },
             )
             .await;
@@ -2998,6 +3002,7 @@ async fn conference_reaps_idle_participants() {
                     sdp: sdp_for(addr, true),
                     role: ConferenceRole::Talker,
                     profile: ProfileFlags::default(),
+                    dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
                 },
             )
             .await;
@@ -3079,6 +3084,7 @@ async fn seat_dtls_participant(
                 sdp: offer,
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -3151,6 +3157,7 @@ async fn a_listen_only_conference_seat_is_not_reaped_for_being_silent() {
                 sdp: sdp_with_direction(addr, "recvonly"),
                 role: ConferenceRole::Listener,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -3187,6 +3194,7 @@ async fn seat_participant(
                 sdp: sdp_for(addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -3593,6 +3601,7 @@ async fn conference_join_negotiates_sdes_srtp() {
                 sdp: savp_answer_sdp(addr, &peer_crypto),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -3633,6 +3642,7 @@ async fn conference_join_accepts_a_secure_text_participant() {
                 sdp: offer,
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -14375,6 +14385,7 @@ async fn a_conference_seat_answers_a_dtls_offer_without_a_setup_passive() {
                     .replace("a=setup:actpass\r\n", ""),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -15364,6 +15375,7 @@ async fn a_plain_seat_still_fits<D: Datapath + Clone + Send + 'static>(engine: &
                 sdp: sdp_for(phone_addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -15388,6 +15400,7 @@ async fn a_dtls_conference_offer_without_a_fingerprint_is_refused_and_frees_its_
                 sdp: dtls_conference_offer(webrtc_addr, None),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -15418,6 +15431,7 @@ async fn a_dtls_conference_offer_to_an_engine_without_a_certificate_is_refused_a
                 sdp: dtls_conference_offer(webrtc_addr, Some(&peer_certificate.fingerprint())),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -15461,6 +15475,7 @@ async fn a_dtls_participant_joins_a_conference_and_is_mixed_once_its_handshake_k
                 sdp: sdp_for(plain_addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -15500,6 +15515,7 @@ async fn a_dtls_participant_joins_a_conference_and_is_mixed_once_its_handshake_k
                 sdp: offer,
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -21130,6 +21146,7 @@ async fn an_ice_lite_dtls_conference_seat_is_keyed_on_the_source_its_check_valid
                 sdp: sdp_for(plain_addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -21155,6 +21172,7 @@ async fn an_ice_lite_dtls_conference_seat_is_keyed_on_the_source_its_check_valid
                 sdp: nated_ice_dtls_offerer_sdp(signalled, webrtc_addr, &peer_cert.fingerprint()),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -21265,6 +21283,7 @@ async fn an_ice_lite_conference_seat_is_sent_the_mix_at_the_source_its_check_val
                 sdp: sdp_for(talker_addr, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -21284,6 +21303,7 @@ async fn an_ice_lite_conference_seat_is_sent_the_mix_at_the_source_its_check_val
                 sdp: nated_ice_offer_sdp(signalled, attendee_addr),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -21650,6 +21670,7 @@ async fn a_conference_join_carrying_ice_is_accepted_and_answers_with_our_own_ice
                 sdp: ice_offer_with_candidate(addr_a),
                 role: Default::default(),
                 profile: Default::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -21705,6 +21726,7 @@ async fn an_ice_lite_conference_seat_mixes_only_a_stun_validated_source() {
                 sdp: sdp_for(addr_a, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -21723,6 +21745,7 @@ async fn an_ice_lite_conference_seat_mixes_only_a_stun_validated_source() {
                 sdp: ice_offer_with_candidate(addr_b),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -21819,6 +21842,7 @@ async fn a_full_ice_conference_seat_opens_its_media_path_only_after_a_pair_is_se
                 sdp: ice_offer_with_candidate(addr_a),
                 role: Default::default(),
                 profile: Default::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -21904,6 +21928,7 @@ async fn a_full_ice_conference_seat_is_mixed_once_its_agent_selects_a_pair() {
                 sdp: sdp_for(addr_a, true),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -21921,6 +21946,7 @@ async fn a_full_ice_conference_seat_is_mixed_once_its_agent_selects_a_pair() {
                 sdp: ice_offer_with_candidate(addr_b),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -22021,6 +22047,7 @@ async fn a_conference_seat_whose_ice_fails_is_removed_rather_than_left_seated() 
                 sdp: ice_offer_with_candidate(unreachable),
                 role: Default::default(),
                 profile: Default::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -27023,6 +27050,7 @@ async fn conference_join_names_the_offer_line_it_accepted() {
                 sdp: lead_with_unkeyable_crypto(&savp_answer_sdp(addr, &peer_crypto)),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -27047,6 +27075,7 @@ async fn conference_join_secure_text_names_the_offer_line_it_accepted() {
                 )),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -28805,6 +28834,7 @@ async fn a_sip_call_id_that_cannot_be_one_is_refused() {
                     sip_call_id: Some("has space".into()),
                     ..Default::default()
                 },
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -29920,6 +29950,7 @@ async fn a_conference_seats_rtcp_is_exported_under_its_own_dialog() {
                     sip_call_id: Some("5a1e0c77-seat".into()),
                     ..Default::default()
                 },
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -30624,6 +30655,7 @@ async fn conference_join_declines_an_active_video_stream() {
                 sdp: audio_offer_with_sections(addr, &[ACTIVE_VIDEO_SECTION]),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -30654,6 +30686,7 @@ async fn conference_join_keeps_the_text_stream_it_anchors_beside_a_declined_vide
                 sdp: audio_offer_with_sections(audio_addr, &[&text_section, ACTIVE_VIDEO_SECTION]),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;
@@ -30686,6 +30719,7 @@ async fn conference_join_declines_a_text_stream_it_cannot_anchor() {
                 sdp: audio_offer_with_sections(addr, &["m=text 49560 RTP/AVP 98\r\n"]),
                 role: ConferenceRole::Talker,
                 profile: ProfileFlags::default(),
+                dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
             },
         )
         .await;

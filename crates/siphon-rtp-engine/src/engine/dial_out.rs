@@ -13,7 +13,7 @@
 
 use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction, SourceFilter};
-use siphon_rtp_proto::{CmdResult, ConferenceRole, ProfileFlags};
+use siphon_rtp_proto::{CmdResult, ProfileFlags};
 
 use crate::sdp::{self, TelephoneEvent};
 
@@ -23,7 +23,7 @@ use super::negotiate::{
     OPUS_DYNAMIC_PAYLOAD_TYPE,
 };
 use super::offer::far_address_family;
-use super::room::{build_seat_codec, SeatRequest};
+use super::room::{build_seat_codec, SeatPlacement, SeatRequest};
 use super::{error_result, ok_empty, ok_sdp, ClientId, Engine};
 
 /// A seat the engine has offered and the participant has not yet answered.
@@ -34,8 +34,8 @@ pub(super) struct PendingSeat {
     offered: Vec<CodecSpec>,
     /// The telephone-event payload types the offer listed, one per clock rate.
     events: Vec<TelephoneEvent>,
-    /// The role the participant takes once seated.
-    role: ConferenceRole,
+    /// The role the participant takes once seated, and whether its digits are forwarded.
+    placement: SeatPlacement,
     /// The offer's profile: its `symmetric` flag and dialog `Call-ID` carry over to the seat.
     profile: ProfileFlags,
     /// The logical tick the offer was made at, the baseline its expiry is measured from.
@@ -198,7 +198,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         conference_id: &str,
         from_tag: String,
-        role: ConferenceRole,
+        placement: SeatPlacement,
         profile: ProfileFlags,
     ) -> CmdResult {
         if let Err(reason) = super::validate_sip_call_id(&profile) {
@@ -260,7 +260,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             endpoint,
             offered,
             events,
-            role,
+            placement,
             profile,
             offered_tick: self.datapath.now_ticks(),
         };
@@ -393,7 +393,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_pending: false,
             text: None,
             text_endpoint: None,
-            role: pending.role,
+            role: pending.placement.role,
+            dtmf: pending.placement.dtmf,
             sip_call_id: pending.profile.sip_call_id,
             // An answer of `a=recvonly` / `a=inactive` holds the seat, as such an offer does on a
             // join (RFC 4566 §6).

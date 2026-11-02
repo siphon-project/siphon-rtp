@@ -63,6 +63,7 @@ async fn a_seat_answer_names_the_ssrc_the_room_sends_and_none_of_the_offerers() 
         sdp,
         role: ConferenceRole::Talker,
         profile: ProfileFlags::default(),
+        dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
     };
     let answered = engine
         .handle(CLIENT, join("app", browser_shaped_offer(app_addr)))

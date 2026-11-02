@@ -10,8 +10,8 @@ use siphon_rtp_media::playback::Gain;
 use siphon_rtp_media::player::{PcmPlayer, PcmRepeat};
 use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_proto::{
-    BridgeDirection, CmdResult, ConferenceRole, Event, PlayMediaSource, PlayRepeat, ProfileFlags,
-    RecordingEndReason,
+    BridgeDirection, CmdResult, ConferenceDtmf, ConferenceRole, Event, PlayMediaSource, PlayRepeat,
+    ProfileFlags, RecordingEndReason,
 };
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
@@ -246,7 +246,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         conference_id: &str,
         from_tag: String,
         sdp: &str,
-        role: ConferenceRole,
+        placement: SeatPlacement,
         profile: &ProfileFlags,
     ) -> CmdResult {
         if let Err(reason) = super::validate_sip_call_id(profile) {
@@ -337,7 +337,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ice_pending: transport.ice_pending,
                     text: text_config,
                     text_endpoint,
-                    role,
+                    role: placement.role,
+                    dtmf: placement.dtmf,
                     sip_call_id: profile.sip_call_id.clone(),
                     // A seat that offered `a=recvonly` / `a=inactive` told us it will not send (RFC
                     // 4566 §6).
@@ -439,6 +440,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text,
             text_endpoint,
             role,
+            dtmf,
             sip_call_id,
             held,
             egress_ssrc,
@@ -457,7 +459,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             secure_pending,
             ice_pending,
             mos_codec: crate::conference::hep_codec_for_name(&codec.spec.encoding_name),
-            telephone_event_in: telephone_event.map(|event| event.payload_type),
+            telephone_event,
+            dtmf,
             secure,
             text,
             routing: routing_of(role),
@@ -579,15 +582,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Live-update a participant's conference role / routing ([`Command::ConferenceRoute`]).
-    pub(super) fn conference_route(
+    pub(super) async fn conference_route(
         &self,
         conference_id: &str,
         from_tag: &str,
         role: ConferenceRole,
+        dtmf: Option<ConferenceDtmf>,
     ) -> CmdResult {
         if self
             .conference
-            .route(conference_id, from_tag, routing_of(role))
+            .route(conference_id, from_tag, routing_of(role), dtmf)
+            .await
         {
             ok_empty()
         } else {
@@ -1030,6 +1035,14 @@ pub(super) struct SeatCodec {
     pub(super) encoder: Box<dyn Encoder>,
 }
 
+/// Where a seat sits in the room besides its media: the audio routing role and whether its
+/// telephone-events are forwarded to the other seats (`role` / `dtmf` on the seating verbs).
+#[derive(Clone, Debug)]
+pub(super) struct SeatPlacement {
+    pub(super) role: ConferenceRole,
+    pub(super) dtmf: ConferenceDtmf,
+}
+
 /// What [`Engine::seat_participant`] seats: one participant whose media is already negotiated.
 pub(super) struct SeatRequest {
     pub(super) tag: String,
@@ -1046,6 +1059,8 @@ pub(super) struct SeatRequest {
     pub(super) text: Option<ParticipantTextConfig>,
     pub(super) text_endpoint: Option<siphon_rtp_datapath::Endpoint>,
     pub(super) role: ConferenceRole,
+    /// Whether the seat's telephone-events are forwarded to the other seats.
+    pub(super) dtmf: ConferenceDtmf,
     pub(super) sip_call_id: Option<String>,
     /// Whether the participant said it will not send (`a=recvonly` / `a=inactive`, RFC 4566 §6).
     pub(super) held: bool,
