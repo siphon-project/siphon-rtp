@@ -939,6 +939,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             })
     }
 
+    /// Swap the mailbox into `call_id`'s running bridge for one nobody reads, and hand back its
+    /// receiver: from the engine's side this is exactly a bridge blocked on a peer that stopped
+    /// reading, which no loopback socket reproduces in test time (the kernel grows a socket's send
+    /// buffer to megabytes before a write blocks).
+    #[cfg(test)]
+    pub(crate) fn stall_ws_bridge_mailbox(
+        &self,
+        call_id: &str,
+    ) -> Option<flume::Receiver<BridgeControl>> {
+        let mut bridge = self.ws_bridges.get_mut(call_id)?;
+        let (control, unread) = flume::bounded(siphon_rtp_media::bridge::ws::BRIDGE_CONTROL_QUEUE);
+        bridge.control = control;
+        Some(unread)
+    }
+
     pub(super) async fn stop_ws_bridge(&self, call_id: &str, reason: WsBridgeEndReason) {
         let Some((_, bridge)) = self.ws_bridges.remove(call_id) else {
             return;

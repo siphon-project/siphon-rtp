@@ -395,3 +395,173 @@ async fn a_call_answered_straight_into_a_bot_is_recorded_too() {
     assert!(channel_mean(wav.samples(), 0) < -1000, "caller left");
     assert!(channel_mean(wav.samples(), 1) > 1000, "bot right");
 }
+
+/// Long enough for a command that hits both bounds on the way, plus slack for a loaded runner.
+const BOUNDED_COMMAND: Duration = Duration::from_secs(
+    crate::engine::record::BRIDGE_REQUEST_TIMEOUT.as_secs()
+        + crate::engine::record::WRITER_CLOSE_TIMEOUT.as_secs()
+        + 4,
+);
+
+/// A recorded call handed to a bot, talking, then the bot's bridge stops hearing the engine: its
+/// mailbox is one nobody reads, which is what a bridge blocked writing to a bot that stopped
+/// reading looks like from here. The receiver is returned so the mailbox stays open (a closed one
+/// would answer every request at once).
+async fn recorded_bot_call_that_stalls(
+    call_id: &str,
+    directory: &std::path::Path,
+) -> (
+    Engine<UdpLoopbackDatapath>,
+    flume::Receiver<Event>,
+    String,
+    flume::Receiver<siphon_rtp_media::bridge::ws::BridgeControl>,
+    flume::Sender<Vec<u8>>,
+) {
+    let (engine, phone, caller_target) = anchored_call(call_id).await;
+    let events = engine.register_client(CLIENT);
+    let (_frames, downlink) = hand_to_bot(&engine, call_id).await;
+    let id = recording_id(
+        engine
+            .handle(
+                CLIENT,
+                start_recording(
+                    call_id,
+                    directory,
+                    RecordingDirection::Both,
+                    RecordingChannels::Stereo,
+                ),
+            )
+            .await,
+    );
+    both_talk(&phone, caller_target, &downlink, 10).await;
+    let unread = engine
+        .stall_ws_bridge_mailbox(call_id)
+        .expect("the call has a bridge");
+    (engine, events, id, unread, downlink)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_answers_when_the_recorded_bot_bridge_has_stopped_listening() {
+    // The incident shape: a `delete` asks the bridge to let go of the recording's taps, and the
+    // bridge, blocked on its bot, never reads the request. The delete used to wait for it forever,
+    // and with it every command queued behind it on the control connection.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (engine, events, id, _unread, _downlink) =
+        recorded_bot_call_that_stalls("stalled-delete", directory.path()).await;
+    let deleted = timeout(
+        BOUNDED_COMMAND,
+        engine.handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "stalled-delete".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        ),
+    )
+    .await
+    .expect("the delete answers instead of waiting on the bridge");
+    assert!(matches!(deleted, CmdResult::Ok { .. }), "{deleted:?}");
+
+    // Tearing the bridge down drops the taps it held, so the file is still finalized.
+    let (finished_id, path, duration_ms, reason) = finished(&events).await;
+    assert_eq!(finished_id, id);
+    assert_eq!(reason, RecordingEndReason::CallEnded);
+    assert!(duration_ms > 0);
+    let bytes = std::fs::read(path.expect("a file")).expect("read");
+    let wav = siphon_rtp_media::player::WavSource::parse(&bytes).expect("a finalized WAV");
+    assert_eq!(wav.channels(), 2);
+    assert_eq!(engine.recording_count(), 0);
+    assert!(!engine.ws().is_ws_call("stalled-delete"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_recording_answers_when_the_bot_bridge_has_stopped_listening() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (engine, events, id, _unread, _downlink) =
+        recorded_bot_call_that_stalls("stalled-stop", directory.path()).await;
+    let stopped = timeout(
+        BOUNDED_COMMAND,
+        engine.handle(
+            CLIENT,
+            Command::StopRecording {
+                call_id: "stalled-stop".into(),
+                from_tag: "tag-a".into(),
+                recording_id: Some(id.clone()),
+            },
+        ),
+    )
+    .await
+    .expect("the stop answers instead of waiting on the bridge");
+    assert!(matches!(stopped, CmdResult::Ok { .. }), "{stopped:?}");
+    assert_eq!(engine.recording_count(), 0, "the recording is stopped");
+
+    // The bridge still holds the taps, so the file closes when it lets go: here, at the hangup.
+    let deleted = timeout(
+        BOUNDED_COMMAND,
+        engine.handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "stalled-stop".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        ),
+    )
+    .await
+    .expect("the delete answers");
+    assert!(matches!(deleted, CmdResult::Ok { .. }), "{deleted:?}");
+    let (finished_id, path, _, reason) = finished(&events).await;
+    assert_eq!(finished_id, id);
+    assert_eq!(
+        reason,
+        RecordingEndReason::Stopped,
+        "the stop is what ended it"
+    );
+    let bytes = std::fs::read(path.expect("a file")).expect("read");
+    siphon_rtp_media::player::WavSource::parse(&bytes).expect("a finalized WAV");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repoint_answers_when_the_old_bot_bridge_has_stopped_listening() {
+    // A re-point asks the old bridge to hand its recording taps over; a bridge that never reads
+    // the request must not hold the re-point (and the call's lane) forever.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (engine, _events, _id, _unread, _downlink) =
+        recorded_bot_call_that_stalls("stalled-repoint", directory.path()).await;
+    let (ws_uri, frames, _downlink_two) = takeover_ws_server().await;
+    let repointed = timeout(
+        BOUNDED_COMMAND,
+        engine.handle(
+            CLIENT,
+            Command::AttachWsBridge {
+                call_id: "stalled-repoint".into(),
+                from_tag: "tag-a".into(),
+                ws_uri,
+                profile: Some(ProfileFlags {
+                    ws_sample_rate: Some(16_000),
+                    ..Default::default()
+                }),
+            },
+        ),
+    )
+    .await
+    .expect("the re-point answers instead of waiting on the old bridge");
+    assert!(matches!(repointed, CmdResult::Ok { .. }), "{repointed:?}");
+    let _ = expect_bridge_start(&frames).await;
+    let deleted = timeout(
+        BOUNDED_COMMAND,
+        engine.handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "stalled-repoint".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        ),
+    )
+    .await
+    .expect("the delete answers");
+    assert!(matches!(deleted, CmdResult::Ok { .. }), "{deleted:?}");
+    assert_eq!(engine.recording_count(), 0);
+}

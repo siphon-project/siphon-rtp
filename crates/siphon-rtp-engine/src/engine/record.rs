@@ -1168,18 +1168,38 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ) {
         use siphon_rtp_media::bridge::ws::BridgeControl;
         if let Some(bridge) = self.bridge_recording_target(call_id) {
-            let (done, removed) = tokio::sync::oneshot::channel();
-            let sent = bridge
-                .control
-                .send_async(BridgeControl::RemoveRecordingTaps {
-                    tag: recording_id.to_string(),
-                    done,
-                })
-                .await;
-            if sent.is_ok() {
-                // A bridge that ends first drops `done`, and its sinks with it: either way they
-                // are gone.
-                let _ = removed.await;
+            let request = async {
+                let (done, removed) = tokio::sync::oneshot::channel();
+                let sent = bridge
+                    .control
+                    .send_async(BridgeControl::RemoveRecordingTaps {
+                        tag: recording_id.to_string(),
+                        done,
+                    })
+                    .await;
+                if sent.is_ok() {
+                    // A bridge that ends first drops `done`, and its sinks with it: either way
+                    // they are gone.
+                    let _ = removed.await;
+                }
+            };
+            // Bounded, because the bridge's answer depends on its WebSocket peer: a bot that stops
+            // reading blocks the bridge's writes, and a blocked bridge does not read this request.
+            // This runs on the control path, so an unbounded wait here is a control plane that
+            // waits on a remote server. Past the bound the request stays queued, and the bridge
+            // honours it (or drops it with its sinks when it ends): the writer then finalizes on
+            // its own.
+            if tokio::time::timeout(BRIDGE_REQUEST_TIMEOUT, request)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "siphon_rtp::media",
+                    call_id,
+                    recording_id,
+                    "ws bridge did not release a recording's taps in time; the recording closes \
+                     when the bridge lets go of them"
+                );
             }
             return;
         }
@@ -1242,7 +1262,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         tag: recording.recording_id.clone(),
                     },
                 );
-                let _ = recording.writer.await;
+                settle_writer(recording.writer, &recording.call_id, recording_id).await;
             }
             None => {
                 // A bridged call's recording: the taps come off the bridge, which ends each
@@ -1257,7 +1277,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &recording.egress_legs,
                 )
                 .await;
-                let _ = recording.writer.await;
+                settle_writer(recording.writer, &recording.call_id, recording_id).await;
                 // The hold is one reason per call, not per recording. Released while another
                 // recording still taps the call, a promoted relay would be demoted under it and that
                 // recording would end with the actor — the `record_call` streams are two recordings
@@ -1419,6 +1439,38 @@ async fn run_pcap_recorder(
     } else {
         tracing::info!(path, "pcap recording finalized");
     }
+}
+
+/// How long the control path waits for a running WS bridge to answer a request about its
+/// recording taps. The bridge serves its mailbox between writes to its WebSocket peer, so this is
+/// what bounds a command's latency by the engine's own work rather than by a remote server's.
+pub(crate) const BRIDGE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a stop waits for a recording's writer to finalize once its sinks are detached.
+pub(crate) const WRITER_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wait for a recording's writer to finish, but not past [`WRITER_CLOSE_TIMEOUT`].
+///
+/// A writer finishes when the last sink feeding it is dropped. Normally the detach just did that
+/// and this returns at once, with the file closed and `recording_finished` sent. A sink can still
+/// be held elsewhere: by a bridge blocked on its WebSocket peer, or by an actor whose mailbox did
+/// not take the removal. Waiting for it there would let one call's media hold up a control command
+/// (and on a serial control connection, every call's). The writer is never aborted, which would
+/// skip the finalize: past the bound it is left running, closes the file when its last sink goes
+/// (at the latest when the call's media is torn down), and sends `recording_finished` itself.
+async fn settle_writer(mut writer: tokio::task::JoinHandle<()>, call_id: &str, recording_id: &str) {
+    if tokio::time::timeout(WRITER_CLOSE_TIMEOUT, &mut writer)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    tracing::warn!(
+        target: "siphon_rtp::media",
+        call_id,
+        recording_id,
+        "recording writer still has a live sink; it finalizes in the background when that sink goes"
+    );
 }
 
 #[cfg(test)]

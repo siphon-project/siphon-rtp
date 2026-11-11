@@ -64,6 +64,8 @@ mod ws_dial;
 
 pub use ws_dial::DEFAULT_WS_CONNECT_TIMEOUT;
 
+#[cfg(test)]
+pub(crate) use record::{BRIDGE_REQUEST_TIMEOUT, WRITER_CLOSE_TIMEOUT};
 pub(crate) use telemetry::validate_sip_call_id;
 
 use dashmap::DashMap;

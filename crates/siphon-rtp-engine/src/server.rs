@@ -419,6 +419,10 @@ struct Finished {
 /// in line, such a command stops the connection for that long: no health probe is answered, no
 /// other call is set up or torn down.
 ///
+/// Ending a call's media is the other such command ([`Engine::command_runs_off_loop`]): a
+/// `delete` or `stop_recording` may wait, up to a bound, for a WebSocket bridge blocked on its
+/// peer to let go of a recording, and one call's slow teardown must not be every call's.
+///
 /// So a command that dials runs as a task of its own, and its answer is written when it has one.
 /// While it runs, its **lane** (the call or conference it addresses, a call being the one of its
 /// scope: two scopes of one `call_id` are two lanes) is held: later commands for
@@ -508,7 +512,7 @@ where
         command: Command,
         lane: &str,
     ) -> Option<CmdResult> {
-        if !Engine::<D>::command_dials(&command) {
+        if !Engine::<D>::command_runs_off_loop(&command) {
             return Some(self.handle(scope.as_deref(), command).await);
         }
         self.held.entry(lane.to_owned()).or_default();
@@ -654,5 +658,197 @@ mod tests {
             waited.is_err(),
             "nothing to deliver, and no busy error loop"
         );
+    }
+
+    /// A slow teardown on one call, over the real control connection.
+    mod stalled_bot {
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::time::{Duration, Instant};
+
+        use futures_util::StreamExt;
+        use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
+        use siphon_rtp_datapath::Datapath;
+        use siphon_rtp_proto::{
+            frame, CmdResult, Command, ProfileFlags, RecordingChannels, RecordingDirection,
+            RecordingFormat, Request, Response, Scoped,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream, UdpSocket};
+        use tokio::time::timeout;
+
+        use crate::server::serve;
+        use crate::Engine;
+
+        /// How long a command unrelated to the slow one may take.
+        const PROMPT: Duration = Duration::from_millis(400);
+
+        struct Control {
+            stream: TcpStream,
+            buffer: Vec<u8>,
+            next_id: u64,
+        }
+
+        impl Control {
+            async fn send(&mut self, command: Command) -> u64 {
+                let id = self.next_id;
+                self.next_id += 1;
+                let bytes =
+                    frame::encode(&Scoped::new(None, Request { id, command })).expect("encode");
+                self.stream.write_all(&bytes).await.expect("write request");
+                id
+            }
+
+            /// The next response (events skipped), which must answer `id`, inside `wait`.
+            async fn response_to(&mut self, id: u64, wait: Duration) -> CmdResult {
+                let deadline = Instant::now() + wait;
+                let mut chunk = [0u8; 4096];
+                loop {
+                    while let Some((value, consumed)) =
+                        frame::decode::<serde_json::Value>(&self.buffer).expect("decode frame")
+                    {
+                        self.buffer.drain(..consumed);
+                        if value.get("event").is_none() {
+                            let response: Response =
+                                serde_json::from_value(value).expect("response shape");
+                            assert_eq!(response.id, id, "the next response answers request {id}");
+                            return response.result;
+                        }
+                    }
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .unwrap_or_else(|| panic!("no response to request {id} within {wait:?}"));
+                    let read = timeout(remaining, self.stream.read(&mut chunk))
+                        .await
+                        .unwrap_or_else(|_| panic!("no response to request {id} within {wait:?}"))
+                        .expect("read control");
+                    assert_ne!(read, 0, "control connection closed");
+                    self.buffer.extend_from_slice(&chunk[..read]);
+                }
+            }
+        }
+
+        /// A bot that accepts the bridge and reads (and ignores) whatever it is sent.
+        async fn bot() -> String {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind bot");
+            let addr = listener.local_addr().expect("bot addr");
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await {
+                            while let Some(Ok(_)) = socket.next().await {}
+                        }
+                    });
+                }
+            });
+            format!("ws://{addr}/voice")
+        }
+
+        async fn phone_sdp() -> String {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind phone");
+            let addr: SocketAddr = socket.local_addr().expect("phone addr");
+            format!(
+                "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+                 m=audio {port} RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n",
+                ip = addr.ip(),
+                port = addr.port()
+            )
+        }
+
+        fn answer_local(call_id: &str, sdp: String, ws_uri: Option<String>) -> Command {
+            Command::AnswerLocal {
+                call_id: call_id.into(),
+                from_tag: "tag-a".into(),
+                sdp,
+                profile: ProfileFlags {
+                    ws_uri,
+                    ..Default::default()
+                },
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_teardown_waiting_on_a_stalled_bot_holds_up_no_other_call() {
+            // The controller multiplexes every call over one connection. A `delete` that has to wait
+            // for a bot's bridge to let go of a recording must answer the other calls meanwhile.
+            let engine = std::sync::Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+            tokio::spawn(crate::srtp_bridge::run_redirect_dispatcher(
+                engine.datapath().rx(),
+                engine.bridge(),
+                engine.media(),
+                engine.ws(),
+                engine.conference(),
+                None,
+            ));
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind control");
+            let addr = listener.local_addr().expect("control addr");
+            let serving = engine.clone();
+            tokio::spawn(async move {
+                let _ = serve(serving, listener).await;
+            });
+            let mut control = Control {
+                stream: TcpStream::connect(addr).await.expect("connect control"),
+                buffer: Vec::new(),
+                next_id: 1,
+            };
+
+            let answered = control
+                .send(answer_local("slow", phone_sdp().await, Some(bot().await)))
+                .await;
+            let answered = control.response_to(answered, Duration::from_secs(3)).await;
+            assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
+            let directory = tempfile::tempdir().expect("tempdir");
+            let recording = control
+                .send(Command::StartRecording {
+                    call_id: "slow".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(directory.path().to_string_lossy().into_owned()),
+                    format: Some(RecordingFormat::Wav),
+                    direction: Some(RecordingDirection::Both),
+                    channels: Some(RecordingChannels::Stereo),
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
+                    bitrate_bps: None,
+                })
+                .await;
+            let recording = control.response_to(recording, PROMPT).await;
+            assert!(matches!(recording, CmdResult::Ok { .. }), "{recording:?}");
+            let _unread = engine
+                .stall_ws_bridge_mailbox("slow")
+                .expect("the call has a bridge");
+
+            let started = Instant::now();
+            let deleted = control
+                .send(Command::Delete {
+                    call_id: "slow".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                })
+                .await;
+            let ping = control.send(Command::Ping).await;
+            let bystander = control
+                .send(answer_local("bystander", phone_sdp().await, None))
+                .await;
+            assert_eq!(control.response_to(ping, PROMPT).await, CmdResult::Pong);
+            let bystander = control.response_to(bystander, PROMPT).await;
+            assert!(matches!(bystander, CmdResult::Ok { .. }), "{bystander:?}");
+            assert!(
+                started.elapsed() < crate::engine::BRIDGE_REQUEST_TIMEOUT,
+                "the other call was served while the delete still waited"
+            );
+
+            let bound = crate::engine::BRIDGE_REQUEST_TIMEOUT
+                + crate::engine::WRITER_CLOSE_TIMEOUT
+                + Duration::from_secs(4);
+            let deleted = control.response_to(deleted, bound).await;
+            assert!(matches!(deleted, CmdResult::Ok { .. }), "{deleted:?}");
+            assert_eq!(engine.session_count(), 1, "only the bystander is left");
+        }
     }
 }
