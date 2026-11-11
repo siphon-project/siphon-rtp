@@ -359,16 +359,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some(bridge) = self.bridge_recording_target(call_id) else {
             return TakenRecordingTaps::default();
         };
-        let (reply, taken) = tokio::sync::oneshot::channel();
-        if bridge
-            .control
-            .send_async(BridgeControl::TakeRecordingTaps { reply })
-            .await
-            .is_err()
-        {
-            return TakenRecordingTaps::default();
+        let request = async {
+            let (reply, taken) = tokio::sync::oneshot::channel();
+            if bridge
+                .control
+                .send_async(BridgeControl::TakeRecordingTaps { reply })
+                .await
+                .is_err()
+            {
+                return TakenRecordingTaps::default();
+            }
+            taken.await.unwrap_or_default()
+        };
+        // Bounded for the reason `detach_recording_sinks` is: a bridge blocked on its WebSocket
+        // peer does not read its mailbox. Its sinks then stay with it and end with it, which is
+        // what an empty answer means here too.
+        match tokio::time::timeout(super::record::BRIDGE_REQUEST_TIMEOUT, request).await {
+            Ok(taken) => taken,
+            Err(_) => {
+                tracing::warn!(
+                    target: "siphon_rtp::media",
+                    call_id,
+                    "ws bridge did not hand its recording taps over in time; its recordings end with it"
+                );
+                TakenRecordingTaps::default()
+            }
         }
-        taken.await.unwrap_or_default()
     }
 
     /// Put recording sinks onto `call_id`'s running bridge. A sink with no bridge to take it is

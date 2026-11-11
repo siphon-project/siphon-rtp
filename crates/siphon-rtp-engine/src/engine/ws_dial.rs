@@ -104,6 +104,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Whether the control server runs `command` as a task of its own, holding only its call's
+    /// lane, rather than in line on the connection's loop: a command that dials, and one that ends
+    /// media a WebSocket bridge or a recording writer may still hold. Those waits are bounded
+    /// (`BRIDGE_REQUEST_TIMEOUT`, `WRITER_CLOSE_TIMEOUT`), but a bound of seconds is still seconds
+    /// of every other call on the connection going unanswered, and a controller multiplexing all
+    /// its calls on one connection times them out.
+    #[must_use]
+    pub fn command_runs_off_loop(command: &Command) -> bool {
+        Self::command_dials(command)
+            || matches!(
+                command,
+                Command::Delete { .. } | Command::StopRecording { .. }
+            )
+    }
+
     /// The call or conference `command` addresses, `None` for the verbs that address none (health,
     /// census, cluster). Commands that share one are served in the order they arrived.
     #[must_use]

@@ -5,6 +5,27 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **A `delete` on a recorded voice-bot call can no longer wedge the control plane.** A bot that
+  stopped reading its WebSocket blocked the bridge's writes, so the bridge stopped reading its
+  mailbox. A `delete` (or `stop_recording`) then queued a request to release the recording's taps
+  and waited for the answer with no bound. When the bot finally closed, the bridge task ended, but
+  the engine still held a sender into its mailbox, so the queued reply channel was never dropped and
+  the wait never ended. Commands on a control connection were served one at a time, so every later
+  command for every call timed out until the engine was restarted. Three changes:
+  - the bridge drops whatever is still queued in its mailbox when it ends, and bounds its closing
+    frame;
+  - the engine bounds its requests to a bridge (`BRIDGE_REQUEST_TIMEOUT`, also for the re-point's
+    tap hand-over) and its wait for a recording's writer (`WRITER_CLOSE_TIMEOUT`); past that the
+    writer is left to finalize the file on its own (it is never aborted), and `recording_finished`
+    still follows;
+  - `delete` and `stop_recording` run in their call's own lane on the control connection, like a
+    dialing command, so one call's slow teardown no longer holds up other calls' commands. Commands
+    for the same call keep their order.
+
 ## [0.19.0] — 2026-11-02
 
 ### Added

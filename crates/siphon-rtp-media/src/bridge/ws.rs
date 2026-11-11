@@ -94,10 +94,38 @@ pub enum BridgeControl {
 /// that distinguishes "the controller detached it" from "the media server went away".
 pub async fn run_bridge<S>(
     socket: WebSocketStream<S>,
-    mut session: BridgeSession,
+    session: BridgeSession,
     rtp_in: flume::Receiver<Bytes>,
     rtp_out: flume::Sender<Bytes>,
     control: flume::Receiver<BridgeControl>,
+    ptime: Duration,
+) -> Result<BridgeEndReason, BridgeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let outcome = drive_bridge(socket, session, rtp_in, rtp_out, &control, ptime).await;
+    // However the session ended, release what is still queued for it. The engine keeps a sender
+    // for as long as the call is registered, and a flume queue lives while any sender does, so a
+    // request left in it (a `done` or `reply` channel) would outlive this task and its requester
+    // would wait for an answer that never comes. Dropping the message drops that channel, which
+    // is the requester's "the bridge is gone". A peer that stops reading blocks the loop's writes
+    // and leaves requests queued, so this is the normal case, not a corner one.
+    for message in control.drain() {
+        drop(message);
+    }
+    outcome
+}
+
+/// Bound on the closing frame's send: a peer that stopped reading must not keep a bridge that is
+/// already ending alive.
+const CLOSE_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn drive_bridge<S>(
+    socket: WebSocketStream<S>,
+    mut session: BridgeSession,
+    rtp_in: flume::Receiver<Bytes>,
+    rtp_out: flume::Sender<Bytes>,
+    control: &flume::Receiver<BridgeControl>,
     ptime: Duration,
 ) -> Result<BridgeEndReason, BridgeError>
 where
@@ -172,7 +200,7 @@ where
         }
     };
 
-    let _ = sink.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(CLOSE_SEND_TIMEOUT, sink.send(Message::Close(None))).await;
     Ok(reason)
 }
 
@@ -573,5 +601,68 @@ mod tests {
             "a closed control mailbox does not end the bridge"
         );
         bridge.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_queued_behind_a_stalled_peer_is_released_when_the_bridge_ends() {
+        // The peer stops reading, so the bridge blocks writing to it and stops hearing the engine.
+        // A request queued in that window must not outlive the bridge: the engine still holds a
+        // sender, so a flume queue keeps every message in it alive after the receiver is gone, and
+        // a reply channel inside one would never resolve.
+        let (client_io, server_io) = tokio::io::duplex(256);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let (rtp_in_tx, rtp_in_rx) = flume::unbounded::<Bytes>();
+        let (rtp_out_tx, _rtp_out_rx) = flume::unbounded::<Bytes>();
+        let (control_tx, control_rx) = flume::bounded(BRIDGE_CONTROL_QUEUE);
+        let bridge = tokio::spawn(run_bridge(
+            server_ws,
+            session_fixture(),
+            rtp_in_rx,
+            rtp_out_tx,
+            control_rx,
+            Duration::from_millis(10),
+        ));
+        // Caller audio, so every tick has an uplink frame for a peer that reads nothing.
+        for sequence in 0..20u16 {
+            rtp_in_tx
+                .send(Bytes::from(ulaw_packet(sequence, 0x00)))
+                .expect("feed rtp");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (done, removed) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(BridgeControl::RemoveRecordingTaps {
+                tag: "rec-1".into(),
+                done,
+            })
+            .expect("queued");
+        let (reply, taken) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(BridgeControl::TakeRecordingTaps { reply })
+            .expect("queued");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!bridge.is_finished(), "the bridge is blocked on the peer");
+
+        // The peer gives up.
+        drop(client_ws);
+        let ended = timeout(Duration::from_secs(2), bridge)
+            .await
+            .expect("the bridge ends with its peer")
+            .expect("bridge task");
+        assert!(
+            ended.is_err(),
+            "a write into a closed peer is a transport error"
+        );
+        assert!(
+            timeout(Duration::from_secs(2), removed).await.is_ok(),
+            "the queued removal resolves although the engine still holds a sender"
+        );
+        assert!(
+            timeout(Duration::from_secs(2), taken).await.is_ok(),
+            "the queued take resolves too"
+        );
+        drop(control_tx);
     }
 }
