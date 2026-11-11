@@ -2140,6 +2140,10 @@ async fn run_conference<D>(
 ) where
     D: Datapath,
 {
+    // A room ends itself when its last participant leaves, while it is still registered: empty the
+    // mailbox on the way out so a request queued behind that leave is answered "gone" (see
+    // `crate::mailbox`).
+    let inbox = crate::mailbox::ActorInbox::new(inbox);
     let mut outbound = Vec::new();
     let mut quality_events: Vec<Event> = Vec::new();
     let mut ticks_since_report = 0u64;
@@ -2520,6 +2524,19 @@ impl ConferenceRegistry {
 
     /// Send a control op to a room's actor, returning `false` when there is no such room (it was torn
     /// down while the op was in flight). The generic seam the DTLS handshake uses to key a seat.
+    /// Swap a room's control mailbox for one nobody reads and hand back its receiver: a room
+    /// actor that is registered but no longer serving its mailbox.
+    #[cfg(test)]
+    pub(crate) fn stall_mailbox(
+        &self,
+        conference_id: &str,
+    ) -> Option<flume::Receiver<ConferenceInput>> {
+        let mut handle = self.rooms.get_mut(conference_id)?;
+        let (mailbox, unread) = flume::bounded(1024);
+        handle.mailbox = mailbox;
+        Some(unread)
+    }
+
     pub fn control(&self, conference_id: &str, control: ConferenceControl) -> bool {
         match self.rooms.get(conference_id) {
             Some(handle) => handle

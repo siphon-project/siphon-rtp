@@ -4350,6 +4350,16 @@ impl MediaRegistry {
     }
 
     /// Send a control op to a call's actor, returning `false` if there is no such media call.
+    /// Swap `call_id`'s control mailbox for one nobody reads and hand back its receiver: an actor
+    /// that is registered but no longer serving its mailbox, as one stuck in a long step is.
+    #[cfg(test)]
+    pub(crate) fn stall_mailbox(&self, call_id: &str) -> Option<flume::Receiver<MediaInput>> {
+        let mut handle = self.calls.get_mut(call_id)?;
+        let (mailbox, unread) = flume::bounded(1024);
+        handle.mailbox = mailbox;
+        Some(unread)
+    }
+
     pub fn control(&self, call_id: &str, control: MediaControl) -> bool {
         match self.calls.get(call_id) {
             Some(handle) => handle
@@ -4539,6 +4549,9 @@ async fn run_media_call<D>(
 ) where
     D: Datapath,
 {
+    // Empties the mailbox however the actor ends, a panic included, so a request queued for it is
+    // answered "gone" rather than waited for forever (see `crate::mailbox`).
+    let inbox = crate::mailbox::ActorInbox::new(inbox);
     let app_events = call.app_events.clone();
     let mut outbound = Vec::new();
     let mut emitted = Vec::new();
