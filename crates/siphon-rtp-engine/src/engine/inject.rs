@@ -299,7 +299,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ) {
             return error_result("play_dtmf", &"call is not a media-processing call");
         }
-        match receiver.await {
+        match crate::mailbox::actor_reply(receiver).await {
             Ok(PlayDtmfOutcome::Started) => ok_empty(),
             Ok(PlayDtmfOutcome::NoTelephoneEvent) => error_result(
                 "play_dtmf",
@@ -310,9 +310,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(PlayDtmfOutcome::InvalidDigits) => {
                 error_result("play_dtmf", &format!("unusable DTMF code {code:?}"))
             }
-            Err(_) => error_result(
+            Err(error) => error_result(
                 "play_dtmf",
-                &"media actor closed before the DTMF sequence started",
+                &format!("media actor gave no answer ({error}) before the DTMF sequence started"),
             ),
         }
     }

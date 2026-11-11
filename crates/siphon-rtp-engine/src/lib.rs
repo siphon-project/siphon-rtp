@@ -32,6 +32,7 @@ pub mod hep_export;
 pub mod ice;
 pub mod ingress;
 pub mod interface;
+mod mailbox;
 pub mod media_fetch;
 pub mod media_pipeline;
 pub mod metrics;
