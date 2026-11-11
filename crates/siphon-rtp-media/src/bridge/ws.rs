@@ -40,6 +40,30 @@ pub enum BridgeError {
     /// Serializing an outbound control message failed.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A write to the peer did not complete within [`WS_WRITE_TIMEOUT`]: it stopped reading.
+    #[error("websocket peer stopped reading (write blocked for {} ms)", WS_WRITE_TIMEOUT.as_millis())]
+    WriteStalled,
+}
+
+/// How long one write to a WebSocket peer may stay blocked before the stream is given up on.
+///
+/// A write only blocks once the kernel's send buffer toward the peer is full, which at an audio
+/// stream's rate takes a peer that has read nothing for a long while. Past that the peer is not
+/// slow, it is stuck: a bridge blocked on it renders no audio to the caller and serves no request
+/// from the engine, and a tee holds its frames. Ending the stream instead reports it to the
+/// controller (`ws_bridge_ended` / `ws_tee_ended`, reason `transport_error`), which can act on it.
+pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Send one message to a WebSocket peer, giving up after [`WS_WRITE_TIMEOUT`]. Every write a bridge
+/// or a tee makes goes through here, so no stream can block on a peer for longer than that.
+pub(crate) async fn send_within<W>(sink: &mut W, message: Message) -> Result<(), BridgeError>
+where
+    W: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match tokio::time::timeout(WS_WRITE_TIMEOUT, sink.send(message)).await {
+        Ok(sent) => Ok(sent?),
+        Err(_) => Err(BridgeError::WriteStalled),
+    }
 }
 
 /// Why a takeover bridge stopped, reported once when [`run_bridge`] returns.
@@ -134,8 +158,7 @@ where
     let (mut sink, mut stream) = socket.split();
 
     // The first text frame announces the leg + audio format (mod_audio_fork handshake order).
-    sink.send(Message::text(session.start_message().to_json()?))
-        .await?;
+    send_within(&mut sink, Message::text(session.start_message().to_json()?)).await?;
 
     let mut ticker = interval(ptime);
     let mut uplink = vec![0u8; UPLINK_CAP];
@@ -155,7 +178,7 @@ where
                 Some(Ok(Message::Text(text))) => match ControlMessage::from_json(text.as_str()) {
                     Ok(control) => {
                         if let Some(reply) = session.on_control(control) {
-                            sink.send(Message::text(reply.to_json()?)).await?;
+                            send_within(&mut sink, Message::text(reply.to_json()?)).await?;
                         }
                     }
                     Err(error) => tracing::debug!(%error, "bridge ignoring malformed control frame"),
@@ -188,10 +211,10 @@ where
                 // Turn signals (speech_started/stopped) go out first, so the server reacts to a
                 // barge-in or turn endpoint without waiting behind this tick's audio frame.
                 while let Some(control) = session.next_control() {
-                    sink.send(Message::text(control.to_json()?)).await?;
+                    send_within(&mut sink, Message::text(control.to_json()?)).await?;
                 }
                 if result.uplink_bytes > 0 {
-                    sink.send(Message::binary(uplink[..result.uplink_bytes].to_vec())).await?;
+                    send_within(&mut sink, Message::binary(uplink[..result.uplink_bytes].to_vec())).await?;
                 }
                 if result.downlink_bytes > 0 && rtp_out.send(Bytes::copy_from_slice(&downlink[..result.downlink_bytes])).is_err() {
                     break BridgeEndReason::CallEnded; // call side gone
@@ -664,5 +687,37 @@ mod tests {
             "the queued take resolves too"
         );
         drop(control_tx);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bot_that_stops_reading_ends_the_bridge_rather_than_stalling_it() {
+        // The bot keeps its socket open and reads nothing. Blocked on that write for good, the
+        // bridge would stop rendering audio to the caller and stop serving its mailbox, and the
+        // controller would never hear that the call has lost its far side.
+        let (_client_io, server_io) = tokio::io::duplex(256);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (rtp_in_tx, rtp_in_rx) = flume::unbounded::<Bytes>();
+        let (rtp_out_tx, _rtp_out_rx) = flume::unbounded::<Bytes>();
+        let (_control_tx, control_rx) = flume::bounded(BRIDGE_CONTROL_QUEUE);
+        let bridge = tokio::spawn(run_bridge(
+            server_ws,
+            session_fixture(),
+            rtp_in_rx,
+            rtp_out_tx,
+            control_rx,
+            Duration::from_millis(10),
+        ));
+        for sequence in 0..20u16 {
+            let _ = rtp_in_tx.send(Bytes::from(ulaw_packet(sequence, 0x00)));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let ended = timeout(WS_WRITE_TIMEOUT + Duration::from_secs(3), bridge)
+            .await
+            .expect("the bridge ends by itself")
+            .expect("bridge task");
+        assert!(
+            matches!(ended, Err(BridgeError::WriteStalled)),
+            "a stalled bot is a transport failure: {ended:?}"
+        );
     }
 }
