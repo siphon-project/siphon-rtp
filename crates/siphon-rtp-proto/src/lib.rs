@@ -879,6 +879,10 @@ pub enum Command {
     /// more than two are given the oldest (first) are dropped and the newest two are kept, so a
     /// controller can send its rolling key list unchanged; outbound floor control uses the last.
     /// An empty `keys` removes every key from the seat.
+    ///
+    /// `stream` picks which keys: `floor` (the default, left off the wire) the floor-control
+    /// stream's, `audio` the media SRTCP keys of a seat of a `media: preserve` forwarding room
+    /// ([`ProfileFlags::media_srtcp_keys`], TS 33.180 §9.4.1). `audio` is refused for any other seat.
     SetFloorKeys {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
@@ -886,6 +890,8 @@ pub enum Command {
         conference_id: Option<String>,
         from_tag: String,
         keys: Vec<FloorKey>,
+        #[serde(default, skip_serializing_if = "RtcpAppStream::is_floor")]
+        stream: RtcpAppStream,
     },
     /// Attach a **WebSocket tee** to a live call: stream its decoded audio to `ws_uri` while the call
     /// keeps relaying. Unlike `ProfileFlags::ws_uri` (takeover — the WS server *becomes* leg A's far
@@ -1270,14 +1276,23 @@ pub enum ConferenceDtmf {
 ///
 /// Deliberately **not** `#[non_exhaustive]`: a controller sending on a stream the engine reads as
 /// some other stream would put floor control where the client does not listen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RtcpAppStream {
     /// The floor-control stream: `m=application <port> udp MCPTT` (3GPP TS 24.380), or a WebRTC
     /// seat's floor data channel.
+    #[default]
     Floor,
     /// The audio stream's RTCP, which some clients use for APP packets too.
     Audio,
+}
+
+impl RtcpAppStream {
+    /// Whether this is [`RtcpAppStream::Floor`], the value left off the wire.
+    #[must_use]
+    pub fn is_floor(&self) -> bool {
+        matches!(self, Self::Floor)
+    }
 }
 
 /// The direction(s) audio flows across a conference bridge ([`Command::ConferenceBridge`]).
@@ -1897,6 +1912,19 @@ pub struct ProfileFlags {
         deserialize_with = "deserialize_floor_keys"
     )]
     pub floor_keys: Vec<FloorKey>,
+    /// SRTCP keys for the media RTCP of a seat of a `media: preserve` forwarding room, the same
+    /// AEAD_AES_128_GCM profile and shape as [`ProfileFlags::floor_keys`] (3GPP TS 33.180 §9.4.1:
+    /// all RTCP, media RTCP included, is protected hop by hop under the client's key; §9.4.2, §9.4.6
+    /// and §9.4.8 for the key and the profile). Only `forward_join`, `forward_offer` and
+    /// `forward_answer` of a preserving room accept it; a translating room and a two-party call
+    /// refuse it. Absent: the seat's audio SRTCP is forwarded byte for byte as before. At most
+    /// [`MAX_FLOOR_KEYS`]; replace them later with [`Command::SetFloorKeys`] `stream: audio`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_floor_keys"
+    )]
+    pub media_srtcp_keys: Vec<FloorKey>,
     /// The controller's `a=key-mgmt` attribute value (RFC 4567) for the floor section. A pure
     /// passthrough exactly like [`ProfileFlags::floor_fmtp`]: the engine never invents, echoes or
     /// drops it. A line break inside is refused.
@@ -1941,6 +1969,12 @@ impl ProfileFlags {
             return Err(FloorKeyError::TooMany(self.floor_keys.len()));
         }
         for key in &self.floor_keys {
+            key.validate()?;
+        }
+        if self.media_srtcp_keys.len() > MAX_FLOOR_KEYS {
+            return Err(FloorKeyError::TooMany(self.media_srtcp_keys.len()));
+        }
+        for key in &self.media_srtcp_keys {
             key.validate()?;
         }
         if let Some(key_mgmt) = &self.key_mgmt {
@@ -5890,6 +5924,7 @@ mod tests {
                 conference_id: Some("group-1".into()),
                 from_tag: "a7c31f".into(),
                 keys: vec![floor_key()],
+                stream: RtcpAppStream::Floor,
             },
         };
         let json = serde_json::to_string(&request).expect("serialize");
@@ -5910,6 +5945,75 @@ mod tests {
         ));
         let bad = r#"{"command":"set_floor_keys","conference_id":"g","from_tag":"f","keys":[{"mki":1,"key":"AA==","salt":"AA=="}]}"#;
         assert!(serde_json::from_str::<Command>(bad).is_err());
+    }
+
+    #[test]
+    fn set_floor_keys_stream_audio_is_written_and_an_old_frame_means_floor() {
+        let request = Request {
+            id: 20,
+            command: Command::SetFloorKeys {
+                call_id: None,
+                conference_id: Some("group-1".into()),
+                from_tag: "a7c31f".into(),
+                keys: vec![floor_key()],
+                stream: RtcpAppStream::Audio,
+            },
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"id":20,"command":"set_floor_keys","conference_id":"group-1","from_tag":"a7c31f","keys":[{FLOOR_KEY_JSON}],"stream":"audio"}}"#
+            )
+        );
+        roundtrip(&request);
+        // A frame written before `stream` existed addresses the floor stream.
+        let old = format!(
+            r#"{{"command":"set_floor_keys","conference_id":"g","from_tag":"f","keys":[{FLOOR_KEY_JSON}]}}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Command>(&old).expect("old frame"),
+            Command::SetFloorKeys {
+                stream: RtcpAppStream::Floor,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn profile_media_srtcp_keys_have_an_exact_wire_shape_and_the_floor_key_limits() {
+        let profile = ProfileFlags {
+            media_srtcp_keys: vec![floor_key(), floor_key()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&profile).expect("serialize");
+        assert_eq!(
+            json,
+            format!(r#"{{"media_srtcp_keys":[{FLOOR_KEY_JSON},{FLOOR_KEY_JSON}]}}"#)
+        );
+        let decoded: ProfileFlags = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, profile);
+        assert_eq!(decoded.validate(), Ok(()));
+        let old: ProfileFlags = serde_json::from_str(r#"{"floor_fmtp":"x"}"#).expect("old");
+        assert!(old.media_srtcp_keys.is_empty());
+        let three = format!(
+            r#"{{"media_srtcp_keys":[{FLOOR_KEY_JSON},{FLOOR_KEY_JSON},{FLOOR_KEY_JSON}]}}"#
+        );
+        assert!(serde_json::from_str::<ProfileFlags>(&three).is_err());
+        let built = ProfileFlags {
+            media_srtcp_keys: vec![floor_key(), floor_key(), floor_key()],
+            ..Default::default()
+        };
+        assert_eq!(built.validate(), Err(FloorKeyError::TooMany(3)));
+        let short = ProfileFlags {
+            media_srtcp_keys: vec![FloorKey {
+                mki: 1,
+                key: vec![0; 3],
+                salt: vec![0; 12],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(short.validate(), Err(FloorKeyError::KeyLength(3)));
     }
 
     #[test]

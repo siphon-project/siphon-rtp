@@ -30,18 +30,21 @@ use siphon_rtp_media::rtp::RtpPacket;
 use siphon_rtp_media::translator::{Forwarded, Translator};
 use siphon_rtp_proto::{Event, ForwardMedia};
 use siphon_rtp_srtp::leg::SecureLeg;
+use siphon_rtp_srtp::srtcp_gcm::FloorMasterKey;
 
 use super::codec::RoomCodec;
 use super::transcode::{EventSource, SeatLeg, StreamPoint, TranscodeStats, Transcoder};
 use crate::app_events::AppEventQueue;
 use crate::floor_channel::FloorChannelHandle;
+use crate::floor_srtcp::FloorProtection;
 use crate::ingress::{Ingress, RefusalLog};
 use crate::media_pipeline::Outbound;
 use crate::reply_latch::SymmetricLatch;
 use crate::sdp::TelephoneEvent;
-use crate::seat_gate::{self, RtcpItem, SeatGate};
+use crate::seat_gate::{self, SeatGate};
 
 mod app;
+mod media_srtcp;
 
 pub(crate) use app::push_failure;
 use app::FloorStream;
@@ -104,6 +107,10 @@ pub struct ForwardSeatConfig {
     pub floor: Option<FloorConfig>,
     /// Where the seat's RTCP APP events go: the queue of the controller that seated it.
     pub app_events: Option<AppEventQueue>,
+    /// The SRTCP master keys of the seat's media RTCP in a preserving room (3GPP TS 33.180 §9.4.1;
+    /// `media_srtcp`); empty leaves it forwarded as it is. The last protects what the room sends,
+    /// the newest two are accepted.
+    pub media_srtcp: Vec<FloorMasterKey>,
 }
 
 /// What the room counted about one seat, for logs and stats.
@@ -121,6 +128,12 @@ pub struct ForwardSeatStats {
     pub app_events: u64,
     /// Datagrams with APP-bearing RTCP the room could not read to the end: counted, no event.
     pub malformed_app: u64,
+    /// Audio SRTCP datagrams of a seat with media keys that did not authenticate under a held key
+    /// (plaintext, unknown MKI, failed tag, replay), in a preserving room: dropped.
+    pub media_srtcp_refused: u64,
+    /// Resealed audio SRTCP the room did not send this seat, as a receiver of a keyed talker, because
+    /// the seat holds no media keys (it is never sent plaintext).
+    pub media_srtcp_unkeyed_receiver: u64,
     /// Floor datagrams a keyed seat's SRTCP refused (plaintext, unknown MKI, failed tag, replay).
     pub floor_refused: u64,
     /// Packets from the seat, while it was the source, that could not be transcoded for the
@@ -155,6 +168,8 @@ struct Seat {
     floor: Option<FloorStream>,
     /// Where this seat's RTCP APP events go.
     app_events: Option<AppEventQueue>,
+    /// The keys of the seat's media RTCP, when it holds any (a preserving room only).
+    media_srtcp: Option<FloorProtection>,
     /// The seat's floor data channel (a browser seat, docs/control/json.md), when it negotiated one
     /// and has no UDP floor stream. Floor control to the seat is one binary message on it.
     floor_channel: Option<FloorChannelHandle>,
@@ -211,6 +226,9 @@ enum Verbatim {
     Rtp,
     /// An audio RTCP (SRTCP) datagram of the source, forwarded byte for byte.
     Rtcp,
+    /// An audio SRTCP datagram of a keyed source, opened into the room's buffer and sealed again
+    /// for each receiver under its own media key (3GPP TS 33.180 §9.4.1).
+    ResealRtcp,
 }
 
 /// The fan-out of one inbound packet, walked by [`ForwardRoom::next_datagram`].
@@ -477,6 +495,7 @@ impl ForwardRoom {
             clock_rate_hz,
             floor: config.floor.map(FloorStream::new),
             app_events: config.app_events,
+            media_srtcp: FloorProtection::new(&config.media_srtcp),
             floor_channel: None,
             stats: IngressStats::new(clock_rate_hz),
             last_sender_report_ntp_middle: 0,
@@ -683,20 +702,9 @@ impl ForwardRoom {
         // datagram. Relaying one seat's reports to the others would describe streams the receivers
         // never saw (RFC 3550 §7.3: a translator rewrites reports, it does not echo them).
         if seat_gate::is_rtcp(data) {
-            let egress_ssrc = seat.translator.egress_ssrc();
             // APP parts (an MCPTT client may put floor control in its audio RTCP) go to the
             // controller; the reports stay here.
-            app::surface_audio_apps(&self.room_id, seat, data);
-            seat_gate::consume_rtcp(data, |item| match item {
-                RtcpItem::SenderReportNtp(ntp) => {
-                    seat.last_sender_report_ntp_middle = ((ntp >> 16) & 0xFFFF_FFFF) as u32;
-                    seat.last_sender_report_arrival = Some(packet.arrival);
-                }
-                RtcpItem::Block(block) => {
-                    seat.stats
-                        .record_reception_report(egress_ssrc, block, packet.arrival);
-                }
-            });
+            media_srtcp::consume_audio_rtcp(&self.room_id, seat, data, packet.arrival);
             return Ingress::Accepted;
         }
         let Ok(parsed) = RtpPacket::parse(data) else {
@@ -800,15 +808,17 @@ impl ForwardRoom {
     }
 
     /// Ingress for a preserving room, after the shared gate: the source's RTP and audio SRTCP are
-    /// armed to be handed on untouched, everything else is counted and dropped.
+    /// armed to be handed on, everything else is counted and dropped.
     ///
-    /// The room is not an endpoint of this stream. The media is SRTP between the UEs, keyed outside
-    /// the engine (3GPP TS 33.180 §7.5.2 NOTE 3), and SRTP authenticates the header's SSRC and
+    /// The room is not an endpoint of the media. It is SRTP between the UEs, keyed outside the
+    /// engine (3GPP TS 33.180 §5.2.1, §7.5.2 NOTE 3), and SRTP authenticates the header's SSRC and
     /// sequence number (RFC 3711 §3.3), so nothing but the sender's own bytes verify at a receiver.
     /// Only the cleartext RTP header (RFC 3711 §3.1) and the RTCP common header (RFC 3711 §3.4) are
-    /// read, to demux (RFC 5761 §4) and to check the payload type; the audio SRTCP is never parsed
-    /// (its body is encrypted and a report about the talker would be about a stream the receivers
-    /// never saw anyway, RFC 3550 §7.3).
+    /// read, to demux (RFC 5761 §4) and to check the payload type. The RTCP is a different hop: all
+    /// of it is protected hop by hop under each client's key (§9.4.1, §9.4.2, §9.4.6). A seat with
+    /// media keys has its RTCP opened and resealed for each receiver (`media_srtcp`); one without
+    /// has it forwarded byte for byte and never parsed (its body is encrypted, and a report about
+    /// the talker would be about a stream the receivers never saw anyway, RFC 3550 §7.3).
     fn ingest_preserved(&mut self, index: usize, packet: &RxPacket) -> Ingress {
         let data: &[u8] = &packet.data;
         let seat = &mut self.seats[index];
@@ -835,12 +845,7 @@ impl ForwardRoom {
             uplink_pending: false,
         };
         if seat_gate::is_rtcp(data) {
-            if !is_source {
-                seat.counters.receiver_rtcp_dropped += 1;
-                return Ingress::DroppedFromPeer;
-            }
-            self.plan = Some(plan);
-            return Ingress::Accepted;
+            return self.ingest_preserved_rtcp(index, packet, plan);
         }
         let Ok(parsed) = RtpPacket::parse(data) else {
             return Ingress::Accepted;
@@ -876,10 +881,13 @@ impl ForwardRoom {
     /// The next receiver of a preserving room's armed datagram: the very buffer that arrived, lent
     /// out again for each reachable seat. Nothing is rewritten, protected or allocated.
     fn next_verbatim<'a>(
-        &mut self,
+        &'a mut self,
         packet: &'a RxPacket,
         mut plan: Plan,
     ) -> Option<(EndpointId, SocketAddr, &'a [u8])> {
+        if plan.verbatim == Verbatim::ResealRtcp {
+            return self.next_resealed(plan);
+        }
         loop {
             let index = plan.cursor;
             if index >= self.seats.len() {
@@ -1090,7 +1098,8 @@ impl ForwardRoom {
     ///
     /// A preserving room builds none: it is not an RTP endpoint of the end-to-end stream, and a
     /// report under an SSRC the receivers never saw would describe a stream that does not exist
-    /// (RFC 3550 §7.3), or be injected into an SRTCP index space the engine does not hold.
+    /// (RFC 3550 §7.3). Keyed seats change nothing here: what the room seals is the talker's own RTCP
+    /// (3GPP TS 33.180 §9.4.1), never one it wrote.
     pub fn build_reports(&mut self, ntp_timestamp: u64, now_micros: u64, out: &mut Vec<Outbound>) {
         if self.codec.media() == ForwardMedia::Preserve {
             return;

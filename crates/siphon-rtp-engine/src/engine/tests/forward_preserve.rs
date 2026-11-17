@@ -6,7 +6,8 @@
 use super::*;
 use crate::srtp_bridge::run_redirect_dispatcher;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader};
-use siphon_rtp_proto::ForwardMedia;
+use siphon_rtp_proto::{FloorKey, ForwardMedia, RtcpAppStream};
+use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
 
 const ROOM: &str = "secure-group";
 const SHORT: Duration = Duration::from_secs(2);
@@ -653,4 +654,342 @@ async fn a_locally_answered_call_never_echoes_key_mgmt() {
         key_mgmt_lines(&ok_sdp_text(&answered)),
         vec![format!("a=key-mgmt:{KEY_MGMT}").as_str()]
     );
+}
+
+// Media SRTCP keys (3GPP TS 33.180 §9.4.1): the talker's audio RTCP is opened under its key and
+// sealed again for each receiver under that receiver's own.
+
+/// Seat `index`'s key: MKI `index`, so a wrong key is an unknown MKI.
+fn media_key(index: u32) -> FloorKey {
+    FloorKey {
+        mki: index,
+        key: vec![0x30 + index as u8; 16],
+        salt: vec![0x50 + index as u8; 12],
+    }
+}
+
+/// What a phone holds for [`media_key`], read independently of the engine's conversion.
+fn phone_context(index: u32) -> SrtcpGcmContext {
+    SrtcpGcmContext::new(&[FloorMasterKey::from_salt_96(
+        index,
+        [0x30 + index as u8; 16],
+        &[0x50 + index as u8; 12],
+    )])
+    .expect("context")
+}
+
+/// An SR under `ssrc` followed by an APP packet, as a phone builds it before protecting it.
+fn plain_report(ssrc: u32) -> Vec<u8> {
+    let mut buffer = [0u8; 128];
+    let mut length = siphon_rtp_media::rtcp::write_sender_report(
+        ssrc,
+        0x0000_0001_8000_0000,
+        160,
+        1,
+        160,
+        &[],
+        &mut buffer,
+    )
+    .expect("sender report");
+    length +=
+        siphon_rtp_media::rtcp::write_app(17, ssrc, *b"MCPT", &[0, 1, 2, 3], &mut buffer[length..])
+            .expect("app");
+    buffer[..length].to_vec()
+}
+
+fn protect(context: &mut SrtcpGcmContext, rtcp: &[u8]) -> Vec<u8> {
+    let mut wire = Vec::new();
+    context.protect(rtcp, true, &mut wire).expect("protect");
+    wire
+}
+
+/// The next RTCP APP event of the controller's queue.
+async fn next_app(events: &flume::Receiver<Event>) -> Event {
+    tokio::time::timeout(SHORT, events.recv_async())
+        .await
+        .expect("an rtcp_app event")
+        .expect("open queue")
+}
+
+async fn keyed_seat(
+    engine: &Engine<UdpLoopbackDatapath>,
+    tag: &str,
+    keys: Vec<FloorKey>,
+) -> (UdpSocket, SocketAddr) {
+    let (socket, addr) = phone().await;
+    let answer = join(
+        engine,
+        ForwardMedia::Preserve,
+        tag,
+        offer(addr, "RTP/SAVP", false, false),
+        ProfileFlags {
+            media_srtcp_keys: keys,
+            ..ProfileFlags::default()
+        },
+    )
+    .await;
+    (
+        socket,
+        sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer")
+            .remote_rtp,
+    )
+}
+
+#[tokio::test]
+async fn a_keyed_talkers_srtcp_reaches_each_receiver_under_its_own_key_and_receivers_rtcp_is_read()
+{
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let events = engine.app_event_receiver(CLIENT).expect("app queue");
+    let (phone_a, port_a) = keyed_seat(&engine, "a", vec![media_key(1)]).await;
+    let (phone_b, port_b) = keyed_seat(&engine, "b", vec![media_key(2)]).await;
+    let (phone_c, _) = keyed_seat(&engine, "c", vec![media_key(3)]).await;
+    set_source(&engine, "a").await;
+
+    let plain = plain_report(0xA0A0_A0A0);
+    let mut talker = phone_context(1);
+    phone_a
+        .send_to(&protect(&mut talker, &plain), port_a)
+        .await
+        .expect("send");
+    let media = srtp_datagram(1, 0xA0A0_A0A0);
+    phone_a.send_to(&media, port_a).await.expect("send");
+    for (phone, index) in [(&phone_b, 2), (&phone_c, 3)] {
+        let heard = expect(phone, 2).await;
+        let mut opened = Vec::new();
+        phone_context(index)
+            .unprotect(&heard[0], &mut opened)
+            .expect("the receiver's own key opens it");
+        assert_eq!(opened, plain, "seat {index} reads the talker's RTCP");
+        assert_eq!(heard[1], media, "the RTP is still byte for byte");
+    }
+    // The talker's own APP part became an event.
+    let event = next_app(&events).await;
+    assert!(matches!(
+        event,
+        Event::RtcpApp { stream: RtcpAppStream::Audio, ref from_tag, .. } if from_tag == "a"
+    ));
+
+    // A datagram that does not authenticate is dropped, not forwarded.
+    let mut forged = protect(&mut talker, &plain);
+    forged[12] ^= 1;
+    phone_a.send_to(&forged, port_a).await.expect("send");
+    // A receiver's RTCP is read (its APP is an event) and reaches nobody.
+    let mut receiver = phone_context(2);
+    phone_b
+        .send_to(&protect(&mut receiver, &plain_report(0xB0B0_B0B0)), port_b)
+        .await
+        .expect("send");
+    let event = next_app(&events).await;
+    assert!(matches!(
+        event,
+        Event::RtcpApp { stream: RtcpAppStream::Audio, ref from_tag, .. } if from_tag == "b"
+    ));
+    for phone in [&phone_a, &phone_b, &phone_c] {
+        assert!(drain(phone, QUIET).await.is_empty(), "nothing else is sent");
+    }
+}
+
+async fn set_media_keys(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: Option<&str>,
+    tag: &str,
+    keys: Vec<FloorKey>,
+) -> CmdResult {
+    engine
+        .handle(
+            CLIENT,
+            Command::SetFloorKeys {
+                call_id: call_id.map(str::to_string),
+                conference_id: call_id.is_none().then(|| ROOM.to_string()),
+                from_tag: tag.into(),
+                keys,
+                stream: RtcpAppStream::Audio,
+            },
+        )
+        .await
+}
+
+#[tokio::test]
+async fn set_floor_keys_for_the_audio_stream_keys_a_preserve_seat_and_an_unkeyed_receiver_hears_nothing(
+) {
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let (phone_a, port_a) = keyed_seat(&engine, "a", vec![]).await;
+    let (phone_b, _) = keyed_seat(&engine, "b", vec![]).await;
+    set_source(&engine, "a").await;
+    assert_eq!(
+        set_media_keys(&engine, None, "a", vec![media_key(1)]).await,
+        ok_empty()
+    );
+    let mut talker = phone_context(1);
+    let plain = plain_report(0xA0A0_A0A0);
+    phone_a
+        .send_to(&protect(&mut talker, &plain), port_a)
+        .await
+        .expect("send");
+    assert!(
+        drain(&phone_b, QUIET).await.is_empty(),
+        "b holds no media key: never the plaintext, never the talker's SRTCP"
+    );
+    assert_eq!(
+        set_media_keys(&engine, None, "b", vec![media_key(2)]).await,
+        ok_empty()
+    );
+    phone_a
+        .send_to(&protect(&mut talker, &plain), port_a)
+        .await
+        .expect("send");
+    let heard = expect(&phone_b, 1).await;
+    let mut opened = Vec::new();
+    phone_context(2)
+        .unprotect(&heard[0], &mut opened)
+        .expect("open");
+    assert_eq!(opened, plain);
+
+    // Unknown seat, a key set the SRTP layer refuses, and a seat that was never in a room.
+    let unknown = reason(set_media_keys(&engine, None, "nobody", vec![media_key(1)]).await);
+    assert!(unknown.contains("nobody"), "{unknown}");
+    let duplicate =
+        reason(set_media_keys(&engine, None, "a", vec![media_key(5), media_key(5)]).await);
+    assert!(
+        duplicate.contains("MKI") || duplicate.contains("mki"),
+        "{duplicate}"
+    );
+}
+
+#[tokio::test]
+async fn media_srtcp_keys_are_refused_outside_a_preserve_room_allocating_nothing() {
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let (_, addr) = phone().await;
+    let keyed = ProfileFlags {
+        media_srtcp_keys: vec![media_key(1)],
+        ..ProfileFlags::default()
+    };
+    let in_translate = reason(
+        join(
+            &engine,
+            ForwardMedia::Translate,
+            "t",
+            offer(addr, "RTP/AVP", false, false),
+            keyed.clone(),
+        )
+        .await,
+    );
+    assert!(in_translate.contains("preserve"), "{in_translate}");
+    let offered = reason(
+        engine
+            .handle(
+                CLIENT,
+                Command::ForwardOffer {
+                    conference_id: ROOM.into(),
+                    from_tag: "o".into(),
+                    profile: keyed.clone(),
+                    media: ForwardMedia::Translate,
+                },
+            )
+            .await,
+    );
+    assert!(offered.contains("preserve"), "{offered}");
+    let two_party = reason(
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "call".into(),
+                    from_tag: "ft".into(),
+                    sdp: offer(addr, "RTP/AVP", false, false),
+                    profile: keyed.clone(),
+                },
+            )
+            .await,
+    );
+    assert!(two_party.contains("preserve"), "{two_party}");
+    let mixing = reason(
+        engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "mix".into(),
+                    from_tag: "m".into(),
+                    sdp: offer(addr, "RTP/AVP", false, false),
+                    role: siphon_rtp_proto::ConferenceRole::Talker,
+                    profile: keyed,
+                    dtmf: siphon_rtp_proto::ConferenceDtmf::Events,
+                },
+            )
+            .await,
+    );
+    assert!(mixing.contains("preserve"), "{mixing}");
+    assert_eq!(engine.conference().forward().seat_count(), 0);
+    assert_eq!(engine.pending_seat_count(), 0);
+    assert!(engine.endpoint_calls.is_empty(), "nothing was allocated");
+    // The audio stream of a two-party call has no media keys to replace either, and a translate
+    // room's seat is refused by the room.
+    let (_, other) = phone().await;
+    let seated = join(
+        &engine,
+        ForwardMedia::Translate,
+        "r",
+        offer(other, "RTP/AVP", false, false),
+        ProfileFlags::default(),
+    )
+    .await;
+    assert!(matches!(seated, CmdResult::Ok { .. }), "{seated:?}");
+    let refused = reason(set_media_keys(&engine, None, "r", vec![media_key(1)]).await);
+    assert!(refused.contains("preserve"), "{refused}");
+    let refused = reason(set_media_keys(&engine, Some("call"), "ft", vec![media_key(1)]).await);
+    assert!(
+        refused.contains("preserve") || refused.contains("unknown call"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_offer_with_media_srtcp_keys_seats_a_keyed_member_on_its_answer() {
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let (phone_a, port_a) = keyed_seat(&engine, "a", vec![media_key(1)]).await;
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::ForwardOffer {
+                conference_id: ROOM.into(),
+                from_tag: "o".into(),
+                profile: ProfileFlags {
+                    media_srtcp_keys: vec![media_key(2)],
+                    ..ProfileFlags::default()
+                },
+                media: ForwardMedia::Preserve,
+            },
+        )
+        .await;
+    assert!(matches!(offered, CmdResult::Ok { .. }), "{offered:?}");
+    let (phone_o, addr) = phone().await;
+    let result = engine
+        .handle(
+            CLIENT,
+            Command::ForwardAnswer {
+                conference_id: ROOM.into(),
+                from_tag: "o".into(),
+                sdp: offer(addr, "RTP/AVP", false, false),
+                received_from: None,
+            },
+        )
+        .await;
+    assert_eq!(result, ok_empty());
+    set_source(&engine, "a").await;
+    let plain = plain_report(0xA0A0_A0A0);
+    phone_a
+        .send_to(&protect(&mut phone_context(1), &plain), port_a)
+        .await
+        .expect("send");
+    let heard = expect(&phone_o, 1).await;
+    let mut opened = Vec::new();
+    phone_context(2)
+        .unprotect(&heard[0], &mut opened)
+        .expect("the dialled-out member holds the offering profile's key");
+    assert_eq!(opened, plain);
 }

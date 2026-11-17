@@ -278,6 +278,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"key_mgmt does not apply to a mixing conference seat: the engine terminates its media",
             );
         }
+        if let Err(reason) = crate::floor_srtcp::refuse_media_srtcp_keys(profile) {
+            return error_result("conference_join", &reason);
+        }
         // The participant's codec, chosen before anything is allocated, so a seat the room could not
         // hold is refused here with the reason for each offered codec.
         let seat = match seat_codec(&info, profile) {

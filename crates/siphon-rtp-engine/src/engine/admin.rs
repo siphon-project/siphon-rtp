@@ -168,6 +168,11 @@ fn build_features() -> Vec<String> {
         // `profile.key_mgmt` is written as `a=key-mgmt` on the audio section. A controller gates
         // secured MCPTT media on this entry.
         "forward_preserve".to_string(),
+        // `profile.media_srtcp_keys` and `set_floor_keys` with `stream: audio` on a `media: preserve`
+        // seat: the audio RTCP of the talker is opened under the talker's key and sealed again for
+        // each receiver under its own (3GPP TS 33.180 §9.4.1), and a keyed receiver's RTCP is
+        // consumed. A controller gates securing preserve-room media RTCP on this entry.
+        "forward_preserve_media_srtcp".to_string(),
         // The MCPTT floor-control stream (`m=application <port> udp MCPTT`, 3GPP TS 24.380) is
         // anchored on a forwarding-room seat, and RTCP APP packets travel both ways as
         // `send_rtcp_app` / `rtcp_app`. Controllers gate floor control on these entries.

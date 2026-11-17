@@ -276,6 +276,7 @@ pub(crate) fn validate_profile(profile: &ProfileFlags) -> Result<(), String> {
     crate::engine::validate_sip_call_id(profile)?;
     validate_floor_fmtp(profile)?;
     refuse_floor_security(profile)?;
+    crate::floor_srtcp::refuse_media_srtcp_keys(profile)?;
     validate_fax_passthrough(profile)
 }
 
@@ -298,6 +299,7 @@ fn validate_floor_fmtp(profile: &ProfileFlags) -> Result<(), String> {
 pub(crate) fn refuse_floor_security(profile: &ProfileFlags) -> Result<(), String> {
     profile.validate().map_err(|error| error.to_string())?;
     crate::floor_srtcp::master_keys(&profile.floor_keys)?;
+    crate::floor_srtcp::master_keys(&profile.media_srtcp_keys)?;
     Ok(())
 }
 

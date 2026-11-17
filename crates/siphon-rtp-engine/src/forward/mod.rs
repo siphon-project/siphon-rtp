@@ -7,9 +7,11 @@
 //! through one RTP translator per receiving seat (RFC 3550 §7) so that every receiver sees a single
 //! stream with a stable SSRC however often the talker changes.
 //!
-//! A room may instead be a *preserving* room (`ForwardMedia::Preserve`): the talker's datagrams,
-//! RTP and its audio SRTCP, go to every receiver byte for byte, so end-to-end SRTP (3GPP TS 33.180
-//! §7.5.2 NOTE 3) survives. No translator, no transcoding and no engine reports there.
+//! A room may instead be a *preserving* room (`ForwardMedia::Preserve`): the talker's RTP goes to
+//! every receiver byte for byte, so end-to-end SRTP (3GPP TS 33.180 §5.2.1, §7.5.2 NOTE 3) survives.
+//! No translator, no transcoding and no engine reports there. The talker's audio SRTCP is forwarded
+//! byte for byte too, unless the seat holds media SRTCP keys: RTCP is protected hop by hop under each
+//! client's key (§9.4.1, §9.4.2, §9.4.6), so the room opens it and seals it again per receiver.
 //!
 //! * [`codec`]: the room's one codec and which offered codecs may join it.
 //! * [`room`]: the synchronous core (seats, source, fan-out, reports). No sockets, no clock.

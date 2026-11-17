@@ -73,6 +73,8 @@ struct Negotiated {
     accepted_source: SourceFilter,
     /// The floor stream, when the answer accepted it.
     floor: Option<FloorConfig>,
+    /// The media SRTCP keys of the offering profile (3GPP TS 33.180 §9.4.1).
+    media_srtcp: Vec<siphon_rtp_srtp::srtcp_gcm::FloorMasterKey>,
     /// What a WebRTC offer's answer settled: the DTLS role, the peer's fingerprint and the channel.
     webrtc: Option<AnsweredWebrtc>,
 }
@@ -386,6 +388,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             initial_timestamp: random_ssrc(),
             floor: negotiated.floor,
             app_events: self.app_event_queue(client),
+            media_srtcp: negotiated.media_srtcp,
         };
         // From here a refusal frees the endpoints itself.
         if let Err(refusal) = self
@@ -505,6 +508,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The seat's floor SRTCP keys are the offering profile's own (TS 33.180 §9.4).
         let floor_keys = crate::floor_srtcp::master_keys(&pending.profile.floor_keys)
             .map_err(|reason| format!("floor_keys: {reason}"))?;
+        let media_srtcp = crate::floor_srtcp::master_keys(&pending.profile.media_srtcp_keys)
+            .map_err(|reason| format!("media_srtcp_keys: {reason}"))?;
         // The floor stream, when the answer accepts it (a port, not 0) in the seat's address family.
         let floor = pending
             .floor
@@ -533,6 +538,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 gate(remote_rtp)
             },
             floor,
+            media_srtcp,
             webrtc,
         })
     }

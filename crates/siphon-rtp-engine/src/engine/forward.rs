@@ -22,7 +22,11 @@ use super::negotiate::{parse_codec_flags, peer_media_address, random_ssrc};
 use super::seat_transport::SeatTransport;
 use super::{boxed_error_result, error_result, ok_empty, ok_sdp, ClientId, Engine};
 
-/// `floor_keys` are checked (3GPP TS 33.180 §9.4) before anything is allocated.
+/// `floor_keys` and `media_srtcp_keys` are checked (3GPP TS 33.180 §9.4) before anything is
+/// allocated.
+///
+/// `media_srtcp_keys` are refused in a translate room: its engine writes the RTCP it sends, so there
+/// is no talker's SRTCP to protect hop by hop (§9.4.1) and a key would silently do nothing.
 ///
 /// `key_mgmt` is refused in a translate room: it sets up end-to-end SRTP between the UEs, which the
 /// translator breaks by rewriting the SSRC and sequence number (RFC 3711 §3.3 authenticates both;
@@ -31,6 +35,9 @@ fn refuse_forward_security(profile: &ProfileFlags, media: ForwardMedia) -> Resul
     crate::media_pipeline::refuse_floor_security(profile)?;
     if profile.key_mgmt.is_some() && media == ForwardMedia::Translate {
         return Err("key_mgmt sets up end-to-end SRTP, which a translate room rewrites; use \"media\": \"preserve\"".to_string());
+    }
+    if !profile.media_srtcp_keys.is_empty() && media == ForwardMedia::Translate {
+        return Err("media_srtcp_keys protect the forwarded RTCP of a preserve room; use \"media\": \"preserve\"".to_string());
     }
     Ok(())
 }
@@ -152,6 +159,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Err(reason) = refuse_seat_keying(&info, media) {
             return error_result("forward_join", &reason);
         }
+        let media_srtcp = match crate::floor_srtcp::master_keys(&profile.media_srtcp_keys) {
+            Ok(keys) => keys,
+            Err(reason) => return error_result("forward_join: media_srtcp_keys", &reason),
+        };
         // The codec, chosen before anything is allocated. A codec needs neither an encoder nor a
         // decoder here: the room forwards the payload as it came (RFC 3550 §7.1).
         let offered = answer_codec_candidates(&info, &parse_codec_flags(&profile.flags));
@@ -198,6 +209,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             initial_timestamp: random_ssrc(),
             floor: floor.map(|(_, config)| config),
             app_events: self.app_event_queue(client),
+            media_srtcp,
         };
         if let Err(refusal) = self
             .seat_forward_member(client, room_id, admission, config, endpoint, floor_endpoint)

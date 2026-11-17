@@ -69,6 +69,7 @@ fn room_of(seats: usize, queue: &AppEventQueue, keys: &[FloorMasterKey]) -> Forw
                     keys: keys.to_vec(),
                 }),
                 app_events: Some(queue.clone()),
+                media_srtcp: Vec::new(),
             },
             0,
         )

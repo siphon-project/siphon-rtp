@@ -31,6 +31,7 @@ fn config(index: u64) -> ForwardSeatConfig {
         initial_timestamp: 0,
         floor: None,
         app_events: None,
+        media_srtcp: Vec::new(),
     }
 }
 

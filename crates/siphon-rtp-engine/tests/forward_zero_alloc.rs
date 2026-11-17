@@ -11,7 +11,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
@@ -19,14 +19,27 @@ use siphon_rtp_engine::forward::{
     AppRequest, AppTarget, FloorConfig, ForwardRoom, ForwardSeatConfig, RoomCodec,
 };
 use siphon_rtp_engine::sdp;
+use siphon_rtp_media::rtcp;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader};
+use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
 
 /// A pass-through allocator that counts allocations on the armed thread only.
 struct CountingAllocator;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+/// The armed thread's own count: tests run in parallel, and another test's deliberate allocations
+/// (the event strings of a source change) must not land in this one's window.
+struct ThreadCount;
+
+static ALLOCATIONS: ThreadCount = ThreadCount;
+
+impl ThreadCount {
+    fn load(&self, _: Ordering) -> usize {
+        COUNT.with(Cell::get)
+    }
+}
 
 thread_local! {
+    static COUNT: Cell<usize> = const { Cell::new(0) };
     // Only the measuring thread arms counting, so the libtest harness's background-thread churn during
     // the same window is not miscounted. `const`-initialised so `alloc` never itself allocates.
     static ARMED: Cell<bool> = const { Cell::new(false) };
@@ -36,7 +49,7 @@ thread_local! {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if ARMED.with(Cell::get) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            COUNT.with(|count| count.set(count.get() + 1));
         }
         System.alloc(layout)
     }
@@ -55,6 +68,15 @@ fn room() -> ForwardRoom {
 }
 
 fn room_with(media: siphon_rtp_proto::ForwardMedia) -> ForwardRoom {
+    room_keyed(media, false)
+}
+
+/// Seat `index`'s media SRTCP key (3GPP TS 33.180 §9.4.1): the MKI is the seat number.
+fn media_key(index: usize) -> FloorMasterKey {
+    FloorMasterKey::from_salt_96(index as u32, [index as u8; 16], &[0x5A ^ index as u8; 12])
+}
+
+fn room_keyed(media: siphon_rtp_proto::ForwardMedia, keyed: bool) -> ForwardRoom {
     let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
                  m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
     let codecs = sdp::parse(offer).unwrap().audio_codecs();
@@ -80,6 +102,11 @@ fn room_with(media: siphon_rtp_proto::ForwardMedia) -> ForwardRoom {
                 initial_timestamp: 0,
                 floor: None,
                 app_events: None,
+                media_srtcp: if keyed {
+                    vec![media_key(index)]
+                } else {
+                    Vec::new()
+                },
             },
             0,
         )
@@ -209,6 +236,59 @@ fn a_preserving_rooms_fan_out_makes_no_heap_allocation_and_forwards_the_same_buf
 }
 
 #[test]
+fn a_keyed_preserving_rooms_srtcp_reseal_makes_no_heap_allocation() {
+    // The talker's SRTCP is opened once into the room's buffer and sealed per receiver into the
+    // room's output buffer: 99 seals per inbound datagram, nothing allocated once warm.
+    let mut room = room_keyed(siphon_rtp_proto::ForwardMedia::Preserve, true);
+    room.set_source(Some("seat-0")).unwrap();
+    let mut talker = SrtcpGcmContext::new(&[media_key(0)]).unwrap();
+    let mut plain = [0u8; 128];
+    let length = rtcp::write_sender_report(
+        0xA000_0000,
+        0x0000_0001_8000_0000,
+        320,
+        1,
+        62,
+        &[],
+        &mut plain,
+    )
+    .unwrap();
+    // No APP part: an APP packet becomes an event for the controller, which allocates by design.
+    // Fresh indices only: a replayed datagram is refused, so each one is sealed in advance.
+    let packets: Vec<RxPacket> = (0..400u64)
+        .map(|sequence| {
+            let mut wire = Vec::new();
+            talker.protect(&plain[..length], true, &mut wire).unwrap();
+            RxPacket {
+                endpoint: EndpointId(1),
+                source: "192.0.2.1:4000".parse().unwrap(),
+                arrival: sequence * 20_000,
+                data: Bytes::from(wire),
+            }
+        })
+        .collect();
+    room.ingest(&packets[0]);
+    while room.next_datagram(&packets[0]).is_some() {}
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut sent = 0usize;
+    for packet in &packets[1..] {
+        room.ingest(packet);
+        while let Some((_, _, datagram)) = room.next_datagram(packet) {
+            sent += std::hint::black_box(datagram).len();
+        }
+    }
+    let steady = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(sent > 0);
+    assert_eq!(
+        steady, 0,
+        "SRTCP reseal allocated {steady} times across 399 datagrams (must be zero)"
+    );
+    assert_eq!(room.seat_stats("seat-1").unwrap().media_srtcp_refused, 0);
+}
+
+#[test]
 fn a_room_wide_rtcp_app_send_makes_no_heap_allocation() {
     // The send path writes every seat's datagram into the room's own scratch and lends it out.
     let mut room = {
@@ -246,6 +326,7 @@ fn a_room_wide_rtcp_app_send_makes_no_heap_allocation() {
                     keys: Vec::new(),
                 }),
                 app_events: None,
+                media_srtcp: Vec::new(),
             },
             0,
         )
