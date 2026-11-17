@@ -20,7 +20,8 @@
 //! `conference_offer` does, except that forwarding needs neither a decoder nor an encoder, so a codec
 //! this build cannot transcode (AMR without the `amr` feature) is listed too. With
 //! `profile.floor_fmtp` set the offer carries an anchored `m=application <port> udp MCPTT` section
-//! (3GPP TS 24.380 §14) with `a=fmtp:MCPTT` verbatim.
+//! (3GPP TS 24.380 §14) with `a=fmtp:MCPTT` verbatim, or `udp MCVideo` (3GPP TS 24.581 §4.3.3.1)
+//! when the profile's first `transmission_control_formats` entry is `MCVideo`.
 //!
 //! A profile with `transport_protocol: "UDP/TLS/RTP/SAVPF"` offers a browser a WebRTC seat instead
 //! ([`super::forward_webrtc`]).
@@ -74,6 +75,16 @@ struct Negotiated {
     floor: Option<FloorConfig>,
     /// What a WebRTC offer's answer settled: the DTLS role, the peer's fingerprint and the channel.
     webrtc: Option<AnsweredWebrtc>,
+}
+
+/// The control format a `forward_offer` writes and its answer must echo (RFC 3264 §6): the
+/// profile's first.
+fn offered_control_format(profile: &ProfileFlags) -> siphon_rtp_proto::ControlFormat {
+    profile
+        .control_formats()
+        .first()
+        .copied()
+        .unwrap_or_default()
 }
 
 type PendingKey = (String, String);
@@ -251,6 +262,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 floor.local_addr.port(),
                 advertised,
                 profile.floor_fmtp.as_deref(),
+                offered_control_format(&profile),
             ));
         }
         let key_mgmt = profile.key_mgmt.clone();
@@ -319,6 +331,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
         let endpoint = pending.endpoint;
+        let floor_label = crate::floor_channel::channel_label(&pending.profile);
         // A floor stream the answer declined leaves an audio-only seat, and frees the endpoint held
         // for it.
         let floor_endpoint = match (pending.floor, negotiated.floor.is_some()) {
@@ -400,6 +413,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ice_pending,
                     offered,
                     answered,
+                    floor_label,
                 )
                 .await
             {
@@ -494,7 +508,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The floor stream, when the answer accepts it (a port, not 0) in the seat's address family.
         let floor = pending
             .floor
-            .zip(sdp::parse_floor(answer))
+            .zip(sdp::parse_floor(
+                answer,
+                &[offered_control_format(&pending.profile)],
+            ))
             .filter(|(_, offered)| AddressFamily::of(offered.remote.ip()) == family)
             .map(|(endpoint, offered)| {
                 let destination = peer_media_address(offered.remote, received_from);

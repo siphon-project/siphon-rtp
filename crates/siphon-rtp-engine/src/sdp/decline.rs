@@ -94,7 +94,7 @@ pub fn decline_unanswered_with_data_channel(
                 data_channel_seen |= first;
                 first
             }
-            MediaKind::Other if floor_answered && is_floor_media_line(value) => {
+            MediaKind::Other if floor_answered && is_floor_media_line(value).is_some() => {
                 let first = !floor_seen && port.is_some_and(|port| port != 0);
                 floor_seen |= first;
                 first

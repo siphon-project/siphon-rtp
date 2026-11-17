@@ -13,7 +13,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction};
-use siphon_rtp_proto::ProfileFlags;
+use siphon_rtp_proto::{ControlFormat, ProfileFlags};
 use siphon_rtp_srtp::srtcp_gcm::FloorMasterKey;
 
 use crate::call_floor::CallFloorLeg;
@@ -45,6 +45,8 @@ pub(super) struct OfferFloor {
     pub(super) near_remote: Option<SocketAddr>,
     /// The offerer's floor SRTCP keys from its own profile, held until the answer registers its leg.
     pub(super) near_keys: Vec<FloorMasterKey>,
+    /// The format the offer's floor section carried, which both legs present and the answer echoes.
+    pub(super) format: ControlFormat,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -78,11 +80,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         call_id: &str,
         tag: &str,
         owner: ClientId,
+        profile: &ProfileFlags,
     ) -> FloorChannelPlan {
         let (handle, plan) = floor_channel(FloorSink {
             scope: FloorScope::Call(call_id.to_string()),
             tag: tag.to_string(),
             events: self.app_event_queue(owner),
+            label: crate::floor_channel::channel_label(profile),
         });
         self.call_floor_channels.insert(
             (call_id.to_string(), tag.to_string()),
@@ -118,7 +122,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         endpoints: &mut Vec<Endpoint>,
     ) -> OfferFloor {
         let ((near_family, near_bind), (far_family, far_bind)) = families;
-        let Some(offered) = sdp::parse_floor(offer).filter(|_| profile.ws_uri.is_none()) else {
+        let Some(offered) =
+            sdp::parse_floor(offer, profile.control_formats()).filter(|_| profile.ws_uri.is_none())
+        else {
             return OfferFloor::default();
         };
         if AddressFamily::of(offered.remote.ip()) != near_family {
@@ -149,6 +155,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far: Some(far),
             near_remote: Some(offered.remote),
             near_keys,
+            format: offered.format,
         }
     }
 
@@ -182,11 +189,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     pub(super) async fn anchor_local_floor(
         &self,
         offer: &str,
+        profile: &ProfileFlags,
         family: AddressFamily,
         bind: Option<IpAddr>,
         endpoints: &mut Vec<Endpoint>,
-    ) -> Option<(Endpoint, SocketAddr)> {
-        let offered = sdp::parse_floor(offer)?;
+    ) -> Option<(Endpoint, SocketAddr, ControlFormat)> {
+        let offered = sdp::parse_floor(offer, profile.control_formats())?;
         if AddressFamily::of(offered.remote.ip()) != family {
             tracing::debug!(
                 "the floor stream is in another address family than the call; declined"
@@ -195,7 +203,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         let endpoint = self.alloc_floor_endpoint(family, bind).await?;
         endpoints.push(endpoint);
-        Some((endpoint, offered.remote))
+        Some((endpoint, offered.remote, offered.format))
     }
 
     /// The single-leg answer with its floor section answered on the engine's endpoint (TS 24.380
@@ -203,13 +211,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     pub(super) fn present_local_floor(
         &self,
         answer: String,
-        floor: Option<(Endpoint, SocketAddr)>,
+        floor: Option<(Endpoint, SocketAddr, ControlFormat)>,
         advertised: IpAddr,
         profile: &ProfileFlags,
         data_channel: bool,
     ) -> String {
         let anchored = match floor {
-            Some((endpoint, _)) => sdp::anchor_floor(
+            Some((endpoint, _, _)) => sdp::anchor_floor(
                 &answer,
                 EngineMedia {
                     rtp: endpoint.local_addr,
@@ -217,6 +225,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     advertised_ip: advertised,
                 },
                 profile.floor_fmtp.as_deref(),
+                profile.control_formats(),
             ),
             None => answer,
         };
@@ -235,11 +244,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         call_id: &str,
         profile: &ProfileFlags,
-        (endpoint, signalled): (Endpoint, SocketAddr),
+        (endpoint, signalled, format): (Endpoint, SocketAddr, ControlFormat),
     ) {
         let Some((tag, owner)) = self.calls.get_mut(call_id).map(|mut call| {
             call.near.floor = Some(endpoint);
             call.near.floor_remote = Some(signalled);
+            call.near.floor_format = format;
             (call.from_tag.clone(), call.owner)
         }) else {
             return;
@@ -266,6 +276,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 events: self.app_event_queue(owner),
                 keys,
                 fmtp: profile.floor_fmtp.clone(),
+                format,
                 restore: None,
             },
         );
@@ -301,7 +312,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         else {
             return;
         };
-        let Some(answered) = sdp::parse_floor(answer) else {
+        // The answerer echoes the format the offer carried (RFC 3264 §6), nothing else.
+        let Some(answered) = sdp::parse_floor(answer, &[near.floor_format]) else {
             tracing::debug!(
                 target: "siphon_rtp::media", call_id,
                 "the answerer declined the floor stream; it is not served"
@@ -346,6 +358,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     events: events.clone(),
                     keys,
                     fmtp: wiring.profile.floor_fmtp.clone(),
+                    format: near.floor_format,
                     restore: None,
                 },
             );
@@ -353,6 +366,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             if let Some(stored) = call.far.as_mut() {
                 stored.floor_remote = Some(answered.remote);
+                stored.floor_format = answered.format;
             }
         }
         tracing::info!(

@@ -1514,163 +1514,48 @@ pub enum PlayMediaSource {
     Http { url: String },
 }
 
-/// The octets of an SRTCP master key for AEAD_AES_128_GCM (RFC 7714 §12.1).
-pub const FLOOR_KEY_LEN: usize = 16;
-/// The octets of the 96-bit SRTCP master salt of AEAD_AES_128_GCM (RFC 7714 §12).
-pub const FLOOR_SALT_LEN: usize = 12;
-/// The octets of the 112-bit SRTP master salt (RFC 3711 §4.3.1), the other length a MIKEY SP
-/// policy can negotiate.
-pub const FLOOR_SALT_LEN_LONG: usize = 14;
-/// The most floor keys a seat holds at once ([`ProfileFlags::floor_keys`], [`Command::SetFloorKeys`]).
-pub const MAX_FLOOR_KEYS: usize = 2;
+/// The longest data channel label, in octets: the DCEP label length is a 16-bit field (RFC 8832
+/// §5.1), and the label is capped at one octet's worth so it stays printable in a log line.
+pub const MAX_FLOOR_CHANNEL_LABEL_LEN: usize = 255;
 
-/// Why a [`FloorKey`] or [`ProfileFlags`] was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FloorKeyError {
-    /// The master key is not [`FLOOR_KEY_LEN`] octets.
-    KeyLength(usize),
-    /// The master salt is neither [`FLOOR_SALT_LEN`] nor [`FLOOR_SALT_LEN_LONG`] octets.
-    SaltLength(usize),
-    /// More than [`MAX_FLOOR_KEYS`] keys in a profile.
-    TooMany(usize),
-    /// `key_mgmt` contains a CR or LF; it is written into an SDP line verbatim.
-    KeyMgmtLineBreak,
-}
-
-impl std::fmt::Display for FloorKeyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::KeyLength(length) => write!(
-                formatter,
-                "floor key must be {FLOOR_KEY_LEN} octets, got {length}"
-            ),
-            Self::SaltLength(length) => write!(
-                formatter,
-                "floor salt must be {FLOOR_SALT_LEN} or {FLOOR_SALT_LEN_LONG} octets, got {length}"
-            ),
-            Self::TooMany(count) => write!(
-                formatter,
-                "at most {MAX_FLOOR_KEYS} floor keys are allowed in a profile, got {count}"
-            ),
-            Self::KeyMgmtLineBreak => formatter.write_str("key_mgmt must not contain a line break"),
-        }
-    }
-}
-
-impl std::error::Error for FloorKeyError {}
-
-/// One SRTCP master key and salt for floor control (3GPP TS 33.180 §9.4.6 and §9.4.8).
+/// The format token of a transmission control stream's `m=application <port> udp <token>` line:
+/// the media plane control channel the engine terminates (RTCP APP packets only).
 ///
-/// The cipher is AEAD_AES_128_GCM (RFC 7714) with key derivation rate 0. `mki` is the 32-bit
-/// KFC-ID the controller signalled, carried as the SRTCP MKI. `key` and `salt` are base64 on the
-/// wire (RFC 4648 §4) and exactly [`FLOOR_KEY_LEN`] octets and [`FLOOR_SALT_LEN`] (RFC 7714 §12, 96 bits) or
-/// [`FLOOR_SALT_LEN_LONG`] (RFC 3711, 112 bits) octets, since the MIKEY SP policy can negotiate either. A
-/// 12-octet salt is zero-extended on the right to 112 bits before the RFC 3711 AES-CM PRF, which is
-/// libsrtp's behaviour. Any other length
-/// is refused when the frame is read. [`std::fmt::Debug`] redacts both: key material never reaches a log.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "FloorKeyWire")]
-pub struct FloorKey {
-    pub mki: u32,
-    #[serde(with = "base64::strict")]
-    pub key: Vec<u8>,
-    #[serde(with = "base64::strict")]
-    pub salt: Vec<u8>,
+/// The tokens are spec-defined, so they are typed rather than free text: `MCPTT` is the floor
+/// control stream of 3GPP TS 24.380 §14, `MCVideo` the transmission control stream of 3GPP
+/// TS 24.581 §4.3.3.1 (table 4.3.3.1-1: media `application`, port the RTCP port, protocol `udp`).
+/// Any other token is refused when the frame is read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ControlFormat {
+    /// `MCPTT`: floor control (TS 24.380).
+    #[default]
+    #[serde(rename = "MCPTT")]
+    Mcptt,
+    /// `MCVideo`: transmission control (TS 24.581).
+    #[serde(rename = "MCVideo")]
+    Mcvideo,
 }
 
-impl std::fmt::Debug for FloorKey {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FloorKey")
-            .field("mki", &self.mki)
-            .field("key", &"<redacted>")
-            .field("salt", &"<redacted>")
-            .finish()
-    }
-}
-
-impl zeroize::Zeroize for FloorKey {
-    /// Overwrite the key and salt octets in place (length kept). The MKI is wire data and stays.
-    fn zeroize(&mut self) {
-        self.key.as_mut_slice().zeroize();
-        self.salt.as_mut_slice().zeroize();
-    }
-}
-
-/// The controller-derived key (3GPP TS 33.180 §9.4) must not linger in freed memory.
-impl Drop for FloorKey {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(self);
-    }
-}
-
-impl FloorKey {
-    /// Check the key and salt lengths (for a key built in code rather than read from the wire).
-    ///
-    /// # Errors
-    /// [`FloorKeyError::KeyLength`] or [`FloorKeyError::SaltLength`].
-    pub fn validate(&self) -> Result<(), FloorKeyError> {
-        if self.key.len() != FLOOR_KEY_LEN {
-            return Err(FloorKeyError::KeyLength(self.key.len()));
+impl ControlFormat {
+    /// The token as it appears on the `m=` line and after `a=fmtp:`.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Mcptt => "MCPTT",
+            Self::Mcvideo => "MCVideo",
         }
-        if self.salt.len() != FLOOR_SALT_LEN && self.salt.len() != FLOOR_SALT_LEN_LONG {
-            return Err(FloorKeyError::SaltLength(self.salt.len()));
+    }
+
+    /// The format a media line's token names, or `None` for any other token. Exact, as the specs
+    /// write them.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "MCPTT" => Some(Self::Mcptt),
+            "MCVideo" => Some(Self::Mcvideo),
+            _ => None,
         }
-        Ok(())
     }
-}
-
-#[derive(Deserialize)]
-struct FloorKeyWire {
-    mki: u32,
-    #[serde(with = "base64::strict")]
-    key: Vec<u8>,
-    #[serde(with = "base64::strict")]
-    salt: Vec<u8>,
-}
-
-impl FloorKeyWire {
-    /// Move the decoded key and salt out, leaving the wire form empty.
-    fn take_secrets(&mut self) -> (Vec<u8>, Vec<u8>) {
-        (
-            std::mem::take(&mut self.key),
-            std::mem::take(&mut self.salt),
-        )
-    }
-}
-
-/// A frame whose key fails validation must not leave the decoded octets behind.
-impl Drop for FloorKeyWire {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(self.key.as_mut_slice());
-        zeroize::Zeroize::zeroize(self.salt.as_mut_slice());
-    }
-}
-
-impl TryFrom<FloorKeyWire> for FloorKey {
-    type Error = FloorKeyError;
-
-    fn try_from(mut wire: FloorKeyWire) -> Result<Self, Self::Error> {
-        let (key, salt) = wire.take_secrets();
-        // A failing key is dropped here, and `Drop for FloorKey` wipes it.
-        let key = Self {
-            mki: wire.mki,
-            key,
-            salt,
-        };
-        key.validate()?;
-        Ok(key)
-    }
-}
-
-fn deserialize_floor_keys<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<FloorKey>, D::Error> {
-    let keys = Vec::<FloorKey>::deserialize(deserializer)?;
-    if keys.len() > MAX_FLOOR_KEYS {
-        return Err(serde::de::Error::custom(FloorKeyError::TooMany(keys.len())));
-    }
-    Ok(keys)
 }
 
 /// How a forwarding room carries media ([`Command::ForwardJoin`], [`Command::ForwardOffer`]).
@@ -2017,9 +1902,34 @@ pub struct ProfileFlags {
     /// drops it. A line break inside is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_mgmt: Option<String>,
+    /// The transmission control streams the engine accepts, by `m=application <port> udp <token>`
+    /// format: `MCPTT` (3GPP TS 24.380 §14) and/or `MCVideo` (3GPP TS 24.581 §4.3.3.1). Empty means
+    /// `[MCPTT]`, so a controller that never sets it sees no change; see
+    /// [`ProfileFlags::control_formats`]. An offered control section whose token is not listed is
+    /// declined (port 0, RFC 3264 §6), never passed through. The first entry is the token a
+    /// `forward_offer` writes. [`ProfileFlags::floor_fmtp`], `floor_keys` and `key_mgmt` apply to
+    /// whichever format is in play.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transmission_control_formats: Vec<ControlFormat>,
+    /// The label of the browser data channel that carries floor or transmission control (RFC 8831
+    /// §6.4: a channel is named by a free-form label). `None` means `mcptt-floor`. Refused when
+    /// empty, longer than [`MAX_FLOOR_CHANNEL_LABEL_LEN`] octets, or holding a control character.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_channel_label: Option<String>,
 }
 
 impl ProfileFlags {
+    /// The transmission control formats in force: [`ProfileFlags::transmission_control_formats`],
+    /// or `[MCPTT]` when it is empty.
+    #[must_use]
+    pub fn control_formats(&self) -> &[ControlFormat] {
+        if self.transmission_control_formats.is_empty() {
+            &[ControlFormat::Mcptt]
+        } else {
+            &self.transmission_control_formats
+        }
+    }
+
     /// Check the floor-security fields: at most [`MAX_FLOOR_KEYS`] keys of the right lengths, and
     /// no line break in `key_mgmt`. Wire input already satisfies the first two; this is for a
     /// profile built in code, and for the line-break rule, which the wire does not enforce.
@@ -2036,6 +1946,14 @@ impl ProfileFlags {
         if let Some(key_mgmt) = &self.key_mgmt {
             if key_mgmt.contains(['\r', '\n']) {
                 return Err(FloorKeyError::KeyMgmtLineBreak);
+            }
+        }
+        if let Some(label) = &self.floor_channel_label {
+            if label.is_empty()
+                || label.len() > MAX_FLOOR_CHANNEL_LABEL_LEN
+                || label.chars().any(char::is_control)
+            {
+                return Err(FloorKeyError::ChannelLabel);
             }
         }
         Ok(())
@@ -2818,6 +2736,11 @@ pub mod frame {
 }
 
 mod base64;
+mod floor_key;
+use floor_key::deserialize_floor_keys;
+pub use floor_key::{
+    FloorKey, FloorKeyError, FLOOR_KEY_LEN, FLOOR_SALT_LEN, FLOOR_SALT_LEN_LONG, MAX_FLOOR_KEYS,
+};
 pub mod scope;
 pub mod vq_rtcpxr;
 pub use scope::{normalize_scope, validate_scope, ScopeError, Scoped, MAX_SCOPE_LEN};
@@ -5790,7 +5713,7 @@ mod tests {
     #[test]
     fn the_wire_form_hands_its_secrets_over_and_keeps_none() {
         // A 15-octet key fails validation after the bytes were decoded; the wire form wipes them.
-        let mut wire = FloorKeyWire {
+        let mut wire = crate::floor_key::FloorKeyWire {
             mki: 1,
             key: vec![0x55; 15],
             salt: vec![0x66; 12],
@@ -5848,6 +5771,81 @@ mod tests {
             serde_json::to_string(&ProfileFlags::default()).expect("ser"),
             "{}"
         );
+    }
+
+    #[test]
+    fn control_formats_and_channel_label_wire_shape() {
+        let profile = ProfileFlags {
+            transmission_control_formats: vec![ControlFormat::Mcvideo, ControlFormat::Mcptt],
+            floor_channel_label: Some("tc".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&profile).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"transmission_control_formats":["MCVideo","MCPTT"],"floor_channel_label":"tc"}"#
+        );
+        let decoded: ProfileFlags = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, profile);
+        assert_eq!(
+            decoded.control_formats(),
+            &[ControlFormat::Mcvideo, ControlFormat::Mcptt]
+        );
+        // An old frame without them: MCPTT only, the default label.
+        let old: ProfileFlags =
+            serde_json::from_str(r#"{"floor_fmtp":"mc_granted"}"#).expect("old");
+        assert!(old.transmission_control_formats.is_empty() && old.floor_channel_label.is_none());
+        assert_eq!(old.control_formats(), &[ControlFormat::Mcptt]);
+        assert_eq!(
+            serde_json::to_string(&ProfileFlags::default()).expect("ser"),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_control_format_token_is_refused() {
+        for bad in ["mcvideo", "MCData", "MCPTT ", ""] {
+            let json = format!(r#"{{"transmission_control_formats":["{bad}"]}}"#);
+            assert!(
+                serde_json::from_str::<ProfileFlags>(&json).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            ControlFormat::from_token("MCVideo"),
+            Some(ControlFormat::Mcvideo)
+        );
+        assert_eq!(
+            ControlFormat::from_token("MCPTT"),
+            Some(ControlFormat::Mcptt)
+        );
+        assert_eq!(ControlFormat::from_token("mcptt"), None);
+        assert_eq!(ControlFormat::Mcvideo.token(), "MCVideo");
+        assert_eq!(ControlFormat::Mcptt.token(), "MCPTT");
+    }
+
+    #[test]
+    fn a_bad_floor_channel_label_is_refused_by_validate() {
+        let long = "x".repeat(MAX_FLOOR_CHANNEL_LABEL_LEN + 1);
+        for bad in ["", "a\nb", "a\u{0}b", "\t", long.as_str()] {
+            let profile = ProfileFlags {
+                floor_channel_label: Some(bad.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                profile.validate(),
+                Err(FloorKeyError::ChannelLabel),
+                "{bad:?}"
+            );
+        }
+        let longest = "x".repeat(MAX_FLOOR_CHANNEL_LABEL_LEN);
+        for good in ["mcvideo-tc", "mcptt-floor", longest.as_str()] {
+            let profile = ProfileFlags {
+                floor_channel_label: Some(good.into()),
+                ..Default::default()
+            };
+            assert_eq!(profile.validate(), Ok(()));
+        }
     }
 
     #[test]

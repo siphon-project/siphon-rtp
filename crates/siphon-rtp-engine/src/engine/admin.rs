@@ -173,6 +173,12 @@ fn build_features() -> Vec<String> {
         // `send_rtcp_app` / `rtcp_app`. Controllers gate floor control on these entries.
         "mcptt_floor".to_string(),
         "rtcp_app".to_string(),
+        // The same stream under the MCVideo token (`m=application <rtcp port> udp MCVideo`, 3GPP
+        // TS 24.581 §4.3.3.1), selected by `profile.transmission_control_formats`, and the label of
+        // the browser data channel set by `profile.floor_channel_label`. The engine terminates the
+        // stream and treats the RTCP APP names (`MCV0`..`MCV2`) and subtypes as opaque. A controller
+        // gates sending either field on this entry; `mcptt_floor` stays for MCPTT-only controllers.
+        "transmission_control".to_string(),
         // The floor stream is protected with AEAD_AES_128_GCM SRTCP (3GPP TS 33.180 §9.4) under the
         // `floor_keys` of the profile and `set_floor_keys`. Controllers gate keyed floor control on
         // this entry.

@@ -24,6 +24,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
+use siphon_rtp_proto::ControlFormat;
 
 /// Snapshot wire-format version. Bumped on any breaking change to [`CallSnapshot`]; a standby rejects
 /// a blob whose version it does not understand.
@@ -49,6 +50,19 @@ pub const SNAPSHOT_VERSION_FLOOR: u16 = 4;
 
 /// The version of a snapshot of a **scoped** call that carries a floor stream.
 pub const SNAPSHOT_VERSION_SCOPED_FLOOR: u16 = 5;
+
+/// The version a snapshot of an unscoped call that carries an MCVideo transmission control stream
+/// has (`udp MCVideo`, 3GPP TS 24.581 §4.3.3.1; [`FloorSnapshot::format`]).
+///
+/// A build from before MCVideo ignores the `format` key, so an MCVideo call written at
+/// [`SNAPSHOT_VERSION_FLOOR`] would restore there as an MCPTT floor stream and re-offer the wrong
+/// token. Under its own version such a standby refuses the blob instead. An MCPTT floor call keeps
+/// the bytes and versions it had.
+pub const SNAPSHOT_VERSION_VIDEO_FLOOR: u16 = 6;
+
+/// The version of a snapshot of a **scoped** call that carries an MCVideo transmission control
+/// stream.
+pub const SNAPSHOT_VERSION_SCOPED_VIDEO_FLOOR: u16 = 7;
 
 /// A portable snapshot of one live call's negotiated state (see the module docs). All fields are
 /// plain data (strings / integers / enums / `std::net` addresses), so the whole thing round-trips
@@ -168,9 +182,13 @@ pub struct FloorSnapshot {
     pub latched: Option<SocketAddr>,
     /// The SSRC the engine's floor packets carry toward this party (RFC 3550 §8.1).
     pub ssrc: u32,
-    /// The controller's `a=fmtp:MCPTT` parameters, verbatim.
+    /// The controller's `a=fmtp:<token>` parameters, verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmtp: Option<String>,
+    /// The control format the stream was set up with. Omitted for `MCPTT`, so a checkpoint written
+    /// before MCVideo existed reads back as MCPTT and an MCPTT stream writes the bytes it always did.
+    #[serde(default, skip_serializing_if = "is_mcptt")]
+    pub format: ControlFormat,
     /// The SRTCP master keys in force, oldest first; empty for a stream in the clear. Secret
     /// material, hex-encoded like the SDES keys of a [`CryptoSnapshot`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -228,6 +246,11 @@ pub struct FloorReceivedSnapshot {
     pub mki: u32,
     /// The highest index that authenticated under it.
     pub index: u32,
+}
+
+/// `skip_serializing_if` predicate for the default control format.
+fn is_mcptt(format: &ControlFormat) -> bool {
+    *format == ControlFormat::Mcptt
 }
 
 /// `skip_serializing_if` predicate for a zero counter.
@@ -556,7 +579,7 @@ impl CallSnapshot {
     /// [`SNAPSHOT_VERSION`] without.
     pub fn from_json(blob: &str) -> Result<Self, SnapshotError> {
         let snapshot: Self = serde_json::from_str(blob)?;
-        let expected = Self::version_for(snapshot.scope.as_deref(), snapshot.has_floor());
+        let expected = Self::version_for(snapshot.scope.as_deref(), snapshot.floor_format());
         if snapshot.version != expected {
             return Err(SnapshotError::Version {
                 found: snapshot.version,
@@ -572,14 +595,34 @@ impl CallSnapshot {
         self.near.floor.is_some() || self.far.floor.is_some()
     }
 
-    /// The format version a snapshot of a call in `scope` carries, with or without a floor stream.
+    /// The control format of the call's floor stream in this record: MCVideo when either party's
+    /// stream is MCVideo, MCPTT when there is a floor stream that is not, `None` without one.
     #[must_use]
-    pub fn version_for(scope: Option<&str>, has_floor: bool) -> u16 {
-        match (scope, has_floor) {
-            (Some(_), true) => SNAPSHOT_VERSION_SCOPED_FLOOR,
-            (Some(_), false) => SNAPSHOT_VERSION_SCOPED,
-            (None, true) => SNAPSHOT_VERSION_FLOOR,
-            (None, false) => SNAPSHOT_VERSION,
+    pub fn floor_format(&self) -> Option<ControlFormat> {
+        let formats = [&self.near.floor, &self.far.floor]
+            .into_iter()
+            .flatten()
+            .map(|floor| floor.format);
+        formats.reduce(|kept, format| {
+            if format == ControlFormat::Mcvideo {
+                format
+            } else {
+                kept
+            }
+        })
+    }
+
+    /// The format version a snapshot of a call in `scope` carries, by the control format of its
+    /// floor stream (`None` without one).
+    #[must_use]
+    pub fn version_for(scope: Option<&str>, floor: Option<ControlFormat>) -> u16 {
+        match (scope, floor) {
+            (Some(_), Some(ControlFormat::Mcvideo)) => SNAPSHOT_VERSION_SCOPED_VIDEO_FLOOR,
+            (Some(_), Some(ControlFormat::Mcptt)) => SNAPSHOT_VERSION_SCOPED_FLOOR,
+            (Some(_), None) => SNAPSHOT_VERSION_SCOPED,
+            (None, Some(ControlFormat::Mcvideo)) => SNAPSHOT_VERSION_VIDEO_FLOOR,
+            (None, Some(ControlFormat::Mcptt)) => SNAPSHOT_VERSION_FLOOR,
+            (None, None) => SNAPSHOT_VERSION,
         }
     }
 }
@@ -787,7 +830,7 @@ mod tests {
     fn a_scoped_snapshot_carries_its_scope_under_its_own_version() {
         let mut snapshot = sample();
         snapshot.scope = Some("bgcf".into());
-        snapshot.version = CallSnapshot::version_for(snapshot.scope.as_deref(), false);
+        snapshot.version = CallSnapshot::version_for(snapshot.scope.as_deref(), None);
         let blob = snapshot.to_json().expect("serialize");
         assert!(
             blob.starts_with(r#"{"version":3,"call_id":"call-abc@host","scope":"bgcf","#),
@@ -807,6 +850,7 @@ mod tests {
             latched: Some("198.51.100.1:5010".parse().unwrap()),
             ssrc: 0x1234_5678,
             fmtp: Some("mc_granted".into()),
+            format: siphon_rtp_proto::ControlFormat::Mcptt,
             keys: vec![FloorKeySnapshot {
                 mki: 9,
                 master_key_hex: to_hex(&[0x55; 16]),
@@ -828,15 +872,32 @@ mod tests {
     }
 
     #[test]
+    fn the_control_format_is_omitted_for_mcptt_and_read_back_as_mcptt_from_an_old_blob() {
+        use siphon_rtp_proto::ControlFormat;
+        let mut leg = floor_leg();
+        let plain = serde_json::to_string(&leg).expect("serialize");
+        assert!(!plain.contains("format"), "{plain}");
+        // A checkpoint written before MCVideo existed has no `format`: it is MCPTT.
+        let old: FloorSnapshot = serde_json::from_str(&plain).expect("old blob");
+        assert_eq!(old.format, ControlFormat::Mcptt);
+        leg.format = ControlFormat::Mcvideo;
+        let video = serde_json::to_string(&leg).expect("serialize");
+        assert!(video.contains(r#""format":"MCVideo""#), "{video}");
+        let back: FloorSnapshot = serde_json::from_str(&video).expect("parse");
+        assert_eq!(back, leg);
+    }
+
+    #[test]
     fn a_floor_snapshot_round_trips_under_its_own_version() {
         let mut snapshot = sample();
         snapshot.near.floor = Some(floor_leg());
-        snapshot.version = CallSnapshot::version_for(None, snapshot.has_floor());
+        snapshot.version = CallSnapshot::version_for(None, snapshot.floor_format());
         assert_eq!(snapshot.version, SNAPSHOT_VERSION_FLOOR);
         let blob = snapshot.to_json().expect("serialize");
         assert_eq!(CallSnapshot::from_json(&blob).expect("parse"), snapshot);
         snapshot.scope = Some("bgcf".into());
-        snapshot.version = CallSnapshot::version_for(snapshot.scope.as_deref(), true);
+        snapshot.version =
+            CallSnapshot::version_for(snapshot.scope.as_deref(), snapshot.floor_format());
         assert_eq!(snapshot.version, SNAPSHOT_VERSION_SCOPED_FLOOR);
         let blob = snapshot.to_json().expect("serialize");
         assert_eq!(CallSnapshot::from_json(&blob).expect("parse"), snapshot);
@@ -855,6 +916,44 @@ mod tests {
             SnapshotError::Version {
                 found: SNAPSHOT_VERSION,
                 expected: SNAPSHOT_VERSION_FLOOR
+            }
+        ));
+    }
+
+    #[test]
+    fn an_mcvideo_floor_snapshot_round_trips_under_its_own_version() {
+        let mut snapshot = sample();
+        let mut leg = floor_leg();
+        leg.format = siphon_rtp_proto::ControlFormat::Mcvideo;
+        snapshot.far.floor = Some(leg);
+        snapshot.version = CallSnapshot::version_for(None, snapshot.floor_format());
+        assert_eq!(snapshot.version, SNAPSHOT_VERSION_VIDEO_FLOOR);
+        let blob = snapshot.to_json().expect("serialize");
+        assert_eq!(CallSnapshot::from_json(&blob).expect("parse"), snapshot);
+        snapshot.scope = Some("bgcf".into());
+        snapshot.version =
+            CallSnapshot::version_for(snapshot.scope.as_deref(), snapshot.floor_format());
+        assert_eq!(snapshot.version, SNAPSHOT_VERSION_SCOPED_VIDEO_FLOOR);
+        let blob = snapshot.to_json().expect("serialize");
+        assert_eq!(CallSnapshot::from_json(&blob).expect("parse"), snapshot);
+    }
+
+    /// A standby from before MCVideo reads [`SNAPSHOT_VERSION_FLOOR`] for every floor call and would
+    /// restore an MCVideo stream as MCPTT, re-offering the wrong token. Under its own version such a
+    /// standby refuses the blob; and this build refuses an MCVideo blob that claims the MCPTT version.
+    #[test]
+    fn an_mcvideo_floor_snapshot_is_not_readable_at_the_mcptt_floor_version() {
+        let mut snapshot = sample();
+        let mut leg = floor_leg();
+        leg.format = siphon_rtp_proto::ControlFormat::Mcvideo;
+        snapshot.near.floor = Some(leg);
+        snapshot.version = SNAPSHOT_VERSION_FLOOR;
+        let blob = snapshot.to_json().expect("serialize");
+        assert!(matches!(
+            CallSnapshot::from_json(&blob).expect_err("an MCVideo stream needs its version"),
+            SnapshotError::Version {
+                found: SNAPSHOT_VERSION_FLOOR,
+                expected: SNAPSHOT_VERSION_VIDEO_FLOOR
             }
         ));
     }

@@ -264,6 +264,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     image_remote: None,
                     floor: None,
                     floor_remote: None,
+                    floor_format: siphon_rtp_proto::ControlFormat::Mcptt,
                 };
                 let candidates = self.gather_leg_candidates(&leg, &config).await;
                 (candidates, Some(config))

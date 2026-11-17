@@ -117,7 +117,9 @@ async fn floor_request_is_an_event_frame_and_floor_granted_reaches_the_phone() {
     else {
         panic!("join refused: {response}");
     };
-    let engine_floor = sdp::parse_floor(&answer).expect("floor section").remote;
+    let engine_floor = sdp::parse_floor(&answer, &[siphon_rtp_proto::ControlFormat::Mcptt])
+        .expect("floor section")
+        .remote;
     let _keep_audio_alive = audio;
 
     floor

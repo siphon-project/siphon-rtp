@@ -217,6 +217,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 scope: FloorScope::Room(room_id.to_string()),
                 tag: from_tag.clone(),
                 events: self.app_event_queue(client),
+                label: crate::floor_channel::channel_label(profile),
             });
             self.dtls_bridge().attach_floor_channel(endpoint.id, plan);
             if !forward.attach_floor_channel(room_id, &from_tag, handle) {
@@ -257,6 +258,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             advertised_ip: transport.advertised,
                         },
                         profile.floor_fmtp.as_deref(),
+                        profile.control_formats(),
                     ),
                     None => rewritten,
                 };
@@ -298,7 +300,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         offer: &str,
         profile: &ProfileFlags,
     ) -> Result<Option<(Endpoint, FloorConfig)>, Box<CmdResult>> {
-        let Some(offered) = sdp::parse_floor(offer) else {
+        let Some(offered) = sdp::parse_floor(offer, profile.control_formats()) else {
             return Ok(None);
         };
         if siphon_rtp_datapath::AddressFamily::of(offered.remote.ip()) != transport.family {

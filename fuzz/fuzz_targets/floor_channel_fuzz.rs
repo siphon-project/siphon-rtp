@@ -43,6 +43,7 @@ fuzz_target!(|data: &[u8]| {
         scope: FloorScope::Room("fuzz".into()),
         tag: "seat".into(),
         events: Some(events.clone()),
+        label: FLOOR_CHANNEL_LABEL.into(),
     });
     let mut driver = ChannelDriver::new(DtlsRole::Server, plan);
     let mut browser = DataChannelHost::new(DtlsRole::Client);

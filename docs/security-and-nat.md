@@ -1248,7 +1248,12 @@ own copy of Layers 2–3. Layer 1 is where it differs, and that difference is th
 
 ### Layer 5h — The MCPTT floor-control stream of a forwarding-room seat
 A forwarding-room seat may offer `m=application <port> udp MCPTT` (3GPP TS 24.380 §14, SDP per
-TS 24.379). The engine anchors it on a **separate** `Redirect` endpoint per seat, because RTPBleed is
+TS 24.379), or the MCVideo transmission control stream, `m=application <port> udp MCVideo` (3GPP TS 24.581
+§4.3.3.1), which is the same surface under another token; everything below holds for both. Both tokens
+are always *recognised*, and `profile.transmission_control_formats` picks which are *accepted*
+(default `MCPTT`). A recognised section that is not accepted is declined with port 0 (RFC 3264 §6), so
+neither token is ever passed through to the other party with the offerer's own address. The engine
+anchors it on a **separate** `Redirect` endpoint per seat, because RTPBleed is
 per-stream and the floor stream is a full inbound surface that reaches the controller. The stream
 carries only RTCP APP packets (RFC 3550 §6.7). It is plain unless the controller keyed it (the SRTCP
 rule below); SRTP for the media control channel (TS 24.380 §13) is not implemented, so the answer

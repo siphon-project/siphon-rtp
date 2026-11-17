@@ -237,6 +237,27 @@ use another (TS 24.380 §8.1.2 wants the SSRC the receiving party learnt at sess
 
 The floor stream is plain in this build: media control security (TS 24.380 §13) is not negotiated.
 
+### MCVideo transmission control
+
+The MCVideo transmission control stream (3GPP TS 24.581 §4.3.3.1) has the same shape under another
+token: `m=application <rtcp port> udp MCVideo`, RTCP APP packets only. Accept it with
+`profile.transmission_control_formats`:
+
+```json
+{"command":"forward_join","conference_id":"group-1","from_tag":"a7c31f","sdp":"...",
+ "profile":{"transmission_control_formats":["MCVideo"],
+            "floor_fmtp":"mc_queueing;mc_priority=5;mc_granted;mc_transmission_ssrc=12345678"}}
+```
+
+The answer carries `m=application 30002 udp MCVideo` and `a=fmtp:MCVideo <floor_fmtp>`. Without the field
+only `MCPTT` is accepted, and an `MCVideo` section is declined with port 0 (never passed through). List
+both tokens to take either. `forward_offer` writes the first one listed. `rtcp_app` and `send_rtcp_app`
+work as for floor control, with `stream: "floor"`. The engine does not read the APP names (`MCV0`,
+`MCV1`, `MCV2`, TS 24.581 §9.1.2), the subtypes or the message set: they are yours, and two messages in
+one datagram (§9.1.1) are two events. A browser seat opens the data channel named by
+`profile.floor_channel_label` (default `mcptt-floor`). Check `node_info` `features` for
+`transmission_control` first.
+
 ### Inviting a browser into the group
 
 A browser can be a pre-arranged member the room calls, not only one that calls the room. Ask
@@ -316,7 +337,7 @@ acceptance in your own browser and controller is still yours.
 
 ### Two-party calls
 
-A two-party call carries the same stream. When the offerer's SDP has `m=application <port> udp MCPTT`,
+A two-party call carries the same stream (`udp MCVideo` under `transmission_control_formats`, as above). When the offerer's SDP has `m=application <port> udp MCPTT`,
 `offer` gives each side an engine endpoint for it: the offer B receives carries the far endpoint with
 `a=fmtp:MCPTT <profile.floor_fmtp>`, and when B answers with its own floor section the answer A receives
 carries the near endpoint, with the `floor_fmtp` of the `answer` command. `answer_local` terminates it
