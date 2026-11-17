@@ -576,6 +576,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             image_remote: None,
             floor: role_endpoint(EndpointRole::NearFloor),
             floor_remote: snapshot.near.floor.as_ref().and_then(|floor| floor.remote),
+            floor_format: snapshot
+                .near
+                .floor
+                .as_ref()
+                .map(|floor| floor.format)
+                .unwrap_or_default(),
         };
         let far = Leg {
             rtp: far_rtp,
@@ -593,6 +599,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             image_remote: None,
             floor: role_endpoint(EndpointRole::FarFloor),
             floor_remote: snapshot.far.floor.as_ref().and_then(|floor| floor.remote),
+            floor_format: snapshot
+                .far
+                .floor
+                .as_ref()
+                .map(|floor| floor.format)
+                .unwrap_or_default(),
         };
 
         // A floor stream is terminated here, not relayed: its endpoint redirects to the call-floor

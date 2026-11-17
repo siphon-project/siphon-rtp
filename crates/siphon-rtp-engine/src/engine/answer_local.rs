@@ -232,6 +232,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     image_remote: None,
                     floor: None,
                     floor_remote: None,
+                    floor_format: siphon_rtp_proto::ControlFormat::Mcptt,
                 },
                 // No B-facing leg, and never will be: this verb *is* the answer (see the allocation
                 // comment above). `answer` refuses to run on such a call rather than inventing one.
@@ -806,7 +807,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let mut endpoints: Vec<_> = near_endpoints.to_vec();
         // The MCPTT floor stream, if the offer carries one: terminated on an endpoint of its own.
         let local_floor = self
-            .anchor_local_floor(sdp, near_family, near_bind, &mut endpoints)
+            .anchor_local_floor(sdp, profile, near_family, near_bind, &mut endpoints)
             .await;
 
         // The answer goes back to the offerer and advertises the leg it was allocated for — the socket
@@ -852,20 +853,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     local_ufrag: credentials.ufrag.clone(),
                     local_pwd: credentials.pwd.clone(),
                 };
-                let leg = Leg {
-                    rtp: near_rtp,
-                    rtcp: near_rtcp,
-                    remote_rtp: None,
-                    remote_rtcp: None,
-                    advertised_ip: near_advertised,
-                    text: None,
-                    text_remote_rtp: None,
-                    // Neither a single-leg local answer nor a conference seat relays fax.
-                    image: None,
-                    image_remote: None,
-                    floor: None,
-                    floor_remote: None,
-                };
+                // Neither a single-leg local answer nor a conference seat relays text or fax.
+                let leg = Leg::audio_only(near_rtp, near_rtcp, near_advertised);
                 let candidates = self.gather_leg_candidates(&leg, &config).await;
                 (candidates, Some(config))
             }
@@ -949,7 +938,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The data channel's plan goes to the endpoint's DTLS driver before that driver is
         // registered (below, in `key_local_pipeline` or the takeover).
         if data_channel {
-            let plan = self.new_call_floor_channel(call_id, &floor_channel_tag, client);
+            let plan = self.new_call_floor_channel(call_id, &floor_channel_tag, client, profile);
             self.dtls_bridge().attach_floor_channel(near_rtp.id, plan);
         }
 

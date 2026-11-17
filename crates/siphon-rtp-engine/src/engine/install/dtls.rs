@@ -136,7 +136,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some(owner) = self.owned_call_internal(wiring.call_id, |call| call.owner) else {
             return;
         };
-        let plan = self.new_call_floor_channel(wiring.call_id, wiring.from_tag, owner);
+        let plan =
+            self.new_call_floor_channel(wiring.call_id, wiring.from_tag, owner, wiring.profile);
         self.dtls_bridge()
             .attach_floor_channel(wiring.near.rtp.id, plan);
     }

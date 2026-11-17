@@ -447,7 +447,9 @@ async fn the_floor_stream_of_a_dialled_out_seat_is_offered_anchored_and_delivers
         lines.contains(&format!("a=fmtp:MCPTT {FLOOR_FMTP}").as_str()),
         "the controller's parameters verbatim: {offer}"
     );
-    let engine_floor = sdp::parse_floor(&offer).expect("floor").remote;
+    let engine_floor = sdp::parse_floor(&offer, &[siphon_rtp_proto::ControlFormat::Mcptt])
+        .expect("floor")
+        .remote;
     let engine_audio = sdp::parse(&offer).expect("parse").remote_rtp;
     assert_ne!(engine_floor.port(), engine_audio.port());
 

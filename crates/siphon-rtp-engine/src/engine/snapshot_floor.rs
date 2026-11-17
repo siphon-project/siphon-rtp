@@ -142,6 +142,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             latched: state.latched,
             ssrc: state.ssrc,
             fmtp: floors.fmtp(call_id, tag),
+            format: floors.format(call_id, tag).unwrap_or_default(),
             keys: key_snapshots(&state.keys),
             send_index: state.send_index,
             received: state
@@ -181,6 +182,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 events: self.app_event_queue(client),
                 keys,
                 fmtp: snapshot.fmtp,
+                format: snapshot.format,
                 restore: Some(FloorRestore {
                     latched: snapshot.latched,
                     send_index,
@@ -209,6 +211,7 @@ mod tests {
             latched: None,
             ssrc: 7,
             fmtp: None,
+            format: siphon_rtp_proto::ControlFormat::Mcptt,
             keys: if keyed {
                 key_snapshots(&[FloorMasterKey {
                     mki: 3,

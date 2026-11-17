@@ -34,6 +34,7 @@ mod inject;
 mod install;
 mod intercept;
 mod key_mgmt;
+mod leg;
 mod media_started;
 mod negotiate;
 
@@ -261,6 +262,9 @@ struct Leg {
     /// and first destination of its floor leg. `None` until known (the far leg's arrives with its
     /// answer).
     floor_remote: Option<std::net::SocketAddr>,
+    /// The control format of this leg's floor stream (`MCPTT` or `MCVideo`), which the answerer
+    /// echoes (RFC 3264 §6). Meaningful only while `floor` is set.
+    floor_format: siphon_rtp_proto::ControlFormat,
 }
 
 impl Leg {
@@ -313,7 +317,7 @@ impl Leg {
     /// The decline is the load-bearing case. Leaving an unanchored section alone would present the
     /// party a fax address belonging to the *other* party — its own, often private, one — so the fax
     /// would either bypass the engine or go nowhere. Saying no is honest; saying nothing is not.
-    fn floor_rewrite<'a>(&self, fmtp: Option<&'a str>) -> sdp::FloorRewrite<'a> {
+    fn floor_rewrite<'a>(&'a self, fmtp: Option<&'a str>) -> sdp::FloorRewrite<'a> {
         match self.floor {
             Some(endpoint) => sdp::FloorRewrite::Anchor {
                 engine: EngineMedia {
@@ -322,6 +326,8 @@ impl Leg {
                     advertised_ip: self.advertised_ip,
                 },
                 fmtp,
+                // The leg's stream keeps the format it was set up with (RFC 3264 §6).
+                accepted: std::slice::from_ref(&self.floor_format),
             },
             None => sdp::FloorRewrite::Decline,
         }

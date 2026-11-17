@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use dashmap::DashMap;
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_media::rtcp::{self, AppWriteError};
-use siphon_rtp_proto::RtcpAppStream;
+use siphon_rtp_proto::{ControlFormat, RtcpAppStream};
 use siphon_rtp_srtp::srtcp_gcm::FloorMasterKey;
 
 use crate::app_events::{surface_app_to_queue, AppEventQueue, AppScope};
@@ -61,9 +61,13 @@ pub struct CallFloorLeg {
     /// Empty leaves the stream in the clear. The last protects what is sent, the newest two are
     /// accepted.
     pub keys: Vec<FloorMasterKey>,
-    /// The `a=fmtp:MCPTT` parameters the controller supplied for the stream, kept so a re-offer that
+    /// The `a=fmtp:<token>` parameters the controller supplied for the stream, kept so a re-offer that
     /// names none, and a standby restored from a checkpoint, present the same line.
     pub fmtp: Option<String>,
+    /// The format the stream was set up with (`MCPTT` or `MCVideo`), kept beside the fmtp so a
+    /// re-offer, and a standby restored from a checkpoint, keep it (RFC 3264 §6: an answer echoes the
+    /// offered format).
+    pub format: ControlFormat,
     /// What a standby resumes from a checkpoint; `None` for a leg that starts fresh.
     pub restore: Option<FloorRestore>,
 }
@@ -420,7 +424,7 @@ enum Input {
 pub struct CallFloorRegistry {
     routes: DashMap<EndpointId, ()>,
     /// (call, leg tag) to the leg's endpoint, for a send to name its target without a round trip.
-    by_leg: DashMap<(String, String), (EndpointId, Option<String>)>,
+    by_leg: DashMap<(String, String), (EndpointId, Option<String>, ControlFormat)>,
     /// The offerer's floor keys between its offer and the answer that registers its leg (the leg is
     /// registered only once the far party answers). Dropped with the call.
     offer_keys: DashMap<String, Vec<FloorMasterKey>>,
@@ -461,10 +465,11 @@ impl CallFloorRegistry {
     /// Add a leg and open its route. Datagrams for the endpoint are queued behind the registration,
     /// so none is seen by an actor that has not heard of the leg.
     pub fn register<D: Datapath + Clone + Send + 'static>(&self, datapath: &D, leg: CallFloorLeg) {
-        let (endpoint, key, fmtp) = (
+        let (endpoint, key, fmtp, format) = (
             leg.endpoint,
             (leg.call_id.clone(), leg.tag.clone()),
             leg.fmtp.clone(),
+            leg.format,
         );
         if self
             .mailbox(datapath)
@@ -477,7 +482,7 @@ impl CallFloorRegistry {
             );
             return;
         }
-        self.by_leg.insert(key, (endpoint, fmtp));
+        self.by_leg.insert(key, (endpoint, fmtp, format));
         self.routes.insert(endpoint, ());
     }
 
@@ -500,7 +505,7 @@ impl CallFloorRegistry {
     /// Forget every floor leg of `call_id`.
     pub fn deregister_call(&self, call_id: &str) {
         self.offer_keys.remove(call_id);
-        self.by_leg.retain(|(call, _), (endpoint, _)| {
+        self.by_leg.retain(|(call, _), (endpoint, _, _)| {
             let keep = call != call_id;
             if !keep {
                 self.routes.remove(endpoint);
@@ -519,7 +524,15 @@ impl CallFloorRegistry {
             .contains_key(&(call_id.to_string(), tag.to_string()))
     }
 
-    /// The `a=fmtp:MCPTT` parameters the controller supplied for the leg `tag` of `call_id`.
+    /// The control format the leg `tag` of `call_id` was set up with.
+    #[must_use]
+    pub fn format(&self, call_id: &str, tag: &str) -> Option<ControlFormat> {
+        self.by_leg
+            .get(&(call_id.to_string(), tag.to_string()))
+            .map(|entry| entry.2)
+    }
+
+    /// The `a=fmtp:<token>` parameters the controller supplied for the leg `tag` of `call_id`.
     #[must_use]
     pub fn fmtp(&self, call_id: &str, tag: &str) -> Option<String> {
         self.by_leg
@@ -691,6 +704,7 @@ mod tests {
             events: Some(events.clone()),
             keys: Vec::new(),
             fmtp: None,
+            format: ControlFormat::Mcptt,
             restore: None,
         }
     }

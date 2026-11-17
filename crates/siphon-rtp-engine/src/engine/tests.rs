@@ -70,6 +70,7 @@ mod stream_identity;
 mod tee_sendonly;
 mod tee_undecodable;
 mod transcode_offer;
+mod transmission_control;
 mod turn_client;
 mod turn_client_stream;
 mod webrtc_floor_channel;

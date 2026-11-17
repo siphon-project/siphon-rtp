@@ -216,6 +216,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             image_remote: None,
             floor: None,
             floor_remote: None,
+            floor_format: siphon_rtp_proto::ControlFormat::Mcptt,
         };
         let far_sdp =
             match far_offer_sdp(&offer_sdp, &info, &far, far_mux, &codec, profile, call_id) {

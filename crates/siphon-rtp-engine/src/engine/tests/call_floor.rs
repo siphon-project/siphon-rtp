@@ -115,10 +115,10 @@ async fn floor_call(
 ) -> (SocketAddr, SocketAddr, String, String) {
     let to_b = offer(engine, a, true).await;
     let to_a = answer(engine, b, true).await;
-    let toward_b = sdp::parse_floor(&to_b)
+    let toward_b = sdp::parse_floor(&to_b, &[siphon_rtp_proto::ControlFormat::Mcptt])
         .expect("floor in the offer to B")
         .remote;
-    let toward_a = sdp::parse_floor(&to_a)
+    let toward_a = sdp::parse_floor(&to_a, &[siphon_rtp_proto::ControlFormat::Mcptt])
         .expect("floor in the answer to A")
         .remote;
     (toward_a, toward_b, to_b, to_a)
@@ -336,7 +336,7 @@ async fn a_party_that_declines_the_floor_stream_is_not_served_it() {
     offer(&engine, &a, true).await;
     let to_a = answer(&engine, &b, false).await;
     assert!(
-        sdp::parse_floor(&to_a).is_none(),
+        sdp::parse_floor(&to_a, &[siphon_rtp_proto::ControlFormat::Mcptt]).is_none(),
         "A is not told a floor stream exists: {to_a}"
     );
     let result = send_to_leg(&engine, CALL, Some("tag-a"), RtcpAppStream::Floor, None).await;
@@ -365,7 +365,9 @@ async fn a_reoffer_keeps_the_floor_endpoint_and_delete_frees_it() {
         .await;
     let presented = ok_sdp_text(&reoffered);
     assert_eq!(
-        sdp::parse_floor(&presented).expect("floor kept").remote,
+        sdp::parse_floor(&presented, &[siphon_rtp_proto::ControlFormat::Mcptt])
+            .expect("floor kept")
+            .remote,
         toward_b,
         "B is shown the same engine floor endpoint"
     );
@@ -389,7 +391,11 @@ async fn a_reoffer_keeps_the_floor_endpoint_and_delete_frees_it() {
             },
         )
         .await;
-    assert!(sdp::parse_floor(&ok_sdp_text(&added)).is_none());
+    assert!(sdp::parse_floor(
+        &ok_sdp_text(&added),
+        &[siphon_rtp_proto::ControlFormat::Mcptt]
+    )
+    .is_none());
 
     assert!(matches!(
         engine
@@ -484,7 +490,9 @@ async fn a_single_leg_local_answer_terminates_the_floor_stream() {
         )
         .await;
     let answer = ok_sdp_text(&result);
-    let engine_floor = sdp::parse_floor(&answer).expect("floor answered").remote;
+    let engine_floor = sdp::parse_floor(&answer, &[siphon_rtp_proto::ControlFormat::Mcptt])
+        .expect("floor answered")
+        .remote;
     assert!(
         answer.contains(&format!("a=fmtp:MCPTT {FLOOR_FMTP}")),
         "{answer}"
@@ -596,7 +604,7 @@ async fn a_single_leg_local_answer_with_a_floor_stream_echoes_no_stream_identity
     let answer = ok_sdp_text(&result);
     assert_nothing_of_the_offerer(&answer);
     assert!(
-        sdp::parse_floor(&answer).is_some(),
+        sdp::parse_floor(&answer, &[siphon_rtp_proto::ControlFormat::Mcptt]).is_some(),
         "floor answered:\n{answer}"
     );
 }

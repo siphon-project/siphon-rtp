@@ -138,6 +138,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             image_remote: None,
             floor: None,
             floor_remote: None,
+            floor_format: siphon_rtp_proto::ControlFormat::Mcptt,
         };
         let candidates = self.gather_leg_candidates(&leg, &config).await;
         let fingerprint = sdp::Fingerprint {
@@ -197,6 +198,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ice_pending: bool,
         offered: OfferedWebrtc,
         answered: AnsweredWebrtc,
+        floor_label: String,
     ) -> Result<(), String> {
         let forward = self.conference.forward();
         if answered.data_channel {
@@ -204,6 +206,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 scope: FloorScope::Room(room_id.to_string()),
                 tag: from_tag.to_string(),
                 events: self.app_event_queue(client),
+                label: floor_label,
             });
             self.dtls_bridge().attach_floor_channel(endpoint.id, plan);
             if !forward.attach_floor_channel(room_id, from_tag, handle) {

@@ -134,9 +134,12 @@ async fn seat(engine: &Engine<UdpLoopbackDatapath>, tag: &str, keys: Vec<FloorKe
             },
         )
         .await;
-    let engine_floor = sdp::parse_floor(&ok_sdp_text(&answer))
-        .expect("floor section")
-        .remote;
+    let engine_floor = sdp::parse_floor(
+        &ok_sdp_text(&answer),
+        &[siphon_rtp_proto::ControlFormat::Mcptt],
+    )
+    .expect("floor section")
+    .remote;
     Phone {
         _audio: audio,
         floor,
@@ -498,8 +501,18 @@ async fn keyed_call(
             },
         )
         .await;
-    let toward_b = sdp::parse_floor(&ok_sdp_text(&to_b)).unwrap().remote;
-    let toward_a = sdp::parse_floor(&ok_sdp_text(&to_a)).unwrap().remote;
+    let toward_b = sdp::parse_floor(
+        &ok_sdp_text(&to_b),
+        &[siphon_rtp_proto::ControlFormat::Mcptt],
+    )
+    .unwrap()
+    .remote;
+    let toward_a = sdp::parse_floor(
+        &ok_sdp_text(&to_a),
+        &[siphon_rtp_proto::ControlFormat::Mcptt],
+    )
+    .unwrap()
+    .remote;
     (toward_a, toward_b)
 }
 
@@ -689,7 +702,12 @@ async fn a_single_leg_local_answer_and_an_engine_offered_seat_are_keyed_too() {
             },
         )
         .await;
-    let engine_floor = sdp::parse_floor(&ok_sdp_text(&answer)).unwrap().remote;
+    let engine_floor = sdp::parse_floor(
+        &ok_sdp_text(&answer),
+        &[siphon_rtp_proto::ControlFormat::Mcptt],
+    )
+    .unwrap()
+    .remote;
     let mut ue = phone_context(&keys);
     a.floor.send_to(&FLOOR_REQUEST, engine_floor).await.unwrap();
     a.floor
@@ -724,7 +742,11 @@ async fn a_single_leg_local_answer_and_an_engine_offered_seat_are_keyed_too() {
         )
         .await;
     assert!(
-        sdp::parse_floor(&ok_sdp_text(&offered)).is_some(),
+        sdp::parse_floor(
+            &ok_sdp_text(&offered),
+            &[siphon_rtp_proto::ControlFormat::Mcptt]
+        )
+        .is_some(),
         "{offered:?}"
     );
     let answered = engine
@@ -739,7 +761,12 @@ async fn a_single_leg_local_answer_and_an_engine_offered_seat_are_keyed_too() {
         )
         .await;
     assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
-    let engine_floor = sdp::parse_floor(&ok_sdp_text(&offered)).unwrap().remote;
+    let engine_floor = sdp::parse_floor(
+        &ok_sdp_text(&offered),
+        &[siphon_rtp_proto::ControlFormat::Mcptt],
+    )
+    .unwrap()
+    .remote;
     let mut ue = phone_context(&keys);
     floor.send_to(&FLOOR_REQUEST, engine_floor).await.unwrap();
     floor

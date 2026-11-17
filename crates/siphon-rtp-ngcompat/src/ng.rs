@@ -502,6 +502,8 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         floor_fmtp: None,
         floor_keys: vec![],
         key_mgmt: None,
+        transmission_control_formats: vec![],
+        floor_channel_label: None,
     }
 }
 

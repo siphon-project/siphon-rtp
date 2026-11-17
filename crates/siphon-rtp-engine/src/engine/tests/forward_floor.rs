@@ -87,7 +87,9 @@ async fn seat(engine: &Engine<UdpLoopbackDatapath>, tag: &str, fmtp: Option<&str
         .await;
     let answer = ok_sdp_text(&answer);
     let engine_audio = sdp::parse(&answer).expect("answer").remote_rtp;
-    let engine_floor = sdp::parse_floor(&answer).expect("floor section").remote;
+    let engine_floor = sdp::parse_floor(&answer, &[siphon_rtp_proto::ControlFormat::Mcptt])
+        .expect("floor section")
+        .remote;
     Phone {
         audio,
         floor,
@@ -604,7 +606,12 @@ async fn node_info_advertises_floor_control_and_statistics_count_dropped_app_eve
     let CmdResult::NodeInfo { node } = engine.handle(CLIENT, Command::NodeInfo).await else {
         panic!("node_info answers a node");
     };
-    for feature in ["mcptt_floor", "rtcp_app", "webrtc_floor_channel"] {
+    for feature in [
+        "mcptt_floor",
+        "transmission_control",
+        "rtcp_app",
+        "webrtc_floor_channel",
+    ] {
         assert!(
             node.features.iter().any(|name| name == feature),
             "{feature}"

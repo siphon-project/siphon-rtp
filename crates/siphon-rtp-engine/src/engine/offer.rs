@@ -789,6 +789,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             image_remote: None,
             floor: offer_floor.far,
             floor_remote: None,
+            floor_format: offer_floor.format,
         };
         let text_rewrite = match far_leg.text_anchor(far_text_local_crypto) {
             Some(anchor) => anchor,
@@ -942,17 +943,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag,
                 to_tag: None,
                 near: Leg {
-                    rtp: near_rtp,
-                    rtcp: near_rtcp,
                     remote_rtp: Some(info.remote_rtp),
                     remote_rtcp: Some(info.remote_rtcp),
-                    advertised_ip: near_advertised,
                     text: near_text_endpoint,
                     text_remote_rtp: anchored_text.map(|text| text.remote_rtp),
                     image: offer_image.near_image_endpoint,
                     image_remote: info.image.as_ref().map(|image| image.remote),
                     floor: offer_floor.near,
                     floor_remote: offer_floor.near_remote,
+                    floor_format: offer_floor.format,
+                    ..Leg::audio_only(near_rtp, near_rtcp, near_advertised)
                 },
                 // An offer always allocates a B-facing leg: a B side may still answer, and the offer
                 // being rewritten right here is what would be delivered to it.

@@ -78,6 +78,15 @@ pub(super) fn browser_offer(
 }
 
 async fn join(engine: &Engine<UdpLoopbackDatapath>, tag: &str, offer: String) -> CmdResult {
+    join_with(engine, tag, offer, ProfileFlags::default()).await
+}
+
+async fn join_with(
+    engine: &Engine<UdpLoopbackDatapath>,
+    tag: &str,
+    offer: String,
+    profile: ProfileFlags,
+) -> CmdResult {
     engine
         .handle(
             CLIENT,
@@ -86,7 +95,7 @@ async fn join(engine: &Engine<UdpLoopbackDatapath>, tag: &str, offer: String) ->
                 conference_id: ROOM.into(),
                 from_tag: tag.into(),
                 sdp: offer,
-                profile: ProfileFlags::default(),
+                profile,
             },
         )
         .await
@@ -242,6 +251,16 @@ async fn seat_browser(
     setup: &str,
     role: DtlsRole,
 ) -> Seated {
+    seat_browser_with(engine, tag, setup, role, ProfileFlags::default()).await
+}
+
+async fn seat_browser_with(
+    engine: &Engine<UdpLoopbackDatapath>,
+    tag: &str,
+    setup: &str,
+    role: DtlsRole,
+    profile: ProfileFlags,
+) -> Seated {
     let socket = Arc::new(
         UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -250,7 +269,7 @@ async fn seat_browser(
     let address = socket.local_addr().expect("addr");
     let certificate = DtlsCertificate::generate().expect("browser certificate");
     let offer = browser_offer(address, &certificate, setup, true);
-    let answer = ok_sdp_text(&join(engine, tag, offer).await);
+    let answer = ok_sdp_text(&join_with(engine, tag, offer, profile).await);
     let parsed = sdp::parse(&answer).expect("answer");
     let fingerprint = parsed.fingerprint.clone().expect("engine fingerprint");
     let browser = Browser::start(socket, parsed.remote_rtp, certificate, &fingerprint, role);
@@ -640,6 +659,49 @@ async fn a_channel_with_another_label_never_opens_the_floor() {
     );
     let refused = send_floor(&engine, "a", None).await;
     assert!(matches!(refused, CmdResult::Error { .. }), "{refused:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_label_opens_the_floor_and_the_default_label_no_longer_does() {
+    // `floor_channel_label` names the channel that carries transmission control (MCVideo or MCPTT).
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let app_events = engine.app_event_receiver(CLIENT).expect("queue");
+    let profile = ProfileFlags {
+        floor_channel_label: Some("mcvideo-transmission".into()),
+        ..ProfileFlags::default()
+    };
+    let seated = seat_browser_with(&engine, "a", "active", DtlsRole::Client, profile).await;
+    let browser = &seated.browser;
+    browser
+        .expect(|event| matches!(event, DataChannelEvent::Connected))
+        .await;
+    browser.order(Order::Open("mcptt-floor"));
+    browser
+        .expect(|event| matches!(event, DataChannelEvent::ChannelOpened { .. }))
+        .await;
+    browser.order(Order::Binary(FLOOR_REQUEST.to_vec()));
+    assert!(
+        tokio::time::timeout(NEGATIVE, app_events.recv_async())
+            .await
+            .is_err(),
+        "the default label is just another channel now"
+    );
+    assert!(matches!(
+        send_floor(&engine, "a", None).await,
+        CmdResult::Error { .. }
+    ));
+
+    browser.order(Order::Open("mcvideo-transmission"));
+    browser
+        .expect(|event| matches!(event, DataChannelEvent::ChannelOpened { .. }))
+        .await;
+    browser.order(Order::Binary(FLOOR_REQUEST.to_vec()));
+    assert!(matches!(next_app(&app_events).await, Event::RtcpApp { .. }));
+    assert!(matches!(
+        send_floor(&engine, "a", None).await,
+        CmdResult::Ok { .. }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

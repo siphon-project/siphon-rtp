@@ -168,9 +168,13 @@ pub struct FloorSnapshot {
     pub latched: Option<SocketAddr>,
     /// The SSRC the engine's floor packets carry toward this party (RFC 3550 §8.1).
     pub ssrc: u32,
-    /// The controller's `a=fmtp:MCPTT` parameters, verbatim.
+    /// The controller's `a=fmtp:<token>` parameters, verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmtp: Option<String>,
+    /// The control format the stream was set up with. Omitted for `MCPTT`, so a checkpoint written
+    /// before MCVideo existed reads back as MCPTT and an MCPTT stream writes the bytes it always did.
+    #[serde(default, skip_serializing_if = "is_mcptt")]
+    pub format: siphon_rtp_proto::ControlFormat,
     /// The SRTCP master keys in force, oldest first; empty for a stream in the clear. Secret
     /// material, hex-encoded like the SDES keys of a [`CryptoSnapshot`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -228,6 +232,11 @@ pub struct FloorReceivedSnapshot {
     pub mki: u32,
     /// The highest index that authenticated under it.
     pub index: u32,
+}
+
+/// `skip_serializing_if` predicate for the default control format.
+fn is_mcptt(format: &siphon_rtp_proto::ControlFormat) -> bool {
+    *format == siphon_rtp_proto::ControlFormat::Mcptt
 }
 
 /// `skip_serializing_if` predicate for a zero counter.
@@ -807,6 +816,7 @@ mod tests {
             latched: Some("198.51.100.1:5010".parse().unwrap()),
             ssrc: 0x1234_5678,
             fmtp: Some("mc_granted".into()),
+            format: siphon_rtp_proto::ControlFormat::Mcptt,
             keys: vec![FloorKeySnapshot {
                 mki: 9,
                 master_key_hex: to_hex(&[0x55; 16]),
@@ -825,6 +835,22 @@ mod tests {
         // An old blob, written before the field existed, parses with no floor.
         let parsed = CallSnapshot::from_json(&blob).expect("parse");
         assert!(!parsed.has_floor());
+    }
+
+    #[test]
+    fn the_control_format_is_omitted_for_mcptt_and_read_back_as_mcptt_from_an_old_blob() {
+        use siphon_rtp_proto::ControlFormat;
+        let mut leg = floor_leg();
+        let plain = serde_json::to_string(&leg).expect("serialize");
+        assert!(!plain.contains("format"), "{plain}");
+        // A checkpoint written before MCVideo existed has no `format`: it is MCPTT.
+        let old: FloorSnapshot = serde_json::from_str(&plain).expect("old blob");
+        assert_eq!(old.format, ControlFormat::Mcptt);
+        leg.format = ControlFormat::Mcvideo;
+        let video = serde_json::to_string(&leg).expect("serialize");
+        assert!(video.contains(r#""format":"MCVideo""#), "{video}");
+        let back: FloorSnapshot = serde_json::from_str(&video).expect("parse");
+        assert_eq!(back, leg);
     }
 
     #[test]

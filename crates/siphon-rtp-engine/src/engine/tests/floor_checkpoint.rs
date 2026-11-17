@@ -147,8 +147,12 @@ async fn set_up(
         .await;
     let (to_b, to_a) = (ok_sdp_text(&to_b), ok_sdp_text(&to_a));
     Call {
-        floor_toward_a: sdp::parse_floor(&to_a).unwrap().remote,
-        floor_toward_b: sdp::parse_floor(&to_b).unwrap().remote,
+        floor_toward_a: sdp::parse_floor(&to_a, &[siphon_rtp_proto::ControlFormat::Mcptt])
+            .unwrap()
+            .remote,
+        floor_toward_b: sdp::parse_floor(&to_b, &[siphon_rtp_proto::ControlFormat::Mcptt])
+            .unwrap()
+            .remote,
         audio_toward_a: sdp::parse(&to_a).unwrap(),
     }
 }

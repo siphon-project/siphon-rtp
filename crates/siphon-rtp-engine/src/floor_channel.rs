@@ -1,10 +1,12 @@
-//! MCPTT floor control over a WebRTC data channel, for a browser seat.
+//! MCPTT floor control (and MCVideo transmission control) over a WebRTC data channel, for a browser
+//! seat.
 //!
 //! A browser cannot send RTCP APP, so the floor control of a browser seat runs over a data channel
 //! instead. **3GPP TS 24.380 defines no WebRTC binding; this is siphon-rtp's own convention**, kept
 //! as small as possible:
 //!
-//! * the browser opens a data channel labelled [`FLOOR_CHANNEL_LABEL`] (`"mcptt-floor"`) on the SCTP
+//! * the browser opens a data channel labelled [`FLOOR_CHANNEL_LABEL`] (`"mcptt-floor"`, or the
+//!   profile's `floor_channel_label`) on the SCTP
 //!   association that rides the seat's DTLS association (RFC 8831, RFC 8261). The engine opens none
 //!   itself and accepts the channel the browser opens whatever its ordering and reliability;
 //! * one complete floor message is one **binary** message, encoded exactly as the RTCP APP packet
@@ -29,13 +31,23 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use siphon_rtp_dtls::{DataChannelEvent, DataChannelHost, DtlsRole, DtlsSession};
-use siphon_rtp_proto::RtcpAppStream;
+use siphon_rtp_proto::{ProfileFlags, RtcpAppStream};
 
 use crate::app_events::{surface_app_to_queue, AppEventQueue, AppScope};
 
-/// The label of the data channel that carries the floor (this crate's convention, see the module
-/// documentation).
+/// The default label of the data channel that carries the floor (this crate's convention, see the
+/// module documentation); a profile's `floor_channel_label` replaces it.
 pub const FLOOR_CHANNEL_LABEL: &str = "mcptt-floor";
+
+/// The label of the floor data channel a profile asks for: its `floor_channel_label`, else
+/// [`FLOOR_CHANNEL_LABEL`].
+#[must_use]
+pub fn channel_label(profile: &ProfileFlags) -> String {
+    profile
+        .floor_channel_label
+        .clone()
+        .unwrap_or_else(|| FLOOR_CHANNEL_LABEL.to_string())
+}
 
 /// Floor messages queued toward the driver before a send is refused. A floor message is a few dozen
 /// octets and the controller sends them at human pace, so this is a backstop, not a buffer.
@@ -106,6 +118,8 @@ pub struct FloorSink {
     pub tag: String,
     /// The `rtcp_app` queue of the controller that owns the party.
     pub events: Option<AppEventQueue>,
+    /// The label of the channel that is the floor channel; any other label is ignored.
+    pub label: String,
 }
 
 /// What the channel counted.
@@ -351,7 +365,7 @@ impl ChannelDriver {
         for event in events {
             match event {
                 DataChannelEvent::ChannelOpened { stream_id, label } => {
-                    if label == FLOOR_CHANNEL_LABEL && self.floor_stream.is_none() {
+                    if *label == self.plan.sink.label && self.floor_stream.is_none() {
                         self.floor_stream = Some(*stream_id);
                         self.plan.shared.open.store(true, Ordering::Release);
                         tracing::info!(
@@ -497,6 +511,18 @@ mod tests {
             scope: FloorScope::Room("room".into()),
             tag: "seat".into(),
             events: Some(queue.clone()),
+            label: FLOOR_CHANNEL_LABEL.into(),
+        });
+        (ChannelDriver::new(DtlsRole::Server, plan), handle, queue)
+    }
+
+    fn driver_with_label(label: &str) -> (ChannelDriver, FloorChannelHandle, AppEventQueue) {
+        let queue = AppEventQueue::new(16, Arc::new(Metrics::new()));
+        let (handle, plan) = floor_channel(FloorSink {
+            scope: FloorScope::Room("room".into()),
+            tag: "seat".into(),
+            events: Some(queue.clone()),
+            label: label.into(),
         });
         (ChannelDriver::new(DtlsRole::Server, plan), handle, queue)
     }
@@ -556,6 +582,7 @@ mod tests {
             scope: FloorScope::Call("call-1".into()),
             tag: "leg".into(),
             events: Some(queue.clone()),
+            label: FLOOR_CHANNEL_LABEL.into(),
         });
         let mut driver = ChannelDriver::new(DtlsRole::Server, plan);
         open(&mut driver, 0, FLOOR_CHANNEL_LABEL);
@@ -600,6 +627,44 @@ mod tests {
         driver.apply(&[message(true, &FLOOR_REQUEST)]);
         assert!(queue.is_empty());
         assert_eq!(handle.stats().other_channel_messages, 1);
+    }
+
+    #[test]
+    fn a_configured_label_opens_the_floor_and_carries_app_both_ways() {
+        let (mut driver, handle, queue) = driver_with_label("mcvideo-transmission");
+        open(&mut driver, 0, "mcvideo-transmission");
+        assert!(handle.is_open());
+        driver.apply(&[message(true, &FLOOR_REQUEST)]);
+        assert_eq!(queue.receiver().try_iter().count(), 1, "inbound APP raised");
+        let _pending =
+            submit_floor_message(&handle, 1, *b"MCV1", 3, &[0, 0, 0, 0]).expect("queued");
+        let queued = driver
+            .writer()
+            .expect("mailbox")
+            .try_recv()
+            .expect("queued")
+            .message;
+        assert_eq!(&queued[8..12], b"MCV1", "outbound APP framed");
+    }
+
+    #[test]
+    fn the_default_label_does_not_open_the_floor_when_another_is_configured() {
+        let (mut driver, handle, queue) = driver_with_label("mcvideo-transmission");
+        open(&mut driver, 0, FLOOR_CHANNEL_LABEL);
+        assert!(!handle.is_open());
+        driver.apply(&[message(true, &FLOOR_REQUEST)]);
+        assert!(queue.is_empty());
+        assert_eq!(handle.stats().other_channel_messages, 1);
+    }
+
+    #[test]
+    fn the_label_comes_from_the_profile_with_mcptt_floor_as_the_default() {
+        assert_eq!(channel_label(&ProfileFlags::default()), "mcptt-floor");
+        let profile = ProfileFlags {
+            floor_channel_label: Some("tc".into()),
+            ..Default::default()
+        };
+        assert_eq!(channel_label(&profile), "tc");
     }
 
     #[test]
