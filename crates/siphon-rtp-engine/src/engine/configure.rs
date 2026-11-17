@@ -375,7 +375,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     pub fn ws_tee_frames_sent(&self) -> u64 {
         self.ws_tees
             .iter()
-            .filter_map(|tee| tee.mixer.lock().ok().map(|mixer| mixer.forwarded()))
+            .filter_map(|tee| tee.counters.snapshot().0)
             .sum()
     }
 
@@ -385,7 +385,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     pub fn ws_tee_frames_dropped(&self) -> u64 {
         self.ws_tees
             .iter()
-            .filter_map(|tee| tee.mixer.lock().ok().map(|mixer| mixer.dropped()))
+            .filter_map(|tee| tee.counters.snapshot().1)
             .sum()
     }
 

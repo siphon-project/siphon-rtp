@@ -142,6 +142,7 @@ pub fn parse_command(request: &Value) -> Result<Command, NgError> {
             silence_ms: None,
             path: None,
             bitrate_bps: None,
+            additional_sources: Vec::new(),
         }),
         "stop recording" => Ok(Command::StopRecording {
             call_id: required_str(request, "call-id")?,
@@ -652,6 +653,7 @@ mod tests {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             }
         );
     }
@@ -681,6 +683,7 @@ mod tests {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             }
         );
     }

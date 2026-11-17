@@ -815,6 +815,7 @@ mod tests {
                     silence_ms: None,
                     path: None,
                     bitrate_bps: None,
+                    additional_sources: Vec::new(),
                 })
                 .await;
             let recording = control.response_to(recording, PROMPT).await;

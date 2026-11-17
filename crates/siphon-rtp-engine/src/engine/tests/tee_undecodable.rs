@@ -100,6 +100,7 @@ async fn attach_caller_tee(
                 direction: WsTeeDirection::Caller,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -394,6 +395,7 @@ async fn a_decoded_recording_on_a_relay_forwards_every_packet_byte_for_byte() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;

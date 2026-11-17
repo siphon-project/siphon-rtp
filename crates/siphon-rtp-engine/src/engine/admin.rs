@@ -229,6 +229,8 @@ fn build_features() -> Vec<String> {
         // call must not get — and a controller has no other way to tell, since the behaviour is the
         // engine's, not the contract crate's.
         "answer_local_direction".to_string(),
+        "record_multi_source".to_string(),
+        "ws_tee_multi_source".to_string(),
         // `conference_join`, `conference_offer` and `conference_seat` take `dtmf: "forward"`, and
         // `conference_route` can switch it live: the room regenerates that seat's RFC 4733
         // telephone-events toward every other seat, in each seat's own payload type and clock. A

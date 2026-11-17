@@ -19,6 +19,7 @@ fn start_stereo(call_id: &str, directory: &std::path::Path) -> Command {
         silence_ms: None,
         path: None,
         bitrate_bps: None,
+        additional_sources: Vec::new(),
     }
 }
 

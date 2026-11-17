@@ -267,6 +267,7 @@ async fn a_runtime_recording_keeps_recording_across_a_renegotiation() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -335,6 +336,7 @@ async fn stopping_one_recording_leaves_another_on_the_same_call_running() {
         silence_ms: None,
         path: Some(directory.path().join(name).to_string_lossy().into_owned()),
         bitrate_bps: None,
+        additional_sources: Vec::new(),
     };
     let id_of = |result: CmdResult| match result {
         CmdResult::Ok {

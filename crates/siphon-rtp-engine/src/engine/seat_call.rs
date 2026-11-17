@@ -519,7 +519,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 Some("a text stream (text_events)")
             }
         };
-        if self.x3_sessions.contains_key(call_id) {
+        if let Some(multi) = self.multi_source_attachment(call_id) {
+            Some(multi)
+        } else if self.x3_sessions.contains_key(call_id) {
             Some("a lawful interception (attach_x3)")
         } else if self.ws_tees.contains_key(call_id) {
             Some("a WebSocket tee (attach_ws_tee)")

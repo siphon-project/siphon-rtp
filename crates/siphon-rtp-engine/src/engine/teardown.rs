@@ -29,6 +29,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.drop_subscriptions(call_id).await;
             // …and any WS tee riding the same fan-out, so its transport closes and the controller
             // gets its `ws_tee_ended` rather than a silently dead stream.
+            self.end_multi_source_tees_for_call(call_id).await;
             self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
             // …and any decoded recording on it, **before** the media actor is deregistered. This is
             // what turns a hangup into a finished, playable file rather than a valid WAV declaring
@@ -286,6 +287,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.drop_subscriptions(call_id).await;
         // Any WS tee riding the same fan-out closes with the call, so its controller gets a final
         // `ws_tee_ended` (with the lifetime frame counters) rather than a silently dead stream.
+        self.end_multi_source_tees_for_call(call_id).await;
         self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
         // …and any decoded recording, while the media actor still holds its sinks. Detaching them is
         // what makes the writer finalize the header and emit `recording_finished` naming `call_ended`,

@@ -16,6 +16,7 @@
 //! (see the spec gotchas). Conversions write into caller-owned buffers (no per-frame heap alloc).
 
 pub mod audio;
+pub mod multi_source;
 pub mod protocol;
 pub mod session;
 pub mod taps;

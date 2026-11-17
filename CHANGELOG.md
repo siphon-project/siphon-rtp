@@ -9,6 +9,20 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **One recording or WebSocket tee fed by several calls (SIPREC).** `start_recording` and
+  `attach_ws_tee` take `additional_sources: [{call_id, from_tag}]`, so a recorder that answers each
+  recorded stream on a call of its own gets one file or one stream with a channel per source: 2 to 8
+  sources, stereo for exactly two (left source 0, right source 1), a saturating mono mix otherwise,
+  `wav` or `ogg_opus`. The sources share one 20 ms clock, so a source that starts late or goes quiet
+  stays aligned instead of sliding. Sources are identified by `call_id`, so every stream may share
+  one From-tag. One `recording_finished` or `ws_tee_ended` is emitted, naming source 0, and the
+  recording or tee ends with `call_ended` when any source call is deleted (the file is complete
+  before the event). Each source must be owned by the client and must be the audio its call
+  received (`direction: ingress`; `caller` or `both` for a tee). `node_info` lists
+  `record_multi_source` and `ws_tee_multi_source`. Adding a field to two command variants is a minor
+  bump of `siphon-rtp-proto` for Rust callers that construct them.
+- A recording on a call that answered a `sendonly` offer is covered by a test: it records what the
+  sender sends and sends nothing back.
 - **Media SRTCP keys for a `media: preserve` forwarding room.** 3GPP TS 33.180 §9.4.1 protects all
   RTCP, media RTCP included, hop by hop under each client's key (§9.4.2, §9.4.6; AEAD_AES_128_GCM,
   §9.4.8), while the media stays end to end (§5.2.1). A seat given `profile.media_srtcp_keys` (the

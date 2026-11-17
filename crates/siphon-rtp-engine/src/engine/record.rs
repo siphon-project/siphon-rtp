@@ -68,6 +68,8 @@ pub(super) struct AudioRecording {
     /// the file stays open, and dropped when the recording stops.
     /// Behind a mutex only because a sink is `Send` but not `Sync`, and the registry is shared.
     pub(super) parked: std::sync::Mutex<Vec<Box<dyn siphon_rtp_media::fanout::MediaSink>>>,
+    /// Several calls feeding this one recording (SIPREC); `call_id` is source 0.
+    pub(super) multi: Option<super::multi_source::MultiSourceFeed>,
 }
 
 /// What a call recording taps and into what, so its sinks can be rebuilt on another owner of the
@@ -140,33 +142,37 @@ impl AudioRecording {
 
     /// Whether this recording belongs to `call_id` — how an unnamed `stop_recording` (and a call
     /// teardown) finds every recording it must end.
-    fn call_id_matches(&self, call_id: &str) -> bool {
+    pub(super) fn call_id_matches(&self, call_id: &str) -> bool {
         self.call_id == call_id
+            || self
+                .multi
+                .as_ref()
+                .is_some_and(|multi| multi.involves(call_id))
     }
 }
 
 /// What a call recording's writer task needs to finish the file and report it.
-struct RecordingWriter {
-    owner: ClientId,
-    call_id: String,
-    from_tag: String,
-    to_tag: Option<String>,
-    recording_id: String,
-    path: std::path::PathBuf,
-    file: tokio::fs::File,
-    rate: u32,
-    channels: u8,
-    encoding: crate::recording::RecordingEncoding,
-    limits: crate::recording::RecordingLimits,
-    frames: flume::Receiver<Vec<u8>>,
-    recycle: flume::Sender<Vec<u8>>,
-    source_reason: Arc<std::sync::Mutex<RecordingEndReason>>,
+pub(super) struct RecordingWriter {
+    pub(super) owner: ClientId,
+    pub(super) call_id: String,
+    pub(super) from_tag: String,
+    pub(super) to_tag: Option<String>,
+    pub(super) recording_id: String,
+    pub(super) path: std::path::PathBuf,
+    pub(super) file: tokio::fs::File,
+    pub(super) rate: u32,
+    pub(super) channels: u8,
+    pub(super) encoding: crate::recording::RecordingEncoding,
+    pub(super) limits: crate::recording::RecordingLimits,
+    pub(super) frames: flume::Receiver<Vec<u8>>,
+    pub(super) recycle: flume::Sender<Vec<u8>>,
+    pub(super) source_reason: Arc<std::sync::Mutex<RecordingEndReason>>,
     /// `Some(final path)`: the file is being written at `path` (a `.partial` name) and is renamed
     /// over the final one once closed, **before** the event — so a consumer that watches the
     /// directory instead of the events never sees a half-written file under the real name. An
     /// empty one is removed and reported as [`RecordingEndReason::NoAudio`]. Used by the
     /// `record_call` streams; `start_recording` writes in place, as it always has.
-    rename_to: Option<std::path::PathBuf>,
+    pub(super) rename_to: Option<std::path::PathBuf>,
 }
 
 /// How a decoded recording stores its audio, as validated from the command.
@@ -184,7 +190,7 @@ const OPUS_INPUT_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
 
 impl DecodedFormat {
     /// The generated file name's extension: RFC 7845 §9 registers `.opus` for Ogg Opus.
-    fn extension(self) -> &'static str {
+    pub(super) fn extension(self) -> &'static str {
         match self {
             DecodedFormat::Wav => "wav",
             DecodedFormat::OggOpus { .. } => "opus",
@@ -193,7 +199,7 @@ impl DecodedFormat {
 
     /// Build the sink's encoding for a recording at `rate` with `channels`. Runs before anything on
     /// the call is touched, so a rate Opus cannot take fails the verb with the call as it was.
-    fn encoding(
+    pub(super) fn encoding(
         self,
         rate: u32,
         channels: u8,
@@ -466,6 +472,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     "stop_recording",
                     &format!("no recording {recording_id} is running on this call"),
                 );
+            }
+            if !self.owns_every_source(client, recording_id) {
+                return unknown_call(call_id);
             }
             self.stop_wav_recording(recording_id, RecordingEndReason::Stopped)
                 .await;
@@ -860,6 +869,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }),
                 seat: None,
                 parked: std::sync::Mutex::new(Vec::new()),
+                multi: None,
             },
         );
         Ok(())
@@ -1075,6 +1085,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }),
                 seat: None,
                 parked: std::sync::Mutex::new(Vec::new()),
+                multi: None,
             },
         );
         tracing::info!(
@@ -1102,7 +1113,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// The next recording id — also the tag on everything the recording attaches.
-    fn next_recording_id(&self) -> String {
+    pub(super) fn next_recording_id(&self) -> String {
         format!(
             "rec-{}",
             self.next_recording_id
@@ -1111,7 +1122,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Spawn the task that streams a call recording to disk and reports it finished.
-    fn spawn_recording_writer(&self, writer: RecordingWriter) -> tokio::task::JoinHandle<()> {
+    pub(super) fn spawn_recording_writer(
+        &self,
+        writer: RecordingWriter,
+    ) -> tokio::task::JoinHandle<()> {
         let events = self.event_sink(writer.owner);
         tokio::spawn(async move {
             let outcome = crate::recording::run_recorder(
@@ -1235,6 +1249,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some((_, mut recording)) = self.recordings.remove(recording_id) else {
             return;
         };
+        if recording.multi.is_some() {
+            return self
+                .stop_multi_source_recording(recording_id, recording, reason)
+                .await;
+        }
         // Sinks a seated leg carried (or parked when it left its room) are this recording's to
         // release: off the seat, out of the call, before the writer is awaited.
         if let Some((conference_id, tag)) = recording.seat.take() {
@@ -1367,7 +1386,7 @@ async fn settle_partial(
 
 /// Why a recording ended when nothing said otherwise. `CallEnded` is the truthful default: the
 /// sources went away and nobody asked them to.
-fn new_source_reason() -> Arc<std::sync::Mutex<RecordingEndReason>> {
+pub(super) fn new_source_reason() -> Arc<std::sync::Mutex<RecordingEndReason>> {
     Arc::new(std::sync::Mutex::new(RecordingEndReason::CallEnded))
 }
 
@@ -1377,7 +1396,7 @@ fn new_source_reason() -> Arc<std::sync::Mutex<RecordingEndReason>> {
 /// Opened up front, exactly as the pcap path does: a bad path must fail the verb with the call
 /// untouched — nothing promoted, no sink attached — rather than being reported minutes later as a
 /// `RecordingFinished{Error}` for a recording the controller believes is running.
-async fn open_recording_output(
+pub(super) async fn open_recording_output(
     call_id: &str,
     recording_id: &str,
     extension: &str,
@@ -1458,7 +1477,11 @@ pub(crate) const WRITER_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration
 /// (and on a serial control connection, every call's). The writer is never aborted, which would
 /// skip the finalize: past the bound it is left running, closes the file when its last sink goes
 /// (at the latest when the call's media is torn down), and sends `recording_finished` itself.
-async fn settle_writer(mut writer: tokio::task::JoinHandle<()>, call_id: &str, recording_id: &str) {
+pub(super) async fn settle_writer(
+    mut writer: tokio::task::JoinHandle<()>,
+    call_id: &str,
+    recording_id: &str,
+) {
     if tokio::time::timeout(WRITER_CLOSE_TIMEOUT, &mut writer)
         .await
         .is_ok()
