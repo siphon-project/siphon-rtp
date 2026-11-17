@@ -79,8 +79,8 @@ impl CeltDecoder {
         let end = self.end_band;
         let eff_end = start.max(end.min(NB_BANDS));
 
-        for c in 0..channels {
-            self.decode_mem[c].copy_within(n.., 0);
+        for history in self.decode_mem.iter_mut().take(channels) {
+            history.copy_within(n.., 0);
         }
         if self.prefilter_and_fold {
             self.prefilter_and_fold(n);

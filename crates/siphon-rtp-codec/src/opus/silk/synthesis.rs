@@ -593,8 +593,8 @@ mod tests {
         }
         let frame: Vec<i16> = (1000..1080).collect();
         update_output_history(&mut channel, &frame).expect("history");
-        for index in 0..80 {
-            assert_eq!(channel.out_buf[index], (index + 80) as i16);
+        for (index, &sample) in channel.out_buf.iter().enumerate().take(80) {
+            assert_eq!(sample, (index + 80) as i16);
         }
         assert_eq!(&channel.out_buf[80..160], &frame[..]);
     }

@@ -820,14 +820,12 @@ fn score_frame(
             i64::from(TOLERANCE_NLSF_Q15),
         );
     }
-    for half in 0..2usize {
+    for (half, coefficients) in analysis.control.prediction_coefficients.iter().enumerate() {
         let key = if half == 0 { "a0" } else { "a1" };
         for (position, &theirs) in pred.floats(key).iter().enumerate().take(order) {
             // The C stores Q12 coefficients scaled to floats; compare in the Q12 integer domain so
             // the tolerance is in units the decoder actually sees.
-            let ours_q12 = (f64::from(analysis.control.prediction_coefficients[half][position])
-                * 4096.0)
-                .round() as i64;
+            let ours_q12 = (f64::from(coefficients[position]) * 4096.0).round() as i64;
             let theirs_q12 = (theirs * 4096.0).round() as i64;
             tally.near_i64(
                 "NLSF",

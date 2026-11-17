@@ -653,8 +653,8 @@ impl SilkEncoder {
         // Bit order: per channel, one VAD flag per frame (MSB first), then the channel's LBRR flag.
         let mut flags = 0u32;
         for channel in self.channels.iter().take(channels) {
-            for frame in 0..layout.frames_per_packet {
-                flags = (flags << 1) | u32::from(channel.vad_flags[frame]);
+            for &vad_flag in channel.vad_flags.iter().take(layout.frames_per_packet) {
+                flags = (flags << 1) | u32::from(vad_flag);
             }
             flags = (flags << 1) | u32::from(channel.lbrr_flag);
         }
@@ -705,8 +705,13 @@ impl SilkEncoder {
         let mut any = false;
         for channel in self.channels.iter_mut().take(channels) {
             let mut symbol = 0usize;
-            for frame in 0..layout.frames_per_packet {
-                symbol |= usize::from(channel.lbrr_flags[frame]) << frame;
+            for (frame, &lbrr_flag) in channel
+                .lbrr_flags
+                .iter()
+                .enumerate()
+                .take(layout.frames_per_packet)
+            {
+                symbol |= usize::from(lbrr_flag) << frame;
             }
             // `LBRR_flag` is latched here, from what is about to be written, and read again when the
             // header flags are patched in — long after `lbrr_flags` has been reused.
