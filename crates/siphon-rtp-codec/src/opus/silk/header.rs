@@ -88,8 +88,8 @@ impl LpLayerHeader {
         // Pass 1: one VAD flag per SILK frame, then the global LBRR flag — for each channel in turn
         // (dec_API.c:231-236). Both are single bits with uniform probability (RFC 6716 Table 3).
         for channel in channels.iter_mut().take(channel_count) {
-            for frame_index in 0..frames_per_packet {
-                channel.vad_flags[frame_index] = decoder.dec_bit_logp(VAD_FLAG_LOG_PROBABILITY);
+            for vad_flag in channel.vad_flags.iter_mut().take(frames_per_packet) {
+                *vad_flag = decoder.dec_bit_logp(VAD_FLAG_LOG_PROBABILITY);
             }
             channel.lbrr_flag = decoder.dec_bit_logp(VAD_FLAG_LOG_PROBABILITY);
         }
@@ -115,8 +115,13 @@ impl LpLayerHeader {
             let symbol = decoder.dec_icdf(icdf, ICDF_FTB) + 1;
             // "the resulting 2- or 3-bit integer contains the corresponding LBRR flag for each
             // frame, packed in order from the LSB to the MSB" (RFC 6716 §4.2.4).
-            for frame_index in 0..frames_per_packet {
-                channel.lbrr_flags[frame_index] = (symbol >> frame_index) & 1 == 1;
+            for (frame_index, lbrr_flag) in channel
+                .lbrr_flags
+                .iter_mut()
+                .enumerate()
+                .take(frames_per_packet)
+            {
+                *lbrr_flag = (symbol >> frame_index) & 1 == 1;
             }
         }
 

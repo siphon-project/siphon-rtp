@@ -1029,8 +1029,8 @@ mod tests {
         let unpacked = unpack(codebook, 0);
         let mut symbols: Vec<(&[u8], usize)> =
             vec![(codebook.stage1_icdf(SignalType::Unvoiced.index()), 0)];
-        for coefficient in 0..codebook.order {
-            symbols.push((codebook.stage2_icdf(unpacked.pdf_index[coefficient]), 4));
+        for &pdf_index in unpacked.pdf_index.iter().take(codebook.order) {
+            symbols.push((codebook.stage2_icdf(pdf_index), 4));
         }
         // A sentinel the interpolation read would consume if it happened.
         symbols.push((&NLSF_INTERPOLATION_FACTOR_ICDF, 1));
@@ -1081,8 +1081,8 @@ mod tests {
         let unpacked = unpack(codebook, 4);
         let mut symbols: Vec<(&[u8], usize)> =
             vec![(codebook.stage1_icdf(SignalType::Voiced.index()), 4)];
-        for coefficient in 0..codebook.order {
-            symbols.push((codebook.stage2_icdf(unpacked.pdf_index[coefficient]), 5));
+        for &pdf_index in unpacked.pdf_index.iter().take(codebook.order) {
+            symbols.push((codebook.stage2_icdf(pdf_index), 5));
         }
         symbols.push((&NLSF_INTERPOLATION_FACTOR_ICDF, 4));
         let bytes = encode_symbols(&symbols);
