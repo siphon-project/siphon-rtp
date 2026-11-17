@@ -9,6 +9,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **A WebSocket bridge or tee whose peer stops reading now ends instead of stalling.** A write to a
+  peer that reads nothing blocks once the socket's send buffer is full, and nothing bounded it: a
+  takeover bridge stopped rendering audio to the caller and serving the engine's requests, a tee held
+  its frames, and the controller was never told. Every write is now bounded (`WS_WRITE_TIMEOUT`, 5 s);
+  past it the stream ends with `transport_error` in `ws_bridge_ended` / `ws_tee_ended`, so the
+  controller can re-point, detach or hang up.
 - **A control command no longer waits forever on a call's or a room's actor.** `play_media` (overlay),
   `stop_media`, `set_play_gain`, `play_dtmf`, the conference play verbs and the recording hand-overs
   asked the actor for an answer and awaited it with no bound. An actor that had ended while still

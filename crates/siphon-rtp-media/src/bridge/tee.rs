@@ -30,7 +30,7 @@
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -38,7 +38,9 @@ use tokio_tungstenite::WebSocketStream;
 use crate::bridge::audio::{MAX_FRAME_SAMPLES, MAX_PTIME_MS};
 use crate::bridge::pcm_to_l16_le;
 use crate::bridge::protocol::{ControlMessage, Direction, MediaFormat, StartData};
-use crate::bridge::ws::BridgeError;
+#[cfg(test)]
+use crate::bridge::ws::WS_WRITE_TIMEOUT;
+use crate::bridge::ws::{send_within, BridgeError};
 use crate::fanout::MediaSink;
 
 /// How many wire frames the tee buffers between the sink and the socket. Bounded: a stalled server
@@ -561,7 +563,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut sink, mut stream) = socket.split();
-    sink.send(Message::text(start.to_json()?)).await?;
+    send_within(&mut sink, Message::text(start.to_json()?)).await?;
 
     let reason = loop {
         tokio::select! {
@@ -577,7 +579,8 @@ where
             },
             received = frames.recv_async() => match received {
                 Ok(frame) => {
-                    let result = sink.send(Message::binary(Bytes::copy_from_slice(&frame))).await;
+                    let result =
+                        send_within(&mut sink, Message::binary(Bytes::copy_from_slice(&frame))).await;
                     // Recycle the pooled buffer whatever the send outcome, so the sink keeps its
                     // allocation-free steady state. A closed channel just drops it.
                     let _ = recycle.send(frame);
@@ -588,7 +591,8 @@ where
         }
     };
 
-    let _ = sink.send(Message::Close(None)).await;
+    // Bounded like every write: a consumer that stopped reading must not hold the ending tee.
+    let _ = send_within(&mut sink, Message::Close(None)).await;
     Ok(reason)
 }
 
@@ -598,6 +602,7 @@ mod tests {
     use crate::bridge::l16_le_to_pcm;
     use crate::bridge::protocol::{Encoding, Endianness, StopData};
     use crate::fanout::FanOut;
+    use futures_util::SinkExt;
     use std::time::Duration;
     use tokio::time::timeout;
     use tokio_tungstenite::tungstenite::protocol::Role;
@@ -1212,5 +1217,31 @@ mod tests {
             .expect("join")
             .expect("task");
         assert_eq!(outcome.expect("clean exit"), TeeEndReason::CallEnded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consumer_that_stops_reading_ends_the_tee_rather_than_stalling_it() {
+        // The consumer keeps its socket open and reads nothing, so every write eventually blocks.
+        // Blocked for good, the tee would hold its frames, its pooled buffers and its task until
+        // the call ended, and the controller would never hear that the stream died.
+        let (_client_io, server_io) = tokio::io::duplex(256);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let plan = plan_ws_tee(format(8000, 1), false, false);
+        let start = tee_start_message("tee-1", "call-1", plan.format, plan.tracks.clone());
+        let (frames_tx, frames_rx) = flume::bounded::<Vec<u8>>(64);
+        let (recycle_tx, _recycle_rx) = flume::unbounded::<Vec<u8>>();
+        let transport = tokio::spawn(run_ws_tee(server_ws, start, frames_rx, recycle_tx));
+        for _ in 0..32 {
+            let _ = frames_tx.try_send(vec![0u8; 640]);
+        }
+        let outcome = timeout(WS_WRITE_TIMEOUT + Duration::from_secs(3), transport)
+            .await
+            .expect("the tee ends by itself")
+            .expect("task");
+        assert!(
+            matches!(outcome, Err(BridgeError::WriteStalled)),
+            "a stalled consumer is a transport failure: {outcome:?}"
+        );
+        drop(frames_tx);
     }
 }
