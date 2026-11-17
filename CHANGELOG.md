@@ -15,6 +15,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   its frames, and the controller was never told. Every write is now bounded (`WS_WRITE_TIMEOUT`, 5 s);
   past it the stream ends with `transport_error` in `ws_bridge_ended` / `ws_tee_ended`, so the
   controller can re-point, detach or hang up.
+- **A control command no longer waits forever on a call's or a room's actor.** `play_media` (overlay),
+  `stop_media`, `set_play_gain`, `play_dtmf`, the conference play verbs and the recording hand-overs
+  asked the actor for an answer and awaited it with no bound. An actor that had ended while still
+  registered (a room ends itself when its last participant leaves; any actor can panic) left the
+  request in a queue the registry kept alive, so the answer never came and the control connection
+  stopped with it. The actor now empties its mailbox however it ends, a panic included, and every
+  such wait is bounded (`ACTOR_REPLY_TIMEOUT`, 2 s) and answered with an error past it.
 
 ## [0.19.1] — 2026-11-11
 

@@ -180,8 +180,8 @@ fn index_decode_allocates_nothing() {
     let length = {
         let mut encoder = RangeEncoder::new(&mut buffer);
         encoder.enc_icdf(12, codebook.stage1_icdf(SignalType::Voiced.index()), 8);
-        for coefficient in 0..codebook.order {
-            encoder.enc_icdf(6, codebook.stage2_icdf(unpacked.pdf_index[coefficient]), 8);
+        for &pdf_index in unpacked.pdf_index.iter().take(codebook.order) {
+            encoder.enc_icdf(6, codebook.stage2_icdf(pdf_index), 8);
         }
         encoder.enc_icdf(
             1,
@@ -227,8 +227,8 @@ fn the_decoder_entry_point_allocates_nothing_per_frame() {
     let length = {
         let mut encoder = RangeEncoder::new(&mut buffer);
         encoder.enc_icdf(8, codebook.stage1_icdf(SignalType::Unvoiced.index()), 8);
-        for coefficient in 0..codebook.order {
-            encoder.enc_icdf(4, codebook.stage2_icdf(unpacked.pdf_index[coefficient]), 8);
+        for &pdf_index in unpacked.pdf_index.iter().take(codebook.order) {
+            encoder.enc_icdf(4, codebook.stage2_icdf(pdf_index), 8);
         }
         encoder.enc_icdf(
             0,

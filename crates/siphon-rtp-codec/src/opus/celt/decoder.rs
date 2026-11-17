@@ -678,8 +678,8 @@ impl CeltDecoder {
         // samples, sliding the rest down so the IMDCT overlap-add + the comb post-filter's pitch
         // history line up for this frame. The moved count is exactly `DECODE_MEM_LEN - N`, i.e. the
         // whole tail `[N..]` → `[0..]`. Over **CC** channels — the ring is the caller's width.
-        for c in 0..channels {
-            self.decode_mem[c].copy_within(n.., 0);
+        for history in self.decode_mem.iter_mut().take(channels) {
+            history.copy_within(n.., 0);
         }
 
         // ── Band / PVQ decode (celt_decoder.c:1274) ──────────────────────────────────────────────
