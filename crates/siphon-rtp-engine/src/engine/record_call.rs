@@ -310,7 +310,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ) {
             return TakenRecordingTaps::default();
         }
-        let Ok(carried) = taken.await else {
+        // Bounded like every actor reply on the control path (`crate::mailbox`): an actor that does
+        // not answer keeps its sinks, and its recordings end with it.
+        let Ok(carried) = crate::mailbox::actor_reply(taken).await else {
             return TakenRecordingTaps::default();
         };
         // On a single-leg anchor the caller's audio is leg A's ingress and what the caller hears

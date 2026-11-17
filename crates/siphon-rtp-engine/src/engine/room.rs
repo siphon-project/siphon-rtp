@@ -727,7 +727,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ) {
             return error_result("conference_play", &"conference is no longer running");
         }
-        match receiver.await {
+        match crate::mailbox::actor_reply(receiver).await {
             Ok(Ok(())) => CmdResult::Ok {
                 sdp: None,
                 duration_ms,
@@ -737,9 +737,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 stats: None,
             },
             Ok(Err(error)) => error_result("conference_play", &error),
-            Err(_) => error_result(
+            Err(error) => error_result(
                 "conference_play",
-                &"conference actor closed before the playback started",
+                &format!("conference actor gave no answer ({error}) before the playback started"),
             ),
         }
     }
@@ -763,7 +763,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &format!("unknown conference: {conference_id}"),
             );
         }
-        match receiver.await {
+        match crate::mailbox::actor_reply(receiver).await {
             Ok(true) => ok_empty(),
             // An id that is not running is an error, not a hollow success: a controller that believes
             // it stopped a playback and did not has no way to notice.
@@ -774,7 +774,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ),
                 None => ok_empty(),
             },
-            Err(_) => error_result("conference_stop_play", &"conference actor closed"),
+            Err(error) => error_result(
+                "conference_stop_play",
+                &format!("conference actor gave no answer ({error})"),
+            ),
         }
     }
 
@@ -799,13 +802,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &format!("unknown conference: {conference_id}"),
             );
         }
-        match receiver.await {
+        match crate::mailbox::actor_reply(receiver).await {
             Ok(true) => ok_empty(),
             Ok(false) => error_result(
                 "conference_set_play_gain",
                 &format!("no playback {play_id} is running in this conference"),
             ),
-            Err(_) => error_result("conference_set_play_gain", &"conference actor closed"),
+            Err(error) => error_result(
+                "conference_set_play_gain",
+                &format!("conference actor gave no answer ({error})"),
+            ),
         }
     }
 

@@ -455,9 +455,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         {
             return Err("media actor unavailable".to_string());
         }
-        let attachments = carried
+        // Bounded (`crate::mailbox`): past the bound nothing was deregistered yet, so the call is
+        // left exactly as it was and the upgrade is refused.
+        let attachments = crate::mailbox::actor_reply(carried)
             .await
-            .map_err(|_| "media actor unavailable".to_string())?;
+            .map_err(|error| format!("media actor unavailable ({error})"))?;
         self.media.deregister(call_id);
         let rebuilt = match self.promote_to_processing(call_id, echo).await {
             Ok(()) => Ok(()),
