@@ -91,14 +91,14 @@ pub enum TeeEndReason {
 /// A bounded, drop-oldest FIFO of PCM samples for one tee channel. Preallocated: `push` and
 /// `read_into` are copy loops, so the hot path allocates nothing. (Same shape as the media pipeline's
 /// echo-reference ring — a stalled consumer must never pin stale audio or grow the buffer.)
-struct SampleRing {
+pub(super) struct SampleRing {
     buffer: Box<[i16]>,
     head: usize,
     length: usize,
 }
 
 impl SampleRing {
-    fn new(capacity: usize) -> Self {
+    pub(super) fn new(capacity: usize) -> Self {
         Self {
             buffer: vec![0i16; capacity.max(1)].into_boxed_slice(),
             head: 0,
@@ -108,7 +108,7 @@ impl SampleRing {
 
     /// Append `samples`, overwriting the oldest first once full (drop-oldest — keep the newest audio).
     /// Returns how many samples were dropped to make room.
-    fn push(&mut self, samples: &[i16]) -> usize {
+    pub(super) fn push(&mut self, samples: &[i16]) -> usize {
         let capacity = self.buffer.len();
         let mut dropped = 0;
         for &sample in samples {
@@ -126,7 +126,7 @@ impl SampleRing {
     }
 
     /// Drain exactly `out.len()` samples into `out` — the caller checks [`Self::len`] first.
-    fn read_into(&mut self, out: &mut [i16]) {
+    pub(super) fn read_into(&mut self, out: &mut [i16]) {
         let capacity = self.buffer.len();
         for slot in out.iter_mut() {
             *slot = self.buffer[self.head];
@@ -135,16 +135,16 @@ impl SampleRing {
         self.length -= out.len();
     }
 
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.length
     }
 
-    fn capacity(&self) -> usize {
+    pub(super) fn capacity(&self) -> usize {
         self.buffer.len()
     }
 
     /// Top the ring up to `count` samples with silence. A no-op once it already holds that many.
-    fn pad_to(&mut self, count: usize) {
+    pub(super) fn pad_to(&mut self, count: usize) {
         let capacity = self.buffer.len();
         while self.length < count.min(capacity) {
             let tail = (self.head + self.length) % capacity;

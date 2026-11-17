@@ -1272,6 +1272,7 @@ async fn record_start_stop(engine: &Engine<UdpLoopbackDatapath>, dir: &str, inde
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -1707,6 +1708,7 @@ async fn conference_seat_leave_delete(
                         silence_ms: None,
                         path: None,
                         bitrate_bps: None,
+                        additional_sources: Vec::new(),
                     },
                 )
                 .await,
@@ -1856,6 +1858,7 @@ async fn ws_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &str, i
                     direction: WsTeeDirection::Both,
                     channels: Some(2),
                     sample_rate: None,
+                    additional_sources: Vec::new(),
                 },
             )
             .await,
@@ -2082,6 +2085,7 @@ async fn recording_handover_cycle(
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -2233,6 +2237,7 @@ async fn bridged_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &s
                     direction: WsTeeDirection::Both,
                     channels: Some(2),
                     sample_rate: None,
+                    additional_sources: Vec::new(),
                 },
             )
             .await,
@@ -2314,6 +2319,7 @@ async fn bridged_recording_start_stop(
                 silence_ms: None,
                 path: Some(path.to_string()),
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -2737,6 +2743,234 @@ async fn dtls_offerer_relay_does_not_leak() {
             engine.session_count(),
             0,
             "registry drained after every segment"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
+/// A SIPREC stream's offer: sendonly (RFC 3264 §6.1), so the engine answers recvonly.
+fn sendonly_sdp(host: &str, port: u16) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {host}\r\ns=-\r\nc=IN IP4 {host}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendonly\r\na=rtcp-mux\r\n"
+    )
+}
+
+/// Two SIPREC streams answered as `answer_local` calls sharing one From-tag, the way a recorder
+/// sees one session.
+async fn answer_two_streams(engine: &Engine<UdpLoopbackDatapath>, index: usize) -> [String; 2] {
+    let ids = [
+        format!("multi-soak-{index}~0"),
+        format!("multi-soak-{index}~1"),
+    ];
+    for (offset, call_id) in ids.iter().enumerate() {
+        assert_ok(
+            &engine
+                .handle(
+                    CLIENT,
+                    Command::AnswerLocal {
+                        call_id: call_id.clone(),
+                        from_tag: "siprec-session".into(),
+                        sdp: sendonly_sdp("198.51.100.1", 40_000 + offset as u16),
+                        profile: Default::default(),
+                    },
+                )
+                .await,
+            "answer_local",
+        );
+    }
+    ids
+}
+
+async fn delete_call(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) {
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: call_id.to_string(),
+                    from_tag: "siprec-session".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+/// One multi-source recording cycle: two streams, one stereo recording over both, ended by an
+/// explicit stop on even cycles and by deleting a source call on odd ones, then the rest deleted.
+async fn multi_source_recording_cycle(
+    engine: &Engine<UdpLoopbackDatapath>,
+    dir: &str,
+    index: usize,
+) {
+    let ids = answer_two_streams(engine, index).await;
+    let started = engine
+        .handle(
+            CLIENT,
+            Command::StartRecording {
+                call_id: ids[0].clone(),
+                from_tag: "siprec-session".into(),
+                recording_dir: Some(dir.to_string()),
+                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                direction: None,
+                channels: Some(siphon_rtp_proto::RecordingChannels::Stereo),
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
+                bitrate_bps: None,
+                additional_sources: vec![siphon_rtp_proto::RecordingSource {
+                    call_id: ids[1].clone(),
+                    from_tag: "siprec-session".into(),
+                }],
+            },
+        )
+        .await;
+    assert_ok(&started, "multi-source start_recording");
+    if index.is_multiple_of(2) {
+        assert_ok(
+            &engine
+                .handle(
+                    CLIENT,
+                    Command::StopRecording {
+                        call_id: ids[0].clone(),
+                        from_tag: "siprec-session".into(),
+                        recording_id: None,
+                    },
+                )
+                .await,
+            "stop_recording",
+        );
+    } else {
+        delete_call(engine, &ids[1]).await;
+    }
+    for call_id in &ids {
+        // A call already deleted answers unknown_call, which is fine here.
+        let _ = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: call_id.clone(),
+                    from_tag: "siprec-session".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_source_recording_start_end_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_string_lossy().into_owned();
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    // Each cycle stands up two promoted calls, a mixer task, a writer task and a file, then ends all
+    // of it through either door. Nothing may outlive the cycle: not a mixer, a source queue, a sink,
+    // a hold or the recording's registry entry.
+    let mut gate = LeakGate::new("multi-source recording", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            multi_source_recording_cycle(&engine, &path, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(
+            engine.recording_count(),
+            0,
+            "recording registry drained after every segment"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
+/// One multi-source tee cycle: two streams, one tee over both, ended by detaching on even cycles and
+/// by deleting a source call on odd ones.
+async fn multi_source_tee_cycle(engine: &Engine<UdpLoopbackDatapath>, uri: &str, index: usize) {
+    let ids = answer_two_streams(engine, index).await;
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: ids[0].clone(),
+                    from_tag: "siprec-session".into(),
+                    ws_uri: uri.to_string(),
+                    direction: WsTeeDirection::Caller,
+                    channels: Some(2),
+                    sample_rate: None,
+                    additional_sources: vec![siphon_rtp_proto::RecordingSource {
+                        call_id: ids[1].clone(),
+                        from_tag: "siprec-session".into(),
+                    }],
+                },
+            )
+            .await,
+        "multi-source attach_ws_tee",
+    );
+    if index.is_multiple_of(2) {
+        assert_ok(
+            &engine
+                .handle(
+                    CLIENT,
+                    Command::DetachWsTee {
+                        call_id: ids[0].clone(),
+                        from_tag: "siprec-session".into(),
+                    },
+                )
+                .await,
+            "detach_ws_tee",
+        );
+    } else {
+        delete_call(engine, &ids[1]).await;
+    }
+    for call_id in &ids {
+        let _ = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: call_id.clone(),
+                    from_tag: "siprec-session".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_source_ws_tee_attach_end_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let (uri, live) = tee_sink_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    let mut gate = LeakGate::new("multi-source ws tee", 100, 40).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            multi_source_tee_cycle(&engine, &uri, index).await;
+            index += 1;
+        }
+        drain_tee_server(&live).await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(
+            engine.ws_tee_count(),
+            0,
+            "tee registry drained after every segment"
         );
         gate.sample().await;
     }

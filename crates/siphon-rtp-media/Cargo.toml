@@ -27,6 +27,7 @@ futures-util = { workspace = true }
 flume = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 proptest = { workspace = true }
 iai-callgrind = { workspace = true }
@@ -47,6 +48,10 @@ harness = false
 
 [[bench]]
 name = "mixer_bench"
+harness = false
+
+[[bench]]
+name = "multi_source_bench"
 harness = false
 
 [[bench]]

@@ -23,6 +23,7 @@ fn start_recording(
         silence_ms: None,
         path: None,
         bitrate_bps: None,
+        additional_sources: Vec::new(),
     }
 }
 

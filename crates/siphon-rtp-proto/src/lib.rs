@@ -145,27 +145,6 @@ const _: () = assert!(ECHO_DELAY_SEARCH_MS_MIN < ECHO_DELAY_SEARCH_MS_MAX);
 /// See the assert above.
 const _: () = assert!(ECHO_LONG_TAIL_MS_MIN < ECHO_LONG_TAIL_MS_MAX);
 
-/// Smallest [`Command::StartRecording`] `bitrate_bps` the engine accepts for an
-/// [`RecordingFormat::OggOpus`] recording: the bottom of Opus' own range (RFC 6716 §2.1.1).
-///
-/// Exported for the same reason as the echo bounds: a controller validating at config load must
-/// read the engine's range, not restate it.
-pub const RECORDING_OPUS_BITRATE_BPS_MIN: u32 = 6_000;
-/// Largest [`Command::StartRecording`] `bitrate_bps` the engine accepts: the top of Opus' range
-/// (RFC 6716 §2.1.1). See [`RECORDING_OPUS_BITRATE_BPS_MIN`].
-pub const RECORDING_OPUS_BITRATE_BPS_MAX: u32 = 510_000;
-/// The bitrate an [`RecordingFormat::OggOpus`] recording gets per channel when `bitrate_bps` is
-/// absent: 16 kbit/s for mono, 32 kbit/s for stereo. Transparent for narrowband speech and
-/// comfortable for wideband.
-pub const RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT: u32 = 16_000;
-
-/// See the echo-bound asserts above.
-const _: () = assert!(RECORDING_OPUS_BITRATE_BPS_MIN < RECORDING_OPUS_BITRATE_BPS_MAX);
-const _: () = assert!(
-    RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT >= RECORDING_OPUS_BITRATE_BPS_MIN
-        && 2 * RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT <= RECORDING_OPUS_BITRATE_BPS_MAX
-);
-
 /// serde `default` for a `bool` field that should default to `true`.
 fn default_true() -> bool {
     true
@@ -567,6 +546,21 @@ pub enum Command {
         /// asked for a bitrate has not got the artefact it thinks it has.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bitrate_bps: Option<u32>,
+        /// More calls feeding this one recording (SIPREC, RFC 7866: one recorded stream per
+        /// `answer_local` call). `call_id` / `from_tag` above are source 0 (channel 0, and the call
+        /// the verb, the `recording_id`'s owner and every event are addressed to); each entry adds
+        /// the next channel in order. Empty (the default, and omitted from the wire) is an ordinary
+        /// one-call recording.
+        ///
+        /// With sources the total (`1 + additional_sources.len()`) is 2 to
+        /// [`MAX_RECORDING_SOURCES`]; `channels = stereo` needs exactly 2 (left is source 0, right
+        /// is source 1) and mono sums them all, saturating. Each source contributes the audio its
+        /// call *received*, so `direction` must be `ingress` (or absent); `egress`, `both` and
+        /// `format = pcap` are refused. Every source call must be owned by the requesting client.
+        /// The recording ends, once and with [`RecordingEndReason::CallEnded`], when any source call
+        /// ends.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        additional_sources: Vec<RecordingSource>,
     },
     /// Stop a runtime recording started with [`Command::StartRecording`] (rtpengine
     /// `stop recording`): finalize the file and demote the relay back to the fast path if nothing
@@ -915,6 +909,17 @@ pub enum Command {
         /// event's `sample_rate` report.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sample_rate: Option<u32>,
+        /// More calls feeding this one tee (SIPREC: one stream per `answer_local` call), with the
+        /// same shape as `StartRecording`'s `additional_sources`: `call_id` / `from_tag` are
+        /// source 0 (the call the tee is keyed on and `detach_ws_tee` is addressed to), each entry adds
+        /// the next channel. Total 2 to [`MAX_RECORDING_SOURCES`]; `channels = 2` needs exactly 2
+        /// sources (left source 0, right source 1) and `1` (or absent with more than 2 sources)
+        /// mixes them. Each source contributes what its call received, so `direction` must be
+        /// `caller` or `both` (a source call has no callee leg to stream; `callee` is refused). No
+        /// source may already carry a tee. The tee ends, once and with `call_ended`, when any
+        /// source call ends.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        additional_sources: Vec<RecordingSource>,
     },
     /// Detach the WebSocket tee from a call, closing its stream. Idempotent: detaching a call with no
     /// tee is not an error.
@@ -1294,89 +1299,6 @@ pub enum BridgeDirection {
     AToB,
     /// Only room B's participants are heard in room A.
     BToA,
-}
-
-/// What [`Command::StartRecording`] writes.
-///
-/// Deliberately **not** `#[non_exhaustive]`: a controller that asks for a format the engine answers
-/// with something else has been silently given a different artefact, and the two here are not
-/// substitutes — one is raw wire bytes for an audit, the others decoded audio for a person to
-/// listen to. Losing compilation on a new format is the feature, and so is an engine that predates
-/// a format refusing it: an unknown variant fails to deserialize, so the command fails instead of
-/// falling back to the default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordingFormat {
-    /// Raw RTP/RTCP datagrams, verbatim, in a `.pcap`. The historical behaviour and the default.
-    #[default]
-    Pcap,
-    /// Decoded 16-bit linear PCM, streamed to a RIFF/WAVE file as it arrives.
-    Wav,
-    /// The same decoded audio, Opus-encoded into an Ogg file (RFC 7845) as it arrives. On the wire
-    /// as `"ogg_opus"`; a generated file name ends `.opus`.
-    OggOpus,
-}
-
-/// Which audio a decoded ([`RecordingFormat::Wav`] or [`RecordingFormat::OggOpus`]) recording
-/// captures.
-///
-/// "Ingress" and "egress" are relative to the **engine**: ingress is what the parties sent *to* it
-/// (a voicemail message, a call recording), egress is what the engine sent *to* them (its prompts,
-/// an injected announcement, the mixed audio a party heard).
-///
-/// Exhaustive for the same reason as [`RecordingFormat`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordingDirection {
-    /// What the parties sent. On a two-party call this is both legs' inbound audio; on a single-leg
-    /// (`answer_local`) call it is the caller's. The default, and what a voicemail needs.
-    #[default]
-    Ingress,
-    /// What the engine sent to the parties — prompts, announcements, the conference mix it produced.
-    Egress,
-    /// Both, which on a mono recording is the two summed and on a stereo one is the two separated.
-    Both,
-}
-
-/// Whether a decoded recording is one mixed track or two separated ones.
-///
-/// Exhaustive for the same reason as [`RecordingFormat`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordingChannels {
-    /// One track. Sources selected by [`RecordingDirection`] are summed (saturating).
-    #[default]
-    Mono,
-    /// Two tracks, interleaved: the caller's audio left, the other side right. Needs two sources
-    /// ([`RecordingDirection::Both`] on a single-leg call, or two parties). On a single-leg call the
-    /// right channel is what the caller heard: the engine's prompts, or the voice bot that has taken
-    /// the leg over. With one source the recording is mono whatever is asked for.
-    Stereo,
-}
-
-/// How a decoded recording ended ([`Event::RecordingFinished`]).
-///
-/// `#[non_exhaustive]`: engine-emitted and informational. A consumer that does not recognise a reason
-/// still has the finished file, which is the part it acts on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum RecordingEndReason {
-    /// Ended by [`Command::StopRecording`].
-    Stopped,
-    /// The `max_duration_ms` limit was reached.
-    MaxDuration,
-    /// `silence_ms` elapsed with no speech.
-    Silence,
-    /// The call ended (hangup, `delete`, or a media timeout) while the recording was running.
-    CallEnded,
-    /// The recording aborted — a write failed, or the file could not be finalized. The file may be
-    /// truncated or missing; its `duration_ms` is what had been written when the error hit.
-    Error,
-    /// The recorded party never sent audio, so no file was kept: `path` is absent and `duration_ms`
-    /// is 0. Reported by a `record_call` stream (one per party), so a consumer waiting on every
-    /// party's file can tell "this one will never come" from "still being written".
-    NoAudio,
 }
 
 /// How many times a [`Command::PlayMedia`] plays its source.
@@ -2737,9 +2659,15 @@ pub mod frame {
 
 mod base64;
 mod floor_key;
+mod recording;
 use floor_key::deserialize_floor_keys;
 pub use floor_key::{
     FloorKey, FloorKeyError, FLOOR_KEY_LEN, FLOOR_SALT_LEN, FLOOR_SALT_LEN_LONG, MAX_FLOOR_KEYS,
+};
+pub use recording::{
+    RecordingChannels, RecordingDirection, RecordingEndReason, RecordingFormat, RecordingSource,
+    MAX_RECORDING_SOURCES, RECORDING_OPUS_BITRATE_BPS_MAX, RECORDING_OPUS_BITRATE_BPS_MIN,
+    RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT,
 };
 pub mod scope;
 pub mod vq_rtcpxr;
@@ -2799,11 +2727,82 @@ mod tests {
             silence_ms: None,
             path: None,
             bitrate_bps: None,
+            additional_sources: Vec::new(),
         };
         assert_eq!(
             serde_json::to_string(&command).expect("serialize"),
             r#"{"command":"start_recording","call_id":"c1","from_tag":"t1","format":"wav"}"#
         );
+    }
+
+    #[test]
+    fn a_multi_source_recording_names_its_extra_calls_in_order() {
+        let wire = concat!(
+            r#"{"command":"start_recording","call_id":"c1","from_tag":"t1","format":"wav","#,
+            r#""channels":"stereo","additional_sources":[{"call_id":"c2","from_tag":"t2"}]}"#
+        );
+        let command: Command = serde_json::from_str(wire).expect("deserialize");
+        let Command::StartRecording {
+            additional_sources, ..
+        } = &command
+        else {
+            panic!("not a start_recording: {command:?}");
+        };
+        assert_eq!(
+            additional_sources,
+            &[RecordingSource {
+                call_id: "c2".into(),
+                from_tag: "t2".into()
+            }]
+        );
+        assert_eq!(serde_json::to_string(&command).expect("serialize"), wire);
+    }
+
+    #[test]
+    fn a_recording_without_extra_sources_keeps_its_old_wire_shape() {
+        // An older controller's frame has no `additional_sources`, and a one-call recording must not
+        // grow one on the wire.
+        let wire = r#"{"command":"start_recording","call_id":"c1","from_tag":"t1","format":"wav"}"#;
+        let command: Command = serde_json::from_str(wire).expect("deserialize");
+        let Command::StartRecording {
+            additional_sources, ..
+        } = &command
+        else {
+            panic!("not a start_recording: {command:?}");
+        };
+        assert!(additional_sources.is_empty());
+        assert_eq!(serde_json::to_string(&command).expect("serialize"), wire);
+    }
+
+    #[test]
+    fn a_multi_source_tee_round_trips_and_an_old_attach_still_parses() {
+        let wire = concat!(
+            r#"{"command":"attach_ws_tee","call_id":"c1","from_tag":"t1","ws_uri":"ws://192.0.2.1/tee","#,
+            r#""direction":"caller","channels":2,"additional_sources":"#,
+            r#"[{"call_id":"c2","from_tag":"t2"}]}"#
+        );
+        let command: Command = serde_json::from_str(wire).expect("deserialize");
+        let Command::AttachWsTee {
+            additional_sources, ..
+        } = &command
+        else {
+            panic!("not an attach_ws_tee: {command:?}");
+        };
+        assert_eq!(additional_sources.len(), 1);
+        assert_eq!(serde_json::to_string(&command).expect("serialize"), wire);
+
+        let old = r#"{"command":"attach_ws_tee","call_id":"c1","from_tag":"t1","ws_uri":"ws://192.0.2.1/tee"}"#;
+        let command: Command = serde_json::from_str(old).expect("deserialize");
+        let Command::AttachWsTee {
+            additional_sources, ..
+        } = &command
+        else {
+            panic!("not an attach_ws_tee: {command:?}");
+        };
+        assert!(additional_sources.is_empty());
+        assert!(!serde_json::to_string(&command)
+            .expect("serialize")
+            .contains("additional_sources"));
     }
 
     #[test]
@@ -3061,6 +3060,7 @@ mod tests {
                 direction,
                 channels,
                 sample_rate,
+                additional_sources: _,
             } => {
                 assert_eq!(call_id, "c");
                 assert_eq!(from_tag, "f");
@@ -3079,6 +3079,7 @@ mod tests {
             direction: WsTeeDirection::Caller,
             channels: Some(1),
             sample_rate: None,
+            additional_sources: Vec::new(),
         };
         let value = serde_json::to_value(&explicit).expect("to_value");
         assert_eq!(value["command"], "attach_ws_tee");
@@ -3145,6 +3146,7 @@ mod tests {
             direction: WsTeeDirection::Both,
             channels: None,
             sample_rate: None,
+            additional_sources: Vec::new(),
         };
         let value = serde_json::to_value(&attach).expect("to_value");
         assert!(
@@ -3195,6 +3197,7 @@ mod tests {
             direction: WsTeeDirection::Caller,
             channels: Some(1),
             sample_rate: Some(16_000),
+            additional_sources: Vec::new(),
         };
         let value = serde_json::to_value(&attach).expect("to_value");
         assert_eq!(value["sample_rate"], 16_000);

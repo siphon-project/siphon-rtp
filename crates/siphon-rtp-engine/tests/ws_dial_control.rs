@@ -179,6 +179,7 @@ fn attach_tee(call_id: &str, ws_uri: String) -> Command {
         direction: WsTeeDirection::Both,
         channels: None,
         sample_rate: None,
+        additional_sources: Vec::new(),
     }
 }
 

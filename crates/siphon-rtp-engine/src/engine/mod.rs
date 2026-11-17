@@ -39,6 +39,7 @@ mod media_started;
 mod negotiate;
 
 pub(crate) use media_started::MEDIA_STARTED_POLL_MS;
+mod multi_source;
 mod offer;
 mod offer_far;
 mod play;

@@ -27,6 +27,7 @@ fn start(
         silence_ms: None,
         path: None,
         bitrate_bps,
+        additional_sources: Vec::new(),
     }
 }
 

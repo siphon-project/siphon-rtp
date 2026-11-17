@@ -864,6 +864,7 @@ async fn a_recording_of_a_scoped_call_has_its_own_file() {
                     silence_ms: None,
                     path: None,
                     bitrate_bps: None,
+                    additional_sources: Vec::new(),
                 },
             )
             .await;

@@ -960,6 +960,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 taps: None,
                 seat: None,
                 parked: std::sync::Mutex::new(Vec::new()),
+                multi: None,
             },
         );
         CmdResult::Ok {

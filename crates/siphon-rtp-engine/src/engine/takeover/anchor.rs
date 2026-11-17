@@ -66,6 +66,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let dtls = self.dtls_bridge().owns(caller);
         let keyed = sdes_keyed || (dtls && self.dtls_bridge().is_keyed(caller));
         if others
+            || self.multi_source_attachment(call_id).is_some()
             || self.ws_tees.contains_key(call_id)
             || self.x3_sessions.contains_key(call_id)
             || self

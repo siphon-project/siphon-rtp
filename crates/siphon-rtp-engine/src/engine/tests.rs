@@ -62,6 +62,8 @@ mod forward_offer_turn_relay;
 mod forward_offer_webrtc;
 mod forward_room;
 mod forward_stream_identity;
+mod multi_source_recording;
+mod multi_source_tee;
 mod offer_far;
 mod ogg_opus_recording;
 mod record_call_streams;
@@ -8356,6 +8358,7 @@ async fn every_egress_on_a_secure_takeover_leg_is_encrypted() {
                         silence_ms: None,
                         path: None,
                         bitrate_bps: None,
+                        additional_sources: Vec::new(),
                     },
                 )
                 .await,
@@ -8372,6 +8375,7 @@ async fn every_egress_on_a_secure_takeover_leg_is_encrypted() {
                         direction: WsTeeDirection::Caller,
                         channels: None,
                         sample_rate: None,
+                        additional_sources: Vec::new(),
                     },
                 )
                 .await,
@@ -9408,6 +9412,7 @@ async fn a_fax_pinned_call_refuses_every_verb_that_would_decode_it() {
                     silence_ms: None,
                     path: None,
                     bitrate_bps: None,
+                    additional_sources: Vec::new(),
                 },
             ),
         ]
@@ -9476,6 +9481,7 @@ async fn a_fax_pinned_call_still_allows_the_verbatim_relay_verbs() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -10378,6 +10384,7 @@ async fn start_recording_promotes_a_relay_and_captures_both_legs_to_pcap() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -10513,6 +10520,7 @@ async fn start_recording_rejects_a_secure_call_and_unknown_call() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -10535,6 +10543,7 @@ async fn start_recording_rejects_a_secure_call_and_unknown_call() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -11145,6 +11154,7 @@ async fn a_voicemail_records_the_caller_and_reports_the_finished_file() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -11235,6 +11245,7 @@ async fn a_recording_is_finalized_when_the_call_ends_under_it() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -11347,6 +11358,7 @@ async fn a_recording_is_finalized_when_the_media_timeout_reaps_the_call() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -11416,6 +11428,7 @@ async fn an_explicit_path_is_honoured_and_an_unknown_recording_id_is_refused() {
                 silence_ms: None,
                 path: Some(wanted.to_string_lossy().into_owned()),
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -11474,6 +11487,7 @@ async fn an_unwritable_recording_path_fails_the_verb_with_the_call_untouched() {
                 silence_ms: None,
                 path: Some(unwritable.to_string_lossy().into_owned()),
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -11535,6 +11549,7 @@ async fn a_pcap_recording_is_unchanged_by_the_wav_form() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -12723,6 +12738,7 @@ async fn recording_and_block_dtmf_reason_set_holds_the_relay_until_both_release(
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -14558,6 +14574,7 @@ async fn a_bridge_facing_a_secure_offerer_refuses_every_verb_that_needs_decoded_
             silence_ms: None,
             path: None,
             bitrate_bps: None,
+            additional_sources: Vec::new(),
         };
         let verbs = [
             (
@@ -15301,6 +15318,7 @@ async fn a_dtls_leg_can_be_ws_teed_on_the_media_path_and_on_the_bridge() {
                 direction: WsTeeDirection::Caller,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -15327,6 +15345,7 @@ async fn a_dtls_leg_can_be_ws_teed_on_the_media_path_and_on_the_bridge() {
                 direction: WsTeeDirection::Caller,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -23674,6 +23693,7 @@ async fn ws_tee_streams_both_legs_as_stereo_while_the_relay_keeps_running() {
                 direction: WsTeeDirection::Both,
                 channels: Some(2),
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -23775,6 +23795,7 @@ async fn a_caller_only_ws_tee_streams_the_monologue_as_mono() {
                 direction: WsTeeDirection::Caller,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -23851,6 +23872,7 @@ async fn a_ws_tee_and_a_siprec_subscription_coexist_on_the_same_leg() {
                 direction: WsTeeDirection::Caller,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -23935,6 +23957,7 @@ async fn a_ws_tee_server_that_never_reads_does_not_stall_the_call() {
                 direction: WsTeeDirection::Caller,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -24021,6 +24044,7 @@ async fn attaching_a_ws_tee_to_a_websocket_takeover_call_is_rejected() {
                 direction: WsTeeDirection::Caller,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -24054,6 +24078,7 @@ async fn a_ws_tee_joins_a_pcap_recording_on_the_same_forward_only_relay() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -24073,6 +24098,7 @@ async fn a_ws_tee_joins_a_pcap_recording_on_the_same_forward_only_relay() {
                 direction: WsTeeDirection::Caller,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -24233,6 +24259,7 @@ async fn repeated_ws_tee_attach_detach_cycles_leave_no_residue() {
                     direction: WsTeeDirection::Caller,
                     channels: None,
                     sample_rate: None,
+                    additional_sources: Vec::new(),
                 },
             )
             .await;
@@ -24540,6 +24567,7 @@ async fn a_tee_at_a_requested_wire_rate_upsamples_an_8k_call() {
                 direction: WsTeeDirection::Caller,
                 channels: None,
                 sample_rate: Some(16_000),
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -24582,6 +24610,7 @@ async fn a_stereo_tee_at_a_requested_wire_rate_frames_both_upsampled_legs() {
                 direction: WsTeeDirection::Both,
                 channels: None,
                 sample_rate: Some(16_000),
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -24630,6 +24659,7 @@ async fn an_unserviceable_tee_wire_rate_is_rejected_and_the_call_keeps_relaying(
                     direction: WsTeeDirection::Caller,
                     channels: None,
                     sample_rate: Some(rate),
+                    additional_sources: Vec::new(),
                 },
             )
             .await;
@@ -25638,6 +25668,7 @@ async fn record_caller_while<F: std::future::Future<Output = ()>>(
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -26120,6 +26151,7 @@ async fn attaching_a_ws_bridge_is_refused_while_a_tee_holds_the_call() {
                 direction: WsTeeDirection::Caller,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -26261,6 +26293,7 @@ async fn a_ws_tee_the_server_drops_reports_its_start_before_its_end() {
                     direction: WsTeeDirection::Caller,
                     channels: None,
                     sample_rate: None,
+                    additional_sources: Vec::new(),
                 },
             )
             .await;
@@ -27519,6 +27552,7 @@ async fn a_ws_tee_attached_mid_call_hears_a_bridged_secure_leg() {
                 direction: WsTeeDirection::Callee,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -27632,6 +27666,7 @@ async fn a_ws_tee_attached_mid_call_hears_both_parties_of_a_transcrypt() {
                 direction: WsTeeDirection::Both,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -27681,6 +27716,7 @@ async fn start_decoded_recording(
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -28023,6 +28059,7 @@ async fn a_tee_and_a_recording_share_a_bridged_leg_and_detach_independently() {
                 direction: WsTeeDirection::Callee,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -28397,6 +28434,7 @@ async fn attach_callee_tee(
                 direction: WsTeeDirection::Callee,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -28977,6 +29015,7 @@ async fn a_voicemail_records_an_opus_caller() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -29636,6 +29675,7 @@ async fn a_bot_is_refused_while_something_else_runs_on_the_anchor() {
                 silence_ms: None,
                 path: None,
                 bitrate_bps: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -30924,6 +30964,7 @@ async fn attach_transcription_tee(
                 direction: WsTeeDirection::Both,
                 channels: Some(2),
                 sample_rate: Some(16_000),
+                additional_sources: Vec::new(),
             },
         )
         .await;
@@ -31302,6 +31343,7 @@ async fn a_ws_tee_on_a_secure_bridge_keeps_hearing_the_callee_after_a_renegotiat
                 direction: WsTeeDirection::Callee,
                 channels: None,
                 sample_rate: None,
+                additional_sources: Vec::new(),
             },
         )
         .await;

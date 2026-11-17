@@ -143,6 +143,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }),
                 seat: Some((conference_id, tag)),
                 parked: std::sync::Mutex::new(Vec::new()),
+                multi: None,
             },
         );
         Ok(recording_id)

@@ -583,10 +583,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 direction,
                 channels,
                 sample_rate,
+                additional_sources,
                 ..
             } => {
-                self.attach_ws_tee(client, &call_id, &ws_uri, direction, channels, sample_rate)
+                if additional_sources.is_empty() {
+                    self.attach_ws_tee(client, &call_id, &ws_uri, direction, channels, sample_rate)
+                        .await
+                } else {
+                    self.attach_multi_source_ws_tee(
+                        client,
+                        &call_id,
+                        &additional_sources,
+                        &ws_uri,
+                        direction,
+                        channels,
+                        sample_rate,
+                    )
                     .await
+                }
             }
             Command::DetachWsTee { call_id, .. } => self.detach_ws_tee(client, &call_id).await,
             Command::AttachWsBridge {
@@ -730,32 +744,46 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 silence_ms,
                 path,
                 bitrate_bps,
+                additional_sources,
             } => {
                 let format = format.unwrap_or_default();
                 let decoded = match decoded_format(format, bitrate_bps) {
                     Ok(decoded) => decoded,
                     Err(reason) => return error_result("start_recording", &reason),
                 };
+                if !additional_sources.is_empty() && decoded.is_none() {
+                    return error_result(
+                        "start_recording",
+                        &"a multi-source recording is decoded audio: format wav or ogg_opus, not pcap",
+                    );
+                }
                 match decoded {
                     None => self.start_recording(client, &call_id, recording_dir).await,
                     Some(decoded) => {
-                        self.start_wav_recording(
-                            client,
-                            &call_id,
-                            &from_tag,
-                            DecodedRecordingRequest {
-                                format: decoded,
-                                direction: direction.unwrap_or_default(),
-                                channels: channels.unwrap_or_default(),
-                                limits: crate::recording::RecordingLimits {
-                                    max_duration_ms,
-                                    silence_ms,
-                                },
-                                path,
-                                recording_dir,
+                        let request = DecodedRecordingRequest {
+                            format: decoded,
+                            direction: direction.unwrap_or_default(),
+                            channels: channels.unwrap_or_default(),
+                            limits: crate::recording::RecordingLimits {
+                                max_duration_ms,
+                                silence_ms,
                             },
-                        )
-                        .await
+                            path,
+                            recording_dir,
+                        };
+                        if additional_sources.is_empty() {
+                            self.start_wav_recording(client, &call_id, &from_tag, request)
+                                .await
+                        } else {
+                            self.start_multi_source_recording(
+                                client,
+                                &call_id,
+                                &from_tag,
+                                &additional_sources,
+                                request,
+                            )
+                            .await
+                        }
                     }
                 }
             }

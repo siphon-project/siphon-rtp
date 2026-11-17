@@ -185,6 +185,54 @@ call. Compare SSRCs against a capture of the call legs to confirm which leg is
 which. `query` on the call keeps counting the primary legs; the fork does not
 alter A-B media.
 
+## SIPREC: several streams into one recording or tee
+
+When siphon-rtp is the recording server (the SRS, RFC 7866), each recorded
+media stream of a session arrives as its own `sendonly` m-line, and you answer
+each one on its own call with `answer_local` (the engine answers `recvonly` and
+sends nothing back). A session has one recording, though, so one recording or
+one WebSocket tee is fed by all those calls, a channel each. Every stream may
+share the session's From-tag: the calls differ by `call_id`, and a source is
+identified by its `call_id` alone.
+
+```json
+{"id": 10, "command": "start_recording", "call_id": "session~0", "from_tag": "src-tag",
+ "format": "wav", "channels": "stereo", "path": "/var/recordings/session.wav",
+ "additional_sources": [{"call_id": "session~1", "from_tag": "src-tag"}]}
+```
+
+`call_id` / `from_tag` are source 0 (the left channel), and the entries of
+`additional_sources` follow in order. Two to eight sources: stereo takes exactly
+two, and `mono` mixes any number (a saturating sum). `format` is `wav` or
+`ogg_opus`. `attach_ws_tee` takes the same `additional_sources`, with
+`channels: 2` for stereo or `1` to mix.
+
+- **Alignment.** The sources are mixed on one 20 ms clock of the engine's own,
+  not on the order packets arrive in. A source that starts late, or stops
+  sending (silence suppression, hold), is silence in its channel for that long,
+  so the other channels keep their place. The clock starts when the first
+  source has audio. Each source gets a small jitter allowance (two frames before
+  it plays; at most eight buffered, oldest dropped), so a stalled consumer or a
+  burst costs frames, never a growing queue.
+- **Direction.** Each source contributes what its call received, so
+  `direction` must be `ingress` (or absent) for a recording, and `caller` or
+  `both` for a tee.
+- **Ending.** The recording or tee ends once, whichever source call goes first:
+  `delete` on any source ends it with `call_ended`, and the file is complete
+  before `recording_finished` (naming source 0) is emitted. `stop_recording`
+  with the `recording_id` (any source's `call_id` addresses it) and
+  `detach_ws_tee` on source 0 end it by request. The other source calls stay up.
+- **Refusals.** More than eight or fewer than two sources, stereo with other
+  than two, a direction that is not the received audio, `pcap`, a call listed
+  twice, a call the client does not own, and a source that already carries a
+  tee. A source call cannot be seated or taken over by a bot while it feeds one.
+- **Renegotiation.** A repeated answer on a source call moves only that
+  source's tap onto the new media path; the file and the other channels carry on.
+
+Check `node_info` `features` for `record_multi_source` and
+`ws_tee_multi_source` before sending `additional_sources`: an older engine
+ignores the field and would record source 0 alone.
+
 ## The `record_call` answer flag (one WAV per party)
 
 Setting `"record_call": true` (NG `record call: yes`) with `record_path` (NG

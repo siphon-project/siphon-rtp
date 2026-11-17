@@ -606,6 +606,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Decoded recordings, the same way: their sinks lived on the actor the answer replaced.
         // `answer` pinned their assemblers before it installed, so the files are still open here.
         self.retap_call_recordings(call_id).await;
+        // …and the streams fed by this call and others (SIPREC): only this source's sink moves.
+        self.retap_multi_source(call_id).await;
     }
 
     /// Release a userspace hold taken by [`Self::hold_in_userspace`] and demote the relay back to the

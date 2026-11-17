@@ -15,19 +15,22 @@ use super::{
 
 pub(super) struct WsTee {
     /// The tee's stream id — the event correlator, and what the consumer sees in `start`.
-    stream_id: String,
+    pub(super) stream_id: String,
     /// The label on every sink and bridge tap this tee attached. Unique per attach, unlike the
     /// stream id, which a call's replacement tee reuses: the new tee's taps go on before the old
     /// one's come off, so removing the old tee by a shared label would take the new one's with it.
-    tap_tag: String,
+    pub(super) tap_tag: String,
     /// The call's offerer tag and owning control client, copied here at attach time: teardown runs
     /// *after* `delete` has already removed the call from the registry, so the end event cannot look
     /// them up any more.
     from_tag: String,
     owner: ClientId,
-    /// Shared frame assembler; read at teardown for the `frames_sent` / `frames_dropped` on
-    /// [`Event::WsTeeEnded`].
-    pub(super) mixer: Arc<std::sync::Mutex<siphon_rtp_media::bridge::tee::TeeMixer>>,
+    /// The frame assembler's counters; read at teardown for the `frames_sent` / `frames_dropped` on
+    /// [`Event::WsTeeEnded`], and the assembler itself for a single-call tee's re-tap.
+    pub(super) counters: TeeCounters,
+    /// Several calls feeding this one tee (SIPREC): their mixer and where each source is. The key
+    /// this tee is registered under is source 0.
+    pub(super) multi: Option<super::multi_source::MultiSourceFeed>,
     /// Which legs carry a sink for this tee (`true` = leg A / caller), so detach targets exactly them.
     tapped_legs: Vec<bool>,
     /// The L16 rate the tee announced in `start`. Every re-tap converts into this one, whatever the
@@ -108,6 +111,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let pipeline = self
             .owned_call_internal(call_id, |call| call.pipeline)
             .ok_or_else(|| "call no longer exists".to_string())?;
+        if self.is_secondary_tee_source(call_id) {
+            return Err(
+                "the call is a source of a multi-source WebSocket tee, which holds it; detach \
+                 that tee first"
+                    .to_string(),
+            );
+        }
         if self.ws.is_ws_call(call_id) || pipeline == PipelineKind::Ws {
             return Err(
                 "a WebSocket-takeover call (ws_uri) has no relay path to tee; use one or the other"
@@ -215,7 +225,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 channels: wire_channels,
                 sample_rate: wire_rate,
             },
-            (socket, plan, stream_id, tap_tag),
+            (socket, TeeOutput::single(plan), stream_id, tap_tag),
             (tapped_legs, bridge_taps),
         )
     }
@@ -352,14 +362,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// and can re-attach, rather than keeping a stream that will never carry another frame.
     pub(super) async fn retap_ws_tee(&self, call_id: &str) {
         let Some((tap_tag, wire_rate, mixer, legs, old_bridge_taps)) =
-            self.ws_tees.get_mut(call_id).map(|mut tee| {
-                (
+            self.ws_tees.get_mut(call_id).and_then(|mut tee| {
+                // A multi-source tee follows a renegotiation in `retap_multi_source`.
+                let TeeCounters::Mixer(mixer) = &tee.counters else {
+                    return None;
+                };
+                let mixer = mixer.clone();
+                Some((
                     tee.tap_tag.clone(),
                     tee.wire_rate,
-                    tee.mixer.clone(),
+                    mixer,
                     std::mem::take(&mut tee.tapped_legs),
                     std::mem::take(&mut tee.bridge_taps),
-                )
+                ))
             })
         else {
             return;
@@ -469,17 +484,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// Announce a tee whose sinks are attached, start its transport, and register it: shared by the
     /// pipeline and the bridge paths, which differ only in where the audio comes from.
-    fn announce_ws_tee(
+    pub(super) fn announce_ws_tee(
         &self,
         call_id: &str,
         ws_uri: &str,
         shape: TeeShape,
-        (socket, plan, stream_id, tap_tag): (
-            TeeSocket,
-            siphon_rtp_media::bridge::tee::WsTeePlan,
-            String,
-            String,
-        ),
+        (socket, plan, stream_id, tap_tag): (TeeSocket, TeeOutput, String, String),
         (tapped_legs, bridge_taps): (
             Vec<bool>,
             Vec<(siphon_rtp_datapath::EndpointId, tokio::task::JoinHandle<()>)>,
@@ -522,7 +532,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let events = self.event_sink(owner);
             let frames = plan.frames;
             let recycle = plan.recycle;
-            let mixer = plan.mixer.clone();
+            let counters = plan.counters.clone();
             let call_id = call_id.to_string();
             let from_tag = from_tag.clone();
             let stream_id = stream_id.clone();
@@ -553,7 +563,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &from_tag,
                     &stream_id,
                     reason,
-                    &mixer,
+                    &counters,
                 );
             })
         };
@@ -565,7 +575,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 tap_tag,
                 from_tag,
                 owner,
-                mixer: plan.mixer,
+                counters: plan.counters,
+                multi: plan.multi,
                 tapped_legs,
                 wire_rate,
                 transport,
@@ -672,7 +683,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// [`Self::stop_ws_tee`], with the hold release made explicit: a tee being *replaced* by
     /// another pipeline tee passes `false`, because the replacement holds the call for the same
     /// reason and the hold is one flag, not a count.
-    async fn end_ws_tee(&self, call_id: &str, reason: WsTeeEndReason, release_hold: bool) {
+    pub(super) async fn end_ws_tee(
+        &self,
+        call_id: &str,
+        reason: WsTeeEndReason,
+        release_hold: bool,
+    ) {
         let Some((_, tee)) = self.ws_tees.remove(call_id) else {
             return;
         };
@@ -702,6 +718,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // cancel-safe select loop, so this resolves promptly with `JoinError::Cancelled`.
         tee.transport.abort();
         let _ = tee.transport.await;
+        // After the transport: a multi-source feed ending closes the transport's input, which it
+        // would otherwise report first, as the call ending.
+        if let Some(feed) = tee.multi {
+            self.release_multi_source_tee(call_id, &tee.tap_tag, feed)
+                .await;
+        }
         let events = self.event_sink(tee.owner);
         emit_ws_tee_ended(
             events.as_ref(),
@@ -710,7 +732,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &tee.from_tag,
             &tee.stream_id,
             reason,
-            &tee.mixer,
+            &tee.counters,
         );
         if !bridged && release_hold {
             self.release_userspace_hold(call_id, PromotionReason::WsTee)
@@ -720,10 +742,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 }
 
 /// The dialled tee connection, named so the dial and the transport task can be split.
-type TeeSocket = super::ws_dial::WsClientSocket;
+pub(super) type TeeSocket = super::ws_dial::WsClientSocket;
 
 /// A tee's shared frame assembler, as every sink feeding it holds it.
-type TeeMixerHandle = Arc<std::sync::Mutex<siphon_rtp_media::bridge::tee::TeeMixer>>;
+pub(super) type TeeMixerHandle = Arc<std::sync::Mutex<siphon_rtp_media::bridge::tee::TeeMixer>>;
 
 /// One tapped leg: whether it is leg A, the wire channel it feeds, and its conversion into the
 /// tee's wire rate (`None` when the leg already runs at it).
@@ -750,10 +772,55 @@ struct TeeTaps {
 }
 
 /// The negotiated shape a tee announces in `ws_tee_started`.
-struct TeeShape {
-    direction: WsTeeDirection,
-    channels: u8,
-    sample_rate: u32,
+pub(super) struct TeeShape {
+    pub(super) direction: WsTeeDirection,
+    pub(super) channels: u8,
+    pub(super) sample_rate: u32,
+}
+
+/// Where a tee's lifetime counters come from: the single-call frame assembler, or the multi-source
+/// mixer.
+#[derive(Clone)]
+pub(super) enum TeeCounters {
+    Mixer(TeeMixerHandle),
+    Multi(Arc<siphon_rtp_media::bridge::multi_source::MultiSourceStats>),
+}
+
+impl TeeCounters {
+    /// `(frames_sent, frames_dropped)`, or `None`s when a poisoned lock cannot be read.
+    pub(super) fn snapshot(&self) -> (Option<u64>, Option<u64>) {
+        match self {
+            Self::Mixer(mixer) => match mixer.lock() {
+                Ok(guard) => (Some(guard.forwarded()), Some(guard.dropped())),
+                Err(_) => (None, None),
+            },
+            Self::Multi(stats) => (Some(stats.forwarded()), Some(stats.dropped())),
+        }
+    }
+}
+
+/// What a tee's transport drains and announces, whichever assembler feeds it.
+pub(super) struct TeeOutput {
+    pub(super) frames: flume::Receiver<Vec<u8>>,
+    pub(super) recycle: flume::Sender<Vec<u8>>,
+    pub(super) format: MediaFormat,
+    pub(super) tracks: Vec<String>,
+    pub(super) counters: TeeCounters,
+    pub(super) multi: Option<super::multi_source::MultiSourceFeed>,
+}
+
+impl TeeOutput {
+    /// The output of a single call's tee.
+    fn single(plan: siphon_rtp_media::bridge::tee::WsTeePlan) -> Self {
+        Self {
+            frames: plan.frames,
+            recycle: plan.recycle,
+            format: plan.format,
+            tracks: plan.tracks,
+            counters: TeeCounters::Mixer(plan.mixer),
+            multi: None,
+        }
+    }
 }
 
 /// How many plaintext datagrams a bridged call's tap decoder may fall behind by before the bridge
@@ -798,23 +865,20 @@ pub(super) async fn run_bridge_tap_decoder(
 /// Emit a tee's [`Event::WsTeeEnded`] **exactly once**, whichever of the transport task or a detach
 /// gets there first (`ended` is the shared latch they race on). Carries the mixer's lifetime counters
 /// so a controller can see whether the consumer kept up.
-fn emit_ws_tee_ended(
+pub(super) fn emit_ws_tee_ended(
     events: Option<&flume::Sender<Event>>,
     ended: &std::sync::atomic::AtomicBool,
     call_id: &str,
     from_tag: &str,
     stream_id: &str,
     reason: WsTeeEndReason,
-    mixer: &std::sync::Mutex<siphon_rtp_media::bridge::tee::TeeMixer>,
+    counters: &TeeCounters,
 ) {
     use std::sync::atomic::Ordering;
     if ended.swap(true, Ordering::SeqCst) {
         return; // already reported
     }
-    let (frames_sent, frames_dropped) = match mixer.lock() {
-        Ok(guard) => (Some(guard.forwarded()), Some(guard.dropped())),
-        Err(_) => (None, None),
-    };
+    let (frames_sent, frames_dropped) = counters.snapshot();
     tracing::info!(
         target: "siphon_rtp::media",
         call_id,
