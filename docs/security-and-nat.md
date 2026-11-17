@@ -1115,6 +1115,20 @@ the routing order is unchanged: bridge → media → text → udptl → ws → c
   the ICE gate left open on the signalled address and narrowed by the first authenticated check or the
   full agent's selection, and the DTLS handshake held until ICE validates the peer (RFC 8445 §12). A
   preserve room refuses it, because the engine would have to terminate SRTP the room forwards end to end.
+- **The video endpoint is gated like the audio.** A seat's `m=video` (3GPP TS 24.281 §6.2) is an
+  endpoint of its own, a `Redirect` consumer routed to the same room actor, and `ForwardRoom::ingest_video`
+  runs the same `seat_gate::admit` chain on it: the layer-2 signalled-source gate (the video `c=` and
+  port, the `received-from` hint, or `Any` for a `symmetric` seat), the pending refusals, and the
+  constrained SSRC-consistent latch (RFC 3550 §8) with its own reverse latch per video stream, so a
+  hijacker's packet from another address with another SSRC is refused and never moves the reply address.
+  Only then is RTCP consumed (never relayed, RFC 3550 §7.3) or RTP armed for the fan-out, and only from the
+  chosen source of a seat that offered to send video (`sendrecv`, `sendonly`); a receive-only uplink and a
+  non-source are counted and dropped. A receiver is sent video only on its own video endpoint with a
+  resolved destination (never into the void), under its own SSRC and payload type. The payload is
+  never parsed. Video is plain RTP: a seat whose media is SRTP (SDES, DTLS), a browser seat and a
+  preserve room have their video declined at port 0 with a stated reason, because a plain video answer to
+  a secure offer would send the seat video it cannot decrypt (secure video is a step of its own).
+  Leaving, a room's end and the inactivity scan treat the video endpoint as one of the seat's.
 - **Cross-codec seats put a decoder behind the gate.** A seat whose codec is not the room's has its
   payload decoded (when it is the source) and re-encoded. That is a new consumer of untrusted bytes, but
   it sits strictly after the gate above (signalled source, SRTP, the SSRC latch, source selected by the

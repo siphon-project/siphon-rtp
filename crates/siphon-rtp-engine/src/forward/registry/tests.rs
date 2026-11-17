@@ -32,6 +32,7 @@ fn config(index: u64) -> ForwardSeatConfig {
         floor: None,
         app_events: None,
         media_srtcp: Vec::new(),
+        video: None,
     }
 }
 
@@ -220,3 +221,4 @@ async fn deregister_hands_back_every_seat_endpoint() {
 }
 
 mod reaping;
+mod video;

@@ -526,7 +526,7 @@ async fn a_forward_offer_carries_the_controllers_key_mgmt_and_a_preserve_offer_i
             },
         )
         .await;
-    assert_eq!(result, ok_empty());
+    assert_eq!(result, seated_with(&["audio"]));
     assert_eq!(engine.conference().forward().seat_count(), 1);
 }
 
@@ -979,7 +979,7 @@ async fn a_forward_offer_with_media_srtcp_keys_seats_a_keyed_member_on_its_answe
             },
         )
         .await;
-    assert_eq!(result, ok_empty());
+    assert_eq!(result, seated_with(&["audio"]));
     set_source(&engine, "a").await;
     let plain = plain_report(0xA0A0_A0A0);
     phone_a

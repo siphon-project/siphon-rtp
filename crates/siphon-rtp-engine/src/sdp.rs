@@ -38,6 +38,7 @@ pub use data_channel::{
 };
 pub use decline::{
     decline_unanswered_media, decline_unanswered_streams, decline_unanswered_with_data_channel,
+    Answered,
 };
 pub use direction::answer_direction;
 pub use floor::{
@@ -48,6 +49,7 @@ pub use key_mgmt::{apply_key_mgmt, terminates_keying};
 pub use stream_identity::{own_stream_identity, OwnSsrc};
 mod telephone_event;
 pub use telephone_event::TelephoneEvent;
+pub mod video;
 
 /// Default packetization when the SDP carries no `a=ptime` (RFC 3551: 20 ms for telephony codecs).
 const DEFAULT_PTIME_MS: u8 = 20;

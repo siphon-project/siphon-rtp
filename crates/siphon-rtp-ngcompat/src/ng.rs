@@ -304,6 +304,10 @@ pub fn serialize_result(result: &CmdResult) -> Value {
             // Likewise `recording_id`: an NG `start recording` is always a pcap, which has no
             // completion event to correlate and no per-recording stop to address.
             recording_id: _,
+            // Forwarding-room answer details are native siphon-rtp (JSON control) only: the NG
+            // dictionary has no forwarding room verbs.
+            streams: _,
+            video_declined: _,
         } => {
             dict.insert(b"result".to_vec(), Value::string("ok"));
             if let Some(sdp) = sdp {
@@ -501,6 +505,7 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         },
         // MCPTT floor control is a native-protocol feature; rtpengine's NG has no such key.
         floor_fmtp: None,
+        video: None,
         floor_keys: vec![],
         media_srtcp_keys: vec![],
         key_mgmt: None,
@@ -1306,6 +1311,8 @@ mod tests {
             recording_id: None,
             to_tag: None,
             stats: None,
+            streams: Vec::new(),
+            video_declined: None,
         });
         assert_eq!(ok.get("result").and_then(Value::as_str), Some("ok"));
         assert!(ok
@@ -1331,6 +1338,8 @@ mod tests {
                 bytes_out: 15_680,
                 packets_lost: 2,
             }),
+            streams: Vec::new(),
+            video_declined: None,
         });
         let totals = ok.get("totals").and_then(Value::as_dict).expect("totals");
         assert_eq!(

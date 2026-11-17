@@ -21,6 +21,9 @@
 //! talk-spurt start). Inside a run the mapping is a fixed offset, so in-source loss stays visible to
 //! the receiver, and reordered or duplicate packets map to the same out values every time.
 //!
+//! A translator built [`Translator::with_preserved_marker`] (video, RFC 6184 §5.1) leaves the
+//! marker bit as the sender set it, at a rebase too.
+//!
 //! # Stale packets
 //! After a switch away from source A, late packets of A are dropped ([`Forwarded::DroppedStale`])
 //! rather than mapped: they would land behind the rebase point and break monotonicity. A packet of A
@@ -84,6 +87,8 @@ pub struct Translator {
     last_clock: u32,
     packets_sent: u32,
     octets_sent: u32,
+    /// The marker bit is the sender's, never set for a rebase (see [`Self::with_preserved_marker`]).
+    preserve_marker: bool,
 }
 
 impl Translator {
@@ -103,7 +108,20 @@ impl Translator {
             last_clock: 0,
             packets_sent: 0,
             octets_sent: 0,
+            preserve_marker: false,
         }
+    }
+
+    /// Carry the sender's marker bit through as it is, and never set it for a rebase.
+    ///
+    /// For video the marker ends an access unit (RFC 6184 §5.1: set on the last packet of the access
+    /// unit), so a source switch that landed mid access unit must not mark the first packet of the
+    /// new run: a receiver would take it for the end of a picture. Audio keeps the default, where
+    /// the marker starts a talk-spurt (RFC 3551 §4.1).
+    #[must_use]
+    pub fn with_preserved_marker(mut self) -> Self {
+        self.preserve_marker = true;
+        self
     }
 
     /// The egress SSRC (RTCP SR sender SSRC, RFC 3550 §6.4.1).
@@ -221,7 +239,7 @@ impl Translator {
         }
 
         let header = RtpHeader {
-            marker: rebase || packet.marker,
+            marker: (rebase && !self.preserve_marker) || packet.marker,
             payload_type,
             sequence: out_sequence,
             timestamp: out_timestamp,
@@ -390,6 +408,33 @@ mod tests {
             run(&mut translator, &packet(0xA, 503, 9480, b"a"), 960),
             (false, 105, 5960, EGRESS)
         );
+    }
+
+    #[test]
+    fn preserved_marker_is_the_senders_at_a_rebase_and_inside_a_run() {
+        // RFC 6184 §5.1: the marker ends an access unit, so a rebase must not set it.
+        let mut translator = Translator::new(EGRESS, 100, 5000).with_preserved_marker();
+        assert_eq!(
+            run(&mut translator, &packet(1, 10, 1000, b"a"), 0),
+            (false, 100, 5000, EGRESS)
+        );
+        let mut marked = packet(1, 11, 1000, b"a");
+        marked[1] |= 0x80;
+        assert_eq!(
+            run(&mut translator, &marked, 3000),
+            (true, 101, 5000, EGRESS)
+        );
+        translator.switch_source();
+        assert_eq!(
+            run(&mut translator, &packet(2, 7, 70, b"b"), 6000),
+            (false, 102, 8000, EGRESS)
+        );
+    }
+
+    #[test]
+    fn default_translator_still_marks_a_rebase() {
+        let mut translator = Translator::new(EGRESS, 100, 5000);
+        assert!(run(&mut translator, &packet(1, 10, 1000, b"a"), 0).0);
     }
 
     #[test]

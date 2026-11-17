@@ -235,7 +235,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             anchored
         };
-        sdp::decline_unanswered_with_data_channel(anchored, false, floor.is_some(), data_channel)
+        sdp::decline_unanswered_with_data_channel(
+            anchored,
+            sdp::Answered {
+                floor: floor.is_some(),
+                data_channel,
+                ..sdp::Answered::default()
+            },
+        )
     }
 
     /// Record a single-leg call's floor endpoint on its leg and start serving the stream, for the

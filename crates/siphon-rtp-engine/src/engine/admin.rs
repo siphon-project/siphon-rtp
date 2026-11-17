@@ -31,6 +31,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             recording_id: None,
             to_tag: None,
             stats: Some(stats),
+            streams: Vec::new(),
+            video_declined: None,
         }
     }
 
@@ -198,6 +200,10 @@ fn build_features() -> Vec<String> {
         // carries `floor_fmtp`), which `forward_answer` seats on the browser's answer. A controller
         // gates inviting a browser member to a group on this entry.
         "forward_offer_webrtc".to_string(),
+        // `forward_join` and `forward_offer` take `profile.video` and carry a seat's H.264 `m=video`
+        // through a translating room (3GPP TS 24.281 §6.2), and their results report `streams` and
+        // `video_declined`. A controller gates asking for video on this entry.
+        "forward_video".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

@@ -564,7 +564,7 @@ async fn a_forward_offer_writes_the_profiles_first_format_and_reads_the_answer_u
             },
         )
         .await;
-    assert_eq!(answered, ok_empty());
+    assert_eq!(answered, seated_with(&["audio", "floor"]));
     seat.control
         .send_to(&app_packet(b"MCV0", 5), engine_control)
         .await
@@ -625,7 +625,7 @@ async fn a_forward_offer_answered_under_another_token_has_no_control_stream() {
             },
         )
         .await;
-    assert_eq!(answered, ok_empty());
+    assert_eq!(answered, seated_with(&["audio"]));
     seat.control
         .send_to(&app_packet(b"MCV0", 5), engine_control)
         .await

@@ -28,6 +28,7 @@ mod floor_keys;
 mod fork;
 mod forward;
 mod forward_dial_out;
+mod forward_video;
 mod forward_webrtc;
 mod gather;
 mod inject;
@@ -47,6 +48,7 @@ mod promote;
 mod record;
 mod record_call;
 mod reoffer;
+mod results;
 mod room;
 mod rtcp_app;
 pub mod scope;
@@ -54,6 +56,7 @@ mod seat_call;
 mod seat_transport;
 mod snapshot;
 mod snapshot_floor;
+use results::{ok_empty, ok_sdp};
 mod sweep;
 mod takeover;
 mod teardown;
@@ -1452,29 +1455,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// demotion, which already validated ownership via the public verb). Returns `None` if unknown.
     fn owned_call_internal<T>(&self, call_id: &str, f: impl FnOnce(&Call) -> T) -> Option<T> {
         self.calls.get(call_id).map(|call| f(&call))
-    }
-}
-
-fn ok_sdp(sdp: String, to_tag: Option<String>) -> CmdResult {
-    CmdResult::Ok {
-        sdp: Some(sdp),
-        duration_ms: None,
-        play_id: None,
-        recording_id: None,
-        to_tag,
-        stats: None,
-    }
-}
-
-/// A bare success (no SDP/stats) — the reply to control verbs like block/silence.
-fn ok_empty() -> CmdResult {
-    CmdResult::Ok {
-        sdp: None,
-        duration_ms: None,
-        play_id: None,
-        recording_id: None,
-        to_tag: None,
-        stats: None,
     }
 }
 

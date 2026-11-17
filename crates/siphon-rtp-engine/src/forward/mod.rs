@@ -29,6 +29,6 @@ pub use codec::RoomCodec;
 pub use registry::{media_mismatch, ForwardControl, ForwardRefusal, ForwardRegistry};
 pub use room::{
     AppRequest, AppSendError, AppTarget, FloorConfig, FloorKeysError, ForwardError, ForwardRoom,
-    ForwardSeatConfig, ForwardSeatStats, MAX_SEATS,
+    ForwardSeatConfig, ForwardSeatStats, VideoConfig, MAX_SEATS,
 };
 pub use transcode::TranscodeStats;

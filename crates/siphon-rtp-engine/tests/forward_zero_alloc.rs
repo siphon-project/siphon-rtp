@@ -16,9 +16,11 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::forward::{
-    AppRequest, AppTarget, FloorConfig, ForwardRoom, ForwardSeatConfig, RoomCodec,
+    AppRequest, AppTarget, FloorConfig, ForwardRoom, ForwardSeatConfig, RoomCodec, VideoConfig,
 };
 use siphon_rtp_engine::sdp;
+use siphon_rtp_engine::sdp::video::RoomVideoFormat;
+use siphon_rtp_engine::sdp::MediaDirection;
 use siphon_rtp_media::rtcp;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader};
 use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
@@ -77,6 +79,31 @@ fn media_key(index: usize) -> FloorMasterKey {
 }
 
 fn room_keyed(media: siphon_rtp_proto::ForwardMedia, keyed: bool) -> ForwardRoom {
+    build_room(media, keyed, false)
+}
+
+/// The video stream of seat `index`: endpoint `10_000 + index`, port `5000 + index`.
+fn video_of(index: usize) -> VideoConfig {
+    VideoConfig {
+        endpoint: EndpointId(10_000 + index as u64),
+        destination: format!("192.0.2.{}:{}", 1 + index % 250, 5000 + index)
+            .parse()
+            .unwrap(),
+        accepted_source: SourceFilter::Any,
+        payload_type: 99,
+        direction: MediaDirection::SendRecv,
+        egress_ssrc: 0xF000_0000 + index as u32,
+        initial_sequence: 0,
+        initial_timestamp: 0,
+        format: RoomVideoFormat {
+            packetization_mode: 1,
+            profile_level_id: Some("640c1f".to_string()),
+            fmtp: None,
+        },
+    }
+}
+
+fn build_room(media: siphon_rtp_proto::ForwardMedia, keyed: bool, video: bool) -> ForwardRoom {
     let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
                  m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
     let codecs = sdp::parse(offer).unwrap().audio_codecs();
@@ -107,6 +134,7 @@ fn room_keyed(media: siphon_rtp_proto::ForwardMedia, keyed: bool) -> ForwardRoom
                 } else {
                     Vec::new()
                 },
+                video: video.then(|| video_of(index)),
             },
             0,
         )
@@ -327,6 +355,7 @@ fn a_room_wide_rtcp_app_send_makes_no_heap_allocation() {
                 }),
                 app_events: None,
                 media_srtcp: Vec::new(),
+                video: None,
             },
             0,
         )
@@ -358,4 +387,94 @@ fn a_room_wide_rtcp_app_send_makes_no_heap_allocation() {
         allocated, 0,
         "send_rtcp_app allocated {allocated} times across 200 room-wide sends"
     );
+}
+
+fn video_packet(talker: usize, sequence: u16, marker: bool) -> RxPacket {
+    let header = RtpHeader {
+        marker,
+        payload_type: 99,
+        sequence,
+        timestamp: u32::from(sequence / 3) * 3000,
+        ssrc: 0xB000_0000 + talker as u32,
+    };
+    let mut datagram = vec![0u8; 12 + 1200];
+    write_packet(&header, &[0x7C; 1200], &mut datagram).unwrap();
+    RxPacket {
+        endpoint: EndpointId(10_000 + talker as u64),
+        source: format!("192.0.2.{}:{}", 1 + talker % 250, 5000 + talker)
+            .parse()
+            .unwrap(),
+        arrival: u64::from(sequence) * 11_000,
+        data: Bytes::from(datagram),
+    }
+}
+
+#[test]
+fn video_ingest_and_fan_out_make_no_heap_allocation() {
+    // 100 seats with video: one inbound packet is one translate per receiver on the 90 kHz clock.
+    let mut room = build_room(siphon_rtp_proto::ForwardMedia::Translate, false, true);
+    let from_first: Vec<RxPacket> = (1..=63)
+        .map(|sequence| video_packet(0, sequence, sequence % 3 == 0))
+        .collect();
+    let from_second: Vec<RxPacket> = (1..=63)
+        .map(|sequence| video_packet(1, sequence, sequence % 3 == 0))
+        .collect();
+    // Warm up: both talkers have been the source, so every latch, statistics block and video
+    // translator has seen its first packet.
+    for talker in [0usize, 1, 0] {
+        room.set_source(Some(&format!("seat-{talker}"))).unwrap();
+        let warm = video_packet(talker, 1, false);
+        room.ingest(&warm);
+        while room.next_datagram(&warm).is_some() {}
+    }
+    room.drain_events().for_each(drop);
+    room.set_source(Some("seat-0")).unwrap();
+    room.ingest(&from_first[0]);
+    while room.next_datagram(&from_first[0]).is_some() {}
+    room.drain_events().for_each(drop);
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut forwarded = 0usize;
+    for _ in 0..100 {
+        for packet in &from_first {
+            room.ingest(packet);
+            while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                forwarded += std::hint::black_box(datagram).len();
+            }
+        }
+    }
+    let steady = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(forwarded > 0, "the loop forwarded something");
+    assert_eq!(
+        steady, 0,
+        "video fan-out allocated {steady} times across 6300 packets x 99 receivers (must be zero)"
+    );
+    // A switch every 63 packets: a flag per video translator, and the one event the change
+    // announces (two strings), nothing per packet.
+    room.drain_events().for_each(drop);
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for round in 0..100 {
+        let (tag, packets) = if round % 2 == 0 {
+            ("seat-1", &from_second)
+        } else {
+            ("seat-0", &from_first)
+        };
+        room.set_source(Some(tag)).unwrap();
+        for packet in packets {
+            room.ingest(packet);
+            while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                forwarded += std::hint::black_box(datagram).len();
+            }
+        }
+        room.drain_events().for_each(drop);
+    }
+    let switching = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(
+        switching <= 100 * 8,
+        "{switching} allocations across 100 switches: only the announcement may allocate"
+    );
+    assert!(forwarded > 0);
 }
