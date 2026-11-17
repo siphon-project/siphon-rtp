@@ -282,14 +282,15 @@ mod tests {
         for &n in &[128usize, 256, 512] {
             let fft = RealFft::new(n).expect("build");
             let bits = n.trailing_zeros();
-            for index in 0..n {
+            assert!(fft.bitrev.len() >= n, "n={n}");
+            for (index, &reversed) in fft.bitrev.iter().enumerate().take(n) {
                 let mut manual = 0usize;
                 for bit in 0..bits {
                     if index & (1 << bit) != 0 {
                         manual |= 1 << (bits - 1 - bit);
                     }
                 }
-                assert_eq!(fft.bitrev[index], manual, "n={n} index={index}");
+                assert_eq!(reversed, manual, "n={n} index={index}");
             }
         }
     }

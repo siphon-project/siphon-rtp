@@ -16,10 +16,21 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   offered token with `a=fmtp:<token> <floor_fmtp>`, and a control section whose token is not accepted
   is declined with port 0 and never passed through. A re-offer and an HA checkpoint keep the format the
   stream was set up with; an MCVideo checkpoint carries its own snapshot version (6, scoped 7), so a
-  standby from before this release refuses it instead of restoring it as MCPTT. RTCP APP names and subtypes (`MCV0`, `MCV1`, `MCV2`) stay opaque to the
-  engine, as for MCPTT. `node_info` lists `transmission_control`.
+  standby from before this release refuses it instead of restoring it as MCPTT. RTCP APP names and
+  subtypes (`MCV0`, `MCV1`, `MCV2`) stay opaque to the engine, as for MCPTT. `node_info` lists
+  `transmission_control`.
 - `profile.floor_channel_label` names the browser data channel that carries floor or transmission
   control (default `mcptt-floor`).
+
+### Fixed
+
+- **A control command no longer waits forever on a call's or a room's actor.** `play_media` (overlay),
+  `stop_media`, `set_play_gain`, `play_dtmf`, the conference play verbs and the recording hand-overs
+  asked the actor for an answer and awaited it with no bound. An actor that had ended while still
+  registered (a room ends itself when its last participant leaves; any actor can panic) left the
+  request in a queue the registry kept alive, so the answer never came and the control connection
+  stopped with it. The actor now empties its mailbox however it ends, a panic included, and every
+  such wait is bounded (`ACTOR_REPLY_TIMEOUT`, 2 s) and answered with an error past it.
 
 ## [0.19.1] — 2026-11-11
 

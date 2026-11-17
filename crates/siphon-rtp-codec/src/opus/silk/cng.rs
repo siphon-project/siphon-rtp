@@ -171,9 +171,9 @@ pub fn run(
         // the background the talker is actually in.
         let mut loudest = 0usize;
         let mut max_gain_q16 = 0i32;
-        for subframe in 0..subframe_count {
-            if control.gains_q16[subframe] > max_gain_q16 {
-                max_gain_q16 = control.gains_q16[subframe];
+        for (subframe, &gain_q16) in control.gains_q16.iter().enumerate().take(subframe_count) {
+            if gain_q16 > max_gain_q16 {
+                max_gain_q16 = gain_q16;
                 loudest = subframe;
             }
         }
@@ -184,17 +184,13 @@ pub fn run(
             &excitation_q14[loudest * subframe_length..(loudest + 1) * subframe_length],
         );
 
-        for subframe in 0..subframe_count {
-            state.smoothed_gain_q16 += smulwb(
-                control.gains_q16[subframe] - state.smoothed_gain_q16,
-                GAIN_SMOOTHING_Q16,
-            );
+        for &gain_q16 in control.gains_q16.iter().take(subframe_count) {
+            state.smoothed_gain_q16 +=
+                smulwb(gain_q16 - state.smoothed_gain_q16, GAIN_SMOOTHING_Q16);
             // "If the smoothed gain is 3 dB greater than this subframe's gain, use this subframe's
             // gain to adapt faster."
-            if smulww(state.smoothed_gain_q16, GAIN_SMOOTHING_THRESHOLD_Q16)
-                > control.gains_q16[subframe]
-            {
-                state.smoothed_gain_q16 = control.gains_q16[subframe];
+            if smulww(state.smoothed_gain_q16, GAIN_SMOOTHING_THRESHOLD_Q16) > gain_q16 {
+                state.smoothed_gain_q16 = gain_q16;
             }
         }
     }
@@ -297,9 +293,9 @@ mod tests {
         assert_eq!(state.smoothed_gain_q16, 0);
         // Equally spaced NLSFs: strictly increasing with a constant step.
         let step = i32::from(i16::MAX) / 17;
-        for index in 0..16usize {
+        for (index, &nlsf_q15) in state.smoothed_nlsf_q15.iter().enumerate().take(16) {
             assert_eq!(
-                state.smoothed_nlsf_q15[index],
+                nlsf_q15,
                 (step * (index as i32 + 1)) as i16,
                 "coefficient {index}"
             );

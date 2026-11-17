@@ -233,15 +233,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             )));
         }
         if let Some(receiver) = receiver {
-            match receiver.await {
+            match crate::mailbox::actor_reply(receiver).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     return Err(Box::new(error_result("play_media: overlay", &error)))
                 }
-                Err(_) => {
+                Err(error) => {
                     return Err(Box::new(error_result(
                         "play_media",
-                        &"media actor closed before the overlay started",
+                        &format!("media actor gave no answer ({error}) before the overlay started"),
                     )))
                 }
             }
@@ -434,15 +434,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ) {
             return error_result("stop_media", &"call has no active media playback");
         }
-        match receiver.await {
+        match crate::mailbox::actor_reply(receiver).await {
             Ok(true) => ok_empty(),
             Ok(false) => error_result(
                 "stop_media",
                 &format!("no playback {play_id} is running on this call"),
             ),
-            Err(_) => error_result(
+            Err(error) => error_result(
                 "stop_media",
-                &"media actor closed before the stop was applied",
+                &format!("media actor gave no answer ({error}) before the stop was applied"),
             ),
         }
     }
@@ -495,15 +495,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ) {
             return error_result("set_play_gain", &"call has no active media playback");
         }
-        match receiver.await {
+        match crate::mailbox::actor_reply(receiver).await {
             Ok(true) => ok_empty(),
             Ok(false) => error_result(
                 "set_play_gain",
                 &format!("no playback {play_id} is running on this call"),
             ),
-            Err(_) => error_result(
+            Err(error) => error_result(
                 "set_play_gain",
-                &"media actor closed before the gain was applied",
+                &format!("media actor gave no answer ({error}) before the gain was applied"),
             ),
         }
     }
@@ -654,10 +654,12 @@ async fn fetch_and_start(
     ) {
         return Err("call has no media-processing actor".to_string());
     }
-    match receiver.await {
+    match crate::mailbox::actor_reply(receiver).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err("media actor closed before the playback started".to_string()),
+        Err(error) => Err(format!(
+            "media actor gave no answer ({error}) before the playback started"
+        )),
     }
 }
 
