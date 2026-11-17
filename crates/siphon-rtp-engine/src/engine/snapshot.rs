@@ -369,7 +369,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
         }
-        snapshot.version = crate::ha::CallSnapshot::version_for(call_scope, snapshot.has_floor());
+        snapshot.version =
+            crate::ha::CallSnapshot::version_for(call_scope, snapshot.floor_format());
         // For a secure call, fold in the live SRTP rollover (+ bridge flow plans, for `Srtp`). Sourced
         // from the SRTP bridge for `Srtp`, from the media actor's shared `SecureLeg` for `SrtpMedia`.
         snapshot.secure = match secure_ctx {

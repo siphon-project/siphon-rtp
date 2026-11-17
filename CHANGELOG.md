@@ -15,7 +15,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   (`"MCPTT"`, `"MCVideo"`; default `["MCPTT"]`) picks which tokens are accepted: the answer echoes the
   offered token with `a=fmtp:<token> <floor_fmtp>`, and a control section whose token is not accepted
   is declined with port 0 and never passed through. A re-offer and an HA checkpoint keep the format the
-  stream was set up with. RTCP APP names and subtypes (`MCV0`, `MCV1`, `MCV2`) stay opaque to the
+  stream was set up with; an MCVideo checkpoint carries its own snapshot version (6, scoped 7), so a
+  standby from before this release refuses it instead of restoring it as MCPTT. RTCP APP names and subtypes (`MCV0`, `MCV1`, `MCV2`) stay opaque to the
   engine, as for MCPTT. `node_info` lists `transmission_control`.
 - `profile.floor_channel_label` names the browser data channel that carries floor or transmission
   control (default `mcptt-floor`).
