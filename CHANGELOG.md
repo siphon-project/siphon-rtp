@@ -5,6 +5,29 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Added
+
+- **Media SRTCP keys for a `media: preserve` forwarding room.** 3GPP TS 33.180 §9.4.1 protects all
+  RTCP, media RTCP included, hop by hop under each client's key (§9.4.2, §9.4.6; AEAD_AES_128_GCM,
+  §9.4.8), while the media stays end to end (§5.2.1). A seat given `profile.media_srtcp_keys` (the
+  `floor_keys` shape, at most two) or `set_floor_keys` with the new `stream: "audio"` (the default
+  `floor` is left off the wire, so existing frames are unchanged) has its audio RTCP opened under its
+  key: what does not authenticate is dropped and counted (`media_srtcp_refused`), what does is read like
+  a translating room reads it, and its APP parts surface as `rtcp_app` events with stream `audio`. A
+  keyed talker's RTCP is sealed again for each receiver under that receiver's own key; a receiver with
+  no key is sent nothing of it, never plaintext (`media_srtcp_unkeyed_receiver`). A keyed receiver's RTCP
+  is consumed. `send_rtcp_app` with `stream: "audio"` to a keyed seat is protected under its key. A seat
+  without keys is forwarded exactly as before. The keys are refused in a translate room, a mixing room
+  and on a two-party call. `node_info` lists `forward_preserve_media_srtcp`; the bench has
+  `per_inbound_srtcp_preserve`.
+
+### Fixed
+
+- The preserve room end-to-end tests (`engine/tests/forward_preserve.rs`) were not part of the test
+  build; they are now.
+
 ## [0.20.0] — 2026-11-17
 
 ### Added

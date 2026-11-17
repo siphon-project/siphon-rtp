@@ -573,8 +573,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 conference_id,
                 from_tag,
                 keys,
+                stream,
             } => {
-                self.set_floor_keys(client, call_id, conference_id, &from_tag, &keys)
+                self.set_floor_keys(client, call_id, conference_id, &from_tag, &keys, stream)
                     .await
             }
             Command::AttachWsTee {

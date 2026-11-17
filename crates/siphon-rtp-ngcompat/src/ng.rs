@@ -501,6 +501,7 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         // MCPTT floor control is a native-protocol feature; rtpengine's NG has no such key.
         floor_fmtp: None,
         floor_keys: vec![],
+        media_srtcp_keys: vec![],
         key_mgmt: None,
         transmission_control_formats: vec![],
         floor_channel_label: None,

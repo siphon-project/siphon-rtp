@@ -235,29 +235,57 @@ fn read_report_blocks(body: &[u8], count: usize) -> Vec<ReportBlock> {
     reports
 }
 
+/// One packet of a compound RTCP datagram: its header fields and body (RFC 3550 §6.4).
+struct Part<'a> {
+    report_count: usize,
+    packet_type: u8,
+    body: &'a [u8],
+}
+
+/// The packet of `buffer` at `offset`, header-checked, and where the next one starts.
+fn part_at(buffer: &[u8], offset: usize) -> Result<(Part<'_>, usize), RtcpError> {
+    if buffer.len() - offset < 4 {
+        return Err(RtcpError::TooShort);
+    }
+    let header = &buffer[offset..];
+    let version = header[0] >> 6;
+    if version != 2 {
+        return Err(RtcpError::BadVersion(version));
+    }
+    let length_words = u16::from_be_bytes([header[2], header[3]]) as usize;
+    let packet_len = (length_words + 1) * 4;
+    if offset + packet_len > buffer.len() {
+        return Err(RtcpError::BadLength);
+    }
+    let part = Part {
+        report_count: (header[0] & 0x1F) as usize,
+        packet_type: header[1],
+        body: &buffer[offset + 4..offset + packet_len],
+    };
+    Ok((part, offset + packet_len))
+}
+
+/// The reception report blocks of an SR or RR part, empty for any other packet.
+fn blocks_of<'a>(part: &Part<'a>) -> (&'a [u8], usize) {
+    match part.packet_type {
+        packet_type::SENDER_REPORT if part.body.len() >= 24 => {
+            (&part.body[24..], part.report_count)
+        }
+        packet_type::RECEIVER_REPORT if part.body.len() >= 4 => {
+            (&part.body[4..], part.report_count)
+        }
+        _ => (&[], 0),
+    }
+}
+
 /// Parse a (possibly compound) RTCP packet into its constituent reports.
 pub fn parse_compound(buffer: &[u8]) -> Result<Vec<RtcpPacket>, RtcpError> {
     let mut packets = Vec::new();
     let mut offset = 0;
     while offset < buffer.len() {
-        if buffer.len() - offset < 4 {
-            return Err(RtcpError::TooShort);
-        }
-        let header = &buffer[offset..];
-        let version = header[0] >> 6;
-        if version != 2 {
-            return Err(RtcpError::BadVersion(version));
-        }
-        let report_count = (header[0] & 0x1F) as usize;
-        let packet_type = header[1];
-        let length_words = u16::from_be_bytes([header[2], header[3]]) as usize;
-        let packet_len = (length_words + 1) * 4;
-        if offset + packet_len > buffer.len() {
-            return Err(RtcpError::BadLength);
-        }
-        let body = &buffer[offset + 4..offset + packet_len];
-
-        match packet_type {
+        let (part, next) = part_at(buffer, offset)?;
+        let body = part.body;
+        match part.packet_type {
             packet_type::SENDER_REPORT if body.len() >= 24 => {
                 packets.push(RtcpPacket::SenderReport(SenderReport {
                     ssrc: be32(&body[0..4]),
@@ -266,20 +294,55 @@ pub fn parse_compound(buffer: &[u8]) -> Result<Vec<RtcpPacket>, RtcpError> {
                     rtp_timestamp: be32(&body[12..16]),
                     packet_count: be32(&body[16..20]),
                     octet_count: be32(&body[20..24]),
-                    reports: read_report_blocks(body.get(24..).unwrap_or(&[]), report_count),
+                    reports: read_report_blocks(body.get(24..).unwrap_or(&[]), part.report_count),
                 }));
             }
             packet_type::RECEIVER_REPORT if body.len() >= 4 => {
                 packets.push(RtcpPacket::ReceiverReport(ReceiverReport {
                     ssrc: be32(&body[0..4]),
-                    reports: read_report_blocks(body.get(4..).unwrap_or(&[]), report_count),
+                    reports: read_report_blocks(body.get(4..).unwrap_or(&[]), part.report_count),
                 }));
             }
             other => packets.push(RtcpPacket::Other { packet_type: other }),
         }
-        offset += packet_len;
+        offset = next;
     }
     Ok(packets)
+}
+
+/// Hand every reception report block of the SR and RR packets of a (possibly compound) datagram to
+/// `visit`, in order, without allocating (the walk [`parse_compound`] makes, minus the vectors).
+///
+/// The whole datagram is checked first: when any packet in it is malformed nothing is visited and
+/// the same error [`parse_compound`] gives is returned.
+///
+/// # Errors
+/// [`RtcpError`] for a datagram [`parse_compound`] refuses.
+pub fn for_each_report_block(
+    buffer: &[u8],
+    mut visit: impl FnMut(&ReportBlock),
+) -> Result<(), RtcpError> {
+    let mut offset = 0;
+    while offset < buffer.len() {
+        offset = part_at(buffer, offset)?.1;
+    }
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let (part, next) = part_at(buffer, offset)?;
+        let (blocks, count) = blocks_of(&part);
+        for index in 0..count {
+            let start = index * REPORT_BLOCK_LEN;
+            match blocks
+                .get(start..start + REPORT_BLOCK_LEN)
+                .and_then(ReportBlock::parse)
+            {
+                Some(block) => visit(&block),
+                None => break,
+            }
+        }
+        offset = next;
+    }
+    Ok(())
 }
 
 /// Length of an APP packet with no application data: header word, SSRC, name (RFC 3550 §6.7).
@@ -960,6 +1023,80 @@ mod tests {
         );
     }
 
+    fn blocks_by_parse_compound(buffer: &[u8]) -> Option<Vec<ReportBlock>> {
+        let packets = parse_compound(buffer).ok()?;
+        Some(
+            packets
+                .into_iter()
+                .flat_map(|packet| match packet {
+                    RtcpPacket::SenderReport(report) => report.reports,
+                    RtcpPacket::ReceiverReport(report) => report.reports,
+                    RtcpPacket::Other { .. } => Vec::new(),
+                })
+                .collect(),
+        )
+    }
+
+    fn blocks_by_walk(buffer: &[u8]) -> Option<Vec<ReportBlock>> {
+        let mut blocks = Vec::new();
+        for_each_report_block(buffer, |block| blocks.push(*block)).ok()?;
+        Some(blocks)
+    }
+
+    #[test]
+    fn for_each_report_block_visits_what_parse_compound_returns() {
+        let report = ReceptionReport {
+            ssrc: 0xAABB_CCDD,
+            cumulative_lost: 5,
+            extended_highest_seq: 0x0001_2345,
+            ..ReceptionReport::default()
+        };
+        let mut buffer = [0u8; 128];
+        let mut len = write_sender_report(
+            0x1111_2222,
+            0,
+            0x0000_1000,
+            100,
+            16_000,
+            &[report, report],
+            &mut buffer,
+        )
+        .expect("write");
+        len += write_app(3, 0x1111_2222, *b"TEST", &[0; 4], &mut buffer[len..]).expect("app");
+        let walked = blocks_by_walk(&buffer[..len]).expect("well formed");
+        assert_eq!(walked.len(), 2);
+        assert_eq!(walked, blocks_by_parse_compound(&buffer[..len]).unwrap());
+        // A receiver report carries its blocks too, and a datagram with none yields none.
+        let mut rr = [0x81, 201, 0, 7, 0, 0, 0, 1].to_vec();
+        rr.extend_from_slice(&[0u8; 24]);
+        assert_eq!(blocks_by_walk(&rr).unwrap().len(), 1);
+        assert_eq!(blocks_by_walk(&FLOOR_REQUEST), Some(Vec::new()));
+    }
+
+    #[test]
+    fn for_each_report_block_visits_nothing_of_a_malformed_datagram() {
+        let mut buffer = [0u8; 128];
+        let len = write_sender_report(1, 0, 0, 0, 0, &[ReceptionReport::default()], &mut buffer)
+            .expect("write");
+        // A good SR followed by a packet whose length runs past the datagram.
+        let mut bad = buffer[..len].to_vec();
+        bad.extend_from_slice(&[0x80, 204, 0x00, 0x09, 1, 2, 3, 4]);
+        assert_eq!(
+            for_each_report_block(&bad, |_| panic!("visited")),
+            Err(RtcpError::BadLength)
+        );
+        assert_eq!(
+            for_each_report_block(&[0x80, 200], |_| ()),
+            Err(RtcpError::TooShort)
+        );
+        let mut version = buffer[..len].to_vec();
+        version[0] = 0x40;
+        assert_eq!(
+            for_each_report_block(&version, |_| ()),
+            Err(RtcpError::BadVersion(1))
+        );
+    }
+
     #[test]
     fn parse_compound_still_reports_app_as_other() {
         let packets = parse_compound(&FLOOR_REQUEST).expect("parse");
@@ -978,6 +1115,7 @@ mod tests {
         #[test]
         fn parsers_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
             let _ = parse_compound(&bytes);
+            prop_assert_eq!(blocks_by_walk(&bytes), blocks_by_parse_compound(&bytes));
             let _ = demux(&bytes);
             for result in app_packets(&bytes) {
                 let _ = result;

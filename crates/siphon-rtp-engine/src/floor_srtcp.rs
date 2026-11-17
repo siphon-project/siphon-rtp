@@ -14,12 +14,15 @@
 //!   layer 5h);
 //! * an unkeyed stream behaves exactly as before.
 //!
-//! The audio stream's RTCP is never protected with these keys: it is end to end under the media key.
+//! The floor keys never protect the audio stream's RTCP. A seat of a `media: preserve` forwarding
+//! room has media SRTCP keys of its own for that (3GPP TS 33.180 §9.4.1: all RTCP, media RTCP
+//! included, is protected hop by hop under each client's key), which reuse `FloorProtection` and
+//! [`master_keys`] and live in `forward::room::media_srtcp`.
 
 use std::net::SocketAddr;
 
 use siphon_rtp_datapath::RxPacket;
-use siphon_rtp_proto::{FloorKey, FLOOR_SALT_LEN};
+use siphon_rtp_proto::{FloorKey, ProfileFlags, FLOOR_SALT_LEN};
 use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
 use siphon_rtp_srtp::SrtpError;
 use zeroize::Zeroize;
@@ -70,6 +73,19 @@ pub fn master_keys(keys: &[FloorKey]) -> Result<Vec<FloorMasterKey>, String> {
         SrtcpGcmContext::new(&converted).map_err(|error| format!("floor_keys: {error}"))?;
     }
     Ok(converted)
+}
+
+/// `media_srtcp_keys` protect the forwarded audio RTCP of a `media: preserve` forwarding-room seat
+/// (3GPP TS 33.180 §9.4.1, [`crate::forward`]). A two-party call or a mixing room terminates its
+/// media and writes its own RTCP, so a key there would silently protect nothing: refused.
+///
+/// # Errors
+/// The reason string, ready to return as a `CmdResult::Error`.
+pub(crate) fn refuse_media_srtcp_keys(profile: &ProfileFlags) -> Result<(), String> {
+    if profile.media_srtcp_keys.is_empty() {
+        return Ok(());
+    }
+    Err("media_srtcp_keys apply to a media: preserve forwarding room seat only".to_string())
 }
 
 /// The SRTCP state of one keyed floor stream: the GCM context, the key set it was built from (for an

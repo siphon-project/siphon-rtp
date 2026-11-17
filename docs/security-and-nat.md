@@ -1123,6 +1123,51 @@ the routing order is unchanged: bridge → media → text → udptl → ws → c
   decoder refuses, or a frame of an unexpected length, is dropped and counted (`transcode_dropped`); it
   never reaches another seat. Nothing is allocated per packet, so a hostile source cannot grow memory.
 
+### Layer 5c-iii: Preserve rooms (end-to-end SRTP, hop-by-hop SRTCP)
+A forwarding room created with `"media": "preserve"` forwards the talker's media untouched, so it
+runs the layer-2 gate, the pending-seat refusals and the constrained SSRC latch of 5c-ii and then
+stops short of the translator. Two different things are protected, on two different hops
+(3GPP TS 33.180):
+
+- **The media is end to end** (§5.2.1, §7.5.2 NOTE 3). The UEs key their own SRTP and SRTP
+  authenticates the SSRC and sequence number (RFC 3711 §3.3), so the engine, which holds no key,
+  hands the talker's datagram on byte for byte and cannot verify its tag. What bounds who can feed the
+  room is therefore the source gate and the controller's choice of source, nothing cryptographic: a
+  seat that offers `a=crypto` or DTLS-SRTP is refused, because the engine would have to terminate
+  what the room forwards end to end. Only the cleartext RTP header (RFC 3711 §3.1) is read, to demux
+  (RFC 5761 §4) and to check the payload type. The engine writes no SR, RR or BYE toward a seat: a
+  report under an SSRC the receivers never saw would describe a stream that does not exist (RFC 3550
+  §7.3).
+- **The RTCP is hop by hop** (§9.4.1: all RTCP, media RTCP included, is protected between each
+  client and the server under that client's own key; §9.4.2 whose key, §9.4.6 how it is derived,
+  §9.4.8 the profile: `AEAD_AES_128_GCM` SRTCP, RFC 7714, 32-bit MKI). A seat given
+  `profile.media_srtcp_keys` (or `set_floor_keys` with `stream: audio`) is a hop of this kind:
+  - **Authenticate first.** Its audio RTCP is opened under a held key before anything is read. A
+    plaintext datagram, an unknown MKI, a failed tag and a replay (RFC 3711 §3.3.2, recorded only
+    after the tag verified) are dropped, counted per seat (`media_srtcp_refused`) and logged through
+    the rate-limited refusal log (a replay at `debug` only). Nothing unauthenticated reaches the
+    controller or another seat, and a refused datagram is not liveness.
+  - **Then read, as a translating room does.** What authenticated feeds the seat's report
+    statistics, and an APP part is surfaced to the controller (`rtcp_app`, stream `audio`).
+  - **A keyed talker's RTCP is resealed, never relayed as it came.** It is sealed again for each
+    receiver under that receiver's own newest key (E=1, RFC 7714 §9.2), each with its own index, so no
+    GCM IV is reused (§9.4). A receiver holding no media key is sent nothing of it, never the
+    plaintext (`media_srtcp_unkeyed_receiver`). The plaintext lives in the room's own buffer for the
+    duration of one fan-out and is never allocated per packet.
+  - **A keyed receiver's RTCP is consumed**, not forwarded (`receiver_rtcp_dropped` still counts it).
+  - **An unkeyed seat is unchanged.** An unkeyed talker's audio SRTCP is still forwarded byte for
+    byte and never parsed (its body is encrypted, and a receiver's report would describe a stream the
+    others never saw); an unkeyed receiver's RTCP is dropped.
+  - **Only the preserve room has this.** A translate room, a mixing room and a two-party call write
+    their own RTCP, so a key there would silently protect nothing: `media_srtcp_keys` is refused
+    with a reason before anything is allocated. `send_rtcp_app` with `stream: audio` to a keyed
+    preserve seat is sealed under that seat's media key.
+  - **The keys are the controller's.** The engine applies them (newest two accepted, the last
+    protects outbound; a rekey keeps an unchanged key's replay state and the send index never moves
+    back); the MIKEY exchange (§9.4.6) belongs to the controller. The floor keys of
+    `profile.floor_keys` protect the floor stream only and are never used here, and these never
+    protect the floor stream.
+
 ### Layer 5f — The RFC 4103 Real-Time Text (RTT) relay path
 A VoLTE/IMS call may carry a second media stream: an `m=text` line (RFC 4103, T.140 over RTP, usually
 RFC 2198 RED-wrapped) alongside the audio. The engine parses it (section-aware SDP), anchors it to a
@@ -1288,8 +1333,8 @@ never offers it.
   (`set_floor_keys` replaces the set; an unchanged key keeps its replay state and the send index
   never moves back, because a reused (key, index) pair reuses the GCM IV, RFC 7714 §9.4). An
   unkeyed stream behaves exactly as before. The floor keys are never used on the audio stream's
-  RTCP, which is end to end under the media key, and a floor data channel is protected by its DTLS
-  association instead. The engine applies keys; the MIKEY-SAKKE exchange (§9.4.6) belongs to the
+  RTCP (a preserve seat's audio RTCP has keys of its own, `media_srtcp_keys`, Layer 5c-iii), and a
+  floor data channel is protected by its DTLS association instead. The engine applies keys; the MIKEY-SAKKE exchange (§9.4.6) belongs to the
   controller.
 - **Never forward into the void.** `send_rtcp_app` to a seat whose floor destination is not yet known
   (no address, or the seat not open yet) is refused for that seat, never guessed.

@@ -6,9 +6,12 @@
 //! knows the very next floor packet in either direction is under it. The set REPLACES the stream's:
 //! the newest two are accepted, outbound uses the last, and an unkeyed stream becomes protected.
 //! An empty set removes the protection.
+//!
+//! `stream: audio` addresses the media SRTCP keys of a seat of a `media: preserve` forwarding room
+//! instead (3GPP TS 33.180 §9.4.1); a two-party call has none, so it is refused there.
 
 use siphon_rtp_datapath::Datapath;
-use siphon_rtp_proto::{CmdResult, FloorKey};
+use siphon_rtp_proto::{CmdResult, FloorKey, RtcpAppStream};
 
 use super::{error_result, ok_empty, ClientId, Engine};
 
@@ -22,6 +25,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         conference_id: Option<String>,
         from_tag: &str,
         keys: &[FloorKey],
+        stream: RtcpAppStream,
     ) -> CmdResult {
         let master = match crate::floor_srtcp::master_keys(keys) {
             Ok(master) => master,
@@ -33,6 +37,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"name either call_id or conference_id, not both",
             ),
             (None, None) => error_result("set_floor_keys", &"name a call_id or a conference_id"),
+            (Some(_), None) if stream == RtcpAppStream::Audio => error_result(
+                "set_floor_keys",
+                &"media SRTCP keys (stream audio) apply to a media: preserve forwarding room only",
+            ),
             (Some(call_id), None) => {
                 if self.owned_call(client, &call_id, |_| ()).is_none() {
                     return super::unknown_call(&call_id);
@@ -51,7 +59,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 match self
                     .conference
                     .forward()
-                    .set_floor_keys(&room_id, from_tag, master)
+                    .set_floor_keys(&room_id, from_tag, master, stream)
                     .await
                 {
                     Ok(()) => ok_empty(),

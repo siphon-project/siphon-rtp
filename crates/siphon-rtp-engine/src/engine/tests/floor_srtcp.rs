@@ -185,6 +185,7 @@ async fn set_keys(
                 conference_id: call_id.is_none().then(|| ROOM.to_string()),
                 from_tag: tag.into(),
                 keys,
+                stream: RtcpAppStream::Floor,
             },
         )
         .await
@@ -402,6 +403,7 @@ async fn set_floor_keys_switches_an_unkeyed_seat_to_protected_and_refuses_what_i
                     conference_id: Some("no-such-room".into()),
                     from_tag: "a".into(),
                     keys: vec![late.clone()],
+                    stream: RtcpAppStream::Floor,
                 },
             )
             .await,
@@ -653,6 +655,7 @@ async fn set_floor_keys_on_a_call_rekeys_one_leg_and_is_scoped_to_the_owner() {
                 conference_id: None,
                 from_tag: "tag-a".into(),
                 keys: vec![k2.clone()],
+                stream: RtcpAppStream::Floor,
             },
         )
         .await;
