@@ -133,18 +133,8 @@ pub(crate) fn consume_rtcp(data: &[u8], mut consume: impl FnMut(RtcpItem<'_>)) {
             consume(RtcpItem::SenderReportNtp(u64::from_be_bytes(ntp_bytes)));
         }
     }
-    if let Ok(packets) = rtcp::parse_compound(data) {
-        for packet in &packets {
-            let blocks = match packet {
-                rtcp::RtcpPacket::SenderReport(report) => report.reports.as_slice(),
-                rtcp::RtcpPacket::ReceiverReport(report) => report.reports.as_slice(),
-                rtcp::RtcpPacket::Other { .. } => &[],
-            };
-            for block in blocks {
-                consume(RtcpItem::Block(block));
-            }
-        }
-    }
+    // A malformed datagram yields nothing; a well-formed one is walked without allocating.
+    let _ = rtcp::for_each_report_block(data, |block| consume(RtcpItem::Block(block)));
 }
 
 #[cfg(test)]

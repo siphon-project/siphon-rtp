@@ -89,6 +89,9 @@ pub enum FloorKeysError {
     /// The SRTP layer refused the key set.
     #[error("{0}")]
     Keys(String),
+    /// Media SRTCP keys belong to a seat of a `media: preserve` room; this room translates.
+    #[error("media SRTCP keys apply to a media: preserve forwarding room only")]
+    NotPreserving,
 }
 
 /// Which seats a [`ForwardRoom::send_app`] addresses.
@@ -262,7 +265,8 @@ impl ForwardRoom {
     /// stream has no floor control to send), minus the excepted ones. A seat that has the stream but
     /// cannot be reached yet (never sent into the void: no destination, ICE or DTLS pending) is not
     /// sent to and is named in the error; the rest are still sent. An audio-stream packet is
-    /// SRTCP-protected on a secure seat (RFC 3711 §3.4) under the seat's media key. A floor packet is
+    /// SRTCP-protected on a secure seat (RFC 3711 §3.4) under the seat's media key, or on a keyed
+    /// preserving seat under its media SRTCP keys ([`Self::set_media_srtcp_keys`]). A floor packet is
     /// protected only when the seat's floor stream is keyed, with AEAD_AES_128_GCM under the floor
     /// keys (RFC 7714 §9.2; 3GPP TS 33.180 §9.4.1), and never with the media key.
     ///
@@ -352,8 +356,20 @@ impl ForwardRoom {
                     }
                 }
                 RtcpAppStream::Audio => {
-                    let wire: &[u8] = match seat.secure.as_mut() {
-                        Some(secure) => {
+                    // A preserving seat's media RTCP is protected under its media keys when it has
+                    // any (3GPP TS 33.180 §9.4.1); otherwise it is sent as it is built.
+                    let wire: &[u8] = match (seat.media_srtcp.as_mut(), seat.secure.as_mut()) {
+                        (Some(protection), _) => {
+                            if protection
+                                .seal(&self.scratch[..length], &mut self.secure_out)
+                                .is_err()
+                            {
+                                push_failure(&mut failures, &seat.tag, "SRTCP protect failed");
+                                continue;
+                            }
+                            &self.secure_out
+                        }
+                        (None, Some(secure)) => {
                             self.secure_out.clear();
                             if secure
                                 .protect(&self.scratch[..length], &mut self.secure_out)
@@ -364,7 +380,7 @@ impl ForwardRoom {
                             }
                             &self.secure_out
                         }
-                        None => &self.scratch[..length],
+                        (None, None) => &self.scratch[..length],
                     };
                     emit(seat.endpoint, seat.egress_destination, wire);
                 }

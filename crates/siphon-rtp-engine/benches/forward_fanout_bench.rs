@@ -25,13 +25,24 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::forward::{ForwardRoom, ForwardSeatConfig, RoomCodec};
 use siphon_rtp_engine::sdp;
+use siphon_rtp_media::rtcp;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader};
 use siphon_rtp_proto::ForwardMedia;
+use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
 
 /// An AMR-WB octet-aligned 20 ms frame at mode 8 (23.85 kbit/s): 1 + 61 octets.
 const PAYLOAD_BYTES: usize = 62;
 
+/// Seat `index`'s media SRTCP key (3GPP TS 33.180 §9.4.1): the MKI is the seat number.
+fn media_key(index: usize) -> FloorMasterKey {
+    FloorMasterKey::from_salt_96(index as u32, [index as u8; 16], &[0x5A ^ index as u8; 12])
+}
+
 fn room_of(seats: usize, media: ForwardMedia) -> ForwardRoom {
+    room_keyed(seats, media, false)
+}
+
+fn room_keyed(seats: usize, media: ForwardMedia, keyed: bool) -> ForwardRoom {
     let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
                  m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
     let codecs = sdp::parse(offer).unwrap().audio_codecs();
@@ -58,6 +69,11 @@ fn room_of(seats: usize, media: ForwardMedia) -> ForwardRoom {
                 initial_timestamp: 0,
                 floor: None,
                 app_events: None,
+                media_srtcp: if keyed {
+                    vec![media_key(index)]
+                } else {
+                    Vec::new()
+                },
             },
             0,
         )
@@ -127,5 +143,61 @@ fn bench_mode(
     }
 }
 
-criterion_group!(benches, fan_out);
+/// What one inbound audio SRTCP datagram of a keyed talker costs a preserving room: one `open` under
+/// the talker's key, then one `seal` per receiver under that receiver's own (3GPP TS 33.180
+/// §9.4.1). Each datagram needs a fresh SRTCP index, or the replay window refuses it, so a chunk
+/// of them is sealed by the talker's phone outside the timed loop.
+fn srtcp_fan_out(criterion: &mut Criterion) {
+    const CHUNK: usize = 1024;
+    let mut group = criterion.benchmark_group("forward_fan_out");
+    for seats in [10usize, 100, 500, 1000] {
+        let mut room = room_keyed(seats, ForwardMedia::Preserve, true);
+        let mut talker = SrtcpGcmContext::new(&[media_key(0)]).unwrap();
+        let mut plain = [0u8; 128];
+        let length =
+            rtcp::write_sender_report(0xA0A0_A0A0, 0, 320, 1, 62, &[], &mut plain).unwrap();
+        let mut next_packet = move || {
+            let mut wire = Vec::new();
+            talker.protect(&plain[..length], true, &mut wire).unwrap();
+            RxPacket {
+                endpoint: EndpointId(1),
+                source: "192.0.2.1:4000".parse().unwrap(),
+                arrival: 1_000_000,
+                data: Bytes::from(wire),
+            }
+        };
+        let warm = next_packet();
+        room.ingest(&warm);
+        while room.next_datagram(&warm).is_some() {}
+        group.throughput(Throughput::Elements(seats as u64 - 1));
+        group.bench_function(
+            BenchmarkId::new("per_inbound_srtcp_preserve", seats),
+            |bencher| {
+                bencher.iter_custom(|iterations| {
+                    let mut elapsed = std::time::Duration::ZERO;
+                    let mut remaining = iterations as usize;
+                    while remaining > 0 {
+                        let chunk: Vec<RxPacket> =
+                            (0..remaining.min(CHUNK)).map(|_| next_packet()).collect();
+                        remaining -= chunk.len();
+                        let started = std::time::Instant::now();
+                        for packet in &chunk {
+                            room.ingest(black_box(packet));
+                            let mut forwarded = 0usize;
+                            while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                                forwarded += black_box(datagram).len();
+                            }
+                            black_box(forwarded);
+                        }
+                        elapsed += started.elapsed();
+                    }
+                    elapsed
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, fan_out, srtcp_fan_out);
 criterion_main!(benches);

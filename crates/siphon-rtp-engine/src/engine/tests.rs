@@ -60,6 +60,7 @@ mod floor_srtcp;
 mod forward_floor;
 mod forward_offer_turn_relay;
 mod forward_offer_webrtc;
+mod forward_preserve;
 mod forward_room;
 mod forward_stream_identity;
 mod multi_source_recording;

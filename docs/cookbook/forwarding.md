@@ -392,17 +392,33 @@ The first seat fixes the mode; a later join or offer in the other mode is refuse
   verbs). The engine never copies the offerer's line, never invents one and never drops yours. A
   `forward_offer` into a preserve room with `key_mgmt` offers `RTP/SAVP`, and the member must answer
   `RTP/SAVP` without `a=crypto`. `key_mgmt` is refused in a translate room (the translator would break the end-to-end SRTP it sets up), so a secured group call needs `media: preserve`.
-- RTCP: no engine SR, RR or BYE toward any seat, at room start or later. The talker's audio SRTCP is
-  forwarded byte for byte with its RTP; receivers' audio RTCP is dropped (`receiver_rtcp_dropped`). The
-  engine cannot read SRTCP, so RTCP APP is surfaced from the floor stream only.
+- RTCP: no engine SR, RR or BYE toward any seat, at room start or later. A seat without media keys
+  has its audio SRTCP forwarded byte for byte with its RTP when it talks and dropped when it listens
+  (`receiver_rtcp_dropped`); the engine cannot read it, so RTCP APP is surfaced from the floor stream
+  only. A seat with `profile.media_srtcp_keys` (a few lines down) is a protected hop instead.
+- Media SRTCP keys: 3GPP TS 33.180 §9.4.1 protects all RTCP, media RTCP included, between each client
+  and the server under that client's own key (§9.4.2, §9.4.6; `AEAD_AES_128_GCM`, §9.4.8), while the
+  media stays end to end (§5.2.1). Give a seat `"media_srtcp_keys": [{"mki", "key", "salt"}, ...]` (the
+  `floor_keys` shape, at most two) on `forward_join` / `forward_offer`, or set them later with
+  `set_floor_keys` and `"stream": "audio"` (replace semantics as for the floor keys). The engine then
+  opens that seat's audio RTCP under its key and drops what does not authenticate
+  (`media_srtcp_refused`). A keyed talker's RTCP is sealed again for each receiver under that
+  receiver's own key; a receiver with no media key is sent nothing of it, never plaintext
+  (`media_srtcp_unkeyed_receiver`), so key every seat of a room that has a keyed talker. A keyed
+  receiver's RTCP is read and not forwarded. APP parts of the audio RTCP of a keyed seat surface as
+  `rtcp_app` events with stream `audio`, and `send_rtcp_app` with `"stream": "audio"` to it is
+  protected under its key. Keys are refused in a translate room, in a mixing room and on a two-party
+  call. `node_info` lists `forward_preserve_media_srtcp`.
 - `forward_set_source`, `forward_source_started` (once per switch), `forward_seat_inactive` and the idle
   backstop behave as in a translating room. `node_info` lists `forward_preserve`.
 - Fan-out is a copy-free loop over the receivers. `cargo bench -p siphon-rtp --bench forward_fanout_bench`
-  has `per_inbound_packet_preserve` beside `per_inbound_packet`.
+  has `per_inbound_packet_preserve` beside `per_inbound_packet`, and `per_inbound_srtcp_preserve` for the
+  one `open` plus one `seal` per receiver a keyed talker's RTCP costs (no allocation, same bench).
 
 The engine cannot verify the SRTP tag in a preserve room (it has no key), so the source-address gate and
 the controller's choice of source are what bound who can send: see
-[the security model](../security-and-nat.md) (preserve rooms).
+[the security model](../security-and-nat.md#layer-5c-iii-preserve-rooms-end-to-end-srtp-hop-by-hop-srtcp)
+(preserve rooms).
 
 ## Security and NAT
 

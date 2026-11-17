@@ -17,7 +17,7 @@ use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket};
 
 use crate::floor_channel::FloorChannelHandle;
 use crate::media_pipeline::Outbound;
-use siphon_rtp_proto::{Event, ForwardMedia};
+use siphon_rtp_proto::{Event, ForwardMedia, RtcpAppStream};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::srtcp_gcm::FloorMasterKey;
 use std::net::SocketAddr;
@@ -105,10 +105,12 @@ pub enum ForwardControl {
         request: Box<AppRequest>,
         reply: tokio::sync::oneshot::Sender<Result<(), AppSendError>>,
     },
-    /// Replace a seat's floor SRTCP keys; the verdict goes back once the room applied them.
+    /// Replace a seat's floor SRTCP keys, or with `stream: audio` its media SRTCP keys (a
+    /// preserving room); the verdict goes back once the room applied them.
     SetFloorKeys {
         tag: String,
         keys: Vec<FloorMasterKey>,
+        stream: RtcpAppStream,
         reply: tokio::sync::oneshot::Sender<Result<(), FloorKeysError>>,
     },
     /// Install a DTLS seat's key.
@@ -564,8 +566,9 @@ impl ForwardRegistry {
         }
     }
 
-    /// Replace the floor SRTCP keys of seat `tag` in `room_id` and wait until the room applied
-    /// them: every datagram after the answer is protected (or verified) under the new set.
+    /// Replace the floor SRTCP keys of seat `tag` in `room_id` (`stream: audio`: its media SRTCP
+    /// keys) and wait until the room applied them: every datagram after the answer is protected (or
+    /// verified) under the new set.
     ///
     /// # Errors
     /// [`ForwardRefusal::UnknownRoom`], or the seat's refusal ([`ForwardRefusal::FloorKeys`]).
@@ -574,6 +577,7 @@ impl ForwardRegistry {
         room_id: &str,
         tag: &str,
         keys: Vec<FloorMasterKey>,
+        stream: RtcpAppStream,
     ) -> Result<(), ForwardRefusal> {
         let Some(mailbox) = self.rooms.get(room_id).map(|room| room.mailbox.clone()) else {
             return Err(ForwardRefusal::UnknownRoom(room_id.to_string()));
@@ -583,6 +587,7 @@ impl ForwardRegistry {
             .try_send(ForwardInput::Control(ForwardControl::SetFloorKeys {
                 tag: tag.to_string(),
                 keys,
+                stream,
                 reply,
             }))
             .map_err(|_| ForwardRefusal::NoVerdict)?;
@@ -763,8 +768,11 @@ async fn run_forward_room<D: Datapath>(
                             send_app(&mut room, &datapath, &mut outbound, &target, &request).await,
                         );
                     }
-                    ForwardInput::Control(ForwardControl::SetFloorKeys { tag, keys, reply }) => {
-                        let _ = reply.send(room.set_floor_keys(&tag, &keys));
+                    ForwardInput::Control(ForwardControl::SetFloorKeys { tag, keys, stream, reply }) => {
+                        let _ = reply.send(match stream {
+                            RtcpAppStream::Floor => room.set_floor_keys(&tag, &keys),
+                            RtcpAppStream::Audio => room.set_media_srtcp_keys(&tag, &keys),
+                        });
                     }
                     ForwardInput::Control(ForwardControl::AttachSecureLeg { tag, leg }) => {
                         room.attach_secure_leg(&tag, *leg);
