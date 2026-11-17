@@ -40,15 +40,19 @@ use crate::floor_srtcp::FloorProtection;
 use crate::ingress::{Ingress, RefusalLog};
 use crate::media_pipeline::Outbound;
 use crate::reply_latch::SymmetricLatch;
+use crate::sdp::video::VIDEO_CLOCK_RATE_HZ;
 use crate::sdp::TelephoneEvent;
 use crate::seat_gate::{self, SeatGate};
 
 mod app;
 mod media_srtcp;
+mod video;
 
 pub(crate) use app::push_failure;
 use app::FloorStream;
 pub use app::{AppRequest, AppSendError, AppTarget, FloorConfig, FloorKeysError};
+pub use video::VideoConfig;
+use video::VideoStream;
 
 /// The most seats one forwarding room holds. A group call's fan-out is one translate per receiver
 /// per packet, so the cap is a statement of what one actor is benchmarked to carry
@@ -111,6 +115,8 @@ pub struct ForwardSeatConfig {
     /// `media_srtcp`); empty leaves it forwarded as it is. The last protects what the room sends,
     /// the newest two are accepted.
     pub media_srtcp: Vec<FloorMasterKey>,
+    /// The seat's video stream (3GPP TS 24.281 §6.2), when its offer carried one the engine took.
+    pub video: Option<VideoConfig>,
 }
 
 /// What the room counted about one seat, for logs and stats.
@@ -143,6 +149,17 @@ pub struct ForwardSeatStats {
     /// Audio RTCP datagrams the seat sent while it was not the source, in a preserving room: counted
     /// and dropped, never read (they are SRTCP end to end).
     pub receiver_rtcp_dropped: u64,
+    /// Video RTP packets the seat sent while it was not the source: counted and dropped.
+    pub video_not_source_dropped: u64,
+    /// Video RTP packets the seat sent while it was the source but had offered receive-only video:
+    /// counted and dropped.
+    pub video_receive_only_dropped: u64,
+    /// Video RTP packets with a payload type the seat did not negotiate: dropped.
+    pub video_unknown_payload_type: u64,
+    /// Video packets the room forwarded to the seat.
+    pub video_forwarded_packets: u32,
+    /// Video payload octets the room forwarded to the seat.
+    pub video_forwarded_octets: u32,
 }
 
 struct Seat {
@@ -173,6 +190,8 @@ struct Seat {
     /// The seat's floor data channel (a browser seat, docs/control/json.md), when it negotiated one
     /// and has no UDP floor stream. Floor control to the seat is one binary message on it.
     floor_channel: Option<FloorChannelHandle>,
+    /// The seat's video stream, when it has one.
+    video: Option<VideoStream>,
     /// Reception statistics of the seat's own inbound stream, for the reception report block.
     stats: IngressStats,
     /// Middle 32 bits of the NTP timestamp of the seat's last Sender Report (our LSR), and when it
@@ -202,6 +221,15 @@ enum Port {
     Audio,
     /// The MCPTT floor-control endpoint (RTCP APP only).
     Floor,
+    /// The video endpoint (RTP and RTCP muxed).
+    Video,
+}
+
+/// Which stream the armed plan forwards.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Audio,
+    Video,
 }
 
 /// What kind of RTP the armed plan forwards.
@@ -234,6 +262,7 @@ enum Verbatim {
 /// The fan-out of one inbound packet, walked by [`ForwardRoom::next_datagram`].
 #[derive(Clone, Copy)]
 struct Plan {
+    stream: Stream,
     verbatim: Verbatim,
     source: usize,
     kind: PlanKind,
@@ -473,6 +502,10 @@ impl ForwardRoom {
             self.by_endpoint
                 .insert(floor.endpoint, (self.seats.len(), Port::Floor));
         }
+        if let Some(video) = &config.video {
+            self.by_endpoint
+                .insert(video.endpoint, (self.seats.len(), Port::Video));
+        }
         self.seats.push(Seat {
             tag: config.tag,
             endpoint: config.endpoint,
@@ -497,6 +530,9 @@ impl ForwardRoom {
             app_events: config.app_events,
             media_srtcp: FloorProtection::new(&config.media_srtcp),
             floor_channel: None,
+            video: config
+                .video
+                .map(|video| VideoStream::new(video, ticks(now_micros, VIDEO_CLOCK_RATE_HZ))),
             stats: IngressStats::new(clock_rate_hz),
             last_sender_report_ntp_middle: 0,
             last_sender_report_arrival: None,
@@ -531,6 +567,10 @@ impl ForwardRoom {
             if let Some(floor) = &seat.floor {
                 self.by_endpoint
                     .insert(floor.endpoint, (position, Port::Floor));
+            }
+            if let Some(video) = &seat.video {
+                self.by_endpoint
+                    .insert(video.endpoint, (position, Port::Video));
             }
         }
         self.plan = None;
@@ -583,6 +623,9 @@ impl ForwardRoom {
     fn switch_every_translator(&mut self) {
         for seat in &mut self.seats {
             seat.translator.switch_source();
+            if let Some(video) = seat.video.as_mut() {
+                video.switch_source();
+            }
         }
     }
 
@@ -648,6 +691,8 @@ impl ForwardRoom {
                 .translator
                 .octets_sent()
                 .wrapping_add(seat.counters.forwarded_octets),
+            video_forwarded_packets: seat.video.as_ref().map_or(0, VideoStream::packets_sent),
+            video_forwarded_octets: seat.video.as_ref().map_or(0, VideoStream::octets_sent),
             ..seat.counters
         })
     }
@@ -668,8 +713,10 @@ impl ForwardRoom {
         let Some(&(index, port)) = self.by_endpoint.get(&packet.endpoint) else {
             return Ingress::Refused;
         };
-        if port == Port::Floor {
-            return self.ingest_floor(index, packet);
+        match port {
+            Port::Floor => return self.ingest_floor(index, packet),
+            Port::Video => return self.ingest_video(index, packet),
+            Port::Audio => {}
         }
         let seat = &mut self.seats[index];
         let data = match seat_gate::admit(
@@ -739,6 +786,7 @@ impl ForwardRoom {
             return Ingress::DroppedFromPeer;
         };
         let mut plan = Plan {
+            stream: Stream::Audio,
             verbatim: Verbatim::No,
             source: index,
             kind,
@@ -824,6 +872,7 @@ impl ForwardRoom {
         let seat = &mut self.seats[index];
         let is_source = self.source == Some(index);
         let mut plan = Plan {
+            stream: Stream::Audio,
             verbatim: Verbatim::Rtcp,
             source: index,
             kind: PlanKind::Audio,
@@ -977,6 +1026,9 @@ impl ForwardRoom {
         packet: &'a RxPacket,
     ) -> Option<(EndpointId, SocketAddr, &'a [u8])> {
         let mut plan = self.plan?;
+        if plan.stream == Stream::Video {
+            return self.next_video(packet, plan);
+        }
         if plan.verbatim != Verbatim::No {
             return self.next_verbatim(packet, plan);
         }
@@ -1109,22 +1161,13 @@ impl ForwardRoom {
             if !seat.reachable() {
                 continue;
             }
-            let block;
-            let reports: &[rtcp::ReceptionReport] = if let Some(ssrc) = seat.stats.ssrc() {
-                let fraction_lost = seat.stats.fraction_lost_since_last_report();
-                block = rtcp::ReceptionReport {
-                    ssrc,
-                    fraction_lost,
-                    cumulative_lost: seat.stats.cumulative_lost(),
-                    extended_highest_seq: seat.stats.extended_highest_sequence(),
-                    jitter: seat.stats.jitter_rtp_units(),
-                    last_sr: seat.last_sender_report_ntp_middle,
-                    delay_last_sr: delay_since(seat.last_sender_report_arrival, now_micros),
-                };
-                std::slice::from_ref(&block)
-            } else {
-                &[]
-            };
+            let block = reception_block(
+                &mut seat.stats,
+                seat.last_sender_report_ntp_middle,
+                seat.last_sender_report_arrival,
+                now_micros,
+            );
+            let reports = block.as_slice();
             // On the seat's own RTP clock: a cross-codec seat's differs from the room codec's.
             let now_clock = ticks(now_micros, seat.clock_rate_hz);
             let rtp_timestamp = seat
@@ -1164,6 +1207,7 @@ impl ForwardRoom {
             // Remember the SR so a later reception report about it yields a round trip.
             seat.stats.record_sent_report(ntp_timestamp, now_micros);
         }
+        self.build_video_reports(ntp_timestamp, now_micros, out);
     }
 
     /// The round-trip time the last reception report from `tag` measured, in microseconds.
@@ -1171,6 +1215,27 @@ impl ForwardRoom {
     pub fn round_trip_micros(&self, tag: &str) -> Option<u64> {
         self.seats[self.index_of(tag)?].stats.rtt_micros()
     }
+}
+
+/// The reception report block about the stream a seat sends the room, once it has sent any: loss,
+/// jitter, and the LSR/DLSR the seat measures its round trip with (RFC 3550 §6.4.1). The one place
+/// the audio and the video reports build it.
+fn reception_block(
+    stats: &mut IngressStats,
+    last_sender_report_ntp_middle: u32,
+    last_sender_report_arrival: Option<u64>,
+    now_micros: u64,
+) -> Option<rtcp::ReceptionReport> {
+    let ssrc = stats.ssrc()?;
+    Some(rtcp::ReceptionReport {
+        ssrc,
+        fraction_lost: stats.fraction_lost_since_last_report(),
+        cumulative_lost: stats.cumulative_lost(),
+        extended_highest_seq: stats.extended_highest_sequence(),
+        jitter: stats.jitter_rtp_units(),
+        last_sr: last_sender_report_ntp_middle,
+        delay_last_sr: delay_since(last_sender_report_arrival, now_micros),
+    })
 }
 
 /// The room-codec payload of an RTP packet, empty when it does not parse.

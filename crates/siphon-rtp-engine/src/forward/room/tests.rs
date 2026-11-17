@@ -40,6 +40,7 @@ fn seat_config(index: u8) -> ForwardSeatConfig {
         floor: None,
         app_events: None,
         media_srtcp: Vec::new(),
+        video: None,
     }
 }
 
@@ -666,3 +667,4 @@ mod floor;
 mod mode_request;
 mod preserve;
 mod transcode;
+mod video;

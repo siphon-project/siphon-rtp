@@ -5,6 +5,25 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Added
+
+- **Video in a translating forwarding room (3GPP TS 24.281 §6.2).** `profile.video` (`fmtp?`,
+  `bandwidth_kbps?`) on `forward_join` and `forward_offer` carries a seat's `m=video` beside its audio
+  and transmission control stream: one video stream per seat on an engine endpoint of its own, gated and
+  latched like the audio, forwarded through a translator per receiver and stream (stable SSRC,
+  continuous sequence, 90 kHz timestamps, each receiver's own payload type). Video is never transcoded:
+  the first seat with video fixes the room's H.264 `packetization-mode` (0 or 1) and `profile-level-id`
+  (or `video.fmtp` does), and a later seat must offer the same or joins audio-only. The answer is the
+  complement of the offered direction (RFC 3264 §6.1): a `recvonly` seat is sent video and is never a
+  source, a `sendonly` seat is sent none. `forward_set_source` moves audio and video together. The
+  marker bit is the sender's and is never set at a switch (RFC 6184 §5.1). Plain RTP seats in a
+  translate room only; SRTP, browser and preserve-room video is declined with a reason. The `ok` result
+  of `forward_join` and `forward_answer` gains `streams` and `video_declined`, which is a minor bump of
+  `siphon-rtp-proto` for Rust callers that construct it. `node_info` lists `forward_video`; the bench has
+  `video_per_inbound_packet`. Keyframe requests are not acted on yet.
+
 ## [0.21.0] — 2026-11-17
 
 ### Added

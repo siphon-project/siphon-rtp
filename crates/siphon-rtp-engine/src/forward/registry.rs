@@ -17,6 +17,7 @@ use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket};
 
 use crate::floor_channel::FloorChannelHandle;
 use crate::media_pipeline::Outbound;
+use crate::sdp::video::RoomVideoFormat;
 use siphon_rtp_proto::{Event, ForwardMedia, RtcpAppStream};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::srtcp_gcm::FloorMasterKey;
@@ -152,6 +153,8 @@ struct Member {
     endpoint: EndpointId,
     /// The seat's MCPTT floor-control endpoint, when it has one.
     floor_endpoint: Option<EndpointId>,
+    /// The seat's video endpoint, when it has one.
+    video_endpoint: Option<EndpointId>,
     /// The datapath tick the member was seated, the quiet baseline before it has sent anything.
     joined_tick: u64,
     /// Where this member's [`Event::ForwardSeatInactive`] goes: the client that seated it.
@@ -163,10 +166,11 @@ struct Member {
 }
 
 impl Member {
-    /// Every endpoint the seat holds: audio first, then its floor stream.
+    /// Every endpoint the seat holds: audio first, then its floor stream, then its video.
     fn endpoints(&self) -> Vec<EndpointId> {
         let mut endpoints = vec![self.endpoint];
         endpoints.extend(self.floor_endpoint);
+        endpoints.extend(self.video_endpoint);
         endpoints
     }
 }
@@ -175,6 +179,8 @@ struct Handle {
     mailbox: flume::Sender<ForwardInput>,
     members: Vec<Member>,
     codec: RoomCodec,
+    /// The H.264 flavour of the room's video, fixed by its first seat with video.
+    video_format: Option<RoomVideoFormat>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -226,15 +232,22 @@ impl ForwardRegistry {
         self.rooms.get(room_id).map(|room| room.codec.clone())
     }
 
+    /// The video format of an existing room, once a seat with video has fixed it, so a join can be
+    /// judged against it before anything is allocated.
+    #[must_use]
+    pub fn room_video_format(&self, room_id: &str) -> Option<RoomVideoFormat> {
+        self.rooms
+            .get(room_id)
+            .and_then(|room| room.video_format.clone())
+    }
+
     /// The room and tag of the seat on `endpoint`.
     #[must_use]
     pub fn seat_at(&self, endpoint: EndpointId) -> Option<(String, String)> {
         self.rooms.iter().find_map(|room| {
             room.members
                 .iter()
-                .find(|member| {
-                    member.endpoint == endpoint || member.floor_endpoint == Some(endpoint)
-                })
+                .find(|member| member.endpoints().contains(&endpoint))
                 .map(|member| (room.key().clone(), member.tag.clone()))
         })
     }
@@ -356,11 +369,14 @@ impl ForwardRegistry {
     {
         let endpoint = config.endpoint;
         let floor_endpoint = config.floor.as_ref().map(|floor| floor.endpoint);
+        let video_endpoint = config.video.as_ref().map(|video| video.endpoint);
+        let video_format = config.video.as_ref().map(|video| video.format.clone());
         let tag = config.tag.clone();
         let member = Member {
             tag: tag.clone(),
             endpoint,
             floor_endpoint,
+            video_endpoint,
             joined_tick,
             events,
             reported_quiet_since: None,
@@ -389,6 +405,7 @@ impl ForwardRegistry {
                     mailbox,
                     members: Vec::new(),
                     codec: proposed,
+                    video_format: None,
                     task,
                 }
             });
@@ -414,8 +431,19 @@ impl ForwardRegistry {
                 ),
                 Admission::Transcoded { .. } => Ok(()),
             };
+            // The first seat with video fixes the room's video format, and a later one is held to
+            // it: the room hands the payload on untouched, so every seat must read what another
+            // wrote (RFC 6184 §8.1). The engine checked this against the room before it allocated;
+            // this is the authority when two first seats raced.
+            let video_mismatch = match (&room.video_format, &video_format) {
+                (Some(fixed), Some(asked)) if fixed != asked => Some(ForwardRefusal::Codec(
+                    "the room's video format changed while the seat was being set up".to_string(),
+                )),
+                _ => None,
+            };
             let refusal = match admitted {
                 Err(refusal) => Some(refusal),
+                Ok(()) if video_mismatch.is_some() => video_mismatch,
                 Ok(()) if room.members.iter().any(|seated| seated.tag == tag) => {
                     Some(ForwardError::DuplicateTag(tag.clone()).into())
                 }
@@ -428,6 +456,9 @@ impl ForwardRegistry {
                     self.end_room(room_id);
                 }
                 return Err(refusal);
+            }
+            if room.video_format.is_none() {
+                room.video_format = video_format;
             }
             room.members.push(member);
             room.mailbox.clone()
@@ -451,6 +482,9 @@ impl ForwardRegistry {
         }
         if let Some(floor) = floor_endpoint {
             self.routes.insert(floor, mailbox.clone());
+        }
+        if let Some(video) = video_endpoint {
+            self.routes.insert(video, mailbox.clone());
         }
         self.routes.insert(endpoint, mailbox);
         Ok(())
@@ -477,6 +511,14 @@ impl ForwardRegistry {
                 return Vec::new();
             };
             let member = room.members.remove(position);
+            // With no seat left carrying video, the next one to bring video fixes a format of its own.
+            if room
+                .members
+                .iter()
+                .all(|seated| seated.video_endpoint.is_none())
+            {
+                room.video_format = None;
+            }
             let _ = room
                 .mailbox
                 .try_send(ForwardInput::Control(ForwardControl::Remove(

@@ -234,6 +234,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 recording_id: Some(recording_id),
                 to_tag: None,
                 stats: None,
+                streams: Vec::new(),
+                video_declined: None,
             },
             Err(reason) => error_result("start_recording", &reason),
         }

@@ -30,16 +30,19 @@ use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction, SourceFilter};
 use siphon_rtp_proto::{CmdResult, ForwardMedia, ProfileFlags};
 
-use crate::forward::{FloorConfig, ForwardSeatConfig, RoomCodec};
+use crate::forward::{FloorConfig, ForwardSeatConfig, RoomCodec, VideoConfig};
 use crate::sdp::{self, TelephoneEvent};
 
 use super::answer_local::order_codec_candidates;
 use super::dial_out::{answered_codec, candidate_codecs, offerable_codecs, offered_events};
 use super::forward::ForwardAdmission;
+use super::forward_video::{
+    answered_streams, ok_forward_seat, validate_video_profile, OfferedVideo, VideoOffer,
+};
 use super::forward_webrtc::{self, AnsweredWebrtc, OfferedWebrtc};
 use super::negotiate::{parse_codec_flags, peer_media_address, random_ssrc};
 use super::offer::far_address_family;
-use super::{error_result, ok_empty, ok_sdp, ClientId, Engine};
+use super::{error_result, ClientId, Engine};
 
 /// A forwarding-room seat the engine has offered and the member has not yet answered.
 pub(super) struct PendingForwardSeat {
@@ -47,6 +50,8 @@ pub(super) struct PendingForwardSeat {
     endpoint: Endpoint,
     /// The seat's MCPTT floor-control endpoint, when the offer carried a floor section.
     floor: Option<Endpoint>,
+    /// The seat's video endpoint, when the offer carried a video section.
+    video: Option<Endpoint>,
     /// The audio codecs the offer listed, in its order.
     offered: Vec<CodecSpec>,
     /// The telephone-event payload types the offer listed, one per clock rate.
@@ -73,6 +78,8 @@ struct Negotiated {
     accepted_source: SourceFilter,
     /// The floor stream, when the answer accepted it.
     floor: Option<FloorConfig>,
+    /// The video stream, when the answer accepted one that fits the room; else why it did not.
+    video: Option<Result<VideoConfig, String>>,
     /// The media SRTCP keys of the offering profile (3GPP TS 33.180 §9.4.1).
     media_srtcp: Vec<siphon_rtp_srtp::srtcp_gcm::FloorMasterKey>,
     /// What a WebRTC offer's answer settled: the DTLS role, the peer's fingerprint and the channel.
@@ -165,6 +172,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result("forward_offer", &error);
             }
         }
+        if let Err(reason) = validate_video_profile(&profile) {
+            return error_result("forward_offer", &reason);
+        }
         // A forwarding room (push-to-talk) and a mixing room share no seats: the id names one kind.
         if self.conference.contains(room_id) {
             return error_result(
@@ -225,6 +235,31 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             None
         };
+        // The video stream (3GPP TS 24.281 §6.2), when the profile carries video: its own endpoint.
+        let video = match self
+            .offer_video(VideoOffer {
+                room_id,
+                profile: &profile,
+                media,
+                want_webrtc,
+                family,
+                bind,
+                advertised_override,
+            })
+            .await
+        {
+            Ok(video) => video,
+            Err(reason) => {
+                self.free(&[endpoint]).await;
+                self.free(&floor.into_iter().collect::<Vec<_>>()).await;
+                return error_result("forward_offer: video stream", &reason);
+            }
+        };
+        let (video_endpoint, video_section, video_declined) = match video {
+            OfferedVideo::None => (None, None, None),
+            OfferedVideo::Declined(reason) => (None, None, Some(reason)),
+            OfferedVideo::Section { endpoint, section } => (Some(endpoint), Some(section), None),
+        };
         let advertised = advertised_override.unwrap_or_else(|| endpoint.local_addr.ip());
         let (mut offer, webrtc) = if want_webrtc {
             match self
@@ -259,6 +294,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if offered_secure {
             offer = offer.replacen("RTP/AVP", "RTP/SAVP", 1);
         }
+        // Audio, video, then the transmission control stream (TS 24.281 §6.2).
+        offer.extend(video_section);
         if let Some(floor) = floor {
             offer.push_str(&sdp::floor::floor_offer_section(
                 floor.local_addr.port(),
@@ -271,6 +308,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let seat = PendingForwardSeat {
             endpoint,
             floor,
+            video: video_endpoint,
             offered,
             events,
             profile,
@@ -292,9 +330,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         if !inserted {
             self.free(&[endpoint]).await;
-            if let Some(floor) = floor {
-                self.free(&[floor]).await;
-            }
+            self.free(&floor.into_iter().chain(video_endpoint).collect::<Vec<_>>())
+                .await;
             return error_result(
                 "forward_offer",
                 &format!("from-tag {from_tag} already has an offer awaiting its answer"),
@@ -302,7 +339,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         // The controller's `a=key-mgmt` (RFC 4567), written verbatim on the audio section.
         let offer = sdp::apply_key_mgmt(&offer, key_mgmt.as_deref());
-        ok_sdp(offer, Some(from_tag))
+        ok_forward_seat(Some(offer), Some(from_tag), Vec::new(), video_declined)
     }
 
     /// Seat the member a [`siphon_rtp_proto::Command::ForwardOffer`] offered, on its answer
@@ -344,18 +381,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             (None, _) => None,
         };
-        for installed in std::iter::once(endpoint).chain(floor_endpoint) {
+        // Likewise a video stream the answer declined, or that does not fit the room, leaves the seat
+        // without video and frees its endpoint; the result says why.
+        let (video_endpoint, video_config, video_declined) = match (pending.video, negotiated.video)
+        {
+            (Some(video), Some(Ok(config))) => (Some(video), Some(config), None),
+            (Some(video), declined) => {
+                self.free(&[video]).await;
+                let reason = declined
+                    .and_then(Result::err)
+                    .unwrap_or_else(|| "the answer carries no video stream".to_string());
+                (None, None, Some(reason))
+            }
+            (None, _) => (None, None, None),
+        };
+        let extra: Vec<Endpoint> = floor_endpoint.into_iter().chain(video_endpoint).collect();
+        for installed in std::iter::once(endpoint).chain(extra.iter().copied()) {
             if let Err(error) = self
                 .datapath
                 .install_flow(installed.id, FlowAction::Redirect)
             {
                 self.free(&[endpoint]).await;
-                if let Some(floor) = floor_endpoint {
-                    self.free(&[floor]).await;
-                }
+                self.free(&extra).await;
                 return error_result("forward_answer: install redirect", &error);
             }
         }
+        let floor_live =
+            floor_endpoint.is_some() || negotiated.webrtc.as_ref().is_some_and(|w| w.data_channel);
         // A WebRTC seat is taken `secure_pending` (and `ice_pending` under a full agent) like a
         // joined browser seat: nothing is forwarded to or from it until the handshake keys it and
         // ICE selects its pair. The ICE agent reads the member's credentials and candidates from the
@@ -389,6 +441,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             floor: negotiated.floor,
             app_events: self.app_event_queue(client),
             media_srtcp: negotiated.media_srtcp,
+            video: video_config,
         };
         // From here a refusal frees the endpoints itself.
         if let Err(refusal) = self
@@ -398,7 +451,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 negotiated.admission,
                 config,
                 endpoint,
-                floor_endpoint,
+                &extra,
             )
             .await
         {
@@ -423,7 +476,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result("forward_answer", &reason);
             }
         }
-        ok_empty()
+        ok_forward_seat(
+            None,
+            None,
+            answered_streams(floor_live, video_endpoint.is_some()),
+            video_declined,
+        )
     }
 
     /// Read the member's answer into the seat it negotiates, refusing an answer the offer does not
@@ -528,6 +586,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     keys: floor_keys,
                 }
             });
+        // The video stream, when the offer carried one: a port, a format that fits the room.
+        let video = pending.video.map(|video| {
+            self.negotiate_video(
+                room_id,
+                answer,
+                received_from,
+                &pending.profile,
+                video,
+                gate,
+            )
+        });
         Ok(Negotiated {
             admission,
             telephone_event,
@@ -538,6 +607,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 gate(remote_rtp)
             },
             floor,
+            video,
             media_srtcp,
             webrtc,
         })
@@ -566,9 +636,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     async fn free_pending_forward_seat(&self, pending: &PendingForwardSeat) {
         self.free(&[pending.endpoint]).await;
-        if let Some(floor) = pending.floor {
-            self.free(&[floor]).await;
-        }
+        self.free(
+            &pending
+                .floor
+                .into_iter()
+                .chain(pending.video)
+                .collect::<Vec<_>>(),
+        )
+        .await;
     }
 
     /// Expire offered forwarding-room seats whose answer has not come within `budget` ticks (see

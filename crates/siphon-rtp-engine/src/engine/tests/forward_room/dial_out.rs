@@ -142,7 +142,7 @@ async fn a_dialled_out_member_is_forwarded_the_source_untouched_and_can_be_the_s
     );
 
     let answered = answer_member(&engine, "d", amr_wb_answer(addr_d, 97)).await;
-    assert_eq!(answered, ok_empty());
+    assert_eq!(answered, seated_with(&["audio"]));
     assert_eq!(engine.pending_seat_count(), 0);
     assert_eq!(engine.conference().forward().seat_count(), 2);
 
@@ -190,7 +190,7 @@ async fn the_first_offer_lists_every_codec_and_the_answer_fixes_the_rooms_codec(
         answer(addr_d, 0, "PCMU/8000", None, Some((101, 8000)), None),
     )
     .await;
-    assert_eq!(answered, ok_empty());
+    assert_eq!(answered, seated_with(&["audio"]));
     let codec = engine
         .conference()
         .forward()
@@ -467,7 +467,7 @@ async fn the_floor_stream_of_a_dialled_out_seat_is_offered_anchored_and_delivers
     )
     .await;
     // The room did not exist: the first seat fixes it. 97 is a listed format.
-    assert_eq!(answered, ok_empty());
+    assert_eq!(answered, seated_with(&["audio", "floor"]));
     floor_d
         .send_to(&FLOOR_REQUEST, engine_floor)
         .await
@@ -522,7 +522,7 @@ async fn declining_the_floor_stream_leaves_an_audio_only_seat_and_frees_its_endp
         ),
     )
     .await;
-    assert_eq!(answered, ok_empty());
+    assert_eq!(answered, seated_with(&["audio"]));
     assert_eq!(engine.conference().forward().seat_count(), 1);
     assert_eq!(engine.endpoint_calls.len(), 1, "audio only");
     assert!(matches!(
@@ -572,7 +572,7 @@ async fn a_draining_node_refuses_forward_offer_but_completes_an_offered_seat() {
     // The answer completes a setup the node had already admitted.
     assert_eq!(
         answer_member(&engine, "d", amr_wb_answer(addr_d, 97)).await,
-        ok_empty()
+        seated_with(&["audio"])
     );
 }
 
@@ -1017,7 +1017,7 @@ async fn a_dialled_out_member_may_answer_in_a_codec_the_room_transcodes() {
         answer(addr_d, 0, "PCMU/8000", None, None, None),
     )
     .await;
-    assert_eq!(answered, ok_empty());
+    assert_eq!(answered, seated_with(&["audio"]));
     assert_eq!(engine.conference().forward().seat_count(), 2);
 }
 

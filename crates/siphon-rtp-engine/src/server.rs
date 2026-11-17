@@ -593,6 +593,8 @@ fn auth_ok() -> CmdResult {
         recording_id: None,
         to_tag: None,
         stats: None,
+        streams: Vec::new(),
+        video_declined: None,
     }
 }
 

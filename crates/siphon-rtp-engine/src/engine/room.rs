@@ -738,6 +738,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 recording_id: None,
                 to_tag: None,
                 stats: None,
+                streams: Vec::new(),
+                video_declined: None,
             },
             Ok(Err(error)) => error_result("conference_play", &error),
             Err(error) => error_result(
@@ -973,6 +975,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             recording_id: Some(recording_id),
             to_tag: None,
             stats: None,
+            streams: Vec::new(),
+            video_declined: None,
         }
     }
 

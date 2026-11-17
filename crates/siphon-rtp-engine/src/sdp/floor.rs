@@ -69,7 +69,7 @@ pub(super) fn is_floor_media_line(value: &str) -> Option<ControlFormat> {
 }
 
 /// The SDP split into lines with their CRs removed.
-fn split_lines(sdp: &str) -> Vec<&str> {
+pub(super) fn split_lines(sdp: &str) -> Vec<&str> {
     sdp.split('\n')
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .collect()

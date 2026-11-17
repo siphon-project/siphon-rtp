@@ -84,6 +84,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     recording_id: None,
                     to_tag: None,
                     stats: None,
+                    streams: Vec::new(),
+                    video_declined: None,
                 }
             }
             None => unknown_call(call_id),

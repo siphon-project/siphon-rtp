@@ -70,6 +70,7 @@ fn room_of(seats: usize, queue: &AppEventQueue, keys: &[FloorMasterKey]) -> Forw
                 }),
                 app_events: Some(queue.clone()),
                 media_srtcp: Vec::new(),
+                video: None,
             },
             0,
         )

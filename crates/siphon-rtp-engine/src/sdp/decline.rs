@@ -54,24 +54,47 @@ pub fn decline_unanswered_streams(
     text_answered: bool,
     floor_answered: bool,
 ) -> String {
-    decline_unanswered_with_data_channel(sdp, text_answered, floor_answered, false)
+    decline_unanswered_with_data_channel(
+        sdp,
+        Answered {
+            text: text_answered,
+            floor: floor_answered,
+            ..Answered::default()
+        },
+    )
+}
+
+/// The streams besides the first audio one that an engine-written answer anchored, and so keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Answered {
+    /// The first text section ([`super::TextRewrite`] anchored it).
+    pub text: bool,
+    /// The first live transmission control section ([`super::anchor_floor`]).
+    pub floor: bool,
+    /// The first live WebRTC data channel section ([`super::anchor_data_channel`]).
+    pub data_channel: bool,
+    /// The first live video section ([`super::video::anchor_video`]).
+    pub video: bool,
 }
 
 /// [`decline_unanswered_streams`] for an answer that may also carry the WebRTC data channel
-/// (`m=application … UDP/DTLS/SCTP webrtc-datachannel`, RFC 8841): with `data_channel_answered` the
-/// first live data channel section is the one the engine anchored ([`super::anchor_data_channel`])
-/// and stays; any further one is declined like every other stream the engine did not answer.
+/// (`m=application … UDP/DTLS/SCTP webrtc-datachannel`, RFC 8841) and a video stream: with
+/// [`Answered::data_channel`] the first live data channel section is the one the engine anchored
+/// ([`super::anchor_data_channel`]) and stays, and with [`Answered::video`] likewise the first live
+/// `m=video`; any further one is declined like every other stream the engine did not answer.
 #[must_use]
-pub fn decline_unanswered_with_data_channel(
-    sdp: String,
-    text_answered: bool,
-    floor_answered: bool,
-    data_channel_answered: bool,
-) -> String {
+pub fn decline_unanswered_with_data_channel(sdp: String, answered_streams: Answered) -> String {
+    let Answered {
+        text: text_answered,
+        floor: floor_answered,
+        data_channel: data_channel_answered,
+        video: video_answered,
+    } = answered_streams;
     let mut data_channel_seen = false;
     let mut audio_seen = false;
     let mut text_seen = false;
     let mut floor_seen = false;
+    let mut video_seen = false;
     // Each line to replace, with its replacement. Empty, and so unallocated, for an audio-only answer.
     let mut declined: Vec<(usize, String)> = Vec::new();
     for (index, raw_line) in sdp.split('\n').enumerate() {
@@ -97,6 +120,13 @@ pub fn decline_unanswered_with_data_channel(
             MediaKind::Other if floor_answered && is_floor_media_line(value).is_some() => {
                 let first = !floor_seen && port.is_some_and(|port| port != 0);
                 floor_seen |= first;
+                first
+            }
+            MediaKind::Other
+                if video_answered && value.split_whitespace().next() == Some("video") =>
+            {
+                let first = !video_seen && port.is_some_and(|port| port != 0);
+                video_seen |= first;
                 first
             }
             _ => false,
@@ -218,7 +248,13 @@ mod tests {
             "m=application 20100 UDP/DTLS/SCTP webrtc-datachannel\r\n",
             "m=application 20200 UDP/DTLS/SCTP webrtc-datachannel\r\n",
         ]);
-        let answer = decline_unanswered_with_data_channel(offer, false, false, true);
+        let answer = decline_unanswered_with_data_channel(
+            offer,
+            Answered {
+                data_channel: true,
+                ..Answered::default()
+            },
+        );
         assert_eq!(
             media_lines(&answer),
             vec![
@@ -234,7 +270,7 @@ mod tests {
     fn a_data_channel_is_declined_unless_the_caller_answered_it() {
         let offer =
             offer_with_sections(&["m=application 20100 UDP/DTLS/SCTP webrtc-datachannel\r\n"]);
-        let answer = decline_unanswered_with_data_channel(offer, false, false, false);
+        let answer = decline_unanswered_with_data_channel(offer, Answered::default());
         assert_eq!(
             media_lines(&answer),
             vec![
@@ -355,6 +391,62 @@ mod tests {
         assert!(media_lines(&declined)[1..]
             .iter()
             .all(|line| line.contains(" 0 ")));
+    }
+
+    #[test]
+    fn the_anchored_video_stream_is_kept_and_any_other_is_declined() {
+        let offer = offer_with_sections(&[
+            "m=video 30004 RTP/AVP 99\r\n",
+            "m=video 30006 RTP/AVP 99\r\n",
+            "m=application 30008 udp MCVideo\r\n",
+        ]);
+        let kept = decline_unanswered_with_data_channel(
+            offer.clone(),
+            Answered {
+                video: true,
+                ..Answered::default()
+            },
+        );
+        assert_eq!(
+            media_lines(&kept),
+            [
+                "m=audio 20100 RTP/AVP 0",
+                "m=video 30004 RTP/AVP 99",
+                "m=video 0 RTP/AVP 99",
+                "m=application 0 udp MCVideo",
+            ],
+            "{kept}"
+        );
+        // Unanswered, as before: every video section goes to port 0.
+        let declined = decline_unanswered_with_data_channel(offer.clone(), Answered::default());
+        assert_eq!(declined, decline_unanswered_media(offer, false));
+        assert!(media_lines(&declined)[1..]
+            .iter()
+            .all(|line| line.contains(" 0 ")));
+    }
+
+    #[test]
+    fn video_floor_and_text_are_kept_together() {
+        let offer = offer_with_sections(&[
+            "m=text 20300 RTP/AVP 98\r\n",
+            "m=video 30004 RTP/AVP 99\r\n",
+            "m=application 30002 udp MCVideo\r\n",
+        ]);
+        let kept = decline_unanswered_with_data_channel(
+            offer,
+            Answered {
+                text: true,
+                floor: true,
+                video: true,
+                ..Answered::default()
+            },
+        );
+        assert!(
+            media_lines(&kept)[1..]
+                .iter()
+                .all(|line| !line.contains(" 0 ")),
+            "{kept}"
+        );
     }
 
     #[test]

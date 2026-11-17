@@ -18,9 +18,12 @@ use crate::forward::{FloorConfig, ForwardRefusal, ForwardSeatConfig, RoomCodec};
 use crate::sdp::{self, EngineMedia, TextRewrite};
 
 use super::answer_local::answer_codec_candidates;
+use super::forward_video::{
+    answered_streams, ok_forward_seat, validate_video_profile, JoinVideo, VideoSeat,
+};
 use super::negotiate::{parse_codec_flags, peer_media_address, random_ssrc};
 use super::seat_transport::SeatTransport;
-use super::{boxed_error_result, error_result, ok_empty, ok_sdp, ClientId, Engine};
+use super::{boxed_error_result, error_result, ok_empty, ClientId, Engine};
 
 /// `floor_keys` and `media_srtcp_keys` are checked (3GPP TS 33.180 §9.4) before anything is
 /// allocated.
@@ -146,6 +149,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result("forward_join", &error);
             }
         }
+        if let Err(reason) = validate_video_profile(profile) {
+            return error_result("forward_join", &reason);
+        }
         let info = match sdp::parse(offer) {
             Ok(info) => info,
             Err(error) => return error_result("forward_join: SDP parse", &error),
@@ -191,6 +197,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
         let floor_endpoint = floor.as_ref().map(|(endpoint, _)| *endpoint);
+        // The video stream (3GPP TS 24.281 §6.2), when the profile carries video and the seat's offer
+        // fits the room: its own endpoint, like the floor stream. Otherwise the seat joins audio-only
+        // and the result says why.
+        let fixed_video = match self.video_format_in_force(room_id, profile) {
+            Ok(format) => format,
+            Err(reason) => {
+                self.free_seat_endpoints(endpoint, floor_endpoint, None)
+                    .await;
+                return error_result("forward_join", &reason);
+            }
+        };
+        let video = match self
+            .open_video_endpoint(JoinVideo {
+                transport: &transport,
+                info: &info,
+                offer,
+                profile,
+                media,
+                fixed: fixed_video.as_ref(),
+            })
+            .await
+        {
+            Ok(video) => video,
+            Err(refusal) => {
+                self.free_seat_endpoints(endpoint, floor_endpoint, None)
+                    .await;
+                return *refusal;
+            }
+        };
+        let video_endpoint = video.endpoint();
         let egress_ssrc = random_ssrc();
         let config = ForwardSeatConfig {
             tag: from_tag.clone(),
@@ -210,9 +246,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             floor: floor.map(|(_, config)| config),
             app_events: self.app_event_queue(client),
             media_srtcp,
+            video: match &video {
+                VideoSeat::Open(open) => Some(open.config.clone()),
+                _ => None,
+            },
         };
         if let Err(refusal) = self
-            .seat_forward_member(client, room_id, admission, config, endpoint, floor_endpoint)
+            .seat_forward_member(
+                client,
+                room_id,
+                admission,
+                config,
+                endpoint,
+                &floor_endpoint
+                    .into_iter()
+                    .chain(video_endpoint)
+                    .collect::<Vec<_>>(),
+            )
             .await
         {
             return error_result("forward_join", &refusal);
@@ -250,15 +300,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.release_forward_seat(room_id, &from_tag).await;
             return error_result("forward_join: install DTLS redirect", &error);
         }
-        // Answer in the one codec the seat was built for (RFC 3264 §6.1), and the floor stream on
-        // its own endpoint when it has one (TS 24.380 §14.3.1). Every other stream the offer carries
-        // (video, a second floor section) is declined with port 0.
+        // Answer in the one codec the seat was built for (RFC 3264 §6.1), the floor stream on its own
+        // endpoint when it has one (TS 24.380 §14.3.1) and the video stream likewise (TS 24.281
+        // §6.2). Every other stream the offer carries (a second video or floor section) is declined
+        // with port 0.
+        let own = sdp::OwnSsrc::with_random_cname(egress_ssrc);
         match self.answer_seat_sdp(
             offer,
             &mut transport,
             profile,
             TextRewrite::None,
-            Some(&sdp::OwnSsrc::with_random_cname(egress_ssrc)),
+            Some(&own),
         ) {
             Ok(rewritten) => {
                 let anchored = match floor_endpoint {
@@ -280,18 +332,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 } else {
                     anchored
                 };
-                ok_sdp(
-                    sdp::force_answer_codec(
+                let anchored = self.anchor_seat_video(anchored, &video, &transport, profile, &own);
+                let streams = answered_streams(
+                    floor_endpoint.is_some() || data_channel.is_some(),
+                    video_endpoint.is_some(),
+                );
+                ok_forward_seat(
+                    Some(sdp::force_answer_codec(
                         &sdp::decline_unanswered_with_data_channel(
                             anchored,
-                            false,
-                            floor_endpoint.is_some(),
-                            data_channel.is_some(),
+                            sdp::Answered {
+                                floor: floor_endpoint.is_some(),
+                                data_channel: data_channel.is_some(),
+                                video: video_endpoint.is_some(),
+                                ..sdp::Answered::default()
+                            },
                         ),
                         &spec,
                         telephone_event,
-                    ),
+                    )),
                     Some(from_tag),
+                    streams,
+                    video.declined(),
                 )
             }
             Err(error) => {
@@ -426,8 +488,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Put an admitted seat in its room and make it reachable: the room (waiting for its verdict),
-    /// then the ICE follower and the endpoint-to-room bookkeeping. A refusal frees the seat's audio
-    /// and floor endpoints, so a caller that gets `Err` has nothing left to release.
+    /// then the ICE follower and the endpoint-to-room bookkeeping. A refusal frees the seat's audio,
+    /// floor and video endpoints, so a caller that gets `Err` has nothing left to release.
     pub(super) async fn seat_forward_member(
         &self,
         client: ClientId,
@@ -435,7 +497,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         admission: ForwardAdmission,
         config: ForwardSeatConfig,
         endpoint: Endpoint,
-        floor_endpoint: Option<Endpoint>,
+        extra: &[Endpoint],
     ) -> Result<(), ForwardRefusal> {
         let forward = self.conference.forward();
         let joined_tick = self.datapath.now_ticks();
@@ -468,16 +530,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         if let Err(refusal) = outcome {
             self.free(&[endpoint]).await;
-            if let Some(floor) = floor_endpoint {
-                self.free(&[floor]).await;
-            }
+            self.free(extra).await;
             return Err(refusal);
         }
         // Seated: aim the room's egress at whatever ICE validates for this seat.
         self.follow_seat_ice(endpoint.id);
         self.endpoint_calls.insert(endpoint.id, room_id.to_string());
-        if let Some(floor) = floor_endpoint {
-            self.endpoint_calls.insert(floor.id, room_id.to_string());
+        for held in extra {
+            self.endpoint_calls.insert(held.id, room_id.to_string());
         }
         Ok(())
     }

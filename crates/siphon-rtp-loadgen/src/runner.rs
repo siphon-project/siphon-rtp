@@ -867,6 +867,8 @@ mod tests {
             recording_id: None,
             to_tag: None,
             stats: None,
+            streams: Vec::new(),
+            video_declined: None,
         };
         assert_eq!(
             media_address(&result),

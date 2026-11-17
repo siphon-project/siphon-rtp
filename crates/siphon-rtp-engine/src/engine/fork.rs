@@ -165,6 +165,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             recording_id: None,
             to_tag: Some(subscription_id),
             stats: None,
+            streams: Vec::new(),
+            video_declined: None,
         }
     }
 

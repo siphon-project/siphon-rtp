@@ -1825,6 +1825,10 @@ pub struct ProfileFlags {
     /// stream out of the offer. A line break inside is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_fmtp: Option<String>,
+    /// Carry the seat's `m=video` in a translating forwarding room (`forward_join`, `forward_offer`;
+    /// see [`VideoProfile`]). `None` declines every video stream at port 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoProfile>,
     /// SRTCP keys for the floor-control stream, AEAD_AES_128_GCM (3GPP TS 33.180 §9.4.6, §9.4.8,
     /// key derivation rate 0); see [`FloorKey`]. At most [`MAX_FLOOR_KEYS`]: more is refused when the
     /// frame is read. Outbound floor control uses the last one. Absent: none.
@@ -1966,6 +1970,15 @@ pub enum CmdResult {
         /// Session statistics (query).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stats: Option<SessionStats>,
+        /// The streams a forwarding seat's answer carries live (`forward_join`, `forward_answer`):
+        /// any of `audio`, `video` and `floor`. A controller reads this instead of parsing the answer.
+        /// Empty for every other verb.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        streams: Vec<String>,
+        /// Why the seat's offered `m=video` was declined (`forward_join`, `forward_answer`), when the
+        /// room was asked to carry video and could not for this seat; the seat is then audio-only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_declined: Option<String>,
     },
     /// Answer to [`Command::Ping`].
     Pong,
@@ -2694,6 +2707,7 @@ pub mod frame {
 mod base64;
 mod floor_key;
 mod recording;
+mod video;
 use floor_key::deserialize_floor_keys;
 pub use floor_key::{
     FloorKey, FloorKeyError, FLOOR_KEY_LEN, FLOOR_SALT_LEN, FLOOR_SALT_LEN_LONG, MAX_FLOOR_KEYS,
@@ -2703,6 +2717,7 @@ pub use recording::{
     MAX_RECORDING_SOURCES, RECORDING_OPUS_BITRATE_BPS_MAX, RECORDING_OPUS_BITRATE_BPS_MIN,
     RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT,
 };
+pub use video::{VideoProfile, VideoProfileError};
 pub mod scope;
 pub mod vq_rtcpxr;
 pub use scope::{normalize_scope, validate_scope, ScopeError, Scoped, MAX_SCOPE_LEN};
@@ -4866,6 +4881,8 @@ mod tests {
                 recording_id: None,
                 to_tag: None,
                 stats: None,
+                streams: Vec::new(),
+                video_declined: None,
             },
         };
         roundtrip(&response);
@@ -4881,6 +4898,8 @@ mod tests {
             recording_id: None,
             to_tag: None,
             stats: None,
+            streams: Vec::new(),
+            video_declined: None,
         })
         .expect("to_value");
         assert!(
@@ -4900,6 +4919,8 @@ mod tests {
                 recording_id: None,
                 to_tag: None,
                 stats: None,
+                streams: Vec::new(),
+                video_declined: None,
             },
         });
         roundtrip(&Response {
@@ -5004,6 +5025,8 @@ mod tests {
                     bytes_out: 15840,
                     packets_lost: 1,
                 }),
+                streams: Vec::new(),
+                video_declined: None,
             },
         });
     }

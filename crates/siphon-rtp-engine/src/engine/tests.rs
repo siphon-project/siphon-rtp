@@ -63,6 +63,7 @@ mod forward_offer_webrtc;
 mod forward_preserve;
 mod forward_room;
 mod forward_stream_identity;
+mod forward_video;
 mod multi_source_recording;
 mod multi_source_tee;
 mod offer_far;
@@ -620,6 +621,20 @@ async fn phone_v6() -> (UdpSocket, SocketAddr) {
         .expect("bind v6");
     let addr = socket.local_addr().expect("v6 addr");
     (socket, addr)
+}
+
+/// The success of a `forward_answer` that seated the member with `streams` answered live.
+fn seated_with(streams: &[&str]) -> CmdResult {
+    CmdResult::Ok {
+        sdp: None,
+        duration_ms: None,
+        play_id: None,
+        recording_id: None,
+        to_tag: None,
+        stats: None,
+        streams: streams.iter().map(|stream| (*stream).to_string()).collect(),
+        video_declined: None,
+    }
 }
 
 fn ok_sdp_text(result: &CmdResult) -> String {

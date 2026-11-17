@@ -258,6 +258,57 @@ one datagram (§9.1.1) are two events. A browser seat opens the data channel nam
 `profile.floor_channel_label` (default `mcptt-floor`). Check `node_info` `features` for
 `transmission_control` first.
 
+### Video
+
+A seat may carry video beside its audio and the transmission control stream (3GPP TS 24.281 §6.2:
+`m=audio`, `m=video`, `m=application ... udp MCVideo`). Ask for it with `profile.video`:
+
+```json
+{"id":7,"command":"forward_join","conference_id":"group-1","from_tag":"a7c31f","sdp":"...",
+ "profile":{"transmission_control_formats":["MCVideo"],"floor_fmtp":"mc_queueing;mc_granted",
+            "video":{"fmtp":"profile-level-id=640c1f;packetization-mode=1","bandwidth_kbps":1200}}}
+```
+```json
+{"id":7,"result":"ok","sdp":"v=0\r\n...","to_tag":"a7c31f","streams":["audio","video","floor"]}
+```
+
+Without `profile.video` the `m=video` section is declined with port 0, as before, and the result says
+so in `video_declined`.
+
+**The codec rule.** Video is opaque to the engine: it is never transcoded, so every seat speaks the
+same H.264 flavour (RFC 6184 §8.1). The first seat with live video fixes the room's
+`packetization-mode` (0 or 1; 2, interleaved, is refused) and `profile-level-id`, or
+`video.fmtp` does when you set it (3GPP TS 26.281 §4.1.1 makes H.264 mandatory, Constrained High
+Profile level 3.1 being `640c1f`). A later seat has to offer `H264/90000` with the same mode and
+`profile-level-id`; one that does not joins with audio only and `video_declined` names the reason.
+Each seat keeps its own payload type, as audio does. The engine writes the room's `a=fmtp` only; a
+seat's own `sprop-parameter-sets` are never handed to another seat.
+
+**Directions.** The answer is the complement of the offered direction (RFC 3264 §6.1). A `sendrecv`
+seat can be the video source and is sent video. A `recvonly` seat is answered `sendonly`, is sent
+video and is never a source: whatever it sends is ignored and counted. A `sendonly` seat is answered
+`recvonly`, may be the source, and is sent no video. `inactive` is neither.
+
+**One source for both.** `forward_set_source` moves audio and video together, and the client gets one
+`forward_source_started` per change. A source with no video sends the receivers none. Each receiver has
+its own video translator: a stable SSRC, continuous sequence numbers and a 90 kHz timestamp line (RFC
+3550 §5.1, RFC 6184 §8.2.1). The marker bit is the sender's and is never set at a switch: it ends an
+access unit (RFC 6184 §5.1), so a switch that lands in the middle of a picture must not mark the first
+packet of the new run.
+
+**What this does not do yet.** Keyframe requests (PLI, FIR) are not acted on, so after a switch a
+receiver shows the new source from its next IDR picture; have the transmitter start a transmission with
+one. There is no transcoding or level negotiation beyond the exact match above. Plain `RTP/AVP` and
+`RTP/AVPF` seats in a translate room only: video offered by a DTLS or SDES seat, a browser seat or a
+`media: preserve` room is declined with the reason. One transmission at a time: concurrent video
+sources (3GPP TS 24.581 §4.1.1.2) need per-receiver subscriptions and stable seat ids and are a step of
+their own. Check `node_info` `features` for `forward_video` first.
+
+The video endpoint is gated exactly like the seat's audio (the signalled source, then the SSRC-consistent
+latch, [Layer 5c-ii](../security-and-nat.md)). `forward_offer` with `profile.video` offers
+`m=video <port> RTP/AVP 126` with the same format rules, and `forward_answer` reports `streams` and
+`video_declined` too.
+
 ### Inviting a browser into the group
 
 A browser can be a pre-arranged member the room calls, not only one that calls the room. Ask
@@ -448,6 +499,10 @@ sockets, a 62-octet AMR-WB payload; the per-datagram `send` is not in these figu
 | 100 | 1.74 us | 17.5 ns |
 | 500 | 8.86 us | 17.8 ns |
 | 1000 | 17.8 us | 17.9 ns |
+
+A video packet (`video_per_inbound_packet`, a 1200-octet FU-A payload on the video endpoint) costs the
+same translate per receiver with a larger payload to copy: 321 ns at 10 seats, 3.2 us at 100, 16.6 us
+at 500 and 33.7 us at 1000 (`--quick` run, one core).
 
 At 50 packets per second (20 ms frames) a 1000-seat room spends under 1 ms of CPU per second in the
 fan-out itself. The cost that grows with the room is the datagram send, one per receiver per packet,

@@ -71,6 +71,7 @@ fn config(index: usize, audio_payload_type: u8) -> ForwardSeatConfig {
         floor: None,
         app_events: None,
         media_srtcp: Vec::new(),
+        video: None,
     }
 }
 

@@ -83,6 +83,8 @@ mod tests {
                 recording_id: None,
                 to_tag: None,
                 stats: None,
+                streams: Vec::new(),
+                video_declined: None,
             },
             Command::List => CmdResult::List {
                 call_ids: vec!["call-x".into()],
