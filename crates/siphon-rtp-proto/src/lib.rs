@@ -2409,6 +2409,17 @@ pub enum Event {
         conference_id: String,
         from_tag: String,
     },
+    /// A forwarding room asked its new video source for a keyframe after
+    /// [`Command::ForwardSetSource`] and has the answer: `timed_out` false when the source's first IDR
+    /// picture arrived and started the receivers, `latency_ms` after the change; true when the room
+    /// waited out its limit and forwarded without one (receivers recover on the source's next IDR).
+    /// Once per source change, sent to the client that issued it. Only a source with video raises it.
+    ForwardKeyframe {
+        conference_id: String,
+        from_tag: String,
+        latency_ms: u64,
+        timed_out: bool,
+    },
     /// A forwarding-room seat has received nothing (no RTP, RTCP or floor control) for the media
     /// timeout. The seat stays seated; raised again only after it has been heard from in between.
     ForwardSeatInactive {
@@ -4316,6 +4327,21 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&started).expect("serialize"),
             r#"{"event":"forward_source_started","conference_id":"group-1","from_tag":"a7c31f"}"#
+        );
+        let keyframe = Event::ForwardKeyframe {
+            conference_id: "group-1".into(),
+            from_tag: "a7c31f".into(),
+            latency_ms: 240,
+            timed_out: false,
+        };
+        let json = serde_json::to_string(&keyframe).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"event":"forward_keyframe","conference_id":"group-1","from_tag":"a7c31f","latency_ms":240,"timed_out":false}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Event>(&json).expect("deserialize"),
+            keyframe
         );
         let inactive = Event::ForwardSeatInactive {
             conference_id: "group-1".into(),

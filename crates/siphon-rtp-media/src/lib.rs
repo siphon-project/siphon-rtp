@@ -11,6 +11,7 @@ pub mod dtmf;
 pub mod echo;
 pub mod fanout;
 pub mod fork;
+pub mod h264;
 pub mod ingress;
 pub mod jitter;
 pub mod leg;

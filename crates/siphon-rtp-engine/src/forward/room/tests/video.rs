@@ -2,12 +2,12 @@
 //! stream, the sender's marker bit, and the direction a seat offered (3GPP TS 24.281 §6.2).
 
 use super::*;
-use crate::sdp::video::RoomVideoFormat;
+use crate::sdp::video::{RoomVideoFormat, VideoFeedback};
 use crate::sdp::MediaDirection;
 
-const FIRST_VIDEO_PAYLOAD_TYPE: u8 = 98;
+pub(super) const FIRST_VIDEO_PAYLOAD_TYPE: u8 = 98;
 
-fn format() -> RoomVideoFormat {
+pub(super) fn format() -> RoomVideoFormat {
     RoomVideoFormat {
         packetization_mode: 1,
         profile_level_id: Some("640c1f".to_string()),
@@ -17,7 +17,7 @@ fn format() -> RoomVideoFormat {
 
 /// Seat `index` with a video endpoint `100 + index` at `192.0.2.<index>:5000`, its own payload type
 /// `98 + index`, and egress SSRC `0xF000_0000 | index`.
-fn video_seat(index: u8, direction: MediaDirection) -> ForwardSeatConfig {
+pub(super) fn video_seat(index: u8, direction: MediaDirection) -> ForwardSeatConfig {
     let mut config = seat_config(index);
     let remote = address(&format!("192.0.2.{index}:5000"));
     config.video = Some(VideoConfig {
@@ -30,11 +30,13 @@ fn video_seat(index: u8, direction: MediaDirection) -> ForwardSeatConfig {
         initial_sequence: 2000,
         initial_timestamp: 70_000,
         format: format(),
+        feedback: VideoFeedback::default(),
+        cname: String::new(),
     });
     config
 }
 
-fn video_room(directions: &[MediaDirection]) -> ForwardRoom {
+pub(super) fn video_room(directions: &[MediaDirection]) -> ForwardRoom {
     let mut room = amr_wb_room();
     for (position, direction) in directions.iter().enumerate() {
         room.add_seat(video_seat(position as u8 + 1, *direction), 0)
@@ -43,12 +45,12 @@ fn video_room(directions: &[MediaDirection]) -> ForwardRoom {
     room
 }
 
-fn all_sendrecv(seats: usize) -> ForwardRoom {
+pub(super) fn all_sendrecv(seats: usize) -> ForwardRoom {
     video_room(&vec![MediaDirection::SendRecv; seats])
 }
 
 /// A video RTP datagram.
-fn video_rtp(
+pub(super) fn video_rtp(
     payload_type: u8,
     sequence: u16,
     timestamp: u32,
@@ -63,7 +65,7 @@ fn video_rtp(
     datagram
 }
 
-fn rx_video(index: u8, arrival: u64, data: Vec<u8>) -> RxPacket {
+pub(super) fn rx_video(index: u8, arrival: u64, data: Vec<u8>) -> RxPacket {
     RxPacket {
         endpoint: EndpointId(100 + u64::from(index)),
         source: address(&format!("192.0.2.{index}:5000")),
@@ -73,7 +75,7 @@ fn rx_video(index: u8, arrival: u64, data: Vec<u8>) -> RxPacket {
 }
 
 /// An FU-A fragment of an H.264 NAL unit (RFC 6184 §5.8): indicator, header, then `data`.
-fn fu_a(start: bool, end: bool, data: &[u8]) -> Vec<u8> {
+pub(super) fn fu_a(start: bool, end: bool, data: &[u8]) -> Vec<u8> {
     let header = (u8::from(start) << 7) | (u8::from(end) << 6) | 5; // type 5, an IDR slice
     let mut payload = vec![0x7C, header]; // F=0, NRI=3, type 28
     payload.extend_from_slice(data);
@@ -150,8 +152,8 @@ fn a_video_switch_keeps_each_receivers_stream_continuous_and_never_marks_a_run_s
             }
         }
     }
-    // The talker changes in the middle of seat-2's picture: its first packet we see is a middle
-    // fragment, marker clear. A rebase must not mark it.
+    // The talker changes. A receiver is sent nothing until the new source's picture begins (an IDR
+    // start fragment, marker clear: a rebase must not mark it, the marker ends an access unit).
     room.set_source(Some("seat-2")).unwrap();
     let middle = rx_video(
         2,
@@ -162,7 +164,7 @@ fn a_video_switch_keeps_each_receivers_stream_continuous_and_never_marks_a_run_s
             3_000_000,
             0x2222_2222,
             false,
-            &fu_a(false, false, &[7]),
+            &fu_a(true, false, &[7]),
         ),
     );
     room.ingest(&middle);
@@ -512,7 +514,7 @@ fn a_receiver_with_no_video_destination_yet_is_skipped() {
     );
 }
 
-/// The first bytes of an IDR slice of an x264 stream (RFC 6184 §5.8: what follows the FU header of a
+/// The first bytes of an IDR slice (RFC 6184 §5.8: what follows the FU header of a
 /// start fragment is the NAL unit's own bytes, here its slice header), so a dissector reads them.
 const SLICE_HEADER: [u8; 5] = [0x88, 0x84, 0x00, 0x33, 0xFF];
 

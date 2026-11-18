@@ -28,10 +28,10 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::forward::{ForwardRoom, ForwardSeatConfig, RoomCodec, VideoConfig};
 use siphon_rtp_engine::sdp;
-use siphon_rtp_engine::sdp::video::RoomVideoFormat;
+use siphon_rtp_engine::sdp::video::{RoomVideoFormat, VideoFeedback};
 use siphon_rtp_engine::sdp::MediaDirection;
 use siphon_rtp_media::rtcp;
-use siphon_rtp_media::rtp::{write_packet, RtpHeader};
+use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
 use siphon_rtp_proto::ForwardMedia;
 use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
 
@@ -72,6 +72,8 @@ fn video_of(index: usize) -> VideoConfig {
             profile_level_id: Some("640c1f".to_string()),
             fmtp: None,
         },
+        feedback: VideoFeedback::SUPPORTED,
+        cname: "cname".to_string(),
     }
 }
 
@@ -136,17 +138,21 @@ fn inbound() -> RxPacket {
 }
 
 /// A video RTP datagram of the chosen source: an FU-A fragment of 1200 payload octets (RFC 6184
-/// §5.8), the size a video packet fills most of an Ethernet MTU with.
-fn video_inbound() -> RxPacket {
+/// §5.8), the size a video packet fills most of an Ethernet MTU with. `sequence` 1 is the start of an
+/// IDR slice (`0x7C 0x85`), which opens the keyframe gate a source change closes; later ones are
+/// middle fragments.
+fn video_inbound(sequence: u16) -> RxPacket {
     let header = RtpHeader {
         marker: false,
         payload_type: 99,
-        sequence: 1,
+        sequence,
         timestamp: 90_000,
         ssrc: 0xB0B0_B0B0,
     };
+    let mut payload = [0x7C; VIDEO_PAYLOAD_BYTES];
+    payload[1] = if sequence == 1 { 0x85 } else { 0x05 };
     let mut datagram = vec![0u8; 12 + VIDEO_PAYLOAD_BYTES];
-    write_packet(&header, &[0x7C; VIDEO_PAYLOAD_BYTES], &mut datagram).unwrap();
+    write_packet(&header, &payload, &mut datagram).unwrap();
     RxPacket {
         endpoint: EndpointId(10_000),
         source: "192.0.2.1:5000".parse().unwrap(),
@@ -155,15 +161,18 @@ fn video_inbound() -> RxPacket {
     }
 }
 
-/// What one inbound video packet costs a translating room: the same gate and one translator rewrite
-/// per receiver as audio, on the video endpoint, with a larger payload to copy.
+/// What one inbound video packet costs a translating room once the keyframe has opened every
+/// receiver: the same gate and one translator rewrite per receiver as audio, on the video endpoint,
+/// with a larger payload to copy, and the copy into the history a NACK is served from.
 fn video_fan_out(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("forward_fan_out");
     for seats in [10usize, 100, 500, 1000] {
         let mut room = build_room(seats, ForwardMedia::Translate, false, true);
-        let packet = video_inbound();
-        room.ingest(&packet);
-        while room.next_datagram(&packet).is_some() {}
+        // The keyframe opens every receiver; the packet measured is the one after it.
+        let keyframe = video_inbound(1);
+        room.ingest(&keyframe);
+        while room.next_datagram(&keyframe).is_some() {}
+        let packet = video_inbound(2);
         room.drain_events().for_each(drop);
         group.throughput(Throughput::Elements(seats as u64 - 1));
         group.bench_function(
@@ -180,6 +189,53 @@ fn video_fan_out(criterion: &mut Criterion) {
             },
         );
     }
+    group.finish();
+}
+
+/// What one receiver's Generic NACK costs: the history lookup and one translator rewrite of the
+/// packet it asks for (RFC 4585 §6.2.1).
+fn video_nack_serve(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("forward_fan_out");
+    let mut room = build_room(100, ForwardMedia::Translate, false, true);
+    let keyframe = video_inbound(1);
+    room.ingest(&keyframe);
+    while room.next_datagram(&keyframe).is_some() {}
+    let packet = video_inbound(2);
+    room.ingest(&packet);
+    let mut egress_sequence = None;
+    while let Some((endpoint, _, datagram)) = room.next_datagram(&packet) {
+        if endpoint == EndpointId(10_001) {
+            egress_sequence = RtpPacket::parse(datagram)
+                .ok()
+                .map(|parsed| parsed.sequence);
+        }
+    }
+    let mut nack = vec![0u8; rtcp::NACK_LEN];
+    rtcp::write_nack(
+        0xA0A0_A0A0,
+        0xF000_0001,
+        egress_sequence.unwrap_or_default(),
+        0,
+        &mut nack,
+    )
+    .unwrap();
+    let nack = RxPacket {
+        endpoint: EndpointId(10_001),
+        source: "192.0.2.2:5001".parse().unwrap(),
+        arrival: 1_000_000,
+        data: Bytes::from(nack),
+    };
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("video_nack_serve", |bencher| {
+        bencher.iter(|| {
+            room.ingest(black_box(&nack));
+            let mut served = 0usize;
+            while let Some((_, _, datagram)) = room.next_datagram(&nack) {
+                served += black_box(datagram).len();
+            }
+            black_box(served)
+        });
+    });
     group.finish();
 }
 
@@ -281,5 +337,11 @@ fn srtcp_fan_out(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, fan_out, video_fan_out, srtcp_fan_out);
+criterion_group!(
+    benches,
+    fan_out,
+    video_fan_out,
+    video_nack_serve,
+    srtcp_fan_out
+);
 criterion_main!(benches);

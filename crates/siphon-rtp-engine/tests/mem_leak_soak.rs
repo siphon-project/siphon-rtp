@@ -1068,8 +1068,10 @@ async fn conference_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usiz
 
 /// Churn one forwarding room through `join ×3 → set_source → set_source(None) → leave ×3` (the last
 /// leave ends the room actor and frees its endpoints), with the seat codec negotiated from an AMR-WB
-/// offer the build cannot transcode. The last two seats carry an H.264 video stream, so a seat's
-/// video endpoint, translator and latch are churned with it.
+/// offer the build cannot transcode. The last two seats carry an H.264 video stream that accepts
+/// RTCP feedback, so a seat's video endpoint, translator and latch are churned with it, and so is the
+/// room's NACK history (allocated with the first such seat, freed with the room) and the keyframe
+/// request a source change starts.
 async fn forward_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
     let conference_id = format!("soak-forward-{index}");
     let amr_wb_sdp = |port: u16, video: bool| {
@@ -1079,8 +1081,10 @@ async fn forward_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usize) 
         );
         if video {
             sdp.push_str(&format!(
-                "m=video {} RTP/AVP 99\r\na=rtpmap:99 H264/90000\r\n\
-                 a=fmtp:99 profile-level-id=640c1f;packetization-mode=1\r\na=sendrecv\r\n",
+                "m=video {} RTP/AVPF 99\r\na=rtpmap:99 H264/90000\r\n\
+                 a=fmtp:99 profile-level-id=640c1f;packetization-mode=1\r\n\
+                 a=rtcp-fb:99 nack\r\na=rtcp-fb:99 nack pli\r\na=rtcp-fb:99 ccm fir\r\n\
+                 a=sendrecv\r\n",
                 port + 100
             ));
         }

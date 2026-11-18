@@ -762,7 +762,42 @@ impl ForwardRegistry {
     }
 }
 
-/// The room actor: ingest datagrams, forward, and send the periodic Sender Reports.
+/// Do what the room's keyframe requests have due, send it, and pass the room's events to the client
+/// that chose the source. `started` is the actor's own monotonic clock: the room is driven by
+/// milliseconds since then, never by the datapath's receive clock, which is logical on the loopback
+/// backend (twenty milliseconds per wall second).
+async fn pump_keyframes<D: Datapath>(
+    room: &mut ForwardRoom,
+    datapath: &D,
+    outbound: &mut Vec<Outbound>,
+    source_events: &Option<flume::Sender<Event>>,
+    started: tokio::time::Instant,
+) {
+    if room.keyframe_active() {
+        outbound.clear();
+        let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        room.poll_keyframe(now_ms, outbound);
+        send_all(datapath, outbound).await;
+    }
+    for event in room.drain_events() {
+        if let Some(sink) = source_events {
+            if sink.try_send(event).is_err() {
+                tracing::debug!("forwarding room event dropped (sink full or closed)");
+            }
+        }
+    }
+}
+
+/// Sleep until the room's next keyframe deadline (milliseconds on the actor's clock), or for ever.
+async fn keyframe_deadline(deadline: Option<u64>, started: tokio::time::Instant) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(started + std::time::Duration::from_millis(at)).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The room actor: ingest datagrams, forward, send the periodic Sender Reports, and run the room's
+/// keyframe requests (`room/keyframe.rs`).
 async fn run_forward_room<D: Datapath>(
     mut room: ForwardRoom,
     inbox: flume::Receiver<ForwardInput>,
@@ -770,6 +805,7 @@ async fn run_forward_room<D: Datapath>(
 ) {
     let mut outbound = Vec::new();
     let mut source_events: Option<flume::Sender<Event>> = None;
+    let started = tokio::time::Instant::now();
     let mut reports = tokio::time::interval(REPORT_INTERVAL);
     reports.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -829,13 +865,10 @@ async fn run_forward_room<D: Datapath>(
                     }
                     ForwardInput::Control(ForwardControl::Stop) => break,
                 }
-                for event in room.drain_events() {
-                    if let Some(sink) = &source_events {
-                        if sink.try_send(event).is_err() {
-                            tracing::debug!("forwarding room event dropped (sink full or closed)");
-                        }
-                    }
-                }
+                pump_keyframes(&mut room, &datapath, &mut outbound, &source_events, started).await;
+            }
+            () = keyframe_deadline(room.next_keyframe_deadline(), started) => {
+                pump_keyframes(&mut room, &datapath, &mut outbound, &source_events, started).await;
             }
             _ = reports.tick() => {
                 outbound.clear();

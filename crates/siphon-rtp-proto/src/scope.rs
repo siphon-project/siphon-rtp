@@ -238,6 +238,7 @@ impl Event {
             Event::CallQuality { call_id, .. } | Event::RtcpApp { call_id, .. } => call_id.as_mut(),
             Event::ActiveSpeaker { .. }
             | Event::ForwardSourceStarted { .. }
+            | Event::ForwardKeyframe { .. }
             | Event::ForwardSeatInactive { .. }
             | Event::Unknown => None,
         }

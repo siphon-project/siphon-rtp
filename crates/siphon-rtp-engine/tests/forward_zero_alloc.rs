@@ -19,7 +19,7 @@ use siphon_rtp_engine::forward::{
     AppRequest, AppTarget, FloorConfig, ForwardRoom, ForwardSeatConfig, RoomCodec, VideoConfig,
 };
 use siphon_rtp_engine::sdp;
-use siphon_rtp_engine::sdp::video::RoomVideoFormat;
+use siphon_rtp_engine::sdp::video::{RoomVideoFormat, VideoFeedback};
 use siphon_rtp_engine::sdp::MediaDirection;
 use siphon_rtp_media::rtcp;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader};
@@ -100,6 +100,8 @@ fn video_of(index: usize) -> VideoConfig {
             profile_level_id: Some("640c1f".to_string()),
             fmtp: None,
         },
+        feedback: VideoFeedback::SUPPORTED,
+        cname: "cname".to_string(),
     }
 }
 
@@ -390,15 +392,36 @@ fn a_room_wide_rtcp_app_send_makes_no_heap_allocation() {
 }
 
 fn video_packet(talker: usize, sequence: u16, marker: bool) -> RxPacket {
+    // A source change gates every receiver until a picture begins (RFC 6184 §5.8: an FU-A start of
+    // an IDR slice is `0x7C 0x85`), so a run opens with one and goes on with middle fragments.
+    let mut payload = [0x7C; 1200];
+    payload[1] = if sequence == 1 { 0x85 } else { 0x05 };
+    video_rtp(
+        talker,
+        sequence,
+        u32::from(sequence / 3) * 3000,
+        marker,
+        &payload,
+    )
+}
+
+/// A video RTP packet of seat `talker` with `payload`.
+fn video_rtp(
+    talker: usize,
+    sequence: u16,
+    timestamp: u32,
+    marker: bool,
+    payload: &[u8],
+) -> RxPacket {
     let header = RtpHeader {
         marker,
         payload_type: 99,
         sequence,
-        timestamp: u32::from(sequence / 3) * 3000,
+        timestamp,
         ssrc: 0xB000_0000 + talker as u32,
     };
-    let mut datagram = vec![0u8; 12 + 1200];
-    write_packet(&header, &[0x7C; 1200], &mut datagram).unwrap();
+    let mut datagram = vec![0u8; 12 + payload.len()];
+    write_packet(&header, payload, &mut datagram).unwrap();
     RxPacket {
         endpoint: EndpointId(10_000 + talker as u64),
         source: format!("192.0.2.{}:{}", 1 + talker % 250, 5000 + talker)
@@ -477,4 +500,115 @@ fn video_ingest_and_fan_out_make_no_heap_allocation() {
         "{switching} allocations across 100 switches: only the announcement may allocate"
     );
     assert!(forwarded > 0);
+}
+
+/// An RTCP datagram a video seat sends the room (its video endpoint, its signalled address).
+fn video_rtcp(seat: usize, data: Vec<u8>) -> RxPacket {
+    RxPacket {
+        endpoint: EndpointId(10_000 + seat as u64),
+        source: format!("192.0.2.{}:{}", 1 + seat % 250, 5000 + seat)
+            .parse()
+            .unwrap(),
+        arrival: 0,
+        data: Bytes::from(data),
+    }
+}
+
+#[test]
+fn the_keyframe_gate_the_parameter_set_replay_and_the_nack_serve_make_no_heap_allocation() {
+    let mut room = build_room(siphon_rtp_proto::ForwardMedia::Translate, false, true);
+    let sps = [0x67u8, 0x64, 0x00, 0x1F];
+    let pps = [0x68u8, 0xEE, 0x3C];
+    let idr = [0x7C, 0x85, 0x88, 0x84, 0x00];
+    let slice = [0x41u8, 0x9A, 0x00];
+    // One run of a source: pictures that are held back, its parameter sets, the keyframe that opens
+    // every receiver (which replays the parameter sets first), then two pictures.
+    let run = |talker: usize| -> Vec<RxPacket> {
+        vec![
+            video_rtp(talker, 1, 3_000, false, &slice),
+            video_rtp(talker, 2, 6_000, false, &sps),
+            video_rtp(talker, 3, 6_000, false, &pps),
+            video_rtp(talker, 4, 6_000, false, &idr),
+            video_rtp(talker, 5, 9_000, true, &slice),
+            video_rtp(talker, 6, 12_000, true, &slice),
+        ]
+    };
+    let (first, second) = (run(0), run(1));
+    let feed = |room: &mut ForwardRoom, packets: &[RxPacket]| -> usize {
+        let mut octets = 0;
+        for packet in packets {
+            room.ingest(packet);
+            while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                octets += std::hint::black_box(datagram).len();
+            }
+        }
+        octets
+    };
+    // Warm up: each talker has been the source with its parameter sets cached (the cache is
+    // allocated the first time a seat sends one) and every translator has seen a run.
+    for (tag, packets) in [("seat-0", &first), ("seat-1", &second), ("seat-0", &first)] {
+        room.set_source(Some(tag)).unwrap();
+        feed(&mut room, packets);
+        room.drain_events().for_each(drop);
+    }
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut forwarded = 0usize;
+    for round in 0..100 {
+        let (tag, packets) = if round % 2 == 0 {
+            ("seat-1", &second)
+        } else {
+            ("seat-0", &first)
+        };
+        room.set_source(Some(tag)).unwrap();
+        forwarded += feed(&mut room, packets);
+        room.drain_events().for_each(drop);
+    }
+    let switching = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(forwarded > 0);
+    // Only the source-started announcement (two strings) may allocate, once per switch.
+    assert!(
+        switching <= 100 * 2,
+        "{switching} allocations across 100 gated switches with replay: only the announcement may allocate"
+    );
+
+    // A receiver's NACK, served from the history: what the room sent seat 2 last is asked for again.
+    let mut last_sent = None;
+    let probe = video_rtp(0, 7, 15_000, true, &slice);
+    room.set_source(Some("seat-0")).unwrap();
+    feed(&mut room, &first);
+    room.ingest(&probe);
+    while let Some((endpoint, _, datagram)) = room.next_datagram(&probe) {
+        if endpoint == EndpointId(10_002) {
+            last_sent = siphon_rtp_media::rtp::RtpPacket::parse(datagram)
+                .ok()
+                .map(|parsed| parsed.sequence);
+        }
+    }
+    let egress_sequence = last_sent.expect("seat 2 was sent the probe");
+    let mut nack = vec![0u8; rtcp::NACK_LEN];
+    rtcp::write_nack(0xA0A0_A0A0, 0xF000_0002, egress_sequence, 0, &mut nack).unwrap();
+    let nack = video_rtcp(2, nack);
+    room.ingest(&nack);
+    assert!(
+        room.next_datagram(&nack).is_some(),
+        "the packet is in the history"
+    );
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut served = 0usize;
+    for _ in 0..1_000 {
+        room.ingest(&nack);
+        while let Some((_, _, datagram)) = room.next_datagram(&nack) {
+            served += std::hint::black_box(datagram).len();
+        }
+    }
+    let nacks = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(served > 0);
+    assert_eq!(
+        nacks, 0,
+        "serving a NACK allocated {nacks} times across 1000 requests"
+    );
 }

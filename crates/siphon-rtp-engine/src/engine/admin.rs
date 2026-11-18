@@ -204,6 +204,12 @@ fn build_features() -> Vec<String> {
         // through a translating room (3GPP TS 24.281 §6.2), and their results report `streams` and
         // `video_declined`. A controller gates asking for video on this entry.
         "forward_video".to_string(),
+        // A source change in a video room starts every receiver on a keyframe: the room asks the new
+        // source for one (RTCP PLI, then FIR, for what the seat accepted in `a=rtcp-fb`), holds each
+        // receiver's video until an IDR, replays the SPS and PPS first, serves receivers' PLI, FIR
+        // and NACK, and raises `forward_keyframe`. `forward_offer` offers `RTP/AVPF`. A controller
+        // gates relying on a decodable switch on this entry.
+        "forward_video_keyframe".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

@@ -145,3 +145,12 @@ path = "fuzz_targets/floor_channel_fuzz.rs"
 test = false
 doc = false
 bench = false
+
+# RFC 6184 §5 — the H.264 payload classifier (single NAL, STAP-A, FU-A) a forwarding room runs on a
+# seat's video to find the IDR picture a receiver can start on. The payload is untrusted network input.
+[[bin]]
+name = "h264_scan_fuzz"
+path = "fuzz_targets/h264_scan_fuzz.rs"
+test = false
+doc = false
+bench = false

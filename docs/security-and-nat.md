@@ -1125,10 +1125,27 @@ the routing order is unchanged: bridge → media → text → udptl → ws → c
   chosen source of a seat that offered to send video (`sendrecv`, `sendonly`); a receive-only uplink and a
   non-source are counted and dropped. A receiver is sent video only on its own video endpoint with a
   resolved destination (never into the void), under its own SSRC and payload type. The payload is
-  never parsed. Video is plain RTP: a seat whose media is SRTP (SDES, DTLS), a browser seat and a
+  never decoded; only its H.264 framing is read, after the gate and only from the chosen source (and
+  the SPS and PPS of any seat, kept to start a receiver on a keyframe), by `siphon-rtp-media::h264`,
+  which reads no further than the packet (fuzzed). Video is plain RTP: a seat whose media is SRTP (SDES, DTLS), a browser seat and a
   preserve room have their video declined at port 0 with a stated reason, because a plain video answer to
   a secure offer would send the seat video it cannot decrypt (secure video is a step of its own).
   Leaving, a room's end and the inactivity scan treat the video endpoint as one of the seat's.
+- **What the room sends a video seat, and only there.** A source change holds each receiver's video
+  until a keyframe (RFC 6184 §5.8), so a seat never receives a stream it cannot start; the packets held
+  back are dropped, never queued. The room originates RTCP toward a seat in two cases, both on the seat's
+  video endpoint and only to the destination its video gate latched (the signalled address or the
+  SSRC-consistent latch above, never an address a datagram merely claims): the Sender Reports above,
+  and, to the **source** only, a keyframe request (RFC 4585 PLI, RFC 5104 FIR, in a compound that opens
+  with an empty report and the source description, RFC 4585 §3.1) built from the stream the room sends
+  that seat. A request goes only to a source that accepted that feedback in its SDP, is bounded (a
+  repeat every 500 ms, three repeats, one request a second however many receivers ask), and is never
+  sent for a source whose SSRC the room has not yet seen. A receiver's feedback is read only after the
+  gate, only about the stream the room sends *that* receiver (a PLI, FIR or NACK naming another SSRC is
+  ignored), and a NACK is answered to the receiver that sent it alone, from a fixed history of the
+  current source's packets that is emptied at every source change (a retransmission is the packet the
+  receiver was already sent, through its own translator, so it can never carry another source's bytes or
+  a sequence number outside the receiver's own run). Nothing here allocates per packet.
 - **Cross-codec seats put a decoder behind the gate.** A seat whose codec is not the room's has its
   payload decoded (when it is the source) and re-encoded. That is a new consumer of untrusted bytes, but
   it sits strictly after the gate above (signalled source, SRTP, the SSRC latch, source selected by the

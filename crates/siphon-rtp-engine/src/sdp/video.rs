@@ -44,10 +44,80 @@ pub struct RoomVideoFormat {
     pub fmtp: Option<String>,
 }
 
+/// The RTCP feedback (RFC 4585 §4.2) a video stream accepted. The room supports exactly these
+/// three, and answers with the intersection of them and what the offer listed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoFeedback {
+    /// `a=rtcp-fb:<pt> nack`: Generic NACK (RFC 4585 §6.2.1), served from the room's history.
+    pub nack: bool,
+    /// `a=rtcp-fb:<pt> nack pli`: Picture Loss Indication (RFC 4585 §6.3.1).
+    pub pli: bool,
+    /// `a=rtcp-fb:<pt> ccm fir`: Full Intra Request (RFC 5104 §4.3.1).
+    pub fir: bool,
+}
+
+impl VideoFeedback {
+    /// Everything the room supports: what a `forward_offer` offers.
+    pub const SUPPORTED: Self = Self {
+        nack: true,
+        pli: true,
+        fir: true,
+    };
+
+    /// The `a=rtcp-fb` lines for `payload_type`, in the order RFC 4585 §4.2 examples list them.
+    fn lines(self, payload_type: u8) -> impl Iterator<Item = String> {
+        [
+            (self.nack, "nack"),
+            (self.pli, "nack pli"),
+            (self.fir, "ccm fir"),
+        ]
+        .into_iter()
+        .filter(|(accepted, _)| *accepted)
+        .map(move |(_, kind)| format!("a=rtcp-fb:{payload_type} {kind}"))
+    }
+
+    /// What the section's `a=rtcp-fb` lines list for `payload_type`, `*` (every payload type of the
+    /// section, RFC 4585 §4.2) included. Types the room does not support are ignored.
+    fn of_payload(section: &[&str], payload_type: u8) -> Self {
+        let mut feedback = Self::default();
+        for line in section {
+            let Some(rest) = line.strip_prefix("a=rtcp-fb:") else {
+                continue;
+            };
+            let mut words = rest.split_whitespace();
+            let Some(target) = words.next() else {
+                continue;
+            };
+            if target != "*" && target.parse::<u8>().ok() != Some(payload_type) {
+                continue;
+            }
+            match (words.next(), words.next()) {
+                (Some(kind), None) if kind.eq_ignore_ascii_case("nack") => feedback.nack = true,
+                (Some(kind), Some(parameter))
+                    if kind.eq_ignore_ascii_case("nack")
+                        && parameter.eq_ignore_ascii_case("pli") =>
+                {
+                    feedback.pli = true;
+                }
+                (Some(kind), Some(parameter))
+                    if kind.eq_ignore_ascii_case("ccm")
+                        && parameter.eq_ignore_ascii_case("fir") =>
+                {
+                    feedback.fir = true;
+                }
+                _ => {}
+            }
+        }
+        feedback
+    }
+}
+
 /// One payload type a video section offers, as far as H.264 is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfferedVideoPayload {
     pub payload_type: u8,
+    /// The feedback the section lists for it, supported types only.
+    pub feedback: VideoFeedback,
     /// The `a=rtpmap` encoding name and clock, when the section maps the payload type.
     pub encoding: Option<(String, u32)>,
     /// The `a=fmtp` parameters, when it carries any.
@@ -82,6 +152,9 @@ pub struct VideoChoice {
     pub payload_type: u8,
     /// The room's format: the existing one, or the one this seat fixed.
     pub format: RoomVideoFormat,
+    /// The RTCP feedback the seat accepted: what the offer listed for the chosen payload type, and
+    /// only on `RTP/AVPF` (RFC 4585 §4.2; `RTP/AVP` has no feedback).
+    pub feedback: VideoFeedback,
 }
 
 impl RoomVideoFormat {
@@ -182,6 +255,7 @@ pub fn parse_video(sdp: &str) -> Option<VideoOffer> {
         .filter_map(|field| field.parse::<u8>().ok())
         .map(|payload_type| OfferedVideoPayload {
             payload_type,
+            feedback: VideoFeedback::of_payload(section, payload_type),
             encoding: attribute(section, "rtpmap", payload_type).and_then(|body| {
                 let (name, rest) = body.split_once('/')?;
                 let clock = rest.split('/').next()?.trim().parse().ok()?;
@@ -259,6 +333,18 @@ pub fn choose_video(
             offer.transport
         ));
     }
+    let feedback_of = |payload_type: u8| {
+        if offer.transport.eq_ignore_ascii_case("RTP/AVPF") {
+            offer
+                .payloads
+                .iter()
+                .find(|payload| payload.payload_type == payload_type)
+                .map(|payload| payload.feedback)
+                .unwrap_or_default()
+        } else {
+            VideoFeedback::default()
+        }
+    };
     let h264: Vec<(u8, u8, Option<String>)> = offer
         .payloads
         .iter()
@@ -321,6 +407,7 @@ pub fn choose_video(
         rtcp_mux: offer.rtcp_mux,
         payload_type,
         format,
+        feedback: feedback_of(payload_type),
     })
 }
 
@@ -366,6 +453,7 @@ pub fn anchor_video(sdp: &str, answer: &VideoAnswer<'_>) -> String {
     if let Some(parameters) = choice.format.fmtp.as_deref() {
         section.push(format!("a=fmtp:{payload_type} {parameters}"));
     }
+    section.extend(choice.feedback.lines(payload_type));
     // RFC 3264 §6.1: the answer's direction is the complement of the offer's.
     section.push(format!("a={}", choice.direction.answered().token()));
     if choice.rtcp_mux {
@@ -401,7 +489,7 @@ pub fn video_offer_section(
     bandwidth_kbps: Option<u32>,
 ) -> String {
     let mut section = format!(
-        "m=video {rtp_port} RTP/AVP {OFFER_PAYLOAD_TYPE}{CRLF}c=IN {} {advertised}{CRLF}",
+        "m=video {rtp_port} RTP/AVPF {OFFER_PAYLOAD_TYPE}{CRLF}c=IN {} {advertised}{CRLF}",
         addrtype(advertised)
     );
     if let Some(kbps) = bandwidth_kbps {
@@ -413,6 +501,10 @@ pub fn video_offer_section(
     );
     if let Some(parameters) = fmtp.filter(|parameters| !parameters.is_empty()) {
         let _ = write!(section, "a=fmtp:{OFFER_PAYLOAD_TYPE} {parameters}{CRLF}");
+    }
+    // RFC 4585 §4.2: everything the room supports, so the member's answer can accept any of it.
+    for line in VideoFeedback::SUPPORTED.lines(OFFER_PAYLOAD_TYPE) {
+        let _ = write!(section, "{line}{CRLF}");
     }
     // RFC 5761 §5.1.1: the seat is one muxed endpoint, as the audio is.
     section.push_str("a=sendrecv\r\na=rtcp-mux\r\n");
@@ -800,6 +892,7 @@ mod tests {
             rtcp_mux: false,
             payload_type: 99,
             format: fixed(1, None),
+            feedback: VideoFeedback::default(),
         };
         let own = OwnSsrc {
             ssrc: 1,
@@ -828,11 +921,14 @@ mod tests {
         assert_eq!(
             section,
             concat!(
-                "m=video 30004 RTP/AVP 126\r\n",
+                "m=video 30004 RTP/AVPF 126\r\n",
                 "c=IN IP4 198.51.100.7\r\n",
                 "b=AS:900\r\n",
                 "a=rtpmap:126 H264/90000\r\n",
                 "a=fmtp:126 profile-level-id=640c1f;packetization-mode=1\r\n",
+                "a=rtcp-fb:126 nack\r\n",
+                "a=rtcp-fb:126 nack pli\r\n",
+                "a=rtcp-fb:126 ccm fir\r\n",
                 "a=sendrecv\r\n",
                 "a=rtcp-mux\r\n",
             )
@@ -841,5 +937,152 @@ mod tests {
         assert!(
             v6.contains("c=IN IP6 2001:db8::7\r\n") && !v6.contains("fmtp") && !v6.contains("b=AS")
         );
+    }
+
+    const AVPF_VIDEO: &str = concat!(
+        "m=video 20200 RTP/AVPF 99 100\r\n",
+        "c=IN IP4 192.0.2.11\r\n",
+        "a=rtpmap:99 H264/90000\r\n",
+        "a=fmtp:99 profile-level-id=640C1F;packetization-mode=1\r\n",
+        "a=rtcp-fb:99 nack\r\n",
+        "a=rtcp-fb:99 nack pli\r\n",
+        "a=rtcp-fb:99 ccm fir\r\n",
+        "a=rtcp-fb:99 ccm tmmbr\r\n",
+        "a=rtcp-fb:99 goog-remb\r\n",
+        "a=rtcp-fb:100 nack\r\n",
+        "a=rtpmap:100 VP8/90000\r\n",
+        "a=sendrecv\r\n",
+        "a=rtcp-mux\r\n",
+    );
+
+    const ALL_FEEDBACK: VideoFeedback = VideoFeedback {
+        nack: true,
+        pli: true,
+        fir: true,
+    };
+
+    #[test]
+    fn an_avpf_offer_is_answered_with_the_feedback_it_offers_for_the_chosen_payload() {
+        let choice = choose_video(&parse_video(&offer(AVPF_VIDEO)).unwrap(), None).unwrap();
+        assert_eq!(choice.payload_type, 99);
+        assert_eq!(choice.feedback, ALL_FEEDBACK);
+        let answer = answered(AVPF_VIDEO, None);
+        let section = answer.split("m=video").nth(1).unwrap();
+        // RFC 4585 §4.2: only what the offer listed and the room supports; tmmbr and remb are not.
+        assert_eq!(
+            format!("m=video{section}"),
+            concat!(
+                "m=video 30004 RTP/AVPF 99\r\n",
+                "c=IN IP4 198.51.100.7\r\n",
+                "a=rtpmap:99 H264/90000\r\n",
+                "a=fmtp:99 profile-level-id=640c1f;packetization-mode=1\r\n",
+                "a=rtcp-fb:99 nack\r\n",
+                "a=rtcp-fb:99 nack pli\r\n",
+                "a=rtcp-fb:99 ccm fir\r\n",
+                "a=sendrecv\r\n",
+                "a=rtcp-mux\r\n",
+                "a=ssrc:1068393083 cname:seat-cname\r\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_wildcard_feedback_line_applies_to_the_payload_and_a_payload_line_adds_to_it() {
+        // RFC 4585 §4.2: `*` is every payload type of the section.
+        let sdp = offer(concat!(
+            "m=video 20200 RTP/AVPF 99\r\nc=IN IP4 192.0.2.11\r\n",
+            "a=rtpmap:99 H264/90000\r\n",
+            "a=rtcp-fb:* nack pli\r\n",
+            "a=rtcp-fb:99 ccm fir\r\n",
+        ));
+        let choice = choose_video(&parse_video(&sdp).unwrap(), None).unwrap();
+        assert_eq!(
+            choice.feedback,
+            VideoFeedback {
+                nack: false,
+                pli: true,
+                fir: true
+            }
+        );
+    }
+
+    #[test]
+    fn feedback_of_another_payload_type_does_not_count() {
+        let sdp = offer(concat!(
+            "m=video 20200 RTP/AVPF 99 100\r\nc=IN IP4 192.0.2.11\r\n",
+            "a=rtpmap:99 H264/90000\r\na=rtpmap:100 VP8/90000\r\n",
+            "a=rtcp-fb:100 nack pli\r\n",
+        ));
+        let choice = choose_video(&parse_video(&sdp).unwrap(), None).unwrap();
+        assert_eq!(choice.feedback, VideoFeedback::default());
+    }
+
+    #[test]
+    fn an_unknown_feedback_type_is_ignored_and_a_bare_nack_is_generic_nack_only() {
+        let sdp = offer(concat!(
+            "m=video 20200 RTP/AVPF 99\r\nc=IN IP4 192.0.2.11\r\n",
+            "a=rtpmap:99 H264/90000\r\n",
+            "a=rtcp-fb:99 nack\r\n",
+            "a=rtcp-fb:99 nack sli\r\n",
+            "a=rtcp-fb:99 nack rpsi\r\n",
+            "a=rtcp-fb:99 ccm tmmbr\r\n",
+            "a=rtcp-fb:99 trr-int 100\r\n",
+            "a=rtcp-fb:99 transport-cc\r\n",
+        ));
+        let choice = choose_video(&parse_video(&sdp).unwrap(), None).unwrap();
+        assert_eq!(
+            choice.feedback,
+            VideoFeedback {
+                nack: true,
+                pli: false,
+                fir: false
+            }
+        );
+    }
+
+    #[test]
+    fn an_avp_offer_gets_no_feedback_even_when_it_lists_some() {
+        // RFC 4585 §4.2 defines the attribute for RTP/AVPF; an RTP/AVP offer has none to accept.
+        let sdp = offer(concat!(
+            "m=video 20200 RTP/AVP 99\r\nc=IN IP4 192.0.2.11\r\n",
+            "a=rtpmap:99 H264/90000\r\na=rtcp-fb:99 nack pli\r\n",
+        ));
+        let choice = choose_video(&parse_video(&sdp).unwrap(), None).unwrap();
+        assert_eq!(choice.feedback, VideoFeedback::default());
+        assert!(!answered(
+            "m=video 20200 RTP/AVP 99\r\nc=IN IP4 192.0.2.11\r\na=rtpmap:99 H264/90000\r\na=rtcp-fb:99 nack pli\r\n",
+            None
+        )
+        .contains("rtcp-fb"));
+    }
+
+    #[test]
+    fn an_avpf_offer_with_no_feedback_lines_gets_none_back() {
+        let choice = choose_video(
+            &parse_video(&offer(
+                "m=video 20200 RTP/AVPF 99\r\nc=IN IP4 192.0.2.11\r\na=rtpmap:99 H264/90000\r\n",
+            ))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(choice.feedback, VideoFeedback::default());
+    }
+
+    #[test]
+    fn the_offer_section_lists_all_three_feedback_types() {
+        let section = video_offer_section(30004, "198.51.100.7".parse().unwrap(), None, None);
+        for line in [
+            "m=video 30004 RTP/AVPF 126\r\n",
+            "a=rtcp-fb:126 nack\r\n",
+            "a=rtcp-fb:126 nack pli\r\n",
+            "a=rtcp-fb:126 ccm fir\r\n",
+        ] {
+            assert!(section.contains(line), "{line}: {section}");
+        }
+        // The answer to that offer is read like any other: all three accepted.
+        let answer = format!("{HEADER}{section}");
+        let choice = choose_video(&parse_video(&answer).unwrap(), None).unwrap();
+        assert_eq!(choice.feedback, ALL_FEEDBACK);
     }
 }

@@ -208,6 +208,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result("forward_join", &reason);
             }
         };
+        let egress_ssrc = random_ssrc();
+        let own = sdp::OwnSsrc::with_random_cname(egress_ssrc);
         let video = match self
             .open_video_endpoint(JoinVideo {
                 transport: &transport,
@@ -216,6 +218,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 profile,
                 media,
                 fixed: fixed_video.as_ref(),
+                cname: &own.cname,
             })
             .await
         {
@@ -227,7 +230,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
         let video_endpoint = video.endpoint();
-        let egress_ssrc = random_ssrc();
         let config = ForwardSeatConfig {
             tag: from_tag.clone(),
             endpoint: endpoint.id,
@@ -304,7 +306,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // endpoint when it has one (TS 24.380 §14.3.1) and the video stream likewise (TS 24.281
         // §6.2). Every other stream the offer carries (a second video or floor section) is declined
         // with port 0.
-        let own = sdp::OwnSsrc::with_random_cname(egress_ssrc);
         match self.answer_seat_sdp(
             offer,
             &mut transport,

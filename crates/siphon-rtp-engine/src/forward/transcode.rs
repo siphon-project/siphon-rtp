@@ -271,7 +271,7 @@ pub(super) enum EventSource<'a> {
 }
 
 /// The header of a room-domain packet, which is all a receiver's packet is built from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct StreamPoint {
     pub(super) ssrc: u32,
     pub(super) sequence: u16,

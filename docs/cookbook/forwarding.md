@@ -296,9 +296,56 @@ its own video translator: a stable SSRC, continuous sequence numbers and a 90 kH
 access unit (RFC 6184 §5.1), so a switch that lands in the middle of a picture must not mark the first
 packet of the new run.
 
-**What this does not do yet.** Keyframe requests (PLI, FIR) are not acted on, so after a switch a
-receiver shows the new source from its next IDR picture; have the transmitter start a transmission with
-one. There is no transcoding or level negotiation beyond the exact match above. Plain `RTP/AVP` and
+### Keyframes on a switch
+
+H.264 is predictive, so a receiver handed a stream in the middle of a group of pictures shows nothing
+usable until the next IDR picture (RFC 6184 §1.1). A source change therefore starts every receiver on a
+keyframe (3GPP TS 24.581 treats a transmission grant as the start of a new video transmission, and TS
+26.281 wants the video decodable):
+
+1. **Gate.** Each receiver is sent nothing of the new source until a packet begins an IDR slice (a
+   single NAL unit of type 5, one inside a STAP-A, or an FU-A start of one, RFC 6184 §5.6 to §5.8).
+   Packets held back are counted (`video_dropped_awaiting_keyframe`).
+2. **Ask.** The room sends the new source a keyframe request in an RTCP compound (RFC 4585 §3.1: an
+   empty report, the source description with the CNAME, then the feedback): a Picture Loss Indication
+   first (RFC 4585 §6.3.1), then a Full Intra Request (RFC 5104 §4.3.1) every 500 ms, up to three
+   repeats. A repeat of an unanswered FIR keeps its command sequence number; the next request,
+   at the next switch, takes the next. A source is sent only what it accepted in its SDP
+   (`a=rtcp-fb`, below), and one that accepted none is sent nothing.
+3. **Open.** On the IDR the gate opens, after the source's last SPS and PPS, replayed as single NAL
+   unit packets (valid in packetization modes 0 and 1) under the sequence numbers right before the IDR
+   and its timestamp, so a receiver that missed them can decode the picture; an IDR that carries them
+   itself (a STAP-A) is not preceded by a second copy. Anything older than the IDR is dropped.
+4. **Give up.** After 2000 ms with no IDR the room forwards anyway, so a source that cannot send a
+   keyframe never mutes the room.
+
+The controller hears `forward_keyframe` once per change (`timed_out`, `latency_ms`). A seat that joins
+while a source is streaming is held and asked for a keyframe the same way, alone; that is not a source
+change and raises no event.
+
+**Feedback negotiation.** The room supports `nack`, `nack pli` and `ccm fir` (RFC 4585 §4.2, RFC 5104
+§7). An `RTP/AVPF` video offer is answered with the intersection of what it lists for the chosen payload
+type (or `*`) and that set; an `RTP/AVP` offer is answered none, since that profile has no feedback.
+`forward_offer` offers `RTP/AVPF` with all three. A source that did not accept `pli` or `fir` is not
+sent one, and a receiver's NACK is answered only if it accepted `nack`.
+
+**Receivers' feedback.** A PLI or FIR a receiver sends about the stream the room sends it is passed on to
+the source as one request per second however many receivers ask. A Generic NACK (RFC 4585 §6.2.1) is
+answered from a history of the source's last 256 video packets (about 384 KiB per room that has a seat
+accepting `nack`, allocated once): the packet is sent again through that receiver's translator, under
+the sequence number it was lost under. There is no RTX stream (RFC 4588); a NACK for a packet that left
+the history, or from before a switch, or for a replayed parameter set, is counted (`nack_missed`) and
+the receiver recovers on its own PLI.
+
+The timings are engine constants: a 500 ms retry, three repeats, a 2000 ms limit and a 1000 ms
+interval for receivers' requests. Counters per seat, in the log line when a seat leaves (and in
+`ForwardRoom::seat_stats` for an embedder): `pli_sent`, `fir_sent`, `keyframes_seen`, `video_dropped_awaiting_keyframe`,
+`nack_answered`, `nack_missed`, `keyframe_timeouts`. Check `node_info` `features` for
+`forward_video_keyframe`.
+
+**What this does not do yet.** The gate opens on any IDR slice, not only the first slice of a picture,
+so a source that sends an IDR as several slices and is joined in the middle of one starts its receivers
+one picture late. There is no transcoding or level negotiation beyond the exact match above. Plain `RTP/AVP` and
 `RTP/AVPF` seats in a translate room only: video offered by a DTLS or SDES seat, a browser seat or a
 `media: preserve` room is declined with the reason. One transmission at a time: concurrent video
 sources (3GPP TS 24.581 §4.1.1.2) need per-receiver subscriptions and stable seat ids and are a step of
@@ -306,7 +353,7 @@ their own. Check `node_info` `features` for `forward_video` first.
 
 The video endpoint is gated exactly like the seat's audio (the signalled source, then the SSRC-consistent
 latch, [Layer 5c-ii](../security-and-nat.md)). `forward_offer` with `profile.video` offers
-`m=video <port> RTP/AVP 126` with the same format rules, and `forward_answer` reports `streams` and
+`m=video <port> RTP/AVPF 126` with the same format rules, and `forward_answer` reports `streams` and
 `video_declined` too.
 
 ### Inviting a browser into the group
