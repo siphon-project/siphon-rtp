@@ -164,6 +164,29 @@ impl Translator {
         }
     }
 
+    /// The SSRC of the source the current run forwards, or `None` when no run is open (before any
+    /// packet, or between a [`Self::switch_source`] and the next packet).
+    #[must_use]
+    pub fn source_ssrc(&self) -> Option<u32> {
+        self.source.map(|source| source.ssrc)
+    }
+
+    /// The source sequence number the current run mapped to `egress_sequence`, or `None` when the
+    /// egress number is not one of the run: before its first packet, beyond the highest source
+    /// sequence it has carried, or no run is open (before any packet, or between a
+    /// [`Self::switch_source`] and the next packet). What a receiver's Generic NACK (RFC 4585 §6.2.1)
+    /// names is an egress number; this finds the source packet to send it again from.
+    #[must_use]
+    pub fn source_sequence_of(&self, egress_sequence: u16) -> Option<u16> {
+        let source = self.source?;
+        let offset = egress_sequence.wrapping_sub(source.base_sequence);
+        if offset >= 0x8000 {
+            return None; // behind the run's first packet (RFC 1982 serial arithmetic)
+        }
+        let sequence = source.first_sequence.wrapping_add(offset);
+        (!ahead16(sequence, source.highest_sequence)).then_some(sequence)
+    }
+
     /// Rewrite `inbound` (an unprotected RTP packet from the current source) into `out`, under
     /// `payload_type`: the receiver's own number for this format. Payload type numbers are dynamic
     /// and negotiated per session (RFC 3551 §3, RFC 3264 §6.1), so the source's number means nothing
@@ -408,6 +431,61 @@ mod tests {
             run(&mut translator, &packet(0xA, 503, 9480, b"a"), 960),
             (false, 105, 5960, EGRESS)
         );
+    }
+
+    #[test]
+    fn the_source_sequence_of_an_egress_sequence_is_the_inverse_of_the_run_mapping() {
+        let mut translator = Translator::new(EGRESS, 100, 5000);
+        assert_eq!(translator.source_sequence_of(100), None, "nothing sent yet");
+        run(&mut translator, &packet(0xA, 500, 9000, b"a"), 0);
+        run(&mut translator, &packet(0xA, 501, 9160, b"a"), 160);
+        run(&mut translator, &packet(0xA, 503, 9480, b"a"), 480);
+        // Egress 100, 101 and 103 are source 500, 501 and 503; 102 was lost in the source.
+        assert_eq!(translator.source_sequence_of(100), Some(500));
+        assert_eq!(translator.source_sequence_of(101), Some(501));
+        assert_eq!(translator.source_sequence_of(103), Some(503));
+        // Nothing before the run's first packet, nothing beyond the highest source sequence seen.
+        assert_eq!(translator.source_sequence_of(99), None);
+        assert_eq!(translator.source_sequence_of(104), None);
+    }
+
+    #[test]
+    fn the_source_ssrc_is_the_open_runs_and_none_between_runs() {
+        let mut translator = Translator::new(EGRESS, 100, 5000);
+        assert_eq!(translator.source_ssrc(), None);
+        run(&mut translator, &packet(0xA, 500, 9000, b"a"), 0);
+        assert_eq!(translator.source_ssrc(), Some(0xA));
+        translator.switch_source();
+        assert_eq!(translator.source_ssrc(), None);
+        run(&mut translator, &packet(0xB, 7, 70, b"b"), 320);
+        assert_eq!(translator.source_ssrc(), Some(0xB));
+    }
+
+    #[test]
+    fn the_source_sequence_of_follows_a_rebase_and_forgets_the_old_run() {
+        let mut translator = Translator::new(EGRESS, 100, 5000);
+        run(&mut translator, &packet(0xA, 500, 9000, b"a"), 0);
+        run(&mut translator, &packet(0xA, 501, 9160, b"a"), 160);
+        translator.switch_source();
+        assert_eq!(translator.source_sequence_of(100), None, "between runs");
+        run(&mut translator, &packet(0xB, 7, 70, b"b"), 320); // egress 102
+        assert_eq!(translator.source_sequence_of(102), Some(7));
+        assert_eq!(
+            translator.source_sequence_of(101),
+            None,
+            "the old run is gone"
+        );
+    }
+
+    #[test]
+    fn the_source_sequence_of_wraps_with_the_sequence_space() {
+        let mut translator = Translator::new(EGRESS, 65_535, 5000);
+        run(&mut translator, &packet(0xA, 65_534, 9000, b"a"), 0);
+        run(&mut translator, &packet(0xA, 65_535, 9160, b"a"), 160);
+        run(&mut translator, &packet(0xA, 0, 9320, b"a"), 320);
+        assert_eq!(translator.source_sequence_of(65_535), Some(65_534));
+        assert_eq!(translator.source_sequence_of(0), Some(65_535));
+        assert_eq!(translator.source_sequence_of(1), Some(0));
     }
 
     #[test]

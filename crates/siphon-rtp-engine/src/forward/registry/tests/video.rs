@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::forward::VideoConfig;
-use crate::sdp::video::RoomVideoFormat;
+use crate::sdp::video::{RoomVideoFormat, VideoFeedback};
 use crate::sdp::MediaDirection;
 
 fn format(level: &str) -> RoomVideoFormat {
@@ -26,6 +26,8 @@ fn video_config(index: u64, video_format: RoomVideoFormat) -> ForwardSeatConfig 
         initial_sequence: 0,
         initial_timestamp: 0,
         format: video_format,
+        feedback: VideoFeedback::default(),
+        cname: String::new(),
     });
     seat
 }
@@ -170,4 +172,92 @@ async fn video_traffic_counts_as_the_seat_being_alive() {
     assert_eq!(registry.scan_inactive(505, 10, activity), 0);
     assert!(events.try_recv().is_err());
     assert_eq!(registry.scan_inactive(510, 10, activity), 1);
+}
+
+/// A video RTP packet of seat `index`, at its video endpoint.
+fn video_packet_of(index: u64, sequence: u16, payload: &[u8]) -> RxPacket {
+    let mut datagram = vec![0u8; 12];
+    datagram[0] = 0x80;
+    datagram[1] = 99;
+    datagram[2..4].copy_from_slice(&sequence.to_be_bytes());
+    datagram[8..12].copy_from_slice(&(0x1000_0000 | index as u32).to_be_bytes());
+    datagram.extend_from_slice(payload);
+    RxPacket {
+        endpoint: EndpointId(100 + index),
+        source: format!("192.0.2.{index}:5000").parse().unwrap(),
+        arrival: 0,
+        data: bytes::Bytes::from(datagram),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_actor_gives_up_on_a_keyframe_after_two_seconds_of_its_own_clock_and_says_so() {
+    let registry = ForwardRegistry::default();
+    let datapath = UdpLoopbackDatapath::new();
+    join_with_video(&registry, &datapath, video_config(1, format("640c1f")))
+        .await
+        .unwrap();
+    join_with_video(&registry, &datapath, video_config(2, format("640c1f")))
+        .await
+        .unwrap();
+    let (sink, events) = flume::unbounded();
+    registry
+        .set_source("group", Some("seat-1".to_string()), Some(sink))
+        .await
+        .unwrap();
+    // A picture that is not a keyframe, so the receiver stays held back.
+    registry.dispatch(video_packet_of(1, 1, &[0x41, 0x9A]));
+    tokio::time::sleep(std::time::Duration::from_millis(1900)).await;
+    assert!(
+        events
+            .try_iter()
+            .all(|event| !matches!(event, Event::ForwardKeyframe { .. })),
+        "not yet: the room waits two seconds"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let reported: Vec<_> = events
+        .try_iter()
+        .filter_map(|event| match event {
+            Event::ForwardKeyframe {
+                from_tag,
+                latency_ms,
+                timed_out,
+                ..
+            } => Some((from_tag, latency_ms, timed_out)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported, [("seat-1".to_string(), 2000, true)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_actor_reports_the_keyframe_that_answered_the_switch_with_its_latency() {
+    let registry = ForwardRegistry::default();
+    let datapath = UdpLoopbackDatapath::new();
+    join_with_video(&registry, &datapath, video_config(1, format("640c1f")))
+        .await
+        .unwrap();
+    join_with_video(&registry, &datapath, video_config(2, format("640c1f")))
+        .await
+        .unwrap();
+    let (sink, events) = flume::unbounded();
+    registry
+        .set_source("group", Some("seat-1".to_string()), Some(sink))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    registry.dispatch(video_packet_of(1, 1, &[0x65, 0x88]));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let reported: Vec<_> = events
+        .try_iter()
+        .filter_map(|event| match event {
+            Event::ForwardKeyframe {
+                latency_ms,
+                timed_out,
+                ..
+            } => Some((latency_ms, timed_out)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported, [(300, false)]);
 }

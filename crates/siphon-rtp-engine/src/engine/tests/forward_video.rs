@@ -696,7 +696,12 @@ async fn a_forward_offer_with_a_video_profile_offers_video_and_its_answer_seats_
     let talker = video_phone(&engine, "a", 99, "sendrecv", CHP_L31).await;
     let offered = ok_sdp_text(&offer_member(&engine, "b", profile(carry_video())).await);
     let video = sdp::video::parse_video(&offered).expect("the offer carries video");
-    assert_eq!(video.transport, "RTP/AVP");
+    // RFC 4585 §4.2: RTP/AVPF, offering the three feedback types the room supports.
+    assert_eq!(video.transport, "RTP/AVPF");
+    assert_eq!(
+        video.payloads[0].feedback,
+        sdp::video::VideoFeedback::SUPPORTED
+    );
     assert_eq!(video.direction, sdp::MediaDirection::SendRecv);
     assert_eq!(
         video.payloads[0].payload_type,
@@ -823,4 +828,251 @@ async fn node_info_advertises_forward_video() {
         panic!("node_info answers a node");
     };
     assert!(node.features.iter().any(|name| name == "forward_video"));
+    assert!(node
+        .features
+        .iter()
+        .any(|name| name == "forward_video_keyframe"));
+}
+
+/// The first RTCP datagram carrying feedback (a PLI, FIR or NACK) that arrives on `socket` within
+/// `window`; the room's periodic Sender Reports are skipped.
+async fn recv_feedback(socket: &UdpSocket, window: Duration) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut buffer = [0u8; 2048];
+    while let Ok(Ok((length, _))) =
+        tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await
+    {
+        let datagram = &buffer[..length];
+        if length >= 2
+            && (64..=95).contains(&(buffer[1] & 0x7f))
+            && siphon_rtp_media::rtcp::feedback_packets(datagram).any(|item| item.is_ok())
+        {
+            return Some(datagram.to_vec());
+        }
+    }
+    None
+}
+
+/// A seated phone that offered `RTP/AVPF` video with all three feedback types (RFC 4585 §4.2).
+async fn avpf_video_phone(
+    engine: &Engine<UdpLoopbackDatapath>,
+    tag: &str,
+    payload_type: u8,
+) -> Phone {
+    let (audio, audio_address) = phone().await;
+    let (video, video_address) = phone().await;
+    let text = offer(
+        audio_address,
+        Some((video_address, payload_type, "sendrecv", CHP_L31)),
+        None,
+    )
+    .replace(
+        &format!("m=video {} RTP/AVP {payload_type}", video_address.port()),
+        &format!("m=video {} RTP/AVPF {payload_type}", video_address.port()),
+    )
+    .replace(
+        "a=extmap:1",
+        &format!(
+            "a=rtcp-fb:{payload_type} nack\r\na=rtcp-fb:{payload_type} nack pli\r\n\
+             a=rtcp-fb:{payload_type} ccm fir\r\na=extmap:1"
+        ),
+    );
+    let result = join(
+        engine,
+        ForwardMedia::Translate,
+        tag,
+        text,
+        profile(carry_video()),
+    )
+    .await;
+    let answer = ok_sdp_text(&result);
+    let engine_video = sdp::video::parse_video(&answer)
+        .expect("a live video section")
+        .remote;
+    Phone {
+        audio,
+        video,
+        engine_video,
+        answer,
+    }
+}
+
+/// The next `forward_keyframe` event: `(from_tag, timed_out)`.
+async fn next_keyframe_event(events: &flume::Receiver<Event>) -> (String, bool) {
+    let deadline = tokio::time::Instant::now() + SHORT;
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv_async()).await {
+        if let Event::ForwardKeyframe {
+            conference_id,
+            from_tag,
+            timed_out,
+            ..
+        } = event
+        {
+            assert_eq!(conference_id, ROOM);
+            return (from_tag, timed_out);
+        }
+    }
+    panic!("no forward_keyframe event");
+}
+
+#[tokio::test]
+async fn a_switch_asks_the_source_for_a_keyframe_and_the_receiver_is_started_on_it() {
+    let engine = engine_of(16);
+    let events = engine.register_client(CLIENT);
+    let talker = avpf_video_phone(&engine, "a", 99).await;
+    let listener = avpf_video_phone(&engine, "b", 105).await;
+    // The answer accepted what both offered, and says so (RFC 4585 §4.2).
+    for line in [
+        "a=rtcp-fb:99 nack\r\n",
+        "a=rtcp-fb:99 nack pli\r\n",
+        "a=rtcp-fb:99 ccm fir\r\n",
+    ] {
+        assert!(talker.answer.contains(line), "{line}: {}", talker.answer);
+    }
+    let (sps, pps, idr) = (
+        [0x67u8, 0x64, 0x00, 0x1F],
+        [0x68u8, 0xEE, 0x3C],
+        [0x65u8, 0x88, 0x84],
+    );
+    // The talker has been sending its stream; only the source's reaches the others.
+    for (sequence, payload) in [(1u16, &sps[..]), (2, &pps[..])] {
+        talker
+            .video
+            .send_to(
+                &video_packet(99, sequence, 9_000, 0xA0A0_A0A0, false, payload),
+                talker.engine_video,
+            )
+            .await
+            .expect("send");
+    }
+    // The room has taken them in before the switch.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    set_source(&engine, "a").await;
+    // A compound arrives at the talker's video socket: RR, SDES, then a PLI about its stream.
+    let request = recv_feedback(&talker.video, SHORT)
+        .await
+        .expect("a keyframe request");
+    let feedback: Vec<_> = siphon_rtp_media::rtcp::feedback_packets(&request)
+        .map(|item| item.expect("well formed"))
+        .collect();
+    assert!(
+        matches!(
+            feedback[..],
+            [siphon_rtp_media::rtcp::Feedback::Pli {
+                media_ssrc: 0xA0A0_A0A0,
+                ..
+            }]
+        ),
+        "{feedback:?}"
+    );
+    // Pictures before the keyframe are not sent on.
+    talker
+        .video
+        .send_to(
+            &video_packet(99, 3, 12_000, 0xA0A0_A0A0, true, &[0x41, 0x9A, 0]),
+            talker.engine_video,
+        )
+        .await
+        .expect("send");
+    assert!(recv_rtp(&listener.video, NEGATIVE).await.is_none());
+    talker
+        .video
+        .send_to(
+            &video_packet(99, 4, 15_000, 0xA0A0_A0A0, true, &idr),
+            talker.engine_video,
+        )
+        .await
+        .expect("send");
+    let mut heard = Vec::new();
+    for _ in 0..3 {
+        let datagram = recv_rtp(&listener.video, SHORT).await.expect("video");
+        let packet = RtpPacket::parse(&datagram).expect("rtp");
+        assert_eq!(packet.payload_type, 105, "the listener's own number");
+        heard.push((packet.sequence, packet.payload.to_vec()));
+    }
+    let sequences: Vec<u16> = heard.iter().map(|(sequence, _)| *sequence).collect();
+    assert_eq!(sequences[1], sequences[0].wrapping_add(1));
+    assert_eq!(sequences[2], sequences[1].wrapping_add(1));
+    let payloads: Vec<&[u8]> = heard
+        .iter()
+        .map(|(_, payload)| payload.as_slice())
+        .collect();
+    assert_eq!(payloads, [&sps[..], &pps[..], &idr[..]]);
+    assert_eq!(next_keyframe_event(&events).await, ("a".to_string(), false));
+    drop((talker.audio, listener.audio));
+}
+
+#[tokio::test]
+async fn a_source_that_offered_plain_avp_is_sent_no_feedback() {
+    let engine = engine_of(16);
+    let _events = engine.register_client(CLIENT);
+    let talker = video_phone(&engine, "a", 99, "sendrecv", CHP_L31).await;
+    let _listener = video_phone(&engine, "b", 105, "sendrecv", CHP_L31).await;
+    assert!(!talker.answer.contains("rtcp-fb"), "{}", talker.answer);
+    talker
+        .video
+        .send_to(
+            &video_packet(99, 1, 0, 0xA0A0_A0A0, false, &[0x41, 0]),
+            talker.engine_video,
+        )
+        .await
+        .expect("send");
+    set_source(&engine, "a").await;
+    assert!(
+        recv_feedback(&talker.video, NEGATIVE).await.is_none(),
+        "RTP/AVP has no feedback to send"
+    );
+}
+
+#[tokio::test]
+async fn a_member_that_answers_an_offer_with_avpf_feedback_is_asked_for_keyframes_as_a_source() {
+    let engine = engine_of(16);
+    let _events = engine.register_client(CLIENT);
+    let listener = avpf_video_phone(&engine, "a", 99).await;
+    let offered = ok_sdp_text(&offer_member(&engine, "b", profile(carry_video())).await);
+    let (member_audio, audio_address) = phone().await;
+    let (member_video, video_address) = phone().await;
+    let video_type = sdp::video::OFFER_PAYLOAD_TYPE;
+    // RFC 4585 §4.2: the answer keeps the offer's RTP/AVPF and accepts nack pli only.
+    let answer = member_answer(
+        &offered,
+        audio_address,
+        video_address.port(),
+        "sendrecv",
+        CHP_L31,
+    )
+    .replace(
+        &format!("RTP/AVP {video_type}"),
+        &format!("RTP/AVPF {video_type}"),
+    ) + &format!("a=rtcp-fb:{video_type} nack pli\r\n");
+    let result = answer_member(&engine, "b", answer).await;
+    assert_eq!(streams(&result), ["audio", "video"]);
+    // The member's own stream, so the room knows its SSRC before the switch.
+    let engine_video = sdp::video::parse_video(&offered).expect("video").remote;
+    member_video
+        .send_to(
+            &video_packet(126, 1, 0, 0xC0C0_C0C0, false, &[0x41, 0]),
+            engine_video,
+        )
+        .await
+        .expect("send");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    set_source(&engine, "b").await;
+    let request = recv_feedback(&member_video, SHORT)
+        .await
+        .expect("a keyframe request");
+    let feedback: Vec<_> = siphon_rtp_media::rtcp::feedback_packets(&request)
+        .map(|item| item.expect("well formed"))
+        .collect();
+    assert!(
+        matches!(
+            feedback[..],
+            [siphon_rtp_media::rtcp::Feedback::Pli {
+                media_ssrc: 0xC0C0_C0C0,
+                ..
+            }]
+        ),
+        "only what the member accepted: {feedback:?}"
+    );
+    drop((member_audio, listener.audio));
 }

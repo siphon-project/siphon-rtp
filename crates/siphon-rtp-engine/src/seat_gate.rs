@@ -137,6 +137,15 @@ pub(crate) fn consume_rtcp(data: &[u8], mut consume: impl FnMut(RtcpItem<'_>)) {
     let _ = rtcp::for_each_report_block(data, |block| consume(RtcpItem::Block(block)));
 }
 
+/// Hand every feedback message (RFC 4585 PLI and Generic NACK, RFC 5104 FIR) of a datagram a video
+/// seat sent to `consume`, without allocating. A malformed datagram yields what precedes the fault:
+/// its length cannot be trusted, so nothing after it is read.
+pub(crate) fn consume_feedback(data: &[u8], mut consume: impl FnMut(rtcp::Feedback<'_>)) {
+    for feedback in rtcp::feedback_packets(data).map_while(Result::ok) {
+        consume(feedback);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -301,5 +310,26 @@ mod tests {
     fn consume_rtcp_ignores_garbage() {
         consume_rtcp(&[0x80, 200], |_| panic!("nothing to read"));
         consume_rtcp(&[], |_| panic!("nothing to read"));
+    }
+
+    #[test]
+    fn consume_feedback_reads_every_message_up_to_a_fault() {
+        let mut datagram = vec![0u8; rtcp::PLI_LEN + rtcp::NACK_LEN];
+        rtcp::write_pli(1, 2, &mut datagram).unwrap();
+        rtcp::write_nack(1, 2, 7, 0, &mut datagram[rtcp::PLI_LEN..]).unwrap();
+        let mut seen = Vec::new();
+        consume_feedback(&datagram, |feedback| {
+            seen.push(matches!(feedback, rtcp::Feedback::Pli { .. }));
+        });
+        assert_eq!(seen, [true, false]);
+        // A length that overruns after the first packet: the first is still read.
+        datagram.extend_from_slice(&[0x81, 0xCE, 0x00, 0x09, 0, 0, 0, 1]);
+        seen.clear();
+        consume_feedback(&datagram, |feedback| {
+            seen.push(matches!(feedback, rtcp::Feedback::Pli { .. }));
+        });
+        assert_eq!(seen, [true, false]);
+        consume_feedback(&[0x80, 0xCE], |_| panic!("nothing to read"));
+        consume_feedback(&[], |_| panic!("nothing to read"));
     }
 }

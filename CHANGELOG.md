@@ -5,6 +5,28 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Added
+
+- **A source change in a video room starts every receiver on a keyframe.** H.264 is predictive, so a
+  receiver handed the new source in the middle of a group of pictures showed nothing usable until the
+  source's next IDR picture, and receivers' feedback was dropped. Now each receiver is held back until
+  a packet begins an IDR slice (RFC 6184 §5.8), the new source is asked for one (an RTCP PLI, RFC 4585
+  §6.3.1, then a FIR every 500 ms, RFC 5104 §4.3.1, in a compound with the source description), the
+  source's last SPS and PPS are replayed as single NAL unit packets just before the IDR, and the room
+  forwards anyway after 2 seconds. A PLI or FIR from a receiver is passed on to the source (one request
+  a second for any number of receivers), and a Generic NACK (RFC 4585 §6.2.1) is answered from a fixed
+  history of the source's last 256 packets, sent again under the sequence number it was lost under.
+  Feedback is negotiated: an `RTP/AVPF` video offer is answered with the `a=rtcp-fb` types it lists
+  that the room supports (`nack`, `nack pli`, `ccm fir`), an `RTP/AVP` offer with none, and
+  `forward_offer` now offers `RTP/AVPF` with all three; a source is sent only what it accepted. The new
+  `forward_keyframe` event (`conference_id`, `from_tag`, `latency_ms`, `timed_out`) tells the controller
+  how the switch ended, once per change. `node_info` lists `forward_video_keyframe`; the seat counters
+  and the leave log gain `pli_sent`, `fir_sent`, `keyframes_seen`, `video_dropped_awaiting_keyframe`,
+  `nack_answered`, `nack_missed` and `keyframe_timeouts`. `siphon-rtp-proto` gains an event variant (the
+  enum is non-exhaustive).
+
 ## [0.22.0] — 2026-11-17
 
 ### Added
@@ -22,7 +44,7 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   translate room only; SRTP, browser and preserve-room video is declined with a reason. The `ok` result
   of `forward_join` and `forward_answer` gains `streams` and `video_declined`, which is a minor bump of
   `siphon-rtp-proto` for Rust callers that construct it. `node_info` lists `forward_video`; the bench has
-  `video_per_inbound_packet`. Keyframe requests are not acted on yet.
+  `video_per_inbound_packet`. Keyframe requests are not acted on yet (see Unreleased).
 
 ## [0.21.0] — 2026-11-17
 

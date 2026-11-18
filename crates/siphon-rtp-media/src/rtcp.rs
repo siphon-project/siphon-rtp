@@ -592,6 +592,635 @@ pub fn demux(datagram: &[u8]) -> Option<MuxKind> {
     }
 }
 
+/// RTCP transport-layer feedback packet type (RFC 4585 §6.1, RTPFB).
+pub const RTPFB: u8 = 205;
+/// RTCP payload-specific feedback packet type (RFC 4585 §6.1, PSFB).
+pub const PSFB: u8 = 206;
+/// RTPFB format of a Generic NACK (RFC 4585 §6.2.1).
+const FORMAT_GENERIC_NACK: u8 = 1;
+/// PSFB format of a Picture Loss Indication (RFC 4585 §6.3.1).
+const FORMAT_PLI: u8 = 1;
+/// PSFB format of a Full Intra Request (RFC 5104 §4.3.1).
+const FORMAT_FIR: u8 = 4;
+
+/// Length of [`write_pli`]'s packet: header, sender SSRC, media source SSRC (RFC 4585 §6.1).
+pub const PLI_LEN: usize = 12;
+/// Length of [`write_fir`]'s packet: the common feedback header and one FCI entry (RFC 5104
+/// §4.3.1.1).
+pub const FIR_LEN: usize = 20;
+/// Length of [`write_nack`]'s packet: the common feedback header and one FCI entry (RFC 4585 §6.2.1).
+pub const NACK_LEN: usize = 16;
+/// Length of [`write_empty_receiver_report`]'s packet (RFC 3550 §6.4.2 with RC = 0).
+pub const EMPTY_RECEIVER_REPORT_LEN: usize = 8;
+
+/// The common header of a feedback packet (RFC 4585 §6.1) and the two SSRCs after it.
+fn write_feedback_header(
+    packet_type: u8,
+    format: u8,
+    length_words: u16,
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    out: &mut [u8],
+) {
+    out[0] = 0x80 | format; // V=2, P=0, FMT
+    out[1] = packet_type;
+    out[2..4].copy_from_slice(&length_words.to_be_bytes());
+    out[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
+    out[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
+}
+
+/// Write a Picture Loss Indication (RFC 4585 §6.3.1: PSFB, FMT 1, no FCI) from `sender_ssrc` about
+/// the stream `media_ssrc`, returning its length, or `None` when `out` is shorter than [`PLI_LEN`].
+#[must_use]
+pub fn write_pli(sender_ssrc: u32, media_ssrc: u32, out: &mut [u8]) -> Option<usize> {
+    let packet = out.get_mut(..PLI_LEN)?;
+    write_feedback_header(PSFB, FORMAT_PLI, 2, sender_ssrc, media_ssrc, packet);
+    Some(PLI_LEN)
+}
+
+/// Write a Full Intra Request with one entry (RFC 5104 §4.3.1.1: PSFB, FMT 4) asking `target_ssrc`
+/// for a decoder refresh point, returning its length, or `None` when `out` is shorter than
+/// [`FIR_LEN`].
+///
+/// The header's media source SSRC is 0 (§4.3.1.2: the targets are named in the entries), and
+/// `sequence` is the command sequence number: it increments for each new request, and a repeat of
+/// one that was not answered carries the same number so a receiver that did act on the first can
+/// tell (§4.3.1.2).
+#[must_use]
+pub fn write_fir(
+    sender_ssrc: u32,
+    target_ssrc: u32,
+    sequence: u8,
+    out: &mut [u8],
+) -> Option<usize> {
+    let packet = out.get_mut(..FIR_LEN)?;
+    write_feedback_header(PSFB, FORMAT_FIR, 4, sender_ssrc, 0, packet);
+    packet[12..16].copy_from_slice(&target_ssrc.to_be_bytes());
+    packet[16] = sequence;
+    packet[17..20].copy_from_slice(&[0, 0, 0]); // reserved
+    Some(FIR_LEN)
+}
+
+/// Write a Generic NACK with one FCI entry (RFC 4585 §6.2.1: RTPFB, FMT 1): `pid` is the first
+/// sequence number lost and bit `n` of `blp` says whether `pid + n + 1` was lost too. Returns its
+/// length, or `None` when `out` is shorter than [`NACK_LEN`].
+#[must_use]
+pub fn write_nack(
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    pid: u16,
+    blp: u16,
+    out: &mut [u8],
+) -> Option<usize> {
+    let packet = out.get_mut(..NACK_LEN)?;
+    write_feedback_header(
+        RTPFB,
+        FORMAT_GENERIC_NACK,
+        3,
+        sender_ssrc,
+        media_ssrc,
+        packet,
+    );
+    packet[12..14].copy_from_slice(&pid.to_be_bytes());
+    packet[14..16].copy_from_slice(&blp.to_be_bytes());
+    Some(NACK_LEN)
+}
+
+/// Write an empty Receiver Report from `ssrc` (RFC 3550 §6.4.2, RC = 0): the report every compound
+/// opens with when the sender has sent no media (§6.1; RFC 4585 §3.1 for feedback), returning its
+/// length, or `None` when `out` is shorter than [`EMPTY_RECEIVER_REPORT_LEN`].
+#[must_use]
+pub fn write_empty_receiver_report(ssrc: u32, out: &mut [u8]) -> Option<usize> {
+    let packet = out.get_mut(..EMPTY_RECEIVER_REPORT_LEN)?;
+    packet[0..4].copy_from_slice(&[0x80, packet_type::RECEIVER_REPORT, 0, 1]);
+    packet[4..8].copy_from_slice(&ssrc.to_be_bytes());
+    Some(EMPTY_RECEIVER_REPORT_LEN)
+}
+
+/// Write a Source Description with one chunk for `ssrc` carrying its CNAME (RFC 3550 §6.5, §6.5.1),
+/// returning its length, or `None` when `cname` is over the 255 octets an item holds (§6.5) or `out`
+/// is too short.
+///
+/// The item list ends with at least one null octet, and more follow to the next 32-bit boundary.
+#[must_use]
+pub fn write_sdes_cname(ssrc: u32, cname: &str, out: &mut [u8]) -> Option<usize> {
+    const ITEM_CNAME: u8 = 1;
+    let text = cname.as_bytes();
+    if text.len() > usize::from(u8::MAX) {
+        return None;
+    }
+    // Header, SSRC, item type and length, the text, and the terminating null; then word padding.
+    let total = (4 + 4 + 2 + text.len() + 1).next_multiple_of(4);
+    let packet = out.get_mut(..total)?;
+    let length_words = u16::try_from(total / 4 - 1).ok()?;
+    packet[0] = 0x81; // V=2, P=0, SC=1
+    packet[1] = packet_type::SOURCE_DESCRIPTION;
+    packet[2..4].copy_from_slice(&length_words.to_be_bytes());
+    packet[4..8].copy_from_slice(&ssrc.to_be_bytes());
+    packet[8] = ITEM_CNAME;
+    packet[9] = text.len() as u8;
+    packet[10..10 + text.len()].copy_from_slice(text);
+    packet[10 + text.len()..].fill(0);
+    Some(total)
+}
+
+/// One Full Intra Request entry (RFC 5104 §4.3.1.1): the stream asked for a refresh point and the
+/// command sequence number of the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirEntry {
+    /// SSRC of the stream the sender asks to refresh.
+    pub ssrc: u32,
+    /// Command sequence number (RFC 5104 §4.3.1.2).
+    pub sequence: u8,
+}
+
+/// The entries of one Full Intra Request, borrowed from the datagram (8 octets each; a ragged tail
+/// shorter than an entry is ignored).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirEntries<'a> {
+    fci: &'a [u8],
+}
+
+impl Iterator for FirEntries<'_> {
+    type Item = FirEntry;
+
+    fn next(&mut self) -> Option<FirEntry> {
+        let entry = self.fci.get(..8)?;
+        self.fci = &self.fci[8..];
+        Some(FirEntry {
+            ssrc: be32(&entry[0..4]),
+            sequence: entry[4],
+        })
+    }
+}
+
+/// One feedback message read out of a datagram by [`feedback_packets`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feedback<'a> {
+    /// A Picture Loss Indication (RFC 4585 §6.3.1).
+    Pli {
+        /// SSRC of the sender of the feedback.
+        sender_ssrc: u32,
+        /// SSRC of the stream that lost a picture.
+        media_ssrc: u32,
+    },
+    /// A Full Intra Request (RFC 5104 §4.3.1).
+    Fir {
+        /// SSRC of the sender of the request.
+        sender_ssrc: u32,
+        /// The streams it asks to refresh.
+        entries: FirEntries<'a>,
+    },
+    /// One FCI entry of a Generic NACK (RFC 4585 §6.2.1): a packet in a stream lost, and the 16
+    /// that follow it.
+    GenericNack {
+        /// SSRC of the sender of the feedback.
+        sender_ssrc: u32,
+        /// SSRC of the stream that lost packets.
+        media_ssrc: u32,
+        /// First sequence number lost.
+        pid: u16,
+        /// Bit `n` set: `pid + n + 1` was lost too.
+        blp: u16,
+    },
+}
+
+/// Iterator over the feedback messages of one datagram, from [`feedback_packets`].
+#[derive(Debug, Clone)]
+pub struct FeedbackPackets<'a> {
+    buffer: &'a [u8],
+    offset: usize,
+    failed: bool,
+    /// The rest of a Generic NACK's FCI, one item per 4 octets, with its two SSRCs.
+    nack: Option<(u32, u32, &'a [u8])>,
+}
+
+/// Walk every RTCP packet in `datagram` and yield the feedback messages in it (PLI, FIR, Generic
+/// NACK), skipping every other packet.
+///
+/// No compound rule is applied: feedback rides in a compound (RFC 4585 §3.1) or alone in a
+/// reduced-size packet (RFC 5506). A Generic NACK with several FCI entries yields one item each.
+/// A malformed packet yields one `Err` and ends the walk: its length cannot be trusted, so nothing
+/// after it can be located. Nothing is allocated.
+#[must_use]
+pub fn feedback_packets(datagram: &[u8]) -> FeedbackPackets<'_> {
+    FeedbackPackets {
+        buffer: datagram,
+        offset: 0,
+        failed: false,
+        nack: None,
+    }
+}
+
+impl<'a> Iterator for FeedbackPackets<'a> {
+    type Item = Result<Feedback<'a>, RtcpError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((sender_ssrc, media_ssrc, fci)) = self.nack {
+                if let Some(entry) = fci.get(..4) {
+                    self.nack = Some((sender_ssrc, media_ssrc, &fci[4..]));
+                    return Some(Ok(Feedback::GenericNack {
+                        sender_ssrc,
+                        media_ssrc,
+                        pid: u16::from_be_bytes([entry[0], entry[1]]),
+                        blp: u16::from_be_bytes([entry[2], entry[3]]),
+                    }));
+                }
+                self.nack = None;
+            }
+            if self.failed || self.offset >= self.buffer.len() {
+                return None;
+            }
+            match self.read_one() {
+                Ok(Some(feedback)) => return Some(Ok(feedback)),
+                Ok(None) => {}
+                Err(error) => {
+                    self.failed = true;
+                    return Some(Err(error));
+                }
+            }
+        }
+    }
+}
+
+impl<'a> FeedbackPackets<'a> {
+    /// Read the packet at `offset` and step past it: the first message of a feedback packet, or
+    /// `Ok(None)` for a packet with none (another type, a format this does not read, a NACK whose
+    /// entries follow from [`Iterator::next`]).
+    fn read_one(&mut self) -> Result<Option<Feedback<'a>>, RtcpError> {
+        let rest = &self.buffer[self.offset..];
+        let header = rest.get(..4).ok_or(RtcpError::TooShort)?;
+        let version = header[0] >> 6;
+        if version != 2 {
+            return Err(RtcpError::BadVersion(version));
+        }
+        let padded = header[0] & 0x20 != 0;
+        let format = header[0] & 0x1F;
+        let packet_type = header[1];
+        let packet_len = (usize::from(u16::from_be_bytes([header[2], header[3]])) + 1) * 4;
+        let packet = rest.get(..packet_len).ok_or(RtcpError::BadLength)?;
+        self.offset += packet_len;
+        if !matches!(
+            (packet_type, format),
+            (RTPFB, FORMAT_GENERIC_NACK) | (PSFB, FORMAT_PLI | FORMAT_FIR)
+        ) {
+            return Ok(None);
+        }
+        // Header, sender SSRC and media source SSRC (RFC 4585 §6.1), then the FCI.
+        if packet.len() < PLI_LEN {
+            return Err(RtcpError::TooShort);
+        }
+        let mut fci = &packet[PLI_LEN..];
+        if padded {
+            // RFC 3550 §6.4.1: the last octet counts the padding octets, itself included.
+            let count = usize::from(*packet.last().ok_or(RtcpError::BadPadding)?);
+            if count == 0 || count > fci.len() {
+                return Err(RtcpError::BadPadding);
+            }
+            fci = &fci[..fci.len() - count];
+        }
+        let (sender_ssrc, media_ssrc) = (be32(&packet[4..8]), be32(&packet[8..12]));
+        match (packet_type, format) {
+            (PSFB, FORMAT_PLI) => Ok(Some(Feedback::Pli {
+                sender_ssrc,
+                media_ssrc,
+            })),
+            (PSFB, _) => Ok(Some(Feedback::Fir {
+                sender_ssrc,
+                entries: FirEntries { fci },
+            })),
+            _ => {
+                self.nack = Some((sender_ssrc, media_ssrc, fci));
+                Ok(None)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "tests")]
+mod feedback_tests {
+    use super::*;
+
+    /// RFC 4585 §6.3.1 / §6.1: V=2, P=0, FMT=1, PT=206 (PSFB), length 2, sender, media source.
+    const PLI: [u8; 12] = [
+        0x81, 0xCE, 0x00, 0x02, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44,
+    ];
+    /// RFC 5104 §4.3.1.1: FMT=4, PT=206, length 4; the media source SSRC is 0 (§4.3.1.2), the one FCI
+    /// entry carries the target SSRC, the command sequence number 5 and 24 reserved bits.
+    const FIR: [u8; 20] = [
+        0x84, 0xCE, 0x00, 0x04, 0x11, 0x11, 0x22, 0x22, 0x00, 0x00, 0x00, 0x00, 0x33, 0x33, 0x44,
+        0x44, 0x05, 0x00, 0x00, 0x00,
+    ];
+    /// RFC 4585 §6.2.1: FMT=1, PT=205 (RTPFB), length 3; FCI is PID 0x1234 and BLP 0x8001.
+    const NACK: [u8; 16] = [
+        0x81, 0xCD, 0x00, 0x03, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x12, 0x34, 0x80,
+        0x01,
+    ];
+
+    #[test]
+    fn a_pli_is_the_rfc_4585_layout() {
+        let mut out = [0u8; 12];
+        assert_eq!(write_pli(0x1111_2222, 0x3333_4444, &mut out), Some(12));
+        assert_eq!(out, PLI);
+        assert_eq!(write_pli(1, 2, &mut [0u8; 11]), None);
+    }
+
+    #[test]
+    fn a_fir_is_the_rfc_5104_layout() {
+        let mut out = [0u8; 20];
+        assert_eq!(write_fir(0x1111_2222, 0x3333_4444, 5, &mut out), Some(20));
+        assert_eq!(out, FIR);
+        assert_eq!(write_fir(1, 2, 3, &mut [0u8; 19]), None);
+    }
+
+    #[test]
+    fn a_generic_nack_is_the_rfc_4585_layout() {
+        let mut out = [0u8; 16];
+        assert_eq!(
+            write_nack(0x1111_2222, 0x3333_4444, 0x1234, 0x8001, &mut out),
+            Some(16)
+        );
+        assert_eq!(out, NACK);
+        assert_eq!(write_nack(1, 2, 3, 4, &mut [0u8; 15]), None);
+    }
+
+    #[test]
+    fn an_empty_receiver_report_is_rc_zero_and_the_sender() {
+        let mut out = [0u8; 8];
+        assert_eq!(write_empty_receiver_report(0xAABB_CCDD, &mut out), Some(8));
+        assert_eq!(out, [0x80, 0xC9, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(write_empty_receiver_report(1, &mut [0u8; 7]), None);
+    }
+
+    #[test]
+    fn an_sdes_cname_is_one_chunk_with_a_null_terminated_item_padded_to_a_word() {
+        // RFC 3550 §6.5: SSRC, item type 1, length 3, "abc", then nulls to the next 32-bit boundary
+        // (at least one, which ends the list).
+        let mut out = [0u8; 16];
+        assert_eq!(write_sdes_cname(0xAABB_CCDD, "abc", &mut out), Some(16));
+        assert_eq!(
+            out,
+            [
+                0x81, 0xCA, 0x00, 0x03, 0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x03, b'a', b'b', b'c', 0, 0,
+                0
+            ]
+        );
+        // A name that ends on a word boundary still gets a whole word of nulls.
+        let mut out = [0u8; 16];
+        assert_eq!(write_sdes_cname(1, "ab", &mut out), Some(16));
+        assert_eq!(out[8..], [0x01, 0x02, b'a', b'b', 0, 0, 0, 0]);
+        assert_eq!(out[2..4], [0x00, 0x03]);
+        assert_eq!(write_sdes_cname(1, "abc", &mut [0u8; 15]), None);
+        assert_eq!(write_sdes_cname(1, &"x".repeat(256), &mut [0u8; 400]), None);
+    }
+
+    #[test]
+    fn the_compound_pieces_parse_as_a_compound() {
+        let mut out = [0u8; 64];
+        let mut length = write_empty_receiver_report(7, &mut out).unwrap();
+        length += write_sdes_cname(7, "cname", &mut out[length..]).unwrap();
+        length += write_pli(7, 9, &mut out[length..]).unwrap();
+        let packets = parse_compound(&out[..length]).unwrap();
+        assert_eq!(packets.len(), 3);
+        assert!(matches!(&packets[0], RtcpPacket::ReceiverReport(report) if report.ssrc == 7));
+        assert!(matches!(
+            &packets[2],
+            RtcpPacket::Other { packet_type: 206 }
+        ));
+    }
+
+    fn feedback_of(datagram: &[u8]) -> Vec<Feedback<'_>> {
+        feedback_packets(datagram).map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn a_pli_is_read_back() {
+        assert_eq!(
+            feedback_of(&PLI),
+            [Feedback::Pli {
+                sender_ssrc: 0x1111_2222,
+                media_ssrc: 0x3333_4444
+            }]
+        );
+    }
+
+    #[test]
+    fn a_fir_is_read_back_with_its_entries() {
+        let feedback = feedback_of(&FIR);
+        let [Feedback::Fir {
+            sender_ssrc,
+            entries,
+        }] = feedback.as_slice()
+        else {
+            panic!("one fir: {feedback:?}");
+        };
+        assert_eq!(*sender_ssrc, 0x1111_2222);
+        assert_eq!(
+            entries.collect::<Vec<_>>(),
+            [FirEntry {
+                ssrc: 0x3333_4444,
+                sequence: 5
+            }]
+        );
+    }
+
+    #[test]
+    fn a_fir_with_two_entries_yields_both_and_ignores_a_ragged_tail() {
+        let mut datagram = vec![
+            0x84, 0xCE, 0x00, 0x06, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 10, 1, 0, 0, 0, 0, 0, 0, 11,
+            2, 0, 0, 0,
+        ];
+        let feedback = feedback_of(&datagram);
+        let [Feedback::Fir { entries, .. }] = feedback.as_slice() else {
+            panic!("one fir");
+        };
+        assert_eq!(
+            entries
+                .map(|entry| (entry.ssrc, entry.sequence))
+                .collect::<Vec<_>>(),
+            [(10, 1), (11, 2)]
+        );
+        // Four stray octets after the entries (a length that does not divide into entries).
+        datagram[3] = 0x07;
+        datagram.extend_from_slice(&[9, 9, 9, 9]);
+        let feedback = feedback_of(&datagram);
+        let [Feedback::Fir { entries, .. }] = feedback.as_slice() else {
+            panic!("one fir");
+        };
+        assert_eq!(entries.count(), 2);
+    }
+
+    #[test]
+    fn a_generic_nack_is_read_back_one_item_per_fci() {
+        assert_eq!(
+            feedback_of(&NACK),
+            [Feedback::GenericNack {
+                sender_ssrc: 0x1111_2222,
+                media_ssrc: 0x3333_4444,
+                pid: 0x1234,
+                blp: 0x8001
+            }]
+        );
+        // Two FCI entries in one packet (RFC 4585 §6.1: length 4).
+        let two = [
+            0x81, 0xCD, 0x00, 0x04, 0, 0, 0, 1, 0, 0, 0, 2, 0x00, 0x10, 0x00, 0x00, 0x00, 0x20,
+            0x00, 0x01,
+        ];
+        assert_eq!(
+            feedback_of(&two),
+            [
+                Feedback::GenericNack {
+                    sender_ssrc: 1,
+                    media_ssrc: 2,
+                    pid: 0x10,
+                    blp: 0
+                },
+                Feedback::GenericNack {
+                    sender_ssrc: 1,
+                    media_ssrc: 2,
+                    pid: 0x20,
+                    blp: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn feedback_is_found_in_a_compound_and_in_a_reduced_size_packet() {
+        // RFC 4585 §3.1: RR, SDES, then the feedback. RFC 5506: the feedback alone.
+        let mut compound = vec![0x80, 0xC9, 0x00, 0x01, 0x11, 0x11, 0x22, 0x22];
+        let mut sdes = [0u8; 16];
+        write_sdes_cname(0x1111_2222, "abc", &mut sdes).unwrap();
+        compound.extend_from_slice(&sdes);
+        compound.extend_from_slice(&PLI);
+        compound.extend_from_slice(&NACK);
+        assert_eq!(feedback_of(&compound).len(), 2);
+        assert_eq!(feedback_of(&PLI).len(), 1);
+        assert!(feedback_of(&[0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 1]).is_empty());
+    }
+
+    #[test]
+    fn a_feedback_packet_shorter_than_its_header_is_an_error_not_a_panic() {
+        // A PLI that stops after the sender SSRC, a FIR and a NACK likewise.
+        for (type_byte, format) in [(0xCE, 1u8), (0xCE, 4), (0xCD, 1)] {
+            let datagram = [0x80 | format, type_byte, 0x00, 0x01, 0, 0, 0, 1];
+            let results: Vec<_> = feedback_packets(&datagram).collect();
+            assert_eq!(
+                results,
+                [Err(RtcpError::TooShort)],
+                "{type_byte:#x} {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_length_that_overruns_the_datagram_ends_the_walk_with_one_error() {
+        let datagram = [0x81, 0xCE, 0x00, 0x09, 0, 0, 0, 1, 0, 0, 0, 2];
+        let results: Vec<_> = feedback_packets(&datagram).collect();
+        assert_eq!(results, [Err(RtcpError::BadLength)]);
+        let mut with_good_first = PLI.to_vec();
+        with_good_first.extend_from_slice(&datagram);
+        let results: Vec<_> = feedback_packets(&with_good_first).collect();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert_eq!(results[1], Err(RtcpError::BadLength));
+    }
+
+    #[test]
+    fn a_wrong_version_is_an_error() {
+        let mut datagram = PLI;
+        datagram[0] = 0x41;
+        let results: Vec<_> = feedback_packets(&datagram).collect();
+        assert_eq!(results, [Err(RtcpError::BadVersion(1))]);
+    }
+
+    #[test]
+    fn padding_is_not_read_as_a_fir_entry() {
+        // P=1: the last octet counts the padding (RFC 3550 §6.4.1).
+        let datagram = [
+            0xA4, 0xCE, 0x00, 0x05, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 10, 3, 0, 0, 0, 0, 0, 0, 4,
+        ];
+        let feedback = feedback_of(&datagram);
+        let [Feedback::Fir { entries, .. }] = feedback.as_slice() else {
+            panic!("one fir");
+        };
+        assert_eq!(entries.count(), 1);
+    }
+
+    #[test]
+    fn walking_feedback_allocates_nothing() {
+        // The iterator borrows the datagram and yields by value: it holds no Vec (a compile-time
+        // property, pinned here by walking a stack array and a borrowed FIR entry list).
+        let datagram = NACK;
+        let mut seen = 0;
+        for item in feedback_packets(&datagram) {
+            let Ok(Feedback::GenericNack { pid, .. }) = item else {
+                panic!("nack");
+            };
+            seen += u32::from(pid);
+        }
+        assert_eq!(seen, 0x1234);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Arbitrary bytes decode-or-error, never panic, never spin.
+        #[test]
+        fn feedback_packets_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
+            for item in feedback_packets(&bytes) {
+                if let Ok(Feedback::Fir { entries, .. }) = item {
+                    for entry in entries {
+                        let _ = entry;
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_written_pli_reads_back(sender in any::<u32>(), media in any::<u32>()) {
+            let mut out = [0u8; 12];
+            let length = write_pli(sender, media, &mut out).unwrap();
+            let items = feedback_of(&out[..length]);
+            prop_assert_eq!(items, vec![Feedback::Pli { sender_ssrc: sender, media_ssrc: media }]);
+        }
+
+        #[test]
+        fn a_written_fir_reads_back(sender in any::<u32>(), target in any::<u32>(), sequence in any::<u8>()) {
+            let mut out = [0u8; 20];
+            let length = write_fir(sender, target, sequence, &mut out).unwrap();
+            let items = feedback_of(&out[..length]);
+            prop_assert_eq!(items.len(), 1);
+            let Feedback::Fir { sender_ssrc, entries } = items[0] else { panic!("fir") };
+            prop_assert_eq!(sender_ssrc, sender);
+            prop_assert_eq!(entries.collect::<Vec<_>>(), vec![FirEntry { ssrc: target, sequence }]);
+        }
+
+        #[test]
+        fn a_written_nack_reads_back(
+            sender in any::<u32>(), media in any::<u32>(), pid in any::<u16>(), blp in any::<u16>()
+        ) {
+            let mut out = [0u8; 16];
+            let length = write_nack(sender, media, pid, blp, &mut out).unwrap();
+            prop_assert_eq!(
+                feedback_of(&out[..length]),
+                vec![Feedback::GenericNack { sender_ssrc: sender, media_ssrc: media, pid, blp }]
+            );
+        }
+
+        #[test]
+        fn a_written_sdes_cname_parses_as_a_compound(ssrc in any::<u32>(), name in "[a-z0-9]{0,64}") {
+            let mut out = [0u8; 96];
+            let length = write_sdes_cname(ssrc, &name, &mut out).unwrap();
+            prop_assert_eq!(length % 4, 0);
+            let packets = parse_compound(&out[..length]).unwrap();
+            prop_assert_eq!(packets, vec![RtcpPacket::Other { packet_type: 202 }]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod goodbye_tests {
     use super::*;

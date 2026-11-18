@@ -92,7 +92,8 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `start_paused` for the room actor's keyframe timers.
+tokio = { workspace = true, features = ["test-util"] }
 siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.22.0" }
 siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.22.0" }
 # Construct a `MediaCall`'s two `DirectionConfig`s directly (codecs, MOS class) and build RTP fixtures

@@ -71,6 +71,9 @@ pub(super) struct JoinVideo<'a> {
     pub(super) media: ForwardMedia,
     /// The format in force: the room's, or the controller's `video.fmtp`.
     pub(super) fixed: Option<&'a RoomVideoFormat>,
+    /// The CNAME the answer gives the seat's streams (RFC 7022 §4), which the room writes in the
+    /// source description of the keyframe requests it sends the seat.
+    pub(super) cname: &'a str,
 }
 
 /// What a `forward_offer` decides about the video of the seat it offers.
@@ -255,6 +258,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &choice,
             destination,
             video_source_filter(join.profile, destination),
+            join.cname.to_string(),
         );
         Ok(VideoSeat::Open(Box::new(OpenVideo {
             endpoint,
@@ -364,11 +368,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
         let destination = peer_media_address(choice.remote, received_from);
+        // The offer carried no CNAME for the seat's streams: the room gives them one of its own.
+        let cname = sdp::OwnSsrc::with_random_cname(0).cname;
         Ok(video_config(
             endpoint,
             &choice,
             destination,
             gate(destination),
+            cname,
         ))
     }
 }
@@ -390,6 +397,7 @@ fn video_config(
     choice: &VideoChoice,
     destination: std::net::SocketAddr,
     accepted_source: SourceFilter,
+    cname: String,
 ) -> VideoConfig {
     VideoConfig {
         endpoint: endpoint.id,
@@ -401,5 +409,7 @@ fn video_config(
         initial_sequence: random_ssrc() as u16,
         initial_timestamp: random_ssrc(),
         format: choice.format.clone(),
+        feedback: choice.feedback,
+        cname,
     }
 }

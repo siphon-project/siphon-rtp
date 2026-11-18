@@ -45,12 +45,14 @@ use crate::sdp::TelephoneEvent;
 use crate::seat_gate::{self, SeatGate};
 
 mod app;
+mod keyframe;
 mod media_srtcp;
 mod video;
 
 pub(crate) use app::push_failure;
 use app::FloorStream;
 pub use app::{AppRequest, AppSendError, AppTarget, FloorConfig, FloorKeysError};
+use keyframe::{KeyframePlan, Keyframes};
 pub use video::VideoConfig;
 use video::VideoStream;
 
@@ -160,6 +162,18 @@ pub struct ForwardSeatStats {
     pub video_forwarded_packets: u32,
     /// Video payload octets the room forwarded to the seat.
     pub video_forwarded_octets: u32,
+    /// Keyframe requests (PLI, FIR) the room sent the seat as the video source.
+    pub pli_sent: u64,
+    pub fir_sent: u64,
+    /// IDR pictures the seat sent as the video source.
+    pub keyframes_seen: u64,
+    /// Video packets not sent to the seat because it waited for a keyframe.
+    pub video_dropped_awaiting_keyframe: u64,
+    /// Packets sent again to the seat for its NACK, and packets it asked for that were gone.
+    pub nack_answered: u64,
+    pub nack_missed: u64,
+    /// Source changes whose keyframe did not arrive in time (the room forwarded without one).
+    pub keyframe_timeouts: u64,
 }
 
 struct Seat {
@@ -230,6 +244,8 @@ enum Port {
 enum Stream {
     Audio,
     Video,
+    /// Video packets a receiver's NACK asked for, sent to that receiver again.
+    Retransmit,
 }
 
 /// What kind of RTP the armed plan forwards.
@@ -287,6 +303,8 @@ struct Plan {
     /// A cross-codec source's packet is decoded only after its concealed frames were (a decoder
     /// conceals the loss before it decodes what came after it); see [`ForwardRoom::finish_uplink`].
     uplink_pending: bool,
+    /// Where the fan-out is in starting a receiver on a keyframe (video only).
+    keyframe: KeyframePlan,
 }
 
 /// Concealed frames for source packets lost before the armed packet (RFC 3550 §5.1), each fanned
@@ -362,6 +380,8 @@ pub struct ForwardRoom {
     pending_channel: Vec<(String, crate::floor_channel::PendingSend)>,
     /// The SRTP-protected packet.
     secure_out: Vec<u8>,
+    /// Starting receivers on a keyframe of the video source (`keyframe.rs`).
+    keyframes: Keyframes,
 }
 
 impl ForwardRoom {
@@ -382,6 +402,7 @@ impl ForwardRoom {
             scratch: vec![0; MAX_DATAGRAM],
             pending_channel: Vec::new(),
             secure_out: Vec::with_capacity(MAX_DATAGRAM),
+            keyframes: Keyframes::new(),
         }
     }
 
@@ -539,6 +560,7 @@ impl ForwardRoom {
             last_forward_clock: anchor,
             counters: ForwardSeatStats::default(),
         });
+        self.keyframe_seat_joined();
     }
 
     /// Unseat a member. Returns whether it was seated. If it was the source, nothing is forwarded
@@ -558,6 +580,13 @@ impl ForwardRoom {
             not_source_dropped = seat.counters.not_source_dropped,
             unknown_payload_type = seat.counters.unknown_payload_type,
             forwarded_packets = seat.translator.packets_sent(),
+            pli_sent = seat.counters.pli_sent,
+            fir_sent = seat.counters.fir_sent,
+            keyframes_seen = seat.counters.keyframes_seen,
+            video_dropped_awaiting_keyframe = seat.counters.video_dropped_awaiting_keyframe,
+            nack_answered = seat.counters.nack_answered,
+            nack_missed = seat.counters.nack_missed,
+            keyframe_timeouts = seat.counters.keyframe_timeouts,
             "forwarding room seat left"
         );
         self.by_endpoint.clear();
@@ -579,6 +608,7 @@ impl ForwardRoom {
                 self.source = None;
                 self.announce_pending = false;
                 self.switch_every_translator();
+                self.arm_keyframe_gate();
                 self.end_transcode_run();
             }
             Some(source) if source > index => self.source = Some(source - 1),
@@ -609,6 +639,7 @@ impl ForwardRoom {
         self.announce_pending = chosen.is_some();
         self.plan = None;
         self.switch_every_translator();
+        self.arm_keyframe_gate();
         self.end_transcode_run();
         Ok(())
     }
@@ -804,6 +835,7 @@ impl ForwardRoom {
             dropped_before: 0,
             fill: None,
             uplink_pending: false,
+            keyframe: KeyframePlan::default(),
         };
         if let Some(transcoder) = self.transcoder.as_mut() {
             plan.dropped_before = transcoder.stats().dropped;
@@ -892,6 +924,7 @@ impl ForwardRoom {
             // concealed.
             fill: None,
             uplink_pending: false,
+            keyframe: KeyframePlan::default(),
         };
         if seat_gate::is_rtcp(data) {
             return self.ingest_preserved_rtcp(index, packet, plan);
@@ -1026,8 +1059,10 @@ impl ForwardRoom {
         packet: &'a RxPacket,
     ) -> Option<(EndpointId, SocketAddr, &'a [u8])> {
         let mut plan = self.plan?;
-        if plan.stream == Stream::Video {
-            return self.next_video(packet, plan);
+        match plan.stream {
+            Stream::Video => return self.next_video(packet, plan),
+            Stream::Retransmit => return self.next_retransmission(),
+            Stream::Audio => {}
         }
         if plan.verbatim != Verbatim::No {
             return self.next_verbatim(packet, plan);

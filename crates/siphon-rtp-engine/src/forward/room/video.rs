@@ -13,6 +13,9 @@
 //! audio and video together. A seat whose offer was receive-only is never forwarded from, and one
 //! whose offer was send-only is never sent video (RFC 3264 §6.1; the answer was the complement).
 //!
+//! A source change starts every receiver on a keyframe (`keyframe.rs`): a receiver's packets are held
+//! back until one begins an IDR picture, and the source is asked for one.
+//!
 //! The endpoint is gated like the seat's audio: the signalled source (layer 2) and the
 //! SSRC-consistent reply latch (layer 3), docs/security-and-nat.md §4 layer 5c-ii.
 
@@ -21,6 +24,7 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_media::h264;
 use siphon_rtp_media::ingress::IngressStats;
 use siphon_rtp_media::rtcp;
 use siphon_rtp_media::rtp::RtpPacket;
@@ -29,11 +33,17 @@ use siphon_rtp_proto::Event;
 use siphon_rtp_srtp::leg::SecureLeg;
 
 use super::super::transcode::StreamPoint;
-use super::{reception_block, ticks, ForwardRoom, Plan, PlanKind, Stream, Verbatim};
+use super::keyframe::{
+    Admission, KeyframePlan, Keyframes, ReceiverKeyframe, SourceMedia, STEP_NONE, STEP_PACKET,
+    STEP_PPS, STEP_SPS,
+};
+use super::{
+    reception_block, ticks, ForwardRoom, ForwardSeatStats, Plan, PlanKind, Stream, Verbatim,
+};
 use crate::ingress::{Ingress, RefusalLog};
 use crate::media_pipeline::Outbound;
 use crate::reply_latch::SymmetricLatch;
-use crate::sdp::video::{RoomVideoFormat, VIDEO_CLOCK_RATE_HZ};
+use crate::sdp::video::{RoomVideoFormat, VideoFeedback, VIDEO_CLOCK_RATE_HZ};
 use crate::sdp::MediaDirection;
 use crate::seat_gate::{self, RtcpItem, SeatGate};
 
@@ -59,22 +69,36 @@ pub struct VideoConfig {
     pub initial_timestamp: u32,
     /// The room's video format this seat was admitted under; the first seat with video fixes it.
     pub format: RoomVideoFormat,
+    /// The RTCP feedback the seat accepted in its SDP (RFC 4585 §4.2): a keyframe request is sent to
+    /// a source only as a PLI or FIR it accepted, and a NACK is answered only for a seat that
+    /// accepted `nack`.
+    pub feedback: VideoFeedback,
+    /// The CNAME of the seat's streams (RFC 3550 §6.5.1), written in the source description of the
+    /// compound a keyframe request travels in (RFC 4585 §3.1).
+    pub cname: String,
 }
 
 pub(super) struct VideoStream {
     pub(super) endpoint: EndpointId,
-    destination: SocketAddr,
+    pub(super) destination: SocketAddr,
     accepted_source: SourceFilter,
     latch: SymmetricLatch,
     refusals: RefusalLog,
-    payload_type: u8,
-    sends: bool,
-    receives: bool,
-    translator: Translator,
+    pub(super) payload_type: u8,
+    pub(super) sends: bool,
+    pub(super) receives: bool,
+    pub(super) translator: Translator,
     stats: IngressStats,
     last_sender_report_ntp_middle: u32,
     last_sender_report_arrival: Option<u64>,
-    last_forward_clock: u32,
+    pub(super) last_forward_clock: u32,
+    /// What the seat accepted of RTCP feedback, and the CNAME of its streams.
+    pub(super) feedback: VideoFeedback,
+    pub(super) cname: Box<str>,
+    /// Whether this receiver is held back until a keyframe.
+    pub(super) keyframe: ReceiverKeyframe,
+    /// What the seat sends, kept for starting receivers on it when it is the source.
+    pub(super) keyframe_media: SourceMedia,
 }
 
 impl VideoStream {
@@ -98,6 +122,10 @@ impl VideoStream {
             last_sender_report_ntp_middle: 0,
             last_sender_report_arrival: None,
             last_forward_clock: anchor,
+            feedback: config.feedback,
+            cname: config.cname.into_boxed_str(),
+            keyframe: ReceiverKeyframe::new(),
+            keyframe_media: SourceMedia::default(),
         }
     }
 
@@ -118,15 +146,21 @@ impl VideoStream {
 impl VideoStream {
     /// Whether the room may send this stream anything: it has a resolved destination (the room never
     /// forwards into the void, docs/security-and-nat.md §4).
-    fn reachable(&self) -> bool {
+    pub(super) fn reachable(&self) -> bool {
         !self.destination.ip().is_unspecified() && self.destination.port() != 0
     }
 }
 
-/// Read the reports of a seat's video RTCP: the sender report's time becomes our LSR, and reception
-/// report blocks about our video egress stream feed the seat's statistics (RFC 3550 §6.4). Keyframe
-/// requests (RFC 4585 PLI, RFC 5104 FIR) are not acted on yet, so they are consumed and dropped.
-fn consume_video_rtcp(video: &mut VideoStream, data: &[u8], arrival: u64) {
+/// Read a seat's video RTCP: the sender report's time becomes our LSR, reception report blocks about
+/// our video egress stream feed the seat's statistics (RFC 3550 §6.4), and its feedback (RFC 4585
+/// PLI and Generic NACK, RFC 5104 FIR) about that stream is passed to the keyframe state.
+fn consume_video_rtcp(
+    video: &mut VideoStream,
+    keyframes: &mut Keyframes,
+    counters: &mut ForwardSeatStats,
+    data: &[u8],
+    arrival: u64,
+) {
     let egress_ssrc = video.translator.egress_ssrc();
     seat_gate::consume_rtcp(data, |item| match item {
         RtcpItem::SenderReportNtp(ntp) => {
@@ -139,6 +173,30 @@ fn consume_video_rtcp(video: &mut VideoStream, data: &[u8], arrival: u64) {
                 .record_reception_report(egress_ssrc, block, arrival);
         }
     });
+    seat_gate::consume_feedback(data, |feedback| {
+        keyframes.receiver_feedback(video, feedback, counters);
+    });
+}
+
+/// The fan-out of one video packet, or of the packets a receiver's NACK asked for.
+fn video_plan(source: usize, point: StreamPoint, arrival: u64, keyframe: KeyframePlan) -> Plan {
+    Plan {
+        stream: Stream::Video,
+        verbatim: Verbatim::No,
+        source,
+        // Unused for video: there is no event or concealment to tell apart.
+        kind: PlanKind::Audio,
+        in_clear_buffer: false,
+        domain_len: None,
+        source_group: None,
+        point,
+        cursor: 0,
+        arrival,
+        dropped_before: 0,
+        fill: None,
+        uplink_pending: false,
+        keyframe,
+    }
 }
 
 impl ForwardRoom {
@@ -181,7 +239,26 @@ impl ForwardRoom {
         }
         // RFC 5761 demux, as for audio: the room terminates the seat's RTCP.
         if seat_gate::is_rtcp(data) {
-            consume_video_rtcp(video, data, packet.arrival);
+            self.keyframes.start_feedback(index);
+            consume_video_rtcp(
+                video,
+                &mut self.keyframes,
+                &mut seat.counters,
+                data,
+                packet.arrival,
+            );
+            if self.keyframes.retransmissions_pending() {
+                // The packets its NACK asked for are sent again by `next_datagram`, to this seat only.
+                self.plan = Some(Plan {
+                    stream: Stream::Retransmit,
+                    ..video_plan(
+                        index,
+                        StreamPoint::default(),
+                        packet.arrival,
+                        KeyframePlan::default(),
+                    )
+                });
+            }
             return Ingress::Accepted;
         }
         let Ok(parsed) = RtpPacket::parse(data) else {
@@ -191,6 +268,15 @@ impl ForwardRoom {
             .stats
             .on_rtp(parsed.ssrc, parsed.sequence, parsed.timestamp);
         video.stats.observe_arrival(packet.arrival);
+        // What a keyframe request to this seat names, and the parameter sets to replay, should it
+        // become the source: kept whoever is the source now.
+        video.keyframe_media.ssrc = Some(parsed.ssrc);
+        let found = if parsed.payload_type == video.payload_type {
+            h264::scan(parsed.payload)
+        } else {
+            h264::Scan::default()
+        };
+        video.keyframe_media.note(&found);
         if self.source != Some(index) {
             seat.counters.video_not_source_dropped += 1;
             return Ingress::DroppedFromPeer;
@@ -204,27 +290,27 @@ impl ForwardRoom {
             seat.counters.video_unknown_payload_type += 1;
             return Ingress::DroppedFromPeer;
         }
-        self.plan = Some(Plan {
-            stream: Stream::Video,
-            verbatim: Verbatim::No,
-            source: index,
-            // Unused for video: there is no event or concealment to tell apart.
-            kind: PlanKind::Audio,
-            in_clear_buffer: false,
-            domain_len: None,
-            source_group: None,
-            point: StreamPoint {
+        if found.keyframe_start {
+            seat.counters.keyframes_seen += 1;
+        }
+        self.keyframes
+            .source_packet(found.keyframe_start, parsed.ssrc, parsed.sequence, data);
+        self.plan = Some(video_plan(
+            index,
+            StreamPoint {
                 ssrc: parsed.ssrc,
                 sequence: parsed.sequence,
                 timestamp: parsed.timestamp,
                 marker: parsed.marker,
             },
-            cursor: 0,
-            arrival: packet.arrival,
-            dropped_before: 0,
-            fill: None,
-            uplink_pending: false,
-        });
+            packet.arrival,
+            KeyframePlan {
+                start: found.keyframe_start,
+                has_sps: found.sps.is_some(),
+                has_pps: found.pps.is_some(),
+                ..KeyframePlan::default()
+            },
+        ));
         Ingress::Accepted
     }
 
@@ -232,18 +318,28 @@ impl ForwardRoom {
     /// the packet through its own video translator, on its video endpoint, under its own payload
     /// type. The source, a seat with no video stream and a seat that offered send-only video are
     /// skipped; so is a packet the translator drops as a late one of the previous source.
+    ///
+    /// A receiver that is waiting for a keyframe (`keyframe.rs`) is sent nothing until the packet
+    /// begins an IDR slice; that packet is then preceded by the source's SPS and PPS, which are two
+    /// more datagrams to the same receiver before the walk moves on.
     pub(super) fn next_video<'a>(
         &'a mut self,
         packet: &'a RxPacket,
         mut plan: Plan,
     ) -> Option<(EndpointId, SocketAddr, &'a [u8])> {
         loop {
-            let index = plan.cursor;
-            if index >= self.seats.len() {
-                self.plan = None;
-                return None;
-            }
-            plan.cursor += 1;
+            let (index, mut step) = if plan.keyframe.step == STEP_NONE {
+                let index = plan.cursor;
+                if index >= self.seats.len() {
+                    self.plan = None;
+                    return None;
+                }
+                plan.cursor += 1;
+                (index, STEP_NONE)
+            } else {
+                (plan.keyframe.receiver, plan.keyframe.step)
+            };
+            plan.keyframe.step = STEP_NONE;
             self.plan = Some(plan);
             if index == plan.source {
                 continue; // the source never hears itself
@@ -258,25 +354,67 @@ impl ForwardRoom {
             if !video.receives || !video.reachable() {
                 continue;
             }
-            // The translator's clock is the video RTP clock, 90 kHz (RFC 3550 §5.1).
-            let clock = ticks(plan.arrival, VIDEO_CLOCK_RATE_HZ);
-            let length = match video.translator.translate(
-                &packet.data,
-                video.payload_type,
-                clock,
-                &mut self.scratch,
-            ) {
-                Ok(Forwarded::Packet { length, .. }) => length,
-                Ok(Forwarded::DroppedStale) => continue,
-                Err(error) => {
-                    tracing::debug!(
-                        target: "siphon_rtp::media", room = %self.room_id, %error,
-                        "forwarding room could not translate a video packet"
-                    );
-                    continue;
+            if step == STEP_NONE {
+                match video.keyframe.admit(&plan.keyframe, plan.point.sequence) {
+                    Admission::Dropped => {
+                        receiver.counters.video_dropped_awaiting_keyframe += 1;
+                        continue;
+                    }
+                    Admission::Forward => step = STEP_PACKET,
+                    Admission::Opened => {
+                        self.plan_replay(&mut plan.keyframe, plan.source);
+                        step = STEP_SPS;
+                    }
+                }
+            }
+            // The parameter sets come first, then the packet itself.
+            let mut replayed = None;
+            while step < STEP_PACKET && replayed.is_none() {
+                let sps = step == STEP_SPS;
+                if sps && plan.keyframe.replay_sps || !sps && plan.keyframe.replay_pps {
+                    replayed =
+                        self.translate_replay(index, &plan.keyframe, sps, plan.point, plan.arrival);
+                }
+                step = if step == STEP_SPS {
+                    STEP_PPS
+                } else {
+                    STEP_PACKET
+                };
+            }
+            let length = match replayed {
+                Some(length) => {
+                    // More of this receiver's keyframe follows.
+                    plan.keyframe.step = step;
+                    plan.keyframe.receiver = index;
+                    self.plan = Some(plan);
+                    length
+                }
+                None => {
+                    let Some(video) = self.seats[index].video.as_mut() else {
+                        continue;
+                    };
+                    // The translator's clock is the video RTP clock, 90 kHz (RFC 3550 §5.1).
+                    let clock = ticks(plan.arrival, VIDEO_CLOCK_RATE_HZ);
+                    let length = match video.translator.translate(
+                        &packet.data,
+                        video.payload_type,
+                        clock,
+                        &mut self.scratch,
+                    ) {
+                        Ok(Forwarded::Packet { length, .. }) => length,
+                        Ok(Forwarded::DroppedStale) => continue,
+                        Err(error) => {
+                            tracing::debug!(
+                                target: "siphon_rtp::media", room = %self.room_id, %error,
+                                "forwarding room could not translate a video packet"
+                            );
+                            continue;
+                        }
+                    };
+                    video.last_forward_clock = clock;
+                    length
                 }
             };
-            video.last_forward_clock = clock;
             if self.announce_pending {
                 self.announce_pending = false;
                 self.events.push(Event::ForwardSourceStarted {

@@ -33,6 +33,14 @@ fn drive(bytes: &[u8]) {
     for app in rtcp::app_packets(bytes) {
         let _ = app;
     }
+    for feedback in rtcp::feedback_packets(bytes) {
+        if let Ok(rtcp::Feedback::Fir { entries, .. }) = feedback {
+            for entry in entries {
+                let _ = entry;
+            }
+        }
+    }
+    let _ = siphon_rtp_media::h264::scan(bytes);
 }
 
 #[test]
@@ -49,6 +57,10 @@ fn crafted_malformed_datagrams_never_panic() {
         &[0x80, 201, 0x00, 0x00],                       // RR length-words=0 (packet_len=4)
         &[0x81, 202, 0x00, 0x01, 0, 0, 0, 0],           // SDES (Other)
         &[0x80, 204, 0x00, 0x01, 0, 0, 0, 0],           // APP with no room for its name
+        &[0x81, 206, 0x00, 0x01, 0, 0, 0, 1],           // PLI that stops after the sender
+        &[0x84, 206, 0x00, 0x03, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2], // FIR with half an entry
+        &[0x81, 205, 0x00, 0x04, 0, 0, 0, 1, 0, 0, 0, 2, 0, 1], // NACK with half an FCI entry
+        &[0x78, 0xFF, 0xFF, 0x65, 0x88],                // STAP-A with a size that overruns
         &[0xA0, 204, 0x00, 0x02, 0, 0, 0, 0, b'M', b'C', b'P', 0xFF], // APP, pad count > data
         &[
             0x80, 204, 0x00, 0x02, 0, 0, 0, 0, b'M', b'C', b'P', b'T', 0x80, 204, 0xFF, 0xFF,
