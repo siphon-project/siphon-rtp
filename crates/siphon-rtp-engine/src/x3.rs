@@ -38,12 +38,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use siphon_rtp_li::attributes::{AttributeWriter, IP_PROTOCOL_UDP};
-use siphon_rtp_li::clock::WallClockAnchor;
+use siphon_rtp_li::clock::unix_nanos_to_timestamp;
 use siphon_rtp_li::inbound::InboundHeader;
 use siphon_rtp_li::{encode, PayloadDirection, PduHeader};
 use siphon_rtp_proto::Xid;
@@ -144,9 +144,13 @@ pub struct X3Packet {
     pub source: SocketAddr,
     /// The engine endpoint the packet arrived on.
     pub destination: SocketAddr,
-    /// Datapath receive-clock reading, microseconds. Resolved to absolute time by the delivery
-    /// task's [`WallClockAnchor`] — it is a relative timeline on its own.
-    pub arrival_micros: u64,
+    /// When the tap saw the packet, nanoseconds since the Unix epoch (wall clock).
+    ///
+    /// Deliberately **not** the datapath's receive-clock reading: that clock is a relative
+    /// timeline, and on the UDP-loopback datapath a *logical* one that advances 20 ms per wall
+    /// second, so a timestamp derived from it does not track time at all. TS 103 221-2 §5.3 defines
+    /// the Timestamp attribute as the moment the content was intercepted.
+    pub intercepted_unix_nanos: u128,
     /// Target-relative direction, decided when the tap was installed.
     pub direction: PayloadDirection,
     /// The accepted, decrypted RTP packet.
@@ -173,6 +177,29 @@ impl X3Counters {
     }
 }
 
+/// The wall clock a tap stamps intercepted packets with (ETSI TS 103 221-2 §5.3, the Timestamp
+/// attribute: the time the content was intercepted).
+///
+/// A trait so a test can drive time itself; production uses [`SystemX3Clock`].
+pub trait X3Clock: std::fmt::Debug + Send + Sync {
+    /// The current time, in nanoseconds since the Unix epoch.
+    fn unix_nanos(&self) -> u128;
+}
+
+/// The host's real-time clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemX3Clock;
+
+impl X3Clock for SystemX3Clock {
+    fn unix_nanos(&self) -> u128 {
+        // A clock set before the epoch reads as zero rather than failing: an implausible timestamp
+        // is a better failure than a dropped intercept.
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since_epoch| since_epoch.as_nanos())
+    }
+}
+
 /// The media-path handle: one per tapped direction, holding everything the tap needs so the hot
 /// path neither looks anything up nor branches on policy.
 ///
@@ -188,6 +215,7 @@ pub struct X3Tap {
     destination: SocketAddr,
     direction: PayloadDirection,
     counters: Arc<X3Counters>,
+    clock: Arc<dyn X3Clock>,
 }
 
 impl X3Tap {
@@ -203,7 +231,7 @@ impl X3Tap {
     /// Never blocks and never allocates on a steady interception — the buffer comes back from the
     /// delivery task through the recycle channel. On a full buffer the *arriving* packet is
     /// discarded, keeping what has been delivered a contiguous prefix, and the drop is counted.
-    pub fn deliver(&self, source: SocketAddr, arrival_micros: u64, data: &[u8]) {
+    pub fn deliver(&self, source: SocketAddr, data: &[u8]) {
         if data.len() < 2 {
             return;
         }
@@ -218,7 +246,7 @@ impl X3Tap {
         let packet = X3Packet {
             source,
             destination: self.destination,
-            arrival_micros,
+            intercepted_unix_nanos: self.clock.unix_nanos(),
             direction: self.direction,
             payload,
         };
@@ -246,6 +274,7 @@ pub struct X3TapFactory {
     recycle_receiver: flume::Receiver<Vec<u8>>,
     recycle_sender: flume::Sender<Vec<u8>>,
     counters: Arc<X3Counters>,
+    clock: Arc<dyn X3Clock>,
 }
 
 impl X3TapFactory {
@@ -259,6 +288,7 @@ impl X3TapFactory {
             destination,
             direction,
             counters: self.counters.clone(),
+            clock: self.clock.clone(),
         }
     }
 
@@ -286,6 +316,16 @@ pub struct X3Delivery {
 /// can never hold more buffers than were in flight.
 #[must_use]
 pub fn x3_channel(buffer_packets: usize) -> (X3TapFactory, X3Delivery) {
+    x3_channel_with_clock(buffer_packets, Arc::new(SystemX3Clock))
+}
+
+/// [`x3_channel`] with the clock the taps stamp packets with supplied by the caller, so a test can
+/// drive interception time deterministically.
+#[must_use]
+pub fn x3_channel_with_clock(
+    buffer_packets: usize,
+    clock: Arc<dyn X3Clock>,
+) -> (X3TapFactory, X3Delivery) {
     let capacity = buffer_packets.max(1);
     let (packet_sender, packet_receiver) = flume::bounded(capacity);
     let (recycle_sender, recycle_receiver) = flume::bounded(capacity);
@@ -296,6 +336,7 @@ pub fn x3_channel(buffer_packets: usize) -> (X3TapFactory, X3Delivery) {
             recycle_receiver,
             recycle_sender: recycle_sender.clone(),
             counters: counters.clone(),
+            clock,
         },
         X3Delivery {
             packets: packet_receiver,
@@ -465,10 +506,10 @@ where
 {
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut reported_drops = 0u64;
-    // The wall-clock anchor is taken once, on the first intercepted packet, and reused for the whole
-    // interception — including across reconnects. Re-anchoring would let a wall-clock step reorder
-    // delivered timestamps.
-    let mut anchor: Option<WallClockAnchor> = None;
+    // The latest timestamp delivered, kept across reconnects: the wall clock can step backwards
+    // (NTP), and a delivered timestamp must never be earlier than the one before it, so an MDF can
+    // order the stream.
+    let mut last_timestamp: u128 = 0;
     // Held across a failed connection so a packet already taken off the queue is not lost.
     let mut pending: Option<X3Packet> = None;
 
@@ -509,7 +550,7 @@ where
         match serve_connection(
             &task,
             stream,
-            &mut anchor,
+            &mut last_timestamp,
             &mut pending,
             &mut reported_drops,
             &mut on_loss,
@@ -574,7 +615,7 @@ async fn connect_unbounded(
 async fn serve_connection<F>(
     task: &X3DeliveryTask,
     stream: tokio_rustls::client::TlsStream<TcpStream>,
-    anchor: &mut Option<WallClockAnchor>,
+    last_timestamp: &mut u128,
     pending: &mut Option<X3Packet>,
     reported_drops: &mut u64,
     on_loss: &mut F,
@@ -651,11 +692,11 @@ where
             continue;
         };
 
-        // Anchor the wall clock to the first intercepted packet, so every delivered timestamp is
-        // absolute while the spacing between them comes from the datapath receive clock.
-        let clock =
-            *anchor.get_or_insert_with(|| WallClockAnchor::anchored_now(packet.arrival_micros));
-        let (seconds, nanoseconds) = clock.timestamp(packet.arrival_micros);
+        // TS 103 221-2 §5.3: the time the content was intercepted, stamped by the tap. Clamped so
+        // a wall-clock step backwards repeats a timestamp instead of reordering the stream.
+        let intercepted = packet.intercepted_unix_nanos.max(*last_timestamp);
+        *last_timestamp = intercepted;
+        let (seconds, nanoseconds) = unix_nanos_to_timestamp(intercepted);
 
         AttributeWriter::new(&mut attributes)
             .network_function_id(&task.network_function_id)
@@ -780,14 +821,52 @@ mod tests {
         let local = address(20000);
         let tap = factory.tap(local, PayloadDirection::FromTarget);
 
-        tap.deliver(address(16384), 1_000, &rtp(1));
+        tap.deliver(address(16384), &rtp(1));
 
         let packet = delivery.packets.try_recv().expect("a delivered packet");
         assert_eq!(packet.source, address(16384));
         assert_eq!(packet.destination, local);
         assert_eq!(packet.direction, PayloadDirection::FromTarget);
-        assert_eq!(packet.arrival_micros, 1_000);
         assert_eq!(packet.payload, rtp(1));
+    }
+
+    /// A clock the test moves by hand.
+    #[derive(Debug, Default)]
+    struct ManualClock(AtomicU64);
+
+    impl X3Clock for ManualClock {
+        fn unix_nanos(&self) -> u128 {
+            u128::from(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    #[test]
+    fn a_tap_stamps_each_packet_with_the_interception_clock() {
+        // ETSI TS 103 221-2 §5.3: the Timestamp is when the content was intercepted. Two packets
+        // 20 ms apart on the interception clock carry stamps exactly 20 ms apart, whatever the
+        // datapath's own (possibly logical) receive clock says.
+        let clock = Arc::new(ManualClock::default());
+        clock.0.store(1_788_177_600_000_000_000, Ordering::SeqCst);
+        let (factory, delivery) = x3_channel_with_clock(8, clock.clone());
+        let tap = factory.tap(address(20000), PayloadDirection::FromTarget);
+
+        tap.deliver(address(16384), &rtp(1));
+        clock.0.fetch_add(20_000_000, Ordering::SeqCst);
+        tap.deliver(address(16384), &rtp(2));
+
+        let first = delivery.packets.try_recv().expect("first");
+        let second = delivery.packets.try_recv().expect("second");
+        assert_eq!(first.intercepted_unix_nanos, 1_788_177_600_000_000_000);
+        assert_eq!(
+            second.intercepted_unix_nanos - first.intercepted_unix_nanos,
+            20_000_000
+        );
+    }
+
+    #[test]
+    fn the_system_clock_reads_a_plausible_unix_time() {
+        // 2020-01-01 as a floor: a since-boot counter would read decades earlier.
+        assert!(SystemX3Clock.unix_nanos() > 1_577_836_800_000_000_000);
     }
 
     #[test]
@@ -797,13 +876,13 @@ mod tests {
         let (factory, delivery) = x3_channel(8);
         let tap = factory.tap(address(20000), PayloadDirection::ToTarget);
 
-        tap.deliver(address(16384), 0, &rtcp());
+        tap.deliver(address(16384), &rtcp());
         assert!(
             delivery.packets.try_recv().is_err(),
             "RTCP must not be delivered"
         );
 
-        tap.deliver(address(16384), 0, &rtp(1));
+        tap.deliver(address(16384), &rtp(1));
         assert!(
             delivery.packets.try_recv().is_ok(),
             "RTP must still be delivered"
@@ -815,7 +894,7 @@ mod tests {
         let (factory, delivery) = x3_channel(8);
         let tap = factory.tap(address(20000), PayloadDirection::ToTarget);
         for runt in [vec![], vec![0x80]] {
-            tap.deliver(address(16384), 0, &runt);
+            tap.deliver(address(16384), &runt);
         }
         assert!(delivery.packets.try_recv().is_err());
     }
@@ -828,9 +907,9 @@ mod tests {
         let caller = factory.tap(address(20000), PayloadDirection::FromTarget);
         let callee = factory.tap(address(20002), PayloadDirection::ToTarget);
 
-        caller.deliver(address(16384), 0, &rtp(1));
-        callee.deliver(address(16386), 20_000, &rtp(100));
-        caller.deliver(address(16384), 20_000, &rtp(2));
+        caller.deliver(address(16384), &rtp(1));
+        callee.deliver(address(16386), &rtp(100));
+        caller.deliver(address(16384), &rtp(2));
 
         let directions: Vec<_> = (0..3)
             .map(|_| delivery.packets.try_recv().expect("packet").direction)
@@ -855,12 +934,12 @@ mod tests {
         let tap = factory.tap(address(20000), PayloadDirection::FromTarget);
 
         for sequence in 1..=3 {
-            tap.deliver(address(16384), 0, &rtp(sequence));
+            tap.deliver(address(16384), &rtp(sequence));
         }
         assert_eq!(tap.counters().dropped(), 0);
 
         for sequence in 4..=6 {
-            tap.deliver(address(16384), 0, &rtp(sequence));
+            tap.deliver(address(16384), &rtp(sequence));
         }
         assert_eq!(
             tap.counters().dropped(),
@@ -884,7 +963,7 @@ mod tests {
         let (factory, _delivery) = x3_channel(2);
         let tap = factory.tap(address(20000), PayloadDirection::FromTarget);
         for sequence in 0..1000 {
-            tap.deliver(address(16384), 0, &rtp(sequence));
+            tap.deliver(address(16384), &rtp(sequence));
         }
         assert_eq!(tap.counters().dropped(), 998);
     }
@@ -894,13 +973,13 @@ mod tests {
         let (factory, delivery) = x3_channel(4);
         let tap = factory.tap(address(20000), PayloadDirection::FromTarget);
 
-        tap.deliver(address(16384), 0, &rtp(1));
+        tap.deliver(address(16384), &rtp(1));
         let packet = delivery.packets.try_recv().expect("packet");
         let capacity = packet.payload.capacity();
         let pointer = packet.payload.as_ptr();
         delivery.recycle.try_send(packet.payload).expect("recycle");
 
-        tap.deliver(address(16384), 0, &rtp(2));
+        tap.deliver(address(16384), &rtp(2));
         let next = delivery.packets.try_recv().expect("packet");
         assert_eq!(next.payload.capacity(), capacity);
         assert_eq!(next.payload.as_ptr(), pointer, "the buffer must be reused");

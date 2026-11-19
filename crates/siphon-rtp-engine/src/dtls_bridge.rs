@@ -1189,7 +1189,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             Direction::Decrypt { .. } | Direction::Pipeline { .. } => out.as_slice(),
         };
         if let Some(x3) = &x3 {
-            x3.deliver(packet.source, packet.arrival, plaintext);
+            x3.deliver(packet.source, plaintext);
         }
         // A tee's or a recording's copy of the same plaintext (the SDES bridge taps identically).
         if !plain_taps.is_empty() && kind != PacketKind::Rtcp {

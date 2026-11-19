@@ -612,7 +612,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         // Reached only after the source gate above and after the crypto succeeded, so a forged or
         // replayed packet — which returns above — is never delivered.
         if let Some(x3) = &x3 {
-            x3.deliver(packet.source, packet.arrival, plaintext);
+            x3.deliver(packet.source, plaintext);
         }
         // A tee's or a recording's copy, from the same place and for the same reason: the only
         // plaintext. Dropped rather than queued when a consumer falls behind.

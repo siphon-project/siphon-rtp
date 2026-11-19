@@ -1,3 +1,7 @@
+//! Note: the engine's X3 taps no longer use [`WallClockAnchor`]: they stamp wall-clock interception
+//! time per packet ([`unix_nanos_to_timestamp`]), because a datapath receive clock need not track
+//! real time. The anchor remains for callers whose receive clock is real.
+//!
 //! Turning a datapath receive-clock reading into the absolute time a delivery timestamp needs.
 //!
 //! Conditional attribute 9 (TS 103 221-2 V1.4.1 §5.3) is an **absolute** Unix time: seconds since
@@ -76,11 +80,19 @@ impl WallClockAnchor {
         let wall_nanos = self
             .wall_unix_nanos
             .saturating_add(elapsed_micros.saturating_mul(NANOS_PER_MICROSECOND));
-        let seconds = u32::try_from(wall_nanos / NANOS_PER_SECOND).unwrap_or(u32::MAX);
-        // Bounded by NANOS_PER_SECOND, so it always fits.
-        let nanoseconds = (wall_nanos % NANOS_PER_SECOND) as u32;
-        (seconds, nanoseconds)
+        unix_nanos_to_timestamp(wall_nanos)
     }
+}
+
+/// Split an absolute time, nanoseconds since the Unix epoch, into the `(Unix seconds, nanoseconds)`
+/// pair attribute 9 (Timestamp, TS 103 221-2 §5.3) carries. Seconds saturate at [`u32::MAX`] (the
+/// year 2106), the bound of the 4-byte field.
+#[must_use]
+pub fn unix_nanos_to_timestamp(wall_unix_nanos: u128) -> (u32, u32) {
+    let seconds = u32::try_from(wall_unix_nanos / NANOS_PER_SECOND).unwrap_or(u32::MAX);
+    // Bounded by NANOS_PER_SECOND, so it always fits.
+    let nanoseconds = (wall_unix_nanos % NANOS_PER_SECOND) as u32;
+    (seconds, nanoseconds)
 }
 
 #[cfg(test)]
