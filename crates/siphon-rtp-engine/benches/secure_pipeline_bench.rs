@@ -284,8 +284,90 @@ fn bench_ws_secure_leg(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// The per-packet cost of a secure **video** stream (SDES-SRTP, `video_relay: anchor`), which the
+/// userspace SRTP bridge carries as 1200 byte packets, not the 160 byte audio frames above. The
+/// `leg_*` arms are the crypto the bridge adds (RFC 3711 `unprotect`, `protect`, and both for a
+/// transcrypt between two SDES parties). The bridge around them (source gate, latch, send) is
+/// proven allocation-free beside a plain relay in `tests/srtp_bridge_video_zero_alloc.rs`.
+fn bench_secure_video(criterion: &mut Criterion) {
+    const RING: usize = 512;
+    let a_key = SrtpKeyMaterial::from_inline_bytes(&[0xA7u8; 30]).expect("30 bytes");
+    let b_key = SrtpKeyMaterial::from_inline_bytes(&[0xB8u8; 30]).expect("30 bytes");
+    let packet = |sequence: u16| {
+        let mut packet = vec![0x80, 96];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&u32::from(sequence).wrapping_mul(3000).to_be_bytes());
+        packet.extend_from_slice(&0xCAFE_F00Du32.to_be_bytes());
+        packet.resize(1200, 0xAB);
+        packet
+    };
+    // A ring of packets sealed under A's key, replay-safe, and the leg rebuilt when it wraps.
+    let sealed_ring = |count: usize| -> Vec<Vec<u8>> {
+        let mut sender = SecureLeg::new(&a_key, &a_key);
+        (0..count)
+            .map(|index| {
+                let mut sealed = Vec::new();
+                sender
+                    .protect(&packet(index as u16), &mut sealed)
+                    .expect("protect");
+                sealed
+            })
+            .collect()
+    };
+    let mut group = criterion.benchmark_group("srtp_video_1200b");
+    group.bench_function("leg_unprotect", |bencher| {
+        let ring = sealed_ring(RING);
+        let mut leg = SecureLeg::new(&a_key, &a_key);
+        let mut out = Vec::with_capacity(1500);
+        let mut index = 0usize;
+        bencher.iter(|| {
+            if index == RING {
+                index = 0;
+                leg = SecureLeg::new(&a_key, &a_key);
+            }
+            out.clear();
+            let kind = leg.unprotect(&ring[index], &mut out);
+            index += 1;
+            black_box(kind)
+        });
+    });
+    group.bench_function("leg_protect", |bencher| {
+        let mut leg = SecureLeg::new(&b_key, &b_key);
+        let mut plain = packet(0);
+        let mut sequence: u16 = 0;
+        let mut out = Vec::with_capacity(1500);
+        bencher.iter(|| {
+            sequence = sequence.wrapping_add(1);
+            plain[2..4].copy_from_slice(&sequence.to_be_bytes());
+            out.clear();
+            black_box(leg.protect(&plain, &mut out))
+        });
+    });
+    group.bench_function("leg_transcrypt", |bencher| {
+        let ring = sealed_ring(RING);
+        let mut near = SecureLeg::new(&a_key, &a_key);
+        let mut far = SecureLeg::new(&b_key, &b_key);
+        let mut plain = Vec::with_capacity(1500);
+        let mut sealed = Vec::with_capacity(1500);
+        let mut index = 0usize;
+        bencher.iter(|| {
+            if index == RING {
+                index = 0;
+                near = SecureLeg::new(&a_key, &a_key);
+            }
+            plain.clear();
+            sealed.clear();
+            let _ = near.unprotect(&ring[index], &mut plain);
+            index += 1;
+            black_box(far.protect(&plain, &mut sealed))
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_secure_video,
     bench_secure_pipeline,
     bench_secure_transcrypt_pipeline,
     bench_ws_secure_leg

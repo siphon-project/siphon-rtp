@@ -192,8 +192,14 @@ the stream like the audio:
   forward.
 - A re-INVITE that moves an address or changes a direction re-gates the relay, one that adds video allocates
   endpoints, and one that drops it frees them.
-- Plain `RTP/AVP` and `RTP/AVPF` only for now. Anything else is declined with port 0 and the reason in
-  `video_declined`.
+- Plain `RTP/AVP[F]` and SDES-SRTP (`RTP/SAVP[F]`, `a=crypto` per video section) per leg. The engine mints its
+  own key toward each secure party (the answer echoes the offered tag) and never passes one party's key to the
+  other. A far party is offered SRTP when the profile's `transport_protocol` asks for `RTP/SAVP`, as for audio.
+  Plain to SDES (a door station on plain RTP to an SDES phone), SDES to plain and SDES to SDES (re-keyed, not
+  forwarded) all work, RTCP becomes SRTCP per stream, and a re-offer carries the SRTP rollover over. A secure
+  stream runs through the userspace SRTP bridge, not the kernel relay. DTLS-SRTP video, a secure answer to a
+  plain offer (or the reverse), and a section with no usable `a=crypto` are declined with port 0 and the reason
+  in `video_declined`.
 - `query`, the end-of-call record and `siphon_rtp_video_*` give per-stream packets and bytes, so "no
   picture" reads as zero packets in (the camera never reached the engine) or in with none out.
 

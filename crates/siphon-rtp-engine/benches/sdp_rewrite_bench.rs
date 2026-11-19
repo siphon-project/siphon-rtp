@@ -286,7 +286,13 @@ fn sdp_rewrite(criterion: &mut Criterion) {
         bencher.iter(|| sdp::parse_video_stream(black_box(call_offer)));
     });
     group.bench_function("anchors_a_video_stream", |bencher| {
-        bencher.iter(|| sdp::VideoRewrite::Anchor(engine_video).apply(black_box(call_offer)));
+        bencher.iter(|| {
+            sdp::VideoRewrite::Anchor {
+                engine: engine_video,
+                keying: sdp::VideoKeying::Plain,
+            }
+            .apply(black_box(call_offer))
+        });
     });
     group.bench_function("keeps_a_passthrough_video_connection", |bencher| {
         let rewritten = call_offer.replace("c=IN IP4 192.0.2.10", "c=IN IP4 198.51.100.5");
