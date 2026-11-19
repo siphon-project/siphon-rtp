@@ -1311,7 +1311,7 @@ inbound surface, so it has its own gate and latch and none is inherited from the
 - **SDES-SRTP per stream** (RFC 4568, RFC 3711). Each video section carries its own `a=crypto`, parsed like the
   text stream's. The engine mints its own key toward each secure party, the answer echoes the offered tag
   (RFC 4568 §5.1.2), and one party's key is never written into the other's SDP. A secure answer to a plain
-  offer, a plain answer to a secure offer, a section with no usable key and DTLS-SRTP video are declined: there
+  offer, a plain answer to a secure offer and a section with no usable key are declined: there
   is no downgrade and no unkeyed relay. A secure leg cannot ride the kernel relay, so every video endpoint
   that carries media is `Redirect`ed and a second bridge plan, over the video endpoints and video
   `SecureLeg`s only, goes to the SRTP bridge. Plain to SDES, SDES to plain and SDES to SDES (a transcrypt)
@@ -1322,6 +1322,21 @@ inbound surface, so it has its own gate and latch and none is inherited from the
   does, so a stream past a sequence wrap keeps authenticating. The bridge's crypto buffers are reused across
   datagrams, so the secure path allocates nothing per packet (`srtp_bridge_video_zero_alloc`); this holds for
   audio's bridge flows too.
+- **DTLS-SRTP per stream** (RFC 5764, RFC 5763, RFC 8843). The engine terminates one party's DTLS; the other is
+  plain. A **bundled** video (the group names the video mid and the audio's) shares the leg's endpoint, source
+  gate and association: no second handshake, one SRTP context per SSRC under the leg's keys. After unprotect the
+  bridge tells it from the audio by payload type (unique across a bundle, RFC 8843 §9.2; a video section that
+  shares one with the audio is declined) and, for RTCP, by the streams it speaks of (the shared
+  `rtcp_is_about_video`); nothing is decided before the signalled-source gate and the crypto, so a stranger
+  or a forged packet is never routed. The far party's video endpoint is its own redirected, gated endpoint,
+  and what it sends leaves the leg's audio 5-tuple as SRTP, never in the clear. **Unbundled, no ICE**: a
+  second association on the video endpoint, registered like the audio's, with the same certificate and the
+  role of its own `a=setup` (the kept association survives a re-offer, RFC 8842 §3.1). Unbundled with ICE,
+  without `a=rtcp-mux`, toward an SDES leg, on a passed-through DTLS audio leg, or bundled on an audio leg the
+  media pipeline owns, the stream is declined. The latch is the audio's: the DTLS bridge gates on the
+  signalled source and has no symmetric latch for either stream. Interception, tees and recordings take the
+  audio only. The bridge's crypto buffers are reused, so the DTLS path allocates nothing per packet
+  (`dtls_bridge_video_zero_alloc`). A DTLS call is not checkpointed, so neither is its video.
 - **HA.** The video sockets re-bind on their ports at restore, with the same gate and latch policy and the
   same directions. A secure stream also records its keys and each secure leg's rollover, so the standby's
   first packet past a wrap authenticates; its snapshot has a version of its own, so an older standby refuses

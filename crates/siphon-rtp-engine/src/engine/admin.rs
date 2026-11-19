@@ -242,6 +242,7 @@ fn build_features() -> Vec<String> {
         // leg: plain to SDES, SDES to plain and SDES to SDES, SRTCP per stream. A controller gates
         // offering secure video on this entry; DTLS-SRTP video is declined.
         "call_video_sdes".to_string(),
+        "call_video_dtls".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

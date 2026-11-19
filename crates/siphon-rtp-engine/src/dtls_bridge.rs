@@ -15,6 +15,7 @@
 //! handshake task returned — and with it went the only thing that could have re-sent that flight.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -30,6 +31,8 @@ use crate::dtls_session::{spawn_session, DriverPlan, SessionOutcome};
 use crate::floor_channel::FloorChannelPlan;
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::plain_tap::{PlainTapSender, PlainTaps};
+use crate::seat_gate::rtcp_is_about_video;
+use crate::srtp_bridge::ScratchPool;
 use crate::x3::X3Tap;
 
 /// How many inbound DTLS records a leg's driver will queue. Bounded so a stalled association cannot
@@ -263,6 +266,76 @@ struct Flow {
     plain_taps: PlainTaps,
     /// Which refusals of this flow's ingress have already been logged at `warn`.
     refusals: Arc<RefusalLog>,
+    /// The video a bundled leg carries beside its audio (RFC 8843): on the secure endpoint's flow,
+    /// where the decrypted media is told apart; on the video endpoint's flow, where the egress stream
+    /// is learned. `None` for every flow of a leg without bundled video.
+    video: Option<Arc<VideoRoute>>,
+    /// RTP on this flow is dropped: the direction a video stream was negotiated closed (RFC 3264
+    /// §6.1). RTCP still flows, as receiver feedback travels against the media.
+    rtp_closed: bool,
+}
+
+/// The two SSRCs a bundled video stream is told apart by in RTCP: the DTLS peer's own video sender
+/// and the stream the engine sends it. Each is `(1 << 32) | ssrc` once learned, `0` before.
+#[derive(Default)]
+struct VideoSsrcs {
+    peer: AtomicU64,
+    egress: AtomicU64,
+}
+
+const SSRC_KNOWN: u64 = 1 << 32;
+
+impl VideoSsrcs {
+    fn learn(slot: &AtomicU64, rtp: &[u8]) {
+        if let Some(bytes) = rtp.get(8..12) {
+            let ssrc = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            slot.store(SSRC_KNOWN | u64::from(ssrc), Ordering::Relaxed);
+        }
+    }
+
+    fn read(slot: &AtomicU64) -> Option<u32> {
+        let value = slot.load(Ordering::Relaxed);
+        // Truncation is the point: the low 32 bits are the SSRC.
+        (value & SSRC_KNOWN != 0).then_some(value as u32)
+    }
+}
+
+/// Where a bundled leg's video goes once it is told from the audio, and what tells it.
+struct VideoRoute {
+    /// Bit `n` set: payload type `n` is the video's (RFC 8843 §9.2 makes it unique in the bundle).
+    payload_types: u128,
+    /// The endpoint the video is relayed out of, and the address it goes to.
+    out_endpoint: EndpointId,
+    out_dst: SocketAddr,
+    /// The video endpoint, whose flow is removed with the route.
+    plain_endpoint: EndpointId,
+    /// The DTLS peer's video RTP may be relayed.
+    rtp_open: bool,
+    ssrcs: Arc<VideoSsrcs>,
+}
+
+impl VideoRoute {
+    /// Whether decrypted `plaintext` is this video stream's. RTP by payload type, which also learns
+    /// the peer's video SSRC; RTCP by the streams it speaks of (RFC 3550 §6.4, RFC 4585 §6.1).
+    fn claims(&self, kind: PacketKind, plaintext: &[u8]) -> bool {
+        match kind {
+            PacketKind::Rtp => {
+                let Some(&second) = plaintext.get(1) else {
+                    return false;
+                };
+                let claimed = self.payload_types >> (second & 0x7F) & 1 == 1;
+                if claimed {
+                    VideoSsrcs::learn(&self.ssrcs.peer, plaintext);
+                }
+                claimed
+            }
+            PacketKind::Rtcp => rtcp_is_about_video(
+                plaintext,
+                VideoSsrcs::read(&self.ssrcs.egress),
+                VideoSsrcs::read(&self.ssrcs.peer),
+            ),
+        }
+    }
 }
 
 /// Copy an ICE-gated leg's validated source into its DTLS destination for as long as the association
@@ -351,6 +424,25 @@ pub struct PlainRtcp {
     pub dst: SocketAddr,
 }
 
+/// The video a bundled leg carries beside its audio on one association (RFC 8843, RFC 5764).
+#[derive(Debug, Clone)]
+pub struct DtlsVideoPlan {
+    /// The endpoint the leg's association runs on: the audio endpoint, which the video shares.
+    pub secure_endpoint: EndpointId,
+    /// The endpoint facing the other party's video.
+    pub plain_endpoint: EndpointId,
+    /// Signalled-source gate for the plain endpoint.
+    pub plain_source: SourceFilter,
+    /// The other party's video address, where decrypted video is forwarded.
+    pub plain_dst: SocketAddr,
+    /// The payload types of the video section, which tell its RTP from the audio's (RFC 8843 §9.2).
+    pub payload_types: Vec<u8>,
+    /// The other party's video RTP may be encrypted toward the DTLS peer.
+    pub to_secure: bool,
+    /// The DTLS peer's video RTP may be relayed to the other party.
+    pub to_plain: bool,
+}
+
 /// The DTLS bridge registry: redirected endpoint → its `Flow`, plus the per-call handshake/drain
 /// tasks keyed by the secure endpoint (aborted on deregister). Shared (`Arc`) between the control path
 /// and the redirect dispatcher.
@@ -378,6 +470,9 @@ pub struct DtlsBridge<D: Datapath> {
     /// leg negotiated one. Set before the leg is registered, handed to every driver spawned for the
     /// endpoint, and forgotten with the endpoint ([`Self::deregister`]).
     floor_channels: DashMap<EndpointId, FloorChannelPlan>,
+    /// Buffers the crypto transforms write into, reused from one datagram to the next, so the steady
+    /// state allocates nothing per packet.
+    scratch: ScratchPool,
 }
 
 /// Dropping the bridge aborts every session it still owns, as per-call teardown does through
@@ -409,6 +504,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             associations: DashMap::new(),
             pipeline_keys: Arc::new(DashMap::new()),
             floor_channels: DashMap::new(),
+            scratch: ScratchPool::default(),
         }
     }
 
@@ -476,6 +572,8 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             plain_taps: PlainTaps::default(),
             rtcp_only: true,
             refusals: Arc::new(RefusalLog::default()),
+            video: None,
+            rtp_closed: false,
             rtcp_out: None,
         }
     }
@@ -671,6 +769,8 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 plain_taps: plain_side_taps,
                 rtcp_only: false,
                 refusals: Arc::new(RefusalLog::default()),
+                video: None,
+                rtp_closed: false,
                 rtcp_out: None,
             },
         );
@@ -700,6 +800,8 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 plain_taps: secure_side_taps,
                 rtcp_only: false,
                 refusals: Arc::new(RefusalLog::default()),
+                video: None,
+                rtp_closed: false,
                 // Decrypted RTCP goes to the plain peer's own RTCP port when it has one.
                 rtcp_out: plan.plain_rtcp.map(|rtcp| (rtcp.endpoint, rtcp.dst)),
             },
@@ -782,6 +884,8 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 // The per-call actor relays RTCP itself (`plan.plain_rtcp` is not used here).
                 rtcp_only: false,
                 refusals: Arc::new(RefusalLog::default()),
+                video: None,
+                rtp_closed: false,
                 rtcp_out: None,
             },
         );
@@ -792,6 +896,104 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             Some(destination.clone()),
         );
         self.destinations.insert(plan.secure_endpoint, destination);
+    }
+
+    /// Carry a video stream beside the audio on `plan.secure_endpoint`'s association (RFC 8843: one
+    /// transport, so one handshake; RFC 5764 §4.2: one SRTP context per SSRC under its keys).
+    ///
+    /// The leg's own flow tells the video from the audio after it has decrypted a datagram, by payload
+    /// type for RTP and by the streams spoken of for RTCP, and relays the video out of
+    /// `plan.plain_endpoint`; the video endpoint's flow encrypts what the other party sends on the
+    /// leg's own secure endpoint, toward the address the audio already goes to. Calling it again
+    /// replaces the route and keeps what the stream had learned.
+    ///
+    /// Returns `false` when there is no association to carry it: none registered on that endpoint, or
+    /// one whose media belongs to a pipeline actor, which owns the crypto itself.
+    pub fn attach_video(&self, plan: &DtlsVideoPlan) -> bool {
+        let Some(destination) = self
+            .destinations
+            .get(&plan.secure_endpoint)
+            .map(|entry| entry.value().clone())
+        else {
+            return false;
+        };
+        let Some(mut secure_flow) = self.flows.get_mut(&plan.secure_endpoint) else {
+            return false;
+        };
+        if !matches!(secure_flow.direction, Direction::Decrypt { .. }) {
+            return false;
+        }
+        let ssrcs = secure_flow
+            .video
+            .as_ref()
+            .map_or_else(Arc::default, |route| route.ssrcs.clone());
+        let mut payload_types = 0u128;
+        for payload_type in plan.payload_types.iter().filter(|number| **number < 128) {
+            payload_types |= 1 << payload_type;
+        }
+        let route = Arc::new(VideoRoute {
+            payload_types,
+            out_endpoint: plan.plain_endpoint,
+            out_dst: plan.plain_dst,
+            plain_endpoint: plan.plain_endpoint,
+            rtp_open: plan.to_plain,
+            ssrcs,
+        });
+        secure_flow.video = Some(route.clone());
+        let secure = secure_flow.secure.clone();
+        // Release the guard before touching another entry of the map.
+        drop(secure_flow);
+        let previous = self.flows.insert(
+            plan.plain_endpoint,
+            Flow {
+                direction: Direction::Encrypt,
+                accepted_source: plan.plain_source,
+                out_endpoint: plan.secure_endpoint,
+                out_dst: None,
+                secure_dst: Some(destination),
+                secure,
+                // X3 content is audio for now (docs/security-and-nat.md), and a tee or recording
+                // decodes audio: neither is offered the video.
+                x3: None,
+                plain_taps: PlainTaps::default(),
+                rtcp_only: false,
+                rtcp_out: None,
+                refusals: Arc::new(RefusalLog::default()),
+                video: Some(route),
+                rtp_closed: !plan.to_secure,
+            },
+        );
+        drop(previous);
+        true
+    }
+
+    /// Stop carrying video on `secure_endpoint`'s association: the route goes, and with it the flow
+    /// of the video endpoint. Idempotent.
+    pub fn detach_video(&self, secure_endpoint: EndpointId) {
+        let route = self
+            .flows
+            .get_mut(&secure_endpoint)
+            .and_then(|mut flow| flow.video.take());
+        if let Some(route) = route {
+            self.flows.remove(&route.plain_endpoint);
+        }
+    }
+
+    /// Open or close the RTP directions of a registered leg's two flows, for a stream whose negotiated
+    /// direction allows one way only (RFC 3264 §6.1): `to_secure` is the plain peer's media toward the
+    /// DTLS peer, `to_plain` the DTLS peer's toward the plain peer. RTCP is not affected.
+    pub fn set_rtp_directions(
+        &self,
+        secure_endpoint: EndpointId,
+        plain_endpoint: EndpointId,
+        (to_secure, to_plain): (bool, bool),
+    ) {
+        if let Some(mut flow) = self.flows.get_mut(&secure_endpoint) {
+            flow.rtp_closed = !to_plain;
+        }
+        if let Some(mut flow) = self.flows.get_mut(&plain_endpoint) {
+            flow.rtp_closed = !to_secure;
+        }
     }
 
     /// Tell a gated DTLS leg which address ICE selected: releases its handshake and re-points every
@@ -1053,6 +1255,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             rtcp_only,
             rtcp_out,
             refusals,
+            (video, rtp_closed),
         )) = self.flows.get(&packet.endpoint).map(|flow| {
             (
                 flow.direction.clone(),
@@ -1068,6 +1271,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 flow.rtcp_only,
                 flow.rtcp_out,
                 flow.refusals.clone(),
+                (flow.video.clone(), flow.rtp_closed),
             )
         })
         else {
@@ -1121,6 +1325,19 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             return;
         }
 
+        // RTP on a direction negotiated closed is dropped before any crypto (RFC 3264 §6.1); RTCP, which
+        // carries receiver feedback against the media's direction, still flows. The video endpoint of
+        // a bundled leg also learns the stream it sends, which the DTLS peer's RTCP will speak of.
+        if matches!(direction, Direction::Encrypt) && !is_rtcp(&packet.data) {
+            if rtp_closed {
+                self.datapath.note_dropped(packet.endpoint);
+                return;
+            }
+            if let Some(route) = &video {
+                VideoSsrcs::learn(&route.ssrcs.egress, &packet.data);
+            }
+        }
+
         // Pipeline mode: hand the still-encrypted media to the per-call actor, which owns the
         // `SecureLeg` and decrypts it on its own `secure_ingress` — the same path SDES secure
         // transcode takes. Before the handshake keys it, drop (the actor could not decrypt anyway,
@@ -1135,7 +1352,8 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             return;
         }
         let Some(out_dst) = out_dst else { return };
-        let mut out = Vec::new();
+        let mut scratch = self.scratch.take();
+        let out = &mut scratch.decrypted;
         let transformed = {
             let Ok(mut guard) = secure.lock() else {
                 tracing::error!("DTLS secure-leg mutex poisoned; dropping packet");
@@ -1148,10 +1366,10 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 return;
             };
             match direction {
-                Direction::Encrypt => leg.protect(&packet.data, &mut out),
+                Direction::Encrypt => leg.protect(&packet.data, out),
                 // `Pipeline` returned above; only the two relaying directions reach the crypto here.
                 Direction::Decrypt { .. } | Direction::Pipeline { .. } => {
-                    leg.unprotect(&packet.data, &mut out)
+                    leg.unprotect(&packet.data, out)
                 }
             }
         };
@@ -1167,10 +1385,31 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 return;
             }
         };
+        // A bundled leg's video is told from its audio now that it is plaintext (RFC 8843 §9.2) and goes
+        // out of the video endpoint. A closed direction drops the video RTP, not its RTCP.
+        let mut is_video = false;
+        let (out_endpoint, out_dst) = match video.as_deref().filter(|route| {
+            matches!(direction, Direction::Decrypt { .. }) && route.claims(kind, out.as_slice())
+        }) {
+            Some(route) => {
+                if kind == PacketKind::Rtp && !route.rtp_open {
+                    self.datapath.note_dropped(packet.endpoint);
+                    return;
+                }
+                is_video = true;
+                (route.out_endpoint, route.out_dst)
+            }
+            None => (out_endpoint, out_dst),
+        };
+        // The same for a leg of an association of its own, whose direction was negotiated closed.
+        if rtp_closed && kind == PacketKind::Rtp && matches!(direction, Direction::Decrypt { .. }) {
+            self.datapath.note_dropped(packet.endpoint);
+            return;
+        }
         // Decrypted RTCP goes to the plain peer's separate RTCP port when it has one (RFC 5761
         // §5.1.1); RTP, and RTCP toward a multiplexing plain peer, go where the flow forwards.
         let (out_endpoint, out_dst) = match (kind, rtcp_out) {
-            (PacketKind::Rtcp, Some(rtcp)) => rtcp,
+            (PacketKind::Rtcp, Some(rtcp)) if !is_video => rtcp,
             _ => (out_endpoint, out_dst),
         };
 
@@ -1188,12 +1427,16 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             Direction::Encrypt => packet.data.as_ref(),
             Direction::Decrypt { .. } | Direction::Pipeline { .. } => out.as_slice(),
         };
-        if let Some(x3) = &x3 {
-            x3.deliver(packet.source, plaintext);
-        }
-        // A tee's or a recording's copy of the same plaintext (the SDES bridge taps identically).
-        if !plain_taps.is_empty() && kind != PacketKind::Rtcp {
-            plain_taps.offer(plaintext);
+        // Audio only: interception, a tee and a recording take the call's audio, and a bundled
+        // video stream is none of it (docs/security-and-nat.md, "Video on a two-party call").
+        if !is_video {
+            if let Some(x3) = &x3 {
+                x3.deliver(packet.source, plaintext);
+            }
+            // A tee's or a recording's copy of the same plaintext (the SDES bridge taps identically).
+            if !plain_taps.is_empty() && kind != PacketKind::Rtcp {
+                plain_taps.offer(plaintext);
+            }
         }
         // Telemetry: the plaintext RTCP either party sent, which the datapath's relay tap never sees
         // on a bridged leg.
@@ -1207,7 +1450,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             );
         }
 
-        if let Err(error) = self.datapath.send(out_endpoint, out_dst, &out).await {
+        if let Err(error) = self.datapath.send(out_endpoint, out_dst, out).await {
             tracing::debug!(%error, "DTLS bridge forward send failed");
         }
     }
@@ -1530,7 +1773,7 @@ mod tests {
     use std::time::Duration;
 
     use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
-    use siphon_rtp_datapath::FlowAction;
+    use siphon_rtp_datapath::{Endpoint, FlowAction};
     use tokio::net::UdpSocket;
     use tokio::time::timeout;
 
@@ -1600,6 +1843,287 @@ mod tests {
             .keying()
             .map(|keying| keying.to_secure_leg())
             .expect("the peer's DTLS handshake completed")
+    }
+
+    /// A video RTP packet (PT 96).
+    fn video_rtp(seq: u16, ssrc: u32) -> Vec<u8> {
+        let mut packet = vec![0x80, 96];
+        packet.extend_from_slice(&seq.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 0]);
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(b"h264-nal-unit---");
+        packet
+    }
+
+    /// An RTCP receiver report from `sender` with one report block about `about` (RFC 3550 §6.4.2).
+    fn report_about(sender: u32, about: u32) -> Vec<u8> {
+        let mut packet = vec![0x81, 201, 0x00, 0x07];
+        packet.extend_from_slice(&sender.to_be_bytes());
+        packet.extend_from_slice(&about.to_be_bytes());
+        packet.extend_from_slice(&[0u8; 20]);
+        packet
+    }
+
+    /// A bundled DTLS leg: audio on `audio`, video on the same association toward `video_phone`.
+    struct BundledCall {
+        bridge: Arc<DtlsBridge<UdpLoopbackDatapath>>,
+        audio: Endpoint,
+        video: Endpoint,
+        audio_phone: UdpSocket,
+        video_phone: UdpSocket,
+        peer: Arc<UdpSocket>,
+        peer_leg: SecureLeg,
+    }
+
+    async fn bundled_call(to_secure: bool, to_plain: bool) -> BundledCall {
+        let datapath = UdpLoopbackDatapath::new();
+        let plain_audio = datapath.alloc_endpoint().await.expect("plain audio");
+        let audio = datapath.alloc_endpoint().await.expect("secure audio");
+        let video = datapath.alloc_endpoint().await.expect("plain video");
+        for endpoint in [plain_audio.id, audio.id, video.id] {
+            datapath
+                .install_flow(endpoint, FlowAction::Redirect)
+                .expect("redirect");
+        }
+        let audio_phone = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind audio phone");
+        let video_phone = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind video phone");
+        let peer = Arc::new(
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind peer"),
+        );
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let engine_cert = DtlsCertificate::generate().expect("engine cert");
+        let peer_cert = DtlsCertificate::generate().expect("peer cert");
+        let bridge = Arc::new(DtlsBridge::new(datapath.clone()));
+        bridge.register(DtlsCallPlan {
+            plain_endpoint: plain_audio.id,
+            plain_source: SourceFilter::Exact(Ipv4Addr::new(127, 0, 0, 2).into()),
+            plain_dst: audio_phone.local_addr().expect("addr"),
+            secure_endpoint: audio.id,
+            secure_source: SourceFilter::Exact(peer_addr.ip()),
+            secure_dst: peer_addr,
+            secure_local: audio.local_addr,
+            certificate: engine_cert.clone(),
+            role: DtlsRole::Server,
+            peer_fingerprint: peer_cert.fingerprint(),
+            gate_on_ice: false,
+            ice_validated: None,
+            plain_rtcp: None,
+        });
+        assert!(
+            bridge.attach_video(&DtlsVideoPlan {
+                secure_endpoint: audio.id,
+                plain_endpoint: video.id,
+                plain_source: SourceFilter::Exact(Ipv4Addr::new(127, 0, 0, 2).into()),
+                plain_dst: video_phone.local_addr().expect("addr"),
+                payload_types: vec![96, 97],
+                to_secure,
+                to_plain,
+            }),
+            "the leg has an association to carry the video on"
+        );
+        let rx = datapath.rx();
+        let dispatch = bridge.clone();
+        tokio::spawn(async move {
+            while let Ok(packet) = rx.recv_async().await {
+                dispatch.handle(packet).await;
+            }
+        });
+        let peer_leg = peer_handshake(
+            peer.clone(),
+            audio.local_addr,
+            &peer_cert,
+            &engine_cert.fingerprint(),
+        )
+        .await;
+        BundledCall {
+            bridge,
+            audio,
+            video,
+            audio_phone,
+            video_phone,
+            peer,
+            peer_leg,
+        }
+    }
+
+    /// What `socket` receives within the window, or `None`.
+    async fn within(socket: &UdpSocket, window: Duration) -> Option<Vec<u8>> {
+        let mut buffer = [0u8; 2048];
+        match timeout(window, socket.recv_from(&mut buffer)).await {
+            Ok(Ok((len, _))) => Some(buffer[..len].to_vec()),
+            _ => None,
+        }
+    }
+
+    impl BundledCall {
+        /// Seal `plain` as the DTLS peer and send it to the leg's one address, retrying across the
+        /// window between the peer keying and the engine installing its leg.
+        async fn peer_sends(&mut self, plain: &[u8], to_audio_phone: bool) -> Option<Vec<u8>> {
+            for _ in 0..25 {
+                let mut sealed = Vec::new();
+                self.peer_leg.protect(plain, &mut sealed).expect("protect");
+                self.peer
+                    .send_to(&sealed, self.audio.local_addr)
+                    .await
+                    .expect("send");
+                let phone = if to_audio_phone {
+                    &self.audio_phone
+                } else {
+                    &self.video_phone
+                };
+                if let Some(received) = within(phone, Duration::from_millis(150)).await {
+                    return Some(received);
+                }
+            }
+            None
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bundled_video_and_audio_share_one_association_and_are_told_apart_by_payload_type() {
+        // RFC 8843 §9.2: one 5-tuple carries both, and a payload type is unique across the bundle.
+        let mut call = bundled_call(true, true).await;
+        let video = video_rtp(1, 0x5151_5151);
+        let audio = rtp(1, 0x0A0A_0A0A);
+        // Audio first, so the keyed leg is known good before the video is judged.
+        assert_eq!(
+            call.peer_sends(&audio, true).await.as_deref(),
+            Some(audio.as_slice()),
+            "audio reaches the audio phone"
+        );
+        let mut sealed = Vec::new();
+        call.peer_leg.protect(&video, &mut sealed).expect("protect");
+        call.peer
+            .send_to(&sealed, call.audio.local_addr)
+            .await
+            .expect("send video");
+        assert_eq!(
+            within(&call.video_phone, RECV_TIMEOUT).await.as_deref(),
+            Some(video.as_slice()),
+            "video reaches the video phone, decrypted, on the one association"
+        );
+        assert!(
+            within(&call.audio_phone, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "video never reaches the audio phone"
+        );
+        // The video phone's plaintext leaves the audio endpoint (the one 5-tuple) as SRTP.
+        let reply = video_rtp(9, 0x6161_6161);
+        call.video_phone
+            .send_to(&reply, call.video.local_addr)
+            .await
+            .expect("video phone send");
+        let mut buffer = [0u8; 2048];
+        let (len, from) = timeout(RECV_TIMEOUT, call.peer.recv_from(&mut buffer))
+            .await
+            .expect("the peer hears the video")
+            .expect("recv");
+        assert_eq!(from, call.audio.local_addr, "from the leg's audio 5-tuple");
+        let mut recovered = Vec::new();
+        call.peer_leg
+            .unprotect(&buffer[..len], &mut recovered)
+            .expect("unprotect");
+        assert_eq!(recovered, reply);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bundled_video_rtcp_is_told_apart_by_the_streams_it_speaks_of() {
+        let mut call = bundled_call(true, true).await;
+        // The engine's video egress SSRC becomes known when the video phone sends.
+        let reply = video_rtp(1, 0x6161_6161);
+        call.video_phone
+            .send_to(&reply, call.video.local_addr)
+            .await
+            .expect("send");
+        let mut buffer = [0u8; 2048];
+        timeout(RECV_TIMEOUT, call.peer.recv_from(&mut buffer))
+            .await
+            .expect("heard")
+            .expect("recv");
+        // The peer's report about that stream is video RTCP.
+        let about_video = report_about(0x9999_0001, 0x6161_6161);
+        assert_eq!(
+            call.peer_sends(&about_video, false).await.as_deref(),
+            Some(about_video.as_slice()),
+            "a report block about the video stream goes to the video phone"
+        );
+        // A report about anything else is the audio's.
+        let about_audio = report_about(0x9999_0002, 0x0A0A_0A0A);
+        assert_eq!(
+            call.peer_sends(&about_audio, true).await.as_deref(),
+            Some(about_audio.as_slice())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stranger_cannot_inject_video_toward_the_dtls_peer_and_a_closed_direction_drops() {
+        // The video endpoint is gated on the signalled address like every redirected endpoint.
+        let call = bundled_call(true, false).await;
+        let stranger = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 9), 0))
+            .await
+            .expect("bind stranger");
+        stranger
+            .send_to(&video_rtp(1, 0x6666_6666), call.video.local_addr)
+            .await
+            .expect("send");
+        let mut buffer = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(300), call.peer.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "a source the SDP never signalled is dropped"
+        );
+        // `to_plain` is closed: the peer's video is decrypted and dropped, not relayed.
+        let mut call = call;
+        let video = video_rtp(1, 0x5151_5151);
+        let relayed = call.peer_sends(&video, false).await;
+        assert!(relayed.is_none(), "{relayed:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detaching_video_ends_the_route_and_the_video_endpoint_flow() {
+        let mut call = bundled_call(true, true).await;
+        let audio = rtp(1, 0x0A0A_0A0A);
+        assert!(call.peer_sends(&audio, true).await.is_some(), "keyed");
+        call.bridge.detach_video(call.audio.id);
+        // The video endpoint no longer encrypts toward the peer.
+        call.video_phone
+            .send_to(&video_rtp(1, 0x6161_6161), call.video.local_addr)
+            .await
+            .expect("send");
+        let mut buffer = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(300), call.peer.recv_from(&mut buffer))
+                .await
+                .is_err()
+        );
+        // And the peer's video is no longer told from the audio: it is not relayed to the video phone.
+        let video = video_rtp(2, 0x5151_5151);
+        assert!(call.peer_sends(&video, false).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attaching_video_to_an_endpoint_with_no_association_is_refused() {
+        let datapath = UdpLoopbackDatapath::new();
+        let secure = datapath.alloc_endpoint().await.expect("secure");
+        let plain = datapath.alloc_endpoint().await.expect("plain");
+        let bridge = DtlsBridge::new(datapath);
+        assert!(!bridge.attach_video(&DtlsVideoPlan {
+            secure_endpoint: secure.id,
+            plain_endpoint: plain.id,
+            plain_source: SourceFilter::Any,
+            plain_dst: "192.0.2.1:5000".parse().expect("addr"),
+            payload_types: vec![96],
+            to_secure: true,
+            to_plain: true,
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

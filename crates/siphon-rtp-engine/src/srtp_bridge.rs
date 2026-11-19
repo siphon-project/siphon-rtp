@@ -168,25 +168,25 @@ pub struct SrtpBridge<D: Datapath> {
 /// The two buffers one datagram's transforms use: what the ingress side decrypts into and what the
 /// egress side encrypts into.
 #[derive(Default)]
-struct Scratch {
-    decrypted: Vec<u8>,
-    sealed: Vec<u8>,
+pub(crate) struct Scratch {
+    pub(crate) decrypted: Vec<u8>,
+    pub(crate) sealed: Vec<u8>,
 }
 
 /// A few [`Scratch`]es, so a datagram takes one for its life and gives it back, whatever way it
 /// leaves `handle`. A pool, not one shared buffer, because `handle` awaits its send while it holds
 /// the plaintext, so datagrams of different flows can overlap.
 #[derive(Default)]
-struct ScratchPool(Mutex<Vec<Scratch>>);
+pub(crate) struct ScratchPool(Mutex<Vec<Scratch>>);
 
 /// A [`Scratch`] on loan from its pool; it returns, emptied, when dropped.
-struct ScratchLoan<'a> {
+pub(crate) struct ScratchLoan<'a> {
     pool: &'a ScratchPool,
     scratch: Scratch,
 }
 
 impl ScratchPool {
-    fn take(&self) -> ScratchLoan<'_> {
+    pub(crate) fn take(&self) -> ScratchLoan<'_> {
         let scratch = self.0.lock().ok().and_then(|mut pool| pool.pop());
         ScratchLoan {
             pool: self,

@@ -11,8 +11,11 @@ use std::net::SocketAddr;
 
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
+use super::data_channel::{bundled_mids, locate_audio, mid_of};
 use super::floor::split_lines;
-use super::{addrtype, parse_connection_addr, EngineMedia, MediaDirection, CRLF};
+use super::{
+    addrtype, parse_connection_addr, EngineMedia, Fingerprint, MediaDirection, Setup, CRLF,
+};
 
 /// Whether `line` is a live (non-zero port) video `m=` line.
 fn is_live_video(line: &str) -> bool {
@@ -105,6 +108,26 @@ pub struct VideoStream {
     /// The keyable `a=crypto` lines of the section, in order (RFC 4568 §5.1.2: the first is the one
     /// accepted). A line whose suite the SRTP context does not run is skipped (RFC 4568 §7.1.1).
     pub crypto: Vec<CryptoAttribute>,
+    /// The section's `a=mid` (RFC 5888 §4).
+    pub mid: Option<String>,
+    /// The section and the first live audio section are in one `a=group:BUNDLE` line (RFC 8843 §7.2),
+    /// so the stream rides the audio's transport: its port, its ICE and its DTLS association.
+    pub bundled: bool,
+    /// The first live audio section's `a=mid`, which the bundle's answer must carry too.
+    pub audio_mid: Option<String>,
+    /// A payload type of the video `m=` line is also the audio's: inside a bundle the two could not be
+    /// told apart (RFC 8843 §9.2).
+    pub payload_collision: bool,
+    /// The payload types of the `m=` line, which tell the stream's RTP from the audio's inside a
+    /// bundle (RFC 8843 §9.2: a payload type is unique across the bundle).
+    pub payload_types: Vec<u8>,
+    /// The DTLS certificate fingerprint of the section, else the session's (RFC 8122 §5).
+    pub fingerprint: Option<Fingerprint>,
+    /// The `a=setup` role of the section, else the session's (RFC 4145 §4, RFC 5763 §5).
+    pub setup: Option<Setup>,
+    /// The section carries ICE of its own (`a=ice-ufrag` or `a=candidate`), or the session's ICE
+    /// applies to it (RFC 8839 §4): with no bundle, ICE would run per `m=` line.
+    pub ice: bool,
 }
 
 impl VideoStream {
@@ -244,6 +267,46 @@ pub fn parse_video_stream(sdp: &str) -> Option<VideoStream> {
         .iter()
         .filter_map(|line| CryptoAttribute::parse_keyable(line.strip_prefix("a=")?))
         .collect();
+    let mid = mid_of(&lines, start, end);
+    // RFC 8843 §7.2: bundled when one `a=group:BUNDLE` line names this section's mid and the audio's.
+    let bundled = mid.as_deref().is_some_and(|video_mid| {
+        let audio_mid = locate_audio(&lines).and_then(|(from, to)| mid_of(&lines, from, to));
+        let group = bundled_mids(&lines);
+        audio_mid.is_some_and(|audio_mid| {
+            group.contains(&video_mid) && group.contains(&audio_mid.as_str())
+        })
+    });
+    let audio_section = locate_audio(&lines);
+    let audio_mid = audio_section.and_then(|(from, to)| mid_of(&lines, from, to));
+    let payload_types: Vec<u8> = lines[start]
+        .split_whitespace()
+        .skip(3)
+        .filter_map(|field| field.parse().ok())
+        .collect();
+    let payload_collision = audio_section.is_some_and(|(from, _)| {
+        lines[from]
+            .split_whitespace()
+            .skip(3)
+            .filter_map(|field| field.parse::<u8>().ok())
+            .any(|number| payload_types.contains(&number))
+    });
+    // RFC 8122 §5, RFC 4145 §4: the section's own attribute, else the session's.
+    let attribute = |name: &str| {
+        section
+            .iter()
+            .find_map(|line| line.strip_prefix(name))
+            .or_else(|| {
+                lines[..first_media]
+                    .iter()
+                    .find_map(|line| line.strip_prefix(name))
+            })
+    };
+    let fingerprint = attribute("a=fingerprint:")
+        .and_then(|value| Fingerprint::parse(&format!("fingerprint:{value}")));
+    let setup = attribute("a=setup:").and_then(|value| Setup::parse(&format!("setup:{value}")));
+    // RFC 8839 §4: ICE credentials at the session level apply to every `m=` line.
+    let ice = attribute("a=ice-ufrag:").is_some()
+        || section.iter().any(|line| line.starts_with("a=candidate:"));
     Some(VideoStream {
         remote_rtp: SocketAddr::new(address, port),
         remote_rtcp: SocketAddr::new(address, rtcp_port),
@@ -251,22 +314,49 @@ pub fn parse_video_stream(sdp: &str) -> Option<VideoStream> {
         rtcp_mux,
         transport,
         crypto,
+        mid,
+        bundled,
+        audio_mid,
+        payload_collision,
+        payload_types,
+        fingerprint,
+        setup,
+        ice,
     })
 }
 
 /// How the anchored video section is keyed toward the party it is presented to.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum VideoKeying {
     /// Plain RTP: the transport is written as `RTP/AVP[F]` and the peer's `a=crypto` is dropped.
     Plain,
     /// SDES-SRTP (RFC 4568): the transport is written as `RTP/SAVP[F]`, the peer's `a=crypto` is
     /// dropped and this key, the engine's own for the leg, is advertised in its place.
     Sdes(CryptoAttribute),
+    /// DTLS-SRTP on an association of the video endpoint's own (RFC 5764): the transport is written
+    /// as `UDP/TLS/RTP/SAVP[F]`, the peer's `a=fingerprint`, `a=setup` and `a=tls-id` are dropped and
+    /// the engine's own fingerprint and role are advertised in their place (RFC 5763 §5).
+    Dtls {
+        /// The engine certificate's fingerprint (`a=fingerprint`, RFC 8122).
+        fingerprint: Fingerprint,
+        /// The engine's DTLS role for the section (`a=setup`).
+        setup: Setup,
+    },
+    /// DTLS-SRTP on the transport the party's audio already runs (RFC 8843): the section takes the
+    /// audio's port and connection, carries no transport attribute of its own (the audio section's
+    /// fingerprint, `a=setup` and ICE are the bundle's, RFC 8843 §7.3), keeps its `a=mid` and joins
+    /// the `a=group:BUNDLE` line.
+    Bundled {
+        /// The party's audio section `a=mid`.
+        audio_mid: String,
+        /// The party's video section `a=mid`.
+        video_mid: String,
+    },
 }
 
 /// How a presented SDP treats its video stream, beside [`super::TextRewrite`] and
 /// [`super::ImageRewrite`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum VideoRewrite {
     /// Leave the section as it arrived (the two parties exchange video directly).
     #[default]
@@ -297,7 +387,7 @@ impl VideoRewrite {
 
 /// `line`, an `m=` line, with its transport profile written for `keying`: `RTP/SAVP[F]` for SDES,
 /// `RTP/AVP[F]` for plain, keeping the feedback `F` of the original (RFC 4585 §4.2).
-fn with_transport(line: &str, keying: VideoKeying) -> String {
+fn with_transport(line: &str, keying: &VideoKeying) -> String {
     line.split(' ')
         .enumerate()
         .map(|(position, field)| {
@@ -308,6 +398,13 @@ fn with_transport(line: &str, keying: VideoKeying) -> String {
             let profile = match (keying, feedback) {
                 (VideoKeying::Plain, false) => "RTP/AVP",
                 (VideoKeying::Plain, true) => "RTP/AVPF",
+                // RFC 5764 §8: the DTLS-SRTP transport profiles.
+                (VideoKeying::Dtls { .. } | VideoKeying::Bundled { .. }, false) => {
+                    "UDP/TLS/RTP/SAVP"
+                }
+                (VideoKeying::Dtls { .. } | VideoKeying::Bundled { .. }, true) => {
+                    "UDP/TLS/RTP/SAVPF"
+                }
                 (VideoKeying::Sdes(_), false) => "RTP/SAVP",
                 (VideoKeying::Sdes(_), true) => "RTP/SAVPF",
             };
@@ -385,8 +482,16 @@ pub fn anchor_video(sdp: &str, engine: EngineMedia, keying: VideoKeying) -> Stri
             }
         }
         // RFC 4568 §5.1: the engine's own key for the leg, advertised in place of the peer's.
-        if let VideoKeying::Sdes(crypto) = keying {
-            out.push(format!("a={}", crypto.to_attribute_value()));
+        match &keying {
+            VideoKeying::Sdes(crypto) => out.push(format!("a={}", crypto.to_attribute_value())),
+            // RFC 5763 §5: the engine's own fingerprint and role for the section's association.
+            VideoKeying::Dtls { fingerprint, setup } => {
+                out.push(format!("a={}", fingerprint.to_attribute_value()));
+                out.push(format!("a=setup:{}", setup.token()));
+            }
+            // RFC 5888 §4: the mid the party offered, echoed.
+            VideoKeying::Bundled { video_mid, .. } => out.push(format!("a=mid:{video_mid}")),
+            VideoKeying::Plain => {}
         }
     };
     for (index, line) in lines.iter().enumerate() {
@@ -398,7 +503,7 @@ pub fn anchor_video(sdp: &str, engine: EngineMedia, keying: VideoKeying) -> Stri
             if Some(index) == first.map(|(start, _, _)| start) {
                 in_anchored = true;
                 pending_connection = true;
-                out.push(with_transport(&with_port(line, engine.rtp.port()), keying));
+                out.push(with_transport(&with_port(line, engine.rtp.port()), &keying));
             } else if is_live_video(line) {
                 out.push(with_port(line, 0));
             } else {
@@ -411,9 +516,16 @@ pub fn anchor_video(sdp: &str, engine: EngineMedia, keying: VideoKeying) -> Stri
                 flush_connection(&mut out);
                 pending_connection = false;
             }
+            // The peer's own keying never describes the engine's: its SDES key, and its DTLS
+            // fingerprint, role and association id (RFC 8842 §4). A bundled section's mid is written
+            // by the keying, as it is the party's own.
             if line.starts_with("c=")
                 || line.starts_with("a=rtcp:")
                 || line.starts_with("a=crypto:")
+                || line.starts_with("a=fingerprint:")
+                || line.starts_with("a=setup:")
+                || line.starts_with("a=tls-id:")
+                || (matches!(keying, VideoKeying::Bundled { .. }) && line.starts_with("a=mid:"))
                 || is_peer_transport_attribute(line)
             {
                 continue;
@@ -433,7 +545,100 @@ pub fn anchor_video(sdp: &str, engine: EngineMedia, keying: VideoKeying) -> Stri
             out.push(String::new());
         }
     }
+    let anchored = out.join(CRLF);
+    match keying {
+        VideoKeying::Bundled {
+            audio_mid,
+            video_mid,
+        } => join_bundle(&anchored, &audio_mid, &video_mid),
+        _ => match first.and_then(|(start, end, _)| mid_of(&lines, start, end)) {
+            Some(video_mid) => leave_bundle(&anchored, &video_mid),
+            None => anchored,
+        },
+    }
+}
+
+/// `sdp` with `video_mid` in its `a=group:BUNDLE` line beside `audio_mid`, the group written when it
+/// has none, and the audio section's `a=mid` written when it has none (RFC 8843 §7.3: an answer's
+/// group names the mids the offer carried, and every bundled section has its mid, RFC 5888 §4).
+fn join_bundle(sdp: &str, audio_mid: &str, video_mid: &str) -> String {
+    let lines = split_lines(sdp);
+    let Some((audio_start, audio_end)) = locate_audio(&lines) else {
+        return sdp.to_string();
+    };
+    let first_media = lines
+        .iter()
+        .position(|line| line.starts_with("m="))
+        .unwrap_or(lines.len());
+    let group_at = lines[..first_media]
+        .iter()
+        .position(|line| line.starts_with("a=group:BUNDLE"));
+    let has_audio_mid = mid_of(&lines, audio_start, audio_end).is_some();
+    // The audio section's `a=mid` ends its attributes, before the empty remainder of an SDP that ends
+    // in CRLF.
+    let mut mid_at = audio_end;
+    while mid_at > audio_start + 1 && lines[mid_at - 1].is_empty() {
+        mid_at -= 1;
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
+    for (index, line) in lines.iter().enumerate() {
+        if index == mid_at && !has_audio_mid {
+            out.push(format!("a=mid:{audio_mid}"));
+        }
+        if Some(index) == group_at {
+            let mut mids: Vec<&str> = line["a=group:BUNDLE".len()..].split_whitespace().collect();
+            for wanted in [audio_mid, video_mid] {
+                if !mids.contains(&wanted) {
+                    mids.push(wanted);
+                }
+            }
+            out.push(format!("a=group:BUNDLE {}", mids.join(" ")));
+            continue;
+        }
+        if group_at.is_none() && index == first_media {
+            out.push(format!("a=group:BUNDLE {audio_mid} {video_mid}"));
+        }
+        out.push((*line).to_string());
+    }
     out.join(CRLF)
+}
+
+/// `sdp` with `video_mid` out of its `a=group:BUNDLE` lines: the video section now travels on a
+/// transport of its own, which the offerer's group would deny (RFC 8843 §7.3.3). A group left with
+/// one mid or none is dropped.
+fn leave_bundle(sdp: &str, video_mid: &str) -> String {
+    let lines = split_lines(sdp);
+    let first_media = lines
+        .iter()
+        .position(|line| line.starts_with("m="))
+        .unwrap_or(lines.len());
+    let mut changed = false;
+    let kept: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let Some(group) = line
+                .strip_prefix("a=group:BUNDLE")
+                .filter(|_| index < first_media)
+            else {
+                return Some((*line).to_string());
+            };
+            let mids: Vec<&str> = group
+                .split_whitespace()
+                .filter(|mid| *mid != video_mid)
+                .collect();
+            if mids.len() == group.split_whitespace().count() {
+                return Some((*line).to_string());
+            }
+            changed = true;
+            (mids.len() > 1).then(|| format!("a=group:BUNDLE {}", mids.join(" ")))
+        })
+        .collect();
+    if changed {
+        kept.join(CRLF)
+    } else {
+        sdp.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -792,6 +997,275 @@ mod connection_tests {
         assert_eq!(
             keep_passthrough_connection(&declined, &rewritten),
             rewritten
+        );
+    }
+}
+
+#[cfg(test)]
+mod dtls_tests {
+    use super::*;
+    use crate::sdp::{rewrite, IceRewrite, ImageRewrite, SecurityAdvertisement, TextRewrite};
+
+    /// A browser-shaped offer: audio and video bundled on one transport (RFC 8843), ICE and DTLS on
+    /// both sections.
+    const BUNDLED_OFFER: &str = concat!(
+        "v=0\r\n",
+        "o=- 1 1 IN IP4 192.0.2.10\r\n",
+        "s=-\r\n",
+        "t=0 0\r\n",
+        "a=group:BUNDLE 0 1\r\n",
+        "m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n",
+        "c=IN IP4 192.0.2.10\r\n",
+        "a=mid:0\r\n",
+        "a=ice-ufrag:abcd\r\n",
+        "a=ice-pwd:efghefghefghefghefghefgh\r\n",
+        "a=fingerprint:sha-256 AA:BB:CC:DD\r\n",
+        "a=setup:actpass\r\n",
+        "a=rtcp-mux\r\n",
+        "a=rtpmap:0 PCMU/8000\r\n",
+        "m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n",
+        "c=IN IP4 192.0.2.10\r\n",
+        "a=mid:1\r\n",
+        "a=ice-ufrag:abcd\r\n",
+        "a=ice-pwd:efghefghefghefghefghefgh\r\n",
+        "a=fingerprint:sha-256 AA:BB:CC:DD\r\n",
+        "a=setup:actpass\r\n",
+        "a=rtcp-mux\r\n",
+        "a=rtpmap:96 H264/90000\r\n",
+        "a=rtpmap:97 rtx/90000\r\n",
+        "a=fmtp:97 apt=96\r\n",
+        "a=sendrecv\r\n",
+    );
+
+    /// The same shape with no bundle and no ICE: a phone with DTLS-SRTP on a port of its own per stream.
+    const UNBUNDLED_OFFER: &str = concat!(
+        "v=0\r\n",
+        "o=- 1 1 IN IP4 192.0.2.10\r\n",
+        "s=-\r\n",
+        "c=IN IP4 192.0.2.10\r\n",
+        "t=0 0\r\n",
+        "m=audio 20100 UDP/TLS/RTP/SAVPF 0\r\n",
+        "a=fingerprint:sha-256 AA:BB:CC:DD\r\n",
+        "a=setup:actpass\r\n",
+        "a=rtcp-mux\r\n",
+        "m=video 6000 UDP/TLS/RTP/SAVPF 96\r\n",
+        "a=fingerprint:sha-256 EE:FF:00:11\r\n",
+        "a=setup:actpass\r\n",
+        "a=rtcp-mux\r\n",
+        "a=rtpmap:96 H264/90000\r\n",
+    );
+
+    fn engine_fingerprint() -> Fingerprint {
+        Fingerprint {
+            hash_function: "sha-256".to_string(),
+            bytes: vec![0x11, 0x22, 0x33, 0x44],
+        }
+    }
+
+    fn engine_audio() -> EngineMedia {
+        EngineMedia::new("198.51.100.5:40000".parse().expect("addr"), None)
+    }
+
+    fn lines(sdp: &str) -> Vec<&str> {
+        sdp.split("\r\n").collect()
+    }
+
+    fn section<'a>(sdp: &'a str, kind: &str) -> Vec<&'a str> {
+        let all = lines(sdp);
+        let prefix = format!("m={kind} ");
+        let start = all.iter().position(|line| line.starts_with(&prefix));
+        let Some(start) = start else {
+            return Vec::new();
+        };
+        let end = all[start + 1..]
+            .iter()
+            .position(|line| line.starts_with("m="))
+            .map_or(all.len(), |offset| start + 1 + offset);
+        all[start..end].to_vec()
+    }
+
+    #[test]
+    fn a_bundled_video_section_is_read_with_its_mid_payload_types_and_transport_state() {
+        let stream = parse_video_stream(BUNDLED_OFFER).expect("video");
+        assert!(stream.is_dtls());
+        assert!(stream.bundled, "mids 0 and 1 are in one BUNDLE group");
+        assert_eq!(stream.mid.as_deref(), Some("1"));
+        assert_eq!(stream.payload_types, vec![96, 97]);
+        assert_eq!(stream.setup, Some(Setup::Actpass));
+        assert_eq!(
+            stream.fingerprint.as_ref().map(|print| print.bytes.clone()),
+            Some(vec![0xAA, 0xBB, 0xCC, 0xDD])
+        );
+        assert!(stream.ice);
+    }
+
+    #[test]
+    fn a_video_section_left_out_of_the_bundle_group_is_not_bundled() {
+        let offer = BUNDLED_OFFER.replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0");
+        let stream = parse_video_stream(&offer).expect("video");
+        assert!(!stream.bundled);
+        assert!(stream.ice, "unbundled with ICE is what the engine declines");
+    }
+
+    #[test]
+    fn an_unbundled_phone_carries_its_own_fingerprint_and_no_ice() {
+        let stream = parse_video_stream(UNBUNDLED_OFFER).expect("video");
+        assert!(stream.is_dtls() && !stream.bundled && !stream.ice);
+        assert_eq!(
+            stream.fingerprint.as_ref().map(|print| print.bytes.clone()),
+            Some(vec![0xEE, 0xFF, 0x00, 0x11]),
+            "the section's own fingerprint wins over the audio's"
+        );
+    }
+
+    #[test]
+    fn the_session_level_fingerprint_and_setup_apply_to_a_section_without_its_own() {
+        let offer = concat!(
+            "v=0\r\nc=IN IP4 192.0.2.10\r\na=fingerprint:sha-256 AA:BB\r\na=setup:passive\r\nt=0 0\r\n",
+            "m=video 6000 UDP/TLS/RTP/SAVPF 96\r\n",
+        );
+        let stream = parse_video_stream(offer).expect("video");
+        assert_eq!(stream.setup, Some(Setup::Passive));
+        assert!(stream.fingerprint.is_some());
+    }
+
+    #[test]
+    fn the_answer_to_a_bundled_party_keeps_the_group_and_mids_and_writes_the_engines_fingerprint_once(
+    ) {
+        // What the engine presents the DTLS party: the audio section the audio rewrite wrote (the
+        // engine's own fingerprint and role), built from the callee's plain answer, and that answer's
+        // video section, which the video pass then anchors on the audio's transport.
+        let callee_answer = concat!(
+            "v=0\r\no=- 1 1 IN IP4 192.0.2.20\r\ns=-\r\nc=IN IP4 192.0.2.20\r\nt=0 0\r\n",
+            "m=audio 30000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+            "m=video 30002 RTP/AVPF 96\r\na=rtpmap:96 H264/90000\r\na=rtcp-mux\r\na=sendrecv\r\n",
+        );
+        let audio = rewrite(
+            callee_answer,
+            engine_audio(),
+            IceRewrite::Keep,
+            Some(SecurityAdvertisement::Dtls {
+                fingerprint: engine_fingerprint(),
+                setup: Setup::Active,
+                tls_id: None,
+            }),
+            None,
+            TextRewrite::None,
+            ImageRewrite::None,
+        )
+        .expect("rewrite")
+        .sdp;
+        let presented = VideoRewrite::Anchor {
+            engine: engine_audio(),
+            keying: VideoKeying::Bundled {
+                audio_mid: "0".to_string(),
+                video_mid: "1".to_string(),
+            },
+        }
+        .apply(&audio);
+        let all = lines(&presented);
+        let first_media = all
+            .iter()
+            .position(|line| line.starts_with("m="))
+            .expect("m=");
+        assert!(
+            all[..first_media].contains(&"a=group:BUNDLE 0 1"),
+            "{presented}"
+        );
+        let audio_section = section(&presented, "audio");
+        assert!(audio_section.contains(&"a=mid:0"), "{presented}");
+        let video_section = section(&presented, "video");
+        assert_eq!(
+            video_section[0], "m=video 40000 UDP/TLS/RTP/SAVPF 96",
+            "the audio's port and the DTLS profile: {presented}"
+        );
+        assert!(video_section.contains(&"a=mid:1"), "{presented}");
+        assert!(video_section.contains(&"c=IN IP4 198.51.100.5"));
+        assert!(
+            !video_section
+                .iter()
+                .any(|line| line.starts_with("a=fingerprint:")
+                    || line.starts_with("a=setup:")
+                    || line.starts_with("a=ice-")),
+            "a bundled section carries no transport attribute of its own: {presented}"
+        );
+        assert_eq!(
+            all.iter()
+                .filter(|line| line.starts_with("a=fingerprint:"))
+                .count(),
+            1,
+            "the engine's fingerprint is written once: {presented}"
+        );
+        assert_eq!(
+            all.iter()
+                .filter(|line| line.starts_with("a=setup:"))
+                .count(),
+            1,
+            "{presented}"
+        );
+    }
+
+    #[test]
+    fn presenting_a_bundled_offer_to_a_plain_party_leaves_the_bundle_and_the_dtls_lines_behind() {
+        let anchored = anchor_video(
+            BUNDLED_OFFER,
+            EngineMedia::new("198.51.100.5:30002".parse().expect("addr"), None),
+            VideoKeying::Plain,
+        );
+        assert!(
+            !anchored.contains("a=group:BUNDLE"),
+            "the video leaves the group and a group of one is dropped: {anchored}"
+        );
+        let video_section = section(&anchored, "video");
+        assert_eq!(
+            video_section[0], "m=video 30002 RTP/AVPF 96 97",
+            "{anchored}"
+        );
+        assert!(
+            !video_section
+                .iter()
+                .any(|line| line.starts_with("a=fingerprint:")
+                    || line.starts_with("a=setup:")
+                    || line.starts_with("a=ice-")),
+            "{anchored}"
+        );
+        assert!(video_section.contains(&"a=mid:1"), "mids stay (RFC 5888)");
+    }
+
+    #[test]
+    fn an_unbundled_dtls_section_gets_its_own_setup_and_fingerprint() {
+        let anchored = anchor_video(
+            UNBUNDLED_OFFER,
+            EngineMedia::new("198.51.100.5:30002".parse().expect("addr"), None),
+            VideoKeying::Dtls {
+                fingerprint: engine_fingerprint(),
+                setup: Setup::Passive,
+            },
+        );
+        let video_section = section(&anchored, "video");
+        assert_eq!(
+            video_section[0], "m=video 30002 UDP/TLS/RTP/SAVPF 96",
+            "{anchored}"
+        );
+        assert_eq!(
+            video_section
+                .iter()
+                .filter(|line| line.starts_with("a=fingerprint:"))
+                .collect::<Vec<_>>(),
+            vec![&"a=fingerprint:sha-256 11:22:33:44"],
+            "the engine's, once, not the phone's: {anchored}"
+        );
+        assert_eq!(
+            video_section
+                .iter()
+                .filter(|line| line.starts_with("a=setup:"))
+                .collect::<Vec<_>>(),
+            vec![&"a=setup:passive"],
+            "{anchored}"
+        );
+        assert!(
+            section(&anchored, "audio").contains(&"a=fingerprint:sha-256 AA:BB:CC:DD"),
+            "the audio section is not this pass's to touch"
         );
     }
 }
