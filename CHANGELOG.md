@@ -20,6 +20,24 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   `profile-level-id` joins audio-only with the reason in `video_declined`, and a malformed
   `profile-level-id` in `video.fmtp` is refused. `node_info` lists `forward_video_h264`.
 
+### Fixed
+
+- **Lawful-interception X3 delivery no longer ends at the first re-offer.** The taps lived in the
+  media pipeline, so the answer to a hold, resume or session refresh dropped them and the delivery
+  was reported ended with `call_ended` while the call went on. The interception now belongs to the
+  call: its tap factory, delivery connection, Correlation ID and PDU sequence counter outlive every
+  pipeline rebuild, and the taps are re-installed on the new path. `call_ended` is emitted only when
+  the call is deleted.
+- **Re-attaching X3 on a live interception delivered nothing.** The replaced session was stopped
+  after the new taps were installed, which removed them. It is now stopped first.
+- **The X3 PDU Timestamp tracks real time on every datapath.** It was derived from the datapath
+  receive clock, which on the UDP-loopback backend advances 20 ms per wall second, so seven seconds
+  of traffic were stamped within 140 ms. It is now the wall-clock interception time (TS 103 221-2
+  §5.3).
+- **X3 PDUs omit the optional Network Function ID and Interception Point ID when unset.** They were
+  sent as zero-length attributes, which Wireshark's `li5g` shows as missing. Both are optional in
+  TS 103 221-2, so nothing is written for an empty value.
+
 ## [0.23.0] — 2026-11-18
 
 ### Added

@@ -107,6 +107,15 @@ was. A plain in-kernel relay is promoted to the userspace path for the intercept
 demoted afterwards — relay-only, so an intercepted call is not forced into a transcode it did not
 otherwise need.
 
+The interception belongs to the **call**, not to one negotiation of it. A re-offer and its answer (a
+hold, a resume, a session refresh carrying SDP) rebuild the call's media path, and the taps are put
+back on the new one: same delivery connection, same Correlation ID, sequence counter unbroken, no
+`x3_ended`. `x3_ended` with `call_ended` is emitted only when the call is deleted; a controller's
+`detach_x3` or a second `attach_x3` ends the interception with `detached`. Should the taps ever fail
+to be re-installed, the interception ends with `transport_error` rather than staying attached and
+silent. A re-offer that changes the negotiated codec is refused by the engine, so that case does not
+arise.
+
 ### Events
 
 | Event | Meaning |
@@ -151,9 +160,10 @@ reportable failure, not a degraded recording.
   one connection, that is not possible here by construction: X2 originates in a different process.
 - Sequence numbers (conditional attribute 8) are per **connection** and reset on reconnect, as the
   specification defines them.
-- Timestamps (attribute 9) are absolute Unix time. The engine anchors the wall clock once per
-  interception and derives the rest from the datapath receive clock, so inter-packet spacing stays
-  exact while the timeline is absolute.
+- Timestamps (attribute 9) are the wall-clock time the tap saw the packet (TS 103 221-2 §5.3), read
+  per packet on every datapath backend. The datapath's own receive clock is not used: on the
+  UDP-loopback backend it is logical and does not track time. A wall-clock step backwards repeats a
+  timestamp rather than reordering the stream.
 - Nothing about the intercepted media is ever logged. Log lines carry the call id, the delivery
   address and the task id, which are what an audit needs.
 

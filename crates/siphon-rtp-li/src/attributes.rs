@@ -111,13 +111,21 @@ impl<'a> AttributeWriter<'a> {
         self.raw(attribute_type, value.as_bytes())
     }
 
-    /// Network Function ID (type 6) — which network element produced this PDU.
+    /// Network Function ID (type 6) — which network element produced this PDU. Optional in
+    /// TS 103 221-2, so an empty value writes nothing rather than a zero-length attribute.
     pub fn network_function_id(&mut self, value: &str) -> &mut Self {
+        if value.is_empty() {
+            return self;
+        }
         self.text(attribute_type::NETWORK_FUNCTION_ID, value)
     }
 
-    /// Interception Point ID (type 7) — where in that element the intercept was taken.
+    /// Interception Point ID (type 7) — where in that element the intercept was taken. Optional in
+    /// TS 103 221-2, so an empty value writes nothing rather than a zero-length attribute.
     pub fn interception_point_id(&mut self, value: &str) -> &mut Self {
+        if value.is_empty() {
+            return self;
+        }
         self.text(attribute_type::INTERCEPTION_POINT_ID, value)
     }
 
@@ -271,6 +279,31 @@ mod tests {
         assert_eq!(
             buffer,
             &[0x00, 0x06, 0x00, 0x06, b's', b'b', b'c', b'-', b'0', b'1'],
+        );
+    }
+
+    #[test]
+    fn an_empty_optional_text_attribute_is_omitted_not_sent_with_length_zero() {
+        // TS 103 221-2 makes the Network Function ID and Interception Point ID optional. A
+        // zero-length TLV is not "absent": a dissector shows it as missing and a strict Mediation
+        // Function may reject it.
+        let mut buffer = Vec::new();
+        AttributeWriter::new(&mut buffer)
+            .network_function_id("")
+            .interception_point_id("");
+        assert!(buffer.is_empty(), "nothing is written for an empty value");
+    }
+
+    #[test]
+    fn a_present_interception_point_id_carries_its_exact_length() {
+        let mut buffer = Vec::new();
+        AttributeWriter::new(&mut buffer)
+            .network_function_id("")
+            .interception_point_id("relay-a");
+        assert_eq!(
+            buffer,
+            &[0x00, 0x07, 0x00, 0x07, b'r', b'e', b'l', b'a', b'y', b'-', b'a'],
+            "only attribute 7, length 7"
         );
     }
 

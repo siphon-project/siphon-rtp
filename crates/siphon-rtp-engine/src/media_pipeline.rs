@@ -2190,7 +2190,7 @@ impl Direction {
         // covered without being forced into a transcode. RTCP is filtered inside the tap (a PDU
         // declares payload format 8, "RTP packet").
         if let Some(x3) = &self.x3 {
-            x3.deliver(source, arrival_micros, data);
+            x3.deliver(source, data);
         }
 
         // Telemetry: the party's RTCP, as plaintext, for the HEP export. A leg carried here never
@@ -10717,7 +10717,6 @@ mod tests {
             addr("127.0.0.1:10000"),
             "leg A's engine-local address"
         );
-        assert_eq!(delivered.arrival_micros, 123_456);
     }
 
     #[test]

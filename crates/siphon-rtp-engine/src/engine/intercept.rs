@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::media_pipeline::MediaControl;
 use crate::x3::{
     build_tls_client_config, ingress_directions, run_x3_delivery, split_delivery_address,
-    x3_channel, X3Config, X3Counters, X3DeliveryEnd, X3DeliveryTask, X3Error,
+    x3_channel, X3Config, X3Counters, X3DeliveryEnd, X3DeliveryTask, X3Error, X3TapFactory,
 };
 
 use super::{
@@ -25,6 +25,13 @@ pub(super) struct X3Session {
     /// Endpoints carrying a crypto-bridge tap, so detach clears exactly those. Empty for a call
     /// tapped in the media pipeline instead.
     bridged_endpoints: Vec<EndpointId>,
+    /// Builds the taps over this interception's one delivery channel. Held by the session, not by
+    /// one pipeline: the interception belongs to the call, so the channel (and with it the delivery
+    /// connection, the Correlation ID and the PDU sequence counter) outlives every pipeline or
+    /// bridge the call is rebuilt with, and the taps are simply installed again on the new one.
+    factory: X3TapFactory,
+    /// Whether the warrant names the caller leg, which fixes each tap's target-relative direction.
+    target_is_caller: bool,
     /// Delivered/dropped counts, read at teardown for [`Event::X3Ended`]. Shared with the taps.
     counters: Arc<X3Counters>,
     /// The delivery task (connect → drain → reconnect). Aborted on detach; it ends on its own when
@@ -97,24 +104,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Validate the delivery address before promoting or dialling anything.
         split_delivery_address(delivery).map_err(|error| error.to_string())?;
 
-        let Some((pipeline, a_local, b_local, a_endpoint, b_endpoint, echo, two_leg)) = self
-            .owned_call_internal(call_id, |call| {
-                let caller = call.caller_leg();
-                (
-                    call.pipeline,
-                    call.near.rtp.local_addr,
-                    call.far
-                        .as_ref()
-                        .map_or(caller.rtp.local_addr, |far| far.rtp.local_addr),
-                    call.near.rtp.id,
-                    call.far.as_ref().map(|far| far.rtp.id),
-                    call.promotion_reasons.contains(&PromotionReason::Echo),
-                    call.far
-                        .as_ref()
-                        .is_some_and(|far| far.remote_rtp.is_some()),
-                )
-            })
-        else {
+        let Some((pipeline, echo, two_leg)) = self.owned_call_internal(call_id, |call| {
+            (
+                call.pipeline,
+                call.promotion_reasons.contains(&PromotionReason::Echo),
+                call.far
+                    .as_ref()
+                    .is_some_and(|far| far.remote_rtp.is_some()),
+            )
+        }) else {
             return Err("call no longer exists".to_string());
         };
 
@@ -141,86 +139,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Build the delivery TLS once, before anything is installed: bad PKI must fail here rather
         // than leave an interception attached to a connection that can never come up.
-        let tls = self.x3_tls_client_config(&config)?;
+        let tls = self.x3_tls_config_for(&config)?;
 
-        let (factory, delivery_channel) = x3_channel(config.buffer_packets);
-        // §5.2.6 is target-relative, and only the warrant knows which leg is the target.
-        let (direction_a, direction_b) =
-            ingress_directions(matches!(target_leg, X3TargetLeg::Caller));
-        let tap_a = factory.tap(a_local, direction_a);
-        let tap_b = factory.tap(b_local, direction_b);
-
-        // Install the taps wherever this call's accepted plaintext actually lives.
-        let mut bridged_endpoints = Vec::new();
-        match pipeline {
-            // The dispatch already refuses this verb on a seated call; said again here so the
-            // interception can never be reported attached to a leg whose media the room owns.
-            PipelineKind::Seated => {
-                return Err(
-                    "the call's leg is seated in a conference room; intercept the room's \
-                     participants instead"
-                        .to_string(),
-                );
-            }
-            // A crypto bridge relays without decoding, so its media never reaches the pipeline. This
-            // is the ordinary same-codec WebRTC / SDES shape, so it is a tap site rather than a
-            // rejection — a warrant has to be servable on any call.
-            // A terminated DTLS offerer taps the same way: each tap sits on its own party's ingress
-            // endpoint, and the bridge hands it the plaintext side of that endpoint's transform.
-            // A **transcrypt** belongs here for the same reason and needs it most: both sides of the
-            // wire are ciphertext, so the intermediate plaintext the bridge taps is the only place
-            // the content exists in the clear anywhere in the engine.
-            //
-            // `SrtpTranscryptMedia` is deliberately **not** here: it is a media pipeline, so its
-            // plaintext reaches the actor and it taps with the other media shapes below. Putting it
-            // here would install a tap on a bridge that call does not have, and the warrant would
-            // deliver nothing.
-            PipelineKind::Srtp
-            | PipelineKind::SrtpOfferer
-            | PipelineKind::SrtpTranscrypt
-            | PipelineKind::Dtls
-            | PipelineKind::DtlsOfferer => {
-                let Some(b_endpoint) = b_endpoint else {
-                    return Err("the call has no answered second leg to intercept".to_string());
-                };
-                if !self.bridge.set_x3_tap(a_endpoint, tap_a)
-                    || !self.bridge.set_x3_tap(b_endpoint, tap_b)
-                {
-                    self.bridge.clear_x3_tap(a_endpoint);
-                    self.bridge.clear_x3_tap(b_endpoint);
-                    return Err("the call's crypto bridge is no longer installed".to_string());
-                }
-                bridged_endpoints = vec![a_endpoint, b_endpoint];
-            }
-            // Everything else decodes (or at least relays) through the media pipeline, where the tap
-            // sits inside `Direction::handle` on the decrypted, authenticated slice. A plain relay is
-            // held in userspace for the interception's lifetime — relay-only, so an intercepted call
-            // is not forced into a transcode it did not need.
-            PipelineKind::Passthrough
-            | PipelineKind::Media
-            | PipelineKind::SrtpMedia
-            | PipelineKind::SrtpTranscryptMedia
-            | PipelineKind::SrtpOffererMedia
-            | PipelineKind::DtlsMedia
-            | PipelineKind::DtlsOffererMedia => {
-                self.hold_in_userspace(call_id, PromotionReason::X3, PromoteMode::RelayOnly)
-                    .await?;
-                if !self
-                    .media
-                    .control(call_id, MediaControl::StartX3(Box::new((tap_a, tap_b))))
-                {
-                    self.release_userspace_hold(call_id, PromotionReason::X3)
-                        .await;
-                    return Err("media actor unavailable".to_string());
-                }
-            }
-            PipelineKind::Ws => unreachable!("rejected above"),
-        }
-
-        // Replacing an existing interception: stop the old one first so its taps and task go away.
+        // Replacing an existing interception: stop the old one **first**. Doing it after the new
+        // taps were installed made its `StopX3` / `clear_x3_tap` remove the very taps just
+        // installed, so a re-attach ended at once with nothing delivered.
         if self.x3_sessions.contains_key(call_id) {
             self.stop_x3(call_id, X3EndReason::Detached).await;
         }
+
+        let (factory, delivery_channel) = x3_channel(config.buffer_packets);
+        let target_is_caller = matches!(target_leg, X3TargetLeg::Caller);
+        let bridged_endpoints = self
+            .install_x3_taps(call_id, &factory, target_is_caller)
+            .await?;
 
         let Some((owner, from_tag)) =
             self.owned_call_internal(call_id, |call| (call.owner, call.from_tag.clone()))
@@ -267,7 +199,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 })
                 .await;
                 let reason = match outcome {
-                    X3DeliveryEnd::SourceClosed => X3EndReason::CallEnded,
+                    // The session holds the tap factory for the life of the call, so the source
+                    // only closes once the session itself has been removed: a detach or a
+                    // replacement, never a pipeline being rebuilt. `CallEnded` is reserved for the
+                    // call really being torn down (`teardown_call` / `finish_call`).
+                    X3DeliveryEnd::SourceClosed => X3EndReason::Detached,
                     X3DeliveryEnd::MediationClosed => X3EndReason::MediationClosed,
                 };
                 emit_x3_ended(
@@ -287,6 +223,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag: from_tag.clone(),
                 owner,
                 bridged_endpoints,
+                factory,
+                target_is_caller,
                 counters,
                 transport,
                 ended,
@@ -313,6 +251,157 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             "lawful-interception content delivery attached"
         );
         Ok(())
+    }
+
+    /// Install `factory`'s taps wherever the call's accepted plaintext lives **now**, returning the
+    /// bridge endpoints that carry one (empty when the media pipeline does).
+    ///
+    /// Used at attach and again whenever the call's pipeline or bridge has been rebuilt
+    /// ([`Self::carry_x3_across_answer`]), so the two can never disagree about where a tap sits.
+    async fn install_x3_taps(
+        &self,
+        call_id: &str,
+        factory: &X3TapFactory,
+        target_is_caller: bool,
+    ) -> Result<Vec<EndpointId>, String> {
+        let Some((pipeline, a_local, b_local, a_endpoint, b_endpoint)) =
+            self.owned_call_internal(call_id, |call| {
+                let caller = call.caller_leg();
+                (
+                    call.pipeline,
+                    call.near.rtp.local_addr,
+                    call.far
+                        .as_ref()
+                        .map_or(caller.rtp.local_addr, |far| far.rtp.local_addr),
+                    call.near.rtp.id,
+                    call.far.as_ref().map(|far| far.rtp.id),
+                )
+            })
+        else {
+            return Err("call no longer exists".to_string());
+        };
+        // §5.2.6 is target-relative, and only the warrant knows which leg is the target.
+        let (direction_a, direction_b) = ingress_directions(target_is_caller);
+        let tap_a = factory.tap(a_local, direction_a);
+        let tap_b = factory.tap(b_local, direction_b);
+
+        match pipeline {
+            // The dispatch already refuses this verb on a seated call; said again here so the
+            // interception can never be reported attached to a leg whose media the room owns.
+            PipelineKind::Seated => Err(
+                "the call's leg is seated in a conference room; intercept the room's \
+                 participants instead"
+                    .to_string(),
+            ),
+            // A crypto bridge relays without decoding, so its media never reaches the pipeline. This
+            // is the ordinary same-codec WebRTC / SDES shape, so it is a tap site rather than a
+            // rejection — a warrant has to be servable on any call.
+            // A terminated DTLS offerer taps the same way: each tap sits on its own party's ingress
+            // endpoint, and the bridge hands it the plaintext side of that endpoint's transform.
+            // A **transcrypt** belongs here for the same reason and needs it most: both sides of the
+            // wire are ciphertext, so the intermediate plaintext the bridge taps is the only place
+            // the content exists in the clear anywhere in the engine.
+            //
+            // `SrtpTranscryptMedia` is deliberately **not** here: it is a media pipeline, so its
+            // plaintext reaches the actor and it taps with the other media shapes below.
+            PipelineKind::Srtp
+            | PipelineKind::SrtpOfferer
+            | PipelineKind::SrtpTranscrypt
+            | PipelineKind::Dtls
+            | PipelineKind::DtlsOfferer => {
+                let Some(b_endpoint) = b_endpoint else {
+                    return Err("the call has no answered second leg to intercept".to_string());
+                };
+                if !self.bridge.set_x3_tap(a_endpoint, tap_a)
+                    || !self.bridge.set_x3_tap(b_endpoint, tap_b)
+                {
+                    self.bridge.clear_x3_tap(a_endpoint);
+                    self.bridge.clear_x3_tap(b_endpoint);
+                    return Err("the call's crypto bridge is no longer installed".to_string());
+                }
+                // Not also in a pipeline actor, which would deliver everything twice.
+                self.media.control(call_id, MediaControl::StopX3);
+                Ok(vec![a_endpoint, b_endpoint])
+            }
+            // Everything else decodes (or at least relays) through the media pipeline, where the tap
+            // sits inside `Direction::handle` on the decrypted, authenticated slice. A plain relay is
+            // held in userspace for the interception's lifetime — relay-only, so an intercepted call
+            // is not forced into a transcode it did not need.
+            PipelineKind::Passthrough
+            | PipelineKind::Media
+            | PipelineKind::SrtpMedia
+            | PipelineKind::SrtpTranscryptMedia
+            | PipelineKind::SrtpOffererMedia
+            | PipelineKind::DtlsMedia
+            | PipelineKind::DtlsOffererMedia => {
+                self.hold_in_userspace(call_id, PromotionReason::X3, PromoteMode::RelayOnly)
+                    .await?;
+                if !self
+                    .media
+                    .control(call_id, MediaControl::StartX3(Box::new((tap_a, tap_b))))
+                {
+                    self.release_userspace_hold(call_id, PromotionReason::X3)
+                        .await;
+                    return Err("media actor unavailable".to_string());
+                }
+                Ok(Vec::new())
+            }
+            PipelineKind::Ws => Err(
+                "a WebSocket-takeover call (ws_uri) has no relayed second party to intercept"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Carry a live interception onto the media path an answer has just (re)installed.
+    ///
+    /// The answer to a re-offer (a hold, a resume, a session refresh) rebuilds the call's pipeline
+    /// or bridge, and the taps on the old one go with it. The interception belongs to the call, so
+    /// the session's own tap factory builds a fresh pair onto whatever carries the call now: same
+    /// delivery channel, same connection, same Correlation ID, sequence counter unbroken.
+    ///
+    /// A no-op on a call that is not intercepted. If the taps cannot be put back, the interception is
+    /// ended loudly (`x3_ended` with `transport_error`, the nearest reason there is) rather than left
+    /// attached and silent.
+    pub(super) async fn carry_x3_across_answer(&self, call_id: &str) {
+        let Some((factory, target_is_caller, previous)) =
+            self.x3_sessions.get(call_id).map(|session| {
+                (
+                    session.factory.clone(),
+                    session.target_is_caller,
+                    session.bridged_endpoints.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        match self
+            .install_x3_taps(call_id, &factory, target_is_caller)
+            .await
+        {
+            Ok(bridged) => {
+                // A bridge endpoint that no longer carries a tap must not keep a stale one.
+                for endpoint in previous
+                    .iter()
+                    .filter(|endpoint| !bridged.contains(endpoint))
+                {
+                    self.bridge.clear_x3_tap(*endpoint);
+                }
+                if let Some(mut session) = self.x3_sessions.get_mut(call_id) {
+                    session.bridged_endpoints = bridged;
+                }
+            }
+            Err(reason) => {
+                tracing::error!(
+                    target: "siphon_rtp::li",
+                    call_id,
+                    reason,
+                    "lawful-interception taps could not be carried onto the renegotiated media \
+                     path; ending the interception rather than leaving it silently deaf"
+                );
+                self.stop_x3(call_id, X3EndReason::TransportError).await;
+            }
+        }
     }
 
     /// `detach_x3`: stop lawful-interception content delivery. Idempotent — detaching a call that is
@@ -357,7 +446,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Build (once) the ring-backed mutual-TLS client configuration for X3 delivery.
-    fn x3_tls_client_config(&self, config: &X3Config) -> Result<Arc<rustls::ClientConfig>, String> {
+    fn x3_tls_config_for(&self, config: &X3Config) -> Result<Arc<rustls::ClientConfig>, String> {
         if let Some(built) = self.x3_tls_config.get() {
             return Ok(built.clone());
         }

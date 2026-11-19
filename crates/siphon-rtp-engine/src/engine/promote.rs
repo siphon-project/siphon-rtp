@@ -550,6 +550,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.carry_holds_across_answer(call_id).await;
             drop(pinned);
         }
+        // A lawful interception belongs to the call: put its taps on the path just installed.
+        self.carry_x3_across_answer(call_id).await;
         self.start_record_call_streams(call_id, profile).await;
         self.maybe_promote_text_for_events(call_id).await;
     }
