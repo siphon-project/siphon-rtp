@@ -14,12 +14,14 @@ use super::install::{AnswerIce, AnswerText, AnswerWiring, AnsweredText};
 use super::negotiate::{
     answer_gate_addresses, answer_ice_rewrite, cannot_bridge, describe_codec,
     far_received_from_hint, far_security, near_security, peer_ice_credentials, present_leg,
-    resolve_pipeline, same_codec, settle_secure_offerer, setup_for_role, CodecPresentation,
-    LegPresentation, NearDtlsAnswer,
+    same_codec, setup_for_role, CodecPresentation, LegPresentation, NearDtlsAnswer,
 };
 use super::takeover::AnswerTakeover;
+
+mod steps;
 use super::Leg;
 use super::{error_result, unknown_call, ClientId, Engine, Party, PipelineKind, PromotionReason};
+use steps::{AnswerFinish, AnsweredStreams};
 
 /// A's answer to a re-offer from B, as [`Engine::answer`] carries it: the far party's SDP (B's
 /// re-offer) drives the media wiring as B's answer usually does, A's answer SDP is what gets
@@ -1087,34 +1089,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        // Resolve how this call's media is carried — an SRTP bridge (secure far leg), the userspace
-        // media slow path (transcode / record), or the in-datapath plain relay — before the SDP is
-        // presented, because a transcoding call presents each party only its own codec.
-        let pipeline = match resolve_pipeline(
+        let (pipeline, near_dtls_settled) = match self.resolve_answer_pipeline(
             near_codec.as_ref(),
-            &info,
-            profile,
-            far_local_crypto,
-            near_local_crypto,
-            far_dtls,
-            near_dtls.is_some(),
+            (&info, profile, reversed.is_some()),
+            (far_local_crypto, near_local_crypto, far_dtls),
+            near_dtls.as_ref(),
         ) {
-            Ok(pipeline) => pipeline,
-            Err(reason) => {
-                return CmdResult::Error {
-                    reason: format!("answer: {reason}"),
-                }
-            }
-        };
-        // A secure offerer is terminated only where a pipeline carries its keying, and a terminated
-        // DTLS offerer is answered as A's DTLS peer (see `settle_secure_offerer`).
-        let near_dtls_settled = match settle_secure_offerer(
-            pipeline,
-            (near_local_crypto.is_some(), near_dtls.as_ref()),
-            far_dtls || far_local_crypto.is_some(),
-            (reversed.is_some(), profile, self.engine_fingerprint()),
-        ) {
-            Ok(settled) => settled,
+            Ok(resolved) => resolved,
             Err(result) => return *result,
         };
         // rtpengine `ptime=<N>` override: force the packetization of the synthesized (transcoded)
@@ -1291,11 +1272,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Err(result) => return *result,
         };
 
-        let AnsweredText {
-            far_text_remote,
-            text_relay_flows,
-            secure_text_registered,
-        } = match self.install_answer_text(
+        let AnsweredStreams {
+            text:
+                AnsweredText {
+                    far_text_remote,
+                    text_relay_flows,
+                    secure_text_registered,
+                },
+            far_image_remote,
+        } = match self.install_answer_streams(
+            &wiring,
+            (sdp, reversed.is_some()),
             &AnswerText {
                 call_id,
                 from_tag,
@@ -1315,18 +1302,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
             secure_text_events_sink,
         ) {
-            Ok(text) => text,
+            Ok(streams) => streams,
             Err(result) => return *result,
         };
-
-        // The T.38 fax relay, if both legs anchored one and B accepted it. It is installed after the
-        // audio/text wiring and independently of it: a fax stream is its own inbound surface with its
-        // own gate and latch, and a failure to bring it up must not fail the call's audio.
-        let far_image_remote =
-            self.install_answer_image(call_id, profile, &info, &near, &far, offer_received_from);
-
-        // The MCPTT floor stream is terminated on both parties' endpoints.
-        self.install_answer_floor(&wiring, sdp, reversed.is_some());
 
         self.record_answer(
             call_id,
@@ -1352,18 +1330,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         );
 
-        self.settle_answered_media(call_id, pinned, profile).await;
-        log_answer_applied(
-            call_id,
-            &to_tag,
-            reversed.as_ref(),
-            &near,
-            &info,
-            near_codec.as_ref(),
-            pipeline,
-        );
-        self.ok_sdp_keyed(call_id, rewritten, Some(answer_to_tag), profile)
-            .await
+        self.finish_answer(
+            AnswerFinish {
+                call_id,
+                to_tag: &to_tag,
+                sdp,
+                profile,
+                reversed: reversed.as_ref(),
+                near: &near,
+                info: &info,
+                near_codec: near_codec.as_ref(),
+                pipeline,
+                pinned,
+            },
+            (rewritten, answer_to_tag),
+        )
+        .await
     }
 }
 

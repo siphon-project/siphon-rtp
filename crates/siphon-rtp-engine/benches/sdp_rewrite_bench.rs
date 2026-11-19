@@ -271,6 +271,30 @@ fn sdp_rewrite(criterion: &mut Criterion) {
         bencher.iter(|| sdp::video::choose_video(black_box(&video_offer), Some(black_box(&room))));
     });
 
+    // A two-party call's anchored video stream: parse the section, then the separate anchor pass over
+    // the presented SDP (port, connection, rtcp), and the passthrough connection fix.
+    let call_offer = concat!(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n",
+        "m=audio 20100 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+        "m=video 6000 RTP/AVPF 96\r\na=rtpmap:96 H264/90000\r\n",
+        "a=fmtp:96 profile-level-id=42e01f;packetization-mode=1\r\na=rtcp-fb:96 nack pli\r\n",
+        "a=rtcp:6005\r\na=sendonly\r\n",
+    );
+    let engine_video =
+        EngineMedia::new(addr("198.51.100.5:30000"), Some(addr("198.51.100.5:30003")));
+    group.bench_function("parses_an_anchored_video_stream", |bencher| {
+        bencher.iter(|| sdp::parse_video_stream(black_box(call_offer)));
+    });
+    group.bench_function("anchors_a_video_stream", |bencher| {
+        bencher.iter(|| sdp::VideoRewrite::Anchor(engine_video).apply(black_box(call_offer)));
+    });
+    group.bench_function("keeps_a_passthrough_video_connection", |bencher| {
+        let rewritten = call_offer.replace("c=IN IP4 192.0.2.10", "c=IN IP4 198.51.100.5");
+        bencher.iter(|| {
+            sdp::keep_passthrough_connection(black_box(call_offer), black_box(&rewritten))
+        });
+    });
+
     group.finish();
 }
 

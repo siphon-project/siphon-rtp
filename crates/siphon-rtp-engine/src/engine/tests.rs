@@ -48,6 +48,7 @@ const CLIENT: ClientId = ClientId(1);
 
 mod actor_reply;
 mod call_floor;
+mod call_video;
 mod conference_dial_out;
 mod conference_dtmf;
 mod conference_received_from;
@@ -30810,6 +30811,27 @@ async fn a_relayed_offer_still_carries_an_active_video_stream_through() {
         "m=video 49550 RTP/AVP 96 97 98",
         "{presented}"
     );
+    // RFC 4566 §5.7: the session `c=` now names the engine for the audio stream, so the video
+    // section carries the phone's own address itself and the picture still goes phone to phone.
+    assert!(
+        video_section(&presented).contains(&format!("c=IN IP4 {}", addr.ip())),
+        "{presented}"
+    );
+}
+
+/// The lines of the first `m=video` section of `sdp`.
+fn video_section(sdp: &str) -> String {
+    let mut lines = sdp.lines().skip_while(|line| !line.starts_with("m=video"));
+    let mut section = String::new();
+    if let Some(first) = lines.next() {
+        section.push_str(first);
+        section.push('\n');
+    }
+    for line in lines.take_while(|line| !line.starts_with("m=")) {
+        section.push_str(line);
+        section.push('\n');
+    }
+    section
 }
 
 #[tokio::test]
@@ -30851,6 +30873,10 @@ async fn a_relayed_answer_and_reoffer_keep_every_media_line_they_were_given() {
         "the far party's own answer to the video stream is relayed: {answer}"
     );
     assert!(answer.contains("a=sendonly"), "{answer}");
+    assert!(
+        video_section(&answer).contains(&format!("c=IN IP4 {}", addr_b.ip())),
+        "{answer}"
+    );
 
     let reoffer = engine
         .handle(
@@ -30870,6 +30896,10 @@ async fn a_relayed_answer_and_reoffer_keep_every_media_line_they_were_given() {
         "{reoffer}"
     );
     assert_eq!(media_lines(&reoffer).len(), 2, "{reoffer}");
+    assert!(
+        video_section(&reoffer).contains(&format!("c=IN IP4 {}", addr_a.ip())),
+        "{reoffer}"
+    );
 }
 
 /// `node_info` lists a licensed codec exactly when the build has it, the same answer the codec

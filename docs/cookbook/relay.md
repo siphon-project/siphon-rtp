@@ -169,6 +169,36 @@ latch need (RFC 3550 header fields). Two consequences worth naming:
 - **Passive monitoring keeps working.** Because SSRC and sequence numbers survive the relay, a
   passive capture (VoIPmonitor-style) can still correlate the two legs.
 
+## Video on a two-party call
+
+By default the engine anchors the audio and copies an `m=video` section through, so the two phones
+exchange video directly at their own addresses. Each keeps its own connection line in the section
+(RFC 4566 §5.7): rewriting the session `c=` for the audio used to hand the far party the engine's address
+with the phone's own port. That works only when both ends can reach each other.
+
+Set `video_relay: "anchor"` in the profile of `offer` (and `answer`, `reoffer`) and the engine carries
+the stream like the audio:
+
+```json
+{"command":"offer","call_id":"door-1","from_tag":"door","sdp":"...","profile":{"video_relay":"anchor"}}
+```
+
+- One endpoint pair per leg (one under `a=rtcp-mux`), the same gated latch as audio: an unexpected source is
+  dropped and counted, never latched.
+- Codecs, payload types, `fmtp` and `rtcp-fb` are copied verbatim. There is no video transcoding.
+- Directions are respected. A door-station camera that offers `sendonly` and is answered `recvonly` forwards
+  camera to phone only; the phone's RTCP (reports, picture loss) still reaches the camera.
+  Under `a=rtcp-mux` RTCP shares the RTP port, so the kernel rule cannot tell them apart and both directions
+  forward.
+- A re-INVITE that moves an address or changes a direction re-gates the relay, one that adds video allocates
+  endpoints, and one that drops it frees them.
+- Plain `RTP/AVP` and `RTP/AVPF` only for now. Anything else is declined with port 0 and the reason in
+  `video_declined`.
+- `query`, the end-of-call record and `siphon_rtp_video_*` give per-stream packets and bytes, so "no
+  picture" reads as zero packets in (the camera never reached the engine) or in with none out.
+
+X3 interception on a call with anchored video covers the audio only.
+
 ## Fax: T.38 and G.711 passthrough
 
 A call carrying T.30 fax comes in one of two shapes, and they need different things from you.

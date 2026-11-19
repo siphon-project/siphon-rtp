@@ -1870,6 +1870,10 @@ pub struct ProfileFlags {
     /// empty, longer than [`MAX_FLOOR_CHANNEL_LABEL_LEN`] octets, or holding a control character.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_channel_label: Option<String>,
+    /// How a two-party relayed call carries an offered `m=video` stream (see [`VideoRelay`]); not
+    /// the forwarding-room [`ProfileFlags::video`]. Honoured on `offer`, `answer` and `reoffer`.
+    #[serde(default, skip_serializing_if = "VideoRelay::is_passthrough")]
+    pub video_relay: VideoRelay,
 }
 
 impl ProfileFlags {
@@ -2078,6 +2082,9 @@ pub struct SessionStats {
     pub bytes_out: u64,
     /// Packets dropped (jitter overflow, late, malformed).
     pub packets_lost: u64,
+    /// The anchored video stream's counters, when the call carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoStats>,
 }
 
 /// One leg's end-of-call figures in an [`Event::CallSummary`]: the datapath byte/packet counters,
@@ -2135,6 +2142,9 @@ pub struct LegSummary {
     /// no content-level text QoS — that is only measured when text is promoted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<TextStreamStats>,
+    /// The call's anchored video stream, from this leg's video endpoints (absent without one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoStats>,
     /// The engine's media address toward this party: the advertised IP and the RTP port. The
     /// `LocalAddr` of an RFC 6035 report sent from the engine's side of the leg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2728,7 +2738,7 @@ pub use recording::{
     MAX_RECORDING_SOURCES, RECORDING_OPUS_BITRATE_BPS_MAX, RECORDING_OPUS_BITRATE_BPS_MIN,
     RECORDING_OPUS_BITRATE_BPS_PER_CHANNEL_DEFAULT,
 };
-pub use video::{VideoProfile, VideoProfileError};
+pub use video::{VideoProfile, VideoProfileError, VideoRelay, VideoStats};
 pub mod scope;
 pub mod vq_rtcpxr;
 pub use scope::{normalize_scope, validate_scope, ScopeError, Scoped, MAX_SCOPE_LEN};
@@ -2942,6 +2952,7 @@ mod tests {
                     mos_max: Some(4.40),
                     mos_basis: Some("full".to_string()),
                     text: None,
+                    video: None,
                     local_address: Some("192.0.2.10:30000".parse().expect("address")),
                     remote_address: Some("198.51.100.7:4000".parse().expect("address")),
                     egress_ssrc: Some(0x1f2e_3d4c),
@@ -2977,6 +2988,7 @@ mod tests {
                         missing_markers: 1,
                         recovered_from_redundancy: 2,
                     }),
+                    video: None,
                 },
             ],
         };
@@ -5050,6 +5062,7 @@ mod tests {
                     bytes_in: 16000,
                     bytes_out: 15840,
                     packets_lost: 1,
+                    video: None,
                 }),
                 streams: Vec::new(),
                 video_declined: None,
@@ -6066,6 +6079,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(short.validate(), Err(FloorKeyError::KeyLength(3)));
+    }
+
+    #[test]
+    fn video_relay_defaults_to_passthrough_is_not_written_and_each_mode_is_snake_case() {
+        assert_eq!(VideoRelay::default(), VideoRelay::Passthrough);
+        assert_eq!(
+            serde_json::to_string(&ProfileFlags::default()).expect("serialize"),
+            "{}"
+        );
+        for (mode, text) in [
+            (VideoRelay::Anchor, "anchor"),
+            (VideoRelay::Decline, "decline"),
+        ] {
+            let profile = ProfileFlags {
+                video_relay: mode,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&profile).expect("serialize");
+            assert_eq!(json, format!(r#"{{"video_relay":"{text}"}}"#));
+            let back: ProfileFlags = serde_json::from_str(&json).expect("parse");
+            assert_eq!(back.video_relay, mode);
+        }
+        assert!(serde_json::from_str::<ProfileFlags>(r#"{"video_relay":"relay"}"#).is_err());
     }
 
     #[test]

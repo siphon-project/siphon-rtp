@@ -125,11 +125,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let far_text = text_counters.map(|counters| counters.far);
         let duration_s = self.datapath.now_ticks().saturating_sub(call.created_tick);
 
+        // The anchored video stream, both legs summed: a "no picture" report reads as zero packets in
+        // here (the camera never reached the engine) or in with none out (the relay refused it).
+        let video = [Some(&call.near), call.far.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|leg| self.video_stats(leg))
+            .fold(None::<siphon_rtp_proto::VideoStats>, |sum, stats| {
+                let mut sum = sum.unwrap_or_default();
+                sum.packets_in += stats.packets_in;
+                sum.packets_out += stats.packets_out;
+                sum.bytes_in += stats.bytes_in;
+                sum.bytes_out += stats.bytes_out;
+                Some(sum)
+            });
+        if let Some(video) = video {
+            self.metrics.record_video(&video);
+        }
         tracing::info!(
             target: "siphon_rtp::cdr",
             call_id = %call_id,
             reason,
             duration_s,
+            video_declined = call.video.declined.as_deref().unwrap_or("-"),
+            video_packets_in = video.map_or_else(|| "-".to_string(), |video| video.packets_in.to_string()),
+            video_packets_out = video.map_or_else(|| "-".to_string(), |video| video.packets_out.to_string()),
+            video_bytes_in = video.map_or_else(|| "-".to_string(), |video| video.bytes_in.to_string()),
+            video_bytes_out = video.map_or_else(|| "-".to_string(), |video| video.bytes_out.to_string()),
             pipeline = ?call.pipeline,
             near_codec = call.near_codec.as_ref().map(|codec| codec.encoding_name.as_str()).unwrap_or("-"),
             far_codec = call.far_codec.as_ref().map(|codec| codec.encoding_name.as_str()).unwrap_or("-"),
@@ -200,6 +222,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         a_to_b,
                         near_text,
                         near_media,
+                        self.video_stats(&call.near),
                     ),
                     leg_summary(
                         call.to_tag.as_deref().unwrap_or("-"),
@@ -208,6 +231,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         b_to_a,
                         far_text,
                         far_media,
+                        self.video_stats(far),
                     ),
                 ]
             }
@@ -254,6 +278,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     a_to_b,
                     near_text,
                     caller_media,
+                    None,
                 )]
             }
         };
@@ -516,6 +541,7 @@ fn leg_summary(
     quality: Option<&DirectionQuality>,
     text: Option<siphon_rtp_proto::TextStreamStats>,
     media: LegMedia,
+    video: Option<siphon_rtp_proto::VideoStats>,
 ) -> LegSummary {
     let mut summary = LegSummary {
         tag: tag.to_string(),
@@ -541,6 +567,7 @@ fn leg_summary(
         mos_basis: None,
         // RFC 4103 content QoS, present only when the call promoted the text stream for observability.
         text,
+        video,
     };
     if let Some(quality) =
         quality.filter(|quality| quality.ssrc.is_some() || quality.packets_received > 0)

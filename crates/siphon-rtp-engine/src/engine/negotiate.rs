@@ -65,7 +65,7 @@ pub(super) fn present_leg(
     call_id: &str,
 ) -> Result<String, sdp::SdpError> {
     let advertised_ip = presentation.engine.advertised_ip;
-    let mut presented = sdp::rewrite(
+    let presented = sdp::rewrite(
         sdp,
         presentation.engine,
         presentation.ice,
@@ -75,6 +75,9 @@ pub(super) fn present_leg(
         presentation.image,
     )?
     .sdp;
+    // RFC 4566 §5.7: a passed-through video section keeps the connection it inherited from the
+    // session line this rewrite just pointed at the engine.
+    let mut presented = sdp::keep_passthrough_connection(sdp, &presented);
     presented = presentation.floor.apply(&presented);
     match presentation.codec {
         CodecPresentation::AsReceived => {}

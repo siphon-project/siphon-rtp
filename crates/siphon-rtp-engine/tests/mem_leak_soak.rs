@@ -2998,3 +2998,106 @@ async fn multi_source_ws_tee_attach_end_does_not_leak() {
     }
     gate.assert_no_leak();
 }
+
+/// One anchored-video call through `offer → answer → re-offer (video moved) → re-answer → re-offer
+/// (video dropped) → re-offer (video added back) → re-answer → delete`. The video endpoints, flows,
+/// index entries and the stored directions have to come back with the call, or the video-bearing
+/// re-offer paths leak a socket a cycle.
+async fn video_offer_answer_reoffer_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let call_id = format!("soak-video-{index}");
+    let sdp_with_video = |host: &str, audio: u16, video: u16| {
+        format!(
+            "{}m=video {video} RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=sendrecv\r\n",
+            sdp_for(host, audio)
+        )
+    };
+    let anchored = siphon_rtp_proto::ProfileFlags {
+        video_relay: siphon_rtp_proto::VideoRelay::Anchor,
+        ..Default::default()
+    };
+    let offer = |from_tag: &str, sdp: String| Command::Reoffer {
+        call_id: call_id.clone(),
+        from_tag: from_tag.into(),
+        sdp,
+        profile: anchored.clone(),
+    };
+    let answer = |sdp: String| Command::Answer {
+        call_id: call_id.clone(),
+        from_tag: "tag-a".into(),
+        to_tag: "tag-b".into(),
+        sdp,
+        profile: anchored.clone(),
+    };
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_with_video("198.51.100.1", 40_000, 40_010),
+                    profile: anchored.clone(),
+                },
+            )
+            .await,
+        "offer",
+    );
+    let b_sdp = || sdp_with_video("203.0.113.1", 41_000, 41_010);
+    assert_ok(&engine.handle(CLIENT, answer(b_sdp())).await, "answer");
+    let moved = sdp_with_video("198.51.100.2", 40_000, 40_020);
+    assert_ok(
+        &engine.handle(CLIENT, offer("tag-a", moved)).await,
+        "moved re-offer",
+    );
+    assert_ok(&engine.handle(CLIENT, answer(b_sdp())).await, "re-answer");
+    let dropped = sdp_with_video("198.51.100.2", 40_000, 0);
+    assert_ok(
+        &engine.handle(CLIENT, offer("tag-a", dropped)).await,
+        "video dropped",
+    );
+    let added = sdp_with_video("198.51.100.2", 40_000, 40_030);
+    assert_ok(
+        &engine.handle(CLIENT, offer("tag-a", added)).await,
+        "video added",
+    );
+    assert_ok(
+        &engine.handle(CLIENT, answer(b_sdp())).await,
+        "answer to it",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchored_video_offer_reoffer_delete_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    let mut gate = LeakGate::new("anchored video", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            video_offer_answer_reoffer_delete(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}

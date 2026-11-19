@@ -13,8 +13,7 @@ use crate::sdp::{self, TextRewrite};
 use super::negotiate::{
     answer_ice_rewrite, dtls_directive, far_security, filter_component, ice_directive,
     ice_tie_breaker, near_security, offer_ice_rewrite, offered_dtls_setup, parse_codec_flags,
-    peer_ice_credentials, present_leg, same_codec, CodecPresentation, IceDirective,
-    LegPresentation,
+    peer_ice_credentials, same_codec, CodecPresentation, IceDirective, LegPresentation,
 };
 use super::{error_result, unknown_call, Call, ClientId, Engine, Leg, Party};
 
@@ -164,6 +163,23 @@ fn reoffer_security_refusal(state: &ReofferState, info: &sdp::MediaInfo) -> Opti
 fn reoffer_mux_override(leg: &Leg, info: &sdp::MediaInfo, profile: &ProfileFlags) -> Option<bool> {
     let muxed = leg.rtcp.is_none();
     (!profile.rtcp_mux.is_empty() || info.rtcp_mux != muxed).then_some(muxed)
+}
+
+/// A re-offer restates the offering party's text address as it does its audio address (RFC 3264
+/// §8): a party that moved network re-INVITEs from the new one, and the text relay is re-gated on it
+/// by the answer that completes the exchange. A leg whose text stream was never anchored stays
+/// without one, and a text section the party closed (port 0) leaves the stored address alone.
+fn move_text_address(leg: &mut Leg, info: &sdp::MediaInfo) {
+    if leg.text_remote_rtp.is_none() {
+        return;
+    }
+    if let Some(text) = info
+        .text
+        .as_ref()
+        .filter(|text| text.remote_rtp.port() != 0)
+    {
+        leg.text_remote_rtp = Some(text.remote_rtp);
+    }
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -431,6 +447,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 Party::Near => {
                     call.near.remote_rtp = Some(info.remote_rtp);
                     call.near.remote_rtcp = Some(info.remote_rtcp);
+                    move_text_address(&mut call.near, &info);
                     // A re-offer restates A's codec list, so an `answer` still to come negotiates
                     // against what A last offered rather than what it opened the dialog with (the
                     // guard above already refused a list that drops the negotiated codec). A re-offer
@@ -463,6 +480,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     if let Some(far) = call.far.as_mut() {
                         far.remote_rtp = Some(info.remote_rtp);
                         far.remote_rtcp = Some(info.remote_rtcp);
+                        move_text_address(far, &info);
                     }
                     call.far_remote_ice = new_remote_ice;
                     if profile.received_from.is_some() {
@@ -625,9 +643,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_restart,
             "re-offer"
         );
-        match present_leg(sdp, presentation, &profile.replace, call_id) {
-            Ok(presented) => super::key_mgmt::ok_sdp_keyed_in_place(&presented, profile),
-            Err(error) => error_result("re-offer rewrite", &error),
-        }
+        self.reoffer_video_reply(call_id, party, sdp, profile, presentation)
+            .await
     }
 }

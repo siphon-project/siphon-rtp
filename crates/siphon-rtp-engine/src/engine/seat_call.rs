@@ -436,9 +436,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             || far.text.is_some()
             || call.near.image.is_some()
             || far.image.is_some()
+            || call.near.video.is_some()
+            || far.video.is_some()
         {
             return refuse(
-                "the call carries a text or fax stream besides its audio; a room seats audio only",
+                "the call carries a text, fax or anchored video stream besides its audio; a room \
+                 seats audio only",
             );
         }
         let (leg, peer, codec, telephone_event, direction, sip_call_id, sdes, dtls, started) =

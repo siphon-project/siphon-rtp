@@ -71,6 +71,9 @@ pub struct Metrics {
     rtcp_app_dropped_total: AtomicU64,
     /// WebSocket dials that failed, by [`WsDialFailure`] class: timeout, connect, TLS, handshake.
     ws_dial_failures_total: [AtomicU64; 4],
+    /// Packets and bytes anchored video streams carried, by direction, added as each call ends.
+    video_packets_total: [AtomicU64; 2],
+    video_bytes_total: [AtomicU64; 2],
 }
 
 /// Why a WebSocket dial failed, as counted in the metrics and named in the log line.
@@ -200,6 +203,14 @@ impl Metrics {
     /// A plain relaxed load of each atomic; the four values are sampled independently (no global
     /// barrier), which is correct for read-only telemetry — `statistics` is a census, not a
     /// transaction.
+    /// Add one ended call's anchored video counters.
+    pub fn record_video(&self, video: &siphon_rtp_proto::VideoStats) {
+        self.video_packets_total[0].fetch_add(video.packets_in, Ordering::Relaxed);
+        self.video_packets_total[1].fetch_add(video.packets_out, Ordering::Relaxed);
+        self.video_bytes_total[0].fetch_add(video.bytes_in, Ordering::Relaxed);
+        self.video_bytes_total[1].fetch_add(video.bytes_out, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -339,6 +350,29 @@ impl Metrics {
             "counter",
             errors,
         );
+        use std::fmt::Write as _;
+        for (name, help, counters) in [
+            (
+                "siphon_rtp_video_packets_total",
+                "Packets anchored video streams carried, by direction (in from a party, out toward one).",
+                &self.video_packets_total,
+            ),
+            (
+                "siphon_rtp_video_bytes_total",
+                "Bytes anchored video streams carried, by direction (in from a party, out toward one).",
+                &self.video_bytes_total,
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
+            for (direction, counter) in ["in", "out"].into_iter().zip(counters) {
+                let _ = writeln!(
+                    output,
+                    "{name}{{direction=\"{direction}\"}} {}",
+                    counter.load(Ordering::Relaxed)
+                );
+            }
+        }
         metric(
             &mut output,
             "siphon_rtp_rtcp_app_dropped_total",
@@ -806,9 +840,9 @@ mod tests {
         }
         assert!(body.contains("# TYPE siphon_rtp_scoped_offers_total counter\n"));
         assert!(body.contains("siphon_rtp_scoped_offers_total 0\n"));
-        // Every series carries a HELP + TYPE line (32 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 32);
-        assert_eq!(body.matches("# TYPE ").count(), 32);
+        // Every series carries a HELP + TYPE line (34 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 34);
+        assert_eq!(body.matches("# TYPE ").count(), 34);
     }
 
     #[test]
@@ -830,8 +864,24 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (31 vs 32).
-        assert_eq!(body.matches("# TYPE ").count(), 31);
+        // One fewer series than the CPU-present case (33 vs 34).
+        assert_eq!(body.matches("# TYPE ").count(), 33);
+    }
+
+    #[test]
+    fn ended_calls_add_their_video_counters_by_direction() {
+        let metrics = Metrics::default();
+        metrics.record_video(&siphon_rtp_proto::VideoStats {
+            packets_in: 7,
+            packets_out: 5,
+            bytes_in: 700,
+            bytes_out: 500,
+        });
+        let body = metrics.render(LiveGauges::default(), 0);
+        assert!(body.contains("siphon_rtp_video_packets_total{direction=\"in\"} 7\n"));
+        assert!(body.contains("siphon_rtp_video_packets_total{direction=\"out\"} 5\n"));
+        assert!(body.contains("siphon_rtp_video_bytes_total{direction=\"in\"} 700\n"));
+        assert!(body.contains("siphon_rtp_video_bytes_total{direction=\"out\"} 500\n"));
     }
 
     #[test]

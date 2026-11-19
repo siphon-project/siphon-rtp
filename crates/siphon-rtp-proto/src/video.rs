@@ -7,6 +7,35 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How a two-party relayed call carries an offered `m=video` stream (`offer`,
+/// `answer` and `reoffer`). A forwarding room or a conference refuses it.
+///
+/// Deliberately **not** `#[non_exhaustive]`: the three modes differ in whether the engine sits in the
+/// video path at all, and a controller must not guess.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoRelay {
+    /// The default: the video section is copied through, so the two parties exchange video directly
+    /// at their own addresses (the engine anchors the audio only).
+    #[default]
+    Passthrough,
+    /// Anchor the video stream like the audio one: an engine endpoint per leg, the gated latch,
+    /// RTCP, direction attributes respected. Codecs and payload numbers are the two parties' own
+    /// business, the engine relays and never transcodes video. A stream the engine cannot carry is
+    /// declined, with the reason in `video_declined`.
+    Anchor,
+    /// Decline the video stream (`m=video 0`, RFC 3264 §6).
+    Decline,
+}
+
+impl VideoRelay {
+    /// Whether this is the default, which is not written.
+    #[must_use]
+    pub fn is_passthrough(&self) -> bool {
+        *self == Self::Passthrough
+    }
+}
+
 /// Why a [`VideoProfile`] was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -173,4 +202,14 @@ mod tests {
             crate::CmdResult::Ok { streams, video_declined: None, .. } if streams.is_empty()
         ));
     }
+}
+
+/// The packets and bytes one call's anchored video stream carried: the engine's datapath counters
+/// on the video endpoints, in from the parties and out toward them ([`crate::VideoRelay`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoStats {
+    pub packets_in: u64,
+    pub packets_out: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
 }

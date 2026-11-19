@@ -790,6 +790,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             floor: offer_floor.far,
             floor_remote: None,
             floor_format: offer_floor.format,
+            video: None,
         };
         let text_rewrite = match far_leg.text_anchor(far_text_local_crypto) {
             Some(anchor) => anchor,
@@ -868,19 +869,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // alone, so a leg whose codec it took follows B's answer like any other. A far offer that
         // will not re-parse (our own rewrite, so a bug rather than input) counts as *not* withheld: the
         // relay that keeps the call up is the better failure mode.
-        let near_codec_withheld = match near_codec.as_ref() {
-            Some(primary)
-                if !codec_policy.is_noop() && held_on_withheld_codec(&codec_policy, primary) =>
-            {
-                sdp::parse(&rewritten).is_ok_and(|far_offer| {
-                    !far_offer
-                        .audio_codecs()
-                        .iter()
-                        .any(|offered| same_codec(offered, primary))
-                })
-            }
-            _ => false,
-        };
+        let near_codec_withheld = codec_withheld(near_codec.as_ref(), &codec_policy, &rewritten);
         let ws_uri = profile.ws_uri.clone();
         // Where the caller's media lands if this call never gets an `answer` follows from the same
         // choice. A WS takeover bridges `near_rtp` (below), so the caller reaches the near socket;
@@ -1014,6 +1003,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_text_local_crypto,
                 // The near text key is minted at answer (advertised to A), not at offer.
                 near_text_local_crypto: None,
+                video: super::call_video::CallVideo::default(),
                 local_answer: None,
                 seat: None,
                 seating: false,
@@ -1053,7 +1043,30 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        self.ok_sdp_keyed(&call_id, rewritten, None, profile).await
+        self.offer_video_reply(&call_id, sdp, profile, rewritten)
+            .await
+    }
+}
+
+/// Whether the codec policy took A's own codec out of the far offer (see the call site): read off
+/// the far offer the policy actually produced, and `false` when it will not re-parse.
+fn codec_withheld(
+    near_codec: Option<&siphon_rtp_codec::factory::CodecSpec>,
+    codec_policy: &sdp::CodecPolicy,
+    rewritten: &str,
+) -> bool {
+    match near_codec {
+        Some(primary)
+            if !codec_policy.is_noop() && held_on_withheld_codec(codec_policy, primary) =>
+        {
+            sdp::parse(rewritten).is_ok_and(|far_offer| {
+                !far_offer
+                    .audio_codecs()
+                    .iter()
+                    .any(|offered| same_codec(offered, primary))
+            })
+        }
+        _ => false,
     }
 }
 

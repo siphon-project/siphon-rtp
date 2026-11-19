@@ -387,6 +387,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(refusal) = self.seated_call_refusal(client, &command) {
             return refusal;
         }
+        if let Some(refusal) = super::call_video::video_relay_refusal(&command) {
+            return refusal;
+        }
         match command {
             Command::ConferenceSeat {
                 call_id,

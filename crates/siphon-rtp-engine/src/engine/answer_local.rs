@@ -233,6 +233,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     floor: None,
                     floor_remote: None,
                     floor_format: siphon_rtp_proto::ControlFormat::Mcptt,
+                    video: None,
                 },
                 // No B-facing leg, and never will be: this verb *is* the answer (see the allocation
                 // comment above). `answer` refuses to run on such a call rather than inventing one.
@@ -291,6 +292,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_text_local_crypto: None,
                 near_text_local_crypto: None,
                 // Set once the local answer is complete (see the end of `answer_local`).
+                video: super::call_video::CallVideo::default(),
                 local_answer: None,
                 seat: None,
                 seating: false,

@@ -37,6 +37,12 @@ pub(super) fn leg_snapshot(leg: &Leg) -> crate::ha::LegSnapshot {
         advertised_ip,
         // Filled by `checkpoint`, which reads the stream's live state from the actor serving it.
         floor: None,
+        video: leg.video.map(|video| crate::ha::VideoSnapshot {
+            rtp_local: video.rtp.local_addr,
+            rtcp_local: video.rtcp.map(|endpoint| endpoint.local_addr),
+            remote_rtp: video.remote_rtp,
+            remote_rtcp: video.remote_rtcp,
+        }),
     }
 }
 
@@ -210,7 +216,7 @@ pub(super) fn restore_source_filter(filter: crate::ha::SourceFilterSnapshot) -> 
 }
 
 /// Map a snapshot latch policy back to the datapath [`LatchPolicy`] on restore.
-fn restore_latch(latch: crate::ha::LatchSnapshot) -> LatchPolicy {
+pub(super) fn restore_latch(latch: crate::ha::LatchSnapshot) -> LatchPolicy {
     use crate::ha::LatchSnapshot;
     match latch {
         LatchSnapshot::Off => LatchPolicy::Off,
@@ -369,8 +375,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
         }
-        snapshot.version =
-            crate::ha::CallSnapshot::version_for(call_scope, snapshot.floor_format());
+        snapshot.version = if snapshot.has_video() {
+            crate::ha::SNAPSHOT_VERSION_VIDEO
+        } else {
+            crate::ha::CallSnapshot::version_for(call_scope, snapshot.floor_format())
+        };
         // For a secure call, fold in the live SRTP rollover (+ bridge flow plans, for `Srtp`). Sourced
         // from the SRTP bridge for `Srtp`, from the media actor's shared `SecureLeg` for `SrtpMedia`.
         snapshot.secure = match secure_ctx {
@@ -575,6 +584,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // that uses it.
             image: None,
             image_remote: None,
+            video: super::call_video::video_leg(
+                snapshot.near.video.as_ref(),
+                role_endpoint(EndpointRole::NearVideo),
+                role_endpoint(EndpointRole::NearVideoRtcp),
+            ),
             floor: role_endpoint(EndpointRole::NearFloor),
             floor_remote: snapshot.near.floor.as_ref().and_then(|floor| floor.remote),
             floor_format: snapshot
@@ -598,6 +612,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text_remote_rtp: None,
             image: None,
             image_remote: None,
+            video: super::call_video::video_leg(
+                snapshot.far.video.as_ref(),
+                role_endpoint(EndpointRole::FarVideo),
+                role_endpoint(EndpointRole::FarVideoRtcp),
+            ),
             floor: role_endpoint(EndpointRole::FarFloor),
             floor_remote: snapshot.far.floor.as_ref().and_then(|floor| floor.remote),
             floor_format: snapshot
@@ -638,6 +657,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let rtcp_legs = restored_rtcp_relay_legs(&snapshot, &near, &media.relay_flows);
         let tags = (snapshot.from_tag.clone(), snapshot.to_tag.clone());
         let (near_floor, far_floor) = (near.floor, far.floor);
+        let restored_video = super::call_video::restored_call_video(&snapshot, &near, &far);
+        let video_flows = self.restore_video_flows(&snapshot, bound)?;
         self.calls.insert(
             snapshot.call_id.clone(),
             Call {
@@ -763,6 +784,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_text_remote_crypto: None,
                 far_text_local_crypto: None,
                 near_text_local_crypto: None,
+                video: restored_video,
                 local_answer: None,
                 seat: None,
                 seating: false,
@@ -770,6 +792,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         );
         // Register the reconstructed call under the requesting (standby) client.
         self.index_new_call(&snapshot.call_id, client);
+        if let Some(mut call) = self.calls.get_mut(&snapshot.call_id) {
+            call.video.flows = video_flows;
+        }
         // The floor streams and the audio RTCP relay report to the controller that now owns the
         // call, so they come up after it is registered.
         let [near_prepared, far_prepared] = floors;
@@ -1077,6 +1102,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         if let Some(floor) = &snapshot.far.floor {
             targets.push((EndpointRole::FarFloor, floor.local));
+        }
+        for (leg, rtp_role, rtcp_role) in [
+            (
+                &snapshot.near,
+                EndpointRole::NearVideo,
+                EndpointRole::NearVideoRtcp,
+            ),
+            (
+                &snapshot.far,
+                EndpointRole::FarVideo,
+                EndpointRole::FarVideoRtcp,
+            ),
+        ] {
+            if let Some(video) = &leg.video {
+                targets.push((rtp_role, video.rtp_local));
+                if let Some(addr) = video.rtcp_local {
+                    targets.push((rtcp_role, addr));
+                }
+            }
         }
         let mut bound: Vec<(EndpointRole, Endpoint)> = Vec::new();
         for (role, addr) in targets {
