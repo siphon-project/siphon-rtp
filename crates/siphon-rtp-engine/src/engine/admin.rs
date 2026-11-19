@@ -210,6 +210,12 @@ fn build_features() -> Vec<String> {
         // and NACK, and raises `forward_keyframe`. `forward_offer` offers `RTP/AVPF`. A controller
         // gates relying on a decodable switch on this entry.
         "forward_video_keyframe".to_string(),
+        // A video room matches a later seat by H.264 sub-profile and level, not by the exact
+        // `profile-level-id` (RFC 6184 §8.2.2): the Table 5 spellings of one sub-profile are one, a
+        // seat above the room's level is answered at it, one below it is seated only if it sends
+        // without receiving, and `level-asymmetry-allowed` with `max-recv-level` is honoured. A
+        // controller gates admitting mixed-level devices to one video room on this entry.
+        "forward_video_h264".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

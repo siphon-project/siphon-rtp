@@ -279,10 +279,34 @@ so in `video_declined`.
 same H.264 flavour (RFC 6184 §8.1). The first seat with live video fixes the room's
 `packetization-mode` (0 or 1; 2, interleaved, is refused) and `profile-level-id`, or
 `video.fmtp` does when you set it (3GPP TS 26.281 §4.1.1 makes H.264 mandatory, Constrained High
-Profile level 3.1 being `640c1f`). A later seat has to offer `H264/90000` with the same mode and
-`profile-level-id`; one that does not joins with audio only and `video_declined` names the reason.
-Each seat keeps its own payload type, as audio does. The engine writes the room's `a=fmtp` only; a
-seat's own `sprop-parameter-sets` are never handed to another seat.
+Profile level 3.1 being `640c1f`). A seat's own `sprop-parameter-sets` are never handed to another
+seat. Each seat keeps its own payload type, as audio does.
+
+**Matching a later seat.** RFC 6184 §8.2.2 splits `profile-level-id` in two: the profile part must be
+used symmetrically, the level part may change. So a later seat's `H264/90000` payload fits when:
+
+- its `packetization-mode` is the room's;
+- its sub-profile is the room's. The spellings RFC 6184 §8.1 Table 5 gives one sub-profile count as one
+  (Constrained Baseline is `42e0..`, `42c0..`, `4240..`, `4d80..` and `58c0..` alike), and any other
+  combination must be the room's exactly (High `6400..`, Constrained High `640c..`);
+- and, when the seat receives video (`sendrecv` or `recvonly`), it decodes the room's level. The
+  room's sources never send above it.
+
+The room's level is the first seat's, or the one in `video.fmtp`. The engine answers each seat in the
+seat's own profile spelling:
+
+| Seat | Answered level |
+|---|---|
+| At or above the room's level | The room's (an answer never upgrades a level) |
+| Below it, `sendonly` or `inactive` | Its own (every receiver decodes all lower levels, RFC 6184 §8.1) |
+| Below it and receiving | Declined: audio only, `video_declined` names both levels |
+| Offers `level-asymmetry-allowed=1` | The room's, with `level-asymmetry-allowed=1`; it receives up to its `max-recv-level`, which must reach the room's level |
+
+Other parameters of `video.fmtp` are written as given; only `profile-level-id` changes per seat.
+`forward_offer` never offers `level-asymmetry-allowed`, so a member's answer is held to one level both
+ways. A seat in another sub-profile, or with a malformed `profile-level-id`, joins with audio only and
+`video_declined` says why. `node_info` lists `forward_video_h264` on an engine that matches this way;
+one without it requires the exact `profile-level-id`.
 
 **Directions.** The answer is the complement of the offered direction (RFC 3264 §6.1). A `sendrecv`
 seat can be the video source and is sent video. A `recvonly` seat is answered `sendonly`, is sent

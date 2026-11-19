@@ -17,7 +17,8 @@ use siphon_rtp_proto::{CmdResult, ForwardMedia, ProfileFlags};
 
 use crate::forward::VideoConfig;
 use crate::sdp::video::{
-    choose_video, parse_video, video_offer_section, RoomVideoFormat, VideoAnswer, VideoChoice,
+    choose_answered_video, choose_video, parse_video, video_offer_section, RoomVideoFormat,
+    VideoAnswer, VideoChoice,
 };
 use crate::sdp::{self, EngineMedia, OwnSsrc};
 
@@ -361,7 +362,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let offered = parse_video(answer)
             .ok_or_else(|| "the answer declined the video stream (port 0)".to_string())?;
         let fixed = self.video_format_in_force(room_id, profile)?;
-        let choice = choose_video(&offered, fixed.as_ref())?;
+        let choice = choose_answered_video(&offered, fixed.as_ref())?;
         if AddressFamily::of(choice.remote.ip()) != AddressFamily::of(endpoint.local_addr.ip()) {
             return Err(
                 "the video stream is in another address family than the seat's audio".to_string(),
