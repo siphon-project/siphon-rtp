@@ -216,6 +216,12 @@ fn build_features() -> Vec<String> {
         // without receiving, and `level-asymmetry-allowed` with `max-recv-level` is honoured. A
         // controller gates admitting mixed-level devices to one video room on this entry.
         "forward_video_h264".to_string(),
+        // A browser seat (`UDP/TLS/RTP/SAVPF`) carries video too: its `m=video` is answered, and
+        // `forward_offer` with that `transport_protocol` offers one, bundled with the audio on the
+        // seat's one ICE/DTLS transport (RFC 8843) and protected under the seat's DTLS-SRTP key. Only
+        // `nack`, `nack pli` and `ccm fir` are answered (never `transport-cc` or `goog-remb`) and no
+        // header extension is. A controller gates offering a browser member video on this entry.
+        "forward_video_webrtc".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

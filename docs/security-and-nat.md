@@ -1154,6 +1154,19 @@ the routing order is unchanged: bridge → media → text → udptl → ws → c
   decoder refuses, or a frame of an unexpected length, is dropped and counted (`transcode_dropped`); it
   never reaches another seat. Nothing is allocated per packet, so a hostile source cannot grow memory.
 
+#### Bundled video of a browser seat (RFC 8843)
+
+A browser seat's video shares the seat's one endpoint, so it has no gate, latch, key or destination of its
+own: every datagram passes the seat's layers 2 to 4 and its `SecureLeg` unprotect (a forged packet never
+reaches the demux), then is told from the audio by payload type (RFC 8843 §9.2: a payload type is
+unique across the bundle) and, for RTCP, by the streams it speaks of (report blocks or feedback about the
+video egress SSRC, or the seat's video sender). The latch is the seat's: it pins the first SSRC the
+endpoint saw, audio or video, and a same-source SSRC change is accepted as before; nothing is loosened. Egress goes
+to the seat's latched or ICE-selected destination, protected under the seat's key (one SRTP context per
+SSRC under one key, RFC 3711 §3.2.3); a bundled video is never sent in the clear and not at all before the
+seat is keyed and its ICE pair selected. A video section outside the audio's BUNDLE group is declined,
+since the room runs no second transport.
+
 ### Layer 5c-iii: Preserve rooms (end-to-end SRTP, hop-by-hop SRTCP)
 A forwarding room created with `"media": "preserve"` forwards the talker's media untouched, so it
 runs the layer-2 gate, the pending-seat refusals and the constrained SSRC latch of 5c-ii and then

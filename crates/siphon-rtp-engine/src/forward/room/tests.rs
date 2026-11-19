@@ -669,3 +669,4 @@ mod mode_request;
 mod preserve;
 mod transcode;
 mod video;
+mod video_webrtc;

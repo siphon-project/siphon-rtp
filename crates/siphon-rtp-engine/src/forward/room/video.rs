@@ -38,7 +38,7 @@ use super::keyframe::{
     STEP_PPS, STEP_SPS,
 };
 use super::{
-    reception_block, ticks, ForwardRoom, ForwardSeatStats, Plan, PlanKind, Stream, Verbatim,
+    reception_block, ticks, ForwardRoom, ForwardSeatStats, Plan, PlanKind, Seat, Stream, Verbatim,
 };
 use crate::ingress::{Ingress, RefusalLog};
 use crate::media_pipeline::Outbound;
@@ -76,6 +76,10 @@ pub struct VideoConfig {
     /// The CNAME of the seat's streams (RFC 3550 §6.5.1), written in the source description of the
     /// compound a keyframe request travels in (RFC 4585 §3.1).
     pub cname: String,
+    /// The video is bundled with the seat's audio on one transport (RFC 8843): it has no endpoint,
+    /// latch, key or destination of its own. `endpoint` is the seat's own, and what the video leaves
+    /// and arrives through is the seat's gate, its latched destination and its `SecureLeg`.
+    pub bundled: bool,
 }
 
 pub(super) struct VideoStream {
@@ -99,6 +103,8 @@ pub(super) struct VideoStream {
     pub(super) keyframe: ReceiverKeyframe,
     /// What the seat sends, kept for starting receivers on it when it is the source.
     pub(super) keyframe_media: SourceMedia,
+    /// See [`VideoConfig::bundled`].
+    pub(super) bundled: bool,
 }
 
 impl VideoStream {
@@ -126,6 +132,7 @@ impl VideoStream {
             cname: config.cname.into_boxed_str(),
             keyframe: ReceiverKeyframe::new(),
             keyframe_media: SourceMedia::default(),
+            bundled: config.bundled,
         }
     }
 
@@ -149,6 +156,117 @@ impl VideoStream {
     pub(super) fn reachable(&self) -> bool {
         !self.destination.ip().is_unspecified() && self.destination.port() != 0
     }
+}
+
+impl Seat {
+    /// Whether the room may send this seat's video anything: its destination is resolved (the room
+    /// never forwards into the void, docs/security-and-nat.md §4), and for a bundled video the seat's
+    /// own key and ICE pair have settled, since it travels on the seat's transport.
+    pub(super) fn video_reachable(&self) -> bool {
+        match &self.video {
+            Some(video) if video.bundled => self.reachable(),
+            Some(video) => video.reachable(),
+            None => false,
+        }
+    }
+
+    /// The endpoint the seat's video leaves from and the destination it goes to: its own, or for a
+    /// bundled video the seat's (RFC 8843 §8), which follows the seat's latch and ICE selection.
+    pub(super) fn video_route(&self) -> Option<(EndpointId, SocketAddr)> {
+        let video = self.video.as_ref()?;
+        let destination = if video.bundled {
+            self.egress_destination
+        } else {
+            video.destination
+        };
+        Some((video.endpoint, destination))
+    }
+}
+
+/// Protect a video datagram for the wire: `Some(false)` when it goes as it is (a video on an endpoint
+/// of its own, plain RTP), `Some(true)` when its protection under the seat's `SecureLeg` is in `sealed`
+/// (a bundled one: RFC 3711 §3.3 for RTP, §3.4 for RTCP; each SSRC has its own context under the one
+/// key, §3.2.3). `None` when it cannot be protected: a bundled video is never sent in the clear.
+pub(super) fn seal(
+    bundled: bool,
+    secure: Option<&mut SecureLeg>,
+    plain: &[u8],
+    sealed: &mut Vec<u8>,
+) -> Option<bool> {
+    if !bundled {
+        return Some(false);
+    }
+    sealed.clear();
+    secure?.protect(plain, sealed).ok()?;
+    Some(true)
+}
+
+/// Whether a cleartext datagram that arrived on a seat's endpoint is that seat's bundled video, not
+/// its audio (RFC 8843 §9.2): RTP carries the video payload type, which no other section of the
+/// bundle uses; RTCP is told apart by the streams it speaks of, since an RTCP packet has no payload
+/// type of the section.
+pub(super) fn is_bundled_video(video: &VideoStream, data: &[u8]) -> bool {
+    if !video.bundled {
+        return false;
+    }
+    if seat_gate::is_rtcp(data) {
+        return rtcp_is_about_video(
+            data,
+            video.translator.egress_ssrc(),
+            video.keyframe_media.ssrc,
+        );
+    }
+    data.len() >= 2 && data[1] & 0x7F == video.payload_type
+}
+
+/// Whether an RTCP datagram concerns the video stream: it is sent by the seat's video sender (`sender`,
+/// known once the seat has sent video), carries a reception report block about the stream the room
+/// sends it (`egress`, RFC 3550 §6.4), or is feedback about it (RFC 4585 §6.1, RFC 5104 §4.3.1).
+pub(super) fn rtcp_is_about_video(data: &[u8], egress: u32, sender: Option<u32>) -> bool {
+    const SENDER_REPORT: u8 = 200;
+    const RECEIVER_REPORT: u8 = 201;
+    const TRANSPORT_FEEDBACK: u8 = 205;
+    const PAYLOAD_FEEDBACK: u8 = 206;
+    let word = |packet: &[u8], at: usize| {
+        packet
+            .get(at..at + 4)
+            .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let mut rest = data;
+    while rest.len() >= 8 && rest[0] >> 6 == 2 {
+        let length = (usize::from(u16::from_be_bytes([rest[2], rest[3]])) + 1) * 4;
+        let Some(packet) = rest.get(..length) else {
+            return false;
+        };
+        let count = usize::from(packet[0] & 0x1F);
+        let from = word(packet, 4);
+        let about = match packet[1] {
+            SENDER_REPORT | RECEIVER_REPORT => {
+                let first = if packet[1] == SENDER_REPORT { 28 } else { 8 };
+                (0..count).any(|block| word(packet, first + block * 24) == Some(egress))
+            }
+            TRANSPORT_FEEDBACK => word(packet, 8) == Some(egress),
+            // A FIR names its streams in the FCI entries (RFC 5104 §4.3.1.1), 8 octets each; the
+            // header's media SSRC is 0 for it.
+            PAYLOAD_FEEDBACK => {
+                word(packet, 8) == Some(egress)
+                    || (12..length.saturating_sub(7))
+                        .step_by(8)
+                        .any(|at| word(packet, at) == Some(egress))
+            }
+            _ => false,
+        };
+        let from_video = matches!(
+            packet[1],
+            SENDER_REPORT | RECEIVER_REPORT | TRANSPORT_FEEDBACK | PAYLOAD_FEEDBACK
+        ) && sender.is_some()
+            && from == sender;
+        if about || from_video {
+            return true;
+        }
+        rest = &rest[length..];
+    }
+    false
 }
 
 /// Read a seat's video RTCP: the sender report's time becomes our LSR, reception report blocks about
@@ -179,14 +297,20 @@ fn consume_video_rtcp(
 }
 
 /// The fan-out of one video packet, or of the packets a receiver's NACK asked for.
-fn video_plan(source: usize, point: StreamPoint, arrival: u64, keyframe: KeyframePlan) -> Plan {
+fn video_plan(
+    source: usize,
+    point: StreamPoint,
+    arrival: u64,
+    in_clear_buffer: bool,
+    keyframe: KeyframePlan,
+) -> Plan {
     Plan {
         stream: Stream::Video,
         verbatim: Verbatim::No,
         source,
         // Unused for video: there is no event or concealment to tell apart.
         kind: PlanKind::Audio,
-        in_clear_buffer: false,
+        in_clear_buffer,
         domain_len: None,
         source_group: None,
         point,
@@ -209,11 +333,21 @@ impl ForwardRoom {
     /// counted and dropped after the gate: [`Ingress::DroppedFromPeer`], which still proves the seat
     /// is alive.
     pub(super) fn ingest_video(&mut self, index: usize, packet: &RxPacket) -> Ingress {
+        // The decrypt buffer is lent to the gate and handed back, so the packet it returns can be
+        // read while the room's other state is changed.
+        let mut clear = std::mem::take(&mut self.clear_in);
+        let outcome = self.gate_video(index, packet, &mut clear);
+        self.clear_in = clear;
+        outcome
+    }
+
+    fn gate_video(&mut self, index: usize, packet: &RxPacket, clear: &mut Vec<u8>) -> Ingress {
         let seat = &mut self.seats[index];
         let Some(video) = seat.video.as_mut() else {
             return Ingress::Refused;
         };
-        // A video stream is plain RTP: the engine declines secure video (steps 5 and 6).
+        // A video stream on an endpoint of its own is plain RTP: the engine declines secure video
+        // there (a bundled one is gated and unprotected with the seat's audio).
         let mut unkeyed: Option<SecureLeg> = None;
         let data = match seat_gate::admit(
             SeatGate {
@@ -229,10 +363,45 @@ impl ForwardRoom {
                 egress_destination: &mut video.destination,
             },
             packet,
-            &mut self.clear_in,
+            clear,
         ) {
             Ok(data) => data,
             Err(refused) => return refused,
+        };
+        self.video_after_gate(index, data, packet.arrival, false)
+    }
+
+    /// Ingress a datagram of a seat's bundled video (RFC 8843): the seat's own gate, latch and
+    /// `SecureLeg` already ran on the audio path, so the cleartext is read as video from here.
+    /// `in_clear_buffer` says the cleartext is the room's decrypt buffer rather than the datagram.
+    pub(super) fn ingest_bundled_video(
+        &mut self,
+        index: usize,
+        packet: &RxPacket,
+        in_clear_buffer: bool,
+    ) -> Ingress {
+        let clear = std::mem::take(&mut self.clear_in);
+        let data: &[u8] = if in_clear_buffer {
+            &clear
+        } else {
+            &packet.data
+        };
+        let outcome = self.video_after_gate(index, data, packet.arrival, in_clear_buffer);
+        self.clear_in = clear;
+        outcome
+    }
+
+    /// What follows the gate for a video datagram: `data` is its cleartext.
+    fn video_after_gate(
+        &mut self,
+        index: usize,
+        data: &[u8],
+        arrival: u64,
+        in_clear_buffer: bool,
+    ) -> Ingress {
+        let seat = &mut self.seats[index];
+        let Some(video) = seat.video.as_mut() else {
+            return Ingress::Refused;
         };
         if data.len() < 2 {
             return Ingress::Accepted; // gated in; too short to be media, but the path is alive
@@ -245,7 +414,7 @@ impl ForwardRoom {
                 &mut self.keyframes,
                 &mut seat.counters,
                 data,
-                packet.arrival,
+                arrival,
             );
             if self.keyframes.retransmissions_pending() {
                 // The packets its NACK asked for are sent again by `next_datagram`, to this seat only.
@@ -254,7 +423,8 @@ impl ForwardRoom {
                     ..video_plan(
                         index,
                         StreamPoint::default(),
-                        packet.arrival,
+                        arrival,
+                        false,
                         KeyframePlan::default(),
                     )
                 });
@@ -267,7 +437,7 @@ impl ForwardRoom {
         video
             .stats
             .on_rtp(parsed.ssrc, parsed.sequence, parsed.timestamp);
-        video.stats.observe_arrival(packet.arrival);
+        video.stats.observe_arrival(arrival);
         // What a keyframe request to this seat names, and the parameter sets to replay, should it
         // become the source: kept whoever is the source now.
         video.keyframe_media.ssrc = Some(parsed.ssrc);
@@ -303,7 +473,8 @@ impl ForwardRoom {
                 timestamp: parsed.timestamp,
                 marker: parsed.marker,
             },
-            packet.arrival,
+            arrival,
+            in_clear_buffer,
             KeyframePlan {
                 start: found.keyframe_start,
                 has_sps: found.sps.is_some(),
@@ -348,10 +519,11 @@ impl ForwardRoom {
             if receiver.secure_pending || receiver.ice_pending {
                 continue;
             }
+            let reachable = receiver.video_reachable();
             let Some(video) = receiver.video.as_mut() else {
                 continue;
             };
-            if !video.receives || !video.reachable() {
+            if !video.receives || !reachable {
                 continue;
             }
             if step == STEP_NONE {
@@ -395,8 +567,14 @@ impl ForwardRoom {
                     };
                     // The translator's clock is the video RTP clock, 90 kHz (RFC 3550 §5.1).
                     let clock = ticks(plan.arrival, VIDEO_CLOCK_RATE_HZ);
+                    // A secure source's packet was unprotected into the room's buffer.
+                    let inbound: &[u8] = if plan.in_clear_buffer {
+                        &self.clear_in
+                    } else {
+                        &packet.data
+                    };
                     let length = match video.translator.translate(
-                        &packet.data,
+                        inbound,
                         video.payload_type,
                         clock,
                         &mut self.scratch,
@@ -422,8 +600,23 @@ impl ForwardRoom {
                     from_tag: self.seats[plan.source].tag.clone(),
                 });
             }
-            let video = self.seats[index].video.as_ref()?;
-            return Some((video.endpoint, video.destination, &self.scratch[..length]));
+            let receiver = &mut self.seats[index];
+            let (endpoint, destination) = receiver.video_route()?;
+            let bundled = receiver.video.as_ref().is_some_and(|video| video.bundled);
+            let Some(sealed) = seal(
+                bundled,
+                receiver.secure.as_mut(),
+                &self.scratch[..length],
+                &mut self.secure_out,
+            ) else {
+                continue;
+            };
+            let wire = if sealed {
+                &self.secure_out[..]
+            } else {
+                &self.scratch[..length]
+            };
+            return Some((endpoint, destination, wire));
         }
     }
 
@@ -442,10 +635,14 @@ impl ForwardRoom {
             if seat.secure_pending || seat.ice_pending {
                 continue;
             }
+            let reachable = seat.video_reachable();
+            let Some((endpoint, destination)) = seat.video_route() else {
+                continue;
+            };
             let Some(video) = seat.video.as_mut() else {
                 continue;
             };
-            if !video.reachable() || !(video.sends || video.receives) {
+            if !reachable || !(video.sends || video.receives) {
                 continue;
             }
             let block = reception_block(
@@ -470,10 +667,25 @@ impl ForwardRoom {
             ) else {
                 continue;
             };
+            // SRTCP under the seat's key for a bundled video (RFC 3711 §3.4), the datagram as it is
+            // otherwise.
+            let Some(sealed) = seal(
+                video.bundled,
+                seat.secure.as_mut(),
+                &buffer[..length],
+                &mut self.secure_out,
+            ) else {
+                continue;
+            };
+            let wire = if sealed {
+                &self.secure_out[..]
+            } else {
+                &buffer[..length]
+            };
             out.push(Outbound {
-                endpoint: video.endpoint,
-                dst: video.destination,
-                data: Bytes::copy_from_slice(&buffer[..length]),
+                endpoint,
+                dst: destination,
+                data: Bytes::copy_from_slice(wire),
             });
             video.stats.record_sent_report(ntp_timestamp, now_micros);
         }

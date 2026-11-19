@@ -94,12 +94,25 @@ pub struct WebrtcOffer<'a> {
     pub fingerprint: &'a Fingerprint,
     /// Offer `m=application ... UDP/DTLS/SCTP webrtc-datachannel` (RFC 8841) bundled with the audio.
     pub data_channel: bool,
+    /// Offer an `m=video` section bundled with the audio (RFC 8843).
+    pub video: Option<WebrtcVideoOffer<'a>>,
+}
+
+/// What a bundled video section of a [`webrtc_seat_offer`] says.
+#[derive(Debug, Clone, Copy)]
+pub struct WebrtcVideoOffer<'a> {
+    /// The `a=fmtp` parameters of the room's H.264 format (RFC 6184 §8.1), when it has one.
+    pub fmtp: Option<&'a str>,
+    /// `b=AS` in kilobits per second.
+    pub bandwidth_kbps: Option<u32>,
 }
 
 /// The `a=mid` of the audio section of a [`webrtc_seat_offer`] (RFC 5888 §4).
 pub const WEBRTC_AUDIO_MID: &str = "0";
 /// The `a=mid` of the data channel section of a [`webrtc_seat_offer`].
 pub const WEBRTC_DATA_CHANNEL_MID: &str = "1";
+/// The `a=mid` of the video section of a [`webrtc_seat_offer`].
+pub const WEBRTC_VIDEO_MID: &str = "2";
 
 /// Write a WebRTC seat's offer: [`conference_seat_offer`]'s audio over `UDP/TLS/RTP/SAVPF` on a
 /// transport the engine terminates (a browser member of a forwarding room).
@@ -138,14 +151,14 @@ pub fn webrtc_seat_offer(
         sdp,
         "v=0{CRLF}o=- {session_id} 1 IN {addrtype} {advertised}{CRLF}s=-{CRLF}t=0 0{CRLF}a=ice-lite{CRLF}"
     );
+    let _ = write!(sdp, "a=group:BUNDLE {WEBRTC_AUDIO_MID}");
     if webrtc.data_channel {
-        let _ = write!(
-            sdp,
-            "a=group:BUNDLE {WEBRTC_AUDIO_MID} {WEBRTC_DATA_CHANNEL_MID}{CRLF}"
-        );
-    } else {
-        let _ = write!(sdp, "a=group:BUNDLE {WEBRTC_AUDIO_MID}{CRLF}");
+        let _ = write!(sdp, " {WEBRTC_DATA_CHANNEL_MID}");
     }
+    if webrtc.video.is_some() {
+        let _ = write!(sdp, " {WEBRTC_VIDEO_MID}");
+    }
+    sdp.push_str(CRLF);
     let mut transport = String::new();
     let _ = write!(
         transport,
@@ -177,6 +190,23 @@ pub fn webrtc_seat_offer(
              a=sctp-port:{DATA_CHANNEL_SCTP_PORT}{CRLF}a=max-message-size:{MAX_MESSAGE_SIZE}{CRLF}",
             port = rtp.port(),
         );
+    }
+    if let Some(video) = &webrtc.video {
+        // RFC 8843 §7.2: on the audio's own port and connection, with the transport attributes
+        // repeated, like the data channel; one payload type, the room's format, with the feedback the
+        // room serves.
+        let _ = write!(
+            sdp,
+            "m=video {port} UDP/TLS/RTP/SAVPF {payload_type}{CRLF}c=IN {addrtype} {advertised}{CRLF}",
+            port = rtp.port(),
+            payload_type = super::video::OFFER_PAYLOAD_TYPE,
+        );
+        if let Some(kbps) = video.bandwidth_kbps {
+            let _ = write!(sdp, "b=AS:{kbps}{CRLF}");
+        }
+        let _ = write!(sdp, "a=mid:{WEBRTC_VIDEO_MID}{CRLF}{transport}");
+        super::video::write_offered_format(&mut sdp, video.fmtp);
+        sdp.push_str("a=sendrecv\r\na=rtcp-mux\r\n");
     }
     sdp
 }
@@ -278,6 +308,10 @@ mod tests {
     }
 
     fn webrtc_offer(data_channel: bool) -> String {
+        webrtc_offer_with(data_channel, None)
+    }
+
+    fn webrtc_offer_with(data_channel: bool, video: Option<WebrtcVideoOffer<'_>>) -> String {
         let address: SocketAddr = "127.0.0.1:30000".parse().expect("address");
         let mut gatherer =
             siphon_rtp_ice::Gatherer::new(siphon_rtp_ice::GatherConfig::host_only(address), 0);
@@ -299,6 +333,7 @@ mod tests {
                 candidates: &candidates,
                 fingerprint: &fingerprint,
                 data_channel,
+                video,
             },
         )
     }
@@ -372,5 +407,59 @@ mod tests {
         assert!(!sdp.contains("m=application"), "{sdp}");
         assert!(sdp.contains("a=group:BUNDLE 0\r\n"), "{sdp}");
         assert!(super::super::parse_data_channel(&sdp).is_none());
+    }
+
+    #[test]
+    fn a_webrtc_offer_with_video_bundles_the_video_on_the_audios_transport() {
+        let sdp = webrtc_offer_with(
+            true,
+            Some(WebrtcVideoOffer {
+                fmtp: Some("profile-level-id=42e01f;packetization-mode=1"),
+                bandwidth_kbps: Some(1200),
+            }),
+        );
+        let lines: Vec<&str> = sdp.split("\r\n").collect();
+        assert!(lines.contains(&"a=group:BUNDLE 0 1 2"), "{sdp}");
+        let video_at = lines
+            .iter()
+            .position(|line| line.starts_with("m=video"))
+            .expect("a video section");
+        assert_eq!(
+            lines[video_at], "m=video 30000 UDP/TLS/RTP/SAVPF 126",
+            "the audio's port"
+        );
+        let video = &lines[video_at..];
+        for expected in [
+            "c=IN IP4 203.0.113.7",
+            "b=AS:1200",
+            "a=mid:2",
+            "a=ice-ufrag:ENGUF",
+            "a=setup:actpass",
+            "a=rtpmap:126 H264/90000",
+            "a=fmtp:126 profile-level-id=42e01f;packetization-mode=1",
+            "a=rtcp-fb:126 nack",
+            "a=rtcp-fb:126 nack pli",
+            "a=rtcp-fb:126 ccm fir",
+            "a=sendrecv",
+            "a=rtcp-mux",
+        ] {
+            assert!(video.contains(&expected), "{expected}: {sdp}");
+        }
+        assert!(
+            !sdp.contains("transport-cc") && !sdp.contains("goog-remb"),
+            "{sdp}"
+        );
+        // The engine's own parser reads the section.
+        let parsed = crate::sdp::video::parse_video(&sdp).expect("video");
+        assert!(parsed.bundled);
+        assert_eq!(parsed.mid.as_deref(), Some("2"));
+        assert_eq!(parsed.transport, "UDP/TLS/RTP/SAVPF");
+    }
+
+    #[test]
+    fn a_webrtc_offer_without_video_has_none_and_keeps_its_group() {
+        let sdp = webrtc_offer(true);
+        assert!(!sdp.contains("m=video"), "{sdp}");
+        assert!(sdp.contains("a=group:BUNDLE 0 1\r\n"), "{sdp}");
     }
 }

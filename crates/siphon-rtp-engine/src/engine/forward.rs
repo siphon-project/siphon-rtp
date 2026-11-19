@@ -336,22 +336,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 let anchored = self.anchor_seat_video(anchored, &video, &transport, profile, &own);
                 let streams = answered_streams(
                     floor_endpoint.is_some() || data_channel.is_some(),
-                    video_endpoint.is_some(),
+                    video.is_open(),
                 );
+                let declined = sdp::decline_unanswered_with_data_channel(
+                    anchored,
+                    sdp::Answered {
+                        floor: floor_endpoint.is_some(),
+                        data_channel: data_channel.is_some(),
+                        video: video.is_open(),
+                        ..sdp::Answered::default()
+                    },
+                );
+                // RFC 8843 §7.3.3: a browser's video the room declined is not in the answer's group.
+                let declined = if transport.dtls_pending() && !video.is_open() {
+                    sdp::video::drop_declined_from_bundle(&declined)
+                } else {
+                    declined
+                };
                 ok_forward_seat(
-                    Some(sdp::force_answer_codec(
-                        &sdp::decline_unanswered_with_data_channel(
-                            anchored,
-                            sdp::Answered {
-                                floor: floor_endpoint.is_some(),
-                                data_channel: data_channel.is_some(),
-                                video: video_endpoint.is_some(),
-                                ..sdp::Answered::default()
-                            },
-                        ),
-                        &spec,
-                        telephone_event,
-                    )),
+                    Some(sdp::force_answer_codec(&declined, &spec, telephone_event)),
                     Some(from_tag),
                     streams,
                     video.declined(),

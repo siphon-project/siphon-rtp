@@ -32,6 +32,7 @@ pub(super) fn video_seat(index: u8, direction: MediaDirection) -> ForwardSeatCon
         format: format(),
         feedback: VideoFeedback::default(),
         cname: String::new(),
+        bundled: false,
     });
     config
 }

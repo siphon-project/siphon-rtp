@@ -523,7 +523,8 @@ impl ForwardRoom {
             self.by_endpoint
                 .insert(floor.endpoint, (self.seats.len(), Port::Floor));
         }
-        if let Some(video) = &config.video {
+        // A bundled video (RFC 8843) shares the audio's endpoint: it is told apart after the gate.
+        if let Some(video) = config.video.as_ref().filter(|video| !video.bundled) {
             self.by_endpoint
                 .insert(video.endpoint, (self.seats.len(), Port::Video));
         }
@@ -597,7 +598,7 @@ impl ForwardRoom {
                 self.by_endpoint
                     .insert(floor.endpoint, (position, Port::Floor));
             }
-            if let Some(video) = &seat.video {
+            if let Some(video) = seat.video.as_ref().filter(|video| !video.bundled) {
                 self.by_endpoint
                     .insert(video.endpoint, (position, Port::Video));
             }
@@ -775,6 +776,14 @@ impl ForwardRoom {
         }
         if self.codec.media() == ForwardMedia::Preserve {
             return self.ingest_preserved(index, packet);
+        }
+        // RFC 8843 §9.2: a bundled video shares this endpoint, told from the audio by payload type.
+        if seat
+            .video
+            .as_ref()
+            .is_some_and(|video| video::is_bundled_video(video, data))
+        {
+            return self.ingest_bundled_video(index, packet, in_clear_buffer);
         }
         // RFC 5761 demux. The room terminates RTCP: it reads the seat's reports and drops the
         // datagram. Relaying one seat's reports to the others would describe streams the receivers

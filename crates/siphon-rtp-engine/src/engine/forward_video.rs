@@ -8,9 +8,12 @@
 //! room. Otherwise the seat joins audio-only and the result says why (`video_declined`), so a
 //! controller never has to parse the answer to find out.
 //!
-//! SRTP, SDES and DTLS video and preserve-room video are not carried yet: a plain answer to a secure
-//! offer would send the seat video it cannot decrypt, and a preserve room forwards SRTP the engine
-//! holds no key for (3GPP TS 33.180 §7.5.2 NOTE 3).
+//! A browser seat (`UDP/TLS/RTP/SAVPF`) carries its video bundled with its audio on the seat's one
+//! ICE/DTLS transport (RFC 8843): the video has no endpoint of its own, and what the seat sends and
+//! is sent travels on the seat's endpoint under the seat's DTLS-SRTP key. A video section on a
+//! transport of its own is declined, and so is SDES-SRTP video: a plain answer to a secure offer
+//! would send the seat video it cannot decrypt. Preserve-room video is not carried either: a preserve
+//! room forwards SRTP the engine holds no key for (3GPP TS 33.180 §7.5.2 NOTE 3).
 
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction, SourceFilter};
 use siphon_rtp_proto::{CmdResult, ForwardMedia, ProfileFlags};
@@ -18,7 +21,7 @@ use siphon_rtp_proto::{CmdResult, ForwardMedia, ProfileFlags};
 use crate::forward::VideoConfig;
 use crate::sdp::video::{
     choose_answered_video, choose_video, parse_video, video_offer_section, RoomVideoFormat,
-    VideoAnswer, VideoChoice,
+    VideoAnswer, VideoChoice, WEBRTC_VIDEO_TRANSPORT,
 };
 use crate::sdp::{self, EngineMedia, OwnSsrc};
 
@@ -41,7 +44,8 @@ pub(super) enum VideoSeat {
 
 /// A seat's open video endpoint and what its offer settled.
 pub(super) struct OpenVideo {
-    pub(super) endpoint: Endpoint,
+    /// The video's own endpoint; `None` for a bundled video, which rides the seat's audio endpoint.
+    pub(super) endpoint: Option<Endpoint>,
     pub(super) choice: VideoChoice,
     pub(super) config: VideoConfig,
 }
@@ -49,9 +53,14 @@ pub(super) struct OpenVideo {
 impl VideoSeat {
     pub(super) fn endpoint(&self) -> Option<Endpoint> {
         match self {
-            Self::Open(open) => Some(open.endpoint),
+            Self::Open(open) => open.endpoint,
             _ => None,
         }
+    }
+
+    /// The seat's video is carried, on an endpoint of its own or bundled with the audio.
+    pub(super) fn is_open(&self) -> bool {
+        matches!(self, Self::Open(_))
     }
 
     pub(super) fn declined(&self) -> Option<String> {
@@ -97,6 +106,12 @@ pub(super) enum OfferedVideo {
     Declined(String),
     /// The video endpoint and the offer section on it.
     Section { endpoint: Endpoint, section: String },
+    /// A WebRTC offer's video: a section of the audio's own transport (RFC 8843), written with the
+    /// rest of the offer, so there is no endpoint to allocate.
+    Bundled {
+        fmtp: Option<String>,
+        bandwidth_kbps: Option<u32>,
+    },
 }
 
 /// Check the profile's video settings before anything is allocated.
@@ -116,6 +131,10 @@ pub(super) fn validate_video_profile(profile: &ProfileFlags) -> Result<(), Strin
 }
 
 /// Why a seat that reached the room cannot carry video at all, whatever its offer says.
+///
+/// A WebRTC seat (DTLS-SRTP audio, whose handshake and ICE run on the seat's endpoint) carries video
+/// bundled with its audio (RFC 8843), so it is not refused here; the offer's video section must then
+/// be a bundled `UDP/TLS/RTP/SAVPF` one ([`choose_video`] says so). Every other secure seat is.
 fn refuse_video_seat(
     media: ForwardMedia,
     info: &sdp::MediaInfo,
@@ -125,6 +144,9 @@ fn refuse_video_seat(
         return Some(
             "video is carried by translate rooms only (preserve-room video is not carried yet)",
         );
+    }
+    if is_webrtc_seat(info, transport) {
+        return None;
     }
     if info.secure
         || info.dtls
@@ -137,6 +159,11 @@ fn refuse_video_seat(
         return Some("the seat's media is SRTP, and secure video is not carried yet");
     }
     None
+}
+
+/// Whether the seat is a browser: DTLS-SRTP audio keyed by a handshake on its endpoint.
+fn is_webrtc_seat(info: &sdp::MediaInfo, transport: &SeatTransport) -> bool {
+    info.dtls && info.crypto.is_empty() && transport.dtls_pending() && transport.secure.is_none()
 }
 
 /// The streams a seat's answer carries live, in the order of the offer.
@@ -231,6 +258,34 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(choice) => choice,
             Err(reason) => return Ok(VideoSeat::Declined(reason)),
         };
+        // RFC 3264 §6: the answer keeps the offer's transport, so a browser seat's video must be a
+        // browser's, and a plain seat's must not be.
+        let webrtc_seat = is_webrtc_seat(join.info, join.transport);
+        let webrtc_video = choice
+            .transport
+            .eq_ignore_ascii_case(WEBRTC_VIDEO_TRANSPORT);
+        if webrtc_seat != webrtc_video {
+            return Ok(VideoSeat::Declined(
+                if webrtc_seat {
+                    "the seat's audio is DTLS-SRTP, so its video must be UDP/TLS/RTP/SAVPF bundled with it (RFC 8843); plain video on a secure seat is not carried"
+                } else {
+                    "UDP/TLS/RTP/SAVPF video needs the seat's audio keyed by DTLS-SRTP on the same transport (RFC 8843)"
+                }
+                .to_string(),
+            ));
+        }
+        if webrtc_seat {
+            // RFC 8843 §8: one transport. The video has no endpoint, latch or key of its own: it
+            // arrives on the seat's endpoint after the seat's gate and SRTP, and leaves under the
+            // seat's key to the seat's latched destination.
+            let config =
+                bundled_video_config(join.transport.endpoint, &choice, join.cname.to_string());
+            return Ok(VideoSeat::Open(Box::new(OpenVideo {
+                endpoint: None,
+                choice,
+                config,
+            })));
+        }
         if AddressFamily::of(choice.remote.ip()) != join.transport.family {
             return Ok(VideoSeat::Declined(
                 "the video stream is in another address family than the seat's audio".to_string(),
@@ -262,7 +317,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             join.cname.to_string(),
         );
         Ok(VideoSeat::Open(Box::new(OpenVideo {
-            endpoint,
+            endpoint: Some(endpoint),
             choice,
             config,
         })))
@@ -286,7 +341,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &answer,
             &VideoAnswer {
                 engine: EngineMedia {
-                    rtp: open.endpoint.local_addr,
+                    // A bundled video is anchored on the audio's transport, which `anchor_video`
+                    // reads from the answer.
+                    rtp: open
+                        .endpoint
+                        .map_or(transport.endpoint.local_addr, |own| own.local_addr),
                     rtcp: None,
                     advertised_ip: transport.advertised,
                 },
@@ -322,19 +381,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .to_string(),
             ));
         }
-        if request.want_webrtc {
-            return Ok(OfferedVideo::Declined(
-                "browser video is not carried yet (a WebRTC seat has no video stream)".to_string(),
-            ));
-        }
-        let endpoint = match self.alloc_endpoints(1, request.family, request.bind).await {
-            Ok(mut endpoints) => endpoints.remove(0),
-            Err(reason) => return Err(reason.to_string()),
-        };
         // The room's format when it has one, else the controller's, else the member's answer fixes it.
         let fmtp = match self.conference.forward().room_video_format(request.room_id) {
             Some(format) => format.fmtp,
             None => video.fmtp.clone(),
+        };
+        if request.want_webrtc {
+            return Ok(OfferedVideo::Bundled {
+                fmtp,
+                bandwidth_kbps: video.bandwidth_kbps,
+            });
+        }
+        let endpoint = match self.alloc_endpoints(1, request.family, request.bind).await {
+            Ok(mut endpoints) => endpoints.remove(0),
+            Err(reason) => return Err(reason.to_string()),
         };
         let advertised = request
             .advertised_override
@@ -346,6 +406,34 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             video.bandwidth_kbps,
         );
         Ok(OfferedVideo::Section { endpoint, section })
+    }
+
+    /// Read a browser member's answer to the bundled video section of a WebRTC `forward_offer`: the
+    /// seat's video config when it kept the section, bundled, in a format that fits the room, else
+    /// the reason it did not.
+    pub(super) fn negotiate_bundled_video(
+        &self,
+        room_id: &str,
+        answer: &str,
+        profile: &ProfileFlags,
+        endpoint: Endpoint,
+    ) -> Result<VideoConfig, String> {
+        let offered = parse_video(answer)
+            .ok_or_else(|| "the answer declined the video stream (port 0)".to_string())?;
+        let fixed = self.video_format_in_force(room_id, profile)?;
+        let choice = choose_answered_video(&offered, fixed.as_ref())?;
+        if !choice
+            .transport
+            .eq_ignore_ascii_case(WEBRTC_VIDEO_TRANSPORT)
+        {
+            return Err(format!(
+                "the answer's video is {}, but the offer's was {WEBRTC_VIDEO_TRANSPORT} (RFC 3264 §6)",
+                choice.transport
+            ));
+        }
+        // The offer carried no CNAME for the seat's streams: the room gives them one of its own.
+        let cname = sdp::OwnSsrc::with_random_cname(0).cname;
+        Ok(bundled_video_config(endpoint, &choice, cname))
     }
 
     /// Read a member's answer to an offered video stream: its video config when it accepted a stream
@@ -381,6 +469,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 }
 
+/// The room's config for a browser seat's bundled video: the seat's own endpoint, and no destination,
+/// source gate or key of its own, because the room uses the seat's (`VideoConfig::bundled`).
+fn bundled_video_config(endpoint: Endpoint, choice: &VideoChoice, cname: String) -> VideoConfig {
+    let mut config = video_config(
+        endpoint,
+        choice,
+        std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0),
+        SourceFilter::Any,
+        cname,
+    );
+    config.bundled = true;
+    config
+}
+
 /// The video gate of a plain seat: the signalled address only, unless the profile is `symmetric`
 /// (docs/security-and-nat.md §4 layer 2).
 fn video_source_filter(profile: &ProfileFlags, destination: std::net::SocketAddr) -> SourceFilter {
@@ -412,5 +514,6 @@ fn video_config(
         format: choice.format.clone(),
         feedback: choice.feedback,
         cname,
+        bundled: false,
     }
 }
