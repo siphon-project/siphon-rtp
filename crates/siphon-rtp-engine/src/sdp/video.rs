@@ -13,11 +13,14 @@
 //! Kept apart from [`super::rewrite`], which copies an `m=video` section through untouched: this pass
 //! re-originates the section on the finished answer, as the control stream module does for the control stream.
 
+mod h264_profile;
+
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 
+use h264_profile::{max_recv_level, Level, ProfileLevel};
+
 use super::floor::split_lines;
-use super::h264_profile::{max_recv_level, Level, ProfileLevel};
 use super::{addrtype, parse_connection_addr, EngineMedia, MediaDirection, OwnSsrc, CRLF};
 
 /// The RTP clock of video: 90 kHz (RFC 6184 §8.2.1 for H.264, RFC 3551 §5 for video in general).

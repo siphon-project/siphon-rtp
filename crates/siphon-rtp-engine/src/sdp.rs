@@ -22,7 +22,6 @@ mod data_channel;
 mod decline;
 mod direction;
 pub(crate) mod floor;
-mod h264_profile;
 mod key_mgmt;
 mod offer;
 mod stream_identity;
