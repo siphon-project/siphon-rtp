@@ -337,6 +337,14 @@ mod tests {
             rtcp_mux: false,
             transport: transport.to_string(),
             crypto,
+            mid: None,
+            bundled: false,
+            audio_mid: None,
+            payload_collision: false,
+            payload_types: vec![96],
+            fingerprint: None,
+            setup: None,
+            ice: false,
         }
     }
 

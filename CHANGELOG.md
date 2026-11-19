@@ -29,14 +29,19 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   `siphon_rtp_video_packets_total` / `siphon_rtp_video_bytes_total` count it. Plain RTP or SDES-SRTP per leg
   (`a=crypto` per video section, the engine's own key toward each secure party and the offered tag
   echoed; plain to SDES, SDES to plain and SDES to SDES, SRTCP per stream, rollover carried across a
-  re-offer and in the snapshot, which has its own version for a secure stream). DTLS-SRTP video and a
-  stream that cannot be keyed are declined with the reason in `video_declined`. Every verb that takes a
+  re-offer and in the snapshot, which has its own version for a secure stream), or DTLS-SRTP (RFC 5764) where
+  the engine terminates one party's DTLS: bundled with the audio on its association (RFC 8843, told from the
+  audio by payload type and SSRC, the answer keeping the group and mids), or on a second association of the
+  video's own. Unbundled video with ICE, DTLS toward SDES and a stream that cannot be keyed are declined with
+  the reason in `video_declined`; a DTLS call is not checkpointed, video included. Every verb that takes a
   profile but has no video stream to anchor (rooms, `answer_local`, `offer_far`, subscriptions,
   `attach_ws_bridge`) refuses the field instead of ignoring it, and a call carrying anchored video is not
-  seated in a room. `node_info` lists `call_video_anchor` and, for SDES-SRTP video, `call_video_sdes`.
+  seated in a room. `node_info` lists `call_video_anchor` and, for SDES-SRTP video, `call_video_sdes` and, for DTLS-SRTP video, `call_video_dtls`.
 
 ### Fixed
 
+- **The userspace DTLS bridge reuses its crypto buffers** too, the SRTP bridge's pool: it allocated a `Vec`
+  for every datagram it decrypted or encrypted.
 - **The userspace SRTP bridge reuses its crypto buffers.** It allocated two `Vec`s for every datagram it
   decrypted or encrypted; the steady state now allocates nothing per packet.
 - **A video stream the engine passes through keeps its own address.** Rewriting the session `c=` to

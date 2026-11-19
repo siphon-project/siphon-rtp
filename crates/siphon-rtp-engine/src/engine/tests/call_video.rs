@@ -817,6 +817,7 @@ async fn node_info_advertises_call_video_anchor() {
     };
     assert!(node.features.iter().any(|name| name == "call_video_anchor"));
     assert!(node.features.iter().any(|name| name == "call_video_sdes"));
+    assert!(node.features.iter().any(|name| name == "call_video_dtls"));
 }
 
 #[tokio::test]

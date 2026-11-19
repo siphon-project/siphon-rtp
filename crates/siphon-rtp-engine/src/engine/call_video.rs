@@ -26,12 +26,18 @@ pub(super) struct VideoLeg {
     /// Where this side receives video RTP, from its SDP. `None` until known (B's, before its answer).
     pub(super) remote_rtp: Option<SocketAddr>,
     pub(super) remote_rtcp: Option<SocketAddr>,
+    /// The stream rides the leg's audio endpoint and its DTLS association (RFC 8843): `rtp` is the
+    /// audio's, which this stream does not own.
+    pub(super) bundled: bool,
 }
 
 impl VideoLeg {
-    /// Every datapath endpoint of the stream.
+    /// Every datapath endpoint the stream owns: none when it is bundled with the audio.
     pub(super) fn endpoint_ids(&self) -> impl Iterator<Item = EndpointId> {
-        std::iter::once(self.rtp.id).chain(self.rtcp.map(|endpoint| endpoint.id))
+        let bundled = self.bundled;
+        std::iter::once(self.rtp.id)
+            .filter(move |_| !bundled)
+            .chain(self.rtcp.map(|endpoint| endpoint.id))
     }
 
     /// The endpoints this leg presents in SDP, at the leg's advertised address.
@@ -62,6 +68,8 @@ pub(super) struct CallVideo {
     /// The flows the SRTP bridge carries when either party is secure: their source gates, latches
     /// and destinations, kept for the snapshot and for the rollover read on a renegotiation.
     pub(super) bridged: Vec<VideoFlowRule>,
+    /// Each party's DTLS-SRTP keying of the stream, see [`super::call_video_dtls`].
+    pub(super) dtls: super::call_video_dtls::VideoDtls,
 }
 
 /// The leg's video stream rebuilt from its snapshot and the endpoints bound for it.
@@ -76,6 +84,7 @@ pub(super) fn video_leg(
         rtcp,
         remote_rtp: snapshot.remote_rtp,
         remote_rtcp: snapshot.remote_rtcp,
+        bundled: false,
     })
 }
 
@@ -110,6 +119,7 @@ pub(super) fn restored_call_video(
         declined: None,
         keys,
         bridged: Vec::new(),
+        dtls: super::call_video_dtls::VideoDtls::default(),
     })
 }
 
@@ -379,12 +389,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             rtcp,
             remote_rtp: None,
             remote_rtcp: None,
+            bundled: false,
         })
     }
 
     /// Free the call's video endpoints and flows (the stream was declined, dropped, or the call
     /// never carried one).
-    async fn free_call_video(&self, call_id: &str) {
+    pub(super) async fn free_call_video(&self, call_id: &str) {
+        self.drop_dtls_video(call_id);
         let mut freed = Vec::new();
         if let Some(mut call) = self.calls.get_mut(call_id) {
             if let Some(video) = call.near.video.take() {
@@ -465,22 +477,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         outcome
     }
 
-    /// Whether the engine offers a first-offered video stream's far party SRTP, as the audio leg's
-    /// far transport says (`RTP/SAVP`), or the reason it cannot: a DTLS far leg carries no video.
-    fn far_offers_srtp(&self, call_id: &str, profile: &ProfileFlags) -> Result<bool, String> {
+    /// Whether the engine offers a first-offered video stream's far party SDES-SRTP, as the audio
+    /// leg's far transport says (`RTP/SAVP`). A DTLS-SRTP far leg is keyed by its own association
+    /// instead ([`super::call_video_dtls`]).
+    fn far_offers_srtp(&self, call_id: &str, profile: &ProfileFlags) -> bool {
         let transport = profile.transport_protocol.as_deref().unwrap_or_default();
         let (audio_dtls, audio_sdes) = self
             .calls
             .get(call_id)
             .map(|call| (call.far_dtls, call.far_local_crypto.is_some()))
             .unwrap_or_default();
-        if transport.contains("UDP/TLS") || audio_dtls {
-            return Err(
-                "video is not carried toward a DTLS-SRTP far leg: DTLS-SRTP video is not supported"
-                    .to_string(),
-            );
-        }
-        Ok(transport.contains("SAVP") || audio_sdes)
+        !audio_dtls && (transport.contains("SAVP") || audio_sdes)
     }
 
     async fn anchor_video_stream(
@@ -504,17 +511,35 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else if allocated.is_some() {
             Exchange::Offer
         } else {
-            match self.far_offers_srtp(call_id, profile) {
-                Ok(far_secure) => Exchange::FirstOffer { far_secure },
-                Err(reason) => {
-                    self.free_call_video(call_id).await;
-                    return VideoOutcome::declined(reason);
-                }
+            Exchange::FirstOffer {
+                far_secure: self.far_offers_srtp(call_id, profile),
             }
         };
-        if let Err(reason) = keys.settle(party, stream, exchange) {
+        if let Err(reason) = self.settle_dtls_video(
+            call_id,
+            party,
+            stream,
+            matches!(exchange, Exchange::FirstOffer { .. }),
+            profile,
+        ) {
             self.free_call_video(call_id).await;
             return VideoOutcome::declined(reason);
+        }
+        // A DTLS stream is keyed by its handshake, not by SDES keys.
+        if !stream.is_dtls() {
+            if let Err(reason) = keys.settle(party, stream, exchange) {
+                self.free_call_video(call_id).await;
+                return VideoOutcome::declined(reason);
+            }
+        }
+        let bundled_near = party == Party::Near && stream.is_dtls() && stream.bundled;
+        if let Some((near_video, _)) = allocated {
+            if party == Party::Near && near_video.bundled != bundled_near {
+                self.free_call_video(call_id).await;
+                return VideoOutcome::declined(
+                    "a re-offer cannot move the video stream in or out of the audio's bundle",
+                );
+            }
         }
         let muxed = match allocated {
             Some((near_video, _)) => near_video.rtcp.is_none(),
@@ -533,9 +558,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.free_call_video(call_id).await;
                 return VideoOutcome::declined("the offer carried no video stream to answer");
             }
-            let near_video = match self.alloc_video_leg(&near, muxed).await {
-                Ok(video) => video,
-                Err(reason) => return VideoOutcome::declined(format!("video endpoints: {reason}")),
+            let near_video = if bundled_near {
+                // RFC 8843: the video shares the audio's transport, so it owns no endpoint.
+                VideoLeg {
+                    rtp: near.rtp,
+                    rtcp: None,
+                    remote_rtp: None,
+                    remote_rtcp: None,
+                    bundled: true,
+                }
+            } else {
+                match self.alloc_video_leg(&near, muxed).await {
+                    Ok(video) => video,
+                    Err(reason) => {
+                        return VideoOutcome::declined(format!("video endpoints: {reason}"))
+                    }
+                }
             };
             let far_video = match self.alloc_video_leg(&far, muxed).await {
                 Ok(video) => video,
@@ -588,7 +626,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Some(engine) => VideoOutcome {
                 rewrite: VideoRewrite::Anchor {
                     engine,
-                    keying: keys.keying_toward(toward),
+                    keying: self
+                        .dtls_keying_toward(call_id, toward)
+                        .unwrap_or_else(|| keys.keying_toward(toward)),
                 },
                 declined: None,
             },
@@ -737,6 +777,45 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // (RFC 5761), where a kernel rule cannot tell the two apart: the RTP direction rule then
         // yields to the RTCP one, see docs/security-and-nat.md.
         let any = near_to_far || far_to_near;
+        let dtls_party = self.calls.get(call_id).and_then(|call| {
+            call.video
+                .dtls
+                .near
+                .as_ref()
+                .map(|_| Party::Near)
+                .or_else(|| call.video.dtls.far.as_ref().map(|_| Party::Far))
+        });
+        if let Some(secure_party) = dtls_party {
+            let near_address = near_gate.unwrap_or(near_rtp);
+            let (secure, plain, secure_address, plain_address, to_secure, to_plain) =
+                match secure_party {
+                    Party::Near => (near, far, near_address, far_gate, far_to_near, near_to_far),
+                    Party::Far => (far, near, far_gate, near_address, near_to_far, far_to_near),
+                };
+            let audio_endpoint = self
+                .calls
+                .get(call_id)
+                .map(|call| match secure_party {
+                    Party::Near => call.near.rtp.id,
+                    Party::Far => call.far.as_ref().map_or(secure.rtp.id, |far| far.rtp.id),
+                })
+                .unwrap_or(secure.rtp.id);
+            return self.install_dtls_video(
+                call_id,
+                profile,
+                super::call_video_dtls::DtlsVideoLegs {
+                    secure_party,
+                    secure: secure.rtp.id,
+                    plain: plain.rtp.id,
+                    audio_endpoint,
+                    secure_local: secure.rtp.local_addr,
+                    secure_address,
+                    plain_address,
+                    to_secure,
+                    to_plain,
+                },
+            );
+        }
         let near_rule = ingress_rule(far.rtp.id, Some(far_gate), near_gate, profile, false);
         let far_rule = ingress_rule(near.rtp.id, near_gate, Some(far_gate), profile, false);
         let muxed = near.rtcp.is_none() || far.rtcp.is_none();

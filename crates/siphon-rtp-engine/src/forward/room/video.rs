@@ -219,54 +219,9 @@ pub(super) fn is_bundled_video(video: &VideoStream, data: &[u8]) -> bool {
     data.len() >= 2 && data[1] & 0x7F == video.payload_type
 }
 
-/// Whether an RTCP datagram concerns the video stream: it is sent by the seat's video sender (`sender`,
-/// known once the seat has sent video), carries a reception report block about the stream the room
-/// sends it (`egress`, RFC 3550 §6.4), or is feedback about it (RFC 4585 §6.1, RFC 5104 §4.3.1).
+/// Whether an RTCP datagram concerns the room's video stream, see [`seat_gate::rtcp_is_about_video`].
 pub(super) fn rtcp_is_about_video(data: &[u8], egress: u32, sender: Option<u32>) -> bool {
-    const SENDER_REPORT: u8 = 200;
-    const RECEIVER_REPORT: u8 = 201;
-    const TRANSPORT_FEEDBACK: u8 = 205;
-    const PAYLOAD_FEEDBACK: u8 = 206;
-    let word = |packet: &[u8], at: usize| {
-        packet
-            .get(at..at + 4)
-            .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    };
-    let mut rest = data;
-    while rest.len() >= 8 && rest[0] >> 6 == 2 {
-        let length = (usize::from(u16::from_be_bytes([rest[2], rest[3]])) + 1) * 4;
-        let Some(packet) = rest.get(..length) else {
-            return false;
-        };
-        let count = usize::from(packet[0] & 0x1F);
-        let from = word(packet, 4);
-        let about = match packet[1] {
-            SENDER_REPORT | RECEIVER_REPORT => {
-                let first = if packet[1] == SENDER_REPORT { 28 } else { 8 };
-                (0..count).any(|block| word(packet, first + block * 24) == Some(egress))
-            }
-            TRANSPORT_FEEDBACK => word(packet, 8) == Some(egress),
-            // A FIR names its streams in the FCI entries (RFC 5104 §4.3.1.1), 8 octets each; the
-            // header's media SSRC is 0 for it.
-            PAYLOAD_FEEDBACK => {
-                word(packet, 8) == Some(egress)
-                    || (12..length.saturating_sub(7))
-                        .step_by(8)
-                        .any(|at| word(packet, at) == Some(egress))
-            }
-            _ => false,
-        };
-        let from_video = matches!(
-            packet[1],
-            SENDER_REPORT | RECEIVER_REPORT | TRANSPORT_FEEDBACK | PAYLOAD_FEEDBACK
-        ) && sender.is_some()
-            && from == sender;
-        if about || from_video {
-            return true;
-        }
-        rest = &rest[length..];
-    }
-    false
+    seat_gate::rtcp_is_about_video(data, Some(egress), sender)
 }
 
 /// Read a seat's video RTCP: the sender report's time becomes our LSR, reception report blocks about

@@ -197,9 +197,20 @@ the stream like the audio:
   other. A far party is offered SRTP when the profile's `transport_protocol` asks for `RTP/SAVP`, as for audio.
   Plain to SDES (a door station on plain RTP to an SDES phone), SDES to plain and SDES to SDES (re-keyed, not
   forwarded) all work, RTCP becomes SRTCP per stream, and a re-offer carries the SRTP rollover over. A secure
-  stream runs through the userspace SRTP bridge, not the kernel relay. DTLS-SRTP video, a secure answer to a
-  plain offer (or the reverse), and a section with no usable `a=crypto` are declined with port 0 and the reason
-  in `video_declined`.
+  stream runs through the userspace SRTP bridge, not the kernel relay. A secure answer to a plain offer (or the
+  reverse) and a section with no usable `a=crypto` are declined with port 0 and the reason in `video_declined`.
+- **DTLS-SRTP video** (RFC 5764) is carried where the engine terminates one party's DTLS (a DTLS caller with
+  `transport_protocol: RTP/AVP` or `dtls: off`, or a far leg asked for `UDP/TLS/RTP/SAVPF`) and the other
+  party is plain RTP. A browser or modern phone **bundles** its video with the audio (`a=group:BUNDLE`,
+  RFC 8843): the video rides the audio's address and its one handshake, the answer keeps the group and both
+  mids, and the engine's fingerprint and `a=setup` appear once, on the audio section. The other party gets
+  plain video on an endpoint of its own and no bundle. A phone that does not bundle gets a second association
+  on the video endpoint: its own handshake, the engine's one certificate, the `a=setup` of its own section.
+  A re-offer keeps the association, and a call with DTLS video is not checkpointed, as a DTLS call is not.
+  Declined with the reason: video not bundled that carries ICE (ICE would run per `m=` line, which no client
+  needs us to do), a section without `a=rtcp-mux`, DTLS toward an SDES leg (audio refuses that posture too),
+  a call whose DTLS audio passes through to the other party, and bundled video on a leg whose audio the
+  media pipeline transcodes or records.
 - `query`, the end-of-call record and `siphon_rtp_video_*` give per-stream packets and bytes, so "no
   picture" reads as zero packets in (the camera never reached the engine) or in with none out.
 

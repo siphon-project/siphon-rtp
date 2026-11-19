@@ -13,6 +13,9 @@
 //! - `secure_rtp_to_plain_tapped` — the same packet with one plaintext tap on the leg (a decoded
 //!   recording or a WebSocket tee on a bridged call). The delta against `secure_rtp_to_plain` is what
 //!   a tapped bridge leg pays per packet: one copy of the plaintext and a `try_send`.
+//! - `bundled_video_secure_to_plain` and `bundled_video_plain_to_secure` — a 1200 byte video packet
+//!   (RFC 8843: one association, told from the audio by payload type) crossing the same leg. The
+//!   delta against `secure_rtp_to_plain` is the demux, and the larger payload.
 //! - `unkeyed_drop` — SRTP arriving before any handshake has keyed the leg. It has to stay cheaper
 //!   than a keyed packet: a peer that floods before the handshake must not cost more than one that
 //!   completes it.
@@ -42,7 +45,7 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, RxPacket, SourceFilter};
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, DtlsSession, Fingerprint};
-use siphon_rtp_engine::dtls_bridge::{DtlsBridge, DtlsCallPlan, PlainRtcp};
+use siphon_rtp_engine::dtls_bridge::{DtlsBridge, DtlsCallPlan, DtlsVideoPlan, PlainRtcp};
 use siphon_rtp_srtp::leg::SecureLeg;
 use tokio::net::UdpSocket;
 
@@ -204,6 +207,25 @@ fn dtls_bridge_handle(criterion: &mut Criterion) {
             dst: addr_a_rtcp,
         }),
     ));
+    // A video stream bundled on the same association, toward a phone of its own.
+    let (video_endpoint, phone_video) = runtime.block_on(async {
+        (
+            datapath.alloc_endpoint().await.expect("plain video"),
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+                .await
+                .expect("bind video"),
+        )
+    });
+    let addr_video = phone_video.local_addr().expect("addr video");
+    assert!(bridge.attach_video(&DtlsVideoPlan {
+        secure_endpoint: secure.id,
+        plain_endpoint: video_endpoint.id,
+        plain_source: SourceFilter::Exact(addr_video.ip()),
+        plain_dst: addr_video,
+        payload_types: vec![96],
+        to_secure: true,
+        to_plain: true,
+    }));
     // A second call that never handshakes, for the unkeyed drop.
     let unkeyed = DtlsBridge::new(datapath.clone());
     unkeyed.register(plan(
@@ -289,6 +311,48 @@ fn dtls_bridge_handle(criterion: &mut Criterion) {
                 Bytes::from(sealed)
             },
             |sealed| runtime.block_on(bridge.handle(black_box(packet(secure.id, addr_b, sealed)))),
+            BatchSize::SmallInput,
+        )
+    });
+
+    let video_frame = |sequence: u16, ssrc: u32| {
+        let mut packet = vec![0x80, 96];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&(u32::from(sequence) * 3000).to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.resize(1200, 0xAB);
+        packet
+    };
+    let mut sequence = 1_000u16;
+    group.bench_function("bundled_video_secure_to_plain", |bencher| {
+        bencher.iter_batched(
+            || {
+                sequence = sequence.wrapping_add(1);
+                let mut sealed = Vec::new();
+                peer_leg
+                    .protect(&video_frame(sequence, 0x5151_5151), &mut sealed)
+                    .expect("peer protect video");
+                Bytes::from(sealed)
+            },
+            |sealed| runtime.block_on(bridge.handle(black_box(packet(secure.id, addr_b, sealed)))),
+            BatchSize::SmallInput,
+        )
+    });
+
+    let mut sequence = 1_000u16;
+    group.bench_function("bundled_video_plain_to_secure", |bencher| {
+        bencher.iter_batched(
+            || {
+                sequence = sequence.wrapping_add(1);
+                Bytes::from(video_frame(sequence, 0x6161_6161))
+            },
+            |frame| {
+                runtime.block_on(bridge.handle(black_box(packet(
+                    video_endpoint.id,
+                    addr_video,
+                    frame,
+                ))))
+            },
             BatchSize::SmallInput,
         )
     });
