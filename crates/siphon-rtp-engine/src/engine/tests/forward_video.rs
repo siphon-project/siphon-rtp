@@ -832,6 +832,90 @@ async fn node_info_advertises_forward_video() {
         .features
         .iter()
         .any(|name| name == "forward_video_keyframe"));
+    assert!(node
+        .features
+        .iter()
+        .any(|name| name == "forward_video_h264"));
+}
+
+#[tokio::test]
+async fn a_seat_at_a_higher_level_is_seated_at_the_rooms_level_and_video_flows_both_ways() {
+    // RFC 6184 §8.2.2: the level part of profile-level-id is changeable. A level 4 phone in a
+    // level 3.1 room is answered at 3.1 and both directions carry video.
+    let engine = engine_of(16);
+    let _events = engine.register_client(CLIENT);
+    let room_seat = video_phone(&engine, "a", 99, "sendrecv", CHP_L31).await;
+    let higher = video_phone(
+        &engine,
+        "b",
+        105,
+        "sendrecv",
+        "profile-level-id=640c28;packetization-mode=1",
+    )
+    .await;
+    assert!(
+        higher
+            .answer
+            .contains("a=fmtp:105 profile-level-id=640c1f;packetization-mode=1\r\n"),
+        "{}",
+        higher.answer
+    );
+    let idr = [0x65, 0x88, 1, 2, 3];
+    set_source(&engine, "a").await;
+    room_seat
+        .video
+        .send_to(
+            &video_packet(99, 10, 90_000, 0xA0A0_A0A0, true, &idr),
+            room_seat.engine_video,
+        )
+        .await
+        .expect("send");
+    let heard = recv_rtp(&higher.video, SHORT).await.expect("video to b");
+    assert_eq!(RtpPacket::parse(&heard).expect("rtp").payload, idr);
+    set_source(&engine, "b").await;
+    higher
+        .video
+        .send_to(
+            &video_packet(105, 1, 3_000, 0xB0B0_B0B0, true, &idr),
+            higher.engine_video,
+        )
+        .await
+        .expect("send");
+    let back = recv_rtp(&room_seat.video, SHORT).await.expect("video to a");
+    assert_eq!(RtpPacket::parse(&back).expect("rtp").payload, idr);
+    drop((room_seat.audio, higher.audio));
+}
+
+#[tokio::test]
+async fn a_receiving_seat_below_the_rooms_level_joins_audio_only_naming_the_levels() {
+    let engine = engine_of(16);
+    let _events = engine.register_client(CLIENT);
+    let _first = video_phone(&engine, "a", 99, "sendrecv", CHP_L31).await;
+    let (_, audio) = phone().await;
+    let (_, video) = phone().await;
+    let result = join(
+        &engine,
+        ForwardMedia::Translate,
+        "b",
+        offer(
+            audio,
+            Some((
+                video,
+                99,
+                "sendrecv",
+                "profile-level-id=640c1e;packetization-mode=1",
+            )),
+            None,
+        ),
+        profile(carry_video()),
+    )
+    .await;
+    assert_eq!(streams(&result), ["audio"]);
+    let reason = video_declined(&result).expect("a reason");
+    assert!(
+        reason.contains("up to level 3,") && reason.contains("level 3.1"),
+        "{reason}"
+    );
 }
 
 /// The first RTCP datagram carrying feedback (a PLI, FIR or NACK) that arrives on `socket` within

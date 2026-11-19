@@ -13,8 +13,12 @@
 //! Kept apart from [`super::rewrite`], which copies an `m=video` section through untouched: this pass
 //! re-originates the section on the finished answer, as the control stream module does for the control stream.
 
+mod h264_profile;
+
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
+
+use h264_profile::{max_recv_level, Level, ProfileLevel};
 
 use super::floor::split_lines;
 use super::{addrtype, parse_connection_addr, EngineMedia, MediaDirection, OwnSsrc, CRLF};
@@ -155,6 +159,10 @@ pub struct VideoChoice {
     /// The RTCP feedback the seat accepted: what the offer listed for the chosen payload type, and
     /// only on `RTP/AVPF` (RFC 4585 §4.2; `RTP/AVP` has no feedback).
     pub feedback: VideoFeedback,
+    /// The parameters of the answer's `a=fmtp` line for this seat: the room's, with the seat's own
+    /// `profile-level-id` spelling at the level the seat is answered at (RFC 6184 §8.2.2). `None`
+    /// writes no `a=fmtp` line.
+    pub answer_fmtp: Option<String>,
 }
 
 impl RoomVideoFormat {
@@ -168,6 +176,13 @@ impl RoomVideoFormat {
             return Err(format!(
                 "video.fmtp names packetization-mode {mode}; the room carries modes 0 and 1"
             ));
+        }
+        if let Some(value) = parameter(parameters, "profile-level-id") {
+            if ProfileLevel::parse(&value).is_none() {
+                return Err(format!(
+                    "video.fmtp names profile-level-id {value}, which is not six hexadecimal digits (RFC 6184 §8.1)"
+                ));
+            }
         }
         Ok(Self {
             packetization_mode: mode,
@@ -309,18 +324,65 @@ fn attribute<'a>(section: &[&'a str], name: &str, payload_type: u8) -> Option<&'
     })
 }
 
-/// Decide whether `offer` fits the room: the seat's own payload type for the room's format.
+/// Decide whether `offer` fits the room: the seat's own payload type for the room's format, and the
+/// parameters the answer gives the seat.
 ///
 /// `fixed` is the format already in force: the room's, or the controller's `video.fmtp`. With none,
 /// the first H.264 payload carrying a mode the room carries fixes it (RFC 3264 §6.1 order).
 ///
+/// With a format in force, a payload fits when its packetization mode is the room's, its
+/// sub-profile is the room's (RFC 6184 §8.2.2: the profile part is used symmetrically; Table 5
+/// spellings of one sub-profile are one), and, when the seat receives video, it decodes the room's
+/// level. The room's sources never send above the room's level, so a receiver must decode at least
+/// that; a seat that only sends may be lower, since every receiver decodes all lower levels
+/// (RFC 6184 §8.1). The level part of the answer is changed per seat (RFC 6184 §8.2.2).
+///
 /// # Errors
 /// The reason the seat's video is declined and it joins audio-only: a transport the engine does not
-/// carry video on, no H.264/90000 payload, only a packetization mode it does not carry, or a
-/// `profile-level-id` or mode other than the room's.
+/// carry video on, no H.264/90000 payload, only a packetization mode it does not carry, a malformed
+/// `profile-level-id`, another mode or sub-profile than the room's, or a level the seat cannot
+/// receive the room's video at.
 pub fn choose_video(
     offer: &VideoOffer,
     fixed: Option<&RoomVideoFormat>,
+) -> Result<VideoChoice, String> {
+    choose(offer, fixed, Asymmetry::AsSignalled)
+}
+
+/// [`choose_video`] for a member's answer to the engine's own offer (`forward_offer`). The engine's
+/// offer never carries `level-asymmetry-allowed`, so it is 0 for the pair whatever the answer says
+/// (RFC 6184 §8.1: "The value of 0 in either the offer or the answer indicates that level
+/// asymmetry is not allowed").
+///
+/// # Errors
+/// As [`choose_video`].
+pub fn choose_answered_video(
+    answer: &VideoOffer,
+    fixed: Option<&RoomVideoFormat>,
+) -> Result<VideoChoice, String> {
+    choose(answer, fixed, Asymmetry::NotAllowed)
+}
+
+/// Whether the other side of the exchange allows level asymmetry (RFC 6184 §8.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asymmetry {
+    /// The engine answers: asymmetry holds when the offer signals it, and the answer echoes it.
+    AsSignalled,
+    /// The engine offered without it.
+    NotAllowed,
+}
+
+/// One H.264 payload of a section: its number, `packetization-mode` and `a=fmtp` parameters.
+struct H264Payload<'a> {
+    payload_type: u8,
+    mode: u8,
+    parameters: &'a str,
+}
+
+fn choose(
+    offer: &VideoOffer,
+    fixed: Option<&RoomVideoFormat>,
+    asymmetry: Asymmetry,
 ) -> Result<VideoChoice, String> {
     // RFC 3264 §6: the answer keeps the offer's transport. SRTP, SDES and DTLS video are not carried
     // yet, and a plain answer to one would send the seat video it cannot decrypt.
@@ -345,7 +407,7 @@ pub fn choose_video(
             VideoFeedback::default()
         }
     };
-    let h264: Vec<(u8, u8, Option<String>)> = offer
+    let h264: Vec<H264Payload<'_>> = offer
         .payloads
         .iter()
         .filter(|payload| {
@@ -355,50 +417,51 @@ pub fn choose_video(
         })
         .map(|payload| {
             let parameters = payload.fmtp.as_deref().unwrap_or_default();
-            (
-                payload.payload_type,
-                packetization_mode(parameters),
-                profile_level_id(parameters),
-            )
+            H264Payload {
+                payload_type: payload.payload_type,
+                mode: packetization_mode(parameters),
+                parameters,
+            }
         })
         .collect();
-    if h264.is_empty() {
+    let Some(first_h264) = h264.first() else {
         return Err(
             "the offer has no H264/90000 video payload (RFC 6184); the room carries H.264 only"
                 .to_string(),
         );
-    }
-    let carried: Vec<&(u8, u8, Option<String>)> = h264
+    };
+    let carried: Vec<&H264Payload<'_>> = h264
         .iter()
-        .filter(|(_, mode, _)| CARRIED_MODES.contains(mode))
+        .filter(|payload| CARRIED_MODES.contains(&payload.mode))
         .collect();
-    let Some(first) = carried.first() else {
+    if carried.is_empty() {
         return Err(format!(
             "only H264 packetization-mode {} is offered; the room carries modes 0 and 1",
-            h264[0].1
+            first_h264.mode
         ));
-    };
-    let (payload_type, format) = match fixed {
+    }
+    let (payload_type, format, answer_fmtp) = match fixed {
         Some(room) => {
-            let matching = carried.iter().find(|(_, mode, level)| {
-                *mode == room.packetization_mode && *level == room.profile_level_id
-            });
-            let Some((payload_type, _, _)) = matching else {
-                return Err(format!(
-                    "the room's video is H264 packetization-mode {} with {}, which the seat did not offer",
-                    room.packetization_mode,
-                    room.profile_level_id.as_deref().map_or_else(
-                        || "no profile-level-id".to_string(),
-                        |level| format!("profile-level-id {level}")
-                    ),
-                ));
-            };
-            (*payload_type, room.clone())
+            let (payload_type, answer_fmtp) = fit_room(room, &carried, offer.direction, asymmetry)?;
+            (payload_type, room.clone(), answer_fmtp)
         }
-        None => (
-            first.0,
-            RoomVideoFormat::of_payload(first.1, first.2.clone()),
-        ),
+        None => {
+            let (payload, level) = carried
+                .iter()
+                .find_map(|payload| {
+                    let level = profile_level_id(payload.parameters)?;
+                    ProfileLevel::parse(&level).map(|_| (payload, level))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "the offered H264 profile-level-id {} is not six hexadecimal digits (RFC 6184 §8.1)",
+                        parameter(carried[0].parameters, "profile-level-id").unwrap_or_default()
+                    )
+                })?;
+            let format = RoomVideoFormat::of_payload(payload.mode, Some(level));
+            let answer_fmtp = format.fmtp.clone();
+            (payload.payload_type, format, answer_fmtp)
+        }
     };
     Ok(VideoChoice {
         remote: offer.remote,
@@ -408,7 +471,130 @@ pub fn choose_video(
         payload_type,
         format,
         feedback: feedback_of(payload_type),
+        answer_fmtp,
     })
+}
+
+/// The first of `carried` that fits `room`, with the answer's `a=fmtp` parameters for it.
+fn fit_room(
+    room: &RoomVideoFormat,
+    carried: &[&H264Payload<'_>],
+    direction: MediaDirection,
+    asymmetry: Asymmetry,
+) -> Result<(u8, Option<String>), String> {
+    let room_level_id = room
+        .profile_level_id
+        .as_deref()
+        .unwrap_or(INFERRED_PROFILE_LEVEL_ID);
+    let room_profile = ProfileLevel::parse(room_level_id).ok_or_else(|| {
+        format!("the room's profile-level-id {room_level_id} is not six hexadecimal digits")
+    })?;
+    let room_level = room_profile.level();
+    // Whether the seat is sent the room's video (RFC 3264 §6.1: it receives unless it said
+    // `sendonly` or `inactive`).
+    let receives = matches!(
+        direction,
+        MediaDirection::SendRecv | MediaDirection::RecvOnly
+    );
+    let mut level_refusal = None;
+    for payload in carried
+        .iter()
+        .filter(|payload| payload.mode == room.packetization_mode)
+    {
+        let Some(seat) =
+            profile_level_id(payload.parameters).and_then(|level| ProfileLevel::parse(&level))
+        else {
+            continue;
+        };
+        if seat.sub_profile() != room_profile.sub_profile() {
+            continue;
+        }
+        // RFC 6184 §8.2.2: asymmetry holds only when both offer and answer say 1.
+        let asymmetric = asymmetry == Asymmetry::AsSignalled
+            && parameter(payload.parameters, "level-asymmetry-allowed").as_deref() == Some("1");
+        let sends_at = seat.level();
+        // RFC 6184 §8.1: max-recv-level raises what a seat receives above its default level. It
+        // only counts with asymmetry: without it one level applies both ways (§8.2.2).
+        let receives_at = if asymmetric {
+            parameter(payload.parameters, "max-recv-level")
+                .as_deref()
+                .and_then(max_recv_level)
+                .map_or(sends_at, |level| level.max(sends_at))
+        } else {
+            sends_at
+        };
+        if receives && receives_at < room_level {
+            level_refusal.get_or_insert_with(|| {
+                format!(
+                    "the seat receives H264 up to level {receives_at}, below the room's level {room_level} (RFC 6184 §8.1)"
+                )
+            });
+            continue;
+        }
+        // RFC 6184 §8.2.2: with asymmetry the answer's level is the highest the engine receives,
+        // the room's; without it the answer never upgrades the offer's level.
+        let answered: Level = if asymmetric {
+            room_level
+        } else {
+            sends_at.min(room_level)
+        };
+        let answer_fmtp = answer_parameters(room, &seat.with_level(answered), asymmetric);
+        return Ok((payload.payload_type, answer_fmtp));
+    }
+    Err(level_refusal.unwrap_or_else(|| {
+        format!(
+            "the room's video is H264 packetization-mode {} with profile-level-id {room_level_id}, which the seat did not offer",
+            room.packetization_mode,
+        )
+    }))
+}
+
+/// The answer's `a=fmtp` parameters for a seat answered with `profile_level_id`: the room's
+/// parameters (a controller's other parameters kept verbatim) with `profile-level-id` replaced, and
+/// `level-asymmetry-allowed=1` exactly when the pair allows it.
+fn answer_parameters(
+    room: &RoomVideoFormat,
+    profile_level_id: &str,
+    asymmetric: bool,
+) -> Option<String> {
+    let unchanged = room.profile_level_id.as_deref() == Some(profile_level_id);
+    let Some(parameters) = room.fmtp.as_deref() else {
+        if unchanged && !asymmetric {
+            return None;
+        }
+        let mut written = format!(
+            "profile-level-id={profile_level_id};packetization-mode={}",
+            room.packetization_mode
+        );
+        if asymmetric {
+            written.push_str(";level-asymmetry-allowed=1");
+        }
+        return Some(written);
+    };
+    let mut named = false;
+    let mut kept: Vec<String> = Vec::new();
+    for pair in parameters.split(';') {
+        let key = pair.split_once('=').map_or(pair, |(key, _)| key).trim();
+        if key.eq_ignore_ascii_case("level-asymmetry-allowed") {
+            continue;
+        }
+        if key.eq_ignore_ascii_case("profile-level-id") {
+            named = true;
+            let lead = &pair[..pair.len() - pair.trim_start().len()];
+            kept.push(format!("{lead}profile-level-id={profile_level_id}"));
+        } else {
+            kept.push(pair.to_string());
+        }
+    }
+    // A format that names no profile-level-id is Baseline Level 1 (RFC 6184 §8.1): it needs naming
+    // only when the answer says something else.
+    if !named && !unchanged {
+        kept.push(format!("profile-level-id={profile_level_id}"));
+    }
+    if asymmetric {
+        kept.push("level-asymmetry-allowed=1".to_string());
+    }
+    Some(kept.join(";"))
 }
 
 /// What an answer's video section says.
@@ -450,7 +636,7 @@ pub fn anchor_video(sdp: &str, answer: &VideoAnswer<'_>) -> String {
     section.push(format!(
         "a=rtpmap:{payload_type} H264/{VIDEO_CLOCK_RATE_HZ}"
     ));
-    if let Some(parameters) = choice.format.fmtp.as_deref() {
+    if let Some(parameters) = choice.answer_fmtp.as_deref() {
         section.push(format!("a=fmtp:{payload_type} {parameters}"));
     }
     section.extend(choice.feedback.lines(payload_type));
@@ -893,6 +1079,7 @@ mod tests {
             payload_type: 99,
             format: fixed(1, None),
             feedback: VideoFeedback::default(),
+            answer_fmtp: None,
         };
         let own = OwnSsrc {
             ssrc: 1,
@@ -1084,5 +1271,195 @@ mod tests {
         let answer = format!("{HEADER}{section}");
         let choice = choose_video(&parse_video(&answer).unwrap(), None).unwrap();
         assert_eq!(choice.feedback, ALL_FEEDBACK);
+    }
+
+    /// A one-payload H.264 offer with `parameters` as its fmtp and `direction` as its attribute.
+    fn h264(parameters: &str, direction: &str) -> VideoOffer {
+        parse_video(&offer(&format!(
+            "m=video 20200 RTP/AVP 97\r\nc=IN IP4 192.0.2.11\r\na=rtpmap:97 H264/90000\r\na=fmtp:97 {parameters}\r\na={direction}\r\n"
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_seat_at_a_higher_level_is_answered_at_the_rooms_level_in_its_own_spelling() {
+        // RFC 6184 §8.2.2: the level part is changeable and an answer never upgrades it; the
+        // profile octets stay the seat's own (42c0 is Constrained Baseline as 42e0 is, Table 5).
+        let room = fixed(1, Some("42e01f"));
+        let choice = choose_video(
+            &h264("profile-level-id=42C028;packetization-mode=1", "sendrecv"),
+            Some(&room),
+        )
+        .unwrap();
+        assert_eq!(choice.payload_type, 97);
+        assert_eq!(choice.format, room, "the room's format is unchanged");
+        assert_eq!(
+            choice.answer_fmtp.as_deref(),
+            Some("profile-level-id=42c01f;packetization-mode=1")
+        );
+    }
+
+    #[test]
+    fn a_seat_at_the_rooms_level_is_answered_with_the_rooms_parameters() {
+        let room = fixed(1, Some("640c1f"));
+        let room = RoomVideoFormat {
+            fmtp: Some("profile-level-id=640c1f;packetization-mode=1".to_string()),
+            ..room
+        };
+        let choice = choose_video(
+            &h264("profile-level-id=640C1F;packetization-mode=1", "sendrecv"),
+            Some(&room),
+        )
+        .unwrap();
+        assert_eq!(choice.answer_fmtp, room.fmtp);
+    }
+
+    #[test]
+    fn a_receiving_seat_below_the_rooms_level_is_declined_naming_both_levels() {
+        // A seat cannot decode what the room's sources send above its level (RFC 6184 §8.1).
+        let room = fixed(1, Some("640c28"));
+        for direction in ["sendrecv", "recvonly"] {
+            let reason = choose_video(
+                &h264("profile-level-id=640c1f;packetization-mode=1", direction),
+                Some(&room),
+            )
+            .unwrap_err();
+            assert!(
+                reason.contains("level 3.1") && reason.contains("level 4"),
+                "{direction}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sending_only_seat_below_the_rooms_level_is_answered_at_its_own_level() {
+        // Every receiver decodes the room's level and so every level below it (RFC 6184 §8.1).
+        let room = fixed(1, Some("640c28"));
+        let choice = choose_video(
+            &h264("profile-level-id=640c1f;packetization-mode=1", "sendonly"),
+            Some(&room),
+        )
+        .unwrap();
+        assert_eq!(
+            choice.answer_fmtp.as_deref(),
+            Some("profile-level-id=640c1f;packetization-mode=1")
+        );
+    }
+
+    #[test]
+    fn level_asymmetry_lets_a_seat_receive_up_to_its_max_recv_level() {
+        // RFC 6184 §8.2.2: with level-asymmetry-allowed=1 in offer and answer, the engine sends
+        // the seat up to the highest level it receives, and the seat sends at the answer's level.
+        let room = fixed(1, Some("640c28"));
+        let choice = choose_video(
+            &h264(
+                "profile-level-id=640c1f;packetization-mode=1;level-asymmetry-allowed=1;max-recv-level=0c28",
+                "sendrecv",
+            ),
+            Some(&room),
+        )
+        .unwrap();
+        assert_eq!(
+            choice.answer_fmtp.as_deref(),
+            Some("profile-level-id=640c28;packetization-mode=1;level-asymmetry-allowed=1")
+        );
+    }
+
+    #[test]
+    fn max_recv_level_without_asymmetry_does_not_raise_what_the_seat_receives() {
+        // Without level-asymmetry-allowed one level applies both ways (RFC 6184 §8.2.2).
+        let room = fixed(1, Some("640c28"));
+        let reason = choose_video(
+            &h264(
+                "profile-level-id=640c1f;packetization-mode=1;max-recv-level=0c28",
+                "sendrecv",
+            ),
+            Some(&room),
+        )
+        .unwrap_err();
+        assert!(reason.contains("level 3.1"), "{reason}");
+    }
+
+    #[test]
+    fn a_seat_in_another_profile_is_declined_whatever_its_level() {
+        let room = fixed(1, Some("42e01f"));
+        let reason = choose_video(
+            &h264("profile-level-id=640c28;packetization-mode=1", "sendrecv"),
+            Some(&room),
+        )
+        .unwrap_err();
+        assert!(reason.contains("42e01f"), "{reason}");
+    }
+
+    #[test]
+    fn a_controllers_pin_keeps_its_parameters_and_only_the_level_is_rewritten() {
+        let room =
+            RoomVideoFormat::from_fmtp("profile-level-id=640c1f;packetization-mode=1;max-fs=3600")
+                .unwrap();
+        let choice = choose_video(
+            &h264("profile-level-id=640c28;packetization-mode=1", "sendrecv"),
+            Some(&room),
+        )
+        .unwrap();
+        assert_eq!(
+            choice.answer_fmtp.as_deref(),
+            Some("profile-level-id=640c1f;packetization-mode=1;max-fs=3600")
+        );
+    }
+
+    #[test]
+    fn a_malformed_profile_level_id_is_declined() {
+        let reason = choose_video(
+            &h264("profile-level-id=640c1;packetization-mode=1", "sendrecv"),
+            None,
+        )
+        .unwrap_err();
+        assert!(reason.contains("profile-level-id"), "{reason}");
+        let room = fixed(1, Some("640c1f"));
+        assert!(choose_video(
+            &h264("profile-level-id=xyz;packetization-mode=1", "sendrecv"),
+            Some(&room)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_answer_writes_the_seats_own_parameters() {
+        let room = fixed(1, Some("42e01f"));
+        let offered = offer(concat!(
+            "m=video 20200 RTP/AVP 97\r\nc=IN IP4 192.0.2.11\r\n",
+            "a=rtpmap:97 H264/90000\r\na=fmtp:97 profile-level-id=42c028;packetization-mode=1\r\n",
+        ));
+        let choice = choose_video(&parse_video(&offered).unwrap(), Some(&room)).unwrap();
+        let own = OwnSsrc {
+            ssrc: 1,
+            cname: "seat-cname".to_string(),
+        };
+        let answer = anchor_video(
+            &offered,
+            &VideoAnswer {
+                engine: engine(),
+                choice: &choice,
+                bandwidth_kbps: None,
+                own: &own,
+            },
+        );
+        assert!(
+            answer.contains("a=fmtp:97 profile-level-id=42c01f;packetization-mode=1\r\n"),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn an_answer_to_the_engines_offer_ignores_asymmetry_the_offer_never_allowed() {
+        // forward_offer does not offer level-asymmetry-allowed, so it is 0 in the pair.
+        let room = fixed(1, Some("640c28"));
+        let answer = h264(
+            "profile-level-id=640c1f;packetization-mode=1;level-asymmetry-allowed=1;max-recv-level=0c28",
+            "sendrecv",
+        );
+        assert!(choose_answered_video(&answer, Some(&room)).is_err());
+        let sending_only = h264("profile-level-id=640c1f;packetization-mode=1", "sendonly");
+        assert!(choose_answered_video(&sending_only, Some(&room)).is_ok());
     }
 }

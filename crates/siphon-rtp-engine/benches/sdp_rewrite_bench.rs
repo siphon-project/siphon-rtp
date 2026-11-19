@@ -252,6 +252,25 @@ fn sdp_rewrite(criterion: &mut Criterion) {
         });
     });
 
+    // A forward seat's video choice at join (call setup): several H.264 payload types, the matching
+    // one third, at a higher level than the room's, so the sub-profile and level checks and the
+    // per-seat answer parameters all run.
+    let video_offer = sdp::video::parse_video(concat!(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n",
+        "m=video 20200 RTP/AVPF 96 97 98\r\n",
+        "a=rtpmap:96 H264/90000\r\na=fmtp:96 profile-level-id=640c28;packetization-mode=1\r\n",
+        "a=rtpmap:97 H264/90000\r\na=fmtp:97 profile-level-id=42001f;packetization-mode=1\r\n",
+        "a=rtpmap:98 H264/90000\r\na=fmtp:98 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e028\r\n",
+        "a=rtcp-fb:* nack\r\na=rtcp-fb:* nack pli\r\na=rtcp-fb:* ccm fir\r\n",
+    ))
+    .expect("a video offer");
+    let room =
+        sdp::video::RoomVideoFormat::from_fmtp("profile-level-id=42e01f;packetization-mode=1")
+            .expect("a room format");
+    group.bench_function("chooses_a_forward_seats_video", |bencher| {
+        bencher.iter(|| sdp::video::choose_video(black_box(&video_offer), Some(black_box(&room))));
+    });
+
     group.finish();
 }
 
