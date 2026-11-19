@@ -486,6 +486,90 @@ async fn a_reoffer_from_a_moved_caller_re_gates_video_and_keeps_the_far_party_an
 }
 
 #[tokio::test]
+async fn a_reoffer_from_a_moved_caller_re_gates_its_text_stream_too() {
+    // The text stream follows the caller like audio and video do: a re-INVITE from a phone on a new
+    // network restates the text address, and the relay must gate and aim at it, never at the old one.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_audio_a, audio_a) = phone().await;
+    let (text_a, text_a_addr) = phone().await;
+    let (_audio_b, audio_b) = phone().await;
+    let (text_b, text_b_addr) = phone().await;
+    for command in [
+        Command::Offer {
+            call_id: "text-move".into(),
+            from_tag: "a".into(),
+            sdp: audio_plaintext_text_sdp(audio_a, text_a_addr),
+            profile: ProfileFlags::default(),
+        },
+        Command::Answer {
+            call_id: "text-move".into(),
+            from_tag: "a".into(),
+            to_tag: "b".into(),
+            sdp: audio_plaintext_text_sdp(audio_b, text_b_addr),
+            profile: ProfileFlags::default(),
+        },
+    ] {
+        let result = engine.handle(CLIENT, command).await;
+        assert!(matches!(result, CmdResult::Ok { .. }), "{result:?}");
+    }
+    let near_text_engine = {
+        let call = engine.calls.get("text-move").expect("call");
+        call.near.text.expect("near text").local_addr
+    };
+    let (moved_audio_a, moved_audio_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let (moved_text_a, moved_text_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+    let _keep = moved_audio_a;
+    let reoffered = engine
+        .handle(
+            CLIENT,
+            Command::Reoffer {
+                call_id: "text-move".into(),
+                from_tag: "a".into(),
+                sdp: audio_plaintext_text_sdp(moved_audio_addr, moved_text_addr),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    assert!(matches!(reoffered, CmdResult::Ok { .. }), "{reoffered:?}");
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: "text-move".into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp: audio_plaintext_text_sdp(audio_b, text_b_addr),
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
+    assert_eq!(
+        engine
+            .calls
+            .get("text-move")
+            .expect("call")
+            .near
+            .text_remote_rtp,
+        Some(moved_text_addr),
+        "the call remembers the caller's moved text address"
+    );
+    text_a
+        .send_to(&video_packet(1), near_text_engine)
+        .await
+        .expect("send");
+    assert!(
+        received(&text_b).await.is_none(),
+        "the old text address is dropped"
+    );
+    moved_text_a
+        .send_to(&video_packet(2), near_text_engine)
+        .await
+        .expect("send");
+    assert_eq!(received(&text_b).await, Some(video_packet(2)));
+}
+
+#[tokio::test]
 async fn a_reoffer_that_drops_video_frees_the_video_endpoints() {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_audio_a, audio_a) = phone().await;
@@ -577,6 +661,83 @@ async fn a_room_refuses_the_two_party_video_mode_it_has_no_use_for() {
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
+}
+
+/// `command` carries `video_relay: anchor` on a verb that has no video stream to anchor: it must
+/// come back as a refusal naming the field, not as a silent success.
+async fn assert_video_relay_refused(verb: &str, command: Command) {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    match engine.handle(CLIENT, command).await {
+        CmdResult::Error { reason } => {
+            assert!(reason.contains("video_relay"), "{verb}: {reason}");
+        }
+        other => panic!("{verb}: expected a refusal, got {other:?}"),
+    }
+}
+
+fn any_sdp() -> String {
+    call_sdp(
+        "192.0.2.10:4000".parse().unwrap(),
+        "192.0.2.10:4002".parse().unwrap(),
+        "sendrecv",
+        "RTP/AVP",
+        true,
+    )
+}
+
+#[tokio::test]
+async fn answer_local_refuses_video_relay_instead_of_ignoring_it() {
+    let command = Command::AnswerLocal {
+        call_id: "no-video".into(),
+        from_tag: "a".into(),
+        sdp: any_sdp(),
+        profile: anchor(),
+    };
+    assert_video_relay_refused("answer_local", command).await;
+}
+
+#[tokio::test]
+async fn offer_far_refuses_video_relay_instead_of_ignoring_it() {
+    let command = Command::OfferFar {
+        call_id: "no-video".into(),
+        from_tag: "a".into(),
+        profile: anchor(),
+    };
+    assert_video_relay_refused("offer_far", command).await;
+}
+
+#[tokio::test]
+async fn subscribe_request_refuses_video_relay_instead_of_ignoring_it() {
+    let command = Command::SubscribeRequest {
+        call_id: "no-video".into(),
+        from_tags: vec!["a".into()],
+        sdp: None,
+        profile: anchor(),
+    };
+    assert_video_relay_refused("subscribe_request", command).await;
+}
+
+#[tokio::test]
+async fn subscribe_answer_refuses_video_relay_instead_of_ignoring_it() {
+    let command = Command::SubscribeAnswer {
+        call_id: "no-video".into(),
+        from_tag: "a".into(),
+        to_tag: "b".into(),
+        sdp: any_sdp(),
+        profile: anchor(),
+    };
+    assert_video_relay_refused("subscribe_answer", command).await;
+}
+
+#[tokio::test]
+async fn attach_ws_bridge_refuses_video_relay_instead_of_ignoring_it() {
+    let command = Command::AttachWsBridge {
+        call_id: "no-video".into(),
+        from_tag: "a".into(),
+        ws_uri: "ws://192.0.2.1:9/".into(),
+        profile: Some(anchor()),
+    };
+    assert_video_relay_refused("attach_ws_bridge", command).await;
 }
 
 #[tokio::test]

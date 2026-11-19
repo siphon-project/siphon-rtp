@@ -27,8 +27,9 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   moved address or direction and adds or frees the endpoints, a snapshot carries the stream (its own
   version, so an older standby refuses it), and `query`, the end-of-call record and
   `siphon_rtp_video_packets_total` / `siphon_rtp_video_bytes_total` count it. Plain RTP only: a secure
-  profile is declined with the reason in `video_declined`. A room refuses the field, and a call carrying
-  anchored video is not seated in one. `node_info` lists `call_video_anchor`.
+  profile is declined with the reason in `video_declined`. Every verb that takes a profile but has no video
+  stream to anchor (rooms, `answer_local`, `offer_far`, subscriptions, `attach_ws_bridge`) refuses the field
+  instead of ignoring it, and a call carrying anchored video is not seated in a room. `node_info` lists `call_video_anchor`.
 
 ### Fixed
 
@@ -38,6 +39,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   now carries the offerer's original `c=`.
 - **The latch refresh sweep walks the text flows too.** It reprogrammed audio flows only, so a NATed
   peer's text kept going to its signalled address.
+- **A re-offer from a moved caller re-gates its text stream.** The caller's audio address followed the
+  re-offer but its text address did not, so the relay kept gating and aiming text at the old one.
 
 ### Changed
 

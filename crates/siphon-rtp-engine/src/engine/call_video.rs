@@ -130,8 +130,9 @@ pub(super) fn with_video_declined(
     result
 }
 
-/// The refusal of a verb that has no two-party video to configure: a mixing room decodes its
-/// seats' audio and a forwarding room carries video by its own `video` profile, so a
+/// The refusal of a verb that does not relay a two-party call's video: a mixing room decodes its
+/// seats' audio, a forwarding room carries video by its own `video` profile, and the local answer,
+/// the far offer, a subscription and a WebSocket bridge have no video stream to anchor, so a
 /// `video_relay` choice there would silently do nothing.
 pub(super) fn video_relay_refusal(
     command: &siphon_rtp_proto::Command,
@@ -142,13 +143,21 @@ pub(super) fn video_relay_refusal(
         Command::ConferenceOffer { profile, .. } => ("conference_offer", profile),
         Command::ForwardJoin { profile, .. } => ("forward_join", profile),
         Command::ForwardOffer { profile, .. } => ("forward_offer", profile),
+        Command::AnswerLocal { profile, .. } => ("answer_local", profile),
+        Command::OfferFar { profile, .. } => ("offer_far", profile),
+        Command::SubscribeRequest { profile, .. } => ("subscribe_request", profile),
+        Command::SubscribeAnswer { profile, .. } => ("subscribe_answer", profile),
+        Command::AttachWsBridge {
+            profile: Some(profile),
+            ..
+        } => ("attach_ws_bridge", profile),
         _ => return None,
     };
     (profile.video_relay != VideoRelay::Passthrough).then(|| {
         super::error_result(
             verb,
-            &"video_relay applies to a two-party offer, answer and reoffer only: a room does not relay \
-              a call's video stream",
+            &"video_relay applies to a two-party offer, answer and reoffer only: this verb does not \
+              relay a call's video stream",
         )
     })
 }

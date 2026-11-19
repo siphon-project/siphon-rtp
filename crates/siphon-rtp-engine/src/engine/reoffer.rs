@@ -165,6 +165,23 @@ fn reoffer_mux_override(leg: &Leg, info: &sdp::MediaInfo, profile: &ProfileFlags
     (!profile.rtcp_mux.is_empty() || info.rtcp_mux != muxed).then_some(muxed)
 }
 
+/// A re-offer restates the offering party's text address as it does its audio address (RFC 3264
+/// §8): a party that moved network re-INVITEs from the new one, and the text relay is re-gated on it
+/// by the answer that completes the exchange. A leg whose text stream was never anchored stays
+/// without one, and a text section the party closed (port 0) leaves the stored address alone.
+fn move_text_address(leg: &mut Leg, info: &sdp::MediaInfo) {
+    if leg.text_remote_rtp.is_none() {
+        return;
+    }
+    if let Some(text) = info
+        .text
+        .as_ref()
+        .filter(|text| text.remote_rtp.port() != 0)
+    {
+        leg.text_remote_rtp = Some(text.remote_rtp);
+    }
+}
+
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// A re-offer's ICE candidates: the offering leg's, for its rebuilt agent, and the presented
     /// leg's, for the SDP. Both are the ones already advertised when stored — the ports are unchanged,
@@ -430,6 +447,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 Party::Near => {
                     call.near.remote_rtp = Some(info.remote_rtp);
                     call.near.remote_rtcp = Some(info.remote_rtcp);
+                    move_text_address(&mut call.near, &info);
                     // A re-offer restates A's codec list, so an `answer` still to come negotiates
                     // against what A last offered rather than what it opened the dialog with (the
                     // guard above already refused a list that drops the negotiated codec). A re-offer
@@ -462,6 +480,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     if let Some(far) = call.far.as_mut() {
                         far.remote_rtp = Some(info.remote_rtp);
                         far.remote_rtcp = Some(info.remote_rtcp);
+                        move_text_address(far, &info);
                     }
                     call.far_remote_ice = new_remote_ice;
                     if profile.received_from.is_some() {
