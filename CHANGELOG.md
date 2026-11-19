@@ -5,7 +5,7 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.24.0] — 2026-11-20
 
 ### Added
 
@@ -36,7 +36,22 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   the reason in `video_declined`; a DTLS call is not checkpointed, video included. Every verb that takes a
   profile but has no video stream to anchor (rooms, `answer_local`, `offer_far`, subscriptions,
   `attach_ws_bridge`) refuses the field instead of ignoring it, and a call carrying anchored video is not
-  seated in a room. `node_info` lists `call_video_anchor` and, for SDES-SRTP video, `call_video_sdes` and, for DTLS-SRTP video, `call_video_dtls`.
+  seated in a room. `node_info` lists `call_video_anchor`, `call_video_sdes` for SDES-SRTP video and
+  `call_video_dtls` for DTLS-SRTP video. `siphon-rtp-proto` gains `ProfileFlags.video_relay` and `video`
+  counters on `SessionStats` and `LegSummary`, a minor bump for Rust callers that construct them.
+
+### Changed
+
+- **A video room matches a later seat by H.264 sub-profile and level, not by the exact
+  `profile-level-id`.** A device whose level differs from the room's, or that spells the same profile
+  another way, joined audio-only. RFC 6184 §8.2.2 keeps the profile part of `profile-level-id`
+  symmetric and lets the level part change, so now the spellings RFC 6184 §8.1 Table 5 gives one
+  sub-profile are one, a seat at or above the room's level is answered at the room's level in its own
+  spelling, a seat below it is seated only when it sends without receiving (every receiver decodes the
+  lower levels), and `level-asymmetry-allowed=1` with `max-recv-level` lets a seat receive above its
+  own level. A receiving seat below the room's level, another sub-profile or a malformed
+  `profile-level-id` joins audio-only with the reason in `video_declined`, and a malformed
+  `profile-level-id` in `video.fmtp` is refused. `node_info` lists `forward_video_h264`.
 
 ### Fixed
 
@@ -53,20 +68,6 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 - **A re-offer from a moved caller re-gates its text stream.** The caller's audio address followed the
   re-offer but its text address did not, so the relay kept gating and aiming text at the old one.
 
-### Changed
-
-- **A video room matches a later seat by H.264 sub-profile and level, not by the exact
-  `profile-level-id`.** A device whose level differs from the room's, or that spells the same profile
-  another way, joined audio-only. RFC 6184 §8.2.2 keeps the profile part of `profile-level-id`
-  symmetric and lets the level part change, so now the spellings RFC 6184 §8.1 Table 5 gives one
-  sub-profile are one, a seat at or above the room's level is answered at the room's level in its own
-  spelling, a seat below it is seated only when it sends without receiving (every receiver decodes the
-  lower levels), and `level-asymmetry-allowed=1` with `max-recv-level` lets a seat receive above its
-  own level. A receiving seat below the room's level, another sub-profile or a malformed
-  `profile-level-id` joins audio-only with the reason in `video_declined`, and a malformed
-  `profile-level-id` in `video.fmtp` is refused. `node_info` lists `forward_video_h264`.
-
-### Fixed
 
 - **Lawful-interception X3 delivery no longer ends at the first re-offer.** The taps lived in the
   media pipeline, so the answer to a hold, resume or session refresh dropped them and the delivery
