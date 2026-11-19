@@ -73,6 +73,14 @@ pub const SNAPSHOT_VERSION_SCOPED_VIDEO_FLOOR: u16 = 7;
 /// without anchored video keeps the bytes and versions it had.
 pub const SNAPSHOT_VERSION_VIDEO: u16 = 8;
 
+/// The version a snapshot of a call whose anchored video stream is SDES-SRTP has
+/// ([`CallVideoSnapshot::secure`]).
+///
+/// A standby that carries anchored video but not its keys reads version [`SNAPSHOT_VERSION_VIDEO`]
+/// only and would ignore the `secure` key, restoring the stream as plain RTP and putting an
+/// unencrypted picture on a secure leg. Under its own version such a standby refuses the blob.
+pub const SNAPSHOT_VERSION_VIDEO_SECURE: u16 = 9;
+
 /// A portable snapshot of one live call's negotiated state (see the module docs). All fields are
 /// plain data (strings / integers / enums / `std::net` addresses), so the whole thing round-trips
 /// through JSON and compares exactly.
@@ -206,9 +214,39 @@ pub struct CallVideoSnapshot {
     /// The answerer's stated direction token.
     pub far_direction: String,
     /// The forwarding rules installed on the video endpoints, by role. An endpoint with no rule here
-    /// was a drop (a direction the parties did not allow) and is restored as one.
+    /// was a drop (a direction the parties did not allow) and is restored as one. On an SDES-SRTP
+    /// stream each rule is the gate, latch and destination of a bridge flow instead.
     #[serde(default)]
     pub flows: Vec<FlowSnapshot>,
+    /// The stream's SDES keys and live SRTP rollover when either party's video is SDES-SRTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure: Option<VideoSecureSnapshot>,
+}
+
+/// The SDES-SRTP state of an anchored video stream: each party's two keys (the engine's own toward
+/// the party, and the party's own) and the live SRTP rollover of each secure leg (RFC 3711 §3.3.1),
+/// which a standby cannot re-derive and without which the first packet past a sequence wrap fails
+/// to authenticate.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct VideoSecureSnapshot {
+    /// The engine's key toward the near party, present when the near party's video is secure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_local: Option<CryptoSnapshot>,
+    /// The near party's own key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_remote: Option<CryptoSnapshot>,
+    /// The engine's key toward the far party, present when the far party's video is secure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far_local: Option<CryptoSnapshot>,
+    /// The far party's own key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far_remote: Option<CryptoSnapshot>,
+    /// The rollover of the near secure leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_rollover: Option<SecureLegRolloverSnapshot>,
+    /// The rollover of the far secure leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far_rollover: Option<SecureLegRolloverSnapshot>,
 }
 
 /// One party's floor stream: everything a standby needs to serve it exactly where the primary left
@@ -656,7 +694,13 @@ impl CallSnapshot {
     /// else the one its scope and floor stream call for ([`Self::version_for`]).
     #[must_use]
     pub fn expected_version(&self) -> u16 {
-        if self.has_video() {
+        if self
+            .video
+            .as_ref()
+            .is_some_and(|video| video.secure.is_some())
+        {
+            SNAPSHOT_VERSION_VIDEO_SECURE
+        } else if self.has_video() {
             SNAPSHOT_VERSION_VIDEO
         } else {
             Self::version_for(self.scope.as_deref(), self.floor_format())

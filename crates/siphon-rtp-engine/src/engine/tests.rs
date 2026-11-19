@@ -49,6 +49,7 @@ const CLIENT: ClientId = ClientId(1);
 mod actor_reply;
 mod call_floor;
 mod call_video;
+mod call_video_secure;
 mod conference_dial_out;
 mod conference_dtmf;
 mod conference_received_from;

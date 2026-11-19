@@ -236,8 +236,12 @@ fn build_features() -> Vec<String> {
         "forward_video_webrtc".to_string(),
         // A two-party relayed call anchors an offered `m=video` stream when the profile says
         // `video_relay: anchor`: an endpoint pair per leg, the gated latch, RTCP and direction
-        // attributes respected, plain RTP only. A controller gates sending `video_relay` on this entry.
+        // attributes respected, plain RTP. A controller gates sending `video_relay` on this entry.
         "call_video_anchor".to_string(),
+        // The anchored stream may be SDES-SRTP (`RTP/SAVP[F]` with an `a=crypto` per video section), per
+        // leg: plain to SDES, SDES to plain and SDES to SDES, SRTCP per stream. A controller gates
+        // offering secure video on this entry; DTLS-SRTP video is declined.
+        "call_video_sdes".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

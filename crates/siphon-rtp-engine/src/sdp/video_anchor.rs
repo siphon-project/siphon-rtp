@@ -9,6 +9,8 @@
 
 use std::net::SocketAddr;
 
+use siphon_rtp_srtp::sdes::CryptoAttribute;
+
 use super::floor::split_lines;
 use super::{addrtype, parse_connection_addr, EngineMedia, MediaDirection, CRLF};
 
@@ -100,17 +102,41 @@ pub struct VideoStream {
     pub rtcp_mux: bool,
     /// The transport profile, third field of the `m=` line.
     pub transport: String,
+    /// The keyable `a=crypto` lines of the section, in order (RFC 4568 §5.1.2: the first is the one
+    /// accepted). A line whose suite the SRTP context does not run is skipped (RFC 4568 §7.1.1).
+    pub crypto: Vec<CryptoAttribute>,
 }
 
 impl VideoStream {
-    /// Whether the engine carries this transport: plain RTP (`RTP/AVP`, `RTP/AVPF`). A secure
-    /// profile is declined until the engine keys video per leg, never relayed through unkeyed.
+    /// Whether this is plain RTP (`RTP/AVP`, `RTP/AVPF`).
     #[must_use]
     pub fn is_plain(&self) -> bool {
         matches!(
             self.transport.to_ascii_uppercase().as_str(),
             "RTP/AVP" | "RTP/AVPF"
         )
+    }
+
+    /// Whether this is SDES-SRTP (`RTP/SAVP`, `RTP/SAVPF`, RFC 4568): keyed by `a=crypto`.
+    #[must_use]
+    pub fn is_sdes(&self) -> bool {
+        matches!(
+            self.transport.to_ascii_uppercase().as_str(),
+            "RTP/SAVP" | "RTP/SAVPF"
+        )
+    }
+
+    /// Whether this is DTLS-SRTP (`UDP/TLS/RTP/SAVP[F]`, RFC 5764), which the engine does not carry
+    /// for video yet.
+    #[must_use]
+    pub fn is_dtls(&self) -> bool {
+        self.transport.to_ascii_uppercase().starts_with("UDP/TLS/")
+    }
+
+    /// Whether the transport carries the RFC 4585 feedback profile (`AVPF`, `SAVPF`).
+    #[must_use]
+    pub fn is_feedback_profile(&self) -> bool {
+        self.transport.to_ascii_uppercase().ends_with('F')
     }
 }
 
@@ -213,13 +239,29 @@ pub fn parse_video_stream(sdp: &str) -> Option<VideoStream> {
         .split_whitespace()
         .nth(2)?
         .to_string();
+    // RFC 4568 §6.1: the SDES key of this section, scoped to it as the text stream's is.
+    let crypto = section
+        .iter()
+        .filter_map(|line| CryptoAttribute::parse_keyable(line.strip_prefix("a=")?))
+        .collect();
     Some(VideoStream {
         remote_rtp: SocketAddr::new(address, port),
         remote_rtcp: SocketAddr::new(address, rtcp_port),
         direction,
         rtcp_mux,
         transport,
+        crypto,
     })
+}
+
+/// How the anchored video section is keyed toward the party it is presented to.
+#[derive(Debug, Clone, Copy)]
+pub enum VideoKeying {
+    /// Plain RTP: the transport is written as `RTP/AVP[F]` and the peer's `a=crypto` is dropped.
+    Plain,
+    /// SDES-SRTP (RFC 4568): the transport is written as `RTP/SAVP[F]`, the peer's `a=crypto` is
+    /// dropped and this key, the engine's own for the leg, is advertised in its place.
+    Sdes(CryptoAttribute),
 }
 
 /// How a presented SDP treats its video stream, beside [`super::TextRewrite`] and
@@ -229,9 +271,14 @@ pub enum VideoRewrite {
     /// Leave the section as it arrived (the two parties exchange video directly).
     #[default]
     Passthrough,
-    /// Anchor the first live video section on the engine's video endpoints; any further live video
-    /// section is declined (RFC 3264 §6).
-    Anchor(EngineMedia),
+    /// Anchor the first live video section on the engine's video endpoints, keyed as `keying` says;
+    /// any further live video section is declined (RFC 3264 §6).
+    Anchor {
+        /// The engine endpoints the section advertises.
+        engine: EngineMedia,
+        /// How the section is keyed toward the party it is presented to.
+        keying: VideoKeying,
+    },
     /// Decline every live video section (port 0, RFC 3264 §6).
     Decline,
 }
@@ -242,10 +289,32 @@ impl VideoRewrite {
     pub fn apply(self, presented: &str) -> String {
         match self {
             Self::Passthrough => presented.to_string(),
-            Self::Anchor(engine) => anchor_video(presented, engine),
+            Self::Anchor { engine, keying } => anchor_video(presented, engine, keying),
             Self::Decline => decline_video(presented),
         }
     }
+}
+
+/// `line`, an `m=` line, with its transport profile written for `keying`: `RTP/SAVP[F]` for SDES,
+/// `RTP/AVP[F]` for plain, keeping the feedback `F` of the original (RFC 4585 §4.2).
+fn with_transport(line: &str, keying: VideoKeying) -> String {
+    line.split(' ')
+        .enumerate()
+        .map(|(position, field)| {
+            if position != 2 {
+                return field.to_string();
+            }
+            let feedback = field.to_ascii_uppercase().ends_with('F');
+            let profile = match (keying, feedback) {
+                (VideoKeying::Plain, false) => "RTP/AVP",
+                (VideoKeying::Plain, true) => "RTP/AVPF",
+                (VideoKeying::Sdes(_), false) => "RTP/SAVP",
+                (VideoKeying::Sdes(_), true) => "RTP/SAVPF",
+            };
+            profile.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `line`, an `m=` line, with its port field replaced.
@@ -287,11 +356,12 @@ fn is_peer_transport_attribute(line: &str) -> bool {
 }
 
 /// Anchor the first live video section on `engine`: its port, a media-level `c=` of the engine's
-/// advertised address (RFC 4566 §5.7), and the `a=rtcp` port (RFC 3605) unless muxed. Every other
+/// advertised address (RFC 4566 §5.7), the `a=rtcp` port (RFC 3605) unless muxed, and the transport
+/// profile and key `keying` names (the peer's own `a=crypto` is never copied). Every other
 /// line, the codecs, `fmtp`, `rtcp-fb` and the direction included, is copied verbatim. A further
 /// live video section is declined.
 #[must_use]
-pub fn anchor_video(sdp: &str, engine: EngineMedia) -> String {
+pub fn anchor_video(sdp: &str, engine: EngineMedia, keying: VideoKeying) -> String {
     let lines = split_lines(sdp);
     let first = locate(&lines);
     let mut out: Vec<String> = Vec::with_capacity(lines.len() + 3);
@@ -314,6 +384,10 @@ pub fn anchor_video(sdp: &str, engine: EngineMedia) -> String {
                 out.push(format!("a=rtcp:{}", rtcp.port()));
             }
         }
+        // RFC 4568 §5.1: the engine's own key for the leg, advertised in place of the peer's.
+        if let VideoKeying::Sdes(crypto) = keying {
+            out.push(format!("a={}", crypto.to_attribute_value()));
+        }
     };
     for (index, line) in lines.iter().enumerate() {
         if line.starts_with("m=") {
@@ -324,7 +398,7 @@ pub fn anchor_video(sdp: &str, engine: EngineMedia) -> String {
             if Some(index) == first.map(|(start, _, _)| start) {
                 in_anchored = true;
                 pending_connection = true;
-                out.push(with_port(line, engine.rtp.port()));
+                out.push(with_transport(&with_port(line, engine.rtp.port()), keying));
             } else if is_live_video(line) {
                 out.push(with_port(line, 0));
             } else {
@@ -339,6 +413,7 @@ pub fn anchor_video(sdp: &str, engine: EngineMedia) -> String {
             }
             if line.starts_with("c=")
                 || line.starts_with("a=rtcp:")
+                || line.starts_with("a=crypto:")
                 || is_peer_transport_attribute(line)
             {
                 continue;
@@ -435,7 +510,7 @@ mod tests {
 
     #[test]
     fn anchoring_moves_port_connection_and_rtcp_and_keeps_the_rest_verbatim() {
-        let anchored = anchor_video(OFFER, engine(Some(30003)));
+        let anchored = anchor_video(OFFER, engine(Some(30003)), VideoKeying::Plain);
         assert_eq!(
             video_lines(&anchored),
             vec![
@@ -462,11 +537,11 @@ mod tests {
 
     #[test]
     fn anchoring_a_muxed_stream_writes_no_rtcp_line_and_an_adjacent_port_needs_none() {
-        let muxed = anchor_video(OFFER, engine(None));
+        let muxed = anchor_video(OFFER, engine(None), VideoKeying::Plain);
         assert!(!video_lines(&muxed)
             .iter()
             .any(|line| line.starts_with("a=rtcp:")));
-        let adjacent = anchor_video(OFFER, engine(Some(30001)));
+        let adjacent = anchor_video(OFFER, engine(Some(30001)), VideoKeying::Plain);
         assert!(!video_lines(&adjacent)
             .iter()
             .any(|line| line.starts_with("a=rtcp:")));
@@ -479,7 +554,7 @@ mod tests {
             "m=audio 20100 RTP/AVP 0\r\n",
             "m=video 6000 RTP/AVP 96\r\ni=door\r\na=rtpmap:96 H264/90000\r\n",
         );
-        let anchored = anchor_video(sdp, engine(None));
+        let anchored = anchor_video(sdp, engine(None), VideoKeying::Plain);
         assert_eq!(
             video_lines(&anchored),
             vec![
@@ -500,7 +575,7 @@ mod tests {
             "a=rtpmap:96 H264/90000\r\n",
             "m=video 6002 RTP/AVP 97\r\na=rtpmap:97 VP8/90000\r\n",
         );
-        let anchored = anchor_video(sdp, engine(None));
+        let anchored = anchor_video(sdp, engine(None), VideoKeying::Plain);
         assert!(!anchored.contains("ice-ufrag") && !anchored.contains("candidate"));
         assert!(anchored.contains("m=video 0 RTP/AVP 97"), "{anchored}");
     }
@@ -536,6 +611,115 @@ mod tests {
             flow_directions(MediaDirection::RecvOnly, MediaDirection::SendOnly),
             (false, true)
         );
+    }
+}
+
+#[cfg(test)]
+mod keying_tests {
+    use super::*;
+    use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+
+    const KEY_A: &str =
+        "crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0e";
+    const KEY_B: &str =
+        "crypto:2 AES_CM_128_HMAC_SHA1_32 inline:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0e";
+
+    fn secure_offer() -> String {
+        format!(
+            concat!(
+                "v=0\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n",
+                "m=audio 20100 RTP/SAVP 0\r\na=crypto:9 AES_CM_128_HMAC_SHA1_80 inline:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0e\r\n",
+                "m=video 6000 RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\na={b}\r\na={a}\r\n",
+            ),
+            a = KEY_A,
+            b = KEY_B
+        )
+    }
+
+    fn engine() -> EngineMedia {
+        EngineMedia::new("198.51.100.5:30000".parse().expect("addr"), None)
+    }
+
+    fn minted(tag: u32) -> CryptoAttribute {
+        CryptoAttribute::generate(tag, CryptoSuite::AesCm128HmacSha1_80).expect("key")
+    }
+
+    #[test]
+    fn a_secure_video_section_carries_its_own_keyable_crypto_lines_in_order() {
+        let stream = parse_video_stream(&secure_offer()).expect("video");
+        assert!(stream.is_sdes() && !stream.is_plain() && !stream.is_dtls());
+        // The `_32` line is recognised but cannot be keyed, so only the keyable one is offered on.
+        assert_eq!(stream.crypto.len(), 1, "{:?}", stream.crypto);
+        assert_eq!(stream.crypto[0].tag, 1);
+        // The audio section's key (tag 9) is not the video's.
+        assert!(stream.crypto.iter().all(|crypto| crypto.tag != 9));
+    }
+
+    #[test]
+    fn a_dtls_video_section_is_neither_plain_nor_sdes() {
+        let dtls = "v=0\r\nc=IN IP4 192.0.2.1\r\nm=video 7000 UDP/TLS/RTP/SAVPF 96\r\n";
+        let stream = parse_video_stream(dtls).expect("video");
+        assert!(stream.is_dtls() && !stream.is_plain() && !stream.is_sdes());
+    }
+
+    #[test]
+    fn anchoring_a_secure_stream_secure_replaces_the_peers_key_with_the_engines_own() {
+        let key = minted(1);
+        let anchored = VideoRewrite::Anchor {
+            engine: engine(),
+            keying: VideoKeying::Sdes(key),
+        }
+        .apply(&secure_offer());
+        let section: Vec<String> = anchored
+            .split("\r\n")
+            .skip_while(|line| !line.starts_with("m=video"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(section[0], "m=video 30000 RTP/SAVPF 96");
+        let crypto: Vec<&String> = section
+            .iter()
+            .filter(|line| line.starts_with("a=crypto:"))
+            .collect();
+        assert_eq!(crypto.len(), 1, "{anchored}");
+        assert_eq!(*crypto[0], format!("a={}", key.to_attribute_value()));
+        assert!(!anchored.contains("WVNfX19z") || crypto[0].contains(&key.to_attribute_value()));
+        assert!(
+            anchored.contains("a=crypto:9 "),
+            "the audio section keeps its own key line"
+        );
+    }
+
+    #[test]
+    fn anchoring_a_plain_stream_toward_a_secure_party_writes_savp_and_the_engines_key() {
+        let plain =
+            "v=0\r\nc=IN IP4 192.0.2.10\r\nm=video 6000 RTP/AVPF 96\r\na=rtpmap:96 H264/90000\r\n";
+        let key = minted(1);
+        let anchored = VideoRewrite::Anchor {
+            engine: engine(),
+            keying: VideoKeying::Sdes(key),
+        }
+        .apply(plain);
+        assert!(
+            anchored.contains("m=video 30000 RTP/SAVPF 96"),
+            "{anchored}"
+        );
+        assert!(anchored.contains(&format!("a={}", key.to_attribute_value())));
+    }
+
+    #[test]
+    fn anchoring_a_secure_stream_toward_a_plain_party_writes_avp_and_no_key() {
+        let anchored = VideoRewrite::Anchor {
+            engine: engine(),
+            keying: VideoKeying::Plain,
+        }
+        .apply(&secure_offer());
+        let section = anchored
+            .split("m=video")
+            .nth(1)
+            .expect("video section")
+            .to_string();
+        assert!(section.starts_with(" 30000 RTP/AVPF 96"), "{anchored}");
+        assert!(!section.contains("a=crypto:"), "{anchored}");
     }
 }
 

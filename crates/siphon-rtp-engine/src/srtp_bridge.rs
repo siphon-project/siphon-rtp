@@ -161,6 +161,62 @@ pub struct SrtpBridge<D: Datapath> {
     /// authenticating under that party's key can never move it.
     latched: DashMap<EndpointId, SocketAddr>,
     dtls: Arc<DtlsBridge<D>>,
+    /// Buffers the crypto transforms write into, reused from one datagram to the next.
+    scratch: ScratchPool,
+}
+
+/// The two buffers one datagram's transforms use: what the ingress side decrypts into and what the
+/// egress side encrypts into.
+#[derive(Default)]
+struct Scratch {
+    decrypted: Vec<u8>,
+    sealed: Vec<u8>,
+}
+
+/// A few [`Scratch`]es, so a datagram takes one for its life and gives it back, whatever way it
+/// leaves `handle`. A pool, not one shared buffer, because `handle` awaits its send while it holds
+/// the plaintext, so datagrams of different flows can overlap.
+#[derive(Default)]
+struct ScratchPool(Mutex<Vec<Scratch>>);
+
+/// A [`Scratch`] on loan from its pool; it returns, emptied, when dropped.
+struct ScratchLoan<'a> {
+    pool: &'a ScratchPool,
+    scratch: Scratch,
+}
+
+impl ScratchPool {
+    fn take(&self) -> ScratchLoan<'_> {
+        let scratch = self.0.lock().ok().and_then(|mut pool| pool.pop());
+        ScratchLoan {
+            pool: self,
+            scratch: scratch.unwrap_or_default(),
+        }
+    }
+}
+
+impl std::ops::Deref for ScratchLoan<'_> {
+    type Target = Scratch;
+    fn deref(&self) -> &Scratch {
+        &self.scratch
+    }
+}
+
+impl std::ops::DerefMut for ScratchLoan<'_> {
+    fn deref_mut(&mut self) -> &mut Scratch {
+        &mut self.scratch
+    }
+}
+
+impl Drop for ScratchLoan<'_> {
+    fn drop(&mut self) {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.decrypted.clear();
+        scratch.sealed.clear();
+        if let Ok(mut pool) = self.pool.0.lock() {
+            pool.push(scratch);
+        }
+    }
 }
 
 impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
@@ -172,6 +228,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             datapath,
             flows: DashMap::new(),
             latched: DashMap::new(),
+            scratch: ScratchPool::default(),
         }
     }
 
@@ -508,14 +565,18 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         // the two `None` and pays for a single transform, and a **transcrypt** runs both, under two
         // different parties' keys. The plaintext between them is a stack buffer that never reaches a
         // socket — on a transcrypt it is the only plaintext the call ever has.
-        let mut decrypted = Vec::new();
+        //
+        // The two buffers are the bridge's own and come back to it when this datagram is done, so
+        // the steady state allocates nothing per packet (they grow once, to the largest datagram).
+        let mut scratch = self.scratch.take();
+        let Scratch { decrypted, sealed } = &mut *scratch;
         let plaintext: &[u8] = if let Some(side) = &ingress_leg {
             let transformed = {
                 let Ok(mut leg) = side.leg.lock() else {
                     tracing::error!("bridge secure-leg mutex poisoned; dropping packet");
                     return;
                 };
-                leg.unprotect(&packet.data, &mut decrypted)
+                leg.unprotect(&packet.data, decrypted)
             };
             if let Err(error) = transformed {
                 let party = match side.party {
@@ -526,19 +587,18 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 self.datapath.note_dropped(packet.endpoint);
                 return;
             }
-            &decrypted
+            decrypted
         } else {
             &packet.data
         };
 
-        let mut sealed = Vec::new();
         let out: &[u8] = if let Some(side) = &egress_leg {
             let transformed = {
                 let Ok(mut leg) = side.leg.lock() else {
                     tracing::error!("bridge secure-leg mutex poisoned; dropping packet");
                     return;
                 };
-                leg.protect(plaintext, &mut sealed)
+                leg.protect(plaintext, sealed)
             };
             if let Err(error) = transformed {
                 tracing::debug!(
@@ -549,7 +609,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 self.datapath.note_dropped(packet.endpoint);
                 return;
             }
-            &sealed
+            sealed
         } else {
             plaintext
         };

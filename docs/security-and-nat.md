@@ -1306,11 +1306,27 @@ inbound surface, so it has its own gate and latch and none is inherited from the
 - **Re-offer.** A moved address or changed direction is recorded when the re-offer arrives and the relay is
   re-gated on it by the answer that completes the exchange; the old source is dropped from then on.
 - **Never into the void, never a leak.** A section the engine does not anchor is declined with port 0, so the
-  other party is never shown a party's own private video address. A secure profile is declined, never
-  relayed unkeyed.
+  other party is never shown a party's own private video address. A stream that cannot be keyed is declined,
+  never relayed unkeyed.
+- **SDES-SRTP per stream** (RFC 4568, RFC 3711). Each video section carries its own `a=crypto`, parsed like the
+  text stream's. The engine mints its own key toward each secure party, the answer echoes the offered tag
+  (RFC 4568 §5.1.2), and one party's key is never written into the other's SDP. A secure answer to a plain
+  offer, a plain answer to a secure offer, a section with no usable key and DTLS-SRTP video are declined: there
+  is no downgrade and no unkeyed relay. A secure leg cannot ride the kernel relay, so every video endpoint
+  that carries media is `Redirect`ed and a second bridge plan, over the video endpoints and video
+  `SecureLeg`s only, goes to the SRTP bridge. Plain to SDES, SDES to plain and SDES to SDES (a transcrypt)
+  are the audio bridge's one mechanism. The gated latch is the bridge's, unchanged: the signalled-source gate
+  runs before any crypto, and the symmetric latch adopts a source only after the packet authenticated under
+  the party's key (`a_stranger_is_dropped_by_the_gated_latch_even_with_a_well_formed_packet`). RTCP is SRTCP
+  per stream. A re-offer carries each secure leg's rollover into the rebuilt one (RFC 3711 §3.3.1), as audio's
+  does, so a stream past a sequence wrap keeps authenticating. The bridge's crypto buffers are reused across
+  datagrams, so the secure path allocates nothing per packet (`srtp_bridge_video_zero_alloc`); this holds for
+  audio's bridge flows too.
 - **HA.** The video sockets re-bind on their ports at restore, with the same gate and latch policy and the
-  same directions; a snapshot of a call with video carries its own version, so an older standby refuses it
-  rather than dropping the picture.
+  same directions. A secure stream also records its keys and each secure leg's rollover, so the standby's
+  first packet past a wrap authenticates; its snapshot has a version of its own, so an older standby refuses
+  it rather than restoring an unencrypted picture on a secure leg. A key that cannot be rebuilt refuses the
+  restore.
 
 ### Layer 5g — The T.38 fax (UDPTL) relay path
 A call may switch to fax: an `m=image <port> udptl t38` section (ITU-T T.38 Annex D, RFC 3362),

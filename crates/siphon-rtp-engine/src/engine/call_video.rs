@@ -3,14 +3,16 @@
 //! The engine relays an offered `m=video` stream like its audio one: an endpoint pair per leg
 //! (one when RTCP is muxed), the gated latch per stream (the same [`ingress_rule`] audio uses), the
 //! direction attributes respected, and no transcoding (codecs and payload numbers are the two
-//! parties' own). Plain RTP only here; a secure profile is declined with the reason in
-//! `video_declined`, never relayed unkeyed. See docs/security-and-nat.md, "Video on a two-party call".
+//! parties' own). Plain RTP and SDES-SRTP per leg ([`super::call_video_secure`]); anything else is
+//! declined with the reason in `video_declined`, never relayed unkeyed. See
+//! docs/security-and-nat.md, "Video on a two-party call".
 
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, EndpointId, FlowAction};
 use siphon_rtp_proto::{ProfileFlags, VideoRelay, VideoStats};
 use std::net::{IpAddr, SocketAddr};
 
 use super::answer::ingress_rule;
+use super::call_video_secure::{Exchange, VideoFlowRule, VideoKeys};
 use super::negotiate::{apply_received_from, far_received_from_hint, peer_media_address};
 use super::{Engine, Leg, Party};
 use crate::sdp::{self, EngineMedia, MediaDirection, VideoRewrite, VideoStream};
@@ -55,6 +57,11 @@ pub(super) struct CallVideo {
     pub(super) flows: Vec<(EndpointId, FlowAction)>,
     /// Why the last offered or answered video stream was declined, when anchoring was asked.
     pub(super) declined: Option<String>,
+    /// Each party's SDES keys for the stream; a party with none is on plain RTP.
+    pub(super) keys: VideoKeys,
+    /// The flows the SRTP bridge carries when either party is secure: their source gates, latches
+    /// and destinations, kept for the snapshot and for the rollover read on a renegotiation.
+    pub(super) bridged: Vec<VideoFlowRule>,
 }
 
 /// The leg's video stream rebuilt from its snapshot and the endpoints bound for it.
@@ -72,27 +79,46 @@ pub(super) fn video_leg(
     })
 }
 
-/// The call-level video state of a restored call: its mode and each party's own direction.
+/// The call-level video state of a restored call: its mode, each party's own direction and its keys.
+///
+/// # Errors
+/// A recorded key that cannot be rebuilt: the call is refused rather than restored as plain RTP
+/// on a leg that negotiated SRTP.
 pub(super) fn restored_call_video(
     snapshot: &crate::ha::CallSnapshot,
     near: &Leg,
     far: &Leg,
-) -> CallVideo {
+) -> Result<CallVideo, Box<siphon_rtp_proto::CmdResult>> {
     let direction = |token: &str| MediaDirection::parse(token).unwrap_or_default();
-    match snapshot
+    let Some(video) = snapshot
         .video
         .as_ref()
         .filter(|_| near.video.is_some() && far.video.is_some())
-    {
-        Some(video) => CallVideo {
-            mode: video.mode,
-            near_direction: direction(&video.near_direction),
-            far_direction: direction(&video.far_direction),
-            flows: Vec::new(),
-            declined: None,
-        },
-        None => CallVideo::default(),
-    }
+    else {
+        return Ok(CallVideo::default());
+    };
+    let keys = VideoKeys::restored(video.secure.as_ref()).map_err(|reason| {
+        Box::new(siphon_rtp_proto::CmdResult::Error {
+            reason: format!("restore: video keys: {reason}"),
+        })
+    })?;
+    Ok(CallVideo {
+        mode: video.mode,
+        near_direction: direction(&video.near_direction),
+        far_direction: direction(&video.far_direction),
+        flows: Vec::new(),
+        declined: None,
+        keys,
+        bridged: Vec::new(),
+    })
+}
+
+/// The video flows of a restored call: the datapath rules or drops installed, and the flows the SRTP
+/// bridge carries when the stream is secure.
+#[derive(Default)]
+pub(super) struct RestoredVideoFlows {
+    pub(super) flows: Vec<(EndpointId, FlowAction)>,
+    pub(super) bridged: Vec<VideoFlowRule>,
 }
 
 /// What negotiating a video stream decides for the SDP presented to the other party.
@@ -198,16 +224,25 @@ impl super::Call {
     /// The call's anchored video stream as an HA snapshot, `None` when it carries none.
     pub(super) fn video_snapshot(&self) -> Option<crate::ha::CallVideoSnapshot> {
         self.near.video.zip(self.far.as_ref()?.video)?;
-        let flows = self
+        // The in-kernel rules, or, on a secure stream, the rules its bridge flows carry.
+        let forwards = self
             .video
             .flows
             .iter()
-            .filter_map(|(endpoint, action)| {
-                let FlowAction::Forward(rule) = action else {
-                    return None;
-                };
+            .filter_map(|(endpoint, action)| match action {
+                FlowAction::Forward(rule) => Some((*endpoint, *rule)),
+                _ => None,
+            })
+            .chain(
+                self.video
+                    .bridged
+                    .iter()
+                    .map(|flow| (flow.endpoint, flow.rule)),
+            );
+        let flows = forwards
+            .filter_map(|(endpoint, rule)| {
                 Some(crate::ha::FlowSnapshot {
-                    installed_on: self.video_endpoint_role(*endpoint)?,
+                    installed_on: self.video_endpoint_role(endpoint)?,
                     out: self.video_endpoint_role(rule.out_endpoint)?,
                     out_dst: rule.out_dst,
                     accepted_source: super::snapshot::source_filter_snapshot(rule.accepted_source),
@@ -221,6 +256,7 @@ impl super::Call {
             near_direction: self.video.near_direction.token().to_string(),
             far_direction: self.video.far_direction.token().to_string(),
             flows,
+            secure: self.video.keys.snapshot(),
         })
     }
 }
@@ -234,10 +270,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         snapshot: &crate::ha::CallSnapshot,
         bound: &[(crate::ha::EndpointRole, Endpoint)],
-    ) -> Result<Vec<(EndpointId, FlowAction)>, Box<siphon_rtp_proto::CmdResult>> {
+    ) -> Result<RestoredVideoFlows, Box<siphon_rtp_proto::CmdResult>> {
         use crate::ha::EndpointRole;
         let Some(video) = snapshot.video.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(RestoredVideoFlows::default());
         };
         let find = |role: EndpointRole| {
             bound
@@ -250,31 +286,70 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 reason: format!("restore: {reason}"),
             })
         };
+        let keys = VideoKeys::restored(video.secure.as_ref())
+            .map_err(|reason| refuse(format!("video keys: {reason}")))?;
         let mut installed: Vec<(EndpointId, FlowAction)> = Vec::new();
+        let mut bridged: Vec<VideoFlowRule> = Vec::new();
         for flow in &video.flows {
             let (Some(on), Some(out)) = (find(flow.installed_on), find(flow.out)) else {
                 return Err(refuse(
                     "a video flow references an unknown endpoint role".to_string(),
                 ));
             };
-            let action = FlowAction::Forward(siphon_rtp_datapath::ForwardRule {
+            let rule = siphon_rtp_datapath::ForwardRule {
                 out_endpoint: out.id,
                 out_dst: flow.out_dst,
                 accepted_source: super::snapshot::restore_source_filter(flow.accepted_source),
                 latch: super::snapshot::restore_latch(flow.latch),
                 rtcp_to_userspace: flow.rtcp_to_userspace,
-            });
+            };
+            if keys.is_secure() {
+                let ingress = match flow.installed_on {
+                    EndpointRole::NearVideo | EndpointRole::NearVideoRtcp => Party::Near,
+                    _ => Party::Far,
+                };
+                bridged.push(VideoFlowRule {
+                    endpoint: on.id,
+                    ingress,
+                    rule,
+                });
+                continue;
+            }
+            let action = FlowAction::Forward(rule);
             self.datapath
                 .install_flow(on.id, action)
                 .map_err(|error| refuse(format!("install video flow: {error}")))?;
             installed.push((on.id, action));
         }
-        for role in [
+        let roles = [
             EndpointRole::NearVideo,
             EndpointRole::FarVideo,
             EndpointRole::NearVideoRtcp,
             EndpointRole::FarVideoRtcp,
-        ] {
+        ];
+        if keys.is_secure() {
+            // The stream is carried by the SRTP bridge, each secure leg seeded with the rollover the
+            // primary had (RFC 3711 §3.3.1), and the flows reinstalled on their gates and latches.
+            let endpoints: Vec<EndpointId> = roles
+                .iter()
+                .filter_map(|role| find(*role))
+                .map(|endpoint| endpoint.id)
+                .collect();
+            let seeds = video.secure.as_ref();
+            let previous = (
+                seeds
+                    .and_then(|secure| secure.near_rollover.as_ref())
+                    .map(super::snapshot::restore_rollover),
+                seeds
+                    .and_then(|secure| secure.far_rollover.as_ref())
+                    .map(super::snapshot::restore_rollover),
+            );
+            let flows = self
+                .install_video_bridge(&keys, &bridged, &endpoints, previous)
+                .map_err(|reason| refuse(format!("video bridge: {reason}")))?;
+            return Ok(RestoredVideoFlows { flows, bridged });
+        }
+        for role in roles {
             let Some(endpoint) = find(role) else {
                 continue;
             };
@@ -285,7 +360,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 installed.push((endpoint.id, FlowAction::Drop));
             }
         }
-        Ok(installed)
+        Ok(RestoredVideoFlows {
+            flows: installed,
+            bridged,
+        })
     }
 
     /// Allocate a video endpoint set (one RTP, plus RTCP unless muxed) on `leg`'s interface.
@@ -316,7 +394,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 freed.extend(video.endpoint_ids());
             }
             call.video.flows.clear();
+            call.video.bridged.clear();
+            call.video.keys = VideoKeys::default();
         }
+        // A secure stream leaves the SRTP bridge with its endpoints, so no flow outlives them.
+        self.bridge.deregister(freed.iter().copied());
         for endpoint in freed {
             self.endpoint_calls.remove(&endpoint);
             self.awaiting_media.remove(&endpoint);
@@ -375,7 +457,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return VideoOutcome::passthrough();
         };
         let outcome = self
-            .anchor_video_stream(call_id, party, &stream, near, far, answering)
+            .anchor_video_stream(call_id, party, &stream, (near, far), (answering, profile))
             .await;
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.video.declined.clone_from(&outcome.declined);
@@ -383,23 +465,57 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         outcome
     }
 
+    /// Whether the engine offers a first-offered video stream's far party SRTP, as the audio leg's
+    /// far transport says (`RTP/SAVP`), or the reason it cannot: a DTLS far leg carries no video.
+    fn far_offers_srtp(&self, call_id: &str, profile: &ProfileFlags) -> Result<bool, String> {
+        let transport = profile.transport_protocol.as_deref().unwrap_or_default();
+        let (audio_dtls, audio_sdes) = self
+            .calls
+            .get(call_id)
+            .map(|call| (call.far_dtls, call.far_local_crypto.is_some()))
+            .unwrap_or_default();
+        if transport.contains("UDP/TLS") || audio_dtls {
+            return Err(
+                "video is not carried toward a DTLS-SRTP far leg: DTLS-SRTP video is not supported"
+                    .to_string(),
+            );
+        }
+        Ok(transport.contains("SAVP") || audio_sdes)
+    }
+
     async fn anchor_video_stream(
         &self,
         call_id: &str,
         party: Party,
         stream: &VideoStream,
-        near: Leg,
-        far: Leg,
-        answering: bool,
+        (near, far): (Leg, Leg),
+        (answering, profile): (bool, &ProfileFlags),
     ) -> VideoOutcome {
-        if !stream.is_plain() {
-            self.free_call_video(call_id).await;
-            return VideoOutcome::declined(format!(
-                "video transport {} is not carried: the engine anchors plain RTP video only",
-                stream.transport
-            ));
-        }
         let allocated = near.video.zip(far.video);
+        // Settle each party's keys first: a stream that cannot be keyed is declined before anything
+        // is allocated or relayed (RFC 4568 §7.1: never in the clear).
+        let mut keys = self
+            .calls
+            .get(call_id)
+            .map(|call| call.video.keys)
+            .unwrap_or_default();
+        let exchange = if answering {
+            Exchange::Answer
+        } else if allocated.is_some() {
+            Exchange::Offer
+        } else {
+            match self.far_offers_srtp(call_id, profile) {
+                Ok(far_secure) => Exchange::FirstOffer { far_secure },
+                Err(reason) => {
+                    self.free_call_video(call_id).await;
+                    return VideoOutcome::declined(reason);
+                }
+            }
+        };
+        if let Err(reason) = keys.settle(party, stream, exchange) {
+            self.free_call_video(call_id).await;
+            return VideoOutcome::declined(reason);
+        }
         let muxed = match allocated {
             Some((near_video, _)) => near_video.rtcp.is_none(),
             None => stream.rtcp_mux,
@@ -456,6 +572,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             } else {
                 call.video.far_direction = stream.direction;
             }
+            call.video.keys = keys;
             let other = match party {
                 Party::Near => call.far.as_ref(),
                 Party::Far => Some(&call.near),
@@ -463,9 +580,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             presented =
                 other.and_then(|leg| leg.video.map(|video| video.engine_media(leg.advertised_ip)));
         }
+        let toward = match party {
+            Party::Near => Party::Far,
+            Party::Far => Party::Near,
+        };
         match presented {
             Some(engine) => VideoOutcome {
-                rewrite: VideoRewrite::Anchor(engine),
+                rewrite: VideoRewrite::Anchor {
+                    engine,
+                    keying: keys.keying_toward(toward),
+                },
                 declined: None,
             },
             None => VideoOutcome::declined("video endpoints are not available"),
@@ -586,7 +710,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         profile: &ProfileFlags,
         reversed: bool,
     ) -> Result<(), String> {
-        let Some((near, far, near_direction, far_direction, offer_hint, stored_far_hint)) =
+        let Some((near, far, near_direction, far_direction, offer_hint, stored_far_hint, keys)) =
             self.calls.get(call_id).and_then(|call| {
                 Some((
                     call.near.video?,
@@ -595,6 +719,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.video.far_direction,
                     call.offer_received_from,
                     call.far_received_from,
+                    call.video.keys,
                 ))
             })
         else {
@@ -607,13 +732,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let near_gate = apply_received_from(Some(near_rtp), offer_hint);
         let far_gate = peer_media_address(far_rtp, far_hint);
         let (near_to_far, far_to_near) = sdp::flow_directions(near_direction, far_direction);
-        let mut flows: Vec<(EndpointId, FlowAction)> = Vec::new();
-        let mut install = |endpoint: EndpointId, action: FlowAction| {
-            self.datapath
-                .install_flow(endpoint, action)
-                .map(|()| flows.push((endpoint, action)))
-                .map_err(|error| format!("install video flow: {error}"))
-        };
         // RTCP carries receiver feedback (reports, picture loss) against the media's direction, so
         // it flows both ways whenever the stream flows at all. Muxed RTCP shares the RTP endpoint
         // (RFC 5761), where a kernel rule cannot tell the two apart: the RTP direction rule then
@@ -622,14 +740,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let near_rule = ingress_rule(far.rtp.id, Some(far_gate), near_gate, profile, false);
         let far_rule = ingress_rule(near.rtp.id, near_gate, Some(far_gate), profile, false);
         let muxed = near.rtcp.is_none() || far.rtcp.is_none();
-        install(
-            near.rtp.id,
-            video_action(near_to_far || (muxed && any), near_rule),
-        )?;
-        install(
-            far.rtp.id,
-            video_action(far_to_near || (muxed && any), far_rule),
-        )?;
+        // Every video endpoint with the rule it would forward by, and whether its direction is open.
+        let mut planned: Vec<(VideoFlowRule, bool)> = vec![
+            (
+                VideoFlowRule {
+                    endpoint: near.rtp.id,
+                    ingress: Party::Near,
+                    rule: near_rule,
+                },
+                near_to_far || (muxed && any),
+            ),
+            (
+                VideoFlowRule {
+                    endpoint: far.rtp.id,
+                    ingress: Party::Far,
+                    rule: far_rule,
+                },
+                far_to_near || (muxed && any),
+            ),
+        ];
         if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
             let near_rtcp_gate = apply_received_from(near.remote_rtcp, offer_hint);
             let far_rtcp_gate = far
@@ -639,11 +768,54 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ingress_rule(far_rtcp.id, far_rtcp_gate, near_rtcp_gate, profile, false);
             let far_rtcp_rule =
                 ingress_rule(near_rtcp.id, near_rtcp_gate, far_rtcp_gate, profile, false);
-            install(near_rtcp.id, video_action(any, near_rtcp_rule))?;
-            install(far_rtcp.id, video_action(any, far_rtcp_rule))?;
+            planned.push((
+                VideoFlowRule {
+                    endpoint: near_rtcp.id,
+                    ingress: Party::Near,
+                    rule: near_rtcp_rule,
+                },
+                any,
+            ));
+            planned.push((
+                VideoFlowRule {
+                    endpoint: far_rtcp.id,
+                    ingress: Party::Far,
+                    rule: far_rtcp_rule,
+                },
+                any,
+            ));
+        }
+        let endpoints: Vec<EndpointId> = near.endpoint_ids().chain(far.endpoint_ids()).collect();
+        if keys.is_secure() {
+            // SDES-SRTP: the SRTP bridge carries the stream, seeded with the rollover the previous
+            // negotiation had (RFC 3711 §3.3.1), so a re-offer does not restart either counter.
+            let open: Vec<VideoFlowRule> = planned
+                .iter()
+                .filter(|(_, allowed)| *allowed)
+                .map(|(flow, _)| *flow)
+                .collect();
+            let previous = self
+                .live_video_rollover(&planned.iter().map(|(flow, _)| *flow).collect::<Vec<_>>());
+            let flows = self.install_video_bridge(&keys, &open, &endpoints, previous)?;
+            if let Some(mut call) = self.calls.get_mut(call_id) {
+                call.video.flows = flows;
+                call.video.bridged = open;
+            }
+            return Ok(());
+        }
+        // A stream that was secure and is plain now leaves the bridge before the kernel takes it.
+        self.bridge.deregister(endpoints);
+        let mut flows: Vec<(EndpointId, FlowAction)> = Vec::new();
+        for (flow, allowed) in planned {
+            let action = video_action(allowed, flow.rule);
+            self.datapath
+                .install_flow(flow.endpoint, action)
+                .map_err(|error| format!("install video flow: {error}"))?;
+            flows.push((flow.endpoint, action));
         }
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.video.flows = flows;
+            call.video.bridged.clear();
         }
         Ok(())
     }

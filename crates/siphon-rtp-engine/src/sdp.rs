@@ -53,7 +53,7 @@ pub mod video;
 mod video_anchor;
 pub use video_anchor::{
     anchor_video, decline_video, flow_directions, keep_passthrough_connection, offers_video,
-    parse_video_stream, VideoRewrite, VideoStream,
+    parse_video_stream, VideoKeying, VideoRewrite, VideoStream,
 };
 
 /// Default packetization when the SDP carries no `a=ptime` (RFC 3551: 20 ms for telephony codecs).

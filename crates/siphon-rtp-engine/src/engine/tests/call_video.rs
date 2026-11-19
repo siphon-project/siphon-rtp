@@ -3,9 +3,9 @@
 use super::*;
 use siphon_rtp_proto::VideoRelay;
 
-const CAMERA_PAYLOAD: &str = "a=rtpmap:96 H264/90000\r\na=fmtp:96 profile-level-id=42e01f;packetization-mode=1\r\na=rtcp-fb:96 nack pli\r\n";
+pub(super) const CAMERA_PAYLOAD: &str = "a=rtpmap:96 H264/90000\r\na=fmtp:96 profile-level-id=42e01f;packetization-mode=1\r\na=rtcp-fb:96 nack pli\r\n";
 
-fn anchor() -> ProfileFlags {
+pub(super) fn anchor() -> ProfileFlags {
     ProfileFlags {
         video_relay: VideoRelay::Anchor,
         ..ProfileFlags::default()
@@ -102,7 +102,7 @@ async fn answered_door_call(call_id: &str, profile: ProfileFlags) -> VideoCall {
 }
 
 /// A socket on the port after `rtp`'s, the RTCP port of a non-muxed stream (RFC 3550 §11).
-async fn phone_pair(rtp: &SocketAddr) -> (UdpSocket, SocketAddr) {
+pub(super) async fn phone_pair(rtp: &SocketAddr) -> (UdpSocket, SocketAddr) {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, rtp.port() + 1))
         .await
         .or_else(|_| futures_free_bind())
@@ -117,7 +117,7 @@ fn futures_free_bind() -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(socket)
 }
 
-async fn received(socket: &UdpSocket) -> Option<Vec<u8>> {
+pub(super) async fn received(socket: &UdpSocket) -> Option<Vec<u8>> {
     let mut buffer = [0u8; 2048];
     match timeout(Duration::from_millis(400), socket.recv_from(&mut buffer)).await {
         Ok(Ok((len, _))) => Some(buffer[..len].to_vec()),
@@ -125,7 +125,7 @@ async fn received(socket: &UdpSocket) -> Option<Vec<u8>> {
     }
 }
 
-fn video_packet(sequence: u16) -> Vec<u8> {
+pub(super) fn video_packet(sequence: u16) -> Vec<u8> {
     let mut packet = vec![0x80, 96];
     packet.extend_from_slice(&sequence.to_be_bytes());
     packet.extend_from_slice(&[0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF]);
@@ -133,7 +133,7 @@ fn video_packet(sequence: u16) -> Vec<u8> {
     packet
 }
 
-fn receiver_report() -> Vec<u8> {
+pub(super) fn receiver_report() -> Vec<u8> {
     vec![0x80, 201, 0, 1, 0xCA, 0xFE, 0xBA, 0xBE]
 }
 
@@ -246,7 +246,7 @@ async fn the_default_leaves_video_unanchored_and_the_phones_own_addresses_in_it(
 }
 
 #[tokio::test]
-async fn secure_video_is_declined_with_the_reason_and_decline_mode_says_no() {
+async fn dtls_video_is_declined_with_the_reason_and_decline_mode_says_no() {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_audio, audio_addr) = phone().await;
     let (_video, video_addr) = phone().await;
@@ -256,15 +256,24 @@ async fn secure_video_is_declined_with_the_reason_and_decline_mode_says_no() {
             Command::Offer {
                 call_id: "video-secure".into(),
                 from_tag: "a".into(),
-                sdp: call_sdp(audio_addr, video_addr, "sendrecv", "RTP/SAVP", true),
+                sdp: call_sdp(
+                    audio_addr,
+                    video_addr,
+                    "sendrecv",
+                    "UDP/TLS/RTP/SAVPF",
+                    true,
+                ),
                 profile: anchor(),
             },
         )
         .await;
     let presented = ok_sdp_text(&offered);
-    assert!(presented.contains("m=video 0 RTP/SAVP 96"), "{presented}");
     assert!(
-        video_declined_of(&offered).is_some_and(|reason| reason.contains("RTP/SAVP")),
+        presented.contains("m=video 0 UDP/TLS/RTP/SAVPF 96"),
+        "{presented}"
+    );
+    assert!(
+        video_declined_of(&offered).is_some_and(|reason| reason.contains("DTLS-SRTP video")),
         "{offered:?}"
     );
     let declined = engine
@@ -807,6 +816,7 @@ async fn node_info_advertises_call_video_anchor() {
         panic!("node_info answers a node");
     };
     assert!(node.features.iter().any(|name| name == "call_video_anchor"));
+    assert!(node.features.iter().any(|name| name == "call_video_sdes"));
 }
 
 #[tokio::test]

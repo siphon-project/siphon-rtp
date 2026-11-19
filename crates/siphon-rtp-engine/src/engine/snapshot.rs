@@ -139,7 +139,9 @@ pub(super) fn crypto_snapshot(crypto: &CryptoAttribute) -> crate::ha::CryptoSnap
 }
 
 /// Map a [`SecureLegRollover`] (from the SRTP bridge) to its snapshot on checkpoint.
-fn secure_rollover_snapshot(rollover: &SecureLegRollover) -> crate::ha::SecureLegRolloverSnapshot {
+pub(super) fn secure_rollover_snapshot(
+    rollover: &SecureLegRollover,
+) -> crate::ha::SecureLegRolloverSnapshot {
     let stream = |value: &StreamRollover| crate::ha::StreamRolloverSnapshot {
         ssrc: value.ssrc,
         roc: value.roc,
@@ -227,7 +229,9 @@ pub(super) fn restore_latch(latch: crate::ha::LatchSnapshot) -> LatchPolicy {
 
 /// Reconstruct an SDES [`CryptoAttribute`] from its snapshot (hex-decoding the key/salt). Returns a
 /// human-readable error for an unknown suite or malformed key material.
-fn restore_crypto(snapshot: &crate::ha::CryptoSnapshot) -> Result<CryptoAttribute, String> {
+pub(super) fn restore_crypto(
+    snapshot: &crate::ha::CryptoSnapshot,
+) -> Result<CryptoAttribute, String> {
     let suite = CryptoSuite::from_name(&snapshot.suite)
         .ok_or_else(|| format!("unknown crypto suite {}", snapshot.suite))?;
     let master_key: [u8; 16] = crate::ha::from_hex(&snapshot.master_key_hex)
@@ -253,7 +257,9 @@ fn restore_crypto(snapshot: &crate::ha::CryptoSnapshot) -> Result<CryptoAttribut
 }
 
 /// Reconstruct a [`SecureLegRollover`] from its snapshot on restore.
-fn restore_rollover(snapshot: &crate::ha::SecureLegRolloverSnapshot) -> SecureLegRollover {
+pub(super) fn restore_rollover(
+    snapshot: &crate::ha::SecureLegRolloverSnapshot,
+) -> SecureLegRollover {
     let stream = |value: &crate::ha::StreamRolloverSnapshot| StreamRollover {
         ssrc: value.ssrc,
         roc: value.roc,
@@ -296,7 +302,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // (the peer's SDES key, plus the endpoint roles the bridge query maps its flow ids through).
         let Some((snapshot, secure_ctx, refusal, floors)) =
             self.owned_call(client, call_id, |call| {
-                let snapshot = call.to_snapshot();
+                let mut snapshot = call.to_snapshot();
+                // A secure video stream's live rollover is the bridge's to say, so it is read here.
+                if let Some(secure) = snapshot
+                    .as_mut()
+                    .and_then(|snapshot| snapshot.video.as_mut())
+                    .and_then(|video| video.secure.as_mut())
+                {
+                    let (near, far) = self.live_video_rollover(&call.video.bridged);
+                    secure.near_rollover = near.as_ref().map(secure_rollover_snapshot);
+                    secure.far_rollover = far.as_ref().map(secure_rollover_snapshot);
+                }
                 // An MCPTT floor stream is terminated on engine endpoints and served by an actor, so its
                 // live state is read from there below. A DTLS or data-channel floor stream is refused by
                 // the pipeline kind, which cannot be restored at all.
@@ -376,7 +392,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
         snapshot.version = if snapshot.has_video() {
-            crate::ha::SNAPSHOT_VERSION_VIDEO
+            snapshot.expected_version()
         } else {
             crate::ha::CallSnapshot::version_for(call_scope, snapshot.floor_format())
         };
@@ -657,7 +673,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let rtcp_legs = restored_rtcp_relay_legs(&snapshot, &near, &media.relay_flows);
         let tags = (snapshot.from_tag.clone(), snapshot.to_tag.clone());
         let (near_floor, far_floor) = (near.floor, far.floor);
-        let restored_video = super::call_video::restored_call_video(&snapshot, &near, &far);
+        let restored_video = super::call_video::restored_call_video(&snapshot, &near, &far)?;
         let video_flows = self.restore_video_flows(&snapshot, bound)?;
         self.calls.insert(
             snapshot.call_id.clone(),
@@ -793,7 +809,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Register the reconstructed call under the requesting (standby) client.
         self.index_new_call(&snapshot.call_id, client);
         if let Some(mut call) = self.calls.get_mut(&snapshot.call_id) {
-            call.video.flows = video_flows;
+            call.video.flows = video_flows.flows;
+            call.video.bridged = video_flows.bridged;
         }
         // The floor streams and the audio RTCP relay report to the controller that now owns the
         // call, so they come up after it is registered.

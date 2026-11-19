@@ -26,13 +26,19 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   Codecs and payload numbers are the two parties' own; there is no video transcoding. A re-offer re-gates a
   moved address or direction and adds or frees the endpoints, a snapshot carries the stream (its own
   version, so an older standby refuses it), and `query`, the end-of-call record and
-  `siphon_rtp_video_packets_total` / `siphon_rtp_video_bytes_total` count it. Plain RTP only: a secure
-  profile is declined with the reason in `video_declined`. Every verb that takes a profile but has no video
-  stream to anchor (rooms, `answer_local`, `offer_far`, subscriptions, `attach_ws_bridge`) refuses the field
-  instead of ignoring it, and a call carrying anchored video is not seated in a room. `node_info` lists `call_video_anchor`.
+  `siphon_rtp_video_packets_total` / `siphon_rtp_video_bytes_total` count it. Plain RTP or SDES-SRTP per leg
+  (`a=crypto` per video section, the engine's own key toward each secure party and the offered tag
+  echoed; plain to SDES, SDES to plain and SDES to SDES, SRTCP per stream, rollover carried across a
+  re-offer and in the snapshot, which has its own version for a secure stream). DTLS-SRTP video and a
+  stream that cannot be keyed are declined with the reason in `video_declined`. Every verb that takes a
+  profile but has no video stream to anchor (rooms, `answer_local`, `offer_far`, subscriptions,
+  `attach_ws_bridge`) refuses the field instead of ignoring it, and a call carrying anchored video is not
+  seated in a room. `node_info` lists `call_video_anchor` and, for SDES-SRTP video, `call_video_sdes`.
 
 ### Fixed
 
+- **The userspace SRTP bridge reuses its crypto buffers.** It allocated two `Vec`s for every datagram it
+  decrypted or encrypted; the steady state now allocates nothing per packet.
 - **A video stream the engine passes through keeps its own address.** Rewriting the session `c=` to
   the engine for the audio stream left a passed-through `m=video` with no connection line of its own,
   so the far party read the engine's address with the phone's own port (RFC 4566 §5.7). Such a section
