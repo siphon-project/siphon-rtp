@@ -19,6 +19,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   `transport_protocol: UDP/TLS/RTP/SAVPF` and `profile.video` offers a bundled video section. A video
   section on a transport of its own, and SDES video, stay declined. `node_info` lists
   `forward_video_webrtc`.
+### Fixed
+
+- **A video stream the engine passes through keeps its own address.** Rewriting the session `c=` to
+  the engine for the audio stream left a passed-through `m=video` with no connection line of its own,
+  so the far party read the engine's address with the phone's own port (RFC 4566 §5.7). Such a section
+  now carries the offerer's original `c=`.
 
 ### Changed
 

@@ -50,6 +50,8 @@ pub use stream_identity::{own_stream_identity, OwnSsrc};
 mod telephone_event;
 pub use telephone_event::TelephoneEvent;
 pub mod video;
+mod video_anchor;
+pub use video_anchor::keep_passthrough_connection;
 
 /// Default packetization when the SDP carries no `a=ptime` (RFC 3551: 20 ms for telephony codecs).
 const DEFAULT_PTIME_MS: u8 = 20;
