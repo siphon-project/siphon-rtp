@@ -36,7 +36,7 @@ use siphon_rtp_media::rtp::{write_packet, RtpHeader};
 use siphon_rtp_media::translator::Forwarded;
 use siphon_rtp_proto::Event;
 
-use super::video::VideoStream;
+use super::video::{seal, VideoStream};
 use super::{ticks, ForwardRoom, StreamPoint, MAX_DATAGRAM};
 use crate::media_pipeline::Outbound;
 use crate::sdp::video::VIDEO_CLOCK_RATE_HZ;
@@ -573,11 +573,13 @@ impl ForwardRoom {
     /// source a request names), it can be reached, and it accepted some feedback.
     fn source_can_be_asked(&self) -> bool {
         self.source
-            .and_then(|source| self.seats[source].video.as_ref())
-            .is_some_and(|video| {
-                video.keyframe_media.ssrc.is_some()
-                    && video.reachable()
-                    && (video.feedback.pli || video.feedback.fir)
+            .map(|source| &self.seats[source])
+            .is_some_and(|seat| {
+                seat.video.as_ref().is_some_and(|video| {
+                    video.keyframe_media.ssrc.is_some()
+                        && seat.video_reachable()
+                        && (video.feedback.pli || video.feedback.fir)
+                })
             })
     }
 
@@ -701,10 +703,12 @@ impl ForwardRoom {
     /// The source has sent no video yet or cannot be reached yet, so a receiver's request waits.
     fn source_unreachable_yet(&self) -> bool {
         self.source
-            .and_then(|source| self.seats[source].video.as_ref())
-            .is_some_and(|video| {
-                (video.feedback.pli || video.feedback.fir)
-                    && (video.keyframe_media.ssrc.is_none() || !video.reachable())
+            .map(|source| &self.seats[source])
+            .is_some_and(|seat| {
+                seat.video.as_ref().is_some_and(|video| {
+                    (video.feedback.pli || video.feedback.fir)
+                        && (video.keyframe_media.ssrc.is_none() || !seat.video_reachable())
+                })
             })
     }
 
@@ -726,6 +730,9 @@ impl ForwardRoom {
         out: &mut Vec<Outbound>,
     ) -> bool {
         let seat = &mut self.seats[source];
+        let Some((endpoint, destination)) = seat.video_route() else {
+            return false;
+        };
         let Some(video) = seat.video.as_ref() else {
             return false;
         };
@@ -754,10 +761,24 @@ impl ForwardRoom {
             return false;
         };
         length += written;
+        // A request to a bundled seat is SRTCP under the seat's key (RFC 3711 §3.4).
+        let Some(sealed) = seal(
+            video.bundled,
+            seat.secure.as_mut(),
+            &buffer[..length],
+            &mut self.secure_out,
+        ) else {
+            return false;
+        };
+        let wire = if sealed {
+            &self.secure_out[..]
+        } else {
+            &buffer[..length]
+        };
         out.push(Outbound {
-            endpoint: video.endpoint,
-            dst: video.destination,
-            data: Bytes::copy_from_slice(&buffer[..length]),
+            endpoint,
+            dst: destination,
+            data: Bytes::copy_from_slice(wire),
         });
         match kind {
             Kind::Pli => seat.counters.pli_sent += 1,
@@ -876,9 +897,26 @@ impl ForwardRoom {
                 receiver.counters.nack_missed += 1;
                 continue;
             };
+            let (endpoint, destination) = receiver.video_route()?;
+            let bundled = receiver.video.as_ref().is_some_and(|video| video.bundled);
+            // SRTP again, under the seat's key: the same packet index gives the same bytes, which is
+            // what a receiver that never saw the first one needs (RFC 3711 §3.3.1).
+            let Some(sealed) = seal(
+                bundled,
+                receiver.secure.as_mut(),
+                &self.scratch[..length],
+                &mut self.secure_out,
+            ) else {
+                receiver.counters.nack_missed += 1;
+                continue;
+            };
             receiver.counters.nack_answered += 1;
-            let video = receiver.video.as_ref()?;
-            return Some((video.endpoint, video.destination, &self.scratch[..length]));
+            let wire = if sealed {
+                &self.secure_out[..]
+            } else {
+                &self.scratch[..length]
+            };
+            return Some((endpoint, destination, wire));
         }
     }
 }

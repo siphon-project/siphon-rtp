@@ -9,7 +9,9 @@
 //! * `a=ice-lite` with credentials and candidates minted for the seat (RFC 8445 §2.5): the engine is
 //!   the lite agent, so the browser controls and nominates (RFC 8445 §6.1.1);
 //! * when the room carries floor control, a bundled `m=application ... webrtc-datachannel` section
-//!   (RFC 8841) in place of the UDP floor section, because a browser cannot send RTCP APP.
+//!   (RFC 8841) in place of the UDP floor section, because a browser cannot send RTCP APP;
+//! * when the profile carries video, a bundled `m=video ... UDP/TLS/RTP/SAVPF` section (RFC 8843):
+//!   the video rides the seat's one transport, so it has no endpoint of its own.
 //!
 //! What the offer fixed (certificate, ICE identity, candidates, the data channel intent) is kept in
 //! the pending seat as [`OfferedWebrtc`]; [`OfferedWebrtc::read_answer`] checks the answer against it
@@ -82,6 +84,8 @@ pub(super) struct OfferedWebrtc {
     pub(super) candidates: Vec<Candidate>,
     /// The offer carried a data channel section for the MCPTT floor control.
     pub(super) data_channel: bool,
+    /// The offer carried a video section bundled with the audio (RFC 8843).
+    pub(super) video: bool,
     /// The address the offer advertised.
     pub(super) advertised: IpAddr,
 }
@@ -114,6 +118,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         codecs: &[CodecSpec],
         events: &[TelephoneEvent],
         data_channel: bool,
+        video: Option<sdp::WebrtcVideoOffer<'_>>,
     ) -> Result<(String, OfferedWebrtc), String> {
         let Some(certificate) = self.dtls_certificate.clone() else {
             return Err("engine has no DTLS certificate".to_string());
@@ -157,6 +162,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 candidates: &candidates,
                 fingerprint: &fingerprint,
                 data_channel,
+                video,
             },
         );
         Ok((
@@ -166,6 +172,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 credentials,
                 candidates,
                 data_channel,
+                video: video.is_some(),
                 advertised,
             },
         ))
@@ -368,6 +375,7 @@ mod tests {
             },
             candidates: Vec::new(),
             data_channel: true,
+            video: false,
             advertised: "127.0.0.1".parse().unwrap(),
         }
     }

@@ -62,7 +62,7 @@ fn split_lines(sdp: &str) -> Vec<&str> {
 }
 
 /// The exclusive end of the section whose `m=` line is at `start`.
-fn section_end(lines: &[&str], start: usize) -> usize {
+pub(super) fn section_end(lines: &[&str], start: usize) -> usize {
     lines[start + 1..]
         .iter()
         .position(|line| line.starts_with("m="))
@@ -70,7 +70,7 @@ fn section_end(lines: &[&str], start: usize) -> usize {
 }
 
 /// `a=mid` of the section `lines[start..end]`.
-fn mid_of(lines: &[&str], start: usize, end: usize) -> Option<String> {
+pub(super) fn mid_of(lines: &[&str], start: usize, end: usize) -> Option<String> {
     lines[start + 1..end]
         .iter()
         .find_map(|line| line.strip_prefix("a=mid:"))
@@ -79,7 +79,7 @@ fn mid_of(lines: &[&str], start: usize, end: usize) -> Option<String> {
 }
 
 /// The mids of the session's `a=group:BUNDLE` lines (RFC 8843 §7.1), in order.
-fn bundled_mids<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+pub(super) fn bundled_mids<'a>(lines: &[&'a str]) -> Vec<&'a str> {
     let first_media = lines
         .iter()
         .position(|line| line.starts_with("m="))
@@ -117,7 +117,7 @@ fn locate_data_channel(lines: &[&str], any_port: bool) -> Option<(usize, usize)>
 }
 
 /// The first live `m=audio` section: its `m=` line index and exclusive end.
-fn locate_audio(lines: &[&str]) -> Option<(usize, usize)> {
+pub(super) fn locate_audio(lines: &[&str]) -> Option<(usize, usize)> {
     lines.iter().enumerate().find_map(|(index, line)| {
         let value = line.strip_prefix("m=")?;
         let mut fields = value.split_whitespace();
@@ -149,7 +149,7 @@ pub fn parse_data_channel(offer: &str) -> Option<DataChannelMedia> {
 /// Whether `line` is a transport attribute that the data channel section shares with the audio
 /// section it is bundled with (RFC 8843 §7.3: the transport-related attributes are identical across
 /// a bundle), and so is copied from the audio section.
-fn is_shared_transport_line(line: &str) -> bool {
+pub(super) fn is_shared_transport_line(line: &str) -> bool {
     [
         "a=ice-ufrag:",
         "a=ice-pwd:",

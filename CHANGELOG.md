@@ -7,6 +7,19 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **Video on a browser seat of a translating forwarding room.** A WebRTC seat (`UDP/TLS/RTP/SAVPF`) joined
+  audio-only. Its `m=video`, when bundled with its audio (RFC 8843), is now answered on the seat's one
+  ICE/DTLS transport: the room's payload type is chosen out of the several offered, only `nack`, `nack pli`
+  and `ccm fir` are answered (never `transport-cc` or `goog-remb`, no `a=extmap`), and the answer's
+  `a=group:BUNDLE` keeps the video mid (a declined video leaves the group). The video has no endpoint of
+  its own: it is told from the audio by payload type after the seat's SRTP is removed, leaves under the
+  seat's key, and its PLI, FIR, NACK resends and reports go out as SRTCP. `forward_offer` with
+  `transport_protocol: UDP/TLS/RTP/SAVPF` and `profile.video` offers a bundled video section. A video
+  section on a transport of its own, and SDES video, stay declined. `node_info` lists
+  `forward_video_webrtc`.
+
 ### Changed
 
 - **A video room matches a later seat by H.264 sub-profile and level, not by the exact

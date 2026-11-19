@@ -102,6 +102,7 @@ fn video_of(index: usize) -> VideoConfig {
         },
         feedback: VideoFeedback::SUPPORTED,
         cname: "cname".to_string(),
+        bundled: false,
     }
 }
 
@@ -610,5 +611,160 @@ fn the_keyframe_gate_the_parameter_set_replay_and_the_nack_serve_make_no_heap_al
     assert_eq!(
         nacks, 0,
         "serving a NACK allocated {nacks} times across 1000 requests"
+    );
+}
+
+/// What the room sends WebRTC seat `index` is protected under `key(10 + index)`; what the seat sends
+/// is protected under `key(100 + index)`.
+fn browser_key(seed: usize) -> siphon_rtp_srtp::sdes::SrtpKeyMaterial {
+    siphon_rtp_srtp::sdes::SrtpKeyMaterial::from_inline_bytes(&[seed as u8 + 1; 30]).unwrap()
+}
+
+fn room_leg(index: usize) -> siphon_rtp_srtp::leg::SecureLeg {
+    siphon_rtp_srtp::leg::SecureLeg::new(&browser_key(10 + index), &browser_key(100 + index))
+}
+
+/// Seat `index`'s mirror image: protects what the room unprotects.
+fn browser_leg(index: usize) -> siphon_rtp_srtp::leg::SecureLeg {
+    siphon_rtp_srtp::leg::SecureLeg::new(&browser_key(100 + index), &browser_key(10 + index))
+}
+
+/// A 100-seat video room whose seat 0 is a plain RTP seat (video endpoint of its own) and whose other
+/// seats are browsers: keyed by DTLS-SRTP, video bundled on the audio endpoint (RFC 8843).
+fn build_browser_room() -> ForwardRoom {
+    let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
+                 m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
+    let codecs = sdp::parse(offer).unwrap().audio_codecs();
+    let (codec, _) = RoomCodec::from_offer(&codecs).unwrap();
+    let mut room = ForwardRoom::new("zero-alloc".to_string(), codec);
+    for index in 0..SEATS {
+        let endpoint = EndpointId(index as u64 + 1);
+        let destination = format!("192.0.2.{}:{}", 1 + index % 250, 4000 + index)
+            .parse()
+            .unwrap();
+        let browser = index != 0;
+        let mut video = video_of(index);
+        if browser {
+            video.endpoint = endpoint;
+            video.destination = destination;
+            video.bundled = true;
+        }
+        room.add_seat(
+            ForwardSeatConfig {
+                tag: format!("seat-{index}"),
+                endpoint,
+                egress_destination: destination,
+                accepted_source: SourceFilter::Any,
+                latch: true,
+                audio_payload_type: 96,
+                telephone_event: None,
+                secure: browser.then(|| room_leg(index)),
+                secure_pending: false,
+                ice_pending: false,
+                egress_ssrc: 0xE000_0000 + index as u32,
+                initial_sequence: 0,
+                initial_timestamp: 0,
+                floor: None,
+                app_events: None,
+                media_srtcp: Vec::new(),
+                video: Some(video),
+            },
+            0,
+        )
+        .unwrap();
+    }
+    room
+}
+
+/// A video RTP datagram of browser seat `talker`, protected by its own key, on its audio endpoint.
+fn browser_video(
+    leg: &mut siphon_rtp_srtp::leg::SecureLeg,
+    talker: usize,
+    sequence: u16,
+    payload: &[u8],
+) -> RxPacket {
+    let clear = video_rtp(
+        talker,
+        sequence,
+        u32::from(sequence / 3) * 3000,
+        sequence.is_multiple_of(3),
+        payload,
+    );
+    let mut wire = Vec::new();
+    leg.protect(&clear.data, &mut wire).unwrap();
+    RxPacket {
+        endpoint: EndpointId(talker as u64 + 1),
+        source: format!("192.0.2.{}:{}", 1 + talker % 250, 4000 + talker)
+            .parse()
+            .unwrap(),
+        arrival: clear.arrival,
+        data: Bytes::from(wire),
+    }
+}
+
+#[test]
+fn browser_video_egress_and_ingest_make_no_heap_allocation() {
+    let mut room = build_browser_room();
+    // Egress to 99 browsers: a plain source's packet is translated once per receiver and protected
+    // under each receiver's own key, into the room's buffer.
+    let from_plain: Vec<RxPacket> = (1..=63)
+        .map(|sequence| video_packet(0, sequence, sequence % 3 == 0))
+        .collect();
+    room.set_source(Some("seat-0")).unwrap();
+    // Warm up: every receiver's SRTP context has seen its stream (the per-SSRC state is created on
+    // the first packet), and the history and statistics exist.
+    for packet in &from_plain {
+        room.ingest(packet);
+        while room.next_datagram(packet).is_some() {}
+    }
+    room.drain_events().for_each(drop);
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut forwarded = 0usize;
+    for _ in 0..20 {
+        for packet in &from_plain {
+            room.ingest(packet);
+            while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                forwarded += std::hint::black_box(datagram).len();
+            }
+        }
+    }
+    let egress = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(forwarded > 0, "the loop forwarded something");
+    assert_eq!(
+        egress, 0,
+        "SRTP video egress allocated {egress} times across 1260 packets x 99 receivers (must be zero)"
+    );
+
+    // Ingest from a browser: the datagram is unprotected into the room's buffer, told from the audio
+    // by payload type, and fanned out to the plain seat and the other browsers.
+    let mut talker = browser_leg(1);
+    let mut payload = [0x7C; 1200];
+    payload[1] = 0x85;
+    let first = browser_video(&mut talker, 1, 1, &payload);
+    payload[1] = 0x05;
+    let rest: Vec<RxPacket> = (2..=1_000)
+        .map(|sequence| browser_video(&mut talker, 1, sequence, &payload))
+        .collect();
+    room.set_source(Some("seat-1")).unwrap();
+    room.ingest(&first);
+    while room.next_datagram(&first).is_some() {}
+    room.drain_events().for_each(drop);
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut forwarded = 0usize;
+    for packet in &rest {
+        room.ingest(packet);
+        while let Some((_, _, datagram)) = room.next_datagram(packet) {
+            forwarded += std::hint::black_box(datagram).len();
+        }
+    }
+    let ingest = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(forwarded > 0, "the browser's video was forwarded");
+    assert_eq!(
+        ingest, 0,
+        "SRTP video ingest and fan-out allocated {ingest} times across 999 packets x 99 receivers (must be zero)"
     );
 }

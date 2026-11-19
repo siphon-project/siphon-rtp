@@ -26,8 +26,8 @@ mod key_mgmt;
 mod offer;
 mod stream_identity;
 pub use offer::{
-    conference_seat_offer, webrtc_seat_offer, WebrtcOffer, WEBRTC_AUDIO_MID,
-    WEBRTC_DATA_CHANNEL_MID,
+    conference_seat_offer, webrtc_seat_offer, WebrtcOffer, WebrtcVideoOffer, WEBRTC_AUDIO_MID,
+    WEBRTC_DATA_CHANNEL_MID, WEBRTC_VIDEO_MID,
 };
 
 pub(crate) use amr::offered as offered_amr;

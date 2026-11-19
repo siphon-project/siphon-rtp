@@ -255,10 +255,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result("forward_offer: video stream", &reason);
             }
         };
-        let (video_endpoint, video_section, video_declined) = match video {
-            OfferedVideo::None => (None, None, None),
-            OfferedVideo::Declined(reason) => (None, None, Some(reason)),
-            OfferedVideo::Section { endpoint, section } => (Some(endpoint), Some(section), None),
+        let (video_endpoint, video_section, video_declined, bundled_video) = match video {
+            OfferedVideo::None => (None, None, None, None),
+            OfferedVideo::Declined(reason) => (None, None, Some(reason), None),
+            OfferedVideo::Section { endpoint, section } => {
+                (Some(endpoint), Some(section), None, None)
+            }
+            OfferedVideo::Bundled {
+                fmtp,
+                bandwidth_kbps,
+            } => (None, None, None, Some((fmtp, bandwidth_kbps))),
         };
         let advertised = advertised_override.unwrap_or_else(|| endpoint.local_addr.ip());
         let (mut offer, webrtc) = if want_webrtc {
@@ -269,6 +275,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &offered,
                     &events,
                     profile.floor_fmtp.is_some(),
+                    bundled_video
+                        .as_ref()
+                        .map(|(fmtp, bandwidth_kbps)| sdp::WebrtcVideoOffer {
+                            fmtp: fmtp.as_deref(),
+                            bandwidth_kbps: *bandwidth_kbps,
+                        }),
                 )
                 .await
             {
@@ -393,8 +405,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .unwrap_or_else(|| "the answer carries no video stream".to_string());
                 (None, None, Some(reason))
             }
-            (None, _) => (None, None, None),
+            // A bundled video (WebRTC) has no endpoint to free: it rides the audio's.
+            (None, Some(Ok(config))) => (None, Some(config), None),
+            (None, Some(Err(reason))) => (None, None, Some(reason)),
+            (None, None) => (None, None, None),
         };
+        let video_config_live = video_config.is_some();
         let extra: Vec<Endpoint> = floor_endpoint.into_iter().chain(video_endpoint).collect();
         for installed in std::iter::once(endpoint).chain(extra.iter().copied()) {
             if let Err(error) = self
@@ -479,7 +495,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ok_forward_seat(
             None,
             None,
-            answered_streams(floor_live, video_endpoint.is_some()),
+            answered_streams(floor_live, video_config_live),
             video_declined,
         )
     }
@@ -587,16 +603,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             });
         // The video stream, when the offer carried one: a port, a format that fits the room.
-        let video = pending.video.map(|video| {
-            self.negotiate_video(
+        let video = match (pending.video, &pending.webrtc) {
+            (Some(video), _) => Some(self.negotiate_video(
                 room_id,
                 answer,
                 received_from,
                 &pending.profile,
                 video,
                 gate,
-            )
-        });
+            )),
+            // A browser seat's video rides the audio's endpoint, bundled (RFC 8843).
+            (None, Some(offered)) if offered.video => Some(self.negotiate_bundled_video(
+                room_id,
+                answer,
+                &pending.profile,
+                pending.endpoint,
+            )),
+            (None, _) => None,
+        };
         Ok(Negotiated {
             admission,
             telephone_event,

@@ -370,10 +370,25 @@ interval for receivers' requests. Counters per seat, in the log line when a seat
 **What this does not do yet.** The gate opens on any IDR slice, not only the first slice of a picture,
 so a source that sends an IDR as several slices and is joined in the middle of one starts its receivers
 one picture late. There is no transcoding or level negotiation beyond the exact match above. Plain `RTP/AVP` and
-`RTP/AVPF` seats in a translate room only: video offered by a DTLS or SDES seat, a browser seat or a
-`media: preserve` room is declined with the reason. One transmission at a time: concurrent video
+`RTP/AVPF` seats in a translate room, and browser seats (below): video offered by an SDES seat, by a
+browser on a transport of its own, or in a `media: preserve` room is declined with the reason. One transmission at a time: concurrent video
 sources (3GPP TS 24.581 §4.1.1.2) need per-receiver subscriptions and stable seat ids and are a step of
 their own. Check `node_info` `features` for `forward_video` first.
+
+**Video on a browser seat.** A WebRTC seat (`UDP/TLS/RTP/SAVPF` audio) carries video bundled with its
+audio and data channel on its one ICE/DTLS transport (RFC 8843), so the video has no endpoint of its own.
+The answer's video section sits on the audio's port with the audio's ICE credentials, candidates,
+fingerprint and `a=setup`, echoes the offered `a=mid`, and the `a=group:BUNDLE` lists it. Of the several
+H.264 payload types a browser offers, the one that fits the room's format is answered. Only `nack`,
+`nack pli` and `ccm fir` that were offered are answered; `transport-cc` and `goog-remb` are not (the room
+does no congestion control), and no `a=extmap` is (the translator strips header extensions). A `recvonly`
+browser is a receive seat. Plain and browser seats in one room see each other's video; keyframe gate,
+parameter-set replay, NACK and `forward_keyframe` work as on plain seats, with PLI, FIR and NACK resends
+sent as SRTCP/SRTP under the seat's key. `forward_offer` with `transport_protocol: UDP/TLS/RTP/SAVPF` and
+`profile.video` offers `m=video <audio port> UDP/TLS/RTP/SAVPF 126` in the bundle; the browser's answer
+seats it. A video section outside the audio's BUNDLE group is declined (`video_declined` names RFC 8843),
+and so is a browser's video in a preserve room. A declined browser video leaves the answer's BUNDLE
+group. Check `node_info` `features` for `forward_video_webrtc`.
 
 The video endpoint is gated exactly like the seat's audio (the signalled source, then the SSRC-consistent
 latch, [Layer 5c-ii](../security-and-nat.md)). `forward_offer` with `profile.video` offers

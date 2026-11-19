@@ -28,6 +28,7 @@ fn video_config(index: u64, video_format: RoomVideoFormat) -> ForwardSeatConfig 
         format: video_format,
         feedback: VideoFeedback::default(),
         cname: String::new(),
+        bundled: false,
     });
     seat
 }

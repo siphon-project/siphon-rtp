@@ -10,6 +10,12 @@
 //! `video_per_inbound_packet` is the same for one video packet of a seat with a video stream: the
 //! same translator rewrite per receiver, with a 1200-octet payload.
 //!
+//! `video_webrtc_receivers_per_inbound_packet` is that with every receiver a browser: the video is
+//! bundled on the receiver's endpoint and protected under its DTLS-SRTP key (RFC 3711), so the
+//! difference to `video_per_inbound_packet` is the SRTP `protect` per receiver.
+//! `video_webrtc_source_per_inbound_packet` is one video packet of a browser source: unprotected under
+//! its key, told from the audio by payload type, then fanned out to plain receivers.
+//!
 //! Throughput is set to the receiver count, so criterion reports the cost **per forwarded packet**
 //! next to the cost per inbound packet, at 10, 100, 500 and 1000 (the cap) seats.
 //!
@@ -74,6 +80,7 @@ fn video_of(index: usize) -> VideoConfig {
         },
         feedback: VideoFeedback::SUPPORTED,
         cname: "cname".to_string(),
+        bundled: false,
     }
 }
 
@@ -185,6 +192,157 @@ fn video_fan_out(criterion: &mut Criterion) {
                         forwarded += black_box(datagram).len();
                     }
                     black_box(forwarded)
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// What the room sends browser seat `index` is protected under `browser_key(10 + index)`, what the
+/// seat sends under `browser_key(100 + index)`.
+fn browser_key(seed: usize) -> siphon_rtp_srtp::sdes::SrtpKeyMaterial {
+    siphon_rtp_srtp::sdes::SrtpKeyMaterial::from_inline_bytes(&[seed as u8 + 1; 30]).unwrap()
+}
+
+/// A video room whose seat 0 is plain RTP (a video endpoint of its own) and whose other seats are
+/// browsers: DTLS-SRTP keyed, video bundled on the audio endpoint (RFC 8843). With `browser_source`
+/// the room's source is browser seat 1 instead.
+fn browser_room(seats: usize, browser_source: bool) -> ForwardRoom {
+    let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
+                 m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
+    let codecs = sdp::parse(offer).unwrap().audio_codecs();
+    let (codec, _) = RoomCodec::from_offer(&codecs).unwrap();
+    let mut room = ForwardRoom::new("bench".to_string(), codec);
+    for index in 0..seats {
+        let address: SocketAddr = format!("192.0.2.{}:{}", 1 + index % 250, 4000 + index)
+            .parse()
+            .unwrap();
+        let endpoint = EndpointId(index as u64 + 1);
+        let browser = index != 0;
+        let mut video = video_of(index);
+        if browser {
+            video.endpoint = endpoint;
+            video.destination = address;
+            video.bundled = true;
+        }
+        room.add_seat(
+            ForwardSeatConfig {
+                tag: format!("seat-{index}"),
+                endpoint,
+                egress_destination: address,
+                accepted_source: SourceFilter::Any,
+                latch: true,
+                audio_payload_type: 96,
+                telephone_event: None,
+                secure: browser.then(|| {
+                    siphon_rtp_srtp::leg::SecureLeg::new(
+                        &browser_key(10 + index),
+                        &browser_key(100 + index),
+                    )
+                }),
+                secure_pending: false,
+                ice_pending: false,
+                egress_ssrc: 0xE000_0000 + index as u32,
+                initial_sequence: 0,
+                initial_timestamp: 0,
+                floor: None,
+                app_events: None,
+                media_srtcp: Vec::new(),
+                video: Some(video),
+            },
+            0,
+        )
+        .unwrap();
+    }
+    room.set_source(Some(if browser_source { "seat-1" } else { "seat-0" }))
+        .unwrap();
+    room
+}
+
+/// What one inbound video packet of a plain source costs a room of browsers: one translator rewrite
+/// and one SRTP protect per receiver, into the room's buffer.
+fn video_webrtc_receivers(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("forward_fan_out");
+    for seats in [10usize, 100, 500, 1000] {
+        let mut room = browser_room(seats, false);
+        let keyframe = video_inbound(1);
+        room.ingest(&keyframe);
+        while room.next_datagram(&keyframe).is_some() {}
+        let packet = video_inbound(2);
+        room.drain_events().for_each(drop);
+        group.throughput(Throughput::Elements(seats as u64 - 1));
+        group.bench_function(
+            BenchmarkId::new("video_webrtc_receivers_per_inbound_packet", seats),
+            |bencher| {
+                bencher.iter(|| {
+                    room.ingest(black_box(&packet));
+                    let mut forwarded = 0usize;
+                    while let Some((_, _, datagram)) = room.next_datagram(&packet) {
+                        forwarded += black_box(datagram).len();
+                    }
+                    black_box(forwarded)
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// What one inbound video packet of a browser source costs: the room unprotects it under the seat's
+/// key, then fans it out to the plain seat and the other browsers. Each datagram needs a fresh SRTP
+/// index, or the replay window refuses it, so a chunk of them is protected by the browser outside the
+/// timed loop.
+fn video_webrtc_source(criterion: &mut Criterion) {
+    const CHUNK: usize = 1024;
+    let mut group = criterion.benchmark_group("forward_fan_out");
+    for seats in [10usize, 100] {
+        let mut room = browser_room(seats, true);
+        let mut browser = siphon_rtp_srtp::leg::SecureLeg::new(&browser_key(101), &browser_key(11));
+        let mut sequence = 0u16;
+        let mut next_packet = move || {
+            sequence = sequence.wrapping_add(1);
+            // The first packet is the IDR start that opens every receiver's gate.
+            let clear = video_inbound(if sequence == 1 { 1 } else { 2 }).data;
+            // The browser's video arrives on its audio endpoint (RFC 8843), from its own address.
+            let mut clear = clear.to_vec();
+            clear[2..4].copy_from_slice(&sequence.to_be_bytes());
+            let mut wire = Vec::new();
+            browser.protect(&clear, &mut wire).unwrap();
+            RxPacket {
+                endpoint: EndpointId(2),
+                source: "192.0.2.2:4001".parse().unwrap(),
+                arrival: 1_000_000,
+                data: Bytes::from(wire),
+            }
+        };
+        let warm = next_packet();
+        room.ingest(&warm);
+        while room.next_datagram(&warm).is_some() {}
+        room.drain_events().for_each(drop);
+        group.throughput(Throughput::Elements(seats as u64 - 1));
+        group.bench_function(
+            BenchmarkId::new("video_webrtc_source_per_inbound_packet", seats),
+            |bencher| {
+                bencher.iter_custom(|iterations| {
+                    let mut elapsed = std::time::Duration::ZERO;
+                    let mut remaining = iterations as usize;
+                    while remaining > 0 {
+                        let chunk: Vec<RxPacket> =
+                            (0..remaining.min(CHUNK)).map(|_| next_packet()).collect();
+                        remaining -= chunk.len();
+                        let started = std::time::Instant::now();
+                        for packet in &chunk {
+                            room.ingest(black_box(packet));
+                            let mut forwarded = 0usize;
+                            while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                                forwarded += black_box(datagram).len();
+                            }
+                            black_box(forwarded);
+                        }
+                        elapsed += started.elapsed();
+                    }
+                    elapsed
                 });
             },
         );
@@ -341,6 +499,8 @@ criterion_group!(
     benches,
     fan_out,
     video_fan_out,
+    video_webrtc_receivers,
+    video_webrtc_source,
     video_nack_serve,
     srtcp_fan_out
 );

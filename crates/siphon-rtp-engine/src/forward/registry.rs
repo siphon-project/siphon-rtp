@@ -153,8 +153,10 @@ struct Member {
     endpoint: EndpointId,
     /// The seat's MCPTT floor-control endpoint, when it has one.
     floor_endpoint: Option<EndpointId>,
-    /// The seat's video endpoint, when it has one.
+    /// The seat's video endpoint, when it has one of its own (a bundled video rides the audio's).
     video_endpoint: Option<EndpointId>,
+    /// The seat carries video, on an endpoint of its own or bundled with the audio.
+    has_video: bool,
     /// The datapath tick the member was seated, the quiet baseline before it has sent anything.
     joined_tick: u64,
     /// Where this member's [`Event::ForwardSeatInactive`] goes: the client that seated it.
@@ -369,7 +371,12 @@ impl ForwardRegistry {
     {
         let endpoint = config.endpoint;
         let floor_endpoint = config.floor.as_ref().map(|floor| floor.endpoint);
-        let video_endpoint = config.video.as_ref().map(|video| video.endpoint);
+        let video_endpoint = config
+            .video
+            .as_ref()
+            .filter(|video| !video.bundled)
+            .map(|video| video.endpoint);
+        let has_video = config.video.is_some();
         let video_format = config.video.as_ref().map(|video| video.format.clone());
         let tag = config.tag.clone();
         let member = Member {
@@ -377,6 +384,7 @@ impl ForwardRegistry {
             endpoint,
             floor_endpoint,
             video_endpoint,
+            has_video,
             joined_tick,
             events,
             reported_quiet_since: None,
@@ -512,11 +520,7 @@ impl ForwardRegistry {
             };
             let member = room.members.remove(position);
             // With no seat left carrying video, the next one to bring video fixes a format of its own.
-            if room
-                .members
-                .iter()
-                .all(|seated| seated.video_endpoint.is_none())
-            {
+            if room.members.iter().all(|seated| !seated.has_video) {
                 room.video_format = None;
             }
             let _ = room

@@ -20,6 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use h264_profile::{max_recv_level, Level, ProfileLevel};
 
+use super::data_channel::{is_shared_transport_line, locate_audio, mid_of};
 use super::floor::split_lines;
 use super::{addrtype, parse_connection_addr, EngineMedia, MediaDirection, OwnSsrc, CRLF};
 
@@ -29,6 +30,10 @@ pub const VIDEO_CLOCK_RATE_HZ: u32 = 90_000;
 /// The payload type a `forward_offer` gives its H.264 stream: dynamic (RFC 3551 §6), and outside the
 /// range the audio candidates use, so the offer never lists one number in two sections.
 pub const OFFER_PAYLOAD_TYPE: u8 = 126;
+
+/// The transport token of a browser's video: DTLS-SRTP with RTCP feedback (RFC 5764 §4.1.2,
+/// RFC 8829 §5.2.1). The room carries it only bundled with the seat's audio (RFC 8843).
+pub const WEBRTC_VIDEO_TRANSPORT: &str = "UDP/TLS/RTP/SAVPF";
 
 /// The packetization modes the room carries (RFC 6184 §5.2): single NAL unit and non-interleaved.
 const CARRIED_MODES: [u8; 2] = [0, 1];
@@ -143,6 +148,11 @@ pub struct VideoOffer {
     pub rtcp_mux: bool,
     /// The payload types, in the `m=` line's order.
     pub payloads: Vec<OfferedVideoPayload>,
+    /// The section's `a=mid` (RFC 5888 §4), which a BUNDLEd answer echoes.
+    pub mid: Option<String>,
+    /// The section is in the same `a=group:BUNDLE` as the first live audio section (RFC 8843 §7.2),
+    /// so it shares that section's transport.
+    pub bundled: bool,
 }
 
 /// What a seat's offer settled for its video.
@@ -163,6 +173,10 @@ pub struct VideoChoice {
     /// `profile-level-id` spelling at the level the seat is answered at (RFC 6184 §8.2.2). `None`
     /// writes no `a=fmtp` line.
     pub answer_fmtp: Option<String>,
+    /// The section's `a=mid`, echoed by a BUNDLEd answer.
+    pub mid: Option<String>,
+    /// The section is bundled with the audio's transport.
+    pub bundled: bool,
 }
 
 impl RoomVideoFormat {
@@ -285,7 +299,43 @@ pub fn parse_video(sdp: &str) -> Option<VideoOffer> {
         direction,
         rtcp_mux: section.contains(&"a=rtcp-mux"),
         payloads,
+        mid: mid_line(section),
+        bundled: bundled_with_audio(&lines, section),
     })
+}
+
+/// The section's `a=mid` (RFC 5888 §4).
+fn mid_line(section: &[&str]) -> Option<String> {
+    section
+        .iter()
+        .find_map(|line| line.strip_prefix("a=mid:"))
+        .map(|mid| mid.trim().to_string())
+        .filter(|mid| !mid.is_empty())
+}
+
+/// Whether the video `section` and the first live audio section are in one `a=group:BUNDLE` line
+/// (RFC 8843 §7.2): the section then travels on the audio's transport.
+fn bundled_with_audio(lines: &[&str], section: &[&str]) -> bool {
+    let Some(video_mid) = mid_line(section) else {
+        return false;
+    };
+    let Some((audio_start, audio_end)) = locate_audio(lines) else {
+        return false;
+    };
+    let Some(audio_mid) = mid_of(lines, audio_start, audio_end) else {
+        return false;
+    };
+    let first_media = lines
+        .iter()
+        .position(|line| line.starts_with("m="))
+        .unwrap_or(lines.len());
+    lines[..first_media]
+        .iter()
+        .filter_map(|line| line.strip_prefix("a=group:BUNDLE"))
+        .any(|group| {
+            let mids: Vec<&str> = group.split_whitespace().collect();
+            mids.contains(&video_mid.as_str()) && mids.contains(&audio_mid.as_str())
+        })
 }
 
 /// Where the first live video section is: its `m=` line index, the exclusive end of the section and
@@ -384,19 +434,30 @@ fn choose(
     fixed: Option<&RoomVideoFormat>,
     asymmetry: Asymmetry,
 ) -> Result<VideoChoice, String> {
-    // RFC 3264 §6: the answer keeps the offer's transport. SRTP, SDES and DTLS video are not carried
-    // yet, and a plain answer to one would send the seat video it cannot decrypt.
-    if !["RTP/AVP", "RTP/AVPF"]
-        .iter()
-        .any(|carried| offer.transport.eq_ignore_ascii_case(carried))
+    // RFC 3264 §6: the answer keeps the offer's transport. Plain RTP is carried on an endpoint of its
+    // own, DTLS-SRTP only bundled with the audio; SDES video is not carried yet, and a plain answer
+    // to a secure offer would send the seat video it cannot decrypt.
+    let webrtc = offer.transport.eq_ignore_ascii_case(WEBRTC_VIDEO_TRANSPORT);
+    if !webrtc
+        && !["RTP/AVP", "RTP/AVPF"]
+            .iter()
+            .any(|carried| offer.transport.eq_ignore_ascii_case(carried))
     {
         return Err(format!(
-            "video over {} is not carried yet (plain RTP/AVP and RTP/AVPF only)",
+            "video over {} is not carried yet (plain RTP/AVP, RTP/AVPF and bundled UDP/TLS/RTP/SAVPF only)",
             offer.transport
         ));
     }
+    if webrtc && !offer.bundled {
+        return Err(
+            "video over UDP/TLS/RTP/SAVPF is carried only bundled with the audio (a=group:BUNDLE, \
+             RFC 8843): a video transport of its own is not run"
+                .to_string(),
+        );
+    }
     let feedback_of = |payload_type: u8| {
-        if offer.transport.eq_ignore_ascii_case("RTP/AVPF") {
+        // RFC 4585 §4.2: feedback is for the AVPF profile, `UDP/TLS/RTP/SAVPF` included.
+        if webrtc || offer.transport.eq_ignore_ascii_case("RTP/AVPF") {
             offer
                 .payloads
                 .iter()
@@ -472,6 +533,8 @@ fn choose(
         format,
         feedback: feedback_of(payload_type),
         answer_fmtp,
+        mid: offer.mid.clone(),
+        bundled: offer.bundled,
     })
 }
 
@@ -610,6 +673,11 @@ pub struct VideoAnswer<'a> {
 }
 
 /// Replace the first live `m=video` section of `sdp` with the engine's answer to it.
+///
+/// A bundled section (RFC 8843, `choice.bundled`) is written on the audio's transport instead of the
+/// engine's video endpoint, which it has none of: the audio section's port, connection line, ICE
+/// credentials, candidates, fingerprint and `a=setup` (RFC 8843 §7.3: one transport, so the
+/// transport attributes are the audio's), and the offered `a=mid` echoed (RFC 5888 §4).
 #[must_use]
 pub fn anchor_video(sdp: &str, answer: &VideoAnswer<'_>) -> String {
     let lines = split_lines(sdp);
@@ -621,17 +689,40 @@ pub fn anchor_video(sdp: &str, answer: &VideoAnswer<'_>) -> String {
     let advertised = answer.engine.advertised_ip;
     // The section is written whole rather than edited. The offerer's own lines describe the
     // offerer: its address, its `a=ssrc` (RFC 5576 §4.1), its `a=extmap` (the translator strips
-    // header extensions, RFC 3550 §5.3.1), its `sprop-parameter-sets`, its other codecs.
-    let mut section = vec![
-        format!(
-            "m=video {} {} {payload_type}",
-            answer.engine.rtp.port(),
-            choice.transport
-        ),
-        format!("c=IN {} {advertised}", addrtype(advertised)),
-    ];
+    // header extensions, RFC 3550 §5.3.1), its `sprop-parameter-sets`, its other codecs, and the
+    // feedback the room does not serve (`transport-cc`, `goog-remb`).
+    let bundled = if choice.bundled {
+        let Some(transport) = BundledTransport::of(&lines) else {
+            return sdp.to_string();
+        };
+        Some(transport)
+    } else {
+        None
+    };
+    let mut section = Vec::new();
+    match &bundled {
+        Some(transport) => {
+            section.push(format!(
+                "m=video {} {} {payload_type}",
+                transport.port, choice.transport
+            ));
+            section.extend(transport.connection.map(str::to_string));
+        }
+        None => {
+            section.push(format!(
+                "m=video {} {} {payload_type}",
+                answer.engine.rtp.port(),
+                choice.transport
+            ));
+            section.push(format!("c=IN {} {advertised}", addrtype(advertised)));
+        }
+    }
     if let Some(kbps) = answer.bandwidth_kbps {
         section.push(format!("b=AS:{kbps}"));
+    }
+    if let Some(transport) = &bundled {
+        section.extend(choice.mid.iter().map(|mid| format!("a=mid:{mid}")));
+        section.extend(transport.attributes.iter().map(|line| (*line).to_string()));
     }
     section.push(format!(
         "a=rtpmap:{payload_type} H264/{VIDEO_CLOCK_RATE_HZ}"
@@ -666,6 +757,112 @@ pub fn anchor_video(sdp: &str, answer: &VideoAnswer<'_>) -> String {
     out.join(CRLF)
 }
 
+/// What a bundled section takes from the audio section it shares a transport with (RFC 8843 §7.3).
+struct BundledTransport<'a> {
+    port: u16,
+    connection: Option<&'a str>,
+    /// ICE credentials, candidates, fingerprint and `a=setup`.
+    attributes: Vec<&'a str>,
+}
+
+impl<'a> BundledTransport<'a> {
+    fn of(lines: &[&'a str]) -> Option<Self> {
+        let (start, end) = locate_audio(lines)?;
+        let port = lines[start]
+            .strip_prefix("m=")?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        let audio = &lines[start + 1..end];
+        Some(Self {
+            port,
+            connection: audio.iter().copied().find(|line| line.starts_with("c=")),
+            attributes: audio
+                .iter()
+                .copied()
+                .filter(|line| is_shared_transport_line(line))
+                .collect(),
+        })
+    }
+}
+
+/// Remove from the `a=group:BUNDLE` line of an answer the sections it declined (port 0 without
+/// `a=bundle-only`, RFC 8843 §7.3.3: a rejected section is not in the group). The m-lines and mids
+/// stay where they are; a group left empty is dropped. An answer that declines nothing is returned as
+/// it is.
+#[must_use]
+pub fn drop_declined_from_bundle(answer: &str) -> String {
+    let lines = split_lines(answer);
+    let first_media = lines
+        .iter()
+        .position(|line| line.starts_with("m="))
+        .unwrap_or(lines.len());
+    let mut declined: Vec<String> = Vec::new();
+    for (index, line) in lines.iter().enumerate().skip(first_media) {
+        let Some(value) = line.strip_prefix("m=") else {
+            continue;
+        };
+        let live = value
+            .split_whitespace()
+            .nth(1)
+            .and_then(|port| port.parse::<u16>().ok())
+            .is_some_and(|port| port != 0);
+        let end = lines[index + 1..]
+            .iter()
+            .position(|line| line.starts_with("m="))
+            .map_or(lines.len(), |offset| index + 1 + offset);
+        if !live && !lines[index + 1..end].contains(&"a=bundle-only") {
+            declined.extend(mid_of(&lines, index, end));
+        }
+    }
+    if declined.is_empty() {
+        return answer.to_string();
+    }
+    let mut changed = false;
+    let rewritten: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let Some(group) = line
+                .strip_prefix("a=group:BUNDLE")
+                .filter(|_| index < first_media)
+            else {
+                return Some((*line).to_string());
+            };
+            let kept: Vec<&str> = group
+                .split_whitespace()
+                .filter(|mid| !declined.iter().any(|gone| gone == mid))
+                .collect();
+            if kept.len() == group.split_whitespace().count() {
+                return Some((*line).to_string());
+            }
+            changed = true;
+            (!kept.is_empty()).then(|| format!("a=group:BUNDLE {}", kept.join(" ")))
+        })
+        .collect();
+    if changed {
+        rewritten.join(CRLF)
+    } else {
+        answer.to_string()
+    }
+}
+
+/// The `a=rtpmap`, `a=fmtp` and `a=rtcp-fb` lines of the one payload type the engine offers.
+pub(super) fn write_offered_format(section: &mut String, fmtp: Option<&str>) {
+    let _ = write!(
+        section,
+        "a=rtpmap:{OFFER_PAYLOAD_TYPE} H264/{VIDEO_CLOCK_RATE_HZ}{CRLF}"
+    );
+    if let Some(parameters) = fmtp.filter(|parameters| !parameters.is_empty()) {
+        let _ = write!(section, "a=fmtp:{OFFER_PAYLOAD_TYPE} {parameters}{CRLF}");
+    }
+    // RFC 4585 §4.2: everything the room supports, so the member's answer can accept any of it.
+    for line in VideoFeedback::SUPPORTED.lines(OFFER_PAYLOAD_TYPE) {
+        let _ = write!(section, "{line}{CRLF}");
+    }
+}
+
 /// The video section of an offer the engine writes (a `forward_offer`).
 #[must_use]
 pub fn video_offer_section(
@@ -681,17 +878,7 @@ pub fn video_offer_section(
     if let Some(kbps) = bandwidth_kbps {
         let _ = write!(section, "b=AS:{kbps}{CRLF}");
     }
-    let _ = write!(
-        section,
-        "a=rtpmap:{OFFER_PAYLOAD_TYPE} H264/{VIDEO_CLOCK_RATE_HZ}{CRLF}"
-    );
-    if let Some(parameters) = fmtp.filter(|parameters| !parameters.is_empty()) {
-        let _ = write!(section, "a=fmtp:{OFFER_PAYLOAD_TYPE} {parameters}{CRLF}");
-    }
-    // RFC 4585 §4.2: everything the room supports, so the member's answer can accept any of it.
-    for line in VideoFeedback::SUPPORTED.lines(OFFER_PAYLOAD_TYPE) {
-        let _ = write!(section, "{line}{CRLF}");
-    }
+    write_offered_format(&mut section, fmtp);
     // RFC 5761 §5.1.1: the seat is one muxed endpoint, as the audio is.
     section.push_str("a=sendrecv\r\na=rtcp-mux\r\n");
     section
@@ -1080,6 +1267,8 @@ mod tests {
             format: fixed(1, None),
             feedback: VideoFeedback::default(),
             answer_fmtp: None,
+            mid: None,
+            bundled: false,
         };
         let own = OwnSsrc {
             ssrc: 1,
@@ -1461,5 +1650,182 @@ mod tests {
         assert!(choose_answered_video(&answer, Some(&room)).is_err());
         let sending_only = h264("profile-level-id=640c1f;packetization-mode=1", "sendonly");
         assert!(choose_answered_video(&sending_only, Some(&room)).is_ok());
+    }
+
+    // ---- a browser's video, bundled with its audio (RFC 8843) ----
+
+    /// A browser offer: audio and video in one BUNDLE group, the video's payload types in the order
+    /// libwebrtc lists them (Baseline first), transport-cc and REMB among the feedback.
+    fn bundled(group: &str, video_mid: &str) -> String {
+        format!(
+            concat!(
+                "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE {group}\r\n",
+                "m=audio 9 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\n",
+                "a=ice-ufrag:abcd\r\na=ice-pwd:0123456789012345678901\r\n",
+                "a=fingerprint:sha-256 {print}\r\na=setup:actpass\r\na=rtpmap:0 PCMU/8000\r\n",
+                "m=video 9 UDP/TLS/RTP/SAVPF 96 98\r\nc=IN IP4 0.0.0.0\r\na=mid:{video_mid}\r\n",
+                "a=extmap:2 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n",
+                "a=sendrecv\r\na=rtcp-mux\r\n",
+                "a=rtpmap:96 H264/90000\r\na=rtcp-fb:96 goog-remb\r\na=rtcp-fb:96 transport-cc\r\n",
+                "a=rtcp-fb:96 ccm fir\r\na=rtcp-fb:96 nack\r\na=rtcp-fb:96 nack pli\r\n",
+                "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n",
+                "a=rtpmap:98 H264/90000\r\na=rtcp-fb:98 nack\r\n",
+                "a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n",
+            ),
+            group = group,
+            video_mid = video_mid,
+            print = "AA:".repeat(31) + "AA",
+        )
+    }
+
+    #[test]
+    fn a_browsers_video_reads_its_mid_and_whether_it_is_bundled_with_the_audio() {
+        let parsed = parse_video(&bundled("0 1", "1")).unwrap();
+        assert_eq!(parsed.transport, "UDP/TLS/RTP/SAVPF");
+        assert_eq!(parsed.mid.as_deref(), Some("1"));
+        assert!(parsed.bundled);
+        // Not in the audio's group: a transport of its own.
+        assert!(!parse_video(&bundled("0", "1")).unwrap().bundled);
+        // No mid at all: nothing to echo, so not bundled.
+        let nameless = bundled("0 1", "1").replace("a=mid:1\r\n", "");
+        assert!(!parse_video(&nameless).unwrap().bundled);
+        // A plain section is never bundled.
+        assert!(!parse_video(&offer(VIDEO)).unwrap().bundled);
+    }
+
+    #[test]
+    fn a_browsers_offer_picks_the_rooms_payload_and_accepts_only_what_the_room_serves() {
+        let offered = parse_video(&bundled("0 1", "1")).unwrap();
+        // No format yet: the first carried H.264 payload fixes it.
+        let first = choose_video(&offered, None).unwrap();
+        assert_eq!(first.payload_type, 96);
+        assert_eq!(
+            first.feedback, ALL_FEEDBACK,
+            "nack, pli and fir; not transport-cc or REMB"
+        );
+        assert!(first.bundled);
+        assert_eq!(first.mid.as_deref(), Some("1"));
+        // A room fixed to Constrained Baseline takes the payload that is one, with its own feedback.
+        let room =
+            RoomVideoFormat::from_fmtp("profile-level-id=42e01f;packetization-mode=1").unwrap();
+        let chosen = choose_video(&offered, Some(&room)).unwrap();
+        assert_eq!(chosen.payload_type, 98);
+        assert_eq!(
+            chosen.feedback,
+            VideoFeedback {
+                nack: true,
+                pli: false,
+                fir: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_browsers_video_on_a_transport_of_its_own_is_declined_naming_the_bundle() {
+        let reason = choose_video(&parse_video(&bundled("0", "1")).unwrap(), None).unwrap_err();
+        assert!(
+            reason.contains("BUNDLE") && reason.contains("RFC 8843"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn sdes_video_is_still_declined() {
+        let sdes = bundled("0 1", "1").replace("UDP/TLS/RTP/SAVPF 96 98", "RTP/SAVP 96 98");
+        let reason = choose_video(&parse_video(&sdes).unwrap(), None).unwrap_err();
+        assert!(reason.contains("RTP/SAVP"), "{reason}");
+    }
+
+    #[test]
+    fn the_answer_to_a_browser_is_written_on_the_audios_transport_and_whole() {
+        let offer = bundled("0 1", "1");
+        let choice = choose_video(
+            &parse_video(&offer).unwrap(),
+            Some(
+                &RoomVideoFormat::from_fmtp("profile-level-id=42e01f;packetization-mode=1")
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        let own = OwnSsrc {
+            ssrc: 77,
+            cname: "room".to_string(),
+        };
+        // The answer as the audio pass wrote it: the engine's port and credentials in the audio
+        // section, the browser's own video section still in place.
+        let written = offer
+            .replace("m=audio 9 ", "m=audio 30000 ")
+            .replace(
+                "c=IN IP4 0.0.0.0\r\na=mid:0",
+                "c=IN IP4 198.51.100.7\r\na=mid:0",
+            )
+            .replace("abcd", "ENGU");
+        let answered = anchor_video(
+            &written,
+            &VideoAnswer {
+                engine: engine(),
+                choice: &choice,
+                bandwidth_kbps: Some(900),
+                own: &own,
+            },
+        );
+        // The offer signalled level asymmetry, so the answer echoes it (RFC 6184 §8.2.2).
+        assert_eq!(
+            choice.answer_fmtp.as_deref(),
+            Some("profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1")
+        );
+        let lines: Vec<&str> = answered.split("\r\n").collect();
+        let video = lines
+            .iter()
+            .position(|line| line.starts_with("m=video"))
+            .unwrap();
+        assert_eq!(
+            lines[video..],
+            [
+                "m=video 30000 UDP/TLS/RTP/SAVPF 98",
+                "c=IN IP4 198.51.100.7",
+                "b=AS:900",
+                "a=mid:1",
+                "a=ice-ufrag:ENGU",
+                "a=ice-pwd:0123456789012345678901",
+                &format!("a=fingerprint:sha-256 {}", "AA:".repeat(31) + "AA"),
+                "a=setup:actpass",
+                "a=rtpmap:98 H264/90000",
+                &format!("a=fmtp:98 {}", choice.answer_fmtp.clone().unwrap()),
+                "a=rtcp-fb:98 nack",
+                "a=sendrecv",
+                "a=rtcp-mux",
+                "a=ssrc:77 cname:room",
+                "",
+            ]
+        );
+    }
+
+    fn declined_pass(answer: &str) -> String {
+        drop_declined_from_bundle(&answer.replace('\n', "\r\n").replace("\r\r", "\r"))
+    }
+
+    #[test]
+    fn a_declined_section_leaves_the_bundle_group_and_a_live_or_bundle_only_one_stays() {
+        let base =
+            "v=0\ns=-\nt=0 0\na=group:BUNDLE 0 1 2\nm=audio 9 UDP/TLS/RTP/SAVPF 0\na=mid:0\n";
+        let declined = declined_pass(&format!("{base}m=video 0 UDP/TLS/RTP/SAVPF 96\na=mid:1\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\na=mid:2\n"));
+        assert!(declined.contains("a=group:BUNDLE 0 2\r\n"), "{declined}");
+        // Port 0 with a=bundle-only is an accepted bundled section (RFC 8843 §6).
+        let bundle_only = format!("{base}m=video 0 UDP/TLS/RTP/SAVPF 96\na=mid:1\na=bundle-only\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\na=mid:2\n");
+        assert_eq!(
+            declined_pass(&bundle_only),
+            bundle_only.replace('\n', "\r\n")
+        );
+        // Nothing declined: returned as it came.
+        let live = format!("{base}m=video 9 UDP/TLS/RTP/SAVPF 96\na=mid:1\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\na=mid:2\n");
+        assert_eq!(declined_pass(&live), live.replace('\n', "\r\n"));
+        // A group left with nothing in it is dropped.
+        let alone = "v=0\ns=-\nt=0 0\na=group:BUNDLE 1\nm=video 0 UDP/TLS/RTP/SAVPF 96\na=mid:1\n";
+        assert!(
+            !declined_pass(alone).contains("a=group"),
+            "{}",
+            declined_pass(alone)
+        );
     }
 }
