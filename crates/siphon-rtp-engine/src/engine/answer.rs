@@ -985,6 +985,10 @@ fn answer_data_channel(answer: String, channel: Option<&(String, String)>) -> St
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear setup sequence; each step is its own helper, and the video reply is the last"
+    )]
     pub(super) async fn answer(
         &self,
         client: ClientId,
@@ -1362,8 +1366,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_codec.as_ref(),
             pipeline,
         );
-        self.ok_sdp_keyed(call_id, rewritten, Some(answer_to_tag), profile)
-            .await
+        // The video stream (see `call_video`): settled, installed and presented, then the reply.
+        self.video_reply(
+            call_id,
+            (sdp, profile, reversed.is_some()),
+            (rewritten, answer_to_tag),
+        )
+        .await
     }
 }
 

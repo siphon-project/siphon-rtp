@@ -547,7 +547,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let call = entry.value_mut();
             // Media/SRTP/transcode calls take the Redirect+userspace path (which latches in userspace
             // already), so their `relay_flows` is empty and they are naturally skipped.
-            for (installed_on, action) in call.relay_flows.iter_mut() {
+            // The text and video relays are their own streams with their own latches, refreshed by the
+            // same rule as the audio relay (a NATed peer's text or picture needs the learned address
+            // as much as its voice does).
+            let call = &mut *call;
+            let flows = call
+                .relay_flows
+                .iter_mut()
+                .chain(call.text_relay_flows.iter_mut())
+                .chain(call.video.flows.iter_mut());
+            for (installed_on, action) in flows {
                 // Only in-kernel `Forward` flows carry an `out_dst` to reprogram; skip Redirect/Drop.
                 let FlowAction::Forward(rule) = *action else {
                     continue;

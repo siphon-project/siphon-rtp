@@ -511,6 +511,8 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         key_mgmt: None,
         transmission_control_formats: vec![],
         floor_channel_label: None,
+        // rtpengine has no per-stream video anchoring switch; the default carries it through.
+        video_relay: siphon_rtp_proto::VideoRelay::Passthrough,
     }
 }
 
@@ -1337,6 +1339,7 @@ mod tests {
                 bytes_in: 16_000,
                 bytes_out: 15_680,
                 packets_lost: 2,
+                video: None,
             }),
             streams: Vec::new(),
             video_declined: None,

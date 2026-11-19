@@ -13,8 +13,7 @@ use crate::sdp::{self, TextRewrite};
 use super::negotiate::{
     answer_ice_rewrite, dtls_directive, far_security, filter_component, ice_directive,
     ice_tie_breaker, near_security, offer_ice_rewrite, offered_dtls_setup, parse_codec_flags,
-    peer_ice_credentials, present_leg, same_codec, CodecPresentation, IceDirective,
-    LegPresentation,
+    peer_ice_credentials, same_codec, CodecPresentation, IceDirective, LegPresentation,
 };
 use super::{error_result, unknown_call, Call, ClientId, Engine, Leg, Party};
 
@@ -625,9 +624,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_restart,
             "re-offer"
         );
-        match present_leg(sdp, presentation, &profile.replace, call_id) {
-            Ok(presented) => super::key_mgmt::ok_sdp_keyed_in_place(&presented, profile),
-            Err(error) => error_result("re-offer rewrite", &error),
-        }
+        self.reoffer_video_reply(call_id, party, sdp, profile, presentation)
+            .await
     }
 }

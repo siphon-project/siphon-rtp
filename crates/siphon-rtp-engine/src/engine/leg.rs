@@ -25,6 +25,7 @@ impl Leg {
             floor: None,
             floor_remote: None,
             floor_format: siphon_rtp_proto::ControlFormat::Mcptt,
+            video: None,
         }
     }
 }

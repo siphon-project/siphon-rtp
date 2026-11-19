@@ -19,12 +19,25 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   `transport_protocol: UDP/TLS/RTP/SAVPF` and `profile.video` offers a bundled video section. A video
   section on a transport of its own, and SDES video, stay declined. `node_info` lists
   `forward_video_webrtc`.
+- **A two-party relayed call can anchor its video stream.** `profile.video_relay` (`passthrough`, the
+  default, `anchor` or `decline`) on `offer`, `answer` and `reoffer`. Anchored video gets an endpoint pair
+  per leg (one under `a=rtcp-mux`), the gated latch of audio, relayed RTCP, and the parties' own
+  `sendonly`/`recvonly`/`inactive` respected, so a door-station camera answered `recvonly` forwards one way.
+  Codecs and payload numbers are the two parties' own; there is no video transcoding. A re-offer re-gates a
+  moved address or direction and adds or frees the endpoints, a snapshot carries the stream (its own
+  version, so an older standby refuses it), and `query`, the end-of-call record and
+  `siphon_rtp_video_packets_total` / `siphon_rtp_video_bytes_total` count it. Plain RTP only: a secure
+  profile is declined with the reason in `video_declined`. A room refuses the field, and a call carrying
+  anchored video is not seated in one. `node_info` lists `call_video_anchor`.
+
 ### Fixed
 
 - **A video stream the engine passes through keeps its own address.** Rewriting the session `c=` to
   the engine for the audio stream left a passed-through `m=video` with no connection line of its own,
   so the far party read the engine's address with the phone's own port (RFC 4566 §5.7). Such a section
   now carries the offerer's original `c=`.
+- **The latch refresh sweep walks the text flows too.** It reprogrammed audio flows only, so a NATed
+  peer's text kept going to its signalled address.
 
 ### Changed
 

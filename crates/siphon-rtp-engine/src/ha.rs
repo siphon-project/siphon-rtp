@@ -64,6 +64,15 @@ pub const SNAPSHOT_VERSION_VIDEO_FLOOR: u16 = 6;
 /// stream.
 pub const SNAPSHOT_VERSION_SCOPED_VIDEO_FLOOR: u16 = 7;
 
+/// The version a snapshot of any call that carries an anchored video stream has
+/// ([`LegSnapshot::video`]), scoped or not, with or without a floor stream.
+///
+/// A build from before anchored video ignores the keys it does not know, so such a call written at
+/// an older version would restore there as a call whose video endpoints are never re-bound, and the
+/// picture would silently stop. Under its own version such a standby refuses the blob instead. A call
+/// without anchored video keeps the bytes and versions it had.
+pub const SNAPSHOT_VERSION_VIDEO: u16 = 8;
+
 /// A portable snapshot of one live call's negotiated state (see the module docs). All fields are
 /// plain data (strings / integers / enums / `std::net` addresses), so the whole thing round-trips
 /// through JSON and compares exactly.
@@ -121,6 +130,9 @@ pub struct CallSnapshot {
     pub near: LegSnapshot,
     /// The far (answerer) leg.
     pub far: LegSnapshot,
+    /// The anchored video stream's mode and directions, when the call carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<CallVideoSnapshot>,
     /// The installed forward rules (a plain relay's `Forward` rules), by endpoint role — so restore
     /// reinstalls the datapath flows without needing the original profile flags. Empty for pipelines
     /// whose media runs through a userspace actor (their flows are `Redirect`, rebuilt differently).
@@ -160,6 +172,43 @@ pub struct LegSnapshot {
     /// floor streams were checkpointed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor: Option<FloorSnapshot>,
+    /// The anchored video stream this party's leg carries ([`VideoSnapshot`]). Absent for a call
+    /// without one, and in a snapshot written before video was anchored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoSnapshot>,
+}
+
+/// One party's anchored video stream: the engine sockets a standby re-binds on their ports, and what
+/// the party signalled. The forward rules are not stored: the restore derives them from these
+/// addresses and the directions, so the gate is the signalled one again and the latch re-learns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoSnapshot {
+    /// The engine video RTP socket.
+    pub rtp_local: SocketAddr,
+    /// The engine video RTCP socket; absent under `a=rtcp-mux`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtcp_local: Option<SocketAddr>,
+    /// The party's signalled video RTP address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_rtp: Option<SocketAddr>,
+    /// The party's signalled video RTCP address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_rtcp: Option<SocketAddr>,
+}
+
+/// The call-level state of an anchored video stream: its mode and each party's own direction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallVideoSnapshot {
+    /// The mode in force (`anchor` for any call that carries a stream).
+    pub mode: siphon_rtp_proto::VideoRelay,
+    /// The offerer's stated direction token (`sendrecv`, `sendonly`, `recvonly`, `inactive`).
+    pub near_direction: String,
+    /// The answerer's stated direction token.
+    pub far_direction: String,
+    /// The forwarding rules installed on the video endpoints, by role. An endpoint with no rule here
+    /// was a drop (a direction the parties did not allow) and is restored as one.
+    #[serde(default)]
+    pub flows: Vec<FlowSnapshot>,
 }
 
 /// One party's floor stream: everything a standby needs to serve it exactly where the primary left
@@ -428,6 +477,14 @@ pub enum EndpointRole {
     NearFloor,
     /// Far leg's MCPTT floor endpoint.
     FarFloor,
+    /// Near leg's anchored video RTP endpoint.
+    NearVideo,
+    /// Far leg's anchored video RTP endpoint.
+    FarVideo,
+    /// Near leg's anchored video RTCP endpoint.
+    NearVideoRtcp,
+    /// Far leg's anchored video RTCP endpoint.
+    FarVideoRtcp,
 }
 
 /// A portable forward rule: which endpoint it is installed on, which it forwards to, and the
@@ -579,7 +636,7 @@ impl CallSnapshot {
     /// [`SNAPSHOT_VERSION`] without.
     pub fn from_json(blob: &str) -> Result<Self, SnapshotError> {
         let snapshot: Self = serde_json::from_str(blob)?;
-        let expected = Self::version_for(snapshot.scope.as_deref(), snapshot.floor_format());
+        let expected = snapshot.expected_version();
         if snapshot.version != expected {
             return Err(SnapshotError::Version {
                 found: snapshot.version,
@@ -587,6 +644,23 @@ impl CallSnapshot {
             });
         }
         Ok(snapshot)
+    }
+
+    /// Whether either party of the call has an anchored video stream in this record.
+    #[must_use]
+    pub fn has_video(&self) -> bool {
+        self.near.video.is_some() || self.far.video.is_some()
+    }
+
+    /// The version this record must carry: [`SNAPSHOT_VERSION_VIDEO`] with an anchored video stream,
+    /// else the one its scope and floor stream call for ([`Self::version_for`]).
+    #[must_use]
+    pub fn expected_version(&self) -> u16 {
+        if self.has_video() {
+            SNAPSHOT_VERSION_VIDEO
+        } else {
+            Self::version_for(self.scope.as_deref(), self.floor_format())
+        }
     }
 
     /// Whether either party of the call has a floor stream in this record.
@@ -675,6 +749,7 @@ mod tests {
         CallSnapshot {
             version: SNAPSHOT_VERSION,
             call_id: "call-abc@host".into(),
+            video: None,
             scope: None,
             from_tag: "alice-tag".into(),
             to_tag: Some("bob-tag".into()),
@@ -714,6 +789,7 @@ mod tests {
                 remote_rtcp: Some("198.51.100.1:5001".parse().unwrap()),
                 advertised_ip: None,
                 floor: None,
+                video: None,
             },
             far: LegSnapshot {
                 rtp_local: "203.0.113.10:30002".parse().unwrap(),
@@ -722,6 +798,7 @@ mod tests {
                 remote_rtcp: None,
                 advertised_ip: None,
                 floor: None,
+                video: None,
             },
             flows: vec![FlowSnapshot {
                 installed_on: EndpointRole::NearRtp,
@@ -1018,5 +1095,33 @@ mod tests {
             !rendered.contains("mki"),
             "and a key without one writes nothing new: {rendered}"
         );
+    }
+
+    /// A call with an anchored video stream is written under its own version: a standby from before
+    /// anchored video ignores the keys it does not know and would drop the picture silently.
+    #[test]
+    fn a_call_with_anchored_video_carries_its_own_version_and_an_older_standby_refuses_it() {
+        let mut snapshot = sample();
+        snapshot.near.video = Some(VideoSnapshot {
+            rtp_local: SocketAddr::from((Ipv4Addr::LOCALHOST, 40_010)),
+            rtcp_local: None,
+            remote_rtp: None,
+            remote_rtcp: None,
+        });
+        assert_eq!(snapshot.expected_version(), SNAPSHOT_VERSION_VIDEO);
+        snapshot.version = SNAPSHOT_VERSION;
+        let blob = snapshot.to_json().expect("serializes");
+        assert!(matches!(
+            CallSnapshot::from_json(&blob),
+            Err(SnapshotError::Version {
+                found: SNAPSHOT_VERSION,
+                expected: SNAPSHOT_VERSION_VIDEO
+            })
+        ));
+        snapshot.version = SNAPSHOT_VERSION_VIDEO;
+        let blob = snapshot.to_json().expect("serializes");
+        assert_eq!(CallSnapshot::from_json(&blob).expect("parses"), snapshot);
+        // A call without video keeps the bytes it always had.
+        assert!(!sample().to_json().expect("serializes").contains("video"));
     }
 }

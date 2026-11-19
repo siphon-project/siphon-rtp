@@ -2807,3 +2807,80 @@ async fn conference_dial_out_over_tcp_control() {
         assert!(matches!(left, CmdResult::Ok { .. }), "{tag}: {left:?}");
     }
 }
+
+/// Audio plus a `sendonly` H.264 video section (a door-station camera), RTCP muxed.
+fn audio_camera_sdp(audio: SocketAddr, video: SocketAddr, direction: &str) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {aport} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+         m=video {vport} RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n\
+         a=fmtp:96 profile-level-id=42e01f;packetization-mode=1\r\na={direction}\r\na=rtcp-mux\r\n",
+        ip = audio.ip(),
+        aport = audio.port(),
+        vport = video.port(),
+    )
+}
+
+fn video_engine_addr(result: &CmdResult) -> SocketAddr {
+    sdp::parse_video_stream(&sdp_text(result))
+        .expect("an anchored video stream")
+        .remote_rtp
+}
+
+/// With `video_relay: anchor` an offer and answer relay an H.264 stream end to end over the control
+/// connection and the UDP-loopback datapath, and the default keeps the phones' own addresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offer_answer_with_video_relay_anchor_relays_h264_end_to_end() {
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+    let (_audio_a, addr_a_audio) = phone().await;
+    let (phone_a_video, addr_a_video) = phone().await;
+    let (_audio_b, addr_b_audio) = phone().await;
+    let (phone_b_video, addr_b_video) = phone().await;
+    let anchored = siphon_rtp_proto::ProfileFlags {
+        video_relay: siphon_rtp_proto::VideoRelay::Anchor,
+        ..Default::default()
+    };
+    let offer = control
+        .request(Command::Offer {
+            call_id: "video-e2e".into(),
+            from_tag: "tag-a".into(),
+            sdp: audio_camera_sdp(addr_a_audio, addr_a_video, "sendonly"),
+            profile: anchored.clone(),
+        })
+        .await;
+    assert_ne!(
+        video_engine_addr(&offer),
+        addr_a_video,
+        "anchored, not the camera's"
+    );
+    let answer = control
+        .request(Command::Answer {
+            call_id: "video-e2e".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: audio_camera_sdp(addr_b_audio, addr_b_video, "recvonly"),
+            profile: anchored,
+        })
+        .await;
+    let near_video = video_engine_addr(&answer);
+    let mut packet = vec![0x80, 96, 0, 1, 0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF];
+    packet.extend_from_slice(b"h264-nal");
+    phone_a_video
+        .send_to(&packet, near_video)
+        .await
+        .expect("send video");
+    let (data, _) = recv(&phone_b_video).await;
+    assert_eq!(data, packet, "the picture reaches the far phone");
+
+    // The default leaves the video section on the phones' own addresses.
+    let plain = control
+        .request(Command::Offer {
+            call_id: "video-plain".into(),
+            from_tag: "tag-a".into(),
+            sdp: audio_camera_sdp(addr_a_audio, addr_a_video, "sendonly"),
+            profile: Default::default(),
+        })
+        .await;
+    assert_eq!(video_engine_addr(&plain), addr_a_video);
+}

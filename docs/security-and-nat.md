@@ -1284,6 +1284,34 @@ copy of Layers 1–3.
   captures pre-decrypt). The one difference from the plaintext path: a secure text stream is never
   demoted back to the kernel (it holds a permanent `Secure` promotion reason).
 
+### Layer 5i: The video stream of a two-party call
+
+With `video_relay: anchor` a two-party call's `m=video` stream is relayed on engine endpoints of its own
+(an RTP pair per leg, one endpoint under `a=rtcp-mux`, RFC 5761), beside the audio. It is a stream with its own
+inbound surface, so it has its own gate and latch and none is inherited from the audio.
+
+- **Gate.** Each video RTP endpoint's rule is built by the same `ingress_rule` as audio: only the SDP-signalled
+  address (RFC 3264) is accepted, tightened to the `received-from` public IP when the proxy supplied one, and
+  loosened only by the documented `subnet-source` and `symmetric` flags. The companion RTCP endpoint is gated
+  on the signalled RTCP address. A stranger's datagram is dropped and counted, never latched
+  (`video_from_an_unexpected_source_is_dropped_not_latched`). Video does not use ICE here.
+- **Latch.** `SignalledOnly`, as audio. The 1 Hz latch refresh sweep reprograms the forward destination of
+  the video flows from the validated learned source exactly as for audio (RFC 3550 §8); it also walks the
+  text flows, which it previously skipped.
+- **Direction.** Only the directions the two parties' own attributes allow get a forward rule (RFC 3264 §6.1,
+  §8.4); the other ingress is a drop. RTCP flows both ways whenever the stream flows at all, because receiver
+  feedback travels against the media. Under `a=rtcp-mux` the RTP direction rule yields to RTCP, since one
+  endpoint receives both and a kernel rule cannot split them: a `recvonly` party's stray RTP is then
+  forwarded. This is the one place the direction is not enforced, and the reason it is not.
+- **Re-offer.** A moved address or changed direction is recorded when the re-offer arrives and the relay is
+  re-gated on it by the answer that completes the exchange; the old source is dropped from then on.
+- **Never into the void, never a leak.** A section the engine does not anchor is declined with port 0, so the
+  other party is never shown a party's own private video address. A secure profile is declined, never
+  relayed unkeyed.
+- **HA.** The video sockets re-bind on their ports at restore, with the same gate and latch policy and the
+  same directions; a snapshot of a call with video carries its own version, so an older standby refuses it
+  rather than dropping the picture.
+
 ### Layer 5g — The T.38 fax (UDPTL) relay path
 A call may switch to fax: an `m=image <port> udptl t38` section (ITU-T T.38 Annex D, RFC 3362),
 either alongside the audio or — the usual T.30 switchover — replacing it, in a re-INVITE that carries

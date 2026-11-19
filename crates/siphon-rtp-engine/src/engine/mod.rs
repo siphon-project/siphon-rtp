@@ -19,6 +19,7 @@
 mod admin;
 mod answer;
 mod answer_local;
+mod call_video;
 mod configure;
 mod dial_out;
 mod dispatch;
@@ -269,6 +270,9 @@ struct Leg {
     /// The control format of this leg's floor stream (`MCPTT` or `MCVideo`), which the answerer
     /// echoes (RFC 3264 §6). Meaningful only while `floor` is set.
     floor_format: siphon_rtp_proto::ControlFormat,
+    /// This leg's anchored video stream (`video_relay: anchor`): its endpoints and the addresses
+    /// its party signalled. `None` when the call carries no anchored video.
+    video: Option<call_video::VideoLeg>,
 }
 
 impl Leg {
@@ -282,11 +286,16 @@ impl Leg {
     /// Every datapath endpoint this leg owns, including the RFC 4103 text stream — for teardown, the
     /// media-timeout sweep, and the call-id index, so text ports are freed and text activity keeps the
     /// call alive. Kept separate from [`Leg::endpoint_ids`] so text is not counted into the audio CDR.
-    fn all_endpoint_ids(&self) -> impl Iterator<Item = EndpointId> {
+    fn all_endpoint_ids(&self) -> impl Iterator<Item = EndpointId> + '_ {
         self.endpoint_ids()
             .chain(self.text.map(|endpoint| endpoint.id))
             .chain(self.image.map(|endpoint| endpoint.id))
             .chain(self.floor.map(|endpoint| endpoint.id))
+            .chain(
+                self.video
+                    .iter()
+                    .flat_map(call_video::VideoLeg::endpoint_ids),
+            )
     }
 
     /// The engine endpoints this leg presents in SDP: its RTP port, its RTCP port unless muxed, and
@@ -634,6 +643,8 @@ struct Call {
     /// and demote it back to these in-kernel flows when the last feature clears. Empty for a call with
     /// no plaintext text stream.
     text_relay_flows: Vec<(EndpointId, FlowAction)>,
+    /// The anchored video stream's mode, per-party directions and installed flows.
+    video: call_video::CallVideo,
     /// Runtime reasons the RFC 4103 text stream is promoted to the userspace text processor — parallel
     /// to `promotion_reasons`, which governs the *audio* relay. Text-only: promoting text never promotes
     /// audio (the maintainer's hard constraint). Empty ⇒ text stays on the PR-1 in-kernel `Forward`
@@ -899,7 +910,7 @@ impl Call {
         {
             Some(EndpointRole::FarRtcp)
         } else {
-            None
+            self.video_endpoint_role(id)
         }
     }
 
@@ -954,8 +965,10 @@ impl Call {
                 })
             })
             .collect();
+        let video = self.video_snapshot();
         Some(ha::CallSnapshot {
             version: ha::SNAPSHOT_VERSION,
+            video,
             call_id: String::new(), // filled by the caller, which holds the registry key
             scope: None,            // likewise
             from_tag: self.from_tag.clone(),

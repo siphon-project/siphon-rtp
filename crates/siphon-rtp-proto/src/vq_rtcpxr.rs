@@ -1287,6 +1287,7 @@ mod tests {
             mos_max: Some(4.4),
             mos_basis: Some("full".to_string()),
             text: None,
+            video: None,
             local_address: Some("192.0.2.10:30000".parse().expect("address")),
             remote_address: Some("198.51.100.7:4000".parse().expect("address")),
             egress_ssrc: Some(0x1f2e_3d4c),

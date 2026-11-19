@@ -24,6 +24,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             stats.bytes_out += leg.bytes_out;
             stats.packets_lost += leg.packets_dropped;
         }
+        // The anchored video stream, summed over both legs the way the audio counters are.
+        stats.video = [Some(&call.near), call.far.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|leg| self.video_stats(leg))
+            .reduce(|mut sum, stats| {
+                sum.packets_in += stats.packets_in;
+                sum.packets_out += stats.packets_out;
+                sum.bytes_in += stats.bytes_in;
+                sum.bytes_out += stats.bytes_out;
+                sum
+            });
         CmdResult::Ok {
             sdp: None,
             duration_ms: None,
@@ -222,6 +234,10 @@ fn build_features() -> Vec<String> {
         // `nack`, `nack pli` and `ccm fir` are answered (never `transport-cc` or `goog-remb`) and no
         // header extension is. A controller gates offering a browser member video on this entry.
         "forward_video_webrtc".to_string(),
+        // A two-party relayed call anchors an offered `m=video` stream when the profile says
+        // `video_relay: anchor`: an endpoint pair per leg, the gated latch, RTCP and direction
+        // attributes respected, plain RTP only. A controller gates sending `video_relay` on this entry.
+        "call_video_anchor".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.
