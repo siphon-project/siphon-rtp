@@ -1726,6 +1726,8 @@ fn inject_x3_session(
             transport: tokio::spawn(std::future::pending::<()>()),
             ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             joined_endpoint: None,
+            handing_over: Default::default(),
+            detach_requested: Default::default(),
         },
     );
     delivery

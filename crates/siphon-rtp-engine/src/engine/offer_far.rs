@@ -17,7 +17,7 @@
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{AddressFamily, Datapath, FlowAction};
 use siphon_rtp_proto::{
-    CmdResult, PlayEndReason, ProfileFlags, RecordingEndReason, WsTeeEndReason, X3EndReason,
+    CmdResult, PlayEndReason, ProfileFlags, RecordingEndReason, WsTeeEndReason,
 };
 
 use crate::media_pipeline::MediaControl;
@@ -400,7 +400,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
         self.stop_wav_recordings_for_call(call_id, RecordingEndReason::Stopped)
             .await;
-        self.stop_x3(call_id, X3EndReason::Detached).await;
+        // The interception belongs to the call, so it outlives the pipeline: its taps go with the
+        // actor being stopped, and the pipeline that replaces it (the relay the far answer installs,
+        // or the local one again) is tapped from the same session, so the delivery connection,
+        // Correlation ID and sequence carry straight on.
+        self.stop_x3_call_taps(call_id);
         // Awaited, so the old actor never sends on the caller's endpoint beside the new one.
         self.media.stop(call_id).await;
         let near = self.calls.get(call_id).map(|call| call.near);
@@ -436,12 +440,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.far_codec = None;
             call.pipeline = PipelineKind::Passthrough;
         }
-        self.hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
-            .await?;
+        if let Err(reason) = self
+            .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
+            .await
+        {
+            // No pipeline to tap: an interception left attached would deliver nothing.
+            self.end_x3_unservable(call_id, &reason).await;
+            return Err(reason);
+        }
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.far_codec = Some(local.codec.clone());
             call.pipeline = PipelineKind::Media;
         }
+        // The caller is on its own pipeline again: put the interception's taps back on it.
+        self.carry_x3_across_answer(call_id).await;
         Ok(())
     }
 }

@@ -365,11 +365,67 @@ fn bench_secure_video(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// The per-frame cost of a **single-leg** engine-answered call (an IVR leg: the caller's packet in,
+/// the engine's comfort-noise frame out) without and with lawful interception (ETSI TS 103 221-2 X3).
+/// The untapped arm is the call's own cost and the gate for the egress hook in `push_egress` (it
+/// must stay within 10 % of the same loop without the hook); the tapped arm adds the ingress and the
+/// egress tap plus the recycled-buffer hand-back the delivery task does, so it is an upper bound on
+/// what an intercepted call costs.
+fn bench_single_leg_interception(criterion: &mut Criterion) {
+    let single_leg = || {
+        let spec = spec(0, "PCMU");
+        let direction = || direction(1, 1, A_ADDR, A_ADDR, &spec, &spec, 0xE000_0001);
+        MediaCall::new("bench", "tag-a", None, direction(), direction(), true)
+            .with_comfort_idle(None)
+    };
+    let mut group = criterion.benchmark_group("media_pipeline_single_leg_frame_8k_20ms");
+    for (label, tapped) in [("untapped", false), ("x3_tapped", true)] {
+        group.bench_function(label, |bencher| {
+            let mut media_call = single_leg();
+            let (factory, delivery) = siphon_rtp_engine::x3::x3_channel(4096);
+            if tapped {
+                media_call.start_x3_single_leg((
+                    factory.tap(addr(B_ADDR), siphon_rtp_li::PayloadDirection::FromTarget),
+                    factory.tap(addr(B_ADDR), siphon_rtp_li::PayloadDirection::ToTarget),
+                ));
+            }
+            let mut packet = ulaw_packet(0);
+            let mut sequence: u16 = 0;
+            let mut out = Vec::with_capacity(4);
+            let mut events = Vec::with_capacity(4);
+            bencher.iter(|| {
+                sequence = sequence.wrapping_add(1);
+                packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+                out.clear();
+                events.clear();
+                media_call.process(
+                    &RxPacket {
+                        endpoint: EndpointId(1),
+                        source: addr(A_ADDR),
+                        arrival: u64::from(sequence) * 20_000,
+                        data: bytes::Bytes::copy_from_slice(&packet),
+                    },
+                    &mut out,
+                    &mut events,
+                );
+                media_call.tick(&mut out, &mut events);
+                // What the delivery task does: frame, then hand the buffer back.
+                while let Ok(delivered) = delivery.packets.try_recv() {
+                    let _ = delivery.recycle.try_send(delivered.payload);
+                }
+                black_box(out.len())
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_secure_video,
     bench_secure_pipeline,
     bench_secure_transcrypt_pipeline,
-    bench_ws_secure_leg
+    bench_ws_secure_leg,
+    bench_single_leg_interception
 );
 criterion_main!(benches);

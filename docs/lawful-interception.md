@@ -120,8 +120,8 @@ arise.
 match at the INVITE. The delivery connection opens at once, and the taps go onto the media path the
 first answer installs, so early media from a `183` with SDP and the final answer share one connection,
 one Correlation ID and one sequence. `target_leg: callee` is resolved then too. A call deleted before
-any answer ends the interception with `call_ended` and nothing delivered. A call with no second leg at
-all (a local answer) is still refused.
+any answer ends the interception with `call_ended` and nothing delivered. A call the engine answered
+itself is intercepted too, see [Engine-answered calls](#engine-answered-calls).
 
 ### Conference rooms
 
@@ -162,6 +162,52 @@ closed mid-move), the call's media is gone and the interception ends loudly with
 Not covered in a room: RFC 4103 real-time text on a seat's `m=text` stream, which is not audio RTP.
 `node_info` lists `x3_conference_seat` on a node provisioned for X3.
 
+### Engine-answered calls
+
+A call the engine answered itself (`answer_local`: an IVR, an announcement, a pre-call prompt) has one
+RTP party, the caller, and the engine is its far side. `attach_x3` is accepted on it. The engine
+answering stands in for the callee, so `target_leg` applies as it does on two parties (TS 103 221-2
+§5.2.6, one mapping for both): with the caller as the target its ingress is `from_target` and the
+engine's egress `to_target`; with the callee as the target the two mirror. The directions stay the same
+when `offer_far`'s party answers and takes the callee side over.
+
+| Tap | Meaning | Direction (`target_leg: caller` / `callee`) |
+|---|---|---|
+| The caller's ingress in the media pipeline, after the source gate and the SRTP unprotect | what the caller sent | 3 (from target) / 2 (to target) |
+| Every datagram the pipeline sends the caller (prompt, comfort noise, telephone-event), in the clear, only once it is really being sent | exactly the RTP that left the engine | 2 (to target) / 3 (from target) |
+
+The egress tap sits in the one place every egress datagram passes, after the leg is keyed, past ICE and
+receiving, and after a secure leg's protect succeeded: an unkeyed or `sendonly`-withheld leg delivers
+nothing, a secure leg delivers plaintext and never ciphertext, and nothing is delivered that was not
+sent. Its PDU source is the engine address the caller talks to and its destination is where the packet
+went. Only a call with one party gets an egress tap: a call with two parties keeps its two ingress taps,
+so no packet is delivered twice.
+
+The interception survives what changes the call's shape, on the same delivery connection, Correlation
+ID and PDU sequence:
+
+- **`offer_far`.** While the far leg is only offered the single-party taps stay on the caller. When the
+  far party answers, the call is a two-party relay and the two ingress taps go on it, with the same
+  directions as before for the caller. A refused far answer, or a `delete` of
+  the far leg, puts the caller back on the local pipeline with its single-party taps.
+- **A re-answer of the same dialog** (`answer_local` again with the same `call_id`, `from_tag` and owner)
+  replaces the call's pipeline and endpoints. The caller is the same party in the same dialog and the X2
+  records the Correlation ID ties the delivery to do not change, so ending the interception there would
+  leave the target's content flowing undelivered. The replacement inherits it. A re-answer under another
+  `from_tag` or from another client is a different call and ends the interception with `call_ended`;
+  one that is a WebSocket takeover (`ws_uri`) cannot carry it and ends it with `transport_error`. The
+  hand-over is atomic as far as `detach_x3` can tell: the session stays registered while the old call is
+  torn down and the new one is registered, a `detach_x3` that lands meanwhile is accepted and honoured the
+  moment the replacement exists (`detached`, one `x3_ended`), and `attach_x3` in that window is refused
+  with a retry reason. The first comfort-noise frame a rebuilt pipeline sends can precede its taps by a
+  moment; the caller's own media is never missed, because it only arrives after the answer.
+
+Refused, with the reason unchanged: a WebSocket takeover (`ws_uri`), whose media goes to the server and
+never through the pipeline, and an echo call. While an interception is attached, `echo` and
+`attach_ws_bridge` are refused on the call (`echo` bypasses the tap and a bridge removes the pipeline),
+so the call is never left attached and deaf (a behaviour change for two-party calls too: `echo` was accepted on an intercepted call and silenced its delivery). `node_info` lists `x3_single_leg` on a node provisioned for
+X3.
+
 ### Events
 
 | Event | Meaning |
@@ -179,6 +225,7 @@ Not covered in a room: RFC 4103 real-time text on a seat's `m=text` stream, whic
 | WebSocket takeover (`ws_uri`) | **Refused** — the far side is a media server, not a second party |
 | Echo test | **Refused** — no second party, and the echo path bypasses the tap |
 | Conference seat (`conference_seat`, or joined with `conference_join`) | Delivered (room tap), see [Conference rooms](#conference-rooms) |
+| Engine-answered call (`answer_local`), also while `offer_far` grows it | Delivered (ingress and egress taps, the caller is the target), see [Engine-answered calls](#engine-answered-calls) |
 
 Each unsupported shape is refused at the command with a reason, never accepted silently.
 

@@ -208,6 +208,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result("echo", &"to_tag does not match this call's to-tag");
             }
         }
+        if enabled && self.x3_sessions.contains_key(call_id) {
+            // Echo reflects a party's audio through `Direction::echo_into`, which bypasses the tap
+            // on the ingress and would leave the interception attached and deaf. Refused, with the
+            // call left as it was, rather than going quiet on a warrant.
+            return error_result(
+                "echo",
+                &"a lawful-interception delivery is attached to this call and echo bypasses its \
+                  tap; detach_x3 first",
+            );
+        }
         if enabled {
             // Promote a plain relay into a processing MediaCall (idempotent on an already-promoted /
             // transcoding call) and hold it, then turn echo on.

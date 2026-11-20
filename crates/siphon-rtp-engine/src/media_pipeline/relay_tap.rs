@@ -75,6 +75,8 @@ pub struct CarriedAttachments {
     pub forks: [Vec<Box<dyn MediaSink>>; 2],
     pub egress_taps: [Vec<Box<dyn MediaSink>>; 2],
     pub x3: Option<(X3Tap, X3Tap)>,
+    /// A single-leg call's interception: `(ingress tap, egress tap)`.
+    pub x3_single_leg: Option<(X3Tap, X3Tap)>,
     pub capture: Option<PcapCapture>,
     pub dtmf_blocked: [bool; 2],
 }
@@ -167,9 +169,13 @@ impl MediaCall {
     /// Move out everything attached to this call ([`super::MediaControl::TakeAttachments`]), leaving it
     /// a bare relay or transcode.
     pub fn take_attachments(&mut self) -> CarriedAttachments {
-        let x3 = match (self.a_to_b.x3.take(), self.b_to_a.x3.take()) {
-            (Some(leg_a), Some(leg_b)) => Some((leg_a, leg_b)),
-            _ => None,
+        // A two-party call has an ingress tap on each leg; a single-leg call has its ingress tap and
+        // an egress tap, both on the direction that faces its caller.
+        let egress = self.a_to_b.x3_egress.take();
+        let (x3, x3_single_leg) = match (self.a_to_b.x3.take(), self.b_to_a.x3.take(), egress) {
+            (Some(leg_a), Some(leg_b), _) => (Some((leg_a, leg_b)), None),
+            (Some(ingress), None, Some(egress)) => (None, Some((ingress, egress))),
+            _ => (None, None),
         };
         CarriedAttachments {
             forks: [
@@ -182,6 +188,7 @@ impl MediaCall {
                 std::mem::take(&mut self.a_to_b.egress_taps),
             ],
             x3,
+            x3_single_leg,
             capture: self.capture.take(),
             dtmf_blocked: [self.a_to_b.dtmf_blocked, self.b_to_a.dtmf_blocked],
         }

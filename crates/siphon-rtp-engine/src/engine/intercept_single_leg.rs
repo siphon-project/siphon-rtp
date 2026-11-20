@@ -1,0 +1,147 @@
+//! Lawful-interception content delivery (ETSI TS 103 221-2 X3) on a single-leg call: an
+//! engine-answered caller (`answer_local`, an IVR, an announcement, a call growing a far leg).
+//!
+//! The engine answering the call stands in for the callee, so the warrant's `target_leg` applies as on
+//! two parties (TS 103 221-2 §5.2.6): with the caller as the target what it sends is `from_target`
+//! and what the engine sends it `to_target`; with the callee as the target the two mirror. The two taps
+//! live in the media actor ([`crate::media_pipeline`]'s single-leg shape); this module installs them
+//! and carries the interception across the rebuilds that change the call's shape.
+
+use siphon_rtp_datapath::Datapath;
+use siphon_rtp_proto::X3EndReason;
+use std::sync::atomic::Ordering;
+
+use crate::media_pipeline::MediaControl;
+use crate::x3::{ingress_directions, X3TapFactory};
+
+use super::{Call, ClientId, Engine, PipelineKind, PromoteMode, PromotionReason};
+
+impl Call {
+    /// Whether the engine is this call's far side: an `answer_local` call (its answer is kept, so
+    /// `offer_far` can grow it) with no far party answered yet, a far leg that is merely offered
+    /// included. Its media is the engine's own single-leg pipeline.
+    pub(super) fn is_single_leg_answer(&self) -> bool {
+        self.local_answer.is_some() && self.to_tag.is_none()
+    }
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Put `factory`'s ingress and egress taps on a single-leg call's media actor.
+    ///
+    /// The actor must be the call's own pipeline: a call whose pipeline is being rebuilt (between
+    /// `offer_far`'s answer and the relay it installs) is refused with a reason, never accepted with
+    /// no taps behind it.
+    pub(super) async fn install_single_leg_x3(
+        &self,
+        call_id: &str,
+        factory: &X3TapFactory,
+        target_is_caller: bool,
+    ) -> Result<(), String> {
+        let Some((pipeline, caller)) = self.owned_call_internal(call_id, |call| {
+            (call.pipeline, call.caller_leg().rtp.local_addr)
+        }) else {
+            return Err("call no longer exists".to_string());
+        };
+        if pipeline != PipelineKind::Media || !self.media.is_media_call(call_id) {
+            return Err(
+                "the call's local media pipeline is being rebuilt; retry the attach once it is up"
+                    .to_string(),
+            );
+        }
+        // The address of the engine endpoint the caller talks to: the PDU's destination for what
+        // the caller sends and its source for what the engine sends.
+        // TS 103 221-2 §5.2.6 is target-relative, and the engine answering the call stands in for
+        // the callee. The caller's ingress is leg A's and the engine's egress is what the far side
+        // sends it, so the one mapping of [`ingress_directions`] serves here as it does for two
+        // parties, and the directions stay the same when `offer_far`'s party takes the callee over.
+        let (ingress_direction, egress_direction) = ingress_directions(target_is_caller);
+        let ingress = factory.tap(caller, ingress_direction);
+        let egress = factory.tap(caller, egress_direction);
+        // Recorded so the call's media is not demoted from under the interception. The actor is the
+        // call's processing pipeline already, so this promotes nothing.
+        self.hold_in_userspace(call_id, PromotionReason::X3, PromoteMode::RelayOnly)
+            .await?;
+        if !self.media.control(
+            call_id,
+            MediaControl::StartX3SingleLeg(Box::new((ingress, egress))),
+        ) {
+            self.release_userspace_hold(call_id, PromotionReason::X3)
+                .await;
+            return Err("media actor unavailable".to_string());
+        }
+        Ok(())
+    }
+
+    /// End the interception of a call whose new media path cannot carry it, loudly: `x3_ended` with
+    /// `transport_error` (the nearest reason there is) and an `error!`, rather than an interception
+    /// that is attached and delivers nothing. A no-op on a call that is not intercepted.
+    pub(super) async fn end_x3_unservable(&self, call_id: &str, why: &str) {
+        if !self.x3_sessions.contains_key(call_id) {
+            return;
+        }
+        tracing::error!(
+            target: "siphon_rtp::li",
+            call_id,
+            why,
+            "the call's media path cannot carry its lawful interception; ending it rather than \
+             leaving it silently deaf"
+        );
+        self.stop_x3(call_id, X3EndReason::TransportError).await;
+    }
+
+    /// Mark the interception of a single-leg call that a re-answer of the **same dialog** (same
+    /// call-id, from-tag and owner) is about to replace, so the replacement inherits it instead of
+    /// ending it. The caller is the same party in the same dialog: an interception that ended here
+    /// would leave the target's content flowing unintercepted (TS 103 221-2 clause 6: the delivery
+    /// is tied to the call's X2 records, which do not change).
+    ///
+    /// The session stays in the map for the whole hand-over, marked, so nothing can miss it: the old
+    /// call's teardown leaves it alone ([`Self::stop_x3`]) and a `detach_x3` that lands meanwhile is
+    /// recorded and honoured by [`Self::settle_x3_hand_over`]. Returns whether one is being handed
+    /// over. Any other replacement is a new call, and the interception ends with the old one.
+    pub(super) fn begin_x3_hand_over(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+    ) -> bool {
+        let Some(session) = self.x3_sessions.get(call_id) else {
+            return false;
+        };
+        let same_dialog = session.owner == client && session.from_tag == from_tag;
+        if same_dialog {
+            session.handing_over.store(true, Ordering::SeqCst);
+        }
+        same_dialog
+    }
+
+    /// The replacement call is registered: the hand-over is over. A withdrawal that arrived meanwhile
+    /// ends the interception now, `detached`, with exactly one `x3_ended`.
+    pub(super) async fn settle_x3_hand_over(&self, call_id: &str) {
+        let Some(requested) = self.x3_sessions.get(call_id).map(|session| {
+            session.handing_over.store(false, Ordering::SeqCst);
+            session.detach_requested.load(Ordering::SeqCst)
+        }) else {
+            return;
+        };
+        if requested {
+            self.stop_x3(call_id, X3EndReason::Detached).await;
+        }
+    }
+
+    /// The re-answer failed with nothing to replace the call: the interception ends with it.
+    pub(super) async fn abandon_x3_hand_over(&self, call_id: &str) {
+        let requested = self.x3_sessions.get(call_id).map(|session| {
+            session.handing_over.store(false, Ordering::SeqCst);
+            session.detach_requested.load(Ordering::SeqCst)
+        });
+        if let Some(requested) = requested {
+            let reason = if requested {
+                X3EndReason::Detached
+            } else {
+                X3EndReason::CallEnded
+            };
+            self.stop_x3(call_id, reason).await;
+        }
+    }
+}

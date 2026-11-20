@@ -154,10 +154,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// The removal is conditional on the call still being this client's single-leg call, so a
     /// relay that took the id while the replacement's ports were being bound is refused rather
     /// than destroyed. `None` means the call-id is free to register.
-    async fn replace_local_call(&self, client: ClientId, call_id: &str) -> Option<CmdResult> {
+    async fn replace_local_call(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), Box<CmdResult>> {
         if let Some((_, previous)) = self.calls.remove_if(call_id, |_, call| {
             call.admits(client, call_id) && call.far.is_none()
         }) {
+            // A re-answer of the same dialog is the same call to the target, so a lawful
+            // interception on it is handed to the replacement rather than ended with the old
+            // pipeline: the delivery connection, Correlation ID and sequence carry on. Marked
+            // before the teardown below, which would otherwise end it.
+            self.begin_x3_hand_over(client, call_id, from_tag);
             tracing::info!(
                 target: "siphon_rtp::control",
                 %call_id,
@@ -168,13 +178,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.finish_call(call_id, &previous, "replaced").await;
         }
         match self.local_call_gate(client, call_id) {
-            Ok(false) => None,
+            Ok(false) => Ok(()),
             // Another `answer_local` on the same id registered while this one was tearing down.
-            Ok(true) => Some(CmdResult::Error {
-                reason: "answer_local: a concurrent answer_local registered this call-id first"
-                    .to_string(),
-            }),
-            Err(refusal) => Some(*refusal),
+            Ok(true) => {
+                self.abandon_x3_hand_over(call_id).await;
+                Err(Box::new(CmdResult::Error {
+                    reason: "answer_local: a concurrent answer_local registered this call-id first"
+                        .to_string(),
+                }))
+            }
+            Err(refusal) => {
+                self.abandon_x3_hand_over(call_id).await;
+                Err(refusal)
+            }
         }
     }
 
@@ -919,9 +935,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Only now, with the replacement's ports bound and every validation passed, is the call it
         // replaces torn down: a re-answer that fails above leaves the caller's live media alone.
-        if let Some(refusal) = self.replace_local_call(client, call_id).await {
+        if let Err(refusal) = self.replace_local_call(client, call_id, &from_tag).await {
             self.free(&endpoints).await;
-            return refusal;
+            return *refusal;
         }
         let floor_channel_tag = from_tag.clone();
         self.register_local_call(
@@ -934,6 +950,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &info,
             profile,
         );
+        // The re-answer of an intercepted dialog: the interception is the replacement's now, and is
+        // tapped onto its pipeline once that is up. A withdrawal that arrived while the old call was
+        // going away ends it here. Anything that fails after this ends the call, and with it the
+        // interception, loudly (`teardown_call`).
+        self.settle_x3_hand_over(call_id).await;
         if let Some(floor) = local_floor {
             self.install_local_floor(call_id, profile, floor);
         }
@@ -987,6 +1008,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         answer_sdp = answered_as_the_engine(&answer_sdp, info.direction);
 
         if let Some(ws_uri) = profile.ws_uri.clone() {
+            // A takeover leg's media goes to the WebSocket server, not through the pipeline an
+            // interception taps: a re-answer into one cannot carry the interception.
+            self.end_x3_unservable(call_id, "the re-answer is a WebSocket takeover (ws_uri)")
+                .await;
             return self
                 .answer_local_takeover(LocalTakeover {
                     call_id,
@@ -1080,6 +1105,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return refusal;
         }
 
+        // The pipeline is up and keyed: put a carried interception's taps on it.
+        self.carry_x3_across_answer(call_id).await;
         ok_sdp(answer_sdp, None)
     }
 }

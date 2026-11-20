@@ -15,9 +15,11 @@ use std::time::Duration;
 
 use siphon_rtp_engine::x3::{build_tls_client_config, X3Clock, X3Config, X3DeliveryTask};
 use siphon_rtp_li::inbound::InboundHeader;
+use siphon_rtp_li::PayloadDirection;
 use siphon_rtp_li::HEADER_LEN;
 use siphon_rtp_proto::Xid;
 use tokio::io::AsyncReadExt;
+use tokio::net::UdpSocket;
 use tokio::time::{timeout, timeout_at};
 
 pub const SHORT: Duration = Duration::from_secs(5);
@@ -321,4 +323,101 @@ impl X3Clock for ManualClock {
     fn unix_nanos(&self) -> u128 {
         u128::from(self.0.load(std::sync::atomic::Ordering::SeqCst))
     }
+}
+
+pub type Tls = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+
+/// A phone: a socket and the address it is reachable at.
+pub struct Phone {
+    pub socket: UdpSocket,
+    pub address: SocketAddr,
+}
+
+impl Phone {
+    pub async fn new() -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind phone");
+        let address = socket.local_addr().expect("phone address");
+        Self { socket, address }
+    }
+
+    pub async fn send(&self, packet: &[u8], toward: SocketAddr) {
+        self.socket
+            .send_to(packet, toward)
+            .await
+            .expect("phone sends");
+    }
+
+    /// Every non-RTCP datagram that has arrived so far.
+    pub async fn drain_rtp(&self) -> Vec<Vec<u8>> {
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 2048];
+        while let Ok(Ok((length, _))) =
+            timeout(Duration::from_millis(2), self.socket.recv_from(&mut buffer)).await
+        {
+            let datagram = &buffer[..length];
+            // RFC 5761 §4: payload types 64..=95 on a muxed port are RTCP.
+            if datagram.len() > 12 && !(64..=95).contains(&(datagram[1] & 0x7f)) {
+                received.push(datagram.to_vec());
+            }
+        }
+        received
+    }
+}
+
+/// The stub Mediation Function's end of the delivery connection: every PDU read is checked against
+/// the one interception's invariants, so a second connection, a new Correlation ID or a gap in the
+/// sequence fails the test where it happens.
+pub struct Mdf {
+    pub stream: PduStream<Tls>,
+    /// The sequence number the next PDU must carry.
+    pub next_sequence: u32,
+    /// Every PDU read so far: its direction and RTP payload.
+    pub seen: Vec<(u16, Vec<u8>)>,
+}
+
+impl Mdf {
+    pub fn check(&mut self, pdu: &DecodedPdu) {
+        assert_eq!(pdu.header.correlation_id, CORRELATION_ID, "same CID");
+        assert_eq!(
+            pdu_sequence(pdu),
+            self.next_sequence,
+            "the delivery connection's sequence counter continues without a gap"
+        );
+        self.next_sequence += 1;
+        self.seen
+            .push((pdu.header.payload_direction, pdu.payload.clone()));
+    }
+
+    /// Read PDUs until `done` says the run has what it needed, checking every one on the way.
+    pub async fn read_until(&mut self, mut done: impl FnMut(&[(u16, Vec<u8>)]) -> bool) {
+        let start = self.seen.len();
+        while !done(&self.seen[start..]) {
+            let pdu = self.stream.next().await;
+            self.check(&pdu);
+        }
+    }
+
+    /// Read exactly `count` PDUs.
+    pub async fn read(&mut self, count: usize) -> Vec<(u16, Vec<u8>)> {
+        let start = self.seen.len();
+        self.read_until(|read| read.len() >= count).await;
+        self.seen[start..start + count].to_vec()
+    }
+
+    /// Whether `payload` was delivered in `direction`, among the PDUs read since `from`.
+    pub fn delivered(&self, from: usize, direction: PayloadDirection, ssrc: u32) -> Vec<Vec<u8>> {
+        self.seen[from..]
+            .iter()
+            .filter(|(read, payload)| *read == direction.to_u16() && ssrc_of(payload) == ssrc)
+            .map(|(_, payload)| payload.clone())
+            .collect()
+    }
+}
+
+pub fn from_target() -> u16 {
+    PayloadDirection::FromTarget.to_u16()
+}
+
+pub fn to_target() -> u16 {
+    PayloadDirection::ToTarget.to_u16()
 }

@@ -380,7 +380,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Take the call's own taps off the media path it is leaving (a crypto bridge's, or the media
     /// actor's), keeping the interception itself: its delivery connection, Correlation ID and
     /// sequence counter belong to the call and carry on from the room.
-    fn stop_x3_call_taps(&self, call_id: &str) {
+    pub(super) fn stop_x3_call_taps(&self, call_id: &str) {
         let Some(mut session) = self.x3_sessions.get_mut(call_id) else {
             return;
         };

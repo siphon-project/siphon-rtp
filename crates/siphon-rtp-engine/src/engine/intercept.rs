@@ -2,6 +2,7 @@
 
 use siphon_rtp_datapath::{Datapath, EndpointId};
 use siphon_rtp_proto::{CmdResult, Event, X3EndReason, X3TargetLeg, Xid};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::media_pipeline::MediaControl;
@@ -46,6 +47,12 @@ pub(super) struct X3Session {
     /// session ends with that seat and never carries over to a later seat under the same tag. `None`
     /// for a call's interception.
     pub(super) joined_endpoint: Option<EndpointId>,
+    /// Set for the whole of a re-answer of the dialog (from the old call's teardown to the new
+    /// call's registration): the session stays in the map, the old call's teardown leaves it alone,
+    /// and a `detach_x3` that lands meanwhile is recorded below instead of being lost.
+    pub(super) handing_over: std::sync::atomic::AtomicBool,
+    /// A `detach_x3` arrived during the hand-over; honoured the moment it ends.
+    pub(super) detach_requested: std::sync::atomic::AtomicBool,
 }
 
 /// What [`Engine::spawn_x3_transport`] needs to run one interception's delivery task.
@@ -160,8 +167,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ) -> Result<(), String> {
         let config = self.validate_x3_request(delivery, xid, correlation_id)?;
 
-        let Some((pipeline, echo, has_far_leg, answered, seated)) =
-            self.owned_call_internal(call_id, |call| {
+        let Some((pipeline, echo, has_far_leg, answered, seated, single_leg)) = self
+            .owned_call_internal(call_id, |call| {
                 (
                     call.pipeline,
                     call.promotion_reasons.contains(&PromotionReason::Echo),
@@ -170,6 +177,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         .as_ref()
                         .is_some_and(|far| far.remote_rtp.is_some()),
                     call.seat.as_ref().is_some_and(|seat| seat.seated),
+                    call.is_single_leg_answer(),
                 )
             })
         else {
@@ -204,10 +212,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .to_string(),
             );
         }
-        // A call with no far leg at all (a local answer) has no second party whose content a warrant
-        // covers. A far leg that is offered but not answered yet does: a warrant can match at the
-        // INVITE, and content (early media included) flows from the first answer on.
-        if !has_far_leg && !in_room {
+        // An engine-answered call (a local answer, with or without a far leg offered on it) is
+        // intercepted on its one party, the engine standing in for the callee ([`Self::install_single_leg_x3`]). A far
+        // leg that is offered but not answered yet is a warrant that can match at the INVITE, and
+        // content (early media included) flows from the first answer on. What is left without any
+        // far leg is not a call the engine answered, so there is nothing to tap.
+        if !has_far_leg && !in_room && !single_leg {
             return Err("the call has no second leg to intercept".to_string());
         }
 
@@ -215,6 +225,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // than leave an interception attached to a connection that can never come up.
         let tls = self.x3_tls_config_for(&config)?;
 
+        if self
+            .x3_sessions
+            .get(call_id)
+            .is_some_and(|session| session.handing_over.load(Ordering::SeqCst))
+        {
+            return Err("the call is being re-answered; retry the attach once it is".to_string());
+        }
         // Replacing an existing interception: stop the old one **first**. Doing it after the new
         // taps were installed made its `StopX3` / `clear_x3_tap` remove the very taps just
         // installed, so a re-attach ended at once with nothing delivered.
@@ -229,7 +246,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // every answer, the first one included, puts the taps onto whatever it installed
         // ([`Self::carry_x3_across_answer`]), so a 183's early media and the final answer share one
         // delivery.
-        let bridged_endpoints = if answered || in_room {
+        let bridged_endpoints = if answered || in_room || single_leg {
             self.install_x3_taps(call_id, &factory, target_is_caller)
                 .await?
         } else {
@@ -267,6 +284,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 transport,
                 ended,
                 joined_endpoint: None,
+                handing_over: Default::default(),
+                detach_requested: Default::default(),
             },
         );
         self.emit_call_event(
@@ -384,8 +403,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         factory: &X3TapFactory,
         target_is_caller: bool,
     ) -> Result<Vec<EndpointId>, String> {
-        let Some((pipeline, a_local, b_local, a_endpoint, b_endpoint)) =
-            self.owned_call_internal(call_id, |call| {
+        let Some((pipeline, a_local, b_local, a_endpoint, b_endpoint, single_leg)) = self
+            .owned_call_internal(call_id, |call| {
                 let caller = call.caller_leg();
                 (
                     call.pipeline,
@@ -395,11 +414,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         .map_or(caller.rtp.local_addr, |far| far.rtp.local_addr),
                     call.near.rtp.id,
                     call.far.as_ref().map(|far| far.rtp.id),
+                    call.is_single_leg_answer(),
                 )
             })
         else {
             return Err("call no longer exists".to_string());
         };
+        // An engine-answered caller with no far party answering (yet): its own pipeline carries the
+        // media, with an ingress and an egress tap on the one party.
+        if single_leg {
+            self.install_single_leg_x3(call_id, factory, target_is_caller)
+                .await?;
+            return Ok(Vec::new());
+        }
         // §5.2.6 is target-relative, and only the warrant knows which leg is the target.
         let (direction_a, direction_b) = ingress_directions(target_is_caller);
         let tap_a = factory.tap(a_local, direction_a);
@@ -538,6 +565,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         call_id: &str,
         from_tag: &str,
     ) -> CmdResult {
+        // A re-answer is replacing the call: the withdrawal is recorded and honoured the moment the
+        // replacement is registered, so delivery never outlives a withdrawn warrant.
+        if let Some(session) = self.x3_sessions.get(call_id) {
+            if session.owner == client && session.handing_over.load(Ordering::SeqCst) {
+                session.detach_requested.store(true, Ordering::SeqCst);
+                return ok_empty();
+            }
+        }
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return self.detach_x3_seat(client, call_id, from_tag).await;
         }
@@ -549,6 +584,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// emit [`Event::X3Ended`] with the delivery counts, and release the userspace hold. A no-op
     /// when the call is not intercepted.
     pub(super) async fn stop_x3(&self, call_id: &str, reason: X3EndReason) {
+        // The old call of a re-answer going away is not the end of the interception it hands over.
+        if self
+            .x3_sessions
+            .get(call_id)
+            .is_some_and(|session| session.handing_over.load(Ordering::SeqCst))
+        {
+            return;
+        }
         let Some((_, session)) = self.x3_sessions.remove(call_id) else {
             return;
         };
@@ -660,7 +703,6 @@ pub(super) fn emit_x3_ended(
     reason: X3EndReason,
     counters: &X3Counters,
 ) {
-    use std::sync::atomic::Ordering;
     if ended.swap(true, Ordering::SeqCst) {
         return; // already reported
     }

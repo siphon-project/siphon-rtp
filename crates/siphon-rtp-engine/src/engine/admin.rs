@@ -161,6 +161,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // `x3_conference_seat`: an interception follows a call's leg into a conference room, is
             // accepted on a seated call, and can be attached to a seat that joined a room.
             features.push("x3_conference_seat".to_string());
+            // `x3_single_leg`: `attach_x3` is accepted on an engine-answered call (`answer_local`),
+            // where the caller is the target, and the interception carries across a re-answer of the
+            // same dialog and across `offer_far`.
+            features.push("x3_single_leg".to_string());
         }
         features
     }
