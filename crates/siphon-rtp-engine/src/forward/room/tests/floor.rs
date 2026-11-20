@@ -18,7 +18,7 @@ fn floor_config(index: u8) -> FloorConfig {
 }
 
 /// A room of `seats` seats that each have a floor stream, all reporting to one APP queue.
-fn floor_room(seats: u8) -> (ForwardRoom, AppEventQueue) {
+pub(super) fn floor_room(seats: u8) -> (ForwardRoom, AppEventQueue) {
     let queue = AppEventQueue::new(64, std::sync::Arc::new(crate::metrics::Metrics::new()));
     let mut room = amr_wb_room();
     for index in 1..=seats {
@@ -223,7 +223,7 @@ fn app_in_a_seats_audio_rtcp_is_reported_and_its_reports_are_still_read() {
     assert_eq!(room.seats[0].last_sender_report_ntp_middle, 0x0001_8000);
 }
 
-fn floor_granted() -> AppRequest {
+pub(super) fn floor_granted() -> AppRequest {
     AppRequest {
         stream: RtcpAppStream::Floor,
         ssrc: None,
@@ -235,9 +235,9 @@ fn floor_granted() -> AppRequest {
     }
 }
 
-type Sent = Vec<(EndpointId, SocketAddr, Vec<u8>)>;
+pub(super) type Sent = Vec<(EndpointId, SocketAddr, Vec<u8>)>;
 
-fn sent_app(
+pub(super) fn sent_app(
     room: &mut ForwardRoom,
     target: &AppTarget,
     request: &AppRequest,

@@ -7,7 +7,7 @@ use crate::app_events::AppEventQueue;
 use siphon_rtp_proto::RtcpAppStream;
 use siphon_rtp_srtp::srtcp_gcm::SrtcpGcmContext;
 
-fn preserve_room(seats: u8) -> ForwardRoom {
+pub(super) fn preserve_room(seats: u8) -> ForwardRoom {
     let text = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
                 m=audio 4000 RTP/SAVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
     let offered = sdp::parse(text).unwrap().audio_codecs();
@@ -23,7 +23,7 @@ fn preserve_room(seats: u8) -> ForwardRoom {
 }
 
 /// An RTP datagram whose "payload" is opaque bytes followed by a 10-octet tag, as SRTP would send.
-fn srtp_like(sequence: u16, ssrc: u32) -> Vec<u8> {
+pub(super) fn srtp_like(sequence: u16, ssrc: u32) -> Vec<u8> {
     let mut payload: Vec<u8> = (0..40u8).map(|byte| byte.wrapping_mul(7) ^ 0xA5).collect();
     payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4, 5, 6]);
     rtp(

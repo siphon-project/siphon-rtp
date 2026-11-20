@@ -181,8 +181,40 @@ pub fn write_sender_report(
     out[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
     out[20..24].copy_from_slice(&packet_count.to_be_bytes());
     out[24..28].copy_from_slice(&octet_count.to_be_bytes());
-    for (index, report) in reports.iter().take(report_count).enumerate() {
-        let base = SENDER_REPORT_LEN + index * RECEPTION_REPORT_LEN;
+    write_report_blocks(out, SENDER_REPORT_LEN, &reports[..report_count]);
+    Some(total)
+}
+
+/// Length of a Receiver Report header (no reception-report blocks), RFC 3550 §6.4.2.
+pub const RECEIVER_REPORT_LEN: usize = 8;
+
+/// Write an RTCP **Receiver Report** from `ssrc` with `reports` reception blocks (`RC =
+/// reports.len()`, capped at 31) into `out`, returning its length, or `None` if `out` is too small.
+/// RFC 3550 §6.4: a site that has sent no data packets in the interval sends this in place of a
+/// Sender Report; it differs only in having no sender information (§6.4.2).
+#[must_use]
+pub fn write_receiver_report(
+    ssrc: u32,
+    reports: &[ReceptionReport],
+    out: &mut [u8],
+) -> Option<usize> {
+    let report_count = reports.len().min(31);
+    let total = RECEIVER_REPORT_LEN + report_count * RECEPTION_REPORT_LEN;
+    if out.len() < total {
+        return None;
+    }
+    out[0] = 0x80 | report_count as u8; // V=2, P=0, RC
+    out[1] = packet_type::RECEIVER_REPORT;
+    out[2..4].copy_from_slice(&((total / 4 - 1) as u16).to_be_bytes());
+    out[4..8].copy_from_slice(&ssrc.to_be_bytes());
+    write_report_blocks(out, RECEIVER_REPORT_LEN, &reports[..report_count]);
+    Some(total)
+}
+
+/// Write `reports` as reception-report blocks from `start` (RFC 3550 §6.4.1); `out` is long enough.
+fn write_report_blocks(out: &mut [u8], start: usize, reports: &[ReceptionReport]) {
+    for (index, report) in reports.iter().enumerate() {
+        let base = start + index * RECEPTION_REPORT_LEN;
         out[base..base + 4].copy_from_slice(&report.ssrc.to_be_bytes());
         // Fraction lost (1 byte) + cumulative lost (low 24 bits).
         out[base + 4] = report.fraction_lost;
@@ -193,7 +225,6 @@ pub fn write_sender_report(
         out[base + 16..base + 20].copy_from_slice(&report.last_sr.to_be_bytes());
         out[base + 20..base + 24].copy_from_slice(&report.delay_last_sr.to_be_bytes());
     }
-    Some(total)
 }
 
 /// Length of [`write_goodbye`]'s compound: an empty Receiver Report (8 bytes) and a one-source BYE
@@ -1261,6 +1292,38 @@ mod goodbye_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_a_receiver_report_with_one_block_byte_for_byte() {
+        // RFC 3550 §6.4.2: V=2 P=0 RC=1, PT=201, length 7, reporter SSRC, then the §6.4.1 block.
+        let block = ReceptionReport {
+            ssrc: 0x1111_2222,
+            fraction_lost: 0x10,
+            cumulative_lost: 5,
+            extended_highest_seq: 0x0000_2710,
+            jitter: 0x40,
+            last_sr: 0x0002_4000,
+            delay_last_sr: 0x8000,
+        };
+        let mut buffer = [0u8; 32];
+        assert_eq!(
+            write_receiver_report(0xAAAA_BBBB, &[block], &mut buffer),
+            Some(32)
+        );
+        assert_eq!(
+            buffer,
+            [
+                0x81, 201, 0x00, 0x07, 0xAA, 0xAA, 0xBB, 0xBB, 0x11, 0x11, 0x22, 0x22, 0x10, 0x00,
+                0x00, 0x05, 0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x00, 0x40, 0x00, 0x02, 0x40, 0x00,
+                0x00, 0x00, 0x80, 0x00
+            ]
+        );
+        // Without blocks it is the empty report, and a short buffer is refused.
+        let mut empty = [0u8; 8];
+        assert_eq!(write_receiver_report(1, &[], &mut empty), Some(8));
+        assert_eq!(empty, [0x80, 201, 0, 1, 0, 0, 0, 1]);
+        assert_eq!(write_receiver_report(1, &[block], &mut buffer[..31]), None);
+    }
 
     #[test]
     fn parses_receiver_report_with_block() {

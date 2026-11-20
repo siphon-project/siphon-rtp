@@ -115,6 +115,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.forward_set_source(client, &conference_id, from_tag)
                     .await
             }
+            Command::ForwardSetReception {
+                conference_id,
+                from_tag,
+                audio,
+                video,
+            } => {
+                self.forward_set_reception(&conference_id, &from_tag, audio, video)
+                    .await
+            }
             other => CmdResult::Error {
                 reason: format!(
                     "unsupported command: {}",
@@ -578,6 +587,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         {
             Ok(()) => ok_empty(),
             Err(refusal) => error_result("forward_set_source", &refusal),
+        }
+    }
+
+    /// Switch what the seat `from_tag` of a forwarding room is sent ([`Command::ForwardSetReception`]).
+    pub(super) async fn forward_set_reception(
+        &self,
+        room_id: &str,
+        from_tag: &str,
+        audio: bool,
+        video: bool,
+    ) -> CmdResult {
+        match self
+            .conference
+            .forward()
+            .set_reception(room_id, from_tag, audio, video)
+            .await
+        {
+            Ok(()) => ok_empty(),
+            Err(refusal) => error_result("forward_set_reception", &refusal),
         }
     }
 }

@@ -175,7 +175,8 @@ impl Command {
             | Command::ForwardOffer { .. }
             | Command::ForwardAnswer { .. }
             | Command::ForwardLeave { .. }
-            | Command::ForwardSetSource { .. } => None,
+            | Command::ForwardSetSource { .. }
+            | Command::ForwardSetReception { .. } => None,
         }
     }
 
@@ -200,6 +201,7 @@ impl Command {
                 | Command::ForwardAnswer { .. }
                 | Command::ForwardLeave { .. }
                 | Command::ForwardSetSource { .. }
+                | Command::ForwardSetReception { .. }
                 | Command::SendRtcpApp {
                     conference_id: Some(_),
                     ..
@@ -439,6 +441,7 @@ mod tests {
             r#"{"command":"forward_answer","conference_id":"g","from_tag":"f","sdp":"v=0"}"#,
             r#"{"command":"forward_leave","conference_id":"g","from_tag":"f"}"#,
             r#"{"command":"forward_set_source","conference_id":"g"}"#,
+            r#"{"command":"forward_set_reception","conference_id":"g","from_tag":"f","audio":true,"video":true}"#,
         ] {
             let mut command: Command = serde_json::from_str(json).expect(json);
             assert!(command.is_conference(), "{json}");

@@ -105,6 +105,8 @@ pub(super) struct VideoStream {
     pub(super) keyframe_media: SourceMedia,
     /// See [`VideoConfig::bundled`].
     pub(super) bundled: bool,
+    /// Whether the room sends this stream, for its report kind (RFC 3550 §6.4).
+    activity: super::reception::SenderActivity,
 }
 
 impl VideoStream {
@@ -133,6 +135,7 @@ impl VideoStream {
             keyframe: ReceiverKeyframe::new(),
             keyframe_media: SourceMedia::default(),
             bundled: config.bundled,
+            activity: super::reception::SenderActivity::default(),
         }
     }
 
@@ -481,6 +484,11 @@ impl ForwardRoom {
             if !video.receives || !reachable {
                 continue;
             }
+            if !receiver.reception.video {
+                // Before the keyframe gate: an off seat is sent no parameter sets either.
+                receiver.counters.reception_off_dropped_video += 1;
+                continue;
+            }
             if step == STEP_NONE {
                 match video.keyframe.admit(&plan.keyframe, plan.point.sequence) {
                     Admission::Dropped => {
@@ -600,6 +608,9 @@ impl ForwardRoom {
             if !reachable || !(video.sends || video.receives) {
                 continue;
             }
+            // RFC 3550 §6.4: an SR only when the room sent this video stream a data packet in this
+            // interval or the previous one, otherwise an RR (see `reception.rs`).
+            let sending = video.activity.sending(video.translator.packets_sent());
             let block = reception_block(
                 &mut video.stats,
                 video.last_sender_report_ntp_middle,
@@ -611,15 +622,24 @@ impl ForwardRoom {
                 .translator
                 .last_timestamp()
                 .wrapping_add(now_clock.wrapping_sub(video.last_forward_clock));
-            let Some(length) = rtcp::write_sender_report(
-                video.translator.egress_ssrc(),
-                ntp_timestamp,
-                rtp_timestamp,
-                video.translator.packets_sent(),
-                video.translator.octets_sent(),
-                block.as_slice(),
-                &mut buffer,
-            ) else {
+            let written = if sending {
+                rtcp::write_sender_report(
+                    video.translator.egress_ssrc(),
+                    ntp_timestamp,
+                    rtp_timestamp,
+                    video.translator.packets_sent(),
+                    video.translator.octets_sent(),
+                    block.as_slice(),
+                    &mut buffer,
+                )
+            } else {
+                rtcp::write_receiver_report(
+                    video.translator.egress_ssrc(),
+                    block.as_slice(),
+                    &mut buffer,
+                )
+            };
+            let Some(length) = written else {
                 continue;
             };
             // SRTCP under the seat's key for a bundled video (RFC 3711 §3.4), the datagram as it is
@@ -642,7 +662,9 @@ impl ForwardRoom {
                 dst: destination,
                 data: Bytes::copy_from_slice(wire),
             });
-            video.stats.record_sent_report(ntp_timestamp, now_micros);
+            if sending {
+                video.stats.record_sent_report(ntp_timestamp, now_micros);
+            }
         }
     }
 }

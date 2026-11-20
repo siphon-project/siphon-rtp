@@ -82,6 +82,14 @@ pub struct Outbound {
     reply: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
+#[cfg(test)]
+impl Outbound {
+    /// The queued message, for room tests.
+    pub(crate) fn message_for_test(&self) -> &Bytes {
+        &self.message
+    }
+}
+
 /// A send the driver has accepted into its mailbox; [`Self::wait`] returns once the message is on the
 /// wire (the SCTP association took it and the DTLS records reached the datapath) or has failed.
 pub struct PendingSend(tokio::sync::oneshot::Receiver<Result<(), String>>);
@@ -183,6 +191,13 @@ impl FloorChannelHandle {
                 flume::TrySendError::Disconnected(_) => FloorChannelError::Gone,
             })?;
         Ok(PendingSend(verdict))
+    }
+
+    /// Mark the channel open as the browser's `ChannelOpened` would, for room tests that have no
+    /// DTLS association.
+    #[cfg(test)]
+    pub(crate) fn open_for_test(&self) {
+        self.shared.open.store(true, Ordering::Release);
     }
 
     /// What the channel counted so far.

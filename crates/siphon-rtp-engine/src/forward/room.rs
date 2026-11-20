@@ -47,12 +47,14 @@ use crate::seat_gate::{self, SeatGate};
 mod app;
 mod keyframe;
 mod media_srtcp;
+mod reception;
 mod video;
 
 pub(crate) use app::push_failure;
 use app::FloorStream;
 pub use app::{AppRequest, AppSendError, AppTarget, FloorConfig, FloorKeysError};
 use keyframe::{KeyframePlan, Keyframes};
+use reception::{Reception, SenderActivity};
 pub use video::VideoConfig;
 use video::VideoStream;
 
@@ -174,6 +176,10 @@ pub struct ForwardSeatStats {
     pub nack_missed: u64,
     /// Source changes whose keyframe did not arrive in time (the room forwarded without one).
     pub keyframe_timeouts: u64,
+    /// Audio and video packets not sent to the seat because its reception of that stream is off
+    /// (`forward_set_reception`).
+    pub reception_off_dropped_audio: u64,
+    pub reception_off_dropped_video: u64,
 }
 
 struct Seat {
@@ -216,6 +222,10 @@ struct Seat {
     /// when it was seated): maps the SR's NTP time onto the egress timestamp line.
     last_forward_clock: u32,
     counters: ForwardSeatStats,
+    /// Which streams the seat is sent (`forward_set_reception`).
+    reception: Reception,
+    /// Whether the room sends the seat's audio, for its report kind (RFC 3550 §6.4).
+    audio_activity: SenderActivity,
 }
 
 impl Seat {
@@ -560,6 +570,8 @@ impl ForwardRoom {
             last_sender_report_arrival: None,
             last_forward_clock: anchor,
             counters: ForwardSeatStats::default(),
+            reception: Reception::default(),
+            audio_activity: SenderActivity::default(),
         });
         self.keyframe_seat_joined();
     }
@@ -588,6 +600,8 @@ impl ForwardRoom {
             nack_answered = seat.counters.nack_answered,
             nack_missed = seat.counters.nack_missed,
             keyframe_timeouts = seat.counters.keyframe_timeouts,
+            reception_off_dropped_audio = seat.counters.reception_off_dropped_audio,
+            reception_off_dropped_video = seat.counters.reception_off_dropped_video,
             "forwarding room seat left"
         );
         self.by_endpoint.clear();
@@ -994,6 +1008,11 @@ impl ForwardRoom {
             if !receiver.reachable() {
                 continue;
             }
+            // Only the RTP is gated; the talker's RTCP is the seat's control stream.
+            if plan.verbatim == Verbatim::Rtp && !receiver.reception.audio {
+                receiver.counters.reception_off_dropped_audio += 1;
+                continue;
+            }
             let (endpoint, destination) = (receiver.endpoint, receiver.egress_destination);
             if plan.verbatim == Verbatim::Rtp {
                 receiver.counters.forwarded_packets =
@@ -1111,6 +1130,13 @@ impl ForwardRoom {
             if !receiver.reachable() {
                 continue;
             }
+            if !receiver.reception.audio {
+                // Concealed frames ahead of the packet are not packets of their own.
+                if plan.fill.is_none_or(|fill| !fill.active()) {
+                    receiver.counters.reception_off_dropped_audio += 1;
+                }
+                continue;
+            }
             let original: &[u8] = if plan.in_clear_buffer {
                 &self.clear_in
             } else {
@@ -1205,6 +1231,11 @@ impl ForwardRoom {
             if !seat.reachable() {
                 continue;
             }
+            // RFC 3550 §6.4: an SR only when the room sent this stream a data packet in this
+            // interval or the previous one (a seat whose reception is off, or a room with no source,
+            // stops being a sender), otherwise an RR from the same SSRC, which still carries the
+            // reception block about the seat's own media.
+            let sending = seat.audio_activity.sending(seat.translator.packets_sent());
             let block = reception_block(
                 &mut seat.stats,
                 seat.last_sender_report_ntp_middle,
@@ -1218,15 +1249,20 @@ impl ForwardRoom {
                 .translator
                 .last_timestamp()
                 .wrapping_add(now_clock.wrapping_sub(seat.last_forward_clock));
-            let Some(length) = rtcp::write_sender_report(
-                seat.translator.egress_ssrc(),
-                ntp_timestamp,
-                rtp_timestamp,
-                seat.translator.packets_sent(),
-                seat.translator.octets_sent(),
-                reports,
-                &mut buffer,
-            ) else {
+            let written = if sending {
+                rtcp::write_sender_report(
+                    seat.translator.egress_ssrc(),
+                    ntp_timestamp,
+                    rtp_timestamp,
+                    seat.translator.packets_sent(),
+                    seat.translator.octets_sent(),
+                    reports,
+                    &mut buffer,
+                )
+            } else {
+                rtcp::write_receiver_report(seat.translator.egress_ssrc(), reports, &mut buffer)
+            };
+            let Some(length) = written else {
                 continue;
             };
             // SRTCP-encrypt the report for a secure seat (RFC 3711 §3.4); plain seats send it as is.
@@ -1249,7 +1285,9 @@ impl ForwardRoom {
                 data: Bytes::copy_from_slice(wire),
             });
             // Remember the SR so a later reception report about it yields a round trip.
-            seat.stats.record_sent_report(ntp_timestamp, now_micros);
+            if sending {
+                seat.stats.record_sent_report(ntp_timestamp, now_micros);
+            }
         }
         self.build_video_reports(ntp_timestamp, now_micros, out);
     }

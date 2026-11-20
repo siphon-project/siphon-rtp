@@ -14,25 +14,25 @@ use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
 
 const SLICE: [u8; 3] = [0x41, 0x9A, 0x00];
 
-fn key(seed: u8) -> SrtpKeyMaterial {
+pub(super) fn key(seed: u8) -> SrtpKeyMaterial {
     SrtpKeyMaterial::from_inline_bytes(&[seed; 30]).unwrap()
 }
 
 /// What the room sends seat `index` is protected under `key(10 + index)`; what the seat sends is
 /// protected under `key(20 + index)`.
-fn room_leg(index: u8) -> SecureLeg {
+pub(super) fn room_leg(index: u8) -> SecureLeg {
     SecureLeg::new(&key(10 + index), &key(20 + index))
 }
 
 /// The seat's phone: the mirror image of [`room_leg`].
-fn phone(index: u8) -> SecureLeg {
+pub(super) fn phone(index: u8) -> SecureLeg {
     SecureLeg::new(&key(20 + index), &key(10 + index))
 }
 
 /// Seat `index` as a WebRTC seat: audio on endpoint `index`, video bundled on the same endpoint (no
 /// endpoint of its own), keyed, with its video payload type `98 + index` and egress SSRC
 /// `0xF000_0000 | index`.
-fn webrtc_seat(index: u8, direction: MediaDirection) -> ForwardSeatConfig {
+pub(super) fn webrtc_seat(index: u8, direction: MediaDirection) -> ForwardSeatConfig {
     let mut config = video_seat(index, direction);
     config.secure = Some(room_leg(index));
     if let Some(video) = config.video.as_mut() {
@@ -47,7 +47,7 @@ fn webrtc_seat(index: u8, direction: MediaDirection) -> ForwardSeatConfig {
 }
 
 /// A room of the given seats, seat `n` plain when `plain.contains(n)` and WebRTC otherwise.
-fn mixed_room(plain: &[u8], webrtc: &[u8]) -> ForwardRoom {
+pub(super) fn mixed_room(plain: &[u8], webrtc: &[u8]) -> ForwardRoom {
     let mut room = amr_wb_room();
     let mut indexes: Vec<u8> = plain.iter().chain(webrtc).copied().collect();
     indexes.sort_unstable();
@@ -67,7 +67,7 @@ fn mixed_room(plain: &[u8], webrtc: &[u8]) -> ForwardRoom {
 }
 
 /// A datagram from WebRTC seat `index`, protected by its phone.
-fn rx_secure(phone: &mut SecureLeg, index: u8, arrival: u64, clear: &[u8]) -> RxPacket {
+pub(super) fn rx_secure(phone: &mut SecureLeg, index: u8, arrival: u64, clear: &[u8]) -> RxPacket {
     let mut wire = Vec::new();
     phone.protect(clear, &mut wire).unwrap();
     RxPacket {
@@ -83,7 +83,7 @@ fn media_ssrc(index: u8) -> u32 {
     0x1000_0000 | u32::from(index)
 }
 
-fn clear_of(phone: &mut SecureLeg, wire: &[u8]) -> (PacketKind, Vec<u8>) {
+pub(super) fn clear_of(phone: &mut SecureLeg, wire: &[u8]) -> (PacketKind, Vec<u8>) {
     let mut clear = Vec::new();
     let kind = phone.unprotect(wire, &mut clear).unwrap();
     (kind, clear)
@@ -379,13 +379,16 @@ fn the_reports_to_a_webrtc_seat_are_srtcp_one_per_stream_from_its_endpoint() {
         let (kind, clear) = clear_of(&mut receiving, &outbound.data);
         assert_eq!(kind, PacketKind::Rtcp);
         let packets = rtcp::parse_compound(&clear).unwrap();
-        let rtcp::RtcpPacket::SenderReport(report) = &packets[0] else {
-            panic!("{packets:?}");
-        };
-        senders.push(report.ssrc);
+        // The audio stream was never sent a packet, so RFC 3550 §6.4 makes its report an RR; the
+        // video stream was, so its report is an SR.
+        match &packets[0] {
+            rtcp::RtcpPacket::SenderReport(report) => senders.push((report.ssrc, 200)),
+            rtcp::RtcpPacket::ReceiverReport(report) => senders.push((report.ssrc, 201)),
+            other => panic!("{other:?}"),
+        }
     }
     senders.sort_unstable();
-    assert_eq!(senders, [0xE000_0002, 0xF000_0002]);
+    assert_eq!(senders, [(0xE000_0002, 201), (0xF000_0002, 200)]);
 }
 
 #[test]

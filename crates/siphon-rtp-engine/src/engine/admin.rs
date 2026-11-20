@@ -170,6 +170,9 @@ fn build_features() -> Vec<String> {
         // `forward_set_source`. A controller gates the verbs on this entry, so it is advertised only
         // where they are served.
         "forward_room".to_string(),
+        // `forward_set_reception`: switch what one seat of a forwarding room is sent, per stream
+        // (3GPP TS 24.581 §6.3.7). A controller gates manual reception mode on this entry.
+        "forward_seat_reception".to_string(),
         // `forward_offer` / `forward_answer`: the room dials a member out (a group call's fan-out),
         // on the same terms `conference_offer` / `conference_answer` dial out of a mixing room.
         "forward_dialout".to_string(),
