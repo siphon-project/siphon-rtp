@@ -1008,11 +1008,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         answer_sdp = answered_as_the_engine(&answer_sdp, info.direction);
 
         if let Some(ws_uri) = profile.ws_uri.clone() {
-            // A takeover leg's media goes to the WebSocket server, not through the pipeline an
-            // interception taps: a re-answer into one cannot carry the interception.
-            self.end_x3_unservable(call_id, "the re-answer is a WebSocket takeover (ws_uri)")
-                .await;
-            return self
+            // A takeover leg's media goes to the WebSocket server, so the interception of a
+            // re-answered dialog is tapped onto the bridge, as it is onto a pipeline.
+            let result = self
                 .answer_local_takeover(LocalTakeover {
                     call_id,
                     ws_uri,
@@ -1028,6 +1026,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     answer_sdp,
                 })
                 .await;
+            if matches!(result, CmdResult::Ok { .. }) {
+                self.carry_x3_across_answer(call_id).await;
+            }
+            return result;
         }
 
         // When the caller offered RFC 3389 comfort noise at the chosen codec's clock rate, negotiate it

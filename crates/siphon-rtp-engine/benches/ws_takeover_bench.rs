@@ -30,6 +30,18 @@
 //! silently measures the replay-reject branch and reports the crypto as free. `iter_batched` keeps
 //! that sealing out of the measurement.
 //!
+//! Lawful interception of a takeover leg (ETSI TS 103 221-2 X3) adds one watch borrow and one copy
+//! per delivery to each path, so it is benched against the untapped legs above:
+//!
+//! - `plaintext_x3` / `plaintext_x3_two` — the `plaintext` leg with one and two deliveries tapping its
+//!   ingress. The delta against `plaintext` is what an intercepted call's uplink pays.
+//! - `drain` / `drain_x3` / `drain_x3_two` — the bridge's drain step (`downlink_datagram`) on a plain
+//!   leg with no, one and two deliveries, and `drain_secure` / `drain_secure_x3` on an SRTP leg. The
+//!   delta is what an intercepted call's downlink pays.
+//!
+//! Each tapped point hands the delivered buffers back to the taps, as the delivery task does after
+//! framing, so the bench measures the steady state and not the allocator.
+//!
 //! `cargo bench -p siphon-rtp --bench ws_takeover_bench`.
 
 #![allow(
@@ -46,6 +58,9 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::ws_bridge::{WsCallPlan, WsEgress, WsRegistry, WsSecureLeg};
+use siphon_rtp_engine::ws_x3::{downlink_datagram, WsTapSet};
+use siphon_rtp_engine::x3::{x3_channel, X3Delivery, X3Taps};
+use siphon_rtp_li::PayloadDirection;
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
 
@@ -96,7 +111,20 @@ fn registry(
     secure: Option<Arc<WsSecureLeg>>,
     ice_managed: bool,
 ) -> (WsRegistry, flume::Receiver<Bytes>) {
+    let (registry, mailbox, _egress) =
+        registry_with_egress(datapath, endpoint, secure, ice_managed);
+    (registry, mailbox)
+}
+
+/// [`registry`], also handing back the leg's egress state, which holds its interception taps.
+fn registry_with_egress(
+    datapath: &UdpLoopbackDatapath,
+    endpoint: EndpointId,
+    secure: Option<Arc<WsSecureLeg>>,
+    ice_managed: bool,
+) -> (WsRegistry, flume::Receiver<Bytes>, Arc<WsEgress>) {
     let registry = WsRegistry::default();
+    let egress = Arc::new(WsEgress::new(addr(PEER), ice_managed));
     let (rtp_in, rtp_in_rx) = flume::bounded::<Bytes>(1024);
     registry.register(WsCallPlan {
         call_id: "bench".to_string(),
@@ -104,7 +132,7 @@ fn registry(
         accepted_source: SourceFilter::Exact(addr(PEER).ip()),
         ice_pending: false,
         secure,
-        egress: Arc::new(WsEgress::new(addr(PEER), ice_managed)),
+        egress: egress.clone(),
         activity: Arc::new(datapath.clone()),
         rtp_in,
         // The registry only ever aborts these; a takeover leg's real bridge and drain tasks are not
@@ -113,7 +141,41 @@ fn registry(
         drain_task: tokio::spawn(std::future::pending()),
         rtcp_tap: None,
     });
-    (registry, rtp_in_rx)
+    (registry, rtp_in_rx, egress)
+}
+
+/// The taps of `deliveries` interceptions (ingress `FromTarget`, egress `ToTarget`) and the ends the
+/// delivery task would hold.
+fn tap_set(deliveries: usize) -> (WsTapSet, Vec<X3Delivery>) {
+    let channels: Vec<_> = (0..deliveries).map(|_| x3_channel(4096)).collect();
+    let engine = addr("198.51.100.1:20000");
+    let set = WsTapSet {
+        ingress: X3Taps::new(
+            channels
+                .iter()
+                .map(|(factory, _)| factory.tap(engine, PayloadDirection::FromTarget))
+                .collect(),
+        ),
+        egress: X3Taps::new(
+            channels
+                .iter()
+                .map(|(factory, _)| factory.tap(engine, PayloadDirection::ToTarget))
+                .collect(),
+        ),
+    };
+    (
+        set,
+        channels.into_iter().map(|(_, delivery)| delivery).collect(),
+    )
+}
+
+/// Hand every delivered buffer back to the taps, as the delivery task does after framing.
+fn return_buffers(deliveries: &[X3Delivery]) {
+    for delivery in deliveries {
+        while let Ok(packet) = delivery.packets.try_recv() {
+            let _ = delivery.recycle.try_send(packet.payload);
+        }
+    }
 }
 
 fn ws_takeover_dispatch(criterion: &mut Criterion) {
@@ -125,11 +187,11 @@ fn ws_takeover_dispatch(criterion: &mut Criterion) {
     let _guard = runtime.enter();
     let mut group = criterion.benchmark_group("ws_takeover_dispatch");
 
-    // Four real endpoints on one backend, so each point's liveness stamp does its real work.
+    // Six real endpoints on one backend, so each point's liveness stamp does its real work.
     let datapath = UdpLoopbackDatapath::new();
     let endpoints: Vec<EndpointId> = runtime.block_on(async {
         let mut ids = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..6 {
             ids.push(datapath.alloc_endpoint().await.expect("endpoint").id);
         }
         ids
@@ -211,6 +273,60 @@ fn ws_takeover_dispatch(criterion: &mut Criterion) {
         )
     });
 
+    // The settled leg with one and two deliveries tapping its ingress.
+    for (name, deliveries, endpoint) in [
+        ("plaintext_x3", 1, endpoints[4]),
+        ("plaintext_x3_two", 2, endpoints[5]),
+    ] {
+        let (tapped, tapped_rx, egress) = registry_with_egress(&datapath, endpoint, None, false);
+        let (set, channels) = tap_set(deliveries);
+        egress.taps().set(set);
+        group.bench_function(name, |bencher| {
+            bencher.iter(|| {
+                tapped.dispatch(black_box(packet(endpoint, peer, &frame)));
+                let _ = tapped_rx.try_recv();
+                return_buffers(&channels);
+            })
+        });
+    }
+    group.finish();
+
+    // The bridge's drain step: encrypt on a secure leg, then deliver what was sent.
+    let mut group = criterion.benchmark_group("ws_takeover_drain");
+    let downlink = rtp_packet(1, 0xE0E0_0001);
+    let egress = WsEgress::new(addr(PEER), false);
+    let mut sealed = Vec::new();
+    for (name, deliveries) in [("drain", 0), ("drain_x3", 1), ("drain_x3_two", 2)] {
+        let (set, channels) = tap_set(deliveries);
+        egress.taps().set(set);
+        let taps = egress.taps().subscribe();
+        group.bench_function(name, |bencher| {
+            bencher.iter(|| {
+                let sent = downlink_datagram(black_box(&downlink), None, &mut sealed, &taps, peer);
+                black_box(sent);
+                return_buffers(&channels);
+            })
+        });
+    }
+    let secure_leg = WsSecureLeg::keyed(SecureLeg::new(&key(0x11), &key(0x22)));
+    for (name, deliveries) in [("drain_secure", 0), ("drain_secure_x3", 1)] {
+        let (set, channels) = tap_set(deliveries);
+        egress.taps().set(set);
+        let taps = egress.taps().subscribe();
+        group.bench_function(name, |bencher| {
+            bencher.iter(|| {
+                let sent = downlink_datagram(
+                    black_box(&downlink),
+                    Some(&secure_leg),
+                    &mut sealed,
+                    &taps,
+                    peer,
+                );
+                black_box(sent);
+                return_buffers(&channels);
+            })
+        });
+    }
     group.finish();
 }
 

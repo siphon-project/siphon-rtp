@@ -673,47 +673,9 @@ async fn a_re_answer_that_is_a_different_dialog_ends_the_interception_loudly() {
     assert_eq!(ends[0].0, X3EndReason::CallEnded);
 }
 
-/// A WebSocket server that accepts every connection and reads it to its end.
-async fn ws_server() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ws");
-    let address = listener.local_addr().expect("ws addr");
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                if let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await {
-                    use futures_util::StreamExt;
-                    while let Some(Ok(_)) = socket.next().await {}
-                }
-            });
-        }
-    });
-    address
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_ws_takeover_call_and_an_echo_call_still_refuse_the_attach() {
+async fn an_echo_call_still_refuses_the_attach() {
     let rig = Rig::new().await;
-    let server = ws_server().await;
-    let bot = Phone::new().await;
-    let (_, taken) = rig
-        .answer_local_as(
-            "bot",
-            FROM_TAG,
-            plain_sdp(bot.address, "sendrecv"),
-            ProfileFlags {
-                ws_uri: Some(format!("ws://{server}/agent")),
-                ..Default::default()
-            },
-        )
-        .await;
-    assert!(matches!(taken, CmdResult::Ok { .. }), "{taken:?}");
-    match rig.attach("bot").await {
-        CmdResult::Error { reason } => {
-            assert!(reason.contains("WebSocket-takeover"), "{reason}");
-        }
-        other => panic!("a ws_uri takeover has no media in the pipeline to tap: {other:?}"),
-    }
-
     let echoing = Phone::new().await;
     rig.answer_local("echo", &echoing).await;
     let enabled = rig
@@ -732,9 +694,8 @@ async fn a_ws_takeover_call_and_an_echo_call_still_refuse_the_attach() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn echo_and_a_ws_bridge_on_an_intercepted_single_leg_call_are_refused_not_deaf() {
+async fn echo_on_an_intercepted_single_leg_call_is_refused_not_deaf() {
     let rig = Rig::new().await;
-    let server = ws_server().await;
     let caller = Phone::new().await;
     let toward_engine = rig.answer_local("guarded", &caller).await;
     assert!(matches!(rig.attach("guarded").await, CmdResult::Ok { .. }));
@@ -752,15 +713,6 @@ async fn echo_and_a_ws_bridge_on_an_intercepted_single_leg_call_are_refused_not_
         CmdResult::Error { reason } => assert!(reason.contains("lawful-interception"), "{reason}"),
         other => panic!("echo bypasses the tap, so it is refused while intercepted: {other:?}"),
     }
-    let bridge = rig
-        .send(Command::AttachWsBridge {
-            call_id: "guarded".into(),
-            from_tag: FROM_TAG.into(),
-            ws_uri: format!("ws://{server}/agent"),
-            profile: None,
-        })
-        .await;
-    assert!(matches!(bridge, CmdResult::Error { .. }), "{bridge:?}");
 
     // Nothing changed for the delivery: the caller is still intercepted both ways.
     let (sent, heard) = caller_talks(&caller, toward_engine, 1, 12).await;

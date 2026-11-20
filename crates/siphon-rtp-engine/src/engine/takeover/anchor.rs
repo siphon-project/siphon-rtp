@@ -47,12 +47,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.offer_received_from,
                     call.caller_source_posture,
                     (call.near_secure, call.near_secure_key.is_some()),
-                    // A decoded recording moves with the leg (below), so it is not a reason to
-                    // refuse; anything else on the pipeline would be stopped silently.
+                    // A decoded recording moves with the leg (below), and so does a lawful
+                    // interception, so neither is a reason to refuse; anything else on the pipeline
+                    // would be stopped silently.
                     call.promotion_reasons.iter().any(|reason| {
                         !matches!(
                             reason,
-                            PromotionReason::MediaOp | PromotionReason::AudioRecording
+                            PromotionReason::MediaOp
+                                | PromotionReason::AudioRecording
+                                | PromotionReason::X3
                         )
                     }),
                 )
@@ -68,7 +71,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if others
             || self.multi_source_attachment(call_id).is_some()
             || self.ws_tees.contains_key(call_id)
-            || self.x3_sessions.contains_key(call_id)
             || self
                 .subscriptions
                 .get(call_id)
@@ -76,8 +78,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         {
             return Err(
                 "ws-takeover-anchor-busy: a pcap recording, WebSocket tee, SIPREC subscription, \
-                 DTMF block, echo or lawful-interception delivery runs on the engine's pipeline for \
-                 this call, and handing the leg to a bot would stop it; stop it first"
+                 DTMF block or echo runs on the engine's pipeline for this call, and handing the leg \
+                 to a bot would stop it; stop it first"
                     .to_string(),
             );
         }
@@ -114,7 +116,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // the file stays open — and go onto the bridge once it is up: one recording across the
         // hand-over, with only the frames in flight during the swap missing from it.
         let recordings = self.take_pipeline_recordings(call_id).await;
-        self.media.stop(call_id).await;
+        // A plain leg has no key to move, so the bridge is registered (and tapped) while the actor
+        // still owns the leg, and the actor stops only once the bridge is live: the dispatcher
+        // offers a packet to the actor before the bridge, so each packet takes one path and an
+        // intercepted caller's ingress has no gap. A secure leg's one SRTP context has exactly one
+        // owner at a time (RFC 3711 §9.1), so it must leave the actor first and cannot be inverted.
+        let overlap = !near_secure;
+        if !overlap {
+            self.media.stop(call_id).await;
+        }
         // Taken, not cloned, and only now: with the actor gone the call's handle is the last one, so
         // the leg can be unwrapped rather than shared between two owners. A DTLS leg's is the copy
         // the bridge retained for the pipeline.
@@ -155,9 +165,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             },
         };
+        let mut had_media_op = false;
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.near_secure_key = None;
-            call.promotion_reasons.remove(&PromotionReason::MediaOp);
+            had_media_op = call.promotion_reasons.remove(&PromotionReason::MediaOp);
         }
         let installed = self
             .setup_ws_bridge(WsBridgeSetup {
@@ -178,6 +189,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 socket: Some(socket),
             })
             .await;
+        if overlap {
+            if let Err(reason) = &installed {
+                // Nothing was stopped: the actor still carries the call, with its taps.
+                if had_media_op {
+                    if let Some(mut call) = self.calls.get_mut(call_id) {
+                        call.promotion_reasons.insert(PromotionReason::MediaOp);
+                    }
+                }
+                self.give_pipeline_recordings(call_id, recordings);
+                return Err(reason.clone());
+            }
+            // Awaited, so what the actor had queued is processed and delivered before it exits.
+            self.media.stop(call_id).await;
+        }
         // The DTLS flow now feeds the WebSocket leg, which holds the key already. Keyed was checked
         // before anything stopped, so this cannot meet a running handshake.
         let installed = installed.and_then(|()| {
@@ -215,6 +240,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.far_codec = None;
             call.pipeline = PipelineKind::Ws;
         }
+        // The interception follows the leg onto the bridge (already tapped at registration; this is
+        // the locked pass that settles a concurrent attach and ends the deliveries if it fails).
+        self.carry_x3_across_answer(call_id).await;
         tracing::info!(
             target: "siphon_rtp::media",
             call_id,
@@ -235,6 +263,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ) -> Result<(), String> {
         let outcome = self.reanchor(call_id, key, reason).await;
         self.give_pipeline_recordings(call_id, recordings);
+        // The pipeline is a new actor: an interception on the call is tapped onto it again.
+        self.carry_x3_across_answer(call_id).await;
         outcome
     }
 
@@ -338,6 +368,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Off the bridge before it stops, onto the anchor once it is up — the same move as an
         // attach, the other way.
         let recordings = self.take_bridge_recordings(call_id).await;
+        // A plain leg has no key to move: the pipeline is built (already tapped, if the call is
+        // intercepted) while the bridge still holds the leg, and the bridge stops once the pipeline
+        // is live. The dispatcher offers a packet to the pipeline before the bridge, so each packet
+        // takes one path and the caller's ingress has no gap. A secure leg's one SRTP context has
+        // exactly one owner at a time (RFC 3711 §9.1), so it leaves the bridge first.
+        if secure.is_none() && !dtls {
+            return self
+                .hand_plain_bridge_to_anchor(call_id, endpoint, has_ice, recordings)
+                .await;
+        }
         self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
             .await;
         // After the stop: the bridge and its drain have been joined, so nothing crypts with it any
@@ -369,6 +409,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 %reason,
                 "a detached takeover leg could not be anchored; it has no media path"
             );
+            self.end_x3_unservable(call_id, &reason).await;
             return Err(format!("ws-bridge-detach-anchor: {reason}"));
         }
         if let Some(mut call) = self.calls.get_mut(call_id) {
@@ -380,12 +421,67 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.give_pipeline_recordings(call_id, recordings);
         if let Some(key) = key {
             let leg = Arc::new(std::sync::Mutex::new(key));
-            self.key_anchor(call_id, endpoint, leg)
-                .map_err(|reason| format!("ws-bridge-detach-anchor: {reason}"))?;
+            if let Err(reason) = self.key_anchor(call_id, endpoint, leg) {
+                self.end_x3_unservable(call_id, &reason).await;
+                return Err(format!("ws-bridge-detach-anchor: {reason}"));
+            }
         }
         if has_ice {
             self.follow_ice_selection(endpoint);
         }
+        // The caller is on the engine's pipeline again: the interception goes back onto it.
+        self.carry_x3_across_answer(call_id).await;
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id,
+            "ws bridge detached; the caller is on the engine's own pipeline"
+        );
+        Ok(())
+    }
+
+    /// [`Self::return_takeover_to_anchor`] for a plain leg, in the order that misses nothing: pipeline
+    /// first, then the bridge. If the pipeline cannot be built the bridge keeps the call, as it was.
+    async fn hand_plain_bridge_to_anchor(
+        &self,
+        call_id: &str,
+        endpoint: siphon_rtp_datapath::EndpointId,
+        has_ice: bool,
+        recordings: siphon_rtp_media::bridge::taps::TakenRecordingTaps,
+    ) -> Result<(), String> {
+        let posture = self
+            .owned_call_internal(call_id, |call| call.caller_source_posture)
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.pipeline = PipelineKind::Passthrough;
+            if has_ice {
+                call.caller_source_posture = super::super::negotiate::SourcePosture::Ice;
+            }
+        }
+        if let Err(reason) = self
+            .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
+            .await
+        {
+            if let Some(mut call) = self.calls.get_mut(call_id) {
+                call.pipeline = PipelineKind::Ws;
+                call.caller_source_posture = posture;
+            }
+            self.give_bridge_recordings(call_id, recordings).await;
+            return Err(format!("ws-bridge-detach-anchor: {reason}"));
+        }
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            // A single-leg pipeline encodes back into the codec the caller sends, as `answer_local`
+            // records it.
+            call.far_codec = call.near_codec.clone();
+            call.pipeline = PipelineKind::Media;
+        }
+        self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
+            .await;
+        self.give_pipeline_recordings(call_id, recordings);
+        if has_ice {
+            self.follow_ice_selection(endpoint);
+        }
+        // The locked pass that settles a concurrent attach and ends the deliveries if it fails.
+        self.carry_x3_across_answer(call_id).await;
         tracing::info!(
             target: "siphon_rtp::media",
             call_id,

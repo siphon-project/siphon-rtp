@@ -19,6 +19,19 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   re-answer, a joined seat), so a carry never moves some and drops others, and the userspace hold goes
   when the last one does. `node_info` lists `x3_multi_delivery` on a node provisioned for X3.
 
+- **A WebSocket-takeover call can be intercepted.** `attach_x3` was refused on a call whose audio goes
+  to a `ws_uri` server. The server stands in for the callee, so `target_leg` applies as on an
+  engine-answered call: with the caller as the target what it sent is `from_target` and what the engine
+  sent it (the bot's audio and the comfort noise, in the clear, as sent) is `to_target`. Ingress is
+  delivered after the source gate, the SRTP or DTLS-SRTP authentication and the latch accepted the
+  packet, egress after the packet was encrypted successfully and before it is sent. The taps ride the
+  leg's state, so a re-point keeps them. Taking an intercepted call over is no longer refused
+  (`attach_ws_bridge` on a relay or an engine-answered call, a `ws_uri` on `answer_local`, `answer` or a
+  re-answer of the same dialog), a refusal the target could have noticed: the interception follows the
+  leg onto the bridge and back on `detach_ws_bridge`, on one connection, Correlation ID and sequence.
+  The server ending the bridge leaves the interception attached until the call is deleted. `node_info`
+  lists `x3_ws_takeover` on a node provisioned for X3.
+
 ### Fixed
 
 - **An rtpengine NG `offer` on a live call renegotiates it instead of replacing it.** A proxy sends
@@ -28,6 +41,14 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   ports and the interception stay, and the NG `answer` completes it (reversed tags for B's). A refused
   re-offer (a codec change) and an unknown `from-tag` still replace the call. The JSON `offer` is
   unchanged.
+
+- **An interception attached at the offer stayed attached and deaf when the answer named `ws_uri`.**
+  That answer returned before the step that puts the taps onto the media path, so the session delivered
+  nothing and never reported `x3_ended`. The answer now carries the taps onto the bridge.
+
+- **A packet arriving while a media actor was being detached was lost.** The actor was told to stop
+  before its routes were removed, so a packet queued in between went down with it. The routes are now
+  removed first.
 
 ## [0.25.2] — 2026-11-20
 

@@ -240,6 +240,9 @@ pub struct WsEgress {
     /// `LatchPolicy::Off` on an ICE relay leg. Fixed for the life of the leg, so it is carried across
     /// a re-point rather than re-derived from `ice_pending`, which a landed selection has cleared.
     ice_managed: bool,
+    /// The lawful-interception taps of this leg (ETSI TS 103 221-2 X3): leg A state like the rest of
+    /// this struct, so a re-point that carries the egress carries the interception with it.
+    taps: crate::ws_x3::WsTaps,
 }
 
 impl WsEgress {
@@ -252,7 +255,15 @@ impl WsEgress {
             destination: tokio::sync::watch::Sender::new((!ice_managed).then_some(destination)),
             latch: Mutex::new(SymmetricLatch::default()),
             ice_managed,
+            taps: crate::ws_x3::WsTaps::default(),
         }
+    }
+
+    /// The leg's lawful-interception taps: delivered from [`WsRegistry::dispatch`] (what the leg
+    /// accepts) and from the bridge's drain task (what it sends).
+    #[must_use]
+    pub fn taps(&self) -> &crate::ws_x3::WsTaps {
+        &self.taps
     }
 
     /// A receiver for the bridge's drain task, which reads the destination once per downlink packet.
@@ -474,6 +485,20 @@ impl WsRegistry {
         self.routes.contains_key(&endpoint)
     }
 
+    /// The egress state of `call_id`'s takeover leg, which holds the leg's lawful-interception taps
+    /// ([`WsEgress::taps`]), or `None` when the call has no bridge.
+    #[must_use]
+    pub fn egress_of(&self, call_id: &str) -> Option<Arc<WsEgress>> {
+        let endpoint = self.calls.get(call_id)?.endpoint_a;
+        Some(self.routes.get(&endpoint)?.egress.clone())
+    }
+
+    /// Leg A's endpoint of `call_id`'s takeover bridge, or `None` when the call has none.
+    #[must_use]
+    pub fn endpoint_of(&self, call_id: &str) -> Option<EndpointId> {
+        self.calls.get(call_id).map(|handle| handle.endpoint_a)
+    }
+
     /// Whether `call_id` is a WS-bridged call.
     #[must_use]
     pub fn is_ws_call(&self, call_id: &str) -> bool {
@@ -615,6 +640,10 @@ impl WsRegistry {
         // packet must not be able to hold a dead call open, and a bridge whose mailbox is momentarily
         // full is still a live call.
         route.activity.stamp(packet.endpoint);
+        // Lawful interception (TS 103 221-2 X3): the packet is accepted, so deliver it as the
+        // caller's ingress, plaintext on a secure leg (it was unprotected above). RTCP is skipped
+        // inside the tap. One watch borrow, no allocation.
+        route.egress.taps().deliver_ingress(packet.source, &payload);
         // Telemetry: a plaintext leg's RTCP, accepted like its media. (A secure leg's SRTCP never gets
         // here; it is exported above, after its own authentication.)
         if let Some((tap, local)) = &route.rtcp_tap {

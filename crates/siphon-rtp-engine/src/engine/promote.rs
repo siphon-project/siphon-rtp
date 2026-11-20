@@ -80,7 +80,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             b_to_a,
             layout.latch,
         );
-        let call = call.with_app_events(self.call_app_queue(call_id));
+        let mut call = call.with_app_events(self.call_app_queue(call_id));
+        // An intercepted relay is tapped before it can take its first packet.
+        self.pretap_relay(call_id, &mut call);
         self.media.register(call, self.datapath.clone(), None);
 
         // Record the promotion on the Call so demotion can restore the in-kernel Forward rules.
@@ -335,6 +337,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // reflected audio, so the actor starts in echo mode instead.
         if echo {
             call.set_echo(true);
+        }
+        // An intercepted caller (a bot handing the leg back to the engine) is tapped before the
+        // actor can take its first packet.
+        if offer_only_restore.is_some() {
+            self.pretap_single_leg(call_id, &mut call);
         }
         self.media
             .register(call, self.datapath.clone(), owner_events);
