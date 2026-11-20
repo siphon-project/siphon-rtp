@@ -195,6 +195,10 @@ harness = false
 name = "conference_dtmf_bench"
 harness = false
 
+[[bench]]
+name = "conference_x3_bench"
+harness = false
+
 [lints]
 workspace = true
 

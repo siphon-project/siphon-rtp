@@ -7,7 +7,8 @@ use std::sync::Arc;
 use crate::media_pipeline::MediaControl;
 use crate::x3::{
     build_tls_client_config, ingress_directions, run_x3_delivery, split_delivery_address,
-    x3_channel, X3Config, X3Counters, X3DeliveryEnd, X3DeliveryTask, X3Error, X3TapFactory,
+    x3_channel, X3Config, X3Counters, X3Delivery, X3DeliveryEnd, X3DeliveryTask, X3Error,
+    X3TapFactory,
 };
 
 use super::{
@@ -20,26 +21,46 @@ use super::{
 pub(super) struct X3Session {
     /// The call's offerer tag and owning control client, copied here at attach time: teardown runs
     /// *after* `delete` has removed the call from the registry, so the end event cannot look them up.
-    from_tag: String,
-    owner: ClientId,
+    pub(super) from_tag: String,
+    pub(super) owner: ClientId,
     /// Endpoints carrying a crypto-bridge tap, so detach clears exactly those. Empty for a call
-    /// tapped in the media pipeline instead.
-    bridged_endpoints: Vec<EndpointId>,
+    /// tapped in the media pipeline or in a conference room instead.
+    pub(super) bridged_endpoints: Vec<EndpointId>,
     /// Builds the taps over this interception's one delivery channel. Held by the session, not by
     /// one pipeline: the interception belongs to the call, so the channel (and with it the delivery
-    /// connection, the Correlation ID and the PDU sequence counter) outlives every pipeline or
-    /// bridge the call is rebuilt with, and the taps are simply installed again on the new one.
-    factory: X3TapFactory,
+    /// connection, the Correlation ID and the PDU sequence counter) outlives every pipeline, bridge
+    /// or room the call is rebuilt with, and the taps are simply installed again on the new one.
+    pub(super) factory: X3TapFactory,
     /// Whether the warrant names the caller leg, which fixes each tap's target-relative direction.
-    target_is_caller: bool,
+    /// A conference room ignores it: there the target is always the seated party.
+    pub(super) target_is_caller: bool,
     /// Delivered/dropped counts, read at teardown for [`Event::X3Ended`]. Shared with the taps.
-    counters: Arc<X3Counters>,
+    pub(super) counters: Arc<X3Counters>,
     /// The delivery task (connect → drain → reconnect). Aborted on detach; it ends on its own when
     /// the taps are dropped and the buffer has drained.
-    transport: tokio::task::JoinHandle<()>,
+    pub(super) transport: tokio::task::JoinHandle<()>,
     /// Set once an end event has been emitted, so the controller sees exactly one `x3_ended`
     /// whichever of detach and transport failure won the race.
-    ended: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) ended: Arc<std::sync::atomic::AtomicBool>,
+    /// The engine endpoint of a conference seat that joined its room (no call behind it), so the
+    /// session ends with that seat and never carries over to a later seat under the same tag. `None`
+    /// for a call's interception.
+    pub(super) joined_endpoint: Option<EndpointId>,
+}
+
+/// What [`Engine::spawn_x3_transport`] needs to run one interception's delivery task.
+pub(super) struct X3TransportSpec<'a> {
+    pub(super) delivery_channel: X3Delivery,
+    pub(super) tls: Arc<rustls::ClientConfig>,
+    pub(super) config: &'a X3Config,
+    pub(super) delivery: &'a str,
+    pub(super) xid: Xid,
+    pub(super) correlation_id: u64,
+    pub(super) owner: ClientId,
+    /// What the interception's events name: the call, or the room of a joined seat.
+    pub(super) call_id: &'a str,
+    pub(super) from_tag: &'a str,
+    pub(super) counters: Arc<X3Counters>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -48,16 +69,38 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Additive — the call keeps relaying, recording and teeing. The engine delivers what it
     /// **accepted**: after SRTP decryption and after the authentication and replay checks, so a
     /// secure leg yields plaintext RTP and a forged packet yields nothing.
+    ///
+    /// A seat that joined a conference room has no call. It is addressed by naming the room as
+    /// `call_id` and the seat's tag as `from_tag` ([`Self::attach_x3_seat`]).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn attach_x3(
         &self,
         client: ClientId,
         call_id: &str,
+        from_tag: &str,
         delivery: &str,
         xid: Xid,
         correlation_id: u64,
         target_leg: X3TargetLeg,
     ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
+            if self
+                .conference
+                .joined_seat_endpoint(call_id, from_tag)
+                .is_some()
+            {
+                return self
+                    .attach_x3_seat(
+                        client,
+                        call_id,
+                        from_tag,
+                        delivery,
+                        xid,
+                        correlation_id,
+                        target_leg,
+                    )
+                    .await;
+            }
             return unknown_call(call_id);
         }
         match self
@@ -69,20 +112,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
-    /// Stand an interception up on `call_id`. Split out from [`Self::attach_x3`], which has already
-    /// validated ownership.
-    ///
-    /// Everything that can be refused is refused **before** anything is installed, so a rejected
-    /// interception leaves the call exactly as it was — and, more importantly, a controller that
-    /// gets an error knows no content is flowing rather than having to guess.
-    async fn start_x3(
+    /// What an `attach_x3` must satisfy whatever it names, before anything is installed. The node
+    /// must be provisioned, and the request must carry what a Mediation Function can attach the
+    /// content to.
+    pub(super) fn validate_x3_request(
         &self,
-        call_id: &str,
         delivery: &str,
         xid: Xid,
         correlation_id: u64,
-        target_leg: X3TargetLeg,
-    ) -> Result<(), String> {
+    ) -> Result<Arc<X3Config>, String> {
         // The node must be provisioned. Refusing here is the whole point: an interception accepted
         // on a node with no delivery PKI reads as done and delivers nothing.
         let Some(config) = self.x3_config.clone() else {
@@ -103,8 +141,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         // Validate the delivery address before promoting or dialling anything.
         split_delivery_address(delivery).map_err(|error| error.to_string())?;
+        Ok(config)
+    }
 
-        let Some((pipeline, echo, has_far_leg, answered)) =
+    /// Stand an interception up on `call_id`. Split out from [`Self::attach_x3`], which has already
+    /// validated ownership.
+    ///
+    /// Everything that can be refused is refused **before** anything is installed, so a rejected
+    /// interception leaves the call exactly as it was — and, more importantly, a controller that
+    /// gets an error knows no content is flowing rather than having to guess.
+    async fn start_x3(
+        &self,
+        call_id: &str,
+        delivery: &str,
+        xid: Xid,
+        correlation_id: u64,
+        target_leg: X3TargetLeg,
+    ) -> Result<(), String> {
+        let config = self.validate_x3_request(delivery, xid, correlation_id)?;
+
+        let Some((pipeline, echo, has_far_leg, answered, seated)) =
             self.owned_call_internal(call_id, |call| {
                 (
                     call.pipeline,
@@ -113,6 +169,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.far
                         .as_ref()
                         .is_some_and(|far| far.remote_rtp.is_some()),
+                    call.seat.as_ref().is_some_and(|seat| seat.seated),
                 )
             })
         else {
@@ -136,10 +193,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .to_string(),
             );
         }
+        // A call whose leg is seated in a conference room is intercepted in the room, where the
+        // seated party is the target. Once the leg has left the room the call relays nothing, so
+        // there is no media to intercept until it is seated again.
+        let in_room = pipeline == PipelineKind::Seated;
+        if in_room && !seated {
+            return Err(
+                "the call's leg left its conference room and relays nothing; seat it again \
+                 (conference_seat) to intercept it"
+                    .to_string(),
+            );
+        }
         // A call with no far leg at all (a local answer) has no second party whose content a warrant
         // covers. A far leg that is offered but not answered yet does: a warrant can match at the
         // INVITE, and content (early media included) flows from the first answer on.
-        if !has_far_leg {
+        if !has_far_leg && !in_room {
             return Err("the call has no second leg to intercept".to_string());
         }
 
@@ -161,7 +229,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // every answer, the first one included, puts the taps onto whatever it installed
         // ([`Self::carry_x3_across_answer`]), so a 183's early media and the final answer share one
         // delivery.
-        let bridged_endpoints = if answered {
+        let bridged_endpoints = if answered || in_room {
             self.install_x3_taps(call_id, &factory, target_is_caller)
                 .await?
         } else {
@@ -174,62 +242,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return Err("call no longer exists".to_string());
         };
         let counters = factory.counters().clone();
-        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let transport = {
-            let events = self.event_sink(owner);
-            let task = X3DeliveryTask {
-                delivery: delivery_channel,
-                address: delivery.to_string(),
-                xid,
-                correlation_id,
-                network_function_id: config.network_function_id.clone(),
-                interception_point_id: config.interception_point_id.clone(),
-                keepalive: config.keepalive,
-                connect_timeout: crate::x3::DEFAULT_CONNECT_TIMEOUT,
-                tls,
-            };
-            let call_id = call_id.to_string();
-            let loss_call_id = call_id.clone();
-            let loss_from_tag = from_tag.clone();
-            let loss_events = events.clone();
-            let started = std::time::Instant::now();
-            let ended = ended.clone();
-            let from_tag = from_tag.clone();
-            let counters = counters.clone();
-            tokio::spawn(async move {
-                let outcome = run_x3_delivery(task, move |dropped, delivered| {
-                    // Warranted content did not reach the agency. The controller raises the
-                    // destination-level report toward the Administration Function from this.
-                    emit_event(
-                        loss_events.as_ref(),
-                        Event::X3Loss {
-                            call_id: loss_call_id.clone(),
-                            from_tag: loss_from_tag.clone(),
-                            dropped,
-                            delivered,
-                            dropped_since_ms: started.elapsed().as_millis() as u64,
-                        },
-                    );
-                })
-                .await;
-                let reason = match outcome {
-                    // The session holds the tap factory for the life of the call, so the source
-                    // only closes once the session itself has been removed: a detach or a
-                    // replacement, never a pipeline being rebuilt. `CallEnded` is reserved for the
-                    // call really being torn down (`teardown_call` / `finish_call`).
-                    X3DeliveryEnd::SourceClosed => X3EndReason::Detached,
-                    X3DeliveryEnd::MediationClosed => X3EndReason::MediationClosed,
-                };
-                emit_x3_ended(
-                    events.as_ref(),
-                    &ended,
-                    &call_id,
-                    &from_tag,
-                    reason,
-                    &counters,
-                );
-            })
-        };
+        let (transport, ended) = self.spawn_x3_transport(X3TransportSpec {
+            delivery_channel,
+            tls,
+            config: &config,
+            delivery,
+            xid,
+            correlation_id,
+            owner,
+            call_id,
+            from_tag: &from_tag,
+            counters: counters.clone(),
+        });
 
         self.x3_sessions.insert(
             call_id.to_string(),
@@ -242,6 +266,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 counters,
                 transport,
                 ended,
+                joined_endpoint: None,
             },
         );
         self.emit_call_event(
@@ -265,6 +290,87 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             "lawful-interception content delivery attached"
         );
         Ok(())
+    }
+
+    /// Spawn the delivery task of an interception: it connects to the Mediation Function, drains the
+    /// taps' buffer into the connection, reconnects when it drops and reports loss. Returns the
+    /// task and the flag that makes `x3_ended` fire exactly once.
+    ///
+    /// Shared by a call's interception and a joined seat's, so the two cannot diverge in what the
+    /// controller is told.
+    pub(super) fn spawn_x3_transport(
+        &self,
+        spec: X3TransportSpec<'_>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let X3TransportSpec {
+            delivery_channel,
+            tls,
+            config,
+            delivery,
+            xid,
+            correlation_id,
+            owner,
+            call_id,
+            from_tag,
+            counters,
+        } = spec;
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = self.event_sink(owner);
+        let task = X3DeliveryTask {
+            delivery: delivery_channel,
+            address: delivery.to_string(),
+            xid,
+            correlation_id,
+            network_function_id: config.network_function_id.clone(),
+            interception_point_id: config.interception_point_id.clone(),
+            keepalive: config.keepalive,
+            connect_timeout: crate::x3::DEFAULT_CONNECT_TIMEOUT,
+            tls,
+        };
+        let call_id = call_id.to_string();
+        let from_tag = from_tag.to_string();
+        let started = std::time::Instant::now();
+        let flag = ended.clone();
+        let handle = tokio::spawn(async move {
+            let loss_events = events.clone();
+            let loss_call_id = call_id.clone();
+            let loss_from_tag = from_tag.clone();
+            let outcome = run_x3_delivery(task, move |dropped, delivered| {
+                // Warranted content did not reach the agency. The controller raises the
+                // destination-level report toward the Administration Function from this.
+                emit_event(
+                    loss_events.as_ref(),
+                    Event::X3Loss {
+                        call_id: loss_call_id.clone(),
+                        from_tag: loss_from_tag.clone(),
+                        dropped,
+                        delivered,
+                        dropped_since_ms: started.elapsed().as_millis() as u64,
+                    },
+                );
+            })
+            .await;
+            let reason = match outcome {
+                // The session holds the tap factory for the life of the interception, so the
+                // source only closes once the session itself has been removed: a detach or a
+                // replacement, never a pipeline being rebuilt. `CallEnded` is reserved for the
+                // call really being torn down (`teardown_call` / `finish_call`).
+                X3DeliveryEnd::SourceClosed => X3EndReason::Detached,
+                X3DeliveryEnd::MediationClosed => X3EndReason::MediationClosed,
+            };
+            emit_x3_ended(
+                events.as_ref(),
+                &flag,
+                &call_id,
+                &from_tag,
+                reason,
+                &counters,
+            );
+        });
+        (handle, ended)
     }
 
     /// Install `factory`'s taps wherever the call's accepted plaintext lives **now**, returning the
@@ -300,13 +406,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let tap_b = factory.tap(b_local, direction_b);
 
         match pipeline {
-            // The dispatch already refuses this verb on a seated call; said again here so the
-            // interception can never be reported attached to a leg whose media the room owns.
-            PipelineKind::Seated => Err(
-                "the call's leg is seated in a conference room; intercept the room's \
-                 participants instead"
-                    .to_string(),
-            ),
+            // A leg seated in a conference room is tapped by the room that owns its media: the seated
+            // party is the target there, so the warrant's `target_leg` has no say in a room.
+            PipelineKind::Seated => {
+                let Some((conference_id, tag)) = self.seated_room(call_id) else {
+                    return Err(
+                        "the call's leg left its conference room and relays nothing; seat it \
+                         again (conference_seat) to intercept it"
+                            .to_string(),
+                    );
+                };
+                self.install_room_x3(&conference_id, &tag, factory).await?;
+                Ok(Vec::new())
+            }
             // A crypto bridge relays without decoding, so its media never reaches the pipeline. This
             // is the ordinary same-codec WebRTC / SDES shape, so it is a tap site rather than a
             // rejection — a warrant has to be servable on any call.
@@ -420,9 +532,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// `detach_x3`: stop lawful-interception content delivery. Idempotent — detaching a call that is
     /// not intercepted is not an error.
-    pub(super) async fn detach_x3(&self, client: ClientId, call_id: &str) -> CmdResult {
+    pub(super) async fn detach_x3(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+    ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
-            return unknown_call(call_id);
+            return self.detach_x3_seat(client, call_id, from_tag).await;
         }
         self.stop_x3(call_id, X3EndReason::Detached).await;
         ok_empty()
@@ -441,7 +558,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.bridge.clear_x3_tap(*endpoint);
         }
         self.media.control(call_id, MediaControl::StopX3);
+        // …and the room's, when the call's leg is seated in one.
+        if let Some((conference_id, tag)) = self.seated_room(call_id) {
+            self.clear_room_x3(&conference_id, &tag).await;
+        }
+        self.finish_x3_session(call_id, session, reason).await;
+        self.release_userspace_hold(call_id, PromotionReason::X3)
+            .await;
+    }
 
+    /// Finish an interception whose taps are already off: let the delivery task go and tell the
+    /// controller, once, with the delivery counts.
+    pub(super) async fn finish_x3_session(
+        &self,
+        call_id: &str,
+        session: X3Session,
+        reason: X3EndReason,
+    ) {
         // Abort **and wait**, for the same reason the WS tee does: `abort()` only schedules
         // cancellation, so returning here would leave the task holding its TLS socket and its buffer.
         session.transport.abort();
@@ -455,12 +588,55 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             reason,
             &session.counters,
         );
-        self.release_userspace_hold(call_id, PromotionReason::X3)
+    }
+
+    /// Put an interception's taps on a seat of a conference room, and say why when the room cannot
+    /// take them. The room builds them from the session's own factory, so the delivery connection,
+    /// Correlation ID and sequence counter carry straight on.
+    pub(super) async fn install_room_x3(
+        &self,
+        conference_id: &str,
+        tag: &str,
+        factory: &X3TapFactory,
+    ) -> Result<(), String> {
+        let installed = self
+            .conference
+            .ask(conference_id, |reply| {
+                crate::conference::SeatControl::SetX3 {
+                    tag: tag.to_string(),
+                    factory: factory.clone(),
+                    reply,
+                }
+            })
+            .await;
+        match installed {
+            Some(true) => Ok(()),
+            Some(false) => Err(format!(
+                "conference {conference_id} has no seat {tag} that can be tapped"
+            )),
+            None => Err(format!("conference {conference_id} did not answer")),
+        }
+    }
+
+    /// Take an interception's taps off a seat of a conference room. Best effort by nature: a seat
+    /// that already left took its taps with it.
+    pub(super) async fn clear_room_x3(&self, conference_id: &str, tag: &str) {
+        let _ = self
+            .conference
+            .ask(conference_id, |reply| {
+                crate::conference::SeatControl::ClearX3 {
+                    tag: tag.to_string(),
+                    reply,
+                }
+            })
             .await;
     }
 
     /// Build (once) the ring-backed mutual-TLS client configuration for X3 delivery.
-    fn x3_tls_config_for(&self, config: &X3Config) -> Result<Arc<rustls::ClientConfig>, String> {
+    pub(super) fn x3_tls_config_for(
+        &self,
+        config: &X3Config,
+    ) -> Result<Arc<rustls::ClientConfig>, String> {
         if let Some(built) = self.x3_tls_config.get() {
             return Ok(built.clone());
         }
@@ -476,7 +652,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 ///
 /// A non-zero `dropped` is logged at `warn!`: warranted content did not reach the agency, which is a
 /// reportable failure rather than a degraded recording.
-fn emit_x3_ended(
+pub(super) fn emit_x3_ended(
     events: Option<&flume::Sender<Event>>,
     ended: &std::sync::atomic::AtomicBool,
     call_id: &str,

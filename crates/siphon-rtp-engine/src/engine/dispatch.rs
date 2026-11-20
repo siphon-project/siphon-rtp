@@ -230,8 +230,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// The refusal for a verb a seated (or seated-then-left) call cannot take, or `None` when the
     /// command is not addressed to such a call or is one it answers: `delete`, `query`, a further
     /// `conference_seat`, `stop_recording`, and — while seated — `silence_media` / `block_media` and
-    /// their reverses, `play_media` / `stop_media` / `set_play_gain` and `start_recording`, which
-    /// act on the seat.
+    /// their reverses, `play_media` / `stop_media` / `set_play_gain`, `start_recording` and
+    /// `attach_x3` / `detach_x3`, which act on the seat.
     fn seated_call_refusal(&self, client: ClientId, command: &Command) -> Option<CmdResult> {
         let call_id = command_call_id(command)?;
         if command.is_conference() {
@@ -253,7 +253,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             | Command::PlayMedia { .. }
             | Command::StopMedia { .. }
             | Command::SetPlayGain { .. }
-            | Command::StartRecording { .. } => seated,
+            | Command::StartRecording { .. }
+            // The room is where a seated leg's media is, so that is where it is intercepted.
+            | Command::AttachX3 { .. }
+            | Command::DetachX3 { .. } => seated,
             // A recording kept running across a leave can still be stopped.
             Command::StopRecording { .. } => true,
             _ => false,
@@ -622,16 +625,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             Command::AttachX3 {
                 call_id,
+                from_tag,
                 delivery,
                 xid,
                 correlation_id,
                 target_leg,
-                ..
             } => {
-                self.attach_x3(client, &call_id, &delivery, xid, correlation_id, target_leg)
-                    .await
+                self.attach_x3(
+                    client,
+                    &call_id,
+                    &from_tag,
+                    &delivery,
+                    xid,
+                    correlation_id,
+                    target_leg,
+                )
+                .await
             }
-            Command::DetachX3 { call_id, .. } => self.detach_x3(client, &call_id).await,
+            Command::DetachX3 { call_id, from_tag } => {
+                self.detach_x3(client, &call_id, &from_tag).await
+            }
             other => CmdResult::Error {
                 reason: format!("unsupported command: {}", command_name(&other)),
             },

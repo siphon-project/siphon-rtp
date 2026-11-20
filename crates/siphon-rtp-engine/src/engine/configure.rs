@@ -103,6 +103,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             x3_config: None,
             x3_tls_config: std::sync::OnceLock::new(),
             x3_sessions: DashMap::new(),
+            x3_seat_sessions: DashMap::new(),
             // HEP export off unless the daemon calls `set_hep_export` from `SIPHON_RTP_HEP_COLLECTOR`.
             hep_export: std::sync::OnceLock::new(),
         }

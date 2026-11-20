@@ -221,7 +221,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return error_result("conference_seat", &refusal);
         }
 
+        // A lawful interception follows the leg into the room (ETSI TS 103 221-2): the same merge
+        // works with no warrant, so refusing it with one would tell the target. The taps go onto the
+        // seat while it is still pending — it ingests and sends nothing until it opens — so the
+        // first packet the room handles is the first one delivered, and a room that cannot take
+        // them refuses the move here, with the call still relaying and still intercepted as it was.
+        if let Err(reason) = self.seat_x3_in_room(call_id, conference_id, from_tag).await {
+            self.conference
+                .release_call_seat(conference_id, from_tag)
+                .await;
+            return error_result(
+                "conference_seat",
+                &format!(
+                    "the call's lawful interception could not follow the leg into the room \
+                     ({reason}); the call is unchanged"
+                ),
+            );
+        }
+
         // From here on nothing refuses: the room has the seat. Take the leg off its current owner.
+        // The call-level taps stop with it: the room's own are on the seat already.
+        self.stop_x3_call_taps(call_id);
         let taken = self
             .take_over_leg(call_id, conference_id, from_tag, &plan)
             .await;
@@ -240,6 +260,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.conference
                     .release_call_seat(conference_id, from_tag)
                     .await;
+                self.end_x3_of_stopped_call(call_id).await;
                 return error_result(
                     "conference_seat",
                     &format!("{reason}; the call's media path is stopped, delete the call"),
@@ -275,6 +296,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.conference
                 .release_call_seat(conference_id, from_tag)
                 .await;
+            self.end_x3_of_stopped_call(call_id).await;
             return error_result(
                 "conference_seat",
                 &"the room closed before the seat opened; the call's media path is stopped, \
@@ -336,6 +358,54 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             "call leg seated in conference"
         );
         ok_empty()
+    }
+
+    /// Put the call's interception, when it has one, on the pending seat in `conference_id`.
+    pub(super) async fn seat_x3_in_room(
+        &self,
+        call_id: &str,
+        conference_id: &str,
+        tag: &str,
+    ) -> Result<(), String> {
+        let Some(factory) = self
+            .x3_sessions
+            .get(call_id)
+            .map(|session| session.factory.clone())
+        else {
+            return Ok(());
+        };
+        self.install_room_x3(conference_id, tag, &factory).await
+    }
+
+    /// Take the call's own taps off the media path it is leaving (a crypto bridge's, or the media
+    /// actor's), keeping the interception itself: its delivery connection, Correlation ID and
+    /// sequence counter belong to the call and carry on from the room.
+    fn stop_x3_call_taps(&self, call_id: &str) {
+        let Some(mut session) = self.x3_sessions.get_mut(call_id) else {
+            return;
+        };
+        for endpoint in std::mem::take(&mut session.bridged_endpoints) {
+            self.bridge.clear_x3_tap(endpoint);
+        }
+        self.media
+            .control(call_id, crate::media_pipeline::MediaControl::StopX3);
+    }
+
+    /// A seat that failed after the call's media path was stopped leaves nothing to intercept. End
+    /// the interception loudly (`x3_ended` with `transport_error`, the nearest reason there is)
+    /// rather than leave it attached and silent. A no-op on a call that is not intercepted.
+    pub(super) async fn end_x3_of_stopped_call(&self, call_id: &str) {
+        if !self.x3_sessions.contains_key(call_id) {
+            return;
+        }
+        tracing::error!(
+            target: "siphon_rtp::li",
+            call_id,
+            "conference_seat failed after the call's media path was stopped; ending the \
+             lawful interception rather than leaving it silently deaf"
+        );
+        self.stop_x3(call_id, siphon_rtp_proto::X3EndReason::TransportError)
+            .await;
     }
 
     /// Read everything the seat needs off the call, refusing a call whose leg cannot be seated in
@@ -517,15 +587,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             PromotionReason::DtmfBlock => Some("a DTMF block (block_dtmf)"),
             PromotionReason::Echo => Some("echo mode (echo)"),
             PromotionReason::WsTee => Some("a WebSocket tee (attach_ws_tee)"),
-            PromotionReason::X3 => Some("a lawful interception (attach_x3)"),
+            // An interception follows the leg into the room ([`Engine::conference_seat`]).
+            PromotionReason::X3 => None,
             PromotionReason::TextEvents | PromotionReason::Secure => {
                 Some("a text stream (text_events)")
             }
         };
         if let Some(multi) = self.multi_source_attachment(call_id) {
             Some(multi)
-        } else if self.x3_sessions.contains_key(call_id) {
-            Some("a lawful interception (attach_x3)")
         } else if self.ws_tees.contains_key(call_id) {
             Some("a WebSocket tee (attach_ws_tee)")
         } else if self.ws_bridges.contains_key(call_id) {
@@ -891,6 +960,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"no such conference participant",
             ));
         }
+        // A lawful interception of the call stays with the call: the room's taps leave with the
+        // seat, and a seat in any room (this one again, or another) puts the session's taps back,
+        // on the same connection and Correlation ID. Ending it here would break a move from one
+        // room to another, and nothing is relayed to intercept in between.
         let released = self.conference.release_call_seat(conference_id, tag).await;
         let Some(mut call) = self.calls.get_mut(&call_id) else {
             return Some(ok_empty());

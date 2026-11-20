@@ -18,7 +18,7 @@ use siphon_rtp_li::inbound::InboundHeader;
 use siphon_rtp_li::HEADER_LEN;
 use siphon_rtp_proto::Xid;
 use tokio::io::AsyncReadExt;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 
 pub const SHORT: Duration = Duration::from_secs(5);
 
@@ -187,12 +187,97 @@ pub fn attribute(block: &[u8], wanted: u16) -> Option<Vec<u8>> {
 
 /// A G.711 RTP packet with a recognisable sequence number and SSRC.
 pub fn rtp(sequence: u16) -> Vec<u8> {
+    rtp_from(0xdead_beef, sequence)
+}
+
+/// [`rtp`] from the source `ssrc`, so a test with several parties can tell them apart.
+pub fn rtp_from(ssrc: u32, sequence: u16) -> Vec<u8> {
     let mut packet = vec![0x80, 0x00];
     packet.extend_from_slice(&sequence.to_be_bytes());
     packet.extend_from_slice(&(u32::from(sequence) * 160).to_be_bytes());
-    packet.extend_from_slice(&0xdead_beefu32.to_be_bytes());
+    packet.extend_from_slice(&ssrc.to_be_bytes());
     packet.extend_from_slice(&[0xd5; 160]);
     packet
+}
+
+/// The SSRC of an RTP packet.
+pub fn ssrc_of(packet: &[u8]) -> u32 {
+    u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]])
+}
+
+/// The RTP sequence number of a packet.
+pub fn rtp_sequence(packet: &[u8]) -> u16 {
+    u16::from_be_bytes([packet[2], packet[3]])
+}
+
+/// A plain `RTP/AVP` PCMU session description for one phone, with a direction attribute.
+pub fn plain_sdp(address: SocketAddr, direction: &str) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\na={direction}\r\n",
+        ip = address.ip(),
+        port = address.port(),
+    )
+}
+
+/// The PDU's X3 sequence number (a per-connection counter).
+pub fn pdu_sequence(pdu: &DecodedPdu) -> u32 {
+    let value = attribute(
+        &pdu.attributes,
+        siphon_rtp_li::attributes::attribute_type::SEQUENCE_NUMBER,
+    )
+    .expect("sequence");
+    u32::from_be_bytes([value[0], value[1], value[2], value[3]])
+}
+
+/// A delivery connection read one PDU at a time, keeping the bytes of the PDUs that arrived
+/// together so none is lost between reads (unlike [`read_pdus`], which is for a known count).
+pub struct PduStream<S> {
+    stream: S,
+    buffer: Vec<u8>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> PduStream<S> {
+    pub fn new(stream: S) -> Self {
+        Self {
+            stream,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// The next PDU, or `None` when nothing arrives within `wait`.
+    pub async fn next_within(&mut self, wait: Duration) -> Option<DecodedPdu> {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Ok(header) = InboundHeader::parse(&self.buffer) {
+                let total = header.total_len().expect("plausible total length");
+                if self.buffer.len() >= total {
+                    let attributes_end = header.header_length as usize;
+                    let decoded = DecodedPdu {
+                        attributes: self.buffer[HEADER_LEN..attributes_end].to_vec(),
+                        payload: self.buffer[attributes_end..total].to_vec(),
+                        header,
+                    };
+                    self.buffer.drain(..total);
+                    return Some(decoded);
+                }
+            }
+            let read = timeout_at(deadline, self.stream.read(&mut chunk))
+                .await
+                .ok()?;
+            let read = read.expect("read");
+            assert!(read > 0, "the delivery connection closed early");
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    /// The next PDU, within the shared timeout.
+    pub async fn next(&mut self) -> DecodedPdu {
+        self.next_within(SHORT)
+            .await
+            .expect("a PDU arrives on the delivery connection")
+    }
 }
 
 /// Build the delivery task for `address` from `pki`.

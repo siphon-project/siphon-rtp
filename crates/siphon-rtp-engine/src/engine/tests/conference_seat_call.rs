@@ -1704,3 +1704,116 @@ async fn a_record_call_stream_follows_its_own_party_across_a_seat() {
         "one file per party, no second one: {files:?}"
     );
 }
+
+/// A lawful interception (ETSI TS 103 221-2 X3) registered on `call_id` without a delivery
+/// connection: the engine side of a session, for the paths a controller cannot provoke.
+fn inject_x3_session(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+    from_tag: &str,
+) -> crate::x3::X3Delivery {
+    let (factory, delivery) = crate::x3::x3_channel(8);
+    let counters = factory.counters().clone();
+    engine.x3_sessions.insert(
+        call_id.to_string(),
+        crate::engine::intercept::X3Session {
+            from_tag: from_tag.to_string(),
+            owner: CLIENT,
+            bridged_endpoints: Vec::new(),
+            factory,
+            target_is_caller: true,
+            counters,
+            transport: tokio::spawn(std::future::pending::<()>()),
+            ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            joined_endpoint: None,
+        },
+    );
+    delivery
+}
+
+fn x3_end_reasons(events: &flume::Receiver<Event>) -> Vec<(String, siphon_rtp_proto::X3EndReason)> {
+    events
+        .try_iter()
+        .filter_map(|event| match event {
+            Event::X3Ended {
+                from_tag, reason, ..
+            } => Some((from_tag, reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The taps cannot be put back on a seated call whose room is gone: the interception ends loudly
+/// (`x3_ended` with `transport_error`) instead of staying attached and delivering nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interception_that_cannot_be_put_back_on_a_seated_call_ends_loudly() {
+    let engine = engine_with_dispatcher();
+    let events = engine.register_client(CLIENT);
+    let _call = plain_call(&engine, "x3-gone", |addr| sdp_for(addr, true)).await;
+    let (_third, _engine_third) = join_third_party(&engine, "room-gone", "third").await;
+    assert!(matches!(
+        seat(&engine, "x3-gone", "x3-gone-near", "room-gone").await,
+        CmdResult::Ok { .. }
+    ));
+    let _delivery = inject_x3_session(&engine, "x3-gone", "x3-gone-near");
+
+    engine.conference().deregister("room-gone");
+    engine.carry_x3_across_answer("x3-gone").await;
+
+    assert!(
+        !engine.x3_sessions.contains_key("x3-gone"),
+        "no session is left attached to a room that cannot be tapped"
+    );
+    assert_eq!(
+        x3_end_reasons(&events),
+        vec![(
+            "x3-gone-near".to_string(),
+            siphon_rtp_proto::X3EndReason::TransportError
+        )]
+    );
+}
+
+/// A seat that failed after the call's media path was stopped ends the call's interception loudly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_that_fails_after_the_media_stopped_ends_the_interception_loudly() {
+    let engine = engine_with_dispatcher();
+    let events = engine.register_client(CLIENT);
+    let _call = plain_call(&engine, "x3-stopped", |addr| sdp_for(addr, true)).await;
+    let _delivery = inject_x3_session(&engine, "x3-stopped", "x3-stopped-near");
+
+    engine.end_x3_of_stopped_call("x3-stopped").await;
+
+    assert_eq!(
+        x3_end_reasons(&events),
+        vec![(
+            "x3-stopped-near".to_string(),
+            siphon_rtp_proto::X3EndReason::TransportError
+        )]
+    );
+    // And a call with no interception is left alone.
+    engine.end_x3_of_stopped_call("x3-stopped").await;
+    assert!(x3_end_reasons(&events).is_empty());
+}
+
+/// A room that cannot take the interception's taps refuses the move, and the call is untouched:
+/// still relaying, still intercepted, its peer not released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_room_that_cannot_take_the_taps_leaves_the_call_unchanged() {
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let _call = plain_call(&engine, "x3-refused", |addr| sdp_for(addr, true)).await;
+    let _delivery = inject_x3_session(&engine, "x3-refused", "x3-refused-near");
+
+    // No such room: the room's answer is the last gate, and nothing has moved when it says no.
+    let refusal = engine
+        .seat_x3_in_room("x3-refused", "room-none", "x3-refused-near")
+        .await;
+    assert!(refusal.is_err(), "{refusal:?}");
+    assert!(engine.x3_sessions.contains_key("x3-refused"));
+
+    // A call with no interception has nothing to install.
+    assert!(engine
+        .seat_x3_in_room("x3-unwatched", "room-none", "tag")
+        .await
+        .is_ok());
+}

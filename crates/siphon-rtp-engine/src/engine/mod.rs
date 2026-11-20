@@ -37,6 +37,7 @@ mod gather;
 mod inject;
 mod install;
 mod intercept;
+mod intercept_seat;
 mod key_mgmt;
 mod leg;
 mod media_started;
@@ -1320,6 +1321,9 @@ pub struct Engine<D: Datapath> {
     /// and the delivered/dropped counters outlive individual control ops and must be torn down on
     /// `delete`.
     x3_sessions: DashMap<String, X3Session>,
+    /// Live interceptions of conference seats that joined their room (no call behind them), keyed by
+    /// `(conference_id, tag)`: [`intercept_seat`].
+    x3_seat_sessions: DashMap<(String, String), X3Session>,
     /// The HEP telemetry export (VoIPmonitor / Homer), when the daemon enabled it via
     /// `SIPHON_RTP_HEP_COLLECTOR`. Set once at startup (after the engine is `Arc`-wrapped, so interior
     /// mutability), then shared read-only by the [`Self::run_rtcp_export`] task (per-interval RTCP/QoS)
