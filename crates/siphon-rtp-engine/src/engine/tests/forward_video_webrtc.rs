@@ -240,6 +240,29 @@ async fn a_libwebrtc_offer_is_answered_in_the_bundle_with_the_rooms_payload_and_
 
 /// An engine whose port pool holds only the seat's own endpoint: a seat that is seated shows the
 /// video took none of its own.
+#[tokio::test]
+async fn a_browsers_audio_feedback_is_not_answered_and_the_video_keeps_what_the_room_serves() {
+    // RFC 4585 §4.2: the room sends Sender and Receiver Reports on audio and nothing else, so the
+    // audio section of the answer lists no feedback.
+    let engine = engine_with_dispatcher();
+    let (_socket, address) = browser_address().await;
+    let certificate = DtlsCertificate::generate().expect("certificate");
+    let offer = libwebrtc_offer(address, &certificate, "0 1 2", "sendrecv").replacen(
+        "a=rtpmap:0 PCMU/8000\r\n",
+        "a=rtpmap:0 PCMU/8000\r\na=rtcp-fb:0 transport-cc\r\na=rtcp-fb:0 nack\r\n",
+        1,
+    );
+    let result = join_webrtc(&engine, "a", offer, video_profile(Some(ROOM_FMTP))).await;
+    let answer = ok_sdp_text(&result);
+    let audio = section(&answer, "m=audio");
+    assert!(
+        !audio.iter().any(|line| line.starts_with("a=rtcp-fb:")),
+        "{answer}"
+    );
+    let video = section(&answer, "m=video");
+    assert!(video.contains(&"a=rtcp-fb:100 nack pli"), "{answer}");
+}
+
 fn engine_of(endpoints: usize) -> Engine<UdpLoopbackDatapath> {
     let engine = Engine::new(UdpLoopbackDatapath::with_max_endpoints(endpoints));
     tokio::spawn(crate::srtp_bridge::run_redirect_dispatcher(

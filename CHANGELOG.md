@@ -5,6 +5,16 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **An answer the engine writes no longer promises audio feedback it does not send.** A seat's,
+  `answer_local`'s and a conference seat's answer echoed the offer's audio and text `a=rtcp-fb` lines,
+  so a browser seat was answered `transport-cc` (and `nack`) on audio although the room sends Sender and
+  Receiver Reports only. They are no longer answered there (RFC 4585 §4.2); a video section keeps the
+  feedback the room serves.
+
 ## [0.24.0] — 2026-11-20
 
 ### Added

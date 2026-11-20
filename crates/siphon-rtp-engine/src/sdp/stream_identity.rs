@@ -55,7 +55,7 @@ fn describes_the_offerer(line: &str) -> bool {
 }
 
 /// Strip the offerer's stream identity and header extensions from an answer the engine wrote from
-/// that offer, and, with `own`, name the SSRC the engine sends in the audio section. Every section
+/// that offer, drop the RTCP feedback it offered on the audio and text the engine terminates, and, with `own`, name the SSRC the engine sends in the audio section. Every section
 /// is stripped (they all describe the offerer); only the first audio section gains `own`, after
 /// its RFC 4566 §5 prelude (`i=`, `c=`, `b=`, `k=`), where an attribute belongs.
 #[must_use]
@@ -85,8 +85,18 @@ pub fn own_stream_identity(sdp: &str, own: Option<&OwnSsrc>) -> String {
     });
     let ending = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
     let mut out = String::with_capacity(sdp.len());
+    let mut terminated_section = false;
     for (index, line) in lines.iter().enumerate() {
-        if !describes_the_offerer(&bare(line)) {
+        let text = bare(line);
+        if let Some(media) = text.strip_prefix("m=") {
+            terminated_section = media.starts_with("audio") || media.starts_with("text");
+        }
+        // RFC 4585 §4.2: an answer lists only the feedback the answerer implements. The engine
+        // terminates the audio and text it answers here and sends Sender and Receiver Reports only,
+        // so the offer's `a=rtcp-fb` there (transport-cc, nack, goog-remb) is not answered. A video
+        // section is written by the engine with the feedback the room serves, and keeps it.
+        let unserved_feedback = terminated_section && text.starts_with("a=rtcp-fb:");
+        if !describes_the_offerer(&text) && !unserved_feedback {
             out.push_str(line);
             if !line.ends_with('\n') && Some(index) == anchor {
                 out.push_str(ending);
@@ -137,6 +147,38 @@ mod tests {
             ssrc: 0x3fae_627b,
             cname: "engine-cname".into(),
         }
+    }
+
+    #[test]
+    fn audio_and_text_feedback_the_engine_does_not_serve_is_not_answered() {
+        // RFC 4585 §4.2: an answer lists only the feedback the answerer implements. The engine
+        // terminates the audio and text of these answers and sends Sender and Receiver Reports
+        // only, so a browser's transport-cc, nack or goog-remb on them would be a promise it never
+        // keeps. A video section keeps its own: the engine writes it with what the room serves.
+        let offer = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.0.2.10\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "a=rtpmap:111 opus/48000/2\r\n",
+            "a=rtcp-fb:111 transport-cc\r\n",
+            "a=rtcp-fb:111 nack\r\n",
+            "m=text 9 RTP/AVPF 98\r\n",
+            "a=rtpmap:98 t140/1000\r\n",
+            "a=rtcp-fb:* nack\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 H264/90000\r\n",
+            "a=rtcp-fb:96 nack pli\r\n",
+            "a=rtcp-fb:96 ccm fir\r\n",
+        );
+        let answer = own_stream_identity(offer, None);
+        let (audio_and_text, video) = answer.split_once("m=video").expect("video");
+        assert!(!audio_and_text.contains("rtcp-fb"), "{answer}");
+        assert!(video.contains("a=rtcp-fb:96 nack pli\r\n"), "{answer}");
+        assert!(video.contains("a=rtcp-fb:96 ccm fir\r\n"), "{answer}");
+        assert!(answer.contains("a=rtpmap:111 opus/48000/2\r\n"));
     }
 
     #[test]
