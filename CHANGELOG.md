@@ -15,7 +15,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   now opens at once and the taps go onto the media path the first answer installs; a `183` with SDP and
   the final answer share one connection, Correlation ID and sequence, and `target_leg: callee` is
   resolved at that answer. A call deleted unanswered ends the interception with `call_ended`. A call
-  with no second leg at all is still refused.
+  with no second leg at all is still refused. `node_info` lists `x3_attach_at_offer` on a node
+  provisioned for X3.
 
 ## [0.25.0] — 2026-11-20
 

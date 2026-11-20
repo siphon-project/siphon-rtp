@@ -152,6 +152,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if self.turn_client.is_some() {
             features.push("turn_client".to_string());
         }
+        // `x3_attach_at_offer`: `attach_x3` is accepted on an offered call before the callee
+        // answers, and the first answer's media (early media included) is delivered. Advertised
+        // only where X3 is provisioned, since `attach_x3` is refused everywhere else. A controller
+        // gates attaching at the INVITE, rather than at the ACK, on this entry.
+        if self.x3_config.is_some() {
+            features.push("x3_attach_at_offer".to_string());
+        }
         features
     }
 }

@@ -573,3 +573,19 @@ async fn an_interception_on_a_call_deleted_unanswered_ends_with_the_call() {
         vec![(X3EndReason::CallEnded, 0)]
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_info_advertises_attach_at_offer_only_on_a_node_provisioned_for_x3() {
+    let features = |result: CmdResult| match result {
+        CmdResult::NodeInfo { node } => node.features,
+        other => panic!("node_info answers a node: {other:?}"),
+    };
+    let rig = Rig::new("x3-feature").await;
+    assert!(features(rig.send(Command::NodeInfo).await)
+        .iter()
+        .any(|name| name == "x3_attach_at_offer"));
+    let bare = Engine::new(Datapath::new());
+    assert!(!features(bare.handle(CLIENT, Command::NodeInfo).await)
+        .iter()
+        .any(|name| name == "x3_attach_at_offer"));
+}
