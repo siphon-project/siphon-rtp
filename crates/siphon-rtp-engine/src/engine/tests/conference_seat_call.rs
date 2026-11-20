@@ -1719,6 +1719,7 @@ fn inject_x3_session(
         vec![crate::engine::intercept::X3Session {
             xid: Default::default(),
             delivery: "mdf.example.net:8090".to_string(),
+            correlation_id: 1,
             from_tag: from_tag.to_string(),
             owner: CLIENT,
             bridged_endpoints: Vec::new(),

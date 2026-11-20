@@ -647,19 +647,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag,
                 xid,
                 delivery,
+                correlation_id,
             } => {
-                // A delivery address alone can be shared by two warrants, so it does not say which
+                // A delivery address can be shared by two warrants, and a Correlation ID is
+                // provisioned per warrant over X1 (TS 103 221-1), so neither alone says which
                 // interception to end. Refused rather than guessed: ending the wrong warrant's
                 // delivery loses content an agency is owed.
-                if xid.is_none() && delivery.is_some() {
+                if xid.is_none() && (delivery.is_some() || correlation_id.is_some()) {
                     return error_result(
                         "detach_x3",
-                        &"delivery names one delivery of a warrant; give its xid too",
+                        &"delivery and correlation_id name a session of a warrant; give its xid too",
                     );
                 }
                 let selector = super::intercept::X3Selector {
                     xid,
                     delivery: delivery.as_deref(),
+                    correlation_id,
                 };
                 self.detach_x3(client, &call_id, &from_tag, selector).await
             }

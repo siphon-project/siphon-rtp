@@ -1,13 +1,15 @@
 //! Several lawful-interception deliveries on one call (ETSI TS 103 221-2, X3).
 //!
 //! A call can be intercepted under more than one warrant, or by one warrant to more than one
-//! Mediation Function. Each `attach_x3` with a new (`xid`, `delivery`) pair adds a delivery with its
-//! own connection, Correlation ID, PDU sequence counter and target leg; the same pair replaces only
-//! itself. `detach_x3` takes an optional `xid` and `delivery` and ends exactly what they name, each
-//! ending delivery reporting one `x3_ended` that names it.
+//! Mediation Function, or under one warrant twice when two calls covered by it are bridged onto one
+//! engine call (each keeps its own LI session and Correlation ID). Each `attach_x3` with a new
+//! (`xid`, `delivery`, `correlation_id`) triple adds a delivery with its own connection, PDU sequence
+//! counter and target leg; the same triple replaces only itself. `detach_x3` takes an optional `xid`,
+//! `delivery` and `correlation_id` and ends exactly what they name, each ending delivery reporting one
+//! `x3_ended` that names it.
 //!
 //! These tests drive the real engine over the UDP-loopback datapath against stub Mediation
-//! Functions behind mutual TLS (one listener per delivery, one PKI).
+//! Functions behind mutual TLS (one listener per delivery address, one PKI).
 
 #![allow(
     clippy::unwrap_used,
@@ -18,6 +20,7 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::x3_mdf::{
@@ -66,7 +69,8 @@ fn savp_sdp(address: SocketAddr, crypto: &CryptoAttribute, direction: &str) -> S
 
 /// One stub Mediation Function: its listener and, once the engine has dialled, the connection.
 struct Mdf {
-    listener: TcpListener,
+    /// Shared by the sessions of one delivery address ([`Mdf::second_session`]).
+    listener: Arc<TcpListener>,
     correlation_id: u64,
     stream: Option<PduStream<Tls>>,
     next_sequence: u32,
@@ -77,7 +81,19 @@ struct Mdf {
 impl Mdf {
     async fn new(correlation_id: u64) -> Self {
         Self {
-            listener: TcpListener::bind("127.0.0.1:0").await.expect("bind mdf"),
+            listener: Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind mdf")),
+            correlation_id,
+            stream: None,
+            next_sequence: 0,
+            seen: Vec::new(),
+        }
+    }
+
+    /// A second LI session at the same delivery address, under its own Correlation ID: the engine
+    /// opens a connection of its own for it on the same listener.
+    fn second_session(&self, correlation_id: u64) -> Self {
+        Self {
+            listener: Arc::clone(&self.listener),
             correlation_id,
             stream: None,
             next_sequence: 0,
@@ -269,12 +285,18 @@ impl Rig {
         .await
     }
 
-    async fn detach(&self, task: Option<Xid>, delivery: Option<String>) -> CmdResult {
+    async fn detach(
+        &self,
+        task: Option<Xid>,
+        delivery: Option<String>,
+        correlation_id: Option<u64>,
+    ) -> CmdResult {
         self.send(Command::DetachX3 {
             call_id: CALL.into(),
             from_tag: FROM_TAG.into(),
             xid: task,
             delivery,
+            correlation_id,
         })
         .await
     }
@@ -296,19 +318,21 @@ impl Rig {
         self.events.try_iter().collect()
     }
 
-    /// Every `x3_ended`, as (xid, delivery, reason).
-    fn ends(&self) -> Vec<(Xid, String, X3EndReason)> {
+    /// Every `x3_ended`, as (xid, delivery, correlation id, reason).
+    fn ends(&self) -> Vec<(Xid, String, u64, X3EndReason)> {
         self.drained_events()
             .into_iter()
             .filter_map(|event| match event {
                 Event::X3Ended {
                     xid,
                     delivery,
+                    correlation_id,
                     reason,
                     ..
                 } => Some((
                     xid.expect("the engine always names the warrant"),
                     delivery.expect("the engine always names the delivery"),
+                    correlation_id.expect("the engine always names the session"),
                     reason,
                 )),
                 _ => None,
@@ -391,11 +415,16 @@ async fn detaching_by_xid_ends_only_that_warrant_and_the_other_continues() {
     first.read_until(xid_one(), |read| read.len() >= 6).await;
     second.read_until(xid_two(), |read| read.len() >= 6).await;
 
-    let detached = rig.detach(Some(xid_one()), None).await;
+    let detached = rig.detach(Some(xid_one()), None, None).await;
     assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
     assert_eq!(
         rig.ends(),
-        vec![(xid_one(), first.address(), X3EndReason::Detached)],
+        vec![(
+            xid_one(),
+            first.address(),
+            first.correlation_id,
+            X3EndReason::Detached
+        )],
         "exactly one x3_ended, naming the warrant and its delivery"
     );
 
@@ -419,11 +448,18 @@ async fn detaching_by_xid_and_delivery_ends_exactly_one_of_two_deliveries_of_a_w
     first.read_until(xid_one(), |read| read.len() >= 4).await;
     second.read_until(xid_one(), |read| read.len() >= 4).await;
 
-    let detached = rig.detach(Some(xid_one()), Some(second.address())).await;
+    let detached = rig
+        .detach(Some(xid_one()), Some(second.address()), None)
+        .await;
     assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
     assert_eq!(
         rig.ends(),
-        vec![(xid_one(), second.address(), X3EndReason::Detached)]
+        vec![(
+            xid_one(),
+            second.address(),
+            second.correlation_id,
+            X3EndReason::Detached
+        )]
     );
 
     rig.both_talk(3..6).await;
@@ -445,7 +481,7 @@ async fn a_detach_naming_only_a_delivery_is_refused_and_ends_nothing() {
     first.read_until(xid_one(), |read| read.len() >= 4).await;
     second.read_until(xid_two(), |read| read.len() >= 4).await;
 
-    let refused = rig.detach(None, Some(second.address())).await;
+    let refused = rig.detach(None, Some(second.address()), None).await;
     assert!(matches!(refused, CmdResult::Error { .. }), "{refused:?}");
     assert!(rig.ends().is_empty(), "nothing ended: {:?}", rig.ends());
 
@@ -468,19 +504,32 @@ async fn detaching_with_no_xid_ends_every_delivery_with_one_end_event_each() {
     let first = attach_and_accept(&rig, xid_one(), CID_ONE, X3TargetLeg::Caller).await;
     let second = attach_and_accept(&rig, xid_two(), CID_TWO, X3TargetLeg::Caller).await;
 
-    let detached = rig.detach(None, None).await;
+    let detached = rig.detach(None, None, None).await;
     assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
     let mut ends = rig.ends();
-    ends.sort_by_key(|(task, _, _)| *task.as_bytes());
+    ends.sort_by_key(|(task, _, _, _)| *task.as_bytes());
     let mut expected = vec![
-        (xid_one(), first.address(), X3EndReason::Detached),
-        (xid_two(), second.address(), X3EndReason::Detached),
+        (
+            xid_one(),
+            first.address(),
+            first.correlation_id,
+            X3EndReason::Detached,
+        ),
+        (
+            xid_two(),
+            second.address(),
+            second.correlation_id,
+            X3EndReason::Detached,
+        ),
     ];
-    expected.sort_by_key(|(task, _, _)| *task.as_bytes());
+    expected.sort_by_key(|(task, _, _, _)| *task.as_bytes());
     assert_eq!(ends, expected);
 
     // Idempotent: nothing left to end, no further events.
-    assert!(matches!(rig.detach(None, None).await, CmdResult::Ok { .. }));
+    assert!(matches!(
+        rig.detach(None, None, None).await,
+        CmdResult::Ok { .. }
+    ));
     assert!(rig.ends().is_empty());
 }
 
@@ -509,7 +558,12 @@ async fn a_re_attach_of_the_same_xid_and_delivery_replaces_only_that_one() {
     ));
     assert_eq!(
         rig.ends(),
-        vec![(xid_one(), replaced.address(), X3EndReason::Detached)],
+        vec![(
+            xid_one(),
+            replaced.address(),
+            replaced.correlation_id,
+            X3EndReason::Detached
+        )],
         "only the replaced delivery reports an end"
     );
     replaced.next_sequence = 0;
@@ -524,6 +578,107 @@ async fn a_re_attach_of_the_same_xid_and_delivery_replaces_only_that_one() {
         "the other delivery never noticed"
     );
     assert!(rig.ends().is_empty());
+}
+
+/// Two calls covered by one warrant, bridged onto one engine call: each keeps its own LI session and
+/// Correlation ID, so the same warrant and delivery address carry two sessions at once
+/// (TS 103 221-2 clause 6: the CID ties X3 to the X2 records of its own session).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_warrant_and_delivery_carry_two_sessions_under_their_own_correlation_ids() {
+    let rig = Rig::new().await;
+    let mut first = attach_and_accept(&rig, xid_one(), CID_ONE, X3TargetLeg::Caller).await;
+    let mut second = first.second_session(CID_TWO);
+    let attached = rig
+        .attach(&second, xid_one(), CID_TWO, X3TargetLeg::Caller)
+        .await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    second.accept(&rig.pki).await;
+    assert!(rig.ends().is_empty(), "the second session replaced nothing");
+
+    rig.both_talk(1..5).await;
+    for mdf in [&mut first, &mut second] {
+        mdf.read_until(xid_one(), |read| read.len() >= 8).await;
+        assert_eq!(mdf.rtp_sequences(from_target(), A_SSRC), vec![1, 2, 3, 4]);
+        assert_eq!(mdf.rtp_sequences(to_target(), B_SSRC), vec![1, 2, 3, 4]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detaching_a_full_triple_ends_exactly_that_session_and_names_its_correlation_id() {
+    let rig = Rig::new().await;
+    let mut first = attach_and_accept(&rig, xid_one(), CID_ONE, X3TargetLeg::Caller).await;
+    let mut second = first.second_session(CID_TWO);
+    assert!(matches!(
+        rig.attach(&second, xid_one(), CID_TWO, X3TargetLeg::Caller)
+            .await,
+        CmdResult::Ok { .. }
+    ));
+    second.accept(&rig.pki).await;
+    rig.both_talk(1..3).await;
+    first.read_until(xid_one(), |read| read.len() >= 4).await;
+    second.read_until(xid_one(), |read| read.len() >= 4).await;
+
+    let detached = rig
+        .detach(Some(xid_one()), Some(first.address()), Some(CID_TWO))
+        .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+    assert_eq!(
+        rig.ends(),
+        vec![(xid_one(), second.address(), CID_TWO, X3EndReason::Detached)]
+    );
+
+    rig.both_talk(3..6).await;
+    first.read_until(xid_one(), |read| read.len() >= 6).await;
+    assert_eq!(
+        first.rtp_sequences(from_target(), A_SSRC),
+        vec![1, 2, 3, 4, 5],
+        "the session under the other Correlation ID lost nothing"
+    );
+    assert!(rig.ends().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detaching_a_warrant_and_delivery_ends_every_session_at_that_address() {
+    let rig = Rig::new().await;
+    let first = attach_and_accept(&rig, xid_one(), CID_ONE, X3TargetLeg::Caller).await;
+    let mut second = first.second_session(CID_TWO);
+    assert!(matches!(
+        rig.attach(&second, xid_one(), CID_TWO, X3TargetLeg::Caller)
+            .await,
+        CmdResult::Ok { .. }
+    ));
+    second.accept(&rig.pki).await;
+
+    let detached = rig
+        .detach(Some(xid_one()), Some(first.address()), None)
+        .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+    let mut ends = rig.ends();
+    ends.sort_by_key(|(_, _, correlation_id, _)| *correlation_id);
+    assert_eq!(
+        ends,
+        vec![
+            (xid_one(), first.address(), CID_ONE, X3EndReason::Detached),
+            (xid_one(), first.address(), CID_TWO, X3EndReason::Detached),
+        ]
+    );
+}
+
+/// A Correlation ID is provisioned per warrant over X1, so on its own it does not say which warrant's
+/// session to end: refused, and both keep delivering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detach_naming_only_a_correlation_id_is_refused_and_ends_nothing() {
+    let rig = Rig::new().await;
+    let mut first = attach_and_accept(&rig, xid_one(), CID_ONE, X3TargetLeg::Caller).await;
+    let mut second = attach_and_accept(&rig, xid_two(), CID_TWO, X3TargetLeg::Caller).await;
+
+    let refused = rig.detach(None, None, Some(CID_TWO)).await;
+    assert!(matches!(refused, CmdResult::Error { .. }), "{refused:?}");
+    assert!(rig.ends().is_empty(), "nothing ended: {:?}", rig.ends());
+
+    rig.both_talk(1..3).await;
+    first.read_until(xid_one(), |read| read.len() >= 4).await;
+    second.read_until(xid_two(), |read| read.len() >= 4).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -599,7 +754,7 @@ async fn every_delivery_survives_a_re_offer_with_the_same_cids_and_unbroken_sequ
     assert_eq!(ends.len(), 2);
     assert!(ends
         .iter()
-        .all(|(_, _, reason)| *reason == X3EndReason::CallEnded));
+        .all(|(_, _, _, reason)| *reason == X3EndReason::CallEnded));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

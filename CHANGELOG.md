@@ -10,11 +10,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 ### Added
 
 - **Several X3 deliveries on one call.** A call can be intercepted under more than one warrant, or by one
-  warrant toward several Mediation Functions. `attach_x3` with a new (`xid`, `delivery`) pair adds a
-  delivery with its own connection, Correlation ID, PDU sequence counter and `target_leg`; the same pair
-  replaces only itself. `detach_x3` gained optional `xid` and `delivery` selectors (none: every delivery,
-  as before; `xid`: that warrant's; both: exactly one), and `x3_ended` and `x3_loss` gained `xid` and
-  `delivery`, always filled. Each ended delivery reports one `x3_ended`. All deliveries of a call are
+  warrant toward several Mediation Functions, or by one warrant under two Correlation IDs when two calls
+  it covers are bridged onto one engine call. `attach_x3` with a new (`xid`, `delivery`,
+  `correlation_id`) triple adds a delivery with its own connection, PDU sequence counter and
+  `target_leg`; the same triple replaces only itself. `detach_x3` gained optional `xid`, `delivery` and
+  `correlation_id` selectors (none: every delivery, as before; `xid`: that warrant's; the others narrow
+  it; `delivery` or `correlation_id` without `xid` is refused), and `x3_ended` and `x3_loss` gained
+  `xid`, `delivery` and `correlation_id`, always filled. Each ended delivery reports one `x3_ended`. All deliveries of a call are
   installed as one set on whatever carries the call (a re-offer, `conference_seat`, `offer_far`, a
   re-answer, a joined seat), so a carry never moves some and drops others, and the userspace hold goes
   when the last one does. `node_info` lists `x3_multi_delivery` on a node provisioned for X3.

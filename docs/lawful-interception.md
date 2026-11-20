@@ -96,6 +96,8 @@ it).
 {"command":"detach_x3","call_id":"…","from_tag":"…","xid":"8c292fa1-5831-46ec-86be-bd85f2083299"}
 {"command":"detach_x3","call_id":"…","from_tag":"…","xid":"8c292fa1-5831-46ec-86be-bd85f2083299",
  "delivery":"mdf.example.net:8090"}
+{"command":"detach_x3","call_id":"…","from_tag":"…","xid":"8c292fa1-5831-46ec-86be-bd85f2083299",
+ "delivery":"mdf.example.net:8090","correlation_id":72623859790382856}
 ```
 
 `xid` and `correlation_id` come from X1 provisioning and are copied into every PDU header without
@@ -108,19 +110,25 @@ idempotent, and interception ends automatically with the call.
 ### Several deliveries on one call
 
 A call can be intercepted under several warrants, or by one warrant toward several Mediation
-Functions, at once. Each `attach_x3` names a delivery by its (`xid`, `delivery`) pair:
+Functions, at once. One warrant can also cover the same engine call twice: when two calls of the
+target are bridged onto one engine call, each keeps its own LI session and Correlation ID, and X3 has
+to be delivered under both (the CID ties X3 to the X2 records of its own session, TS 103 221-2
+clause 6). Each `attach_x3` therefore names a delivery by its (`xid`, `delivery`, `correlation_id`)
+triple:
 
-- a pair the call does not carry **adds** a delivery, with its own mutual-TLS connection, its own
-  `correlation_id`, its own PDU sequence counter and its own `target_leg`. Two warrants naming
-  different legs on one call each get directions relative to their own target (mirrored);
-- the **same** pair again replaces only that delivery (its connection is closed with `detached`, a new
-  one opens with a fresh sequence counter) and leaves every other delivery untouched.
+- a triple the call does not carry **adds** a delivery, with its own mutual-TLS connection, its own
+  PDU sequence counter and its own `target_leg`. Two warrants naming different legs on one call each
+  get directions relative to their own target (mirrored);
+- the **same** triple again replaces only that delivery (its connection is closed with `detached`, a
+  new one opens with a fresh sequence counter) and leaves every other delivery untouched.
 
 `detach_x3` ends what its selectors name: no `xid` ends every delivery of the call (the meaning it
-always had), an `xid` ends that warrant's deliveries, `xid` and `delivery` end exactly one. A `delivery`
-without an `xid` is refused, since two warrants can share one Mediation Function. Each ended
-delivery reports exactly one `x3_ended`, and `x3_loss` / `x3_ended` carry the `xid` and `delivery` they
-concern (the engine always fills them). The survivors are not interrupted: the taps of the remaining
+always had), an `xid` ends that warrant's deliveries, and `delivery` and `correlation_id` each narrow
+that further; all three end exactly one. A `delivery` or `correlation_id` without an `xid` is
+refused, since two warrants can share one Mediation Function and Correlation IDs are provisioned per
+warrant. Each ended delivery reports exactly one `x3_ended`, and `x3_loss` / `x3_ended` carry the
+`xid`, `delivery` and `correlation_id` they concern (the engine always fills them), so a controller
+can attribute an event from the moment it sends the attach, before its reply arrives. The survivors are not interrupted: the taps of the remaining
 deliveries are installed again as a whole, so their connections, Correlation IDs and sequence counters
 carry straight on.
 
@@ -298,8 +306,8 @@ recording, SIPREC subscription, WebSocket tee or DTMF block is attached, as befo
 | Event | Meaning |
 |---|---|
 | `x3_started` | Delivery is attached and content is flowing. |
-| `x3_loss` | **Warranted content was dropped.** See below. Names the `xid` and `delivery` that lost it. |
-| `x3_ended` | One delivery stopped, with its lifetime `delivered` / `dropped` counts. Names its `xid` and `delivery`. |
+| `x3_loss` | **Warranted content was dropped.** See below. Names the `xid`, `delivery` and `correlation_id` that lost it. |
+| `x3_ended` | One delivery stopped, with its lifetime `delivered` / `dropped` counts. Names its `xid`, `delivery` and `correlation_id`. |
 
 ### What cannot be intercepted
 
