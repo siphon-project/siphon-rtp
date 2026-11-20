@@ -54,6 +54,8 @@ struct Rig {
     engine: Engine<Datapath>,
     pki: Pki,
     listener: TcpListener,
+    /// A second Mediation Function, for the tests with two deliveries on one call.
+    second_listener: TcpListener,
     events: flume::Receiver<Event>,
 }
 
@@ -85,6 +87,7 @@ impl Rig {
     async fn new() -> Self {
         let pki = pki();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mdf");
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mdf");
         let engine = Engine::new(Datapath::new()).with_x3(pki.config.clone());
         tokio::spawn(run_redirect_dispatcher(
             engine.datapath().rx(),
@@ -100,6 +103,7 @@ impl Rig {
             engine,
             pki,
             listener,
+            second_listener,
             events,
         }
     }
@@ -206,9 +210,36 @@ impl Rig {
             .await
     }
 
+    /// A second delivery of the same call: another warrant, to the second Mediation Function.
+    async fn attach_second(&self, call_id: &str, from_tag: &str) -> CmdResult {
+        self.send(Command::AttachX3 {
+            call_id: call_id.into(),
+            from_tag: from_tag.into(),
+            delivery: self
+                .second_listener
+                .local_addr()
+                .expect("mdf addr")
+                .to_string(),
+            xid: "1f0e0d0c-0b0a-4908-8706-050403020100"
+                .parse::<Xid>()
+                .expect("xid"),
+            correlation_id: CORRELATION_ID,
+            target_leg: X3TargetLeg::Caller,
+        })
+        .await
+    }
+
     async fn accept(&self) -> Mdf {
+        self.accept_on(&self.listener).await
+    }
+
+    async fn accept_second(&self) -> Mdf {
+        self.accept_on(&self.second_listener).await
+    }
+
+    async fn accept_on(&self, listener: &TcpListener) -> Mdf {
         let acceptor = acceptor(&self.pki);
-        let (stream, _) = timeout(SHORT, self.listener.accept())
+        let (stream, _) = timeout(SHORT, listener.accept())
             .await
             .expect("the engine connects to the mediation function")
             .expect("accept");
@@ -443,6 +474,8 @@ async fn an_interception_attached_on_a_seated_call_delivers_both_directions() {
         .send(Command::DetachX3 {
             call_id: call.id.into(),
             from_tag: call.target_tag(),
+            xid: None,
+            delivery: None,
         })
         .await;
     assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
@@ -570,6 +603,8 @@ async fn detaching_a_joined_seat_ends_it_detached_and_the_room_stopping_ends_it_
         .send(Command::DetachX3 {
             call_id: "room-detach".into(),
             from_tag: "only".into(),
+            xid: None,
+            delivery: None,
         })
         .await;
     assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
@@ -586,6 +621,8 @@ async fn detaching_a_joined_seat_ends_it_detached_and_the_room_stopping_ends_it_
         rig.send(Command::DetachX3 {
             call_id: "room-detach".into(),
             from_tag: "only".into(),
+            xid: None,
+            delivery: None,
         })
         .await,
         CmdResult::Ok { .. }
@@ -878,4 +915,194 @@ async fn node_info_advertises_conference_seat_interception_only_with_x3() {
     assert!(!features(bare.handle(CLIENT, Command::NodeInfo).await)
         .iter()
         .any(|name| name == "x3_conference_seat"));
+}
+
+/// Both deliveries of a call follow its leg into a room: the one install carries the whole set, so
+/// neither is dropped by the merge, each keeps its connection and sequence counter, and a detach of
+/// one warrant on the seated call leaves the other delivering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_deliveries_follow_a_call_into_a_room_and_detach_one_leaves_the_other() {
+    let rig = Rig::new().await;
+    let call = rig.two_party("merge-two").await;
+    assert!(matches!(
+        rig.attach(call.id, &call.target_tag()).await,
+        CmdResult::Ok { .. }
+    ));
+    let mut first = rig.accept().await;
+    assert!(matches!(
+        rig.attach_second(call.id, &call.target_tag()).await,
+        CmdResult::Ok { .. }
+    ));
+    let mut second = rig.accept_second().await;
+
+    for sequence in 1..=2 {
+        call.target
+            .send(&rtp_from(TARGET_SSRC, sequence), call.toward_target)
+            .await;
+    }
+    first.read(2).await;
+    second.read(2).await;
+
+    let third = rig.join("room-two-warrants", "third").await;
+    let fourth = rig.join("room-two-warrants", "fourth").await;
+    let seated = rig
+        .seat(call.id, &call.target_tag(), "room-two-warrants")
+        .await;
+    assert!(matches!(seated, CmdResult::Ok { .. }), "{seated:?}");
+
+    everybody_talks(&call, &third, &fourth, 3, 20).await;
+    for mdf in [&mut first, &mut second] {
+        mdf.read_until(|read| {
+            read.iter()
+                .filter(|(direction, payload)| {
+                    *direction == from_target() && ssrc_of(payload) == TARGET_SSRC
+                })
+                .count()
+                >= 20
+        })
+        .await;
+        assert!(
+            mdf.seen
+                .iter()
+                .any(|(direction, _)| *direction == to_target()),
+            "the room's stream toward the target reaches every delivery"
+        );
+    }
+    assert!(
+        x3_ends(rig.drained_events()).is_empty(),
+        "the merge ended no delivery"
+    );
+
+    // Detach one warrant while the call is seated: its delivery ends, the other keeps going.
+    let detached = rig
+        .send(Command::DetachX3 {
+            call_id: call.id.into(),
+            from_tag: call.target_tag(),
+            xid: Some(XID_TEXT.parse::<Xid>().expect("xid")),
+            delivery: None,
+        })
+        .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+    let ends = rig.drained_events();
+    let ended: Vec<_> = ends
+        .iter()
+        .filter_map(|event| match event {
+            Event::X3Ended { xid, reason, .. } => Some((*xid, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ended,
+        vec![(
+            Some(XID_TEXT.parse::<Xid>().expect("xid")),
+            X3EndReason::Detached
+        )]
+    );
+    let before = second.seen.len();
+    everybody_talks(&call, &third, &fourth, 100, 10).await;
+    second
+        .read_until(|read| {
+            read.iter()
+                .filter(|(direction, payload)| {
+                    *direction == from_target() && rtp_sequence(payload) >= 100
+                })
+                .count()
+                >= 10
+        })
+        .await;
+    assert!(second.seen.len() > before);
+}
+
+/// A joined seat carries several deliveries too: each has its own connection, a detach of one warrant
+/// ends that delivery alone (one `x3_ended` naming it) and the other goes on, and the seat leaving
+/// ends what is left, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joined_seat_carries_two_deliveries_and_detaching_one_leaves_the_other() {
+    let rig = Rig::new().await;
+    let target = rig.join("room-multi", "target").await;
+    let other = rig.join("room-multi", "other").await;
+    assert!(matches!(
+        rig.attach("room-multi", "target").await,
+        CmdResult::Ok { .. }
+    ));
+    let mut first = rig.accept().await;
+    assert!(matches!(
+        rig.attach_second("room-multi", "target").await,
+        CmdResult::Ok { .. }
+    ));
+    let mut second = rig.accept_second().await;
+
+    let talk = |first_sequence: u16, frames: u16| {
+        let target = &target;
+        let other = &other;
+        async move {
+            for sequence in first_sequence..first_sequence + frames {
+                target
+                    .phone
+                    .send(&rtp_from(TARGET_SSRC, sequence), target.toward_engine)
+                    .await;
+                other
+                    .phone
+                    .send(&rtp_from(THIRD_SSRC, sequence), other.toward_engine)
+                    .await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                target.phone.drain_rtp().await;
+            }
+        }
+    };
+    talk(1, 10).await;
+    for mdf in [&mut first, &mut second] {
+        mdf.read_until(|read| {
+            read.iter()
+                .filter(|(direction, _)| *direction == from_target())
+                .count()
+                >= 10
+        })
+        .await;
+    }
+
+    let detached = rig
+        .send(Command::DetachX3 {
+            call_id: "room-multi".into(),
+            from_tag: "target".into(),
+            xid: Some(XID_TEXT.parse::<Xid>().expect("xid")),
+            delivery: None,
+        })
+        .await;
+    assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+    assert_eq!(
+        x3_ends(rig.drained_events()),
+        vec![(
+            "room-multi".to_string(),
+            "target".to_string(),
+            X3EndReason::Detached
+        )],
+        "one end event, for the delivery that was detached"
+    );
+
+    talk(100, 10).await;
+    second
+        .read_until(|read| {
+            read.iter()
+                .filter(|(direction, payload)| {
+                    *direction == from_target() && rtp_sequence(payload) >= 100
+                })
+                .count()
+                >= 10
+        })
+        .await;
+
+    assert!(matches!(
+        rig.leave("room-multi", "target").await,
+        CmdResult::Ok { .. }
+    ));
+    assert_eq!(
+        x3_ends(rig.drained_events()),
+        vec![(
+            "room-multi".to_string(),
+            "target".to_string(),
+            X3EndReason::CallEnded
+        )],
+        "the seat leaving ends the remaining delivery, once"
+    );
 }

@@ -174,11 +174,11 @@ pub enum SeatControl {
         gain: Gain,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
-    /// Put a lawful interception's taps on one seat ([`Conference::set_seat_x3`]). `reply` carries
+    /// Put the taps of every lawful-interception delivery on one seat ([`Conference::set_seat_x3`]). `reply` carries
     /// whether the tag was seated.
     SetX3 {
         tag: String,
-        factory: crate::x3::X3TapFactory,
+        factories: Vec<crate::x3::X3TapFactory>,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
     /// Take a lawful interception's taps off one seat ([`Conference::clear_seat_x3`]). `reply`
@@ -220,10 +220,10 @@ impl Conference {
             }
             SeatControl::SetX3 {
                 tag,
-                factory,
+                factories,
                 reply,
             } => {
-                let _ = reply.send(self.set_seat_x3(&tag, &factory));
+                let _ = reply.send(self.set_seat_x3(&tag, &factories));
             }
             SeatControl::ClearX3 { tag, reply } => {
                 let _ = reply.send(self.clear_seat_x3(&tag));

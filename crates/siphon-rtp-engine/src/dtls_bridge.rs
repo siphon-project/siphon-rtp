@@ -33,7 +33,7 @@ use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::plain_tap::{PlainTapSender, PlainTaps};
 use crate::seat_gate::rtcp_is_about_video;
 use crate::srtp_bridge::ScratchPool;
-use crate::x3::X3Tap;
+use crate::x3::X3Taps;
 
 /// How many inbound DTLS records a leg's driver will queue. Bounded so a stalled association cannot
 /// grow an unbounded queue on a traffic spike; [`DtlsBridge::handle`] drops the newest when it is
@@ -254,7 +254,7 @@ struct Flow {
     /// still-encrypted media to the per-call media actor, which decrypts and taps on its own
     /// `Direction::handle` — tapping here as well would deliver every packet twice, once as
     /// ciphertext.
-    x3: Option<X3Tap>,
+    x3: X3Taps,
     /// This endpoint is the plain peer's separate RTCP port, so only RTCP is relayed from it
     /// (classified by packet type, RFC 5761 §4).
     rtcp_only: bool,
@@ -568,7 +568,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             secure_dst: Some(destination),
             secure,
             // X3 content is the call's media, tapped on the RTP endpoints; RTCP is not content.
-            x3: None,
+            x3: X3Taps::default(),
             plain_taps: PlainTaps::default(),
             rtcp_only: true,
             refusals: Arc::new(RefusalLog::default()),
@@ -879,7 +879,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: None,
                 secure_dst: Some(destination.clone()),
                 secure: Arc::new(Mutex::new(None)),
-                x3: None,
+                x3: X3Taps::default(),
                 plain_taps: PlainTaps::default(),
                 // The per-call actor relays RTCP itself (`plan.plain_rtcp` is not used here).
                 rtcp_only: false,
@@ -954,7 +954,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure,
                 // X3 content is audio for now (docs/security-and-nat.md), and a tee or recording
                 // decodes audio: neither is offered the video.
-                x3: None,
+                x3: X3Taps::default(),
                 plain_taps: PlainTaps::default(),
                 rtcp_only: false,
                 rtcp_out: None,
@@ -1187,7 +1187,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 flow.out_dst = None;
                 flow.rtcp_out = None;
                 flow.rtcp_only = false;
-                flow.x3 = None;
+                flow.x3 = X3Taps::default();
                 flow.plain_taps = PlainTaps::default();
                 Ok(Some(leg))
             }
@@ -1195,21 +1195,22 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         }
     }
 
-    /// Install a lawful-interception content tap on one bridged endpoint's ingress, replacing any
-    /// tap already there. Returns whether this bridge owns the endpoint.
+    /// Install the lawful-interception content taps (one per delivery on the call) on one bridged
+    /// endpoint's ingress, replacing any set already there. Returns whether this bridge owns the endpoint.
     ///
     /// A **pipeline** flow (one whose media belongs to the per-call media actor rather than to a
     /// peer socket) is left untapped on purpose: its media reaches that actor still encrypted and is
     /// tapped there, on plaintext. Installing one here would deliver each packet twice, and the copy
     /// from here would be ciphertext.
-    pub fn set_x3_tap(&self, endpoint: EndpointId, tap: X3Tap) -> bool {
+    pub fn set_x3_tap(&self, endpoint: EndpointId, taps: impl Into<X3Taps>) -> bool {
+        let taps = taps.into();
         let Some(mut flow) = self.flows.get_mut(&endpoint) else {
             return false;
         };
         if matches!(flow.direction, Direction::Pipeline { .. }) {
             return false;
         }
-        flow.x3 = Some(tap);
+        flow.x3 = taps;
         true
     }
 
@@ -1237,7 +1238,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
     /// Remove the lawful-interception tap from one bridged endpoint. Idempotent.
     pub fn clear_x3_tap(&self, endpoint: EndpointId) {
         if let Some(mut flow) = self.flows.get_mut(&endpoint) {
-            flow.x3 = None;
+            flow.x3 = X3Taps::default();
         }
     }
 
@@ -1430,9 +1431,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         // Audio only: interception, a tee and a recording take the call's audio, and a bundled
         // video stream is none of it (docs/security-and-nat.md, "Video on a two-party call").
         if !is_video {
-            if let Some(x3) = &x3 {
-                x3.deliver(packet.source, plaintext);
-            }
+            x3.deliver(packet.source, plaintext);
             // A tee's or a recording's copy of the same plaintext (the SDES bridge taps identically).
             if !plain_taps.is_empty() && kind != PacketKind::Rtcp {
                 plain_taps.offer(plaintext);

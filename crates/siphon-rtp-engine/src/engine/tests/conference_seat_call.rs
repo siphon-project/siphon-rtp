@@ -1716,7 +1716,9 @@ fn inject_x3_session(
     let counters = factory.counters().clone();
     engine.x3_sessions.insert(
         call_id.to_string(),
-        crate::engine::intercept::X3Session {
+        vec![crate::engine::intercept::X3Session {
+            xid: Default::default(),
+            delivery: "mdf.example.net:8090".to_string(),
             from_tag: from_tag.to_string(),
             owner: CLIENT,
             bridged_endpoints: Vec::new(),
@@ -1728,7 +1730,7 @@ fn inject_x3_session(
             joined_endpoint: None,
             handing_over: Default::default(),
             detach_requested: Default::default(),
-        },
+        }],
     );
     delivery
 }

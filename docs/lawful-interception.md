@@ -93,6 +93,9 @@ it).
 
 ```json
 {"command":"detach_x3","call_id":"…","from_tag":"…"}
+{"command":"detach_x3","call_id":"…","from_tag":"…","xid":"8c292fa1-5831-46ec-86be-bd85f2083299"}
+{"command":"detach_x3","call_id":"…","from_tag":"…","xid":"8c292fa1-5831-46ec-86be-bd85f2083299",
+ "delivery":"mdf.example.net:8090"}
 ```
 
 `xid` and `correlation_id` come from X1 provisioning and are copied into every PDU header without
@@ -101,6 +104,34 @@ interpretation — the engine stays lawful-interception-agnostic apart from fram
 `correlation_id` must be **non-zero** and must match the value the signalling plane puts on this
 session's X2 records (TS 103 221-2 clause 6); a zero correlation is refused. `detach_x3` is
 idempotent, and interception ends automatically with the call.
+
+### Several deliveries on one call
+
+A call can be intercepted under several warrants, or by one warrant toward several Mediation
+Functions, at once. Each `attach_x3` names a delivery by its (`xid`, `delivery`) pair:
+
+- a pair the call does not carry **adds** a delivery, with its own mutual-TLS connection, its own
+  `correlation_id`, its own PDU sequence counter and its own `target_leg`. Two warrants naming
+  different legs on one call each get directions relative to their own target (mirrored);
+- the **same** pair again replaces only that delivery (its connection is closed with `detached`, a new
+  one opens with a fresh sequence counter) and leaves every other delivery untouched.
+
+`detach_x3` ends what its selectors name: no `xid` ends every delivery of the call (the meaning it
+always had), an `xid` ends that warrant's deliveries, `xid` and `delivery` end exactly one. A `delivery`
+without an `xid` is refused, since two warrants can share one Mediation Function. Each ended
+delivery reports exactly one `x3_ended`, and `x3_loss` / `x3_ended` carry the `xid` and `delivery` they
+concern (the engine always fills them). The survivors are not interrupted: the taps of the remaining
+deliveries are installed again as a whole, so their connections, Correlation IDs and sequence counters
+carry straight on.
+
+The deliveries of a call move together. Whatever rebuilds the call's media path (a re-offer and its
+answer, `conference_seat`, `offer_far`, a re-answer of the same dialog) installs the taps of **all**
+of them in one step, so a carry can never move some deliveries and drop others; if the taps cannot be
+put back, every delivery of the call ends with `transport_error`, loudly. The userspace hold an
+interception keeps on a plain relay is released only when the last delivery goes. During the hand-over
+of a re-answer a `detach_x3` is honoured for the deliveries it names only. A joined conference seat
+carries several deliveries in the same way. The call ending ends every delivery (`call_ended`), one
+`x3_ended` each. `node_info` lists `x3_multi_delivery` on a node provisioned for X3.
 
 Attaching is **additive**: the call keeps relaying, recording, teeing and transcoding exactly as it
 was. A plain in-kernel relay is promoted to the userspace path for the interception's lifetime and
@@ -111,7 +142,7 @@ The interception belongs to the **call**, not to one negotiation of it. A re-off
 hold, a resume, a session refresh carrying SDP) rebuild the call's media path, and the taps are put
 back on the new one: same delivery connection, same Correlation ID, sequence counter unbroken, no
 `x3_ended`. `x3_ended` with `call_ended` is emitted only when the call is deleted; a controller's
-`detach_x3` or a second `attach_x3` ends the interception with `detached`. Should the taps ever fail
+`detach_x3` or a second `attach_x3` of the same delivery ends that delivery with `detached`. Should the taps ever fail
 to be re-installed, the interception ends with `transport_error` rather than staying attached and
 silent. A re-offer that changes the negotiated codec is refused by the engine, so that case does not
 arise.
@@ -213,8 +244,8 @@ X3.
 | Event | Meaning |
 |---|---|
 | `x3_started` | Delivery is attached and content is flowing. |
-| `x3_loss` | **Warranted content was dropped.** See below. |
-| `x3_ended` | Delivery stopped, with lifetime `delivered` / `dropped` counts. |
+| `x3_loss` | **Warranted content was dropped.** See below. Names the `xid` and `delivery` that lost it. |
+| `x3_ended` | One delivery stopped, with its lifetime `delivered` / `dropped` counts. Names its `xid` and `delivery`. |
 
 ### What cannot be intercepted
 

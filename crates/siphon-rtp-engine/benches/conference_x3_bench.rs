@@ -74,20 +74,28 @@ fn room_benches(criterion: &mut Criterion) {
                     .collect()
             })
             .collect();
-        for tapped in [false, true] {
+        for deliveries in [0usize, 1, 2] {
             let mut room = Conference::new("bench".into(), 0);
             for index in 0..seats {
                 room.add_participant(seat(index)).unwrap();
             }
-            let (factory, delivery) = x3_channel(4096);
-            if tapped {
-                assert!(room.set_seat_x3("seat-1", &factory));
+            let channels: Vec<_> = (0..deliveries).map(|_| x3_channel(4096)).collect();
+            if deliveries > 0 {
+                let factories: Vec<_> = channels
+                    .iter()
+                    .map(|(factory, _)| factory.clone())
+                    .collect();
+                assert!(room.set_seat_x3("seat-1", &factories));
             }
             let mut out = Vec::with_capacity(seats * 4);
             let mut next = 0usize;
             let name = format!(
                 "{seats}_seats_{}",
-                if tapped { "seat_1_tapped" } else { "untapped" }
+                match deliveries {
+                    0 => "untapped",
+                    1 => "seat_1_tapped",
+                    _ => "seat_1_tapped_two",
+                }
             );
             group.bench_function(name, |bencher| {
                 bencher.iter(|| {
@@ -98,8 +106,10 @@ fn room_benches(criterion: &mut Criterion) {
                     room.tick(&mut out);
                     next = (next + 1) % FRAMES;
                     // The delivery task's side: frame it, hand the buffer back.
-                    while let Ok(packet) = delivery.packets.try_recv() {
-                        let _ = delivery.recycle.try_send(packet.payload);
+                    for (_, delivery) in &channels {
+                        while let Ok(packet) = delivery.packets.try_recv() {
+                            let _ = delivery.recycle.try_send(packet.payload);
+                        }
                     }
                     black_box(out.len())
                 });

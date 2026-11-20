@@ -1018,7 +1018,21 @@ pub enum Command {
     },
     /// Stop lawful-interception content delivery for a call, closing the delivery connection.
     /// Idempotent: detaching a call with no interception is not an error.
-    DetachX3 { call_id: String, from_tag: String },
+    ///
+    /// A call can carry several deliveries at once (one [`Command::AttachX3`] per `xid` and
+    /// `delivery`). With neither selector every delivery on the call ends (the original meaning);
+    /// with `xid` only that warrant's deliveries end; with `xid` and `delivery` exactly one does.
+    /// Each ended delivery reports its own [`Event::X3Ended`].
+    DetachX3 {
+        call_id: String,
+        from_tag: String,
+        /// Detach only this warrant's deliveries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        xid: Option<Xid>,
+        /// Detach only the delivery to this address (as given on the attach), within `xid`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<String>,
+    },
     /// Authenticate the control connection with the server's shared secret, and optionally present
     /// the stable identity the controller reconnects under. Handled by the control server (not the
     /// session engine); required as the first command when a secret is configured.
@@ -2588,6 +2602,13 @@ pub enum Event {
     X3Loss {
         call_id: String,
         from_tag: String,
+        /// The warrant of the delivery that lost content. Always set by the engine; absent only
+        /// from events written before a call could carry several deliveries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        xid: Option<Xid>,
+        /// The delivery address that lost content, as given on the attach. Always set by the engine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<String>,
         /// Packets dropped on this interception so far.
         dropped: u64,
         /// Packets successfully handed to the delivery transport so far.
@@ -2599,6 +2620,13 @@ pub enum Event {
     X3Ended {
         call_id: String,
         from_tag: String,
+        /// The warrant of the delivery that ended. Always set by the engine; absent only from
+        /// events written before a call could carry several deliveries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        xid: Option<Xid>,
+        /// The delivery address that ended, as given on the attach. Always set by the engine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<String>,
         reason: X3EndReason,
         /// Packets handed to the delivery transport over the interception's lifetime.
         delivered: u64,
@@ -3403,12 +3431,108 @@ mod tests {
     fn detach_x3_wire_shape() {
         let json = r#"{"command":"detach_x3","call_id":"c","from_tag":"f"}"#;
         match serde_json::from_str::<Command>(json).expect("deserialize") {
-            Command::DetachX3 { call_id, from_tag } => {
+            Command::DetachX3 {
+                call_id,
+                from_tag,
+                xid,
+                delivery,
+            } => {
                 assert_eq!(call_id, "c");
                 assert_eq!(from_tag, "f");
+                assert_eq!(xid, None);
+                assert_eq!(delivery, None);
             }
             other => panic!("expected detach_x3, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detach_x3_names_a_warrant_and_a_delivery_when_asked_to() {
+        let xid: Xid = "8c292fa1-5831-46ec-86be-bd85f2083299".parse().expect("xid");
+        let wire = concat!(
+            r#"{"command":"detach_x3","call_id":"c","from_tag":"f","#,
+            r#""xid":"8c292fa1-5831-46ec-86be-bd85f2083299","delivery":"mdf.example.net:8090"}"#,
+        );
+        match serde_json::from_str::<Command>(wire).expect("deserialize") {
+            Command::DetachX3 {
+                xid: decoded_xid,
+                delivery,
+                ..
+            } => {
+                assert_eq!(decoded_xid, Some(xid));
+                assert_eq!(delivery.as_deref(), Some("mdf.example.net:8090"));
+            }
+            other => panic!("expected detach_x3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detach_x3_without_selectors_serializes_without_them() {
+        let detach = Command::DetachX3 {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            xid: None,
+            delivery: None,
+        };
+        let value = serde_json::to_value(&detach).expect("to_value");
+        assert!(value.get("xid").is_none(), "{value}");
+        assert!(value.get("delivery").is_none(), "{value}");
+    }
+
+    #[test]
+    fn old_shape_x3_events_still_decode() {
+        let ended = r#"{"event":"x3_ended","call_id":"c","from_tag":"f","reason":"detached","delivered":3,"dropped":0}"#;
+        match serde_json::from_str::<Event>(ended).expect("x3_ended") {
+            Event::X3Ended { xid, delivery, .. } => {
+                assert_eq!(xid, None);
+                assert_eq!(delivery, None);
+            }
+            other => panic!("expected x3_ended, got {other:?}"),
+        }
+        let loss = r#"{"event":"x3_loss","call_id":"c","from_tag":"f","dropped":1,"delivered":2,"dropped_since_ms":3}"#;
+        match serde_json::from_str::<Event>(loss).expect("x3_loss") {
+            Event::X3Loss { xid, delivery, .. } => {
+                assert_eq!(xid, None);
+                assert_eq!(delivery, None);
+            }
+            other => panic!("expected x3_loss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x3_end_and_loss_events_name_their_warrant_and_delivery() {
+        let xid: Xid = "8c292fa1-5831-46ec-86be-bd85f2083299".parse().expect("xid");
+        let ended = Event::X3Ended {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            xid: Some(xid),
+            delivery: Some("mdf.example.net:8090".into()),
+            reason: X3EndReason::Detached,
+            delivered: 1,
+            dropped: 0,
+        };
+        let value = serde_json::to_value(&ended).expect("to_value");
+        assert_eq!(value["xid"], "8c292fa1-5831-46ec-86be-bd85f2083299");
+        assert_eq!(value["delivery"], "mdf.example.net:8090");
+        assert_eq!(
+            serde_json::from_value::<Event>(value).expect("roundtrip"),
+            ended
+        );
+        let loss = Event::X3Loss {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            xid: Some(xid),
+            delivery: Some("mdf.example.net:8090".into()),
+            dropped: 1,
+            delivered: 2,
+            dropped_since_ms: 3,
+        };
+        let value = serde_json::to_value(&loss).expect("to_value");
+        assert_eq!(value["delivery"], "mdf.example.net:8090");
+        assert_eq!(
+            serde_json::from_value::<Event>(value).expect("roundtrip"),
+            loss
+        );
     }
 
     #[test]
@@ -3446,6 +3570,8 @@ mod tests {
         let loss = Event::X3Loss {
             call_id: "c".into(),
             from_tag: "f".into(),
+            xid: None,
+            delivery: None,
             dropped: 12,
             delivered: 20_000,
             dropped_since_ms: 45_000,
@@ -3461,6 +3587,8 @@ mod tests {
         let ended = Event::X3Ended {
             call_id: "c".into(),
             from_tag: "f".into(),
+            xid: None,
+            delivery: None,
             reason: X3EndReason::Detached,
             delivered: 20_000,
             dropped: 0,

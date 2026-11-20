@@ -50,6 +50,8 @@ struct Rig {
     engine: Engine<Datapath>,
     pki: Pki,
     listener: TcpListener,
+    /// A second Mediation Function, for the tests with two deliveries on one call.
+    second_listener: TcpListener,
     events: flume::Receiver<Event>,
 }
 
@@ -57,6 +59,7 @@ impl Rig {
     async fn new() -> Self {
         let pki = pki();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mdf");
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mdf");
         let engine = Engine::new(Datapath::new()).with_x3(pki.config.clone());
         tokio::spawn(run_redirect_dispatcher(
             engine.datapath().rx(),
@@ -71,6 +74,7 @@ impl Rig {
             engine,
             pki,
             listener,
+            second_listener,
             events,
         }
     }
@@ -144,9 +148,36 @@ impl Rig {
         self.send(self.attach_command(call, target_leg)).await
     }
 
+    /// The second delivery of `call`: another warrant, to the second Mediation Function.
+    async fn attach_second(&self, call: &str, target_leg: X3TargetLeg) -> CmdResult {
+        self.send(Command::AttachX3 {
+            call_id: call.into(),
+            from_tag: FROM_TAG.into(),
+            delivery: self
+                .second_listener
+                .local_addr()
+                .expect("mdf addr")
+                .to_string(),
+            xid: "1f0e0d0c-0b0a-4908-8706-050403020100"
+                .parse::<Xid>()
+                .expect("xid"),
+            correlation_id: CORRELATION_ID,
+            target_leg,
+        })
+        .await
+    }
+
     async fn accept(&self) -> Mdf {
+        self.accept_on(&self.listener).await
+    }
+
+    async fn accept_second(&self) -> Mdf {
+        self.accept_on(&self.second_listener).await
+    }
+
+    async fn accept_on(&self, listener: &TcpListener) -> Mdf {
         let acceptor = acceptor(&self.pki);
-        let (stream, _) = timeout(SHORT, self.listener.accept())
+        let (stream, _) = timeout(SHORT, listener.accept())
             .await
             .expect("the engine connects to the mediation function")
             .expect("accept");
@@ -959,4 +990,156 @@ async fn a_dtls_answer_local_leg_is_delivered_as_plaintext_never_ciphertext() {
         .map(|(_, payload)| payload.clone())
         .collect();
     assert_heard_was_delivered(&heard_plaintext, &delivered_to);
+}
+
+/// Both deliveries of a single-leg call (one per warrant, one naming each leg) survive `offer_far`
+/// growing the call into a relay, with the directions each warrant implies and no packet delivered
+/// twice to either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offer_far_keeps_both_deliveries_each_with_its_own_target_leg() {
+    let rig = Rig::new().await;
+    let caller = Phone::new().await;
+    let callee = Phone::new().await;
+    let toward_caller_leg = rig.answer_local("grow-two", &caller).await;
+    assert!(matches!(
+        rig.attach_as("grow-two", X3TargetLeg::Caller).await,
+        CmdResult::Ok { .. }
+    ));
+    let mut caller_target = rig.accept().await;
+    assert!(matches!(
+        rig.attach_second("grow-two", X3TargetLeg::Callee).await,
+        CmdResult::Ok { .. }
+    ));
+    let mut callee_target = rig.accept_second().await;
+
+    let (sent_before, _) = caller_talks(&caller, toward_caller_leg, 1, 10).await;
+    let offered = rig
+        .send(Command::OfferFar {
+            call_id: "grow-two".into(),
+            from_tag: FROM_TAG.into(),
+            profile: ProfileFlags::default(),
+        })
+        .await;
+    let toward_callee_leg = Rig::engine_address(&offered);
+    let answered = rig
+        .send(Command::Answer {
+            call_id: "grow-two".into(),
+            from_tag: FROM_TAG.into(),
+            to_tag: "tag-b".into(),
+            sdp: plain_sdp(callee.address, "sendrecv"),
+            profile: ProfileFlags::default(),
+        })
+        .await;
+    assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
+
+    let mut sent_caller = Vec::new();
+    let mut sent_callee = Vec::new();
+    for sequence in 21..41u16 {
+        let from_caller = rtp_from(CALLER_SSRC, sequence);
+        let from_callee = rtp_from(CALLEE_SSRC, sequence);
+        caller.send(&from_caller, toward_caller_leg).await;
+        callee.send(&from_callee, toward_callee_leg).await;
+        sent_caller.push(from_caller);
+        sent_callee.push(from_callee);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for (mdf, caller_direction, callee_direction) in [
+        (&mut caller_target, from_target(), to_target()),
+        (&mut callee_target, to_target(), from_target()),
+    ] {
+        mdf.read_until(|read| {
+            let caller_rtp = read
+                .iter()
+                .filter(|(_, payload)| ssrc_of(payload) == CALLER_SSRC)
+                .count();
+            let callee_rtp = read
+                .iter()
+                .filter(|(_, payload)| ssrc_of(payload) == CALLEE_SSRC)
+                .count();
+            caller_rtp >= sent_before.len() + sent_caller.len() && callee_rtp >= sent_callee.len()
+        })
+        .await;
+        for packet in &sent_caller {
+            let seen = mdf
+                .seen
+                .iter()
+                .filter(|(direction, payload)| *direction == caller_direction && payload == packet)
+                .count();
+            assert_eq!(
+                seen, 1,
+                "the caller's packet, once, in this warrant's direction"
+            );
+        }
+        for packet in &sent_callee {
+            let seen = mdf
+                .seen
+                .iter()
+                .filter(|(direction, payload)| *direction == callee_direction && payload == packet)
+                .count();
+            assert_eq!(seen, 1, "the callee's packet, once, in the other direction");
+        }
+    }
+    assert!(
+        !rig.second_connection().await,
+        "no third delivery connection"
+    );
+    assert!(
+        x3_ends(rig.drained_events()).is_empty(),
+        "offer_far ends no delivery"
+    );
+}
+
+/// Both deliveries survive a re-answer of the same dialog (the hand-over): neither ends, the
+/// sequences continue on the same connections, and the call ending ends each once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_answer_of_the_same_dialog_keeps_both_deliveries() {
+    let rig = Rig::new().await;
+    let caller = Phone::new().await;
+    let first = rig.answer_local("again-two", &caller).await;
+    assert!(matches!(
+        rig.attach("again-two").await,
+        CmdResult::Ok { .. }
+    ));
+    let mut one = rig.accept().await;
+    assert!(matches!(
+        rig.attach_second("again-two", X3TargetLeg::Caller).await,
+        CmdResult::Ok { .. }
+    ));
+    let mut two = rig.accept_second().await;
+    let (sent_first, _) = caller_talks(&caller, first, 1, 8).await;
+
+    let second = rig.answer_local("again-two", &caller).await;
+    let (sent_second, heard) = caller_talks(&caller, second, 100, 12).await;
+
+    for mdf in [&mut one, &mut two] {
+        mdf.read_until(|read| {
+            count(read, from_target()) >= sent_first.len() + sent_second.len()
+                && count(read, to_target()) >= heard.len() + 2
+        })
+        .await;
+        let delivered_from: Vec<&Vec<u8>> = mdf
+            .seen
+            .iter()
+            .filter(|(direction, _)| *direction == from_target())
+            .map(|(_, payload)| payload)
+            .collect();
+        for packet in sent_first.iter().chain(&sent_second) {
+            assert!(
+                delivered_from.contains(&packet),
+                "the caller's packet {} was delivered across the re-answer",
+                rtp_sequence(packet)
+            );
+        }
+    }
+    assert!(!rig.second_connection().await, "same delivery connections");
+    assert!(
+        x3_ends(rig.drained_events()).is_empty(),
+        "a re-answer of the same dialog ends no delivery"
+    );
+    rig.delete("again-two").await;
+    let ends = x3_ends(rig.drained_events());
+    assert_eq!(ends.len(), 2, "one end event per delivery");
+    assert!(ends
+        .iter()
+        .all(|(reason, _)| *reason == X3EndReason::CallEnded));
 }

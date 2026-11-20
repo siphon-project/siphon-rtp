@@ -642,8 +642,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 )
                 .await
             }
-            Command::DetachX3 { call_id, from_tag } => {
-                self.detach_x3(client, &call_id, &from_tag).await
+            Command::DetachX3 {
+                call_id,
+                from_tag,
+                xid,
+                delivery,
+            } => {
+                // A delivery address alone can be shared by two warrants, so it does not say which
+                // interception to end. Refused rather than guessed: ending the wrong warrant's
+                // delivery loses content an agency is owed.
+                if xid.is_none() && delivery.is_some() {
+                    return error_result(
+                        "detach_x3",
+                        &"delivery names one delivery of a warrant; give its xid too",
+                    );
+                }
+                let selector = super::intercept::X3Selector {
+                    xid,
+                    delivery: delivery.as_deref(),
+                };
+                self.detach_x3(client, &call_id, &from_tag, selector).await
             }
             other => CmdResult::Error {
                 reason: format!("unsupported command: {}", command_name(&other)),

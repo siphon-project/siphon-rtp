@@ -12,7 +12,9 @@ use siphon_rtp_proto::X3EndReason;
 use std::sync::atomic::Ordering;
 
 use crate::media_pipeline::MediaControl;
-use crate::x3::{ingress_directions, X3TapFactory};
+use crate::x3::{ingress_directions, X3Taps};
+
+use super::intercept::X3TapSource;
 
 use super::{Call, ClientId, Engine, PipelineKind, PromoteMode, PromotionReason};
 
@@ -26,7 +28,8 @@ impl Call {
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
-    /// Put `factory`'s ingress and egress taps on a single-leg call's media actor.
+    /// Put the ingress and egress taps of every delivery in `sources` on a single-leg call's media
+    /// actor, as the whole set.
     ///
     /// The actor must be the call's own pipeline: a call whose pipeline is being rebuilt (between
     /// `offer_far`'s answer and the relay it installs) is refused with a reason, never accepted with
@@ -34,8 +37,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     pub(super) async fn install_single_leg_x3(
         &self,
         call_id: &str,
-        factory: &X3TapFactory,
-        target_is_caller: bool,
+        sources: &[X3TapSource],
     ) -> Result<(), String> {
         let Some((pipeline, caller)) = self.owned_call_internal(call_id, |call| {
             (call.pipeline, call.caller_leg().rtp.local_addr)
@@ -54,9 +56,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // the callee. The caller's ingress is leg A's and the engine's egress is what the far side
         // sends it, so the one mapping of [`ingress_directions`] serves here as it does for two
         // parties, and the directions stay the same when `offer_far`'s party takes the callee over.
-        let (ingress_direction, egress_direction) = ingress_directions(target_is_caller);
-        let ingress = factory.tap(caller, ingress_direction);
-        let egress = factory.tap(caller, egress_direction);
+        let mut ingress = Vec::with_capacity(sources.len());
+        let mut egress = Vec::with_capacity(sources.len());
+        for source in sources {
+            let (ingress_direction, egress_direction) = ingress_directions(source.target_is_caller);
+            ingress.push(source.factory.tap(caller, ingress_direction));
+            egress.push(source.factory.tap(caller, egress_direction));
+        }
+        let (ingress, egress) = (X3Taps::new(ingress), X3Taps::new(egress));
         // Recorded so the call's media is not demoted from under the interception. The actor is the
         // call's processing pipeline already, so this promotes nothing.
         self.hold_in_userspace(call_id, PromotionReason::X3, PromoteMode::RelayOnly)
@@ -65,8 +72,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call_id,
             MediaControl::StartX3SingleLeg(Box::new((ingress, egress))),
         ) {
-            self.release_userspace_hold(call_id, PromotionReason::X3)
-                .await;
+            self.release_x3_hold_if_unused(call_id).await;
             return Err("media actor unavailable".to_string());
         }
         Ok(())
@@ -89,59 +95,74 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.stop_x3(call_id, X3EndReason::TransportError).await;
     }
 
-    /// Mark the interception of a single-leg call that a re-answer of the **same dialog** (same
-    /// call-id, from-tag and owner) is about to replace, so the replacement inherits it instead of
-    /// ending it. The caller is the same party in the same dialog: an interception that ended here
+    /// Mark the interceptions of a single-leg call that a re-answer of the **same dialog** (same
+    /// call-id, from-tag and owner) is about to replace, so the replacement inherits them instead of
+    /// ending them. The caller is the same party in the same dialog: an interception that ended here
     /// would leave the target's content flowing unintercepted (TS 103 221-2 clause 6: the delivery
     /// is tied to the call's X2 records, which do not change).
     ///
-    /// The session stays in the map for the whole hand-over, marked, so nothing can miss it: the old
-    /// call's teardown leaves it alone ([`Self::stop_x3`]) and a `detach_x3` that lands meanwhile is
-    /// recorded and honoured by [`Self::settle_x3_hand_over`]. Returns whether one is being handed
-    /// over. Any other replacement is a new call, and the interception ends with the old one.
+    /// The sessions stay in the map for the whole hand-over, marked, so nothing can miss them: the
+    /// old call's teardown leaves them alone ([`Self::stop_x3`]) and a `detach_x3` that lands meanwhile
+    /// is recorded per delivery and honoured by [`Self::settle_x3_hand_over`]. Returns whether any is
+    /// being handed over. Any other replacement is a new call, and the interceptions end with the
+    /// old one.
     pub(super) fn begin_x3_hand_over(
         &self,
         client: ClientId,
         call_id: &str,
         from_tag: &str,
     ) -> bool {
-        let Some(session) = self.x3_sessions.get(call_id) else {
+        let Some(sessions) = self.x3_sessions.get(call_id) else {
             return false;
         };
-        let same_dialog = session.owner == client && session.from_tag == from_tag;
-        if same_dialog {
+        let mut handing_over = false;
+        for session in sessions
+            .iter()
+            .filter(|session| session.owner == client && session.from_tag == from_tag)
+        {
             session.handing_over.store(true, Ordering::SeqCst);
+            handing_over = true;
         }
-        same_dialog
+        handing_over
     }
 
     /// The replacement call is registered: the hand-over is over. A withdrawal that arrived meanwhile
-    /// ends the interception now, `detached`, with exactly one `x3_ended`.
+    /// ends that delivery now, `detached`, with exactly one `x3_ended`; the others carry on.
     pub(super) async fn settle_x3_hand_over(&self, call_id: &str) {
-        let Some(requested) = self.x3_sessions.get(call_id).map(|session| {
-            session.handing_over.store(false, Ordering::SeqCst);
-            session.detach_requested.load(Ordering::SeqCst)
-        }) else {
-            return;
-        };
-        if requested {
-            self.stop_x3(call_id, X3EndReason::Detached).await;
+        let _changing = self.x3_sessions.lock.lock().await;
+        if let Some(sessions) = self.x3_sessions.get(call_id) {
+            for session in sessions.iter() {
+                session.handing_over.store(false, Ordering::SeqCst);
+            }
         }
+        self.end_x3_where(
+            call_id,
+            |session| session.detach_requested.load(Ordering::SeqCst),
+            |_| X3EndReason::Detached,
+        )
+        .await;
     }
 
-    /// The re-answer failed with nothing to replace the call: the interception ends with it.
+    /// The re-answer failed with nothing to replace the call: the interceptions end with it, a
+    /// delivery whose withdrawal had arrived as `detached`, the rest as `call_ended`.
     pub(super) async fn abandon_x3_hand_over(&self, call_id: &str) {
-        let requested = self.x3_sessions.get(call_id).map(|session| {
-            session.handing_over.store(false, Ordering::SeqCst);
-            session.detach_requested.load(Ordering::SeqCst)
-        });
-        if let Some(requested) = requested {
-            let reason = if requested {
-                X3EndReason::Detached
-            } else {
-                X3EndReason::CallEnded
-            };
-            self.stop_x3(call_id, reason).await;
+        let _changing = self.x3_sessions.lock.lock().await;
+        if let Some(sessions) = self.x3_sessions.get(call_id) {
+            for session in sessions.iter() {
+                session.handing_over.store(false, Ordering::SeqCst);
+            }
         }
+        self.end_x3_where(
+            call_id,
+            |_| true,
+            |session| {
+                if session.detach_requested.load(Ordering::SeqCst) {
+                    X3EndReason::Detached
+                } else {
+                    X3EndReason::CallEnded
+                }
+            },
+        )
+        .await;
     }
 }

@@ -367,24 +367,35 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         conference_id: &str,
         tag: &str,
     ) -> Result<(), String> {
-        let Some(factory) = self
-            .x3_sessions
-            .get(call_id)
-            .map(|session| session.factory.clone())
-        else {
+        // Under the sessions lock, so an attach or a detach cannot change the set between reading it
+        // and installing it on the seat.
+        let _changing = self.x3_sessions.lock.lock().await;
+        let factories: Vec<_> = self
+            .x3_tap_sources(call_id)
+            .into_iter()
+            .map(|source| source.factory)
+            .collect();
+        if factories.is_empty() {
             return Ok(());
-        };
-        self.install_room_x3(conference_id, tag, &factory).await
+        }
+        self.install_room_x3(conference_id, tag, &factories).await
     }
 
     /// Take the call's own taps off the media path it is leaving (a crypto bridge's, or the media
     /// actor's), keeping the interception itself: its delivery connection, Correlation ID and
     /// sequence counter belong to the call and carry on from the room.
     pub(super) fn stop_x3_call_taps(&self, call_id: &str) {
-        let Some(mut session) = self.x3_sessions.get_mut(call_id) else {
+        let Some(mut sessions) = self.x3_sessions.get_mut(call_id) else {
             return;
         };
-        for endpoint in std::mem::take(&mut session.bridged_endpoints) {
+        // Every delivery of the call names the same bridge endpoints, so each is cleared once.
+        let mut endpoints: Vec<_> = sessions
+            .iter_mut()
+            .flat_map(|session| std::mem::take(&mut session.bridged_endpoints))
+            .collect();
+        endpoints.sort_unstable_by_key(|endpoint| endpoint.0);
+        endpoints.dedup();
+        for endpoint in endpoints {
             self.bridge.clear_x3_tap(endpoint);
         }
         self.media

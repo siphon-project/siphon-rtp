@@ -48,6 +48,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
+/// The allocation counter is process-wide, so the measuring tests take turns.
+static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const SEATS: usize = 3;
 const WARM_FRAMES: u16 = 40;
 const MEASURED_FRAMES: u16 = 200;
@@ -106,15 +109,23 @@ fn return_buffers(delivery: &X3Delivery) -> usize {
 }
 
 /// Allocations over `MEASURED_FRAMES` ingest-and-tick frames of a three-seat room whose seat 1 is
-/// intercepted when `delivery` is given, and how many packets the interception delivered.
-fn allocations_of_the_room(tapped: bool) -> (usize, usize) {
+/// intercepted by `deliveries` interceptions (none for the baseline), and how many packets they
+/// delivered in all.
+fn allocations_of_the_room(deliveries: usize) -> (usize, usize) {
+    let _turn = MEASURING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut room = Conference::new("x3-zero-alloc".into(), 0);
     for index in 0..SEATS {
         room.add_participant(seat(index)).unwrap();
     }
-    let (factory, delivery) = x3_channel(4096);
-    if tapped {
-        assert!(room.set_seat_x3("seat-1", &factory));
+    let channels: Vec<_> = (0..deliveries).map(|_| x3_channel(4096)).collect();
+    if deliveries > 0 {
+        let factories: Vec<_> = channels
+            .iter()
+            .map(|(factory, _)| factory.clone())
+            .collect();
+        assert!(room.set_seat_x3("seat-1", &factories));
     }
     // Built before arming: building a packet allocates, handling one must not.
     let frames: Vec<Vec<RxPacket>> = (0..WARM_FRAMES + MEASURED_FRAMES)
@@ -129,7 +140,10 @@ fn allocations_of_the_room(tapped: bool) -> (usize, usize) {
             }
             out.clear();
             room.tick(&mut out);
-            delivered += return_buffers(&delivery);
+            delivered += channels
+                .iter()
+                .map(|(_, delivery)| return_buffers(delivery))
+                .sum::<usize>();
         }
         delivered
     };
@@ -147,8 +161,8 @@ fn allocations_of_the_room(tapped: bool) -> (usize, usize) {
 
 #[test]
 fn an_intercepted_seat_adds_no_allocation_to_the_rooms_packet_path() {
-    let (untapped, untapped_delivered) = allocations_of_the_room(false);
-    let (tapped, tapped_delivered) = allocations_of_the_room(true);
+    let (untapped, untapped_delivered) = allocations_of_the_room(0);
+    let (tapped, tapped_delivered) = allocations_of_the_room(1);
 
     assert_eq!(untapped_delivered, 0, "nothing is delivered with no tap");
     assert!(
@@ -159,5 +173,20 @@ fn an_intercepted_seat_adds_no_allocation_to_the_rooms_packet_path() {
     assert_eq!(
         tapped, untapped,
         "the interception allocates nothing beyond what the room itself does"
+    );
+}
+
+#[test]
+fn two_interceptions_of_a_seat_stay_allocation_free_on_the_rooms_packet_path() {
+    let (untapped, _) = allocations_of_the_room(0);
+    let (tapped, delivered) = allocations_of_the_room(2);
+
+    assert!(
+        delivered >= usize::from(MEASURED_FRAMES) * 4 - 16,
+        "both deliveries receive both directions of the seat ({delivered} packets)"
+    );
+    assert_eq!(
+        tapped, untapped,
+        "a set of two taps allocates nothing beyond what the room itself does"
     );
 }

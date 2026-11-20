@@ -165,6 +165,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // where the caller is the target, and the interception carries across a re-answer of the
             // same dialog and across `offer_far`.
             features.push("x3_single_leg".to_string());
+            // `x3_multi_delivery`: a call carries several deliveries (one per `xid` and `delivery`),
+            // and `detach_x3` takes an optional `xid` and `delivery`. `x3_ended` and `x3_loss` name
+            // the delivery they concern.
+            features.push("x3_multi_delivery".to_string());
         }
         features
     }

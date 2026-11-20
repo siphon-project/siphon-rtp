@@ -50,7 +50,7 @@ use siphon_rtp_proto::{Event, PlayEndReason, ProfileFlags, RtcpAppStream};
 use crate::app_events::{surface_app_packets, AppEventQueue, AppScope};
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
-use crate::x3::X3Tap;
+use crate::x3::X3Taps;
 
 mod ingress_clock;
 mod relay_tap;
@@ -750,10 +750,10 @@ pub struct Direction {
     ///
     /// The tap carries its own target-relative direction, fixed when it was installed, so the
     /// per-packet path does not branch on which leg is the warrant's target.
-    x3: Option<X3Tap>,
+    x3: X3Taps,
     /// Lawful-interception tap on what this direction **sends** toward the party, set only on the
     /// one direction of a single-leg call that faces its caller (media_pipeline/x3_single_leg.rs).
-    x3_egress: Option<X3Tap>,
+    x3_egress: X3Taps,
     decoder: Box<dyn Decoder>,
     encoder: Box<dyn Encoder>,
     /// Audio channels the decoder emits per frame (`decoder.params().channels`) — 1 for every
@@ -1587,8 +1587,8 @@ impl Direction {
             relay_only: false,
             tap: None,
             raw_tee: Vec::new(),
-            x3: None,
-            x3_egress: None,
+            x3: X3Taps::default(),
+            x3_egress: X3Taps::default(),
             decoder: config.decoder,
             encoder: config.encoder,
             ingress_channels,
@@ -1672,8 +1672,8 @@ impl Direction {
             relay_only: true,
             tap: config.tap_codec.map(TapDecode::new),
             raw_tee: Vec::new(),
-            x3: None,
-            x3_egress: None,
+            x3: X3Taps::default(),
+            x3_egress: X3Taps::default(),
             decoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             encoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             // A relay-only direction never decodes, so the channel fold and the decode-error counter
@@ -2206,8 +2206,8 @@ impl Direction {
         // It is also before the `relay_only` early return below, so an intercepted plain relay is
         // covered without being forced into a transcode. RTCP is filtered inside the tap (a PDU
         // declares payload format 8, "RTP packet").
-        if let Some(x3) = &self.x3 {
-            x3.deliver(source, data);
+        if !self.x3.is_empty() {
+            self.x3.deliver(source, data);
         }
 
         // Telemetry: the party's RTCP, as plaintext, for the HEP export. A leg carried here never
@@ -2652,8 +2652,8 @@ impl Direction {
             Bytes::copy_from_slice(plaintext)
         };
         // Lawful interception of a single-leg call's egress, on the plaintext just sent.
-        if let Some(x3) = &self.x3_egress {
-            x3.deliver_egress(self.egress_dst, plaintext);
+        if !self.x3_egress.is_empty() {
+            self.x3_egress.deliver_egress(self.egress_dst, plaintext);
         }
         out.push(Outbound {
             endpoint: self.egress_endpoint,
@@ -3570,32 +3570,34 @@ impl MediaCall {
 
     /// Begin lawful-interception content delivery on both legs (`Command::AttachX3`).
     ///
-    /// `taps` is `(leg A ingress tap, leg B ingress tap)`, each already carrying its target-relative
+    /// `taps` is `(leg A ingress taps, leg B ingress taps)`, one tap per delivery on the call, each already carrying its target-relative
     /// [`siphon_rtp_li::PayloadDirection`] — see [`crate::x3::ingress_directions`]. Both ingress taps
     /// together cover both directions of the call, so there is no egress tap: what leg B sends is
     /// what leg A receives.
     ///
-    /// Replacing an existing interception drops the old taps, which closes their channel and ends
-    /// the previous delivery task.
-    pub fn start_x3(&mut self, taps: (X3Tap, X3Tap)) {
+    /// The taps replace whatever was installed: the set is always the whole of the call's deliveries
+    /// (see `Engine::install_x3_taps`), so a delivery left out of it is a delivery that has ended.
+    pub fn start_x3(&mut self, taps: (X3Taps, X3Taps)) {
         let (leg_a, leg_b) = taps;
-        self.a_to_b.x3 = Some(leg_a);
-        self.b_to_a.x3 = Some(leg_b);
+        self.a_to_b.x3 = leg_a;
+        self.b_to_a.x3 = leg_b;
     }
 
     /// Stop lawful-interception content delivery (`Command::DetachX3`): drop both taps so the
     /// delivery task sees its channel close, drains what is buffered, and finishes. A no-op if this
     /// call is not under interception.
     pub fn stop_x3(&mut self) {
-        self.a_to_b.x3 = None;
-        self.b_to_a.x3 = None;
-        self.a_to_b.x3_egress = None;
+        self.a_to_b.x3 = X3Taps::default();
+        self.b_to_a.x3 = X3Taps::default();
+        self.a_to_b.x3_egress = X3Taps::default();
     }
 
     /// Whether this call is under lawful-interception content delivery (test/observability helper).
     #[must_use]
     pub fn is_intercepted(&self) -> bool {
-        self.a_to_b.x3.is_some() || self.b_to_a.x3.is_some() || self.a_to_b.x3_egress.is_some()
+        !self.a_to_b.x3.is_empty()
+            || !self.b_to_a.x3.is_empty()
+            || !self.a_to_b.x3_egress.is_empty()
     }
 
     /// Copy one accepted ingress datagram to the pcap sink, if recording. `leg_a` selects the capture
@@ -4167,10 +4169,10 @@ pub enum MediaControl {
     },
     /// Begin lawful-interception content delivery (ETSI TS 103 221-2 X3) on both legs. The tuple is
     /// `(leg A ingress tap, leg B ingress tap)`, each carrying its own target-relative direction.
-    StartX3(Box<(X3Tap, X3Tap)>),
+    StartX3(Box<(X3Taps, X3Taps)>),
     /// Begin lawful-interception delivery on a single-leg call: `(ingress tap, egress tap)`, the first
     /// for what the caller sends and the second for what the engine sends it.
-    StartX3SingleLeg(Box<(X3Tap, X3Tap)>),
+    StartX3SingleLeg(Box<(X3Taps, X3Taps)>),
     /// Stop lawful-interception content delivery, closing the delivery task's channel. Idempotent.
     StopX3,
     /// Attach a SIPREC / monitor fork to a source leg's decoded ingress audio (`source_a` selects
@@ -10676,8 +10678,8 @@ mod tests {
         let (factory, delivery) = crate::x3::x3_channel(64);
         let (direction_a, direction_b) = crate::x3::ingress_directions(target_is_caller);
         call.start_x3((
-            factory.tap(addr("127.0.0.1:10000"), direction_a),
-            factory.tap(addr("127.0.0.1:10002"), direction_b),
+            factory.tap(addr("127.0.0.1:10000"), direction_a).into(),
+            factory.tap(addr("127.0.0.1:10002"), direction_b).into(),
         ));
         delivery
     }

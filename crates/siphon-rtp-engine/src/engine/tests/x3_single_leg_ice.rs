@@ -59,7 +59,9 @@ async fn an_ice_answer_local_leg_is_intercepted_after_its_pair_is_selected() {
     let counters = factory.counters().clone();
     engine.x3_sessions.insert(
         "ice-x3".to_string(),
-        crate::engine::intercept::X3Session {
+        vec![crate::engine::intercept::X3Session {
+            xid: Default::default(),
+            delivery: "mdf.example.net:8090".to_string(),
             from_tag: "tag-a".to_string(),
             owner: CLIENT,
             bridged_endpoints: Vec::new(),
@@ -71,7 +73,7 @@ async fn an_ice_answer_local_leg_is_intercepted_after_its_pair_is_selected() {
             joined_endpoint: None,
             handing_over: Default::default(),
             detach_requested: Default::default(),
-        },
+        }],
     );
     engine.carry_x3_across_answer("ice-x3").await;
     assert!(

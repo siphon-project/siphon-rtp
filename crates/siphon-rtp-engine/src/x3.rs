@@ -284,6 +284,62 @@ impl X3Tap {
     }
 }
 
+/// Every tap one media-path position carries: one [`X3Tap`] per delivery on the call (a call can be
+/// intercepted by several warrants, or delivered to several Mediation Functions, at once).
+///
+/// Empty means not intercepted. Built when the taps are installed and replaced as a whole, never
+/// grown on the media path, so delivering allocates nothing: it iterates the slice. Held behind an
+/// `Arc` so a media path that snapshots the set per packet (the crypto bridges) clones a reference
+/// count, not a vector.
+#[derive(Debug, Clone, Default)]
+pub struct X3Taps(Arc<[X3Tap]>);
+
+impl X3Taps {
+    /// The taps of one position, one per delivery.
+    #[must_use]
+    pub fn new(taps: Vec<X3Tap>) -> Self {
+        Self(taps.into())
+    }
+
+    /// A set holding a single delivery's tap.
+    #[must_use]
+    pub fn single(tap: X3Tap) -> Self {
+        Self(Arc::from([tap]))
+    }
+
+    /// Whether no delivery taps this position.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// How many deliveries tap this position.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Deliver one accepted, decrypted packet to every delivery ([`X3Tap::deliver`]).
+    pub fn deliver(&self, source: SocketAddr, data: &[u8]) {
+        for tap in self.0.iter() {
+            tap.deliver(source, data);
+        }
+    }
+
+    /// Deliver one packet the engine sent to every delivery ([`X3Tap::deliver_egress`]).
+    pub fn deliver_egress(&self, destination: SocketAddr, data: &[u8]) {
+        for tap in self.0.iter() {
+            tap.deliver_egress(destination, data);
+        }
+    }
+}
+
+impl From<X3Tap> for X3Taps {
+    fn from(tap: X3Tap) -> Self {
+        Self::single(tap)
+    }
+}
+
 /// Builds the per-direction [`X3Tap`]s for one interception. Each tap carries its own engine-local
 /// address and its own target-relative direction, both fixed at install time so the media path does
 /// no work to decide them.
@@ -1099,5 +1155,51 @@ mod tests {
         let message = X3Error::NotConfigured.to_string();
         assert!(message.contains("x3_client_cert"), "{message}");
         assert!(message.contains("refusing"), "{message}");
+    }
+
+    #[test]
+    fn a_tap_set_delivers_each_packet_once_to_every_delivery_and_an_empty_one_to_none() {
+        let (first_factory, first) = x3_channel(8);
+        let (second_factory, second) = x3_channel(8);
+        let taps = X3Taps::new(vec![
+            first_factory.tap(
+                "198.51.100.1:20000".parse().unwrap(),
+                PayloadDirection::FromTarget,
+            ),
+            second_factory.tap(
+                "198.51.100.1:20000".parse().unwrap(),
+                PayloadDirection::ToTarget,
+            ),
+        ]);
+        assert_eq!(taps.len(), 2);
+        taps.deliver("192.0.2.1:4000".parse().unwrap(), &rtp(1));
+        taps.deliver_egress("192.0.2.1:4000".parse().unwrap(), &rtp(2));
+        for (delivery, direction) in [
+            (&first, PayloadDirection::FromTarget),
+            (&second, PayloadDirection::ToTarget),
+        ] {
+            let ingress = delivery.packets.try_recv().expect("the ingress packet");
+            let egress = delivery.packets.try_recv().expect("the egress packet");
+            assert_eq!(
+                ingress.direction, direction,
+                "each tap keeps its own direction"
+            );
+            assert_eq!(ingress.payload, rtp(1));
+            assert_eq!(egress.payload, rtp(2));
+            assert!(delivery.packets.try_recv().is_err(), "once each");
+        }
+
+        let none = X3Taps::default();
+        assert!(none.is_empty());
+        none.deliver("192.0.2.1:4000".parse().unwrap(), &rtp(3));
+        assert!(first.packets.try_recv().is_err());
+        assert!(
+            X3Taps::from(first_factory.tap(
+                "198.51.100.1:20000".parse().unwrap(),
+                PayloadDirection::FromTarget
+            ))
+            .len()
+                == 1
+        );
     }
 }

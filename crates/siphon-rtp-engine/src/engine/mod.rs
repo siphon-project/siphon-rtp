@@ -105,7 +105,7 @@ use crate::x3::X3Config;
 
 use fork::Subscription;
 use gather::TurnAllocation;
-use intercept::X3Session;
+use intercept::{X3Session, X3Sessions};
 use play::PendingFetch;
 use record::AudioRecording;
 use snapshot::{
@@ -1317,14 +1317,14 @@ pub struct Engine<D: Datapath> {
     /// `ws_tls_config` because it needs a client certificate (the Mediation Function authenticates
     /// the network element) and a private CA (the Mozilla bundle will not contain it).
     x3_tls_config: std::sync::OnceLock<Arc<rustls::ClientConfig>>,
-    /// Live interceptions, keyed by call-id. One per call; attaching again replaces the previous
-    /// one. Held here rather than in the media actor because the delivery task, its TLS connection
-    /// and the delivered/dropped counters outlive individual control ops and must be torn down on
-    /// `delete`.
-    x3_sessions: DashMap<String, X3Session>,
+    /// Live interceptions, keyed by call-id: one per (xid, delivery); attaching the same pair again
+    /// replaces only that one. Held here rather than in the media actor because the delivery task,
+    /// its TLS connection and the delivered/dropped counters outlive individual control ops and must
+    /// be torn down on `delete`.
+    x3_sessions: X3Sessions,
     /// Live interceptions of conference seats that joined their room (no call behind them), keyed by
     /// `(conference_id, tag)`: [`intercept_seat`].
-    x3_seat_sessions: DashMap<(String, String), X3Session>,
+    x3_seat_sessions: DashMap<(String, String), Vec<X3Session>>,
     /// The HEP telemetry export (VoIPmonitor / Homer), when the daemon enabled it via
     /// `SIPHON_RTP_HEP_COLLECTOR`. Set once at startup (after the engine is `Arc`-wrapped, so interior
     /// mutability), then shared read-only by the [`Self::run_rtcp_export`] task (per-interval RTCP/QoS)
