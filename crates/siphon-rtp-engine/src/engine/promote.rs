@@ -488,6 +488,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             forks,
             egress_taps,
             x3,
+            x3_single_leg,
             capture,
             dtmf_blocked,
         } = attachments;
@@ -511,6 +512,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(taps) = x3 {
             self.media
                 .control(call_id, MediaControl::StartX3(Box::new(taps)));
+        }
+        if let Some(taps) = x3_single_leg {
+            self.media
+                .control(call_id, MediaControl::StartX3SingleLeg(Box::new(taps)));
         }
         if let Some(capture) = capture {
             self.media

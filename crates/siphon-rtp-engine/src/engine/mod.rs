@@ -38,6 +38,7 @@ mod inject;
 mod install;
 mod intercept;
 mod intercept_seat;
+mod intercept_single_leg;
 mod key_mgmt;
 mod leg;
 mod media_started;

@@ -21,6 +21,20 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   when the seat leaves or the room stops. `conference_leave` on a seated call keeps the call's
   interception (a move between rooms must not end it). `node_info` lists `x3_conference_seat` on a node
   provisioned for X3.
+- **An engine-answered call (`answer_local`) can be intercepted.** `attach_x3` was refused on a call with
+  no second leg. The engine answering stands in for the callee, so `target_leg` applies as on two parties:
+  with the caller as the target what it sent is `from_target` and what the engine sent it (the prompt,
+  the comfort noise, in the clear and exactly as sent, never ciphertext) is `to_target`, and with the
+  callee as the target the two mirror, before and after `offer_far`'s party answers. The egress tap sits where every egress datagram passes, only on a
+  single-leg call, so a two-party call still delivers each packet once. The interception now survives
+  `offer_far` (the two ingress taps go on when the far party answers; a refused answer or a far
+  `delete` puts the single-party taps back) and a re-answer of the same dialog (same `call_id`,
+  `from_tag` and owner), which used to end it with `detached` / `call_ended` while the target's content
+  kept flowing; a `detach_x3` that lands during the re-answer is honoured, not lost. A ws_uri takeover and
+  an echo call stay refused, and `echo` and `attach_ws_bridge` are refused on an intercepted call rather
+  than leaving it attached and deaf. Behaviour change: `echo` was accepted on an intercepted two-party
+  call and silenced its delivery, and is now refused there too. `node_info` lists
+  `x3_single_leg` on a node provisioned for X3.
 
 ## [0.25.1] — 2026-11-20
 

@@ -54,6 +54,7 @@ use crate::x3::X3Tap;
 
 mod relay_tap;
 mod surrender;
+mod x3_single_leg;
 pub use relay_tap::CarriedAttachments;
 use relay_tap::TapDecode;
 pub use surrender::SurrenderedCall;
@@ -748,6 +749,9 @@ pub struct Direction {
     /// The tap carries its own target-relative direction, fixed when it was installed, so the
     /// per-packet path does not branch on which leg is the warrant's target.
     x3: Option<X3Tap>,
+    /// Lawful-interception tap on what this direction **sends** toward the party, set only on the
+    /// one direction of a single-leg call that faces its caller (media_pipeline/x3_single_leg.rs).
+    x3_egress: Option<X3Tap>,
     decoder: Box<dyn Decoder>,
     encoder: Box<dyn Encoder>,
     /// Audio channels the decoder emits per frame (`decoder.params().channels`) — 1 for every
@@ -1580,6 +1584,7 @@ impl Direction {
             tap: None,
             raw_tee: Vec::new(),
             x3: None,
+            x3_egress: None,
             decoder: config.decoder,
             encoder: config.encoder,
             ingress_channels,
@@ -1659,6 +1664,7 @@ impl Direction {
             tap: config.tap_codec.map(TapDecode::new),
             raw_tee: Vec::new(),
             x3: None,
+            x3_egress: None,
             decoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             encoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             // A relay-only direction never decodes, so the channel fold and the decode-error counter
@@ -2623,6 +2629,10 @@ impl Direction {
         } else {
             Bytes::copy_from_slice(plaintext)
         };
+        // Lawful interception of a single-leg call's egress, on the plaintext just sent.
+        if let Some(x3) = &self.x3_egress {
+            x3.deliver_egress(self.egress_dst, plaintext);
+        }
         out.push(Outbound {
             endpoint: self.egress_endpoint,
             dst: self.egress_dst,
@@ -3557,12 +3567,13 @@ impl MediaCall {
     pub fn stop_x3(&mut self) {
         self.a_to_b.x3 = None;
         self.b_to_a.x3 = None;
+        self.a_to_b.x3_egress = None;
     }
 
     /// Whether this call is under lawful-interception content delivery (test/observability helper).
     #[must_use]
     pub fn is_intercepted(&self) -> bool {
-        self.a_to_b.x3.is_some() || self.b_to_a.x3.is_some()
+        self.a_to_b.x3.is_some() || self.b_to_a.x3.is_some() || self.a_to_b.x3_egress.is_some()
     }
 
     /// Copy one accepted ingress datagram to the pcap sink, if recording. `leg_a` selects the capture
@@ -4135,6 +4146,9 @@ pub enum MediaControl {
     /// Begin lawful-interception content delivery (ETSI TS 103 221-2 X3) on both legs. The tuple is
     /// `(leg A ingress tap, leg B ingress tap)`, each carrying its own target-relative direction.
     StartX3(Box<(X3Tap, X3Tap)>),
+    /// Begin lawful-interception delivery on a single-leg call: `(ingress tap, egress tap)`, the first
+    /// for what the caller sends and the second for what the engine sends it.
+    StartX3SingleLeg(Box<(X3Tap, X3Tap)>),
     /// Stop lawful-interception content delivery, closing the delivery task's channel. Idempotent.
     StopX3,
     /// Attach a SIPREC / monitor fork to a source leg's decoded ingress audio (`source_a` selects
@@ -4679,6 +4693,9 @@ async fn run_media_call<D>(
                     }
                     MediaInput::Control(MediaControl::StopRecording) => call.stop_recording(),
                     MediaInput::Control(MediaControl::StartX3(taps)) => call.start_x3(*taps),
+                    MediaInput::Control(MediaControl::StartX3SingleLeg(taps)) => {
+                        call.start_x3_single_leg(*taps);
+                    }
                     MediaInput::Control(MediaControl::StopX3) => call.stop_x3(),
                     MediaInput::Control(MediaControl::AttachNearSecureLeg { leg }) => {
                         call.attach_near_secure_leg(leg);
