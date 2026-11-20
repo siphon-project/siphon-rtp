@@ -432,9 +432,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// released — then build the replacement.
     ///
     /// Note this is *replacement*, not re-negotiation: the new call gets fresh ports, so the peer
-    /// must be told the new address. A true re-offer (SIP re-INVITE — renegotiating codecs or
-    /// addresses on the *existing* ports, and the trigger an RFC 8445 §9 ICE restart needs) is a
-    /// separate control verb that does not exist yet.
+    /// must be told the new address. A true re-offer (SIP re-INVITE — renegotiating on the
+    /// *existing* ports, and the trigger an RFC 8445 §9 ICE restart needs) is the `reoffer` verb.
+    /// The NG front end, which has no such verb, reaches it through `Engine::handle_ng`; what falls
+    /// through to here from there (a codec change, an unknown from-tag) is a replace on purpose.
     async fn replace_offered_call(&self, client: ClientId, call_id: &str) -> Option<CmdResult> {
         if let Some(existing) = self.calls.get(call_id) {
             if !existing.admits(client, call_id) {

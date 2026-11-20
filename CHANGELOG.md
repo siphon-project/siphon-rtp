@@ -19,6 +19,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   re-answer, a joined seat), so a carry never moves some and drops others, and the userspace hold goes
   when the last one does. `node_info` lists `x3_multi_delivery` on a node provisioned for X3.
 
+### Fixed
+
+- **An rtpengine NG `offer` on a live call renegotiates it instead of replacing it.** A proxy sends
+  `offer` again for every re-INVITE (hold, resume, session refresh), and each one tore the call down
+  (CDR reason `replaced`), moved the engine ports under both peers and ended an attached interception.
+  An NG `offer` whose `from-tag` is the call's A tag, or its B tag once answered, is now a re-offer: the
+  ports and the interception stay, and the NG `answer` completes it (reversed tags for B's). A refused
+  re-offer (a codec change) and an unknown `from-tag` still replace the call. The JSON `offer` is
+  unchanged.
+
 ## [0.25.2] — 2026-11-20
 
 ### Fixed
