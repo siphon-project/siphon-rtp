@@ -225,6 +225,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             self.awaiting_media.remove(&seat_endpoint);
                             self.release_endpoint(seat_endpoint).await;
                         }
+                        self.end_orphaned_seat_x3().await;
                         tracing::warn!(
                             target: "siphon_rtp::media",
                             conference = %conference_id, tag, ?endpoint,
@@ -606,6 +607,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.endpoint_calls.remove(endpoint);
             self.awaiting_media.remove(endpoint);
         }
+        self.end_orphaned_seat_x3().await;
         freed.len()
     }
 

@@ -581,6 +581,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.awaiting_media.remove(&endpoint);
             self.release_endpoint(endpoint).await;
         }
+        // The seat is gone, and so is whatever interception it carried (ETSI TS 103 221-2).
+        self.stop_x3_seat(
+            conference_id,
+            from_tag,
+            siphon_rtp_proto::X3EndReason::CallEnded,
+        )
+        .await;
         ok_empty()
     }
 

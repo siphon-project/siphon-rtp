@@ -232,6 +232,25 @@ impl X3Tap {
     /// delivery task through the recycle channel. On a full buffer the *arriving* packet is
     /// discarded, keeping what has been delivered a contiguous prefix, and the drop is counted.
     pub fn deliver(&self, source: SocketAddr, data: &[u8]) {
+        self.enqueue(source, self.destination, data);
+    }
+
+    /// Deliver one packet the engine **sent** toward the intercepted party: the egress counterpart of
+    /// [`Self::deliver`], for a path that originates its own stream (a conference room's
+    /// mixed-minus-self stream, which no ingress tap ever sees).
+    ///
+    /// The tap's address is the engine endpoint the packet leaves from, so it is the PDU's source,
+    /// and `destination` is where the packet was sent. That is taken per packet, not fixed at install
+    /// time, because a seat's reply address can latch after the tap went on (docs/security-and-nat.md
+    /// §4), and TS 103 221-2 §5.3 wants the addresses the packet really travelled between.
+    ///
+    /// Same contract as [`Self::deliver`]: `data` is plaintext, taken after the engine decided to send
+    /// it, never blocks and never allocates on a steady interception.
+    pub fn deliver_egress(&self, destination: SocketAddr, data: &[u8]) {
+        self.enqueue(self.destination, destination, data);
+    }
+
+    fn enqueue(&self, source: SocketAddr, destination: SocketAddr, data: &[u8]) {
         if data.len() < 2 {
             return;
         }
@@ -245,7 +264,7 @@ impl X3Tap {
         payload.extend_from_slice(data);
         let packet = X3Packet {
             source,
-            destination: self.destination,
+            destination,
             intercepted_unix_nanos: self.clock.unix_nanos(),
             direction: self.direction,
             payload,
@@ -828,6 +847,48 @@ mod tests {
         assert_eq!(packet.destination, local);
         assert_eq!(packet.direction, PayloadDirection::FromTarget);
         assert_eq!(packet.payload, rtp(1));
+    }
+
+    #[test]
+    fn an_egress_delivery_takes_the_destination_per_packet_and_the_tap_address_as_source() {
+        // A packet the engine sent toward the party: the engine endpoint it left from is the PDU's
+        // source and the address it was sent to is the destination, read per packet because a seat's
+        // reply address can latch after the tap was installed.
+        let (factory, delivery) = x3_channel(8);
+        let local = address(20000);
+        let tap = factory.tap(local, PayloadDirection::ToTarget);
+
+        tap.deliver_egress(address(16384), &rtp(1));
+        tap.deliver_egress(address(16386), &rtp(2));
+
+        let first = delivery.packets.try_recv().expect("first");
+        assert_eq!(first.source, local);
+        assert_eq!(first.destination, address(16384));
+        assert_eq!(first.direction, PayloadDirection::ToTarget);
+        assert_eq!(first.payload, rtp(1));
+        let second = delivery.packets.try_recv().expect("second");
+        assert_eq!(second.destination, address(16386), "the latched address");
+    }
+
+    #[test]
+    fn an_egress_delivery_skips_rtcp_and_runts_like_an_ingress_one() {
+        let (factory, delivery) = x3_channel(8);
+        let tap = factory.tap(address(20000), PayloadDirection::ToTarget);
+        tap.deliver_egress(address(16384), &rtcp());
+        tap.deliver_egress(address(16384), &[0x80]);
+        assert!(delivery.packets.try_recv().is_err());
+        assert_eq!(delivery.counters.dropped(), 0);
+    }
+
+    #[test]
+    fn an_egress_delivery_on_a_full_buffer_discards_the_arriving_packet_and_counts_it() {
+        let (factory, delivery) = x3_channel(1);
+        let tap = factory.tap(address(20000), PayloadDirection::ToTarget);
+        tap.deliver_egress(address(16384), &rtp(1));
+        tap.deliver_egress(address(16384), &rtp(2));
+        assert_eq!(delivery.counters.dropped(), 1);
+        let kept = delivery.packets.try_recv().expect("the first is kept");
+        assert_eq!(kept.payload, rtp(1), "a contiguous prefix");
     }
 
     /// A clock the test moves by hand.

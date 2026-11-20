@@ -318,7 +318,7 @@ A refusal leaves the call relaying exactly as it was:
 | The call is unanswered, single-leg, a WebSocket takeover, `fax_passthrough`, or carries text or fax | named in the reason |
 | The call's SRTP runs end to end and the engine holds no key | `the engine holds no key to decrypt the leg` |
 | A DTLS leg whose handshake has not completed | `the leg's DTLS-SRTP handshake has not completed` |
-| A pcap recording, WebSocket tee or bridge, interception, subscription, DTMF block or echo mode is attached | `<feature> is attached to the call; stop it first`, naming it |
+| A pcap recording, WebSocket tee or bridge, subscription, DTMF block or echo mode is attached | `<feature> is attached to the call; stop it first`, naming it. A lawful interception is not one of them: it follows the leg into the room |
 
 ### The call while it is seated
 

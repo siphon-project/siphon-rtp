@@ -158,6 +158,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // gates attaching at the INVITE, rather than at the ACK, on this entry.
         if self.x3_config.is_some() {
             features.push("x3_attach_at_offer".to_string());
+            // `x3_conference_seat`: an interception follows a call's leg into a conference room, is
+            // accepted on a seated call, and can be attached to a seat that joined a room.
+            features.push("x3_conference_seat".to_string());
         }
         features
     }

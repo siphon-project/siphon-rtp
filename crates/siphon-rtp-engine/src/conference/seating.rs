@@ -80,6 +80,8 @@ pub(super) struct CallSeatState {
     pub(super) egress_taps: Vec<Box<dyn MediaSink>>,
     /// The seat's own prompts (`play_media` on the call), mixed into what it hears.
     pub(super) playback: Option<Box<SeatPlayback>>,
+    /// The lawful interception taps on this seat, when the seat is the target ([`super::x3`]).
+    pub(super) x3: Option<Box<super::x3::X3SeatTaps>>,
 }
 
 impl CallSeatState {
@@ -120,6 +122,7 @@ impl CallSeatState {
             ingress_taps: Vec::new(),
             egress_taps: Vec::new(),
             playback: None,
+            x3: None,
         }
     }
 }
@@ -171,6 +174,19 @@ pub enum SeatControl {
         gain: Gain,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
+    /// Put a lawful interception's taps on one seat ([`Conference::set_seat_x3`]). `reply` carries
+    /// whether the tag was seated.
+    SetX3 {
+        tag: String,
+        factory: crate::x3::X3TapFactory,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Take a lawful interception's taps off one seat ([`Conference::clear_seat_x3`]). `reply`
+    /// carries whether the tag was seated.
+    ClearX3 {
+        tag: String,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     /// Gate what the room sends one seat ([`Conference::set_egress_gate`]). `reply` carries whether
     /// the tag was seated.
     EgressGate {
@@ -201,6 +217,16 @@ impl Conference {
                 reply,
             } => {
                 let _ = reply.send(self.add_seat_tap(&tag, egress, sink));
+            }
+            SeatControl::SetX3 {
+                tag,
+                factory,
+                reply,
+            } => {
+                let _ = reply.send(self.set_seat_x3(&tag, &factory));
+            }
+            SeatControl::ClearX3 { tag, reply } => {
+                let _ = reply.send(self.clear_seat_x3(&tag));
             }
             SeatControl::RemoveSeatTapsTagged { tag, label } => {
                 self.remove_seat_taps_tagged(&tag, &label);

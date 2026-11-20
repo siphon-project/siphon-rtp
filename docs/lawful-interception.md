@@ -123,6 +123,45 @@ one Correlation ID and one sequence. `target_leg: callee` is resolved then too. 
 any answer ends the interception with `call_ended` and nothing delivered. A call with no second leg at
 all (a local answer) is still refused.
 
+### Conference rooms
+
+A target is not lost when its call is merged into a conference room: the same `conference_seat` works
+with a warrant attached (the merge must not tell the target it is intercepted), and the interception
+carries on from the room on the **same delivery connection, Correlation ID and PDU sequence**. The
+room's own taps are put on the seat while it is still pending, before the leg moves, so no packet the
+room handles goes undelivered. If the room cannot take them, `conference_seat` is refused and the call
+is left exactly as it was, still relaying and still intercepted.
+
+In a room the target is always **the seated party**, whichever leg the warrant named at attach time:
+
+| Room tap | Meaning | Direction |
+|---|---|---|
+| The seat's ingress, after the source gate and the SRTP unprotect | what the target sent | 3 (from target) |
+| What the room sends the seat, in the clear, built and protected successfully | the room's mixed-minus-self stream for the target | 2 (to target) |
+
+Direction 2 is the stream the target actually receives: the room's own SSRC, sequence and timestamp
+for that seat, including a telephone-event the room forwards to it, and nothing when the room sends
+the seat nothing (a pending, blocked or discontinuous-transmission frame). It is never another seat's
+raw stream. Its PDU source is the engine address the seat talks to and its destination is where the
+packet was sent, read per packet because a seat's reply address can latch after the attach.
+
+`attach_x3` and `detach_x3` are accepted on a call whose leg is **seated** (not on one that has left
+its room: it relays nothing until it is seated again). A seat that **joined** a room with
+`conference_join` has no call, so it is intercepted by naming the room as `call_id` and the seat's
+tag as `from_tag`; only the control client that seated it can attach to it. Its `x3_started`,
+`x3_loss` and `x3_ended` events carry the room id and the tag. It ends with `call_ended` when the seat
+leaves (a `conference_leave`, an idle reap or a failed ICE check) and so when its room stops, and
+with `detached` on `detach_x3`.
+
+`conference_leave` on a seated **call** does not end its interception: the call lives on, and a move
+from one room to another must not break the warrant. The room's taps leave with the seat and a seat in
+any room puts them back on the same connection; the interception ends with the call (`call_ended`) or
+on `detach_x3`. If the seat fails after the call's old media path was already stopped (a room that
+closed mid-move), the call's media is gone and the interception ends loudly with `transport_error`.
+
+Not covered in a room: RFC 4103 real-time text on a seat's `m=text` stream, which is not audio RTP.
+`node_info` lists `x3_conference_seat` on a node provisioned for X3.
+
 ### Events
 
 | Event | Meaning |
@@ -139,7 +178,7 @@ all (a local answer) is still refused.
 | Same-codec SDES or DTLS-SRTP bridge | Delivered (crypto-bridge tap) |
 | WebSocket takeover (`ws_uri`) | **Refused** — the far side is a media server, not a second party |
 | Echo test | **Refused** — no second party, and the echo path bypasses the tap |
-| Conference participant | **Not covered** — a room seat is a separate media path |
+| Conference seat (`conference_seat`, or joined with `conference_join`) | Delivered (room tap), see [Conference rooms](#conference-rooms) |
 
 Each unsupported shape is refused at the command with a reason, never accepted silently.
 

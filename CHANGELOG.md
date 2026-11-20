@@ -5,6 +5,23 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **A target merged into a conference room stays intercepted.** `conference_seat` was refused on a call
+  with `attach_x3` attached, while the same merge works without a warrant, so the target could tell it
+  was being intercepted, and its audio in the room was lost. The merge now goes through: the interception
+  keeps its delivery connection, Correlation ID and PDU sequence, and the room delivers the seat as the
+  target (what it sent as `from_target`, the stream the room sends it as `to_target`, never another
+  seat's raw stream). The room's taps go on while the seat is still pending, so no packet the room
+  handles is missed, and a room that cannot take them refuses the move with the call untouched.
+  `attach_x3` / `detach_x3` are accepted on a seated call. A seat that joined with `conference_join` is
+  intercepted by naming the room as `call_id` and the seat's tag as `from_tag`; it ends with `call_ended`
+  when the seat leaves or the room stops. `conference_leave` on a seated call keeps the call's
+  interception (a move between rooms must not end it). `node_info` lists `x3_conference_seat` on a node
+  provisioned for X3.
+
 ## [0.25.1] — 2026-11-20
 
 ### Fixed
