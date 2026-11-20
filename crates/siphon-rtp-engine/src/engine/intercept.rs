@@ -256,14 +256,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return Err("call no longer exists".to_string());
         };
 
-        // A WebSocket-takeover call's far side is a media server, not a party: there is no second
-        // leg whose content a warrant covers, and the leg's media never reaches the pipeline.
-        if self.ws.is_ws_call(call_id) || pipeline == PipelineKind::Ws {
-            return Err(
-                "a WebSocket-takeover call (ws_uri) has no relayed second party to intercept"
-                    .to_string(),
-            );
-        }
+        // A WebSocket-takeover call is intercepted on its one party, the media server standing in for
+        // the callee ([`Self::install_ws_x3`]): the leg's taps sit in the bridge, not in a pipeline.
+        let ws_call = self.ws.is_ws_call(call_id) || pipeline == PipelineKind::Ws;
         // Echo mode reflects a party's audio back to itself through `Direction::echo_into`, which
         // bypasses `Direction::handle` — and therefore bypasses the X3 tap and the decrypt that
         // precedes it. Rather than deliver nothing (or, worse, ciphertext), refuse and say so.
@@ -289,7 +284,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // leg that is offered but not answered yet is a warrant that can match at the INVITE, and
         // content (early media included) flows from the first answer on. What is left without any
         // far leg is not a call the engine answered, so there is nothing to tap.
-        if !has_far_leg && !in_room && !single_leg {
+        if !has_far_leg && !in_room && !single_leg && !ws_call {
             return Err("the call has no second leg to intercept".to_string());
         }
 
@@ -324,7 +319,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // every answer, the first one included, puts the taps onto whatever it installed
         // ([`Self::carry_x3_across_answer`]), so a 183's early media and the final answer share one
         // delivery.
-        let bridged_endpoints = if answered || in_room || single_leg {
+        let bridged_endpoints = if answered || in_room || single_leg || ws_call {
             let mut sources = others.clone();
             sources.push(X3TapSource {
                 factory: factory.clone(),
@@ -529,19 +524,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         // An engine-answered caller with no far party answering (yet): its own pipeline carries the
         // media, with an ingress and an egress tap on the one party.
-        if single_leg {
+        if single_leg && pipeline != PipelineKind::Ws {
             self.install_single_leg_x3(call_id, sources).await?;
             return Ok(Vec::new());
         }
         // §5.2.6 is target-relative, and only the warrant knows which leg is the target.
-        let mut taps_a = Vec::with_capacity(sources.len());
-        let mut taps_b = Vec::with_capacity(sources.len());
-        for source in sources {
-            let (direction_a, direction_b) = ingress_directions(source.target_is_caller);
-            taps_a.push(source.factory.tap(a_local, direction_a));
-            taps_b.push(source.factory.tap(b_local, direction_b));
-        }
-        let (taps_a, taps_b) = (X3Taps::new(taps_a), X3Taps::new(taps_b));
+        let (taps_a, taps_b) = tap_pairs(sources, a_local, b_local);
 
         match pipeline {
             // A leg seated in a conference room is tapped by the room that owns its media: the seated
@@ -611,10 +599,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
                 Ok(Vec::new())
             }
-            PipelineKind::Ws => Err(
-                "a WebSocket-takeover call (ws_uri) has no relayed second party to intercept"
-                    .to_string(),
-            ),
+            // Reached only by a call that records a takeover but has no bridge route: refused with
+            // the reason [`Self::install_ws_x3`] gives, never accepted with no taps behind it.
+            PipelineKind::Ws => {
+                self.install_ws_x3(call_id, sources)?;
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -847,6 +837,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.bridge.clear_x3_tap(*endpoint);
         }
         self.media.control(call_id, MediaControl::StopX3);
+        if let Some(leg) = self.ws.egress_of(call_id) {
+            leg.taps().clear();
+        }
         if let Some((conference_id, tag)) = self.seated_room(call_id) {
             self.clear_room_x3(&conference_id, &tag).await;
         }
@@ -988,6 +981,25 @@ pub(super) fn emit_x3_ended(
             dropped,
         });
     }
+}
+
+/// The two tap positions of a call for every delivery in `sources`: the first at `first` carrying
+/// [`ingress_directions`]'s first direction, the second at `second` carrying its second. For two
+/// parties they are leg A's and leg B's ingress; for a single-leg call (and a takeover leg) the
+/// caller's ingress and the engine's egress, both at the caller's endpoint.
+pub(super) fn tap_pairs(
+    sources: &[X3TapSource],
+    first: std::net::SocketAddr,
+    second: std::net::SocketAddr,
+) -> (X3Taps, X3Taps) {
+    let mut at_first = Vec::with_capacity(sources.len());
+    let mut at_second = Vec::with_capacity(sources.len());
+    for source in sources {
+        let (direction_first, direction_second) = ingress_directions(source.target_is_caller);
+        at_first.push(source.factory.tap(first, direction_first));
+        at_second.push(source.factory.tap(second, direction_second));
+    }
+    (X3Taps::new(at_first), X3Taps::new(at_second))
 }
 
 /// The factories of a set of sessions' tap sources.

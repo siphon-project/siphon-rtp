@@ -169,6 +169,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // and `detach_x3` takes an optional `xid` and `delivery`. `x3_ended` and `x3_loss` name
             // the delivery they concern.
             features.push("x3_multi_delivery".to_string());
+            // `x3_ws_takeover`: `attach_x3` is accepted on a WebSocket-takeover call (`ws_uri`, or a
+            // call taken over with `attach_ws_bridge`), the bridge's media server standing in for the
+            // callee, and the interception follows the leg onto a bridge, across a re-point and back.
+            features.push("x3_ws_takeover".to_string());
         }
         features
     }

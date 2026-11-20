@@ -4546,10 +4546,7 @@ impl MediaRegistry {
     /// decides whether to wait for it.
     fn detach_actor(&self, call_id: &str) -> Option<tokio::task::JoinHandle<()>> {
         let (_, handle) = self.calls.remove(call_id)?;
-        let _ = handle
-            .mailbox
-            .try_send(MediaInput::Control(MediaControl::Stop));
-        // Dropped first, so the stopping actor receives nothing more while it drains.
+        // Dropped first (`dispatch` holds a route while it queues), so no packet queues behind `Stop`.
         for endpoint in handle
             .endpoints
             .iter()
@@ -4561,6 +4558,9 @@ impl MediaRegistry {
             // signalled address, never from the previous call's peer.
             self.observed.remove(&endpoint);
         }
+        let _ = handle
+            .mailbox
+            .try_send(MediaInput::Control(MediaControl::Stop));
         Some(handle.task)
     }
 }

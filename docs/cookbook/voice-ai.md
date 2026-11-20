@@ -572,7 +572,7 @@ taken over, and every refusal carries its own token:
 |---|---|
 | Secure (SDES / DTLS) offerer | `ws-takeover-secure-offerer` |
 | ICE leg | `ws-takeover-ice-offerer` |
-| Recording, SIPREC subscription, WS tee, DTMF block or X3 interception attached | `ws-takeover-call-is-held` |
+| Recording, SIPREC subscription, WS tee or DTMF block attached (an X3 interception is carried onto the bridge) | `ws-takeover-call-is-held` |
 | Transcoding, secure-bridge or already-promoted call | `ws-takeover-not-a-plain-relay` |
 | Unanswered offer | `ws-takeover-not-answered` |
 
@@ -590,7 +590,7 @@ stopping it would stop that silently:
 
 | Shape | Reason token |
 |---|---|
-| pcap recording, WS tee, SIPREC subscription, DTMF block, echo or X3 interception on the leg | `ws-takeover-anchor-busy` |
+| pcap recording, WS tee, SIPREC subscription, DTMF block or echo on the leg (an X3 interception is carried onto the bot) | `ws-takeover-anchor-busy` |
 
 The first two are the same structural refusals `offer` and `answer` make for `ws_uri`, for the same
 reasons: on a two-leg call the engine is not the offerer's cryptographic far side, and no ICE agent

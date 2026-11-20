@@ -225,19 +225,73 @@ ID and PDU sequence:
   replaces the call's pipeline and endpoints. The caller is the same party in the same dialog and the X2
   records the Correlation ID ties the delivery to do not change, so ending the interception there would
   leave the target's content flowing undelivered. The replacement inherits it. A re-answer under another
-  `from_tag` or from another client is a different call and ends the interception with `call_ended`;
-  one that is a WebSocket takeover (`ws_uri`) cannot carry it and ends it with `transport_error`. The
-  hand-over is atomic as far as `detach_x3` can tell: the session stays registered while the old call is
+  `from_tag` or from another client is a different call and ends the interception with `call_ended`.
+  A re-answer into a WebSocket takeover (`ws_uri`) carries it onto the bridge
+  ([WebSocket takeover calls](#websocket-takeover-calls)). The hand-over is atomic as far as `detach_x3` can tell: the session stays registered while the old call is
   torn down and the new one is registered, a `detach_x3` that lands meanwhile is accepted and honoured the
   moment the replacement exists (`detached`, one `x3_ended`), and `attach_x3` in that window is refused
   with a retry reason. The first comfort-noise frame a rebuilt pipeline sends can precede its taps by a
   moment; the caller's own media is never missed, because it only arrives after the answer.
 
-Refused, with the reason unchanged: a WebSocket takeover (`ws_uri`), whose media goes to the server and
-never through the pipeline, and an echo call. While an interception is attached, `echo` and
-`attach_ws_bridge` are refused on the call (`echo` bypasses the tap and a bridge removes the pipeline),
-so the call is never left attached and deaf (a behaviour change for two-party calls too: `echo` was accepted on an intercepted call and silenced its delivery). `node_info` lists `x3_single_leg` on a node provisioned for
-X3.
+Refused, with the reason unchanged: an echo call. While an interception is attached, `echo` is refused
+on the call (it bypasses the tap), so the call is never left attached and deaf (a behaviour change for
+two-party calls too: `echo` was accepted on an intercepted call and silenced its delivery).
+`node_info` lists `x3_single_leg` on a node provisioned for X3.
+
+### WebSocket takeover calls
+
+A call whose audio goes to a WebSocket media server (`ws_uri` on `answer_local`, `offer` or `answer`, or
+a bridge attached with `attach_ws_bridge`) is intercepted on its one party, the server standing in for
+the callee, so the directions are the engine-answered ones: with `target_leg: caller` what the caller
+sent is `from_target` and what the engine sent it (the bot's audio and the idle comfort noise, in the
+clear, as sent) is `to_target`, and with `callee` the two mirror (§5.2.6).
+
+- **Ingress** is delivered in `WsRegistry::dispatch` after the source gate, the SRTP (or DTLS-SRTP)
+  authentication and the symmetric-RTP latch accepted the packet: plaintext, never a refused packet.
+- **Egress** is delivered by the bridge's drain task on the plaintext packet it sent, after the packet
+  was encrypted successfully on a secure leg and right before it goes on the socket. A frame an unkeyed
+  or failing secure leg dropped is not delivered, since it was never sent.
+- The taps belong to the leg, not to the connection. They ride the leg's state across a re-point
+  (`attach_ws_bridge` on a call that has a bridge), so a re-point never misses a packet.
+
+The interception carries across every change of shape, on one delivery connection, Correlation ID and
+PDU sequence: attached at the offer on a call whose answer names `ws_uri`; an intercepted two-party
+relay or an intercepted engine-answered call taken over by `attach_ws_bridge` (it is no longer refused,
+which the target could notice); `detach_ws_bridge` back to the relay or the engine's pipeline; and a
+re-answer of the same dialog into a `ws_uri`.
+
+Packets that arrive while a call switches over are warranted content, so the switch is ordered to
+leave no gap: the new path is registered and tapped **before** the old one lets go of the leg, and a
+packet takes exactly one of the two (the redirect dispatcher offers it to the pipeline or relay actor
+before the bridge), so it is delivered once, never twice.
+
+- A takeover of a relay that only the interception held in the userspace pipeline keeps leg A on the
+  relay actor until the bridge is registered and tapped, then stops the actor (awaited, so what it had
+  queued is delivered first). Leg B and the companion RTCP endpoints are displaced first; B's media is
+  not relayed during a takeover, as without a warrant.
+- A plain engine-answered caller handed to a bot, and a plain bridge handed back to the engine's
+  pipeline, are done the same way (new path first, old path stopped after).
+- A detach back to a relay promotes the relay-only actor, tapped before it takes its first packet,
+  while the bridge still holds the leg, then stops the bridge. An actor that takes a leg is built
+  already tapped; a tap installed by message afterwards could queue behind the packets already sent.
+- **Not invertible: a secure (SDES or DTLS-SRTP) leg handed to a bot or back.** The leg's one SRTP
+  context has exactly one owner at a time (RFC 3711 section 9.1), so it must leave the old owner before
+  the new one can decrypt anything. Packets that arrive in between cannot be decrypted by either and
+  are not accepted. The window runs from the old owner releasing the leg to the new one being keyed:
+  on the way to the bot, the actor's teardown plus the bridge build (decoders, resamplers and the
+  optional uplink VAD, so the neural detector is the long pole); on the way back, the bridge's task
+  join plus the pipeline build. Both are short synchronous work, about a packet or less at 20 ms
+  ptime; the length was not measured. An interception never sees these packets, and neither does
+  anything else.
+- During the overlap of the plain cases the old and new path may both send on the leg for the few
+  milliseconds the stop takes (comfort noise from the bridge beside the pipeline's).
+
+The server ending the bridge (`ws_bridge_ended`) does not end the interception: the call stays up, the
+session stays attached and nothing flows meanwhile. It ends with `call_ended` when the call is deleted.
+If the taps cannot be put onto a rebuilt path (a failed re-anchor, a relay that cannot be restored), the
+deliveries end loudly with `transport_error` and an `error!` on `siphon_rtp::li`. Still refused while a
+recording, SIPREC subscription, WebSocket tee or DTMF block is attached, as before. `node_info` lists
+`x3_ws_takeover` on a node provisioned for X3.
 
 ### Events
 
@@ -253,7 +307,7 @@ X3.
 |---|---|
 | Plain relay, transcoding, SRTP transcode, DTLS transcode | Delivered (media pipeline tap) |
 | Same-codec SDES or DTLS-SRTP bridge | Delivered (crypto-bridge tap) |
-| WebSocket takeover (`ws_uri`) | **Refused** — the far side is a media server, not a second party |
+| WebSocket takeover (`ws_uri`, `attach_ws_bridge`) | Delivered (ingress in the bridge's dispatch, egress in its drain), see [WebSocket takeover calls](#websocket-takeover-calls) |
 | Echo test | **Refused** — no second party, and the echo path bypasses the tap |
 | Conference seat (`conference_seat`, or joined with `conference_join`) | Delivered (room tap), see [Conference rooms](#conference-rooms) |
 | Engine-answered call (`answer_local`), also while `offer_far` grows it | Delivered (ingress and egress taps, the caller is the target), see [Engine-answered calls](#engine-answered-calls) |

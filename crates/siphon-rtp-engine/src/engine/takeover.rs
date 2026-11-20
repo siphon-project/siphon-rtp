@@ -18,6 +18,7 @@ use super::negotiate::{apply_received_from, bridge_source_filter, random_ssrc};
 use super::{error_result, ok_empty, unknown_call, ClientId, Engine, Leg, PipelineKind};
 
 mod anchor;
+mod x3;
 
 /// Everything [`Engine::setup_ws_bridge`] needs to stand one WebSocket-takeover bridge up. A struct
 /// rather than a parameter list because a secure takeover adds the leg's SRTP state and its ICE gate
@@ -153,6 +154,10 @@ pub(super) struct WsRelayTakeover {
     restore: Vec<(EndpointId, FlowAction)>,
     /// The [`PipelineKind`] the call had before the takeover, restored alongside the flows.
     restore_pipeline: PipelineKind,
+    /// The relay was held in the userspace pipeline by a lawful interception alone: its actor is
+    /// released when the bridge takes the leg, and the interception follows the leg onto the bridge.
+    /// A detach puts the relay back on the kernel path and the interception back on a pipeline.
+    release_actor: bool,
 }
 
 /// A live WebSocket **takeover** bridge, tracked per call alongside the [`crate::ws_bridge`]
@@ -301,10 +306,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Switch the displaced relay off (all `Drop`) and redirect A's RTP here in one step, so the
         // dispatcher routes A to the bridge and B's ingress stops being forwarded onto A's socket.
         // Empty at negotiation time — there is no relay to displace before the call is answered.
+        //
+        // A relay that only an interception held in the userspace pipeline keeps leg A on its actor
+        // until the bridge is registered and tapped (the caller then stops the actor): leg A stays
+        // redirected, so no packet of it is ever dropped or left untapped at the switch. The
+        // dispatcher offers a packet to the actor before the bridge, so a packet takes exactly one
+        // path and is delivered once.
+        let keep_a: Option<EndpointId> = takeover
+            .as_ref()
+            .is_some_and(|t| t.release_actor)
+            .then_some(endpoint_a);
         if let Some(takeover) = takeover.as_ref() {
             for (endpoint, action) in &takeover.displace {
+                if Some(*endpoint) == keep_a {
+                    continue;
+                }
                 if let Err(error) = self.datapath.install_flow(*endpoint, *action) {
-                    let _ = self.restore_displaced_relay(takeover);
+                    let _ = self.restore_displaced_relay_except(takeover, keep_a.as_slice());
                     return Err(format!("displace relay flow for WS takeover: {error}"));
                 }
             }
@@ -313,7 +331,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // Nothing owns the leg yet, so put the relay back rather than leave the call half
             // displaced with no bridge and no record to detach.
             if let Some(takeover) = takeover.as_ref() {
-                let _ = self.restore_displaced_relay(takeover);
+                let _ = self.restore_displaced_relay_except(takeover, keep_a.as_slice());
             }
             return Err(format!("install WS bridge redirect: {error}"));
         }
@@ -463,6 +481,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // datapath's latch nor `Datapath::adopt_source` would ever reach it.
         // Reused verbatim on a re-point (see `WsBridgeSetup::egress`), so a selection or a latch that
         // has already landed keeps steering the downlink; minted at `a_rtp` for a first attach.
+        let egress_carried = existing_egress.is_some();
         let egress = existing_egress
             .unwrap_or_else(|| Arc::new(crate::ws_bridge::WsEgress::new(a_rtp, ice_pending)));
         // The drain: forward each rendered downlink RTP packet out A's endpoint toward A, encrypting
@@ -474,6 +493,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let drain_endpoint = endpoint_a;
         let drain_secure = secure.clone();
         let drain_egress = egress.subscribe();
+        let drain_taps = egress.taps().subscribe();
         let drain_task = tokio::spawn(async move {
             let mut sealed = Vec::new();
             while let Ok(packet) = rtp_out_rx.recv_async().await {
@@ -483,18 +503,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // An ICE leg before its agent selects: nowhere it may send (RFC 8445 §12).
                     continue;
                 };
-                let datagram: &[u8] = match drain_secure.as_ref() {
-                    None => &packet,
-                    Some(secure) => {
-                        sealed.clear();
-                        if !secure.protect_egress(&packet, &mut sealed) {
-                            // Fail closed: an unkeyed leg (DTLS still handshaking) or a crypto failure
-                            // drops the frame. Sending it in the clear toward a peer that negotiated
-                            // SRTP is both unplayable and a confidentiality break.
-                            continue;
-                        }
-                        &sealed
-                    }
+                // Fail closed: an unkeyed leg (DTLS still handshaking) or a crypto failure drops the
+                // frame. Sending it in the clear toward a peer that negotiated SRTP is both
+                // unplayable and a confidentiality break. A frame that is sent is first delivered, in
+                // plaintext, to the lawful-interception taps of the leg.
+                let Some(datagram) = crate::ws_x3::downlink_datagram(
+                    &packet,
+                    drain_secure.as_deref(),
+                    &mut sealed,
+                    &drain_taps,
+                    destination,
+                ) else {
+                    continue;
                 };
                 if let Err(error) = datapath.send(drain_endpoint, destination, datagram).await {
                     tracing::debug!(%error, "ws bridge downlink send failed");
@@ -542,6 +562,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 control,
             },
         );
+        // A bridge stood up on an intercepted call is tapped from its first packet. A re-point carries
+        // the leg's egress state, taps included, so only a new leg needs it.
+        if !egress_carried {
+            self.tap_new_bridge(call_id);
+        }
         tracing::info!(
             target: "siphon_rtp::media",
             call_id,
@@ -554,16 +579,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Ok(())
     }
 
-    /// Reinstall the `Forward` rules a takeover displaced. Shared by the detach path and by the
-    /// rollback in [`Self::setup_ws_bridge`].
+    /// Reinstall the `Forward` rules a takeover displaced, except on the endpoints in `keep`. Shared
+    /// by the detach path and by the rollback in [`Self::setup_ws_bridge`].
     ///
     /// Every rule is attempted even after one fails, so a partial restore is as complete as it can
     /// be rather than stopping at the first endpoint — but the failure is both logged at ERROR and
     /// returned, because a leg left without a flow has no media path and the controller has to hear
     /// about it.
-    fn restore_displaced_relay(&self, takeover: &WsRelayTakeover) -> Result<(), String> {
+    ///
+    /// The endpoints in `keep` are left as they are: those a relay actor owns, whose redirect is its
+    /// route and must not be replaced by a kernel `Forward` rule.
+    fn restore_displaced_relay_except(
+        &self,
+        takeover: &WsRelayTakeover,
+        keep: &[EndpointId],
+    ) -> Result<(), String> {
         let mut failure: Option<String> = None;
         for (endpoint, action) in &takeover.restore {
+            if keep.contains(endpoint) {
+                continue;
+            }
             if let Err(error) = self.datapath.install_flow(*endpoint, *action) {
                 tracing::error!(
                     %error,
@@ -766,18 +801,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Checked before the pipeline kind, because each of these *promotes* a plain relay into the
         // media pipeline: reporting the promotion ("this call is Media") would name the symptom,
         // where naming the feature tells the controller what to stop.
-        if self.ws_tees.contains_key(call_id)
-            || self.x3_sessions.contains_key(call_id)
-            || self.call_has_userspace_hold(call_id)
-        {
+        // A lawful interception is no reason to refuse: a refusal the target could notice, and the
+        // interception is carried onto the bridge instead.
+        if self.held_beyond_x3(call_id) {
             return Err(
-                "ws-takeover-call-is-held: a recording, SIPREC subscription, WebSocket tee, DTMF \
-                 block or lawful-interception delivery is attached to this call and taps the media \
-                 path a takeover removes; stop it first"
+                "ws-takeover-call-is-held: a recording, SIPREC subscription, WebSocket tee or DTMF \
+                 block is attached to this call and taps the media path a takeover removes; stop it \
+                 first"
                     .to_string(),
             );
         }
-        if pipeline != PipelineKind::Passthrough || self.media.is_media_call(call_id) {
+        // A relay that only the interception moved into the userspace pipeline is still a plain relay
+        // underneath, and is what a detach gives back.
+        let relay_held_for_x3 = self.is_relay_held_for_x3(call_id);
+        if !relay_held_for_x3
+            && (pipeline != PipelineKind::Passthrough || self.media.is_media_call(call_id))
+        {
             return Err(format!(
                 "ws-takeover-not-a-plain-relay: only a plain two-party relay can be taken over at \
                  runtime, and this call is {pipeline:?} — a transcoding, secure-bridge or promoted \
@@ -807,9 +846,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // is actually using. With nothing observed yet, fall back to the same `received-from`-seeded
         // address the negotiation paths aim at rather than the raw signalled one; the bridge's own
         // latch then corrects it on leg A's first accepted packet.
-        let a_rtp = self
-            .datapath
-            .latched_source(near.rtp.id)
+        let observed = if relay_held_for_x3 {
+            self.media.latched_source(near.rtp.id)
+        } else {
+            None
+        };
+        let a_rtp = observed
+            .or_else(|| self.datapath.latched_source(near.rtp.id))
             .unwrap_or_else(|| ws_takeover_media_address(signalled, received_from));
         // …and the gate stays exactly the one the negotiation installed on this endpoint, rather
         // than a fresh one derived from the signalling: `Redirect` bypasses the datapath's gate, so
@@ -833,32 +876,57 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .map(|(endpoint, _)| (*endpoint, FlowAction::Drop))
                 .collect(),
             restore: relay_flows,
-            restore_pipeline: pipeline,
+            // What the relay is underneath: the interception's hold is taken again on detach.
+            restore_pipeline: if relay_held_for_x3 {
+                PipelineKind::Passthrough
+            } else {
+                pipeline
+            },
+            release_actor: relay_held_for_x3,
         };
-        self.setup_ws_bridge(WsBridgeSetup {
-            call_id,
-            ws_uri,
-            endpoint_a: near.rtp.id,
-            a_rtp,
-            codec: Some(&codec),
-            accepted_source,
-            // Refused above for both shapes that would need them.
-            ice_pending: false,
-            secure: None,
-            // The attach's own profile, or — without one — the leg's own rate with every uplink
-            // stage off: the relay being taken over was negotiated without a bridge, so there is no
-            // earlier choice to inherit.
-            processing: requested.unwrap_or_default(),
-            egress: None,
-            takeover: Some(takeover),
-            // Nothing has been displaced yet — `setup_ws_bridge` dials before it installs a flow, so
-            // a dial failure here leaves the relay exactly as it was.
-            socket: None,
-        })
-        .await?;
+        let installed = self
+            .setup_ws_bridge(WsBridgeSetup {
+                call_id,
+                ws_uri,
+                endpoint_a: near.rtp.id,
+                a_rtp,
+                codec: Some(&codec),
+                accepted_source,
+                // Refused above for both shapes that would need them.
+                ice_pending: false,
+                secure: None,
+                // The attach's own profile, or — without one — the leg's own rate with every uplink
+                // stage off: the relay being taken over was negotiated without a bridge, so there is no
+                // earlier choice to inherit.
+                processing: requested.unwrap_or_default(),
+                egress: None,
+                takeover: Some(takeover.clone()),
+                // Nothing has been displaced yet — `setup_ws_bridge` dials before it installs a flow, so
+                // a dial failure here leaves the relay exactly as it was.
+                socket: None,
+            })
+            .await;
+        if let Err(reason) = installed {
+            if relay_held_for_x3 {
+                // The actor still owns leg A (it is stopped only once the bridge is live): put the
+                // other endpoints back and leave the relay and its taps as they were.
+                let _ = self.restore_displaced_relay_except(&takeover, &[near.rtp.id]);
+                if !self.media.is_media_call(call_id) {
+                    self.rehold_relay_for_x3(call_id).await;
+                }
+            }
+            return Err(reason);
+        }
+        if relay_held_for_x3 {
+            // The bridge is registered and tapped: only now does the actor let go of leg A. Awaited,
+            // so a packet it had queued is processed and delivered before it exits, and the bridge
+            // never runs alongside it past this point.
+            self.media.stop(call_id).await;
+        }
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.pipeline = PipelineKind::Ws;
         }
+        self.carry_x3_across_answer(call_id).await;
         Ok(())
     }
 
@@ -898,15 +966,45 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 Err(reason) => error_result("detach_ws_bridge", &reason),
             };
         };
+        // An intercepted call goes back onto a pipeline **before** the bridge lets go of leg A: the
+        // relay-only actor is registered already tapped and the dispatcher offers a packet to it
+        // before the bridge, so from that moment leg A's packets reach the actor, each on one path
+        // and delivered once. Leg A and B stay redirected (the actor owns them); only the endpoints
+        // it does not own are restored below.
+        let to_actor = self.x3_sessions.contains_key(call_id);
+        if to_actor {
+            if let Some(mut call) = self.calls.get_mut(call_id) {
+                call.pipeline = takeover.restore_pipeline;
+            }
+            self.carry_x3_across_answer(call_id).await;
+        }
+        let owned_by_actor: Vec<EndpointId> = if to_actor && self.media.is_media_call(call_id) {
+            self.owned_call_internal(call_id, |call| {
+                std::iter::once(call.near.rtp.id)
+                    .chain(call.far.as_ref().map(|far| far.rtp.id))
+                    .collect()
+            })
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
             .await;
         // Put the relay back exactly as it was. A failure here leaves the call with no audio path,
         // which the controller must hear about — it is the one outcome worse than refusing.
-        if let Err(reason) = self.restore_displaced_relay(&takeover) {
+        if let Err(reason) = self.restore_displaced_relay_except(&takeover, &owned_by_actor) {
+            self.end_x3_unservable(call_id, &reason).await;
             return error_result("detach_ws_bridge: restore relay flow", &reason);
         }
-        if let Some(mut call) = self.calls.get_mut(call_id) {
-            call.pipeline = takeover.restore_pipeline;
+        if owned_by_actor.is_empty() {
+            if let Some(mut call) = self.calls.get_mut(call_id) {
+                call.pipeline = takeover.restore_pipeline;
+            }
+            // No actor took the relay (not intercepted, or it could not be rebuilt and the
+            // interception ended): an interception attached since goes onto the restored relay.
+            if !to_actor {
+                self.carry_x3_across_answer(call_id).await;
+            }
         }
         tracing::info!(
             target: "siphon_rtp::media",
@@ -1242,6 +1340,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 call.ice = None;
             }
         }
+        // An interception attached at the offer is tapped onto the bridge now: this answer returns
+        // before the settle that carries it across on every other path, and without the carry the
+        // interception would stay attached with no taps and no `x3_ended`.
+        self.carry_x3_across_answer(call_id).await;
         self.ok_sdp_keyed(call_id, rewritten, Some(answer_to_tag), profile)
             .await
     }

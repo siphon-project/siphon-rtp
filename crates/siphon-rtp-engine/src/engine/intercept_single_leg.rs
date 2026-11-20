@@ -12,7 +12,6 @@ use siphon_rtp_proto::X3EndReason;
 use std::sync::atomic::Ordering;
 
 use crate::media_pipeline::MediaControl;
-use crate::x3::{ingress_directions, X3Taps};
 
 use super::intercept::X3TapSource;
 
@@ -56,14 +55,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // the callee. The caller's ingress is leg A's and the engine's egress is what the far side
         // sends it, so the one mapping of [`ingress_directions`] serves here as it does for two
         // parties, and the directions stay the same when `offer_far`'s party takes the callee over.
-        let mut ingress = Vec::with_capacity(sources.len());
-        let mut egress = Vec::with_capacity(sources.len());
-        for source in sources {
-            let (ingress_direction, egress_direction) = ingress_directions(source.target_is_caller);
-            ingress.push(source.factory.tap(caller, ingress_direction));
-            egress.push(source.factory.tap(caller, egress_direction));
-        }
-        let (ingress, egress) = (X3Taps::new(ingress), X3Taps::new(egress));
+        let (ingress, egress) = super::intercept::tap_pairs(sources, caller, caller);
         // Recorded so the call's media is not demoted from under the interception. The actor is the
         // call's processing pipeline already, so this promotes nothing.
         self.hold_in_userspace(call_id, PromotionReason::X3, PromoteMode::RelayOnly)
