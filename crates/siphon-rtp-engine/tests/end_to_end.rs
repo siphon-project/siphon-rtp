@@ -2263,6 +2263,8 @@ async fn detach_x3_is_idempotent_and_leaves_the_call_relaying() {
             .request(Command::DetachX3 {
                 call_id: "x3-detach".into(),
                 from_tag: "tag-a".into(),
+                xid: None,
+                delivery: None,
             })
             .await;
         assert!(
@@ -2288,6 +2290,8 @@ async fn detach_x3_is_refused_for_an_unknown_call() {
         .request(Command::DetachX3 {
             call_id: "x3-no-such-call".into(),
             from_tag: "tag-a".into(),
+            xid: None,
+            delivery: None,
         })
         .await;
     assert!(

@@ -30,7 +30,7 @@ use crate::dtls_bridge::DtlsBridge;
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::plain_tap::{PlainTapSender, PlainTaps};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
-use crate::x3::X3Tap;
+use crate::x3::X3Taps;
 
 /// The SSRC of an RTP media datagram, or `None` for anything else (RTCP, STUN, DTLS). What the
 /// symmetric latch keys a stream on (RFC 3550 §8), shared with the other `Redirect` consumers.
@@ -126,7 +126,7 @@ struct Flow {
     /// after the authentication decision: a failed `unprotect` returns before it. On a transcrypt
     /// that intermediate is the *only* plaintext there is, so the tap is what keeps a
     /// secure-to-secure call interceptable at all.
-    x3: Option<X3Tap>,
+    x3: X3Taps,
     /// Which refusals this flow has already logged at `warn`, so the operator hears about each once
     /// per negotiation rather than 50 times a second. Every refused datagram is still counted in the
     /// endpoint's `packets_dropped`.
@@ -463,25 +463,26 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             .collect()
     }
 
-    /// Install a lawful-interception content tap on one bridged endpoint's ingress, replacing any
-    /// tap already there. Returns whether the endpoint is bridged here; a DTLS endpoint is delegated
+    /// Install the lawful-interception content taps (one per delivery on the call) on one bridged
+    /// endpoint's ingress, replacing any set already there. Returns whether the endpoint is bridged here; a DTLS endpoint is delegated
     /// to the sibling bridge.
     ///
     /// The caller decides which endpoint gets which tap, because only it knows which leg the warrant
     /// names — the direction on a PDU is target-relative, and the bridge's own keying says which
     /// sides are encrypted, not which party is the target.
-    pub fn set_x3_tap(&self, endpoint: EndpointId, tap: X3Tap) -> bool {
+    pub fn set_x3_tap(&self, endpoint: EndpointId, taps: impl Into<X3Taps>) -> bool {
+        let taps = taps.into();
         if let Some(mut flow) = self.flows.get_mut(&endpoint) {
-            flow.x3 = Some(tap);
+            flow.x3 = taps;
             return true;
         }
-        self.dtls.set_x3_tap(endpoint, tap)
+        self.dtls.set_x3_tap(endpoint, taps)
     }
 
     /// Remove the lawful-interception tap from one bridged endpoint. Idempotent.
     pub fn clear_x3_tap(&self, endpoint: EndpointId) {
         if let Some(mut flow) = self.flows.get_mut(&endpoint) {
-            flow.x3 = None;
+            flow.x3 = X3Taps::default();
         }
         self.dtls.clear_x3_tap(endpoint);
     }
@@ -671,9 +672,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         // flow was handed it, a `Decrypt` flow produced it, and a transcrypt holds it only here.
         // Reached only after the source gate above and after the crypto succeeded, so a forged or
         // replayed packet — which returns above — is never delivered.
-        if let Some(x3) = &x3 {
-            x3.deliver(packet.source, plaintext);
-        }
+        x3.deliver(packet.source, plaintext);
         // A tee's or a recording's copy, from the same place and for the same reason: the only
         // plaintext. Dropped rather than queued when a consumer falls behind.
         if !plain_taps.is_empty() && !siphon_rtp_srtp::leg::is_rtcp(plaintext) {

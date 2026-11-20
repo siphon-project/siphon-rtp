@@ -17,9 +17,9 @@
 use siphon_rtp_datapath::Datapath;
 use siphon_rtp_proto::{CmdResult, Event, X3EndReason, X3TargetLeg, Xid};
 
-use crate::x3::x3_channel;
+use crate::x3::{x3_channel, X3TapFactory};
 
-use super::intercept::{X3Session, X3TransportSpec};
+use super::intercept::{X3Selector, X3Session, X3TransportSpec};
 use super::{error_result, ok_empty, unknown_call, ClientId, Engine};
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -49,6 +49,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if !self.owns_joined_seat(client, conference_id, tag) {
             return unknown_call(conference_id);
         }
+        // Held by `attach_x3`, which is the one entry point.
         match self
             .start_x3_seat(
                 client,
@@ -85,16 +86,41 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some(endpoint) = self.conference.joined_seat_endpoint(conference_id, tag) else {
             return Err("the seat no longer exists".to_string());
         };
-        // Replacing a live interception: stop the old one first, so its teardown cannot remove the
-        // taps just installed.
+        // Replacing a live delivery (same warrant, same address): stop that one first, so its
+        // teardown cannot remove the taps just installed. The seat's other deliveries carry on.
         let key = (conference_id.to_string(), tag.to_string());
-        if self.x3_seat_sessions.contains_key(&key) {
-            self.stop_x3_seat(conference_id, tag, X3EndReason::Detached)
-                .await;
-        }
+        self.end_x3_seat_where(
+            conference_id,
+            tag,
+            |session| session.xid == xid && session.delivery == delivery,
+            |_| X3EndReason::Detached,
+        )
+        .await;
 
         let (factory, delivery_channel) = x3_channel(config.buffer_packets);
-        self.install_room_x3(conference_id, tag, &factory).await?;
+        // The room is installed with the whole set of the seat: the deliveries it already carries and
+        // this one.
+        let mut factories = self.seat_x3_factories(&key);
+        let others = factories.clone();
+        factories.push(factory.clone());
+        if let Err(reason) = self.install_room_x3(conference_id, tag, &factories).await {
+            // A refused install may have cost the other deliveries their taps.
+            if !others.is_empty()
+                && self
+                    .install_room_x3(conference_id, tag, &others)
+                    .await
+                    .is_err()
+            {
+                self.end_x3_seat_where(
+                    conference_id,
+                    tag,
+                    |_| true,
+                    |_| X3EndReason::TransportError,
+                )
+                .await;
+            }
+            return Err(reason);
+        }
 
         let counters = factory.counters().clone();
         let (transport, ended) = self.spawn_x3_transport(X3TransportSpec {
@@ -109,9 +135,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             from_tag: tag,
             counters: counters.clone(),
         });
-        self.x3_seat_sessions.insert(
-            key,
-            X3Session {
+        self.x3_seat_sessions
+            .entry(key)
+            .or_default()
+            .push(X3Session {
+                xid,
+                delivery: delivery.to_string(),
                 from_tag: tag.to_string(),
                 owner: client,
                 bridged_endpoints: Vec::new(),
@@ -123,8 +152,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 joined_endpoint: Some(endpoint),
                 handing_over: Default::default(),
                 detach_requested: Default::default(),
-            },
-        );
+            });
         self.push_event(
             client,
             Event::X3Started {
@@ -147,33 +175,98 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Ok(())
     }
 
-    /// `detach_x3` on a joined seat. Idempotent for a seat that exists; an unknown or foreign seat
-    /// is an unknown call.
+    /// `detach_x3` on a joined seat: the deliveries `selector` names. Idempotent for a seat that
+    /// exists; an unknown or foreign seat is an unknown call. Called with the sessions lock held.
     pub(super) async fn detach_x3_seat(
         &self,
         client: ClientId,
         conference_id: &str,
         tag: &str,
+        selector: X3Selector<'_>,
     ) -> CmdResult {
         if !self.owns_joined_seat(client, conference_id, tag) {
             return unknown_call(conference_id);
         }
-        self.stop_x3_seat(conference_id, tag, X3EndReason::Detached)
-            .await;
+        self.end_x3_seat_where(
+            conference_id,
+            tag,
+            |session| selector.matches(session),
+            |_| X3EndReason::Detached,
+        )
+        .await;
         ok_empty()
     }
 
-    /// Tear a joined seat's interception down: take the taps off, let the delivery task drain and
-    /// report `x3_ended` once. A no-op for a seat that is not intercepted.
+    /// The tap factories of every delivery on a seat, in attach order.
+    fn seat_x3_factories(&self, key: &(String, String)) -> Vec<X3TapFactory> {
+        self.x3_seat_sessions
+            .get(key)
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .map(|session| session.factory.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Tear every interception of a joined seat down: take the taps off, let the delivery tasks
+    /// drain and report `x3_ended` once each. A no-op for a seat that is not intercepted.
     pub(super) async fn stop_x3_seat(&self, conference_id: &str, tag: &str, reason: X3EndReason) {
-        let Some((_, session)) = self
-            .x3_seat_sessions
-            .remove(&(conference_id.to_string(), tag.to_string()))
-        else {
+        let _changing = self.x3_sessions.lock.lock().await;
+        self.end_x3_seat_where(conference_id, tag, |_| true, |_| reason)
+            .await;
+    }
+
+    /// End the deliveries of a joined seat that `select` picks and leave the rest delivering, their
+    /// taps installed again as the seat's whole set. Callers hold the sessions lock.
+    async fn end_x3_seat_where(
+        &self,
+        conference_id: &str,
+        tag: &str,
+        select: impl Fn(&X3Session) -> bool,
+        reason_of: impl Fn(&X3Session) -> X3EndReason,
+    ) {
+        let key = (conference_id.to_string(), tag.to_string());
+        let mut ended: Vec<(X3Session, X3EndReason)> = Vec::new();
+        if let Some(mut sessions) = self.x3_seat_sessions.get_mut(&key) {
+            for session in std::mem::take(&mut *sessions) {
+                if select(&session) {
+                    let reason = reason_of(&session);
+                    ended.push((session, reason));
+                } else {
+                    sessions.push(session);
+                }
+            }
+        }
+        self.x3_seat_sessions
+            .remove_if(&key, |_, sessions| sessions.is_empty());
+        if ended.is_empty() {
             return;
-        };
-        self.clear_room_x3(conference_id, tag).await;
-        self.finish_x3_session(conference_id, session, reason).await;
+        }
+        let remaining = self.seat_x3_factories(&key);
+        if remaining.is_empty() {
+            self.clear_room_x3(conference_id, tag).await;
+        } else if let Err(reason) = self.install_room_x3(conference_id, tag, &remaining).await {
+            tracing::error!(
+                target: "siphon_rtp::li",
+                conference = conference_id,
+                tag,
+                reason,
+                "lawful-interception taps could not be rebuilt after a delivery ended; ending the \
+                 seat's remaining deliveries rather than leaving them silently deaf"
+            );
+            if let Some((_, rest)) = self.x3_seat_sessions.remove(&key) {
+                ended.extend(
+                    rest.into_iter()
+                        .map(|session| (session, X3EndReason::TransportError)),
+                );
+            }
+            self.clear_room_x3(conference_id, tag).await;
+        }
+        for (session, reason) in ended {
+            self.finish_x3_session(conference_id, session, reason).await;
+        }
     }
 
     /// End the interception of every joined seat the room no longer holds: one an idle reap or a
@@ -186,8 +279,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .iter()
             .filter(|entry| {
                 let (conference_id, tag) = entry.key();
-                self.conference.joined_seat_endpoint(conference_id, tag)
-                    != entry.value().joined_endpoint
+                // Every delivery of a seat names the same endpoint.
+                let endpoint = entry
+                    .value()
+                    .first()
+                    .and_then(|session| session.joined_endpoint);
+                self.conference.joined_seat_endpoint(conference_id, tag) != endpoint
             })
             .map(|entry| entry.key().clone())
             .collect();

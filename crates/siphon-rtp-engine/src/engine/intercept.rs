@@ -1,5 +1,6 @@
 //! Lawful-interception content delivery over X3 (ETSI TS 103 221-2).
 
+use dashmap::DashMap;
 use siphon_rtp_datapath::{Datapath, EndpointId};
 use siphon_rtp_proto::{CmdResult, Event, X3EndReason, X3TargetLeg, Xid};
 use std::sync::atomic::Ordering;
@@ -9,7 +10,7 @@ use crate::media_pipeline::MediaControl;
 use crate::x3::{
     build_tls_client_config, ingress_directions, run_x3_delivery, split_delivery_address,
     x3_channel, X3Config, X3Counters, X3Delivery, X3DeliveryEnd, X3DeliveryTask, X3Error,
-    X3TapFactory,
+    X3TapFactory, X3Taps,
 };
 
 use super::{
@@ -20,6 +21,11 @@ use super::{
 /// One live lawful interception (ETSI TS 103 221-2 X3): the delivery task and everything teardown
 /// needs after the call itself is gone.
 pub(super) struct X3Session {
+    /// The warrant and the delivery address this session was attached with. A call carries several
+    /// sessions, told apart by this pair: a re-attach of the same pair replaces only that session,
+    /// and `detach_x3` selects by it.
+    pub(super) xid: Xid,
+    pub(super) delivery: String,
     /// The call's offerer tag and owning control client, copied here at attach time: teardown runs
     /// *after* `delete` has removed the call from the registry, so the end event cannot look them up.
     pub(super) from_tag: String,
@@ -53,6 +59,71 @@ pub(super) struct X3Session {
     pub(super) handing_over: std::sync::atomic::AtomicBool,
     /// A `detach_x3` arrived during the hand-over; honoured the moment it ends.
     pub(super) detach_requested: std::sync::atomic::AtomicBool,
+}
+
+/// Every live interception of the engine's calls, keyed by call: a call carries one session per
+/// (`xid`, `delivery`). The map never holds an empty list, so the presence of a key still means "this
+/// call is intercepted".
+///
+/// The lock serialises the control operations that change a call's set of sessions (attach, detach,
+/// carry across an answer, end). Installing is always "the whole set of the call", so two of them
+/// interleaving could install a set missing the other's session and silently drop its taps. It is
+/// taken by the entry points only, never by the helpers they call.
+#[derive(Default)]
+pub(super) struct X3Sessions {
+    map: DashMap<String, Vec<X3Session>>,
+    pub(super) lock: tokio::sync::Mutex<()>,
+}
+
+impl std::ops::Deref for X3Sessions {
+    type Target = DashMap<String, Vec<X3Session>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+/// Which sessions of a call a `detach_x3` names (the wire's optional `xid` and `delivery`).
+#[derive(Clone, Copy)]
+pub(super) struct X3Selector<'a> {
+    pub(super) xid: Option<Xid>,
+    pub(super) delivery: Option<&'a str>,
+}
+
+impl X3Selector<'_> {
+    pub(super) fn matches(&self, session: &X3Session) -> bool {
+        self.xid.is_none_or(|xid| xid == session.xid)
+            && self
+                .delivery
+                .is_none_or(|delivery| delivery == session.delivery)
+    }
+}
+
+/// What the media path needs of one session to build its taps: the factory (one delivery channel)
+/// and which leg its warrant names.
+#[derive(Clone)]
+pub(super) struct X3TapSource {
+    pub(super) factory: X3TapFactory,
+    pub(super) target_is_caller: bool,
+}
+
+impl X3TapSource {
+    pub(super) fn of(session: &X3Session) -> Self {
+        Self {
+            factory: session.factory.clone(),
+            target_is_caller: session.target_is_caller,
+        }
+    }
+}
+
+/// What an `x3_started` / `x3_loss` / `x3_ended` event names: the call (or the room of a joined
+/// seat) and the one session within it.
+#[derive(Clone)]
+pub(super) struct X3EventKey {
+    pub(super) call_id: String,
+    pub(super) from_tag: String,
+    pub(super) xid: Xid,
+    pub(super) delivery: String,
 }
 
 /// What [`Engine::spawn_x3_transport`] needs to run one interception's delivery task.
@@ -90,6 +161,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         correlation_id: u64,
         target_leg: X3TargetLeg,
     ) -> CmdResult {
+        let _changing = self.x3_sessions.lock.lock().await;
         if self.owned_call(client, call_id, |_| ()).is_none() {
             if self
                 .conference
@@ -225,19 +297,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // than leave an interception attached to a connection that can never come up.
         let tls = self.x3_tls_config_for(&config)?;
 
-        if self
-            .x3_sessions
-            .get(call_id)
-            .is_some_and(|session| session.handing_over.load(Ordering::SeqCst))
-        {
+        if self.x3_sessions.get(call_id).is_some_and(|sessions| {
+            sessions
+                .iter()
+                .any(|session| session.handing_over.load(Ordering::SeqCst))
+        }) {
             return Err("the call is being re-answered; retry the attach once it is".to_string());
         }
-        // Replacing an existing interception: stop the old one **first**. Doing it after the new
-        // taps were installed made its `StopX3` / `clear_x3_tap` remove the very taps just
-        // installed, so a re-attach ended at once with nothing delivered.
-        if self.x3_sessions.contains_key(call_id) {
-            self.stop_x3(call_id, X3EndReason::Detached).await;
-        }
+        // Replacing an existing delivery (same warrant, same address): stop that one **first**, and
+        // only that one, so its teardown cannot remove the taps just installed and every other
+        // delivery of the call carries on untouched. Doing it after the new taps were installed made
+        // its `StopX3` / `clear_x3_tap` remove the very taps just installed, so a re-attach ended at
+        // once with nothing delivered.
+        self.end_x3_where(
+            call_id,
+            |session| session.xid == xid && session.delivery == delivery,
+            |_| X3EndReason::Detached,
+        )
+        .await;
+        let others = self.x3_tap_sources(call_id);
 
         let (factory, delivery_channel) = x3_channel(config.buffer_packets);
         let target_is_caller = matches!(target_leg, X3TargetLeg::Caller);
@@ -247,8 +325,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // ([`Self::carry_x3_across_answer`]), so a 183's early media and the final answer share one
         // delivery.
         let bridged_endpoints = if answered || in_room || single_leg {
-            self.install_x3_taps(call_id, &factory, target_is_caller)
-                .await?
+            let mut sources = others.clone();
+            sources.push(X3TapSource {
+                factory: factory.clone(),
+                target_is_caller,
+            });
+            match self.install_x3_taps(call_id, &sources).await {
+                Ok(bridged) => bridged,
+                Err(reason) => {
+                    // The install replaces the whole set, so a refusal may have cost the other
+                    // deliveries their taps: put theirs back, and end them loudly if that fails.
+                    self.restore_x3_taps(call_id, &others).await;
+                    return Err(reason);
+                }
+            }
         } else {
             Vec::new()
         };
@@ -272,12 +362,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             counters: counters.clone(),
         });
 
-        self.x3_sessions.insert(
-            call_id.to_string(),
-            X3Session {
+        self.x3_sessions
+            .entry(call_id.to_string())
+            .or_default()
+            .push(X3Session {
+                xid,
+                delivery: delivery.to_string(),
                 from_tag: from_tag.clone(),
                 owner,
-                bridged_endpoints,
+                bridged_endpoints: bridged_endpoints.clone(),
                 factory,
                 target_is_caller,
                 counters,
@@ -286,8 +379,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 joined_endpoint: None,
                 handing_over: Default::default(),
                 detach_requested: Default::default(),
-            },
-        );
+            });
+        // Every session of the call names the endpoints the one install put taps on.
+        if let Some(mut sessions) = self.x3_sessions.get_mut(call_id) {
+            for session in sessions.iter_mut() {
+                session.bridged_endpoints = bridged_endpoints.clone();
+            }
+        }
         self.emit_call_event(
             call_id,
             Event::X3Started {
@@ -349,22 +447,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             connect_timeout: crate::x3::DEFAULT_CONNECT_TIMEOUT,
             tls,
         };
-        let call_id = call_id.to_string();
-        let from_tag = from_tag.to_string();
+        let key = X3EventKey {
+            call_id: call_id.to_string(),
+            from_tag: from_tag.to_string(),
+            xid,
+            delivery: delivery.to_string(),
+        };
         let started = std::time::Instant::now();
         let flag = ended.clone();
         let handle = tokio::spawn(async move {
             let loss_events = events.clone();
-            let loss_call_id = call_id.clone();
-            let loss_from_tag = from_tag.clone();
+            let loss_key = key.clone();
             let outcome = run_x3_delivery(task, move |dropped, delivered| {
                 // Warranted content did not reach the agency. The controller raises the
                 // destination-level report toward the Administration Function from this.
                 emit_event(
                     loss_events.as_ref(),
                     Event::X3Loss {
-                        call_id: loss_call_id.clone(),
-                        from_tag: loss_from_tag.clone(),
+                        call_id: loss_key.call_id.clone(),
+                        from_tag: loss_key.from_tag.clone(),
+                        xid: Some(loss_key.xid),
+                        delivery: Some(loss_key.delivery.clone()),
                         dropped,
                         delivered,
                         dropped_since_ms: started.elapsed().as_millis() as u64,
@@ -380,28 +483,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 X3DeliveryEnd::SourceClosed => X3EndReason::Detached,
                 X3DeliveryEnd::MediationClosed => X3EndReason::MediationClosed,
             };
-            emit_x3_ended(
-                events.as_ref(),
-                &flag,
-                &call_id,
-                &from_tag,
-                reason,
-                &counters,
-            );
+            emit_x3_ended(events.as_ref(), &flag, &key, reason, &counters);
         });
         (handle, ended)
     }
 
-    /// Install `factory`'s taps wherever the call's accepted plaintext lives **now**, returning the
-    /// bridge endpoints that carry one (empty when the media pipeline does).
+    /// The taps' sources for every session of the call, in attach order.
+    pub(super) fn x3_tap_sources(&self, call_id: &str) -> Vec<X3TapSource> {
+        self.x3_sessions
+            .get(call_id)
+            .map(|sessions| sessions.iter().map(X3TapSource::of).collect())
+            .unwrap_or_default()
+    }
+
+    /// Install the taps of **every** delivery in `sources` wherever the call's accepted plaintext
+    /// lives **now**, returning the bridge endpoints that carry them (empty when the media pipeline
+    /// does). Each delivery gets its own tap per position, with the directions its own warrant's
+    /// `target_leg` fixes.
     ///
-    /// Used at attach and again whenever the call's pipeline or bridge has been rebuilt
-    /// ([`Self::carry_x3_across_answer`]), so the two can never disagree about where a tap sits.
-    async fn install_x3_taps(
+    /// The set is installed whole and replaces what was there: used at attach, detach of one
+    /// delivery, and whenever the call's pipeline or bridge has been rebuilt
+    /// ([`Self::carry_x3_across_answer`]), so the paths can never disagree about where taps sit nor
+    /// move some deliveries and drop others.
+    pub(super) async fn install_x3_taps(
         &self,
         call_id: &str,
-        factory: &X3TapFactory,
-        target_is_caller: bool,
+        sources: &[X3TapSource],
     ) -> Result<Vec<EndpointId>, String> {
         let Some((pipeline, a_local, b_local, a_endpoint, b_endpoint, single_leg)) = self
             .owned_call_internal(call_id, |call| {
@@ -423,14 +530,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // An engine-answered caller with no far party answering (yet): its own pipeline carries the
         // media, with an ingress and an egress tap on the one party.
         if single_leg {
-            self.install_single_leg_x3(call_id, factory, target_is_caller)
-                .await?;
+            self.install_single_leg_x3(call_id, sources).await?;
             return Ok(Vec::new());
         }
         // §5.2.6 is target-relative, and only the warrant knows which leg is the target.
-        let (direction_a, direction_b) = ingress_directions(target_is_caller);
-        let tap_a = factory.tap(a_local, direction_a);
-        let tap_b = factory.tap(b_local, direction_b);
+        let mut taps_a = Vec::with_capacity(sources.len());
+        let mut taps_b = Vec::with_capacity(sources.len());
+        for source in sources {
+            let (direction_a, direction_b) = ingress_directions(source.target_is_caller);
+            taps_a.push(source.factory.tap(a_local, direction_a));
+            taps_b.push(source.factory.tap(b_local, direction_b));
+        }
+        let (taps_a, taps_b) = (X3Taps::new(taps_a), X3Taps::new(taps_b));
 
         match pipeline {
             // A leg seated in a conference room is tapped by the room that owns its media: the seated
@@ -443,7 +554,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             .to_string(),
                     );
                 };
-                self.install_room_x3(&conference_id, &tag, factory).await?;
+                let factories = factories_of(sources);
+                self.install_room_x3(&conference_id, &tag, &factories)
+                    .await?;
                 Ok(Vec::new())
             }
             // A crypto bridge relays without decoding, so its media never reaches the pipeline. This
@@ -465,8 +578,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 let Some(b_endpoint) = b_endpoint else {
                     return Err("the call has no answered second leg to intercept".to_string());
                 };
-                if !self.bridge.set_x3_tap(a_endpoint, tap_a)
-                    || !self.bridge.set_x3_tap(b_endpoint, tap_b)
+                if !self.bridge.set_x3_tap(a_endpoint, taps_a)
+                    || !self.bridge.set_x3_tap(b_endpoint, taps_b)
                 {
                     self.bridge.clear_x3_tap(a_endpoint);
                     self.bridge.clear_x3_tap(b_endpoint);
@@ -491,10 +604,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .await?;
                 if !self
                     .media
-                    .control(call_id, MediaControl::StartX3(Box::new((tap_a, tap_b))))
+                    .control(call_id, MediaControl::StartX3(Box::new((taps_a, taps_b))))
                 {
-                    self.release_userspace_hold(call_id, PromotionReason::X3)
-                        .await;
+                    self.release_x3_hold_if_unused(call_id).await;
                     return Err("media actor unavailable".to_string());
                 }
                 Ok(Vec::new())
@@ -506,32 +618,73 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
-    /// Carry a live interception onto the media path an answer has just (re)installed.
+    /// Release the userspace hold an interception keeps on the call, unless a delivery still needs it.
+    pub(super) async fn release_x3_hold_if_unused(&self, call_id: &str) {
+        if !self.x3_sessions.contains_key(call_id) {
+            self.release_userspace_hold(call_id, PromotionReason::X3)
+                .await;
+        }
+    }
+
+    /// Put `sources`' taps back after an install that was refused took the call's taps with it (a
+    /// bridge that refused the second endpoint clears the first). If they cannot be put back the
+    /// deliveries they belonged to end loudly (`transport_error`) rather than stay attached and deaf.
+    async fn restore_x3_taps(&self, call_id: &str, sources: &[X3TapSource]) {
+        if sources.is_empty() {
+            return;
+        }
+        match self.install_x3_taps(call_id, sources).await {
+            Ok(bridged) => self.record_bridged_endpoints(call_id, &bridged),
+            Err(reason) => {
+                tracing::error!(
+                    target: "siphon_rtp::li",
+                    call_id,
+                    reason,
+                    "lawful-interception taps could not be restored after a refused attach; ending \
+                     the call's deliveries rather than leaving them silently deaf"
+                );
+                self.end_x3_where(call_id, |_| true, |_| X3EndReason::TransportError)
+                    .await;
+            }
+        }
+    }
+
+    /// Record, on every session of the call, which bridge endpoints the last install tapped.
+    fn record_bridged_endpoints(&self, call_id: &str, bridged: &[EndpointId]) {
+        if let Some(mut sessions) = self.x3_sessions.get_mut(call_id) {
+            for session in sessions.iter_mut() {
+                session.bridged_endpoints = bridged.to_vec();
+            }
+        }
+    }
+
+    /// Carry the live interceptions onto the media path an answer has just (re)installed.
     ///
     /// The answer to a re-offer (a hold, a resume, a session refresh) rebuilds the call's pipeline
-    /// or bridge, and the taps on the old one go with it. The interception belongs to the call, so
-    /// the session's own tap factory builds a fresh pair onto whatever carries the call now: same
-    /// delivery channel, same connection, same Correlation ID, sequence counter unbroken.
+    /// or bridge, and the taps on the old one go with it. The interceptions belong to the call, so
+    /// the sessions' own tap factories build fresh taps onto whatever carries the call now, **all of
+    /// them in one install**: same delivery channels, same connections, same Correlation IDs,
+    /// sequence counters unbroken.
     ///
-    /// A no-op on a call that is not intercepted. If the taps cannot be put back, the interception is
-    /// ended loudly (`x3_ended` with `transport_error`, the nearest reason there is) rather than left
-    /// attached and silent.
+    /// A no-op on a call that is not intercepted. If the taps cannot be put back, every delivery of
+    /// the call is ended loudly (`x3_ended` with `transport_error`, the nearest reason there is)
+    /// rather than left attached and silent.
     pub(super) async fn carry_x3_across_answer(&self, call_id: &str) {
-        let Some((factory, target_is_caller, previous)) =
-            self.x3_sessions.get(call_id).map(|session| {
-                (
-                    session.factory.clone(),
-                    session.target_is_caller,
-                    session.bridged_endpoints.clone(),
-                )
-            })
-        else {
+        if !self.x3_sessions.contains_key(call_id) {
             return;
+        }
+        let _changing = self.x3_sessions.lock.lock().await;
+        let (sources, previous) = match self.x3_sessions.get(call_id) {
+            Some(sessions) => (
+                sessions.iter().map(X3TapSource::of).collect::<Vec<_>>(),
+                sessions
+                    .iter()
+                    .flat_map(|session| session.bridged_endpoints.iter().copied())
+                    .collect::<Vec<_>>(),
+            ),
+            None => return,
         };
-        match self
-            .install_x3_taps(call_id, &factory, target_is_caller)
-            .await
-        {
+        match self.install_x3_taps(call_id, &sources).await {
             Ok(bridged) => {
                 // A bridge endpoint that no longer carries a tap must not keep a stale one.
                 for endpoint in previous
@@ -540,9 +693,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 {
                     self.bridge.clear_x3_tap(*endpoint);
                 }
-                if let Some(mut session) = self.x3_sessions.get_mut(call_id) {
-                    session.bridged_endpoints = bridged;
-                }
+                self.record_bridged_endpoints(call_id, &bridged);
             }
             Err(reason) => {
                 tracing::error!(
@@ -552,62 +703,153 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     "lawful-interception taps could not be carried onto the renegotiated media \
                      path; ending the interception rather than leaving it silently deaf"
                 );
-                self.stop_x3(call_id, X3EndReason::TransportError).await;
+                self.end_x3_where(call_id, |_| true, |_| X3EndReason::TransportError)
+                    .await;
             }
         }
     }
 
     /// `detach_x3`: stop lawful-interception content delivery. Idempotent — detaching a call that is
-    /// not intercepted is not an error.
+    /// not intercepted is not an error. `selector` says which deliveries: all of the call's, one
+    /// warrant's, or exactly one.
     pub(super) async fn detach_x3(
         &self,
         client: ClientId,
         call_id: &str,
         from_tag: &str,
+        selector: X3Selector<'_>,
     ) -> CmdResult {
-        // A re-answer is replacing the call: the withdrawal is recorded and honoured the moment the
-        // replacement is registered, so delivery never outlives a withdrawn warrant.
-        if let Some(session) = self.x3_sessions.get(call_id) {
-            if session.owner == client && session.handing_over.load(Ordering::SeqCst) {
-                session.detach_requested.store(true, Ordering::SeqCst);
+        let _changing = self.x3_sessions.lock.lock().await;
+        // A re-answer is replacing the call: the withdrawal is recorded, per delivery, and honoured
+        // the moment the replacement is registered, so delivery never outlives a withdrawn warrant.
+        if let Some(sessions) = self.x3_sessions.get(call_id) {
+            if sessions.iter().any(|session| {
+                session.owner == client && session.handing_over.load(Ordering::SeqCst)
+            }) {
+                for session in sessions.iter().filter(|session| selector.matches(session)) {
+                    session.detach_requested.store(true, Ordering::SeqCst);
+                }
                 return ok_empty();
             }
         }
         if self.owned_call(client, call_id, |_| ()).is_none() {
-            return self.detach_x3_seat(client, call_id, from_tag).await;
+            return self
+                .detach_x3_seat(client, call_id, from_tag, selector)
+                .await;
         }
-        self.stop_x3(call_id, X3EndReason::Detached).await;
+        self.end_x3_where(
+            call_id,
+            |session| selector.matches(session),
+            |_| X3EndReason::Detached,
+        )
+        .await;
         ok_empty()
     }
 
-    /// Tear an interception down: remove its taps, let the delivery task drain what is buffered,
-    /// emit [`Event::X3Ended`] with the delivery counts, and release the userspace hold. A no-op
-    /// when the call is not intercepted.
+    /// Tear every interception of a call down: remove its taps, let the delivery tasks drain what is
+    /// buffered, emit one [`Event::X3Ended`] each with the delivery counts, and release the userspace
+    /// hold. A no-op when the call is not intercepted.
     pub(super) async fn stop_x3(&self, call_id: &str, reason: X3EndReason) {
-        // The old call of a re-answer going away is not the end of the interception it hands over.
-        if self
-            .x3_sessions
-            .get(call_id)
-            .is_some_and(|session| session.handing_over.load(Ordering::SeqCst))
-        {
+        if !self.x3_sessions.contains_key(call_id) {
             return;
         }
-        let Some((_, session)) = self.x3_sessions.remove(call_id) else {
+        let _changing = self.x3_sessions.lock.lock().await;
+        // The old call of a re-answer going away is not the end of the interception it hands over.
+        if self.x3_sessions.get(call_id).is_some_and(|sessions| {
+            sessions
+                .iter()
+                .any(|session| session.handing_over.load(Ordering::SeqCst))
+        }) {
             return;
-        };
-        // Drop the taps first. That closes the packet channel, which is what lets the delivery task
-        // finish sending whatever is still buffered instead of losing it.
-        for endpoint in &session.bridged_endpoints {
+        }
+        self.end_x3_where(call_id, |_| true, |_| reason).await;
+    }
+
+    /// End the sessions of a call that `select` picks, each with the reason `reason_of` gives it,
+    /// and leave the rest delivering: the survivors' taps are installed again as the whole set. The
+    /// last session going takes every tap off and releases the userspace hold.
+    ///
+    /// Each ended session reports exactly one [`Event::X3Ended`]. Callers hold
+    /// [`X3Sessions::lock`].
+    pub(super) async fn end_x3_where(
+        &self,
+        call_id: &str,
+        select: impl Fn(&X3Session) -> bool,
+        reason_of: impl Fn(&X3Session) -> X3EndReason,
+    ) {
+        let mut ended: Vec<(X3Session, X3EndReason)> = Vec::new();
+        let mut bridged: Vec<EndpointId> = Vec::new();
+        if let Some(mut sessions) = self.x3_sessions.get_mut(call_id) {
+            bridged = sessions
+                .iter()
+                .flat_map(|session| session.bridged_endpoints.iter().copied())
+                .collect();
+            let all = std::mem::take(&mut *sessions);
+            for session in all {
+                if select(&session) {
+                    let reason = reason_of(&session);
+                    ended.push((session, reason));
+                } else {
+                    sessions.push(session);
+                }
+            }
+        }
+        self.x3_sessions
+            .remove_if(call_id, |_, sessions| sessions.is_empty());
+        if ended.is_empty() {
+            return;
+        }
+        let remaining = self.x3_tap_sources(call_id);
+        if remaining.is_empty() {
+            self.clear_x3_taps(call_id, &bridged).await;
+        } else {
+            match self.install_x3_taps(call_id, &remaining).await {
+                Ok(now_bridged) => {
+                    for endpoint in bridged
+                        .iter()
+                        .filter(|endpoint| !now_bridged.contains(endpoint))
+                    {
+                        self.bridge.clear_x3_tap(*endpoint);
+                    }
+                    self.record_bridged_endpoints(call_id, &now_bridged);
+                }
+                Err(reason) => {
+                    tracing::error!(
+                        target: "siphon_rtp::li",
+                        call_id,
+                        reason,
+                        "lawful-interception taps could not be rebuilt after a delivery ended; \
+                         ending the call's remaining deliveries rather than leaving them silently \
+                         deaf"
+                    );
+                    if let Some((_, rest)) = self.x3_sessions.remove(call_id) {
+                        ended.extend(
+                            rest.into_iter()
+                                .map(|session| (session, X3EndReason::TransportError)),
+                        );
+                    }
+                    self.clear_x3_taps(call_id, &bridged).await;
+                }
+            }
+        }
+        for (session, reason) in ended {
+            self.finish_x3_session(call_id, session, reason).await;
+        }
+        self.release_x3_hold_if_unused(call_id).await;
+    }
+
+    /// Take every tap off whatever carries the call's media: the crypto bridge endpoints, the media
+    /// actor and the conference room the call's leg is seated in. Dropping the taps closes the packet
+    /// channels, which is what lets each delivery task finish sending what is still buffered
+    /// instead of losing it.
+    async fn clear_x3_taps(&self, call_id: &str, bridged: &[EndpointId]) {
+        for endpoint in bridged {
             self.bridge.clear_x3_tap(*endpoint);
         }
         self.media.control(call_id, MediaControl::StopX3);
-        // …and the room's, when the call's leg is seated in one.
         if let Some((conference_id, tag)) = self.seated_room(call_id) {
             self.clear_room_x3(&conference_id, &tag).await;
         }
-        self.finish_x3_session(call_id, session, reason).await;
-        self.release_userspace_hold(call_id, PromotionReason::X3)
-            .await;
     }
 
     /// Finish an interception whose taps are already off: let the delivery task go and tell the
@@ -623,31 +865,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         session.transport.abort();
         let _ = session.transport.await;
         let events = self.event_sink(session.owner);
+        let key = X3EventKey {
+            call_id: call_id.to_string(),
+            from_tag: session.from_tag.clone(),
+            xid: session.xid,
+            delivery: session.delivery.clone(),
+        };
         emit_x3_ended(
             events.as_ref(),
             &session.ended,
-            call_id,
-            &session.from_tag,
+            &key,
             reason,
             &session.counters,
         );
     }
 
-    /// Put an interception's taps on a seat of a conference room, and say why when the room cannot
-    /// take them. The room builds them from the session's own factory, so the delivery connection,
-    /// Correlation ID and sequence counter carry straight on.
+    /// Put the taps of every delivery of an interception on a seat of a conference room, and say why
+    /// when the room cannot take them. The room builds them from the sessions' own factories, so the
+    /// delivery connections, Correlation IDs and sequence counters carry straight on.
     pub(super) async fn install_room_x3(
         &self,
         conference_id: &str,
         tag: &str,
-        factory: &X3TapFactory,
+        factories: &[X3TapFactory],
     ) -> Result<(), String> {
         let installed = self
             .conference
             .ask(conference_id, |reply| {
                 crate::conference::SeatControl::SetX3 {
                     tag: tag.to_string(),
-                    factory: factory.clone(),
+                    factories: factories.to_vec(),
                     reply,
                 }
             })
@@ -691,15 +938,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 }
 
 /// Emit [`Event::X3Ended`] exactly once for an interception, whichever of detach and transport
-/// failure got there first, carrying the delivery counts the compliance record needs.
+/// failure got there first, carrying the delivery counts the compliance record needs and naming
+/// the warrant and delivery it ended.
 ///
 /// A non-zero `dropped` is logged at `warn!`: warranted content did not reach the agency, which is a
 /// reportable failure rather than a degraded recording.
 pub(super) fn emit_x3_ended(
     events: Option<&flume::Sender<Event>>,
     ended: &std::sync::atomic::AtomicBool,
-    call_id: &str,
-    from_tag: &str,
+    key: &X3EventKey,
     reason: X3EndReason,
     counters: &X3Counters,
 ) {
@@ -711,7 +958,9 @@ pub(super) fn emit_x3_ended(
     if dropped > 0 {
         tracing::warn!(
             target: "siphon_rtp::li",
-            call_id,
+            call_id = key.call_id,
+            xid = %key.xid,
+            delivery = key.delivery,
             ?reason,
             delivered,
             dropped,
@@ -720,7 +969,9 @@ pub(super) fn emit_x3_ended(
     } else {
         tracing::info!(
             target: "siphon_rtp::li",
-            call_id,
+            call_id = key.call_id,
+            xid = %key.xid,
+            delivery = key.delivery,
             ?reason,
             delivered,
             "lawful-interception content delivery ended"
@@ -728,13 +979,23 @@ pub(super) fn emit_x3_ended(
     }
     if let Some(sender) = events {
         let _ = sender.try_send(Event::X3Ended {
-            call_id: call_id.to_string(),
-            from_tag: from_tag.to_string(),
+            call_id: key.call_id.clone(),
+            from_tag: key.from_tag.clone(),
+            xid: Some(key.xid),
+            delivery: Some(key.delivery.clone()),
             reason,
             delivered,
             dropped,
         });
     }
+}
+
+/// The factories of a set of sessions' tap sources.
+pub(super) fn factories_of(sources: &[X3TapSource]) -> Vec<X3TapFactory> {
+    sources
+        .iter()
+        .map(|source| source.factory.clone())
+        .collect()
 }
 
 /// Send one event to a control client's sink, if it still has one.

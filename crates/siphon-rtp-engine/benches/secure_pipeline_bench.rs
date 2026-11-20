@@ -379,14 +379,25 @@ fn bench_single_leg_interception(criterion: &mut Criterion) {
             .with_comfort_idle(None)
     };
     let mut group = criterion.benchmark_group("media_pipeline_single_leg_frame_8k_20ms");
-    for (label, tapped) in [("untapped", false), ("x3_tapped", true)] {
+    // The third arm is a call under two deliveries (two warrants): the set of two taps.
+    for (label, deliveries) in [("untapped", 0usize), ("x3_tapped", 1), ("x3_tapped_two", 2)] {
         group.bench_function(label, |bencher| {
             let mut media_call = single_leg();
-            let (factory, delivery) = siphon_rtp_engine::x3::x3_channel(4096);
-            if tapped {
+            let channels: Vec<_> = (0..deliveries)
+                .map(|_| siphon_rtp_engine::x3::x3_channel(4096))
+                .collect();
+            if deliveries > 0 {
+                let set = |direction| {
+                    siphon_rtp_engine::x3::X3Taps::new(
+                        channels
+                            .iter()
+                            .map(|(factory, _)| factory.tap(addr(B_ADDR), direction))
+                            .collect(),
+                    )
+                };
                 media_call.start_x3_single_leg((
-                    factory.tap(addr(B_ADDR), siphon_rtp_li::PayloadDirection::FromTarget),
-                    factory.tap(addr(B_ADDR), siphon_rtp_li::PayloadDirection::ToTarget),
+                    set(siphon_rtp_li::PayloadDirection::FromTarget),
+                    set(siphon_rtp_li::PayloadDirection::ToTarget),
                 ));
             }
             let mut packet = ulaw_packet(0);
@@ -410,8 +421,10 @@ fn bench_single_leg_interception(criterion: &mut Criterion) {
                 );
                 media_call.tick(&mut out, &mut events);
                 // What the delivery task does: frame, then hand the buffer back.
-                while let Ok(delivered) = delivery.packets.try_recv() {
-                    let _ = delivery.recycle.try_send(delivered.payload);
+                for (_, delivery) in &channels {
+                    while let Ok(delivered) = delivery.packets.try_recv() {
+                        let _ = delivery.recycle.try_send(delivered.payload);
+                    }
                 }
                 black_box(out.len())
             });

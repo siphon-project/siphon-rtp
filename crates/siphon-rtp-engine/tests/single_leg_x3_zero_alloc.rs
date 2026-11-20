@@ -22,7 +22,7 @@ use bytes::Bytes;
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::media_pipeline::{DirectionConfig, EchoProfile, MediaCall};
-use siphon_rtp_engine::x3::{x3_channel, X3Delivery};
+use siphon_rtp_engine::x3::{x3_channel, X3Delivery, X3Taps};
 use siphon_rtp_li::PayloadDirection;
 
 /// A pass-through allocator that counts allocations on the armed thread only.
@@ -49,6 +49,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
+
+/// The allocation counter is process-wide, so the measuring tests take turns.
+static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const CALLER: &str = "192.0.2.10:5000";
 const ENGINE: &str = "198.51.100.1:20000";
@@ -105,16 +108,29 @@ fn return_buffers(delivery: &X3Delivery) -> usize {
     delivered
 }
 
-/// Allocations over `MEASURED_FRAMES` frames of a single-leg call, and how many packets the
-/// interception delivered.
-fn allocations_of_the_call(tapped: bool) -> (usize, usize) {
+/// Allocations over `MEASURED_FRAMES` frames of a single-leg call under `deliveries` interceptions
+/// (none for the baseline), and how many packets they delivered in all.
+fn allocations_of_the_call(deliveries: usize) -> (usize, usize) {
+    let _turn = MEASURING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut call = MediaCall::new("single", "tag-a", None, direction(), direction(), true)
         .with_comfort_idle(None);
-    let (factory, delivery) = x3_channel(4096);
-    if tapped {
+    let channels: Vec<_> = (0..deliveries).map(|_| x3_channel(4096)).collect();
+    if deliveries > 0 {
         call.start_x3_single_leg((
-            factory.tap(addr(ENGINE), PayloadDirection::FromTarget),
-            factory.tap(addr(ENGINE), PayloadDirection::ToTarget),
+            X3Taps::new(
+                channels
+                    .iter()
+                    .map(|(factory, _)| factory.tap(addr(ENGINE), PayloadDirection::FromTarget))
+                    .collect(),
+            ),
+            X3Taps::new(
+                channels
+                    .iter()
+                    .map(|(factory, _)| factory.tap(addr(ENGINE), PayloadDirection::ToTarget))
+                    .collect(),
+            ),
         ));
     }
     // Built before arming: building a packet allocates, handling one must not.
@@ -128,7 +144,10 @@ fn allocations_of_the_call(tapped: bool) -> (usize, usize) {
             events.clear();
             call.process(packet, &mut out, &mut events);
             call.tick(&mut out, &mut events);
-            delivered += return_buffers(&delivery);
+            delivered += channels
+                .iter()
+                .map(|(_, delivery)| return_buffers(delivery))
+                .sum::<usize>();
         }
         delivered
     };
@@ -146,8 +165,8 @@ fn allocations_of_the_call(tapped: bool) -> (usize, usize) {
 
 #[test]
 fn an_intercepted_single_leg_call_adds_no_allocation_to_its_packet_path() {
-    let (untapped, untapped_delivered) = allocations_of_the_call(false);
-    let (tapped, tapped_delivered) = allocations_of_the_call(true);
+    let (untapped, untapped_delivered) = allocations_of_the_call(0);
+    let (tapped, tapped_delivered) = allocations_of_the_call(1);
 
     assert_eq!(untapped_delivered, 0, "nothing is delivered with no tap");
     assert!(
@@ -158,5 +177,20 @@ fn an_intercepted_single_leg_call_adds_no_allocation_to_its_packet_path() {
     assert_eq!(
         tapped, untapped,
         "the interception allocates nothing beyond what the call itself does"
+    );
+}
+
+#[test]
+fn two_interceptions_of_a_single_leg_call_stay_allocation_free_on_the_packet_path() {
+    let (untapped, _) = allocations_of_the_call(0);
+    let (tapped, delivered) = allocations_of_the_call(2);
+
+    assert!(
+        delivered >= usize::from(MEASURED_FRAMES) * 4 - 16,
+        "both deliveries receive both directions ({delivered} packets)"
+    );
+    assert_eq!(
+        tapped, untapped,
+        "a set of two taps allocates nothing beyond what the call itself does"
     );
 }

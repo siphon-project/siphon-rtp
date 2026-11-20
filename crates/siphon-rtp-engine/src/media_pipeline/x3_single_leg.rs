@@ -16,19 +16,19 @@
 //! ingress tap is `from_target` and the egress tap `to_target`; callee as the target: mirrored).
 
 use super::MediaCall;
-use crate::x3::X3Tap;
+use crate::x3::X3Taps;
 
 impl MediaCall {
     /// Begin lawful-interception delivery on a single-leg call (`MediaControl::StartX3SingleLeg`).
     ///
-    /// `taps` is `(ingress tap, egress tap)`. A call with a far party keeps its two ingress taps
-    /// ([`MediaCall::start_x3`]) and gets no egress tap, so nothing is delivered twice. Replacing an
-    /// interception drops the old taps, which closes their channel.
-    pub fn start_x3_single_leg(&mut self, taps: (X3Tap, X3Tap)) {
+    /// `taps` is `(ingress taps, egress taps)`, one tap per delivery on the call. A call with a far
+    /// party keeps its two ingress sets ([`MediaCall::start_x3`]) and gets no egress set, so nothing
+    /// is delivered twice. The sets replace whatever was installed.
+    pub fn start_x3_single_leg(&mut self, taps: (X3Taps, X3Taps)) {
         let (ingress, egress) = taps;
-        self.b_to_a.x3 = None;
-        self.a_to_b.x3 = Some(ingress);
-        self.a_to_b.x3_egress = Some(egress);
+        self.b_to_a.x3 = X3Taps::default();
+        self.a_to_b.x3 = ingress;
+        self.a_to_b.x3_egress = egress;
     }
 }
 
@@ -88,8 +88,10 @@ mod tests {
     fn intercept(call: &mut MediaCall) -> crate::x3::X3Delivery {
         let (factory, delivery) = crate::x3::x3_channel(64);
         call.start_x3_single_leg((
-            factory.tap(addr(ENGINE), PayloadDirection::FromTarget),
-            factory.tap(addr(ENGINE), PayloadDirection::ToTarget),
+            factory
+                .tap(addr(ENGINE), PayloadDirection::FromTarget)
+                .into(),
+            factory.tap(addr(ENGINE), PayloadDirection::ToTarget).into(),
         ));
         delivery
     }

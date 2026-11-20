@@ -11,7 +11,7 @@ use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::rtp::RtpPacket;
 
 use super::{Direction, LegMeta, MediaCall, PcapCapture, MAX_PCM};
-use crate::x3::X3Tap;
+use crate::x3::X3Taps;
 
 /// The side decode of a **relay-only** direction: a decoded copy of the ingress for the sinks that
 /// want PCM (a WS tee, a decoded recording), next to a relay that forwards each packet verbatim.
@@ -74,9 +74,9 @@ impl TapDecode {
 pub struct CarriedAttachments {
     pub forks: [Vec<Box<dyn MediaSink>>; 2],
     pub egress_taps: [Vec<Box<dyn MediaSink>>; 2],
-    pub x3: Option<(X3Tap, X3Tap)>,
+    pub x3: Option<(X3Taps, X3Taps)>,
     /// A single-leg call's interception: `(ingress tap, egress tap)`.
-    pub x3_single_leg: Option<(X3Tap, X3Tap)>,
+    pub x3_single_leg: Option<(X3Taps, X3Taps)>,
     pub capture: Option<PcapCapture>,
     pub dtmf_blocked: [bool; 2],
 }
@@ -171,10 +171,12 @@ impl MediaCall {
     pub fn take_attachments(&mut self) -> CarriedAttachments {
         // A two-party call has an ingress tap on each leg; a single-leg call has its ingress tap and
         // an egress tap, both on the direction that faces its caller.
-        let egress = self.a_to_b.x3_egress.take();
-        let (x3, x3_single_leg) = match (self.a_to_b.x3.take(), self.b_to_a.x3.take(), egress) {
-            (Some(leg_a), Some(leg_b), _) => (Some((leg_a, leg_b)), None),
-            (Some(ingress), None, Some(egress)) => (None, Some((ingress, egress))),
+        let egress = std::mem::take(&mut self.a_to_b.x3_egress);
+        let leg_a = std::mem::take(&mut self.a_to_b.x3);
+        let leg_b = std::mem::take(&mut self.b_to_a.x3);
+        let (x3, x3_single_leg) = match (leg_a.is_empty(), leg_b.is_empty(), egress.is_empty()) {
+            (false, false, _) => (Some((leg_a, leg_b)), None),
+            (false, true, false) => (None, Some((leg_a, egress))),
             _ => (None, None),
         };
         CarriedAttachments {

@@ -9,16 +9,30 @@
 //! is a few awaits wide and a test cannot land a command in it deterministically.
 
 use super::*;
-use siphon_rtp_proto::X3EndReason;
+use siphon_rtp_proto::{X3EndReason, Xid};
 
 const OWNER_TAG: &str = "tag-a";
 
 fn inject_session(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) -> crate::x3::X3Delivery {
+    inject_session_as(engine, call_id, Xid::default(), "mdf.example.net:8090")
+}
+
+/// A session of warrant `xid` delivering to `address`, added to the call's set.
+fn inject_session_as(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+    xid: Xid,
+    address: &str,
+) -> crate::x3::X3Delivery {
     let (factory, delivery) = crate::x3::x3_channel(8);
     let counters = factory.counters().clone();
-    engine.x3_sessions.insert(
-        call_id.to_string(),
-        crate::engine::intercept::X3Session {
+    engine
+        .x3_sessions
+        .entry(call_id.to_string())
+        .or_default()
+        .push(crate::engine::intercept::X3Session {
+            xid,
+            delivery: address.to_string(),
             from_tag: OWNER_TAG.to_string(),
             owner: CLIENT,
             bridged_endpoints: Vec::new(),
@@ -30,8 +44,7 @@ fn inject_session(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) -> crate:
             joined_endpoint: None,
             handing_over: Default::default(),
             detach_requested: Default::default(),
-        },
-    );
+        });
     delivery
 }
 
@@ -49,6 +62,8 @@ fn detach(call_id: &str) -> Command {
     Command::DetachX3 {
         call_id: call_id.into(),
         from_tag: OWNER_TAG.into(),
+        xid: None,
+        delivery: None,
     }
 }
 
@@ -122,4 +137,150 @@ async fn another_dialog_or_owner_is_not_a_hand_over() {
     let _delivery = inject_session(&engine, "other");
     assert!(!engine.begin_x3_hand_over(CLIENT, "other", "another-tag"));
     assert!(!engine.begin_x3_hand_over(ClientId(99), "other", OWNER_TAG));
+}
+
+fn xid_of(byte: u8) -> Xid {
+    Xid::from_bytes([byte; 16])
+}
+
+/// The (xid, reason) of every `x3_ended` so far.
+fn ended_by_xid(events: &flume::Receiver<Event>) -> Vec<(Xid, X3EndReason)> {
+    let mut ended: Vec<_> = events
+        .try_iter()
+        .filter_map(|event| match event {
+            Event::X3Ended { xid, reason, .. } => Some((xid.expect("named"), reason)),
+            _ => None,
+        })
+        .collect();
+    ended.sort_by_key(|(xid, _)| *xid.as_bytes());
+    ended
+}
+
+fn detach_xid(call_id: &str, xid: Xid) -> Command {
+    Command::DetachX3 {
+        call_id: call_id.into(),
+        from_tag: OWNER_TAG.into(),
+        xid: Some(xid),
+        delivery: None,
+    }
+}
+
+#[tokio::test]
+async fn a_detach_of_one_warrant_in_the_hand_over_window_is_honoured_for_that_warrant_only() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    // A real call under the sessions: the survivors' taps are installed on it again.
+    let (_phone, address) = phone().await;
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "two".into(),
+                from_tag: OWNER_TAG.into(),
+                sdp: sdp_for(address, true),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
+    let _one = inject_session_as(&engine, "two", xid_of(1), "mdf-one.example.net:8090");
+    let _two = inject_session_as(&engine, "two", xid_of(2), "mdf-two.example.net:8090");
+    assert!(engine.begin_x3_hand_over(CLIENT, "two", OWNER_TAG));
+
+    // The old call's teardown leaves both alone.
+    engine.stop_x3("two", X3EndReason::CallEnded).await;
+    assert!(ended_by_xid(&events).is_empty());
+    assert!(matches!(
+        engine.handle(CLIENT, detach_xid("two", xid_of(1))).await,
+        CmdResult::Ok { .. }
+    ));
+    assert!(
+        ended_by_xid(&events).is_empty(),
+        "nothing ends mid hand-over"
+    );
+
+    engine.settle_x3_hand_over("two").await;
+    assert_eq!(
+        ended_by_xid(&events),
+        vec![(xid_of(1), X3EndReason::Detached)],
+        "only the withdrawn warrant ends, once"
+    );
+    assert_eq!(
+        engine.x3_sessions.get("two").map(|sessions| sessions.len()),
+        Some(1),
+        "the other delivery is handed over"
+    );
+    engine.stop_x3("two", X3EndReason::CallEnded).await;
+    assert_eq!(
+        ended_by_xid(&events),
+        vec![(xid_of(2), X3EndReason::CallEnded)]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_re_answer_ends_each_delivery_with_its_own_reason() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    let _one = inject_session_as(&engine, "abandon", xid_of(1), "mdf-one.example.net:8090");
+    let _two = inject_session_as(&engine, "abandon", xid_of(2), "mdf-two.example.net:8090");
+    assert!(engine.begin_x3_hand_over(CLIENT, "abandon", OWNER_TAG));
+    engine
+        .handle(CLIENT, detach_xid("abandon", xid_of(2)))
+        .await;
+    engine.abandon_x3_hand_over("abandon").await;
+    assert_eq!(
+        ended_by_xid(&events),
+        vec![
+            (xid_of(1), X3EndReason::CallEnded),
+            (xid_of(2), X3EndReason::Detached)
+        ]
+    );
+    assert!(!engine.x3_sessions.contains_key("abandon"));
+}
+
+#[tokio::test]
+async fn ending_a_call_ends_every_delivery_with_one_event_each() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    let _one = inject_session_as(&engine, "end", xid_of(1), "mdf-one.example.net:8090");
+    let _two = inject_session_as(&engine, "end", xid_of(1), "mdf-two.example.net:8090");
+    let _three = inject_session_as(&engine, "end", xid_of(3), "mdf-one.example.net:8090");
+    engine.stop_x3("end", X3EndReason::CallEnded).await;
+    assert_eq!(
+        ended_by_xid(&events),
+        vec![
+            (xid_of(1), X3EndReason::CallEnded),
+            (xid_of(1), X3EndReason::CallEnded),
+            (xid_of(3), X3EndReason::CallEnded)
+        ]
+    );
+    assert!(!engine.x3_sessions.contains_key("end"));
+    // Nothing left: a second stop is silent.
+    engine.stop_x3("end", X3EndReason::CallEnded).await;
+    assert!(ended_by_xid(&events).is_empty());
+}
+
+#[tokio::test]
+async fn survivors_that_cannot_be_re_tapped_end_loudly_instead_of_staying_deaf() {
+    // No call stands under the sessions, so the survivors' taps cannot be installed again after
+    // one delivery ends: they end `transport_error` rather than stay attached and deliver nothing.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let events = engine.register_client(CLIENT);
+    let _one = inject_session_as(&engine, "deaf", xid_of(1), "mdf-one.example.net:8090");
+    let _two = inject_session_as(&engine, "deaf", xid_of(2), "mdf-two.example.net:8090");
+    engine
+        .end_x3_where(
+            "deaf",
+            |session| session.xid == xid_of(1),
+            |_| X3EndReason::Detached,
+        )
+        .await;
+    assert_eq!(
+        ended_by_xid(&events),
+        vec![
+            (xid_of(1), X3EndReason::Detached),
+            (xid_of(2), X3EndReason::TransportError)
+        ]
+    );
+    assert!(!engine.x3_sessions.contains_key("deaf"));
 }
