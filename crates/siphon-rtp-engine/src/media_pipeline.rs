@@ -52,9 +52,11 @@ use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
 
+mod ingress_clock;
 mod relay_tap;
 mod surrender;
 mod x3_single_leg;
+use ingress_clock::IngressClock;
 pub use relay_tap::CarriedAttachments;
 use relay_tap::TapDecode;
 pub use surrender::SurrenderedCall;
@@ -822,6 +824,8 @@ pub struct Direction {
     /// to `egress_frame_samples` for every codec whose RTP clock matches its sample rate, but not for
     /// G.722 (16 kHz audio, 8 kHz RTP clock; RFC 3551 §4.5.2) — there it is half the sample count.
     egress_timestamp_increment: u32,
+    /// The ingress media clock the transcode's egress clock keeps time with (see [`IngressClock`]).
+    ingress_clock: IngressClock,
     /// Re-frames the decoded/resampled ingress PCM to the egress `ptime` (rtpengine `ptime=<N>` override
     /// or an ingress↔egress `a=ptime` mismatch). Accumulates egress-domain samples and drains exactly
     /// `egress_frame_samples` per emitted packet, so one ingress frame can yield zero-or-many egress
@@ -1610,6 +1614,11 @@ impl Direction {
             egress_payload_type: config.egress_payload_type,
             egress_frame_samples,
             egress_timestamp_increment,
+            ingress_clock: IngressClock::new(
+                ingress_rate,
+                ingress_rtp_clock_rate_hz,
+                egress_rtp_clock,
+            ),
             repacketizer,
             // RFC 3550 §5.1: don't fabricate a talkspurt marker — propagate the sender's. The first
             // egress packet carries the marker only if the ingress stream flagged one.
@@ -1690,6 +1699,8 @@ impl Direction {
             egress_payload_type: 0,
             egress_frame_samples: 0,
             egress_timestamp_increment: 0,
+            // A relay-only direction re-stamps nothing, so it keeps no ingress clock.
+            ingress_clock: IngressClock::new(0, 0, 0),
             // A relay-only direction forwards RTP verbatim; the repacketizer (frame size 0) never drains.
             repacketizer: Repacketizer::new(0, 0),
             pending_marker: false,
@@ -2490,6 +2501,12 @@ impl Direction {
         // `siphon_rtp_codec`.
         let samples =
             siphon_rtp_codec::downmix_to_mono(&mut decoded[..samples], self.ingress_channels);
+        // How much of the sender's clock passed with no packet before this one (DTX, loss). Taken
+        // before any early return below so the ingress clock always follows the stream; spent on the
+        // egress clock only where this frame is actually re-encoded.
+        let carried_gap = self
+            .ingress_clock
+            .advance(stream_ssrc, parsed.timestamp, samples);
         // Suppress noise in place first, so the forks (SIPREC, recordings) and the peer all receive the
         // cleaned audio. Streaming/WOLA — one ingress frame in, the same count out (delayed).
         if let Some(suppressor) = self.noise_suppressor.as_mut() {
@@ -2575,6 +2592,11 @@ impl Direction {
         // stateful (holds filter history across frames) so it must see the continuous per-ingress-frame
         // stream, and accumulating in the egress domain makes the drain quantum exactly the encoder's
         // frame size.
+        // The stretch the sender did not fill is skipped on the egress clock too, so this frame is
+        // stamped where its audio belongs. With an egress ptime other than the ingress one a partial
+        // egress frame may be waiting in the repacketizer; it rides the moved clock, off by at most
+        // that partial frame for one packet.
+        self.egress_timestamp = self.egress_timestamp.wrapping_add(carried_gap);
         self.repacketize(egress_pcm, parsed.marker, out);
     }
 
@@ -6545,6 +6567,122 @@ mod tests {
             packet.payload.iter().any(|&byte| byte != 0xD5),
             "transcoded G.711a carries non-silence audio"
         );
+    }
+
+    /// A µ-law packet with an explicit timestamp and SSRC, for the egress-clock tests.
+    fn ulaw_rtp_at(sequence: u16, timestamp: u32, ssrc: u32) -> Vec<u8> {
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 0,
+            sequence,
+            timestamp,
+            ssrc,
+        };
+        let payload = [0x7Eu8; 160];
+        let mut buffer = vec![0u8; 12 + payload.len()];
+        let len = write_packet(&header, &payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    /// The egress timestamps of the transcoded packets `packets` (sequence, timestamp, SSRC) produce.
+    fn egress_timestamps(packets: &[(u16, u32, u32)]) -> Vec<u32> {
+        let mut call = ulaw_alaw_call();
+        let mut timestamps = Vec::new();
+        for &(sequence, timestamp, ssrc) in packets {
+            let mut out = Vec::new();
+            let mut events = Vec::new();
+            call.process(
+                &rx(1, A_ADDR, ulaw_rtp_at(sequence, timestamp, ssrc)),
+                &mut out,
+                &mut events,
+            );
+            for datagram in out {
+                timestamps.push(RtpPacket::parse(&datagram.data).expect("parse").timestamp);
+            }
+        }
+        timestamps
+    }
+
+    fn steps(timestamps: &[u32]) -> Vec<u32> {
+        timestamps
+            .windows(2)
+            .map(|pair| pair[1].wrapping_sub(pair[0]))
+            .collect()
+    }
+
+    /// A sender in discontinuous transmission (an AMR phone between talkspurts, RFC 4867 §4.3.2)
+    /// sends nothing, or a SID frame now and then, for stretches of its media clock. The egress
+    /// clock has to cover the same stretch: stamped one frame after the last packet instead, the
+    /// silence is cut out of the timeline and the receiver's jitter buffer runs dry every time.
+    #[test]
+    fn a_silence_the_sender_did_not_send_keeps_its_length_on_the_egress_clock() {
+        let timestamps = egress_timestamps(&[
+            (1, 160, 0x1234_5678),
+            (2, 320, 0x1234_5678),
+            (3, 1600, 0x1234_5678),
+            (4, 1760, 0x1234_5678),
+        ]);
+        assert_eq!(steps(&timestamps), vec![160, 1280, 160], "{timestamps:?}");
+    }
+
+    /// A packet the network lost is 20 ms of audio that happened: the next packet is stamped where
+    /// its audio belongs, not one frame after the last one received.
+    #[test]
+    fn a_lost_packet_keeps_its_place_on_the_egress_clock() {
+        let timestamps = egress_timestamps(&[
+            (1, 160, 0x1234_5678),
+            (2, 320, 0x1234_5678),
+            (4, 640, 0x1234_5678),
+        ]);
+        assert_eq!(steps(&timestamps), vec![160, 320], "{timestamps:?}");
+    }
+
+    /// A new stream (another SSRC: the far end restarted it) starts a new ingress clock, and a jump
+    /// no talkspurt gap could explain is a clock reset, not silence: neither moves the egress clock
+    /// by more than the frame.
+    #[test]
+    fn a_new_stream_or_a_clock_jump_is_not_taken_for_silence() {
+        let new_stream = egress_timestamps(&[
+            (1, 160, 0x1234_5678),
+            (2, 320, 0x1234_5678),
+            (900, 5_000_000, 0x0BAD_CAFE),
+        ]);
+        assert_eq!(steps(&new_stream), vec![160, 160], "{new_stream:?}");
+        let jump = egress_timestamps(&[
+            (1, 160, 0x1234_5678),
+            (2, 320, 0x1234_5678),
+            (3, 320 + 8000 * 120, 0x1234_5678),
+        ]);
+        assert_eq!(steps(&jump), vec![160, 160], "{jump:?}");
+        let backwards = egress_timestamps(&[
+            (1, 1600, 0x1234_5678),
+            (2, 1760, 0x1234_5678),
+            (3, 160, 0x1234_5678),
+        ]);
+        assert_eq!(steps(&backwards), vec![160, 160], "{backwards:?}");
+    }
+
+    /// The gap is measured on the ingress RTP clock and spent on the egress one.
+    #[test]
+    fn an_ingress_gap_is_converted_between_rtp_clocks() {
+        assert_eq!(
+            super::ingress_clock::rescale_ticks(1280, 8_000, 8_000),
+            1280
+        );
+        assert_eq!(
+            super::ingress_clock::rescale_ticks(7680, 48_000, 8_000),
+            1280
+        );
+        assert_eq!(
+            super::ingress_clock::rescale_ticks(2560, 16_000, 8_000),
+            1280
+        );
+        assert_eq!(
+            super::ingress_clock::rescale_ticks(1280, 8_000, 16_000),
+            2560
+        );
+        assert_eq!(super::ingress_clock::rescale_ticks(1280, 0, 8_000), 0);
     }
 
     /// G.729 Annex B end to end on the transcode path: a µ-law leg carrying silence is re-encoded

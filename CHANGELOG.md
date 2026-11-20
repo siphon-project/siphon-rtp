@@ -35,6 +35,13 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   than leaving it attached and deaf. Behaviour change: `echo` was accepted on an intercepted two-party
   call and silenced its delivery, and is now refused there too. `node_info` lists
   `x3_single_leg` on a node provisioned for X3.
+- **A transcode keeps the sender's media clock across discontinuous transmission and loss.** Each
+  egress packet was stamped one frame after the last, so the stretches a sender leaves without packets
+  (an AMR sender between talkspurts, a SID frame every 160 ms; a lost packet) vanished from the egress
+  timeline: the receiver got a stream its timestamps called continuous at a fraction of the packet
+  rate, and its jitter buffer ran dry over and over (choppy audio towards a G.711 peer). The gap in
+  the ingress RTP clock is now carried into the egress clock, converted between the two clocks. A new
+  SSRC, a timestamp behind the one due, or a jump of more than 10 s carries nothing.
 
 ## [0.25.1] — 2026-11-20
 
