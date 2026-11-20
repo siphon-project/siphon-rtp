@@ -5,6 +5,18 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **`attach_x3` is accepted on an offered call, before the callee answers.** It was refused until the
+  second leg had answered, so a controller attaching when the warrant matched (at the INVITE) got an
+  error and had to wait for the ACK, losing early media and the first packets. The delivery connection
+  now opens at once and the taps go onto the media path the first answer installs; a `183` with SDP and
+  the final answer share one connection, Correlation ID and sequence, and `target_leg: callee` is
+  resolved at that answer. A call deleted unanswered ends the interception with `call_ended`. A call
+  with no second leg at all is still refused.
+
 ## [0.25.0] — 2026-11-20
 
 ### Added
