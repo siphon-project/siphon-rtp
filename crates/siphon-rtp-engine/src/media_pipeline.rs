@@ -52,85 +52,14 @@ use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
 
+mod ingress_clock;
 mod relay_tap;
 mod surrender;
 mod x3_single_leg;
+use ingress_clock::IngressClock;
 pub use relay_tap::CarriedAttachments;
 use relay_tap::TapDecode;
 pub use surrender::SurrenderedCall;
-
-/// `ticks` of one RTP clock (`from_hz`) in another (`to_hz`), rounded down; 0 for a clock of 0.
-fn rescale_ticks(ticks: u32, from_hz: u32, to_hz: u32) -> u32 {
-    if from_hz == 0 {
-        return 0;
-    }
-    ((u64::from(ticks) * u64::from(to_hz)) / u64::from(from_hz)) as u32
-}
-
-/// The longest stretch of the ingress media clock with no packet that is still taken for silence
-/// the sender did not send (discontinuous transmission, RFC 4867 §4.3.2) or loss. Anything longer
-/// is a clock reset, not audio, and is not carried into the egress clock.
-const MAX_CARRIED_GAP_SECONDS: u32 = 10;
-
-/// Where the ingress media clock is, so the egress clock of a transcode keeps time with it.
-///
-/// The transcode emits a packet per ingress packet and stamps each one frame after the last. A
-/// sender in discontinuous transmission (an AMR phone between talkspurts: a SID frame every 160 ms,
-/// RFC 4867 §4.3.2) or a lossy network leaves stretches of its clock with no packet, and stamped
-/// back to back those stretches vanish from the egress timeline: the receiver gets a stream its
-/// timestamps call continuous at a fraction of the packet rate, and its jitter buffer runs dry over
-/// and over. The stretch is measured here and the egress clock moved on by it.
-#[derive(Debug, Clone, Copy)]
-struct IngressClock {
-    /// The ingress codec's sample rate, which a decoded frame's sample count is in.
-    sample_rate_hz: u32,
-    /// The ingress RTP clock (RFC 3551 §4.5.2: not always the sample rate).
-    rtp_clock_hz: u32,
-    /// The egress RTP clock the gap is spent on.
-    egress_rtp_clock_hz: u32,
-    /// The SSRC of the stream last decoded and the timestamp its next packet is due at.
-    next: Option<(u32, u32)>,
-}
-
-impl IngressClock {
-    fn new(sample_rate_hz: u32, rtp_clock_hz: u32, egress_rtp_clock_hz: u32) -> Self {
-        Self {
-            sample_rate_hz,
-            rtp_clock_hz,
-            egress_rtp_clock_hz,
-            next: None,
-        }
-    }
-
-    /// A decoded ingress packet of `samples` (per channel, at the ingress sample rate): the egress
-    /// RTP ticks of media clock that passed before it with no packet, 0 when it came on time. A new
-    /// SSRC, a timestamp behind the one due, or a jump past [`MAX_CARRIED_GAP_SECONDS`] carries
-    /// nothing.
-    fn advance(&mut self, ssrc: u32, timestamp: u32, samples: usize) -> u32 {
-        let duration = rescale_ticks(
-            u32::try_from(samples).unwrap_or(u32::MAX),
-            self.sample_rate_hz,
-            self.rtp_clock_hz,
-        );
-        let gap = match self.next {
-            Some((stream, due)) if stream == ssrc => {
-                let ahead = timestamp.wrapping_sub(due);
-                // Ahead by less than half the clock's range: the packet is later than due (RFC 3550
-                // §5.1 modular arithmetic), else it is behind it, reordered or a reset.
-                if ahead < (1 << 31)
-                    && ahead <= self.rtp_clock_hz.saturating_mul(MAX_CARRIED_GAP_SECONDS)
-                {
-                    rescale_ticks(ahead, self.rtp_clock_hz, self.egress_rtp_clock_hz)
-                } else {
-                    0
-                }
-            }
-            _ => 0,
-        };
-        self.next = Some((ssrc, timestamp.wrapping_add(duration)));
-        gap
-    }
-}
 
 /// The playout-clock tick driving injected media (PlayMedia / PlayDtmf): one egress packet per
 /// 20 ms, the telephony default ptime (RFC 3551).
@@ -6737,11 +6666,23 @@ mod tests {
     /// The gap is measured on the ingress RTP clock and spent on the egress one.
     #[test]
     fn an_ingress_gap_is_converted_between_rtp_clocks() {
-        assert_eq!(rescale_ticks(1280, 8_000, 8_000), 1280);
-        assert_eq!(rescale_ticks(7680, 48_000, 8_000), 1280);
-        assert_eq!(rescale_ticks(2560, 16_000, 8_000), 1280);
-        assert_eq!(rescale_ticks(1280, 8_000, 16_000), 2560);
-        assert_eq!(rescale_ticks(1280, 0, 8_000), 0);
+        assert_eq!(
+            super::ingress_clock::rescale_ticks(1280, 8_000, 8_000),
+            1280
+        );
+        assert_eq!(
+            super::ingress_clock::rescale_ticks(7680, 48_000, 8_000),
+            1280
+        );
+        assert_eq!(
+            super::ingress_clock::rescale_ticks(2560, 16_000, 8_000),
+            1280
+        );
+        assert_eq!(
+            super::ingress_clock::rescale_ticks(1280, 8_000, 16_000),
+            2560
+        );
+        assert_eq!(super::ingress_clock::rescale_ticks(1280, 0, 8_000), 0);
     }
 
     /// G.729 Annex B end to end on the transcode path: a µ-law leg carrying silence is re-encoded
