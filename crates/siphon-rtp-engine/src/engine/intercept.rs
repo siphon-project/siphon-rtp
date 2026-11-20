@@ -21,11 +21,14 @@ use super::{
 /// One live lawful interception (ETSI TS 103 221-2 X3): the delivery task and everything teardown
 /// needs after the call itself is gone.
 pub(super) struct X3Session {
-    /// The warrant and the delivery address this session was attached with. A call carries several
-    /// sessions, told apart by this pair: a re-attach of the same pair replaces only that session,
-    /// and `detach_x3` selects by it.
+    /// The warrant, the delivery address and the Correlation ID this session was attached with. A
+    /// call carries several sessions, told apart by this triple: a re-attach of the same triple
+    /// replaces only that session, and `detach_x3` selects by it. The Correlation ID is part of the
+    /// key because one warrant can cover two calls bridged onto one engine call, each keeping its own
+    /// LI session and CID (TS 103 221-2 clause 6), at the same Mediation Function.
     pub(super) xid: Xid,
     pub(super) delivery: String,
+    pub(super) correlation_id: u64,
     /// The call's offerer tag and owning control client, copied here at attach time: teardown runs
     /// *after* `delete` has removed the call from the registry, so the end event cannot look them up.
     pub(super) from_tag: String,
@@ -62,7 +65,7 @@ pub(super) struct X3Session {
 }
 
 /// Every live interception of the engine's calls, keyed by call: a call carries one session per
-/// (`xid`, `delivery`). The map never holds an empty list, so the presence of a key still means "this
+/// (`xid`, `delivery`, `correlation_id`). The map never holds an empty list, so the presence of a key still means "this
 /// call is intercepted".
 ///
 /// The lock serialises the control operations that change a call's set of sessions (attach, detach,
@@ -83,11 +86,13 @@ impl std::ops::Deref for X3Sessions {
     }
 }
 
-/// Which sessions of a call a `detach_x3` names (the wire's optional `xid` and `delivery`).
+/// Which sessions of a call a `detach_x3` names (the wire's optional `xid`, `delivery` and
+/// `correlation_id`).
 #[derive(Clone, Copy)]
 pub(super) struct X3Selector<'a> {
     pub(super) xid: Option<Xid>,
     pub(super) delivery: Option<&'a str>,
+    pub(super) correlation_id: Option<u64>,
 }
 
 impl X3Selector<'_> {
@@ -96,6 +101,16 @@ impl X3Selector<'_> {
             && self
                 .delivery
                 .is_none_or(|delivery| delivery == session.delivery)
+            && self
+                .correlation_id
+                .is_none_or(|correlation_id| correlation_id == session.correlation_id)
+    }
+}
+
+impl X3Session {
+    /// Whether this session is the one an attach of (`xid`, `delivery`, `correlation_id`) replaces.
+    pub(super) fn is(&self, xid: Xid, delivery: &str, correlation_id: u64) -> bool {
+        self.xid == xid && self.delivery == delivery && self.correlation_id == correlation_id
     }
 }
 
@@ -124,6 +139,7 @@ pub(super) struct X3EventKey {
     pub(super) from_tag: String,
     pub(super) xid: Xid,
     pub(super) delivery: String,
+    pub(super) correlation_id: u64,
 }
 
 /// What [`Engine::spawn_x3_transport`] needs to run one interception's delivery task.
@@ -299,14 +315,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }) {
             return Err("the call is being re-answered; retry the attach once it is".to_string());
         }
-        // Replacing an existing delivery (same warrant, same address): stop that one **first**, and
+        // Replacing an existing delivery (same warrant, address and Correlation ID): stop that one **first**, and
         // only that one, so its teardown cannot remove the taps just installed and every other
         // delivery of the call carries on untouched. Doing it after the new taps were installed made
         // its `StopX3` / `clear_x3_tap` remove the very taps just installed, so a re-attach ended at
         // once with nothing delivered.
         self.end_x3_where(
             call_id,
-            |session| session.xid == xid && session.delivery == delivery,
+            |session| session.is(xid, delivery, correlation_id),
             |_| X3EndReason::Detached,
         )
         .await;
@@ -363,6 +379,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .push(X3Session {
                 xid,
                 delivery: delivery.to_string(),
+                correlation_id,
                 from_tag: from_tag.clone(),
                 owner,
                 bridged_endpoints: bridged_endpoints.clone(),
@@ -447,6 +464,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             from_tag: from_tag.to_string(),
             xid,
             delivery: delivery.to_string(),
+            correlation_id,
         };
         let started = std::time::Instant::now();
         let flag = ended.clone();
@@ -463,6 +481,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         from_tag: loss_key.from_tag.clone(),
                         xid: Some(loss_key.xid),
                         delivery: Some(loss_key.delivery.clone()),
+                        correlation_id: Some(loss_key.correlation_id),
                         dropped,
                         delivered,
                         dropped_since_ms: started.elapsed().as_millis() as u64,
@@ -863,6 +882,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             from_tag: session.from_tag.clone(),
             xid: session.xid,
             delivery: session.delivery.clone(),
+            correlation_id: session.correlation_id,
         };
         emit_x3_ended(
             events.as_ref(),
@@ -976,6 +996,7 @@ pub(super) fn emit_x3_ended(
             from_tag: key.from_tag.clone(),
             xid: Some(key.xid),
             delivery: Some(key.delivery.clone()),
+            correlation_id: Some(key.correlation_id),
             reason,
             delivered,
             dropped,

@@ -476,6 +476,7 @@ async fn an_interception_attached_on_a_seated_call_delivers_both_directions() {
             from_tag: call.target_tag(),
             xid: None,
             delivery: None,
+            correlation_id: None,
         })
         .await;
     assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
@@ -605,6 +606,7 @@ async fn detaching_a_joined_seat_ends_it_detached_and_the_room_stopping_ends_it_
             from_tag: "only".into(),
             xid: None,
             delivery: None,
+            correlation_id: None,
         })
         .await;
     assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
@@ -623,6 +625,7 @@ async fn detaching_a_joined_seat_ends_it_detached_and_the_room_stopping_ends_it_
             from_tag: "only".into(),
             xid: None,
             delivery: None,
+            correlation_id: None,
         })
         .await,
         CmdResult::Ok { .. }
@@ -980,6 +983,7 @@ async fn two_deliveries_follow_a_call_into_a_room_and_detach_one_leaves_the_othe
             from_tag: call.target_tag(),
             xid: Some(XID_TEXT.parse::<Xid>().expect("xid")),
             delivery: None,
+            correlation_id: None,
         })
         .await;
     assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
@@ -1067,6 +1071,7 @@ async fn a_joined_seat_carries_two_deliveries_and_detaching_one_leaves_the_other
             from_tag: "target".into(),
             xid: Some(XID_TEXT.parse::<Xid>().expect("xid")),
             delivery: None,
+            correlation_id: None,
         })
         .await;
     assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");

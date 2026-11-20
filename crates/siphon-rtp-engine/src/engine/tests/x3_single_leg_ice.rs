@@ -62,6 +62,7 @@ async fn an_ice_answer_local_leg_is_intercepted_after_its_pair_is_selected() {
         vec![crate::engine::intercept::X3Session {
             xid: Default::default(),
             delivery: "mdf.example.net:8090".to_string(),
+            correlation_id: 1,
             from_tag: "tag-a".to_string(),
             owner: CLIENT,
             bridged_endpoints: Vec::new(),

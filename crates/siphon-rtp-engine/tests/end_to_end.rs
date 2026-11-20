@@ -2265,6 +2265,7 @@ async fn detach_x3_is_idempotent_and_leaves_the_call_relaying() {
                 from_tag: "tag-a".into(),
                 xid: None,
                 delivery: None,
+                correlation_id: None,
             })
             .await;
         assert!(
@@ -2292,6 +2293,7 @@ async fn detach_x3_is_refused_for_an_unknown_call() {
             from_tag: "tag-a".into(),
             xid: None,
             delivery: None,
+            correlation_id: None,
         })
         .await;
     assert!(

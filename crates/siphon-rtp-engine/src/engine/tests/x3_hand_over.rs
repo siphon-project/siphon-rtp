@@ -33,6 +33,7 @@ fn inject_session_as(
         .push(crate::engine::intercept::X3Session {
             xid,
             delivery: address.to_string(),
+            correlation_id: 1,
             from_tag: OWNER_TAG.to_string(),
             owner: CLIENT,
             bridged_endpoints: Vec::new(),
@@ -64,6 +65,7 @@ fn detach(call_id: &str) -> Command {
         from_tag: OWNER_TAG.into(),
         xid: None,
         delivery: None,
+        correlation_id: None,
     }
 }
 
@@ -162,6 +164,7 @@ fn detach_xid(call_id: &str, xid: Xid) -> Command {
         from_tag: OWNER_TAG.into(),
         xid: Some(xid),
         delivery: None,
+        correlation_id: None,
     }
 }
 

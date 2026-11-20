@@ -86,13 +86,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some(endpoint) = self.conference.joined_seat_endpoint(conference_id, tag) else {
             return Err("the seat no longer exists".to_string());
         };
-        // Replacing a live delivery (same warrant, same address): stop that one first, so its
+        // Replacing a live delivery (same warrant, address and Correlation ID): stop that one first, so its
         // teardown cannot remove the taps just installed. The seat's other deliveries carry on.
         let key = (conference_id.to_string(), tag.to_string());
         self.end_x3_seat_where(
             conference_id,
             tag,
-            |session| session.xid == xid && session.delivery == delivery,
+            |session| session.is(xid, delivery, correlation_id),
             |_| X3EndReason::Detached,
         )
         .await;
@@ -141,6 +141,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .push(X3Session {
                 xid,
                 delivery: delivery.to_string(),
+                correlation_id,
                 from_tag: tag.to_string(),
                 owner: client,
                 bridged_endpoints: Vec::new(),
