@@ -137,13 +137,17 @@ impl Rig {
     }
 
     async fn attach(&self) -> CmdResult {
+        self.attach_targeting(X3TargetLeg::Caller).await
+    }
+
+    async fn attach_targeting(&self, target_leg: X3TargetLeg) -> CmdResult {
         self.send(Command::AttachX3 {
             call_id: self.call.into(),
             from_tag: "tag-a".into(),
             delivery: self.listener.local_addr().expect("mdf addr").to_string(),
             xid: XID_TEXT.parse::<Xid>().expect("xid"),
             correlation_id: CORRELATION_ID,
-            target_leg: X3TargetLeg::Caller,
+            target_leg,
         })
         .await
     }
@@ -470,5 +474,102 @@ async fn the_x3_timestamp_is_interception_time_on_the_udp_datapath() {
         (350_000_000..2_000_000_000).contains(&spread),
         "two packets 400 ms apart were stamped {} ms apart",
         spread / 1_000_000
+    );
+}
+
+fn x3_ends(events: Vec<Event>) -> Vec<(X3EndReason, u64)> {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::X3Ended {
+                reason, delivered, ..
+            } => Some((reason, delivered)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interception_attached_at_the_offer_delivers_from_the_first_answered_packet() {
+    // A content warrant can match before the callee answers; the interception is taken at the
+    // offer and its taps go onto the media path the first answer installs.
+    let rig = Rig::new("x3-at-offer").await;
+    rig.offer(plain_sdp(rig.addr_a(), "sendrecv"), ProfileFlags::default())
+        .await;
+    let attached = rig.attach().await;
+    assert!(
+        matches!(attached, CmdResult::Ok { .. }),
+        "attach on an offered call: {attached:?}"
+    );
+    let mut tls = rig.accept().await;
+    let toward_a = rig.answer(plain_sdp(rig.addr_b(), "sendrecv")).await;
+    expect_from_a(&rig, &mut tls, toward_a, &[1, 2], 0).await;
+    assert_no_x3_end(&rig.drained_events(), "at the answer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_media_and_the_final_answer_share_one_delivery() {
+    // A 183 with SDP is answered first, the 200 OK after it: one connection, one Correlation ID,
+    // one unbroken sequence across both.
+    let rig = Rig::new("x3-early-media").await;
+    let toward_b = rig
+        .offer(plain_sdp(rig.addr_a(), "sendrecv"), ProfileFlags::default())
+        .await;
+    assert!(matches!(rig.attach().await, CmdResult::Ok { .. }));
+    let mut tls = rig.accept().await;
+    rig.answer(plain_sdp(rig.addr_b(), "sendrecv")).await;
+    rig.phone_b
+        .send_to(&rtp(700), toward_b)
+        .await
+        .expect("early media from b");
+    let early = read_pdus(&mut tls, 1).await;
+    assert_eq!(rtp_sequence_of(&early[0]), 700);
+    assert_eq!(sequence_of(&early[0]), 0);
+    assert_eq!(early[0].header.correlation_id, CORRELATION_ID);
+    assert_eq!(
+        early[0].header.payload_direction,
+        PayloadDirection::ToTarget.to_u16()
+    );
+    let toward_a = rig.answer(plain_sdp(rig.addr_b(), "sendrecv")).await;
+    expect_from_a(&rig, &mut tls, toward_a, &[1, 2], 1).await;
+    assert_no_x3_end(&rig.drained_events(), "at the final answer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_callee_target_attached_before_the_callee_exists_is_tapped_as_the_target() {
+    let rig = Rig::new("x3-callee-at-offer").await;
+    let toward_b = rig
+        .offer(plain_sdp(rig.addr_a(), "sendrecv"), ProfileFlags::default())
+        .await;
+    assert!(matches!(
+        rig.attach_targeting(X3TargetLeg::Callee).await,
+        CmdResult::Ok { .. }
+    ));
+    let mut tls = rig.accept().await;
+    rig.answer(plain_sdp(rig.addr_b(), "sendrecv")).await;
+    rig.phone_b
+        .send_to(&rtp(42), toward_b)
+        .await
+        .expect("b sends");
+    let pdus = read_pdus(&mut tls, 1).await;
+    assert_eq!(rtp_sequence_of(&pdus[0]), 42);
+    assert_eq!(
+        pdus[0].header.payload_direction,
+        PayloadDirection::FromTarget.to_u16(),
+        "the callee is the target, so its own packets are from the target"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interception_on_a_call_deleted_unanswered_ends_with_the_call() {
+    let rig = Rig::new("x3-unanswered").await;
+    rig.offer(plain_sdp(rig.addr_a(), "sendrecv"), ProfileFlags::default())
+        .await;
+    assert!(matches!(rig.attach().await, CmdResult::Ok { .. }));
+    let _tls = rig.accept().await;
+    rig.delete().await;
+    assert_eq!(
+        x3_ends(rig.drained_events()),
+        vec![(X3EndReason::CallEnded, 0)]
     );
 }

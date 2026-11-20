@@ -104,15 +104,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Validate the delivery address before promoting or dialling anything.
         split_delivery_address(delivery).map_err(|error| error.to_string())?;
 
-        let Some((pipeline, echo, two_leg)) = self.owned_call_internal(call_id, |call| {
-            (
-                call.pipeline,
-                call.promotion_reasons.contains(&PromotionReason::Echo),
-                call.far
-                    .as_ref()
-                    .is_some_and(|far| far.remote_rtp.is_some()),
-            )
-        }) else {
+        let Some((pipeline, echo, has_far_leg, answered)) =
+            self.owned_call_internal(call_id, |call| {
+                (
+                    call.pipeline,
+                    call.promotion_reasons.contains(&PromotionReason::Echo),
+                    call.far.is_some(),
+                    call.far
+                        .as_ref()
+                        .is_some_and(|far| far.remote_rtp.is_some()),
+                )
+            })
+        else {
             return Err("call no longer exists".to_string());
         };
 
@@ -133,8 +136,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .to_string(),
             );
         }
-        if !two_leg {
-            return Err("the call has no answered second leg to intercept".to_string());
+        // A call with no far leg at all (a local answer) has no second party whose content a warrant
+        // covers. A far leg that is offered but not answered yet does: a warrant can match at the
+        // INVITE, and content (early media included) flows from the first answer on.
+        if !has_far_leg {
+            return Err("the call has no second leg to intercept".to_string());
         }
 
         // Build the delivery TLS once, before anything is installed: bad PKI must fail here rather
@@ -150,9 +156,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         let (factory, delivery_channel) = x3_channel(config.buffer_packets);
         let target_is_caller = matches!(target_leg, X3TargetLeg::Caller);
-        let bridged_endpoints = self
-            .install_x3_taps(call_id, &factory, target_is_caller)
-            .await?;
+        // Before the first answer there is no media path to tap yet. The session (and with it the
+        // delivery connection, the Correlation ID and the sequence counter) is stood up now, and
+        // every answer, the first one included, puts the taps onto whatever it installed
+        // ([`Self::carry_x3_across_answer`]), so a 183's early media and the final answer share one
+        // delivery.
+        let bridged_endpoints = if answered {
+            self.install_x3_taps(call_id, &factory, target_is_caller)
+                .await?
+        } else {
+            Vec::new()
+        };
 
         let Some((owner, from_tag)) =
             self.owned_call_internal(call_id, |call| (call.owner, call.from_tag.clone()))

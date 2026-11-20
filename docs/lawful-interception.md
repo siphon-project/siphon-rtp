@@ -116,6 +116,13 @@ to be re-installed, the interception ends with `transport_error` rather than sta
 silent. A re-offer that changes the negotiated codec is refused by the engine, so that case does not
 arise.
 
+`attach_x3` is accepted as soon as the call has been offered, before the callee answers: a warrant can
+match at the INVITE. The delivery connection opens at once, and the taps go onto the media path the
+first answer installs, so early media from a `183` with SDP and the final answer share one connection,
+one Correlation ID and one sequence. `target_leg: callee` is resolved then too. A call deleted before
+any answer ends the interception with `call_ended` and nothing delivered. A call with no second leg at
+all (a local answer) is still refused.
+
 ### Events
 
 | Event | Meaning |
