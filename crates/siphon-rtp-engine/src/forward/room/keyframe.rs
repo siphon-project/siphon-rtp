@@ -511,7 +511,17 @@ impl ForwardRoom {
         if joined.feedback.nack && self.keyframes.history.is_none() {
             self.keyframes.history = Some(History::new());
         }
-        let receives = joined.receives;
+        self.start_receiver_on_keyframe(index);
+    }
+
+    /// Hold seat `index` until a keyframe of the source it is sent from now on, and ask the source for
+    /// one: a seat that joins, or switches its video back on, while the source streams. Nothing for a
+    /// seat that is the source, receives no video, or a source that sends none.
+    pub(super) fn start_receiver_on_keyframe(&mut self, index: usize) {
+        let receives = self.seats[index]
+            .video
+            .as_ref()
+            .is_some_and(|video| video.receives);
         if receives && Some(index) != self.source && self.source_carries_video() {
             if let Some(video) = self.seats[index].video.as_mut() {
                 video.keyframe.arm();
@@ -879,6 +889,10 @@ impl ForwardRoom {
             let index = retransmit.receiver;
             let history = self.keyframes.history.as_deref();
             let receiver = self.seats.get_mut(index)?;
+            if !receiver.reception.video {
+                receiver.counters.reception_off_dropped_video += 1;
+                continue;
+            }
             let video = receiver.video.as_mut()?;
             let original = video
                 .translator

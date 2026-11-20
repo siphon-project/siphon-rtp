@@ -21,6 +21,7 @@ The verbs exist on the native JSON control channel only, and take no `scope`: pu
 | `forward_offer` | Dial a member out: offer it a seat, pending until it answers |
 | `forward_answer` | Seat the member that answered a `forward_offer` |
 | `forward_set_source` | Choose whose audio is forwarded: a `from_tag`, or none |
+| `forward_set_reception` | Switch what one seat is sent, per stream (audio, video) |
 | `forward_leave` | Unseat a member (or drop its unanswered offer); the room ends with its last member |
 
 ```json
@@ -39,6 +40,44 @@ hears itself. If the source leaves, nothing is forwarded until the next `forward
 
 Check `node_info` `features` for `forward_room` first (`forward_dialout` for the offer and answer verbs,
 `forward_transcode` for mixed-codec rooms). A draining node refuses `forward_join` and `forward_offer`.
+
+## Manual reception mode
+
+A seat joins receiving the source's audio and video. 3GPP TS 24.581 §6.3.7 keeps, per receiver, the list
+of flows actually sent to it, and a client in manual reception mode gets nothing until it asks. The
+controller keeps that list; the room enforces it with one verb:
+
+```json
+{"id":6,"command":"forward_set_reception","conference_id":"group-1","from_tag":"b19e02","audio":true,"video":false}
+```
+
+Both booleans are required, `true` receives. It answers `ok`, or an error for an unknown room or seat,
+takes effect on the next packet and is idempotent, so the controller can resend the whole state. Check
+`node_info` `features` for `forward_seat_reception`.
+
+- Only what is sent to the seat is gated: audio and video, in translating rooms (also for a seat that is
+  transcoded for and for a browser seat's bundled video), in preserving rooms (the talker's RTP only), the
+  parameter-set replay and NACK resends. Each withheld packet is counted per seat and stream as
+  `reception_off_dropped`, in the seat's stats and its leave log.
+- The seat's own media is not touched. An off seat still sends, and may be the source.
+- Its control stream is never gated. `send_rtcp_app` (the floor stream, a browser seat's data channel, or
+  the audio RTCP) still reaches a seat whose audio and video are both off, so Media Transmission
+  Notification and Receive Media Response are delivered. A preserving room's forwarded talker RTCP is
+  control too and keeps flowing.
+- Switching a stream back on rebases the seat's stream as at a source switch: its SSRC stays, its sequence
+  number carries on from the last packet it was sent, and the first packet carries the marker bit (RFC
+  3550 §5.1). For video the seat also waits for the source's next keyframe, the same as a seat that
+  joins mid-stream, and the room asks the source for one (PLI or FIR); the parameter sets are replayed
+  ahead of the picture. A keyframe asked for this way is not a source change, so no `forward_keyframe`
+  event is raised.
+- Reports follow RFC 3550 §6.4: the room sends a seat's stream a Sender Report only if it sent that
+  stream a data packet in the current report interval or the previous one, otherwise a Receiver Report
+  from the same SSRC. So a stream that is off (or a room with no source) goes from SR to RR after two
+  report intervals, and back to SR once packets flow again. The RR still carries the reception report
+  block about the seat's own media (loss, jitter, LSR, DLSR).
+- Forwarding rooms are not part of a snapshot (`snapshot`/`restore` carry calls, not rooms), so the flags
+  are not checkpointed: a standby does not have the room at all. A controller that rebuilds a room after
+  a failover sets the reception of each seat again.
 
 ## Dialling a member out
 
@@ -179,7 +218,8 @@ holds that), except that rebuilding the decoder at a source change allocates onc
 
 A seat's RTCP is consumed (Sender Report to LSR/DLSR, reception report blocks to round-trip time) and
 never forwarded. Every 5 s the room sends each seat a Sender Report about the stream that seat
-receives: its fixed SSRC, the translator's packet and octet counts, and an RTP timestamp on the same
+receives (a Receiver Report instead when the room sent that stream no packet in this interval or the
+previous one, RFC 3550 §6.4): its fixed SSRC, the translator's packet and octet counts, and an RTP timestamp on the same
 line as the packets, so the NTP to RTP mapping is consistent. A seat that has sent the room RTP also
 gets a reception report block about it (loss, jitter, LSR and DLSR). RTCP APP packets are not
 relayed either: they go to the controller, see [Floor control](#floor-control-mcptt).

@@ -503,6 +503,71 @@ fn video_ingest_and_fan_out_make_no_heap_allocation() {
     assert!(forwarded > 0);
 }
 
+#[test]
+fn the_reception_gate_and_switching_it_make_no_heap_allocation() {
+    // 100 seats with video; half of them have audio and video switched off, so every packet is
+    // checked against the gate for 99 receivers and dropped for about half.
+    let mut room = build_room(siphon_rtp_proto::ForwardMedia::Translate, false, true);
+    let tags: Vec<String> = (0..SEATS).map(|index| format!("seat-{index}")).collect();
+    let audio: Vec<RxPacket> = (1..=64).map(|sequence| packet(0, sequence)).collect();
+    let video: Vec<RxPacket> = (1..=63)
+        .map(|sequence| video_packet(0, sequence, sequence % 3 == 0))
+        .collect();
+    room.set_source(Some("seat-0")).unwrap();
+    for warm in [&audio[0], &video[0]] {
+        room.ingest(warm);
+        while room.next_datagram(warm).is_some() {}
+    }
+    room.drain_events().for_each(drop);
+    for tag in &tags[1..=50] {
+        room.set_reception(tag, false, false).unwrap();
+    }
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut forwarded = 0usize;
+    for _ in 0..100 {
+        for packet in audio.iter().chain(&video) {
+            room.ingest(packet);
+            while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                forwarded += std::hint::black_box(datagram).len();
+            }
+        }
+    }
+    let gated = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(forwarded > 0, "the other half was still forwarded to");
+    assert_eq!(
+        gated, 0,
+        "the gated fan-out allocated {gated} times (must be zero)"
+    );
+    let stats = room.seat_stats("seat-1").unwrap();
+    assert!(stats.reception_off_dropped_audio > 0 && stats.reception_off_dropped_video > 0);
+
+    // Switching it back on and off between runs: a flag, a rebase and a keyframe request, no heap.
+    let mut resumed = 0usize;
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for round in 0..100 {
+        let on = round % 2 == 0;
+        for tag in &tags[1..=50] {
+            room.set_reception(tag, on, on).unwrap();
+        }
+        for packet in audio.iter().chain(&video) {
+            room.ingest(packet);
+            while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                resumed += std::hint::black_box(datagram).len();
+            }
+        }
+    }
+    let switching = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert_eq!(
+        switching, 0,
+        "switching reception allocated {switching} times across 100 rounds (must be zero)"
+    );
+    assert!(resumed > 0);
+}
+
 /// An RTCP datagram a video seat sends the room (its video endpoint, its signalled address).
 fn video_rtcp(seat: usize, data: Vec<u8>) -> RxPacket {
     RxPacket {

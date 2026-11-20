@@ -99,6 +99,13 @@ pub enum ForwardControl {
         events: Option<flume::Sender<Event>>,
         reply: tokio::sync::oneshot::Sender<Result<(), ForwardError>>,
     },
+    /// Switch what a seat is sent, per stream; the verdict goes back once the room applied it.
+    SetReception {
+        tag: String,
+        audio: bool,
+        video: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(), ForwardError>>,
+    },
     /// Send one RTCP APP packet to the seats `target` names; the verdict goes back on `reply` once
     /// the datapath has taken the datagram for every addressed seat.
     SendApp {
@@ -583,6 +590,36 @@ impl ForwardRegistry {
         }
     }
 
+    /// Switch what seat `tag` of room `room_id` is sent, per stream, and wait for the room's verdict.
+    /// The room applies it between two packets, so it takes effect on the next one.
+    ///
+    /// # Errors
+    /// [`ForwardRefusal::UnknownRoom`], or the room's refusal of an unknown tag.
+    pub async fn set_reception(
+        &self,
+        room_id: &str,
+        tag: &str,
+        audio: bool,
+        video: bool,
+    ) -> Result<(), ForwardRefusal> {
+        let Some(mailbox) = self.rooms.get(room_id).map(|room| room.mailbox.clone()) else {
+            return Err(ForwardRefusal::UnknownRoom(room_id.to_string()));
+        };
+        let (reply, verdict) = tokio::sync::oneshot::channel();
+        mailbox
+            .try_send(ForwardInput::Control(ForwardControl::SetReception {
+                tag: tag.to_string(),
+                audio,
+                video,
+                reply,
+            }))
+            .map_err(|_| ForwardRefusal::NoVerdict)?;
+        match tokio::time::timeout(VERDICT_TIMEOUT, verdict).await {
+            Ok(Ok(outcome)) => outcome.map_err(ForwardRefusal::from),
+            Ok(Err(_)) | Err(_) => Err(ForwardRefusal::NoVerdict),
+        }
+    }
+
     /// Send one RTCP APP packet to the seats `target` names in `room_id`, and wait until the room
     /// has put it on the wire for every addressed seat.
     ///
@@ -844,6 +881,9 @@ async fn run_forward_room<D: Datapath>(
                             source_events = events;
                         }
                         let _ = reply.send(outcome);
+                    }
+                    ForwardInput::Control(ForwardControl::SetReception { tag, audio, video, reply }) => {
+                        let _ = reply.send(room.set_reception(&tag, audio, video));
                     }
                     ForwardInput::Control(ForwardControl::SendApp { target, request, reply }) => {
                         let _ = reply.send(

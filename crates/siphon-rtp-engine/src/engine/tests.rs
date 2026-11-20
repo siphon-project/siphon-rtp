@@ -431,6 +431,13 @@ fn command_call_id_extracts_the_addressed_correlation_key() {
         from_tag: None,
     };
     assert_eq!(command_call_id(&set_source), Some("group-1"));
+    let set_reception = Command::ForwardSetReception {
+        conference_id: "group-1".into(),
+        from_tag: "a".into(),
+        audio: false,
+        video: false,
+    };
+    assert_eq!(command_call_id(&set_reception), Some("group-1"));
     let send = |call_id: Option<&str>, conference_id: Option<&str>| Command::SendRtcpApp {
         call_id: call_id.map(Into::into),
         conference_id: conference_id.map(Into::into),

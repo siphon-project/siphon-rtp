@@ -830,6 +830,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_tag: Option<String>,
     },
+    /// Switch what one seat of a forwarding room is sent, per stream: its `audio` and its `video`
+    /// (3GPP TS 24.581 §6.3.7, the receiver's Active SSRC List). A seat joins receiving both. Takes
+    /// effect on the next packet; idempotent. The seat's own media and its control stream (floor,
+    /// RTCP APP) are not touched. Switching video back on starts the seat on a keyframe of the source.
+    ForwardSetReception {
+        conference_id: String,
+        from_tag: String,
+        audio: bool,
+        video: bool,
+    },
     /// Send one RTCP APP packet (RFC 3550 §6.7), such as a TS 24.380 floor control message, to one
     /// party, or to every seat of a forwarding room.
     ///
@@ -4220,6 +4230,34 @@ mod tests {
             r#"{"id":14,"command":"forward_leave","conference_id":"group-1","from_tag":"b19e02"}"#
         );
         roundtrip(&leave);
+    }
+
+    #[test]
+    fn forward_set_reception_takes_both_streams_as_required_booleans() {
+        let set = Request {
+            id: 16,
+            command: Command::ForwardSetReception {
+                conference_id: "group-1".into(),
+                from_tag: "a7c31f".into(),
+                audio: true,
+                video: false,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&set).expect("serialize"),
+            r#"{"id":16,"command":"forward_set_reception","conference_id":"group-1","from_tag":"a7c31f","audio":true,"video":false}"#
+        );
+        roundtrip(&set);
+        for incomplete in [
+            r#"{"command":"forward_set_reception","conference_id":"g","from_tag":"f","audio":true}"#,
+            r#"{"command":"forward_set_reception","conference_id":"g","from_tag":"f","video":true}"#,
+            r#"{"command":"forward_set_reception","conference_id":"g","audio":true,"video":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Command>(incomplete).is_err(),
+                "{incomplete}"
+            );
+        }
     }
 
     #[test]

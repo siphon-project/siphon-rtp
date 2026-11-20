@@ -518,9 +518,17 @@ fn a_seat_that_has_sent_rtp_gets_a_reception_report_about_it() {
         .iter()
         .find(|item| item.endpoint == EndpointId(1))
         .unwrap();
-    let (_, _, _, packets, _, block) = sender_report_fields(&to_one.data);
-    assert_eq!(packets, 0, "nothing was ever forwarded to the source");
-    let block = block.expect("a reception report block about seat-1's stream");
+    // Nothing was ever forwarded to the source, so RFC 3550 §6.4 makes its report an RR (it was an
+    // SR with a zero count): the reception block about its own stream is the same.
+    let packets = rtcp::parse_compound(&to_one.data).unwrap();
+    let rtcp::RtcpPacket::ReceiverReport(report) = &packets[0] else {
+        panic!("expected an RR, got {packets:?}");
+    };
+    assert_eq!(report.ssrc, 0xE000_0001);
+    let block = *report
+        .reports
+        .first()
+        .expect("a reception report block about seat-1's stream");
     assert_eq!(block.ssrc, 0x1111_1111);
     assert_eq!(block.highest_sequence, 13);
     assert_eq!(block.cumulative_lost, 1);
@@ -532,6 +540,12 @@ fn a_seat_that_has_sent_rtp_gets_a_reception_report_about_it() {
 #[test]
 fn a_reception_report_about_the_seats_stream_yields_a_round_trip() {
     let mut room = room_of(2);
+    // Seat 2 is sent a packet first: only a stream the room sends is reported with an SR (RFC 3550
+    // §6.4), and the SR's NTP time is what the seat echoes as LSR.
+    room.set_source(Some("seat-1")).unwrap();
+    let packet = rx(1, 900_000, rtp(96, 1, 0, 0x1111_1111, &[1]));
+    room.ingest(&packet);
+    forwarded(&mut room, &packet);
     let mut out = Vec::new();
     room.build_reports(0x0000_0010_0000_0000, 1_000_000, &mut out);
     let to_two = out
@@ -667,6 +681,7 @@ mod floor;
 mod keyframe;
 mod mode_request;
 mod preserve;
+mod reception;
 mod transcode;
 mod video;
 mod video_webrtc;

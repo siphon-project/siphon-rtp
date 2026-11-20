@@ -7,6 +7,17 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **`forward_set_reception` switches what a seat of a forwarding room receives, per stream.** `audio` and
+  `video` are required booleans on the new verb, a seat joins received, and it takes effect on the next
+  packet. A seat's own media and its control stream (floor, `send_rtcp_app`, reports) are never gated, so an
+  off seat can still be the source and still be told it was granted. Switching a stream back on rebases the
+  seat's stream as at a source switch, and video waits for the source's next keyframe, which the room asks
+  for. Withheld packets count as `reception_off_dropped` per seat and stream. `node_info` lists
+  `forward_seat_reception`. Adding the `Command::ForwardSetReception` variant is a minor bump of
+  `siphon-rtp-proto`.
+
 ### Fixed
 
 - **An answer the engine writes no longer promises audio feedback it does not send.** A seat's,
@@ -14,6 +25,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   so a browser seat was answered `transport-cc` (and `nack`) on audio although the room sends Sender and
   Receiver Reports only. They are no longer answered there (RFC 4585 §4.2); a video section keeps the
   feedback the room serves.
+
+- **A forwarding room sends a Receiver Report for a stream it did not send.** RFC 3550 §6.4 allows a Sender
+  Report only when data packets were sent in the last report interval or the one before. The room sent an SR
+  with a stalled count to a seat in a room with no source (and would have to an off stream). It now sends an
+  RR from the same SSRC, still carrying the reception block about the seat's own media, and an SR again
+  once packets flow.
 
 ## [0.24.0] — 2026-11-20
 

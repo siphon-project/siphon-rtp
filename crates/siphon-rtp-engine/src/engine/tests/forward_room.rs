@@ -716,3 +716,118 @@ async fn a_nated_seat_is_gated_on_and_sent_to_its_received_from_address() {
 
 mod dial_out;
 mod ice_lite;
+
+async fn set_reception(
+    engine: &Engine<UdpLoopbackDatapath>,
+    room: &str,
+    tag: &str,
+    audio: bool,
+    video: bool,
+) -> CmdResult {
+    engine
+        .handle(
+            CLIENT,
+            Command::ForwardSetReception {
+                conference_id: room.into(),
+                from_tag: tag.into(),
+                audio,
+                video,
+            },
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_seat_with_its_audio_off_hears_nothing_until_it_is_switched_back_on() {
+    let engine = engine_with_dispatcher();
+    let (phone_a, port_a) = seat(&engine, "a", 96).await;
+    let (phone_b, _) = seat(&engine, "b", 96).await;
+    let (phone_c, _) = seat(&engine, "c", 96).await;
+    assert_eq!(set_source(&engine, Some("a")).await, ok_empty());
+    let send = |sequence: u16| {
+        let phone = &phone_a;
+        async move {
+            phone
+                .send_to(
+                    &media(
+                        96,
+                        sequence,
+                        u32::from(sequence) * 320,
+                        0xA0A0_A0A0,
+                        &[7, 8],
+                    ),
+                    port_a,
+                )
+                .await
+                .expect("send");
+        }
+    };
+    send(1).await;
+    let first = hear(&phone_b).await;
+    hear(&phone_c).await;
+
+    assert_eq!(
+        set_reception(&engine, ROOM, "b", false, true).await,
+        ok_empty()
+    );
+    assert_eq!(
+        set_reception(&engine, ROOM, "b", false, true).await,
+        ok_empty(),
+        "idempotent"
+    );
+    send(2).await;
+    send(3).await;
+    hear(&phone_c).await;
+    hear(&phone_c).await;
+    assert!(
+        recv_rtp(&phone_b, NEGATIVE).await.is_none(),
+        "an off seat is sent nothing"
+    );
+
+    assert_eq!(
+        set_reception(&engine, ROOM, "b", true, true).await,
+        ok_empty()
+    );
+    send(4).await;
+    let resumed = hear(&phone_b).await;
+    assert_eq!(resumed.ssrc, first.ssrc);
+    assert_eq!(
+        resumed.sequence,
+        first.sequence.wrapping_add(1),
+        "its own stream carries on without a gap"
+    );
+    assert!(
+        recv_rtp(&phone_a, NEGATIVE).await.is_none(),
+        "the source never hears itself"
+    );
+}
+
+#[tokio::test]
+async fn setting_reception_for_an_unknown_room_or_seat_is_refused() {
+    let engine = engine_with_dispatcher();
+    assert_eq!(
+        set_reception(&engine, ROOM, "a", false, false).await,
+        CmdResult::Error {
+            reason: format!("forward_set_reception: unknown forwarding room: {ROOM}")
+        }
+    );
+    let (_phone_a, _) = seat(&engine, "a", 96).await;
+    assert_eq!(
+        set_reception(&engine, ROOM, "ghost", false, false).await,
+        CmdResult::Error {
+            reason: "forward_set_reception: no seat ghost in this room".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn node_info_advertises_seat_reception() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let CmdResult::NodeInfo { node } = engine.handle(CLIENT, Command::NodeInfo).await else {
+        panic!("node_info answers a node");
+    };
+    assert!(node
+        .features
+        .iter()
+        .any(|name| name == "forward_seat_reception"));
+}

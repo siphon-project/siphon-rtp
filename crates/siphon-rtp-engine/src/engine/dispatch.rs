@@ -543,7 +543,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             | Command::ForwardOffer { .. }
             | Command::ForwardAnswer { .. }
             | Command::ForwardLeave { .. }
-            | Command::ForwardSetSource { .. }) => self.dispatch_forward(client, command).await,
+            | Command::ForwardSetSource { .. }
+            | Command::ForwardSetReception { .. }) => self.dispatch_forward(client, command).await,
             Command::SendRtcpApp {
                 call_id,
                 conference_id,
@@ -1019,6 +1020,7 @@ pub(super) fn command_name(command: &Command) -> &'static str {
         Command::ForwardAnswer { .. } => "forward_answer",
         Command::ForwardLeave { .. } => "forward_leave",
         Command::ForwardSetSource { .. } => "forward_set_source",
+        Command::ForwardSetReception { .. } => "forward_set_reception",
         Command::SendRtcpApp { .. } => "send_rtcp_app",
         Command::SetFloorKeys { .. } => "set_floor_keys",
         // [`Command`] is `#[non_exhaustive]`. A verb this engine has no arm for still has to be
@@ -1075,7 +1077,8 @@ pub(super) fn command_call_id(command: &Command) -> Option<&str> {
         | Command::ForwardOffer { conference_id, .. }
         | Command::ForwardAnswer { conference_id, .. }
         | Command::ForwardLeave { conference_id, .. }
-        | Command::ForwardSetSource { conference_id, .. } => Some(conference_id),
+        | Command::ForwardSetSource { conference_id, .. }
+        | Command::ForwardSetReception { conference_id, .. } => Some(conference_id),
         Command::SendRtcpApp {
             call_id,
             conference_id,
