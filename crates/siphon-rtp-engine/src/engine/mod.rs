@@ -43,6 +43,7 @@ mod key_mgmt;
 mod leg;
 mod media_started;
 mod negotiate;
+mod ng_offer;
 
 pub(crate) use media_started::MEDIA_STARTED_POLL_MS;
 mod multi_source;

@@ -148,6 +148,14 @@ Honest differences from stock rtpengine, and from siphon-rtp's own native protoc
   scope from `via-branch` was considered and left out: the front end does not read that key
   today, a `delete` without it means every branch of the call, and a proxy that re-offers under
   a new branch would land in a second call.
+- **`offer` on a live call is a re-offer.** NG has no re-offer verb, so an `offer` whose `call-id`
+  is live and whose `from-tag` is the call's A tag (or its B tag once answered) renegotiates the
+  call on its existing ports: the interception, if any, rides through, and the `answer` that
+  follows completes it (same tags for A's re-offer, `from-tag` B and `to-tag` A for B's). If the
+  re-offer is refused (for example it drops the negotiated codec) the call is replaced as in a
+  JSON `offer`, with new ports, and an interception ends as `call_ended`. An `offer` with a
+  `from-tag` the call does not know (a forked call) replaces the call: forking is not supported.
+  The JSON front-end `offer` always replaces; use its `reoffer` verb to renegotiate.
 - **Unknown verbs return an error**, never a crash and never silence:
   `{"result": "error", "error-reason": "unsupported command: ..."}`.
 - The bencode parser and NG mapper are fuzzed; malformed datagrams from the network

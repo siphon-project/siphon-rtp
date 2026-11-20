@@ -1270,7 +1270,7 @@ where
             const NG_CLIENT: ClientId = ClientId(u64::MAX);
             let handler = move |command| {
                 let engine = ng_engine.clone();
-                async move { engine.handle(NG_CLIENT, command).await }
+                async move { engine.handle_ng(NG_CLIENT, command).await }
             };
             if let Err(error) = siphon_rtp_ngcompat::server::serve(ng_socket, handler).await {
                 tracing::error!(%error, "NG control listener stopped");
