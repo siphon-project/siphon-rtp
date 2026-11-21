@@ -60,6 +60,7 @@ mod x3;
 pub use bridge::UnbridgeRefusal;
 pub use seat::{SeatRefusal, SEAT_VERDICT_TIMEOUT};
 pub use seating::{ReleasedSeat, SeatActivation, SeatControl, SeatedCall};
+pub use x3::SeatX3Source;
 
 /// The narrowband fast-path room rate (all-G.711/G.726/PSTN, unbridged).
 pub const NARROWBAND_RATE_HZ: u32 = 8_000;
@@ -854,7 +855,7 @@ impl Conference {
         };
         // ETSI TS 103 221-2 X3: what the intercepted seat sent, after the ingress chain accepted it.
         if let Some(x3) = participant.call_seat.x3.as_deref() {
-            x3.from_target.deliver(packet.source, data);
+            x3.from_seat.deliver(packet.source, data);
         }
         if data.len() < 2 {
             return Ingress::Accepted; // gated in; too short to be audio, but the path is alive
@@ -1513,7 +1514,7 @@ impl Conference {
         };
         // ETSI TS 103 221-2 X3: what the room sends the intercepted seat, in the clear.
         if let Some(x3) = self.participants[index].call_seat.x3.as_deref() {
-            x3.to_target.deliver_egress(dst, &self.rtp[..rtp_len]);
+            x3.to_seat.deliver_egress(dst, &self.rtp[..rtp_len]);
         }
         out.push(Outbound {
             endpoint: egress_endpoint,

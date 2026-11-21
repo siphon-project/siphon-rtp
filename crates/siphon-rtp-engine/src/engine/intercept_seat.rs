@@ -17,7 +17,8 @@
 use siphon_rtp_datapath::Datapath;
 use siphon_rtp_proto::{CmdResult, Event, X3EndReason, X3TargetLeg, Xid};
 
-use crate::x3::{x3_channel, X3TapFactory};
+use crate::conference::SeatX3Source;
+use crate::x3::x3_channel;
 
 use super::intercept::{X3Selector, X3Session, X3TransportSpec};
 use super::{error_result, ok_empty, unknown_call, ClientId, Engine};
@@ -33,9 +34,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .is_some_and(|sink| sink.same_channel(&seated_by))
     }
 
-    /// `attach_x3` on a joined seat: the seat is the target, so what it sent is `from_target` and
-    /// what the room sent it is `to_target`; `target_leg` is carried into the event and has no say
-    /// in a room.
+    /// `attach_x3` on a joined seat: it has no call behind it, so the seat is the target, what it sent
+    /// is `from_target` and what the room sent it is `to_target`; `target_leg` is carried into the
+    /// event and has no say.
     pub(super) async fn attach_x3_seat(
         &self,
         client: ClientId,
@@ -100,10 +101,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (factory, delivery_channel) = x3_channel(config.buffer_packets);
         // The room is installed with the whole set of the seat: the deliveries it already carries and
         // this one.
-        let mut factories = self.seat_x3_factories(&key);
-        let others = factories.clone();
-        factories.push(factory.clone());
-        if let Err(reason) = self.install_room_x3(conference_id, tag, &factories).await {
+        let mut sources = self.seat_x3_sources(&key);
+        let others = sources.clone();
+        sources.push(SeatX3Source::target(factory.clone()));
+        if let Err(reason) = self.install_room_x3(conference_id, tag, &sources).await {
             // A refused install may have cost the other deliveries their taps.
             if !others.is_empty()
                 && self
@@ -199,13 +200,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// The tap factories of every delivery on a seat, in attach order.
-    fn seat_x3_factories(&self, key: &(String, String)) -> Vec<X3TapFactory> {
+    /// The deliveries of a joined seat, for the room. A joined seat has no call behind it, so it is
+    /// always its warrant's target.
+    fn seat_x3_sources(&self, key: &(String, String)) -> Vec<SeatX3Source> {
         self.x3_seat_sessions
             .get(key)
             .map(|sessions| {
                 sessions
                     .iter()
-                    .map(|session| session.factory.clone())
+                    .map(|session| SeatX3Source::target(session.factory.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -245,7 +248,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if ended.is_empty() {
             return;
         }
-        let remaining = self.seat_x3_factories(&key);
+        let remaining = self.seat_x3_sources(&key);
         if remaining.is_empty() {
             self.clear_room_x3(conference_id, tag).await;
         } else if let Err(reason) = self.install_room_x3(conference_id, tag, &remaining).await {

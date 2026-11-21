@@ -80,7 +80,7 @@ pub(super) struct CallSeatState {
     pub(super) egress_taps: Vec<Box<dyn MediaSink>>,
     /// The seat's own prompts (`play_media` on the call), mixed into what it hears.
     pub(super) playback: Option<Box<SeatPlayback>>,
-    /// The lawful interception taps on this seat, when the seat is the target ([`super::x3`]).
+    /// The lawful interception taps on this seat, when it is intercepted ([`super::x3`]).
     pub(super) x3: Option<Box<super::x3::X3SeatTaps>>,
 }
 
@@ -178,7 +178,7 @@ pub enum SeatControl {
     /// whether the tag was seated.
     SetX3 {
         tag: String,
-        factories: Vec<crate::x3::X3TapFactory>,
+        sources: Vec<super::SeatX3Source>,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
     /// Take a lawful interception's taps off one seat ([`Conference::clear_seat_x3`]). `reply`
@@ -220,10 +220,10 @@ impl Conference {
             }
             SeatControl::SetX3 {
                 tag,
-                factories,
+                sources,
                 reply,
             } => {
-                let _ = reply.send(self.set_seat_x3(&tag, &factories));
+                let _ = reply.send(self.set_seat_x3(&tag, &sources));
             }
             SeatControl::ClearX3 { tag, reply } => {
                 let _ = reply.send(self.clear_seat_x3(&tag));

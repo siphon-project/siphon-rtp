@@ -15,7 +15,7 @@ use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
-use siphon_rtp_engine::conference::{Conference, ParticipantConfig, SeatTelemetry};
+use siphon_rtp_engine::conference::{Conference, ParticipantConfig, SeatTelemetry, SeatX3Source};
 use siphon_rtp_engine::x3::x3_channel;
 use siphon_rtp_proto::ConferenceDtmf;
 
@@ -83,7 +83,7 @@ fn room_benches(criterion: &mut Criterion) {
             if deliveries > 0 {
                 let factories: Vec<_> = channels
                     .iter()
-                    .map(|(factory, _)| factory.clone())
+                    .map(|(factory, _)| SeatX3Source::target(factory.clone()))
                     .collect();
                 assert!(room.set_seat_x3("seat-1", &factories));
             }

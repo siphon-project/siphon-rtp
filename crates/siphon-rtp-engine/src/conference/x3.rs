@@ -8,15 +8,21 @@
 //! connection, the Correlation ID and the PDU sequence counter are the interception's and never the
 //! room's.
 //!
-//! In a room the target is always the seated party (TS 103 221-2 §5.2.6 is target-relative):
+//! A seat has two tap positions:
 //!
-//! - **`from_target`**: what the seat sent, taken in [`Conference::ingest`] right after the shared
-//!   ingress chain accepted it (source gate, SRTP unprotect), so a secure seat yields plaintext and
-//!   a forged datagram yields nothing.
-//! - **`to_target`**: what the room sent the seat, taken in `Conference::emit` after the packet was
-//!   built and protected successfully and before it is queued, so it is exactly what the seat is
-//!   sent: nothing for a pending, blocked or discontinuous-transmission frame, and never another
-//!   seat's raw stream.
+//! - **what the seat sent**, taken in [`Conference::ingest`] right after the shared ingress chain
+//!   accepted it (source gate, SRTP unprotect), so a secure seat yields plaintext and a forged
+//!   datagram yields nothing;
+//! - **what the room sent the seat**, taken in `Conference::emit` after the packet was built and
+//!   protected successfully and before it is queued, so it is exactly what the seat is sent: nothing
+//!   for a pending, blocked or discontinuous-transmission frame, and never another seat's raw stream.
+//!
+//! TS 103 221-2 §5.2.6 defines the direction against the **target**, not against the seat. When the
+//! seat is the target's own leg (a joined seat, or the target's leg of a call moved in with
+//! `conference_seat`) what it sent is `from_target` and what the room sent it is `to_target`. When
+//! the seat is the target's peer (the far party of the target's call, adopted into a room) the two
+//! swap: the peer's voice is what the target is sent, and the room's stream toward the peer carries
+//! the target's side. Each delivery says which, from its own warrant ([`SeatX3Source`]).
 
 use siphon_rtp_datapath::EndpointId;
 use siphon_rtp_proto::Event;
@@ -25,14 +31,32 @@ use super::{Conference, ConferenceRegistry};
 use crate::x3::{X3TapFactory, X3Taps};
 use siphon_rtp_li::PayloadDirection;
 
+/// One delivery to put on a seat: its tap factory, and whether its warrant's target is the seated
+/// party (`true`) or the seated party's peer (`false`).
+#[derive(Clone)]
+pub struct SeatX3Source {
+    pub factory: X3TapFactory,
+    pub seat_is_target: bool,
+}
+
+impl SeatX3Source {
+    /// A delivery whose target is the seated party.
+    pub fn target(factory: X3TapFactory) -> Self {
+        Self {
+            factory,
+            seat_is_target: true,
+        }
+    }
+}
+
 /// The tap sets of one intercepted seat, built from each delivery's own
 /// [`crate::x3::X3TapFactory`] with the engine address the seat talks to: one tap per delivery in
-/// each set.
+/// each set, each carrying the direction its own warrant gives that position.
 pub(super) struct X3SeatTaps {
-    /// On what the seat sent, delivered as `from_target`.
-    pub(super) from_target: X3Taps,
-    /// On what the room sent the seat, delivered as `to_target`.
-    pub(super) to_target: X3Taps,
+    /// On what the seat sent.
+    pub(super) from_seat: X3Taps,
+    /// On what the room sent the seat.
+    pub(super) to_seat: X3Taps,
 }
 
 impl Conference {
@@ -41,7 +65,7 @@ impl Conference {
     /// seated (and knows the engine address its PDUs are attributed to). A seat still pending
     /// (`conference_seat` before activation) takes them too: it ingests and sends nothing until it
     /// opens, so the first packet it handles is the first one delivered.
-    pub fn set_seat_x3(&mut self, tag: &str, factories: &[X3TapFactory]) -> bool {
+    pub fn set_seat_x3(&mut self, tag: &str, sources: &[SeatX3Source]) -> bool {
         let Some(participant) = self.participants.iter_mut().find(|seat| seat.tag == tag) else {
             return false;
         };
@@ -50,18 +74,27 @@ impl Conference {
         let Some(local) = participant.telemetry.local else {
             return false;
         };
-        participant.call_seat.x3 = (!factories.is_empty()).then(|| {
+        // TS 103 221-2 §5.2.6: the seat's ingress is from the target only when the seat is the
+        // target's leg; otherwise it is the peer speaking to the target.
+        let directions = |source: &SeatX3Source| {
+            if source.seat_is_target {
+                (PayloadDirection::FromTarget, PayloadDirection::ToTarget)
+            } else {
+                (PayloadDirection::ToTarget, PayloadDirection::FromTarget)
+            }
+        };
+        participant.call_seat.x3 = (!sources.is_empty()).then(|| {
             Box::new(X3SeatTaps {
-                from_target: X3Taps::new(
-                    factories
+                from_seat: X3Taps::new(
+                    sources
                         .iter()
-                        .map(|factory| factory.tap(local, PayloadDirection::FromTarget))
+                        .map(|source| source.factory.tap(local, directions(source).0))
                         .collect(),
                 ),
-                to_target: X3Taps::new(
-                    factories
+                to_seat: X3Taps::new(
+                    sources
                         .iter()
-                        .map(|factory| factory.tap(local, PayloadDirection::ToTarget))
+                        .map(|source| source.factory.tap(local, directions(source).1))
                         .collect(),
                 ),
             })
@@ -200,9 +233,9 @@ mod tests {
     fn taps_on_an_unknown_seat_are_refused_and_clearing_one_says_so_too() {
         let mut room = room();
         let (factory, _delivery) = x3_channel(8);
-        assert!(!room.set_seat_x3("nobody", std::slice::from_ref(&factory)));
+        assert!(!room.set_seat_x3("nobody", &[SeatX3Source::target(factory.clone())]));
         assert!(!room.clear_seat_x3("nobody"));
-        assert!(room.set_seat_x3("seat-0", std::slice::from_ref(&factory)));
+        assert!(room.set_seat_x3("seat-0", &[SeatX3Source::target(factory.clone())]));
         assert!(room.clear_seat_x3("seat-0"));
         assert!(
             room.clear_seat_x3("seat-1"),
@@ -219,7 +252,7 @@ mod tests {
         })
         .expect("seat");
         let (factory, _delivery) = x3_channel(8);
-        assert!(!room.set_seat_x3("seat-0", std::slice::from_ref(&factory)));
+        assert!(!room.set_seat_x3("seat-0", &[SeatX3Source::target(factory.clone())]));
     }
 
     #[test]
@@ -229,7 +262,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::oneshot::channel();
         let control = SeatControl::SetX3 {
             tag: "nobody".into(),
-            factories: vec![factory.clone()],
+            sources: vec![SeatX3Source::target(factory.clone())],
             reply: sender,
         };
         assert!(!room.apply_seat_control(control));
@@ -238,7 +271,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::oneshot::channel();
         room.apply_seat_control(SeatControl::SetX3 {
             tag: "seat-2".into(),
-            factories: vec![factory.clone()],
+            sources: vec![SeatX3Source::target(factory.clone())],
             reply: sender,
         });
         assert_eq!(receiver.try_recv(), Ok(true));
@@ -257,10 +290,48 @@ mod tests {
     }
 
     #[test]
+    fn a_seat_that_is_the_targets_peer_is_delivered_with_the_directions_swapped() {
+        let mut room = room();
+        let (factory, delivery) = x3_channel(4096);
+        let peer = SeatX3Source {
+            factory,
+            seat_is_target: false,
+        };
+        assert!(room.set_seat_x3("seat-1", &[peer]));
+
+        let sent = run(&mut room, 10);
+
+        let packets = delivered(&delivery);
+        // What the peer sent is what the target is sent (TS 103 221-2 §5.2.6).
+        let peer_voice: Vec<_> = packets
+            .iter()
+            .filter(|packet| packet.source == address("192.0.2.2:5000"))
+            .collect();
+        assert_eq!(peer_voice.len(), 10, "every packet the seat sent");
+        assert!(peer_voice
+            .iter()
+            .all(|packet| packet.direction == PayloadDirection::ToTarget));
+        // What the room sent the peer carries the target's side: from the target.
+        let to_peer: Vec<_> = packets
+            .iter()
+            .filter(|packet| packet.source == engine_address(1))
+            .collect();
+        let sent_to_seat = sent
+            .iter()
+            .filter(|outbound| outbound.endpoint == EndpointId(2))
+            .count();
+        assert!(sent_to_seat > 0, "the room sends the seat its stream");
+        assert_eq!(to_peer.len(), sent_to_seat, "exactly what was sent");
+        assert!(to_peer
+            .iter()
+            .all(|packet| packet.direction == PayloadDirection::FromTarget));
+    }
+
+    #[test]
     fn an_intercepted_seat_is_delivered_as_the_target_in_both_directions() {
         let mut room = room();
         let (factory, delivery) = x3_channel(4096);
-        assert!(room.set_seat_x3("seat-1", std::slice::from_ref(&factory)));
+        assert!(room.set_seat_x3("seat-1", &[SeatX3Source::target(factory.clone())]));
 
         let sent = run(&mut room, 10);
 
@@ -310,7 +381,7 @@ mod tests {
     fn the_destination_follows_a_reply_address_that_latched_after_the_tap_went_on() {
         let mut room = room();
         let (factory, delivery) = x3_channel(4096);
-        assert!(room.set_seat_x3("seat-1", std::slice::from_ref(&factory)));
+        assert!(room.set_seat_x3("seat-1", &[SeatX3Source::target(factory.clone())]));
         room.participants[1].egress_dst = address("192.0.2.2:4444");
 
         run(&mut room, 3);
@@ -329,7 +400,7 @@ mod tests {
     fn a_seat_that_is_not_intercepted_delivers_nothing_and_a_cleared_one_stops() {
         let mut room = room();
         let (factory, delivery) = x3_channel(4096);
-        assert!(room.set_seat_x3("seat-1", std::slice::from_ref(&factory)));
+        assert!(room.set_seat_x3("seat-1", &[SeatX3Source::target(factory.clone())]));
         run(&mut room, 3);
         let before = delivered(&delivery).len();
         assert!(before > 0);
@@ -358,7 +429,7 @@ mod tests {
         .expect("pending seat");
         let (factory, delivery) = x3_channel(4096);
         assert!(
-            room.set_seat_x3("seat-1", std::slice::from_ref(&factory)),
+            room.set_seat_x3("seat-1", &[SeatX3Source::target(factory.clone())]),
             "a pending seat takes the taps, so the first packet it handles is delivered"
         );
         for sequence in 0..5 {
@@ -376,7 +447,7 @@ mod tests {
     fn a_datagram_from_the_wrong_source_is_not_delivered() {
         let mut room = room();
         let (factory, delivery) = x3_channel(4096);
-        assert!(room.set_seat_x3("seat-1", std::slice::from_ref(&factory)));
+        assert!(room.set_seat_x3("seat-1", &[SeatX3Source::target(factory.clone())]));
         let mut forged = voice(1, 1);
         forged.source = address("203.0.113.66:5000");
         room.ingest(&forged);
@@ -407,7 +478,7 @@ mod tests {
         })
         .expect("target");
         let (factory, delivery) = x3_channel(64);
-        assert!(room.set_seat_x3("seat-1", std::slice::from_ref(&factory)));
+        assert!(room.set_seat_x3("seat-1", &[SeatX3Source::target(factory.clone())]));
 
         let mut packet = vec![0x80, 101, 0, 1];
         packet.extend_from_slice(&8000u32.to_be_bytes());

@@ -1811,14 +1811,14 @@ async fn a_room_that_cannot_take_the_taps_leaves_the_call_unchanged() {
 
     // No such room: the room's answer is the last gate, and nothing has moved when it says no.
     let refusal = engine
-        .seat_x3_in_room("x3-refused", "room-none", "x3-refused-near")
+        .seat_x3_in_room("x3-refused", "room-none", "x3-refused-near", true)
         .await;
     assert!(refusal.is_err(), "{refusal:?}");
     assert!(engine.x3_sessions.contains_key("x3-refused"));
 
     // A call with no interception has nothing to install.
     assert!(engine
-        .seat_x3_in_room("x3-unwatched", "room-none", "tag")
+        .seat_x3_in_room("x3-unwatched", "room-none", "tag", true)
         .await
         .is_ok());
 }
