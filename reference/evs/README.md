@@ -63,8 +63,8 @@ sh reference/evs/oracle/build.sh     # build/EVS_dec, build/EVS_cod, build/basop
 **Everything is compiled with `-fwrapv`.** The reference relies on signed overflow wrapping, which C
 leaves undefined: `L_add_c` computes `L_var1 + L_var2` and *then* tests the sign of the result,
 `L_lshl` shifts bits into the sign. Without the flag gcc is entitled to fold those tests away. With
-it, `build/EVS_cod` reproduces all 818 encoder cases (EVS and AMR-WB IO) and `build/EVS_dec` every
-decoder case checked, byte for byte. Reproduce the vectors with your own build before trusting it as
+it, `build/EVS_cod` reproduces all 818 encoder cases (EVS and AMR-WB IO) and `build/EVS_dec` all
+2569 decoder cases, byte for byte. Reproduce the vectors with your own build before trusting it as
 an oracle for anything.
 
 `build/basop_oracle` links the reference's STL2009 operators (`basop32.c`, `enh1632.c`,

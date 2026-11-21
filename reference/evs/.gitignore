@@ -6,3 +6,17 @@
 !oracle/
 !oracle/build.sh
 !oracle/basop_oracle.c
+!PORTING.md
+!oracle/fn/
+!oracle/fn/*.c
+!oracle/fn/*.h
+!oracle/gen_rom.sh
+!oracle/gen_cnst.py
+!oracle/gen_state.sh
+!oracle/rom_export.py
+!oracle/rom_split.py
+!oracle/state_export.py
+!oracle/gen_state_dump.sh
+!oracle/gen_core_dec_init.sh
+!oracle/gen/
+!oracle/gen/*

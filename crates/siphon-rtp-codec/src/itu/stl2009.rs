@@ -248,6 +248,34 @@ pub const fn ul_sub_ns(ul_var1: u32, ul_var2: u32) -> (u32, bool) {
     (ul_var1.wrapping_sub(ul_var2), ul_var1 < ul_var2)
 }
 
+/// Unsigned 32-bit addition, wrapping, the wrap discarded (STL `UL_addNsD`).
+#[inline]
+#[must_use]
+pub const fn ul_add_ns_d(ul_var1: u32, ul_var2: u32) -> u32 {
+    ul_var1.wrapping_add(ul_var2)
+}
+
+/// Unsigned 32-bit subtraction, wrapping, the sign discarded (STL `UL_subNsD`).
+#[inline]
+#[must_use]
+pub const fn ul_sub_ns_d(ul_var1: u32, ul_var2: u32) -> u32 {
+    ul_var1.wrapping_sub(ul_var2)
+}
+
+/// Logical left shift of an unsigned 32-bit value, `(UWord32)L_lshl((Word32)x, n)` (STL `UL_lshl`).
+#[inline]
+#[must_use]
+pub fn ul_lshl(ul_var1: u32, var2: i16) -> u32 {
+    l_lshl(ul_var1 as i32, var2) as u32
+}
+
+/// Logical right shift of an unsigned 32-bit value, `(UWord32)L_lshr((Word32)x, n)` (STL `UL_lshr`).
+#[inline]
+#[must_use]
+pub fn ul_lshr(ul_var1: u32, var2: i16) -> u32 {
+    l_lshr(ul_var1 as i32, var2) as u32
+}
+
 /// Unsigned 32x16 multiply into a 48-bit result, returned as `(bits 16..48, bits 0..16)`
 /// (STL `Mpy_32_16_uu`).
 #[inline]

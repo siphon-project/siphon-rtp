@@ -123,7 +123,8 @@ impl FrameKind {
             _ => {
                 if let Some(rate) = PrimaryRate::ALL
                     .into_iter()
-                    .find(|rate| rate.bits_per_second() as usize == bits * 50)
+                    // checked: a caller may pass any usize, and a wrapped product could match
+                    .find(|rate| bits.checked_mul(50) == Some(rate.bits_per_second() as usize))
                 {
                     Self::Primary(rate)
                 } else {
@@ -166,6 +167,17 @@ mod tests {
             );
             assert_eq!(FrameKind::Primary(rate).bits(), bits);
         }
+    }
+
+    #[test]
+    fn a_size_whose_rate_would_overflow_is_refused_not_wrapped() {
+        // usize::MAX * 50 overflows (a panic with overflow checks), and the top bit plus 144 wraps
+        // to exactly 7.2 kbit/s; neither is an EVS frame
+        assert_eq!(FrameKind::from_bits(usize::MAX), None);
+        assert_eq!(
+            FrameKind::from_bits((1usize << (usize::BITS - 1)) + 144),
+            None
+        );
     }
 
     #[test]

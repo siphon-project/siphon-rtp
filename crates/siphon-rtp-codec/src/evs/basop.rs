@@ -12,7 +12,8 @@
 //! `ALLOW_40bits` is defined in the reference's `stl.h`, so `Madd_32_16` / `Msub_32_16` take their
 //! 40-bit branch: the 32x16 product through `Mpy_32_16_ss`, not the hand-built DPF fallback.
 
-use crate::itu::basic_ops::{div_s, extract_h, extract_l, l_add, l_mac, l_msu, l_shl, l_sub, mult};
+use crate::itu::basic_ops::{div_s, extract_h, extract_l, l_add, l_msu, l_shl, l_sub, mult};
+pub use crate::itu::oper_32b::mac_32_16;
 use crate::itu::oper_32b::{mpy_32, mpy_32_16};
 use crate::itu::stl2009::{lshr, mpy_32_16_ss, mpy_32_32_ss};
 
@@ -54,6 +55,22 @@ pub fn mpy_32_32_r(x: i32, y: i32) -> i32 {
     }
 }
 
+/// `a · b` for a Q31 `a` and a Q15 `b`, truncated to Q31 (`Mult_32_16`, `basic_math/math_32.c`).
+/// The same `Mpy_32_16_ss` high word as [`mpy_32_16_1`], under the name `math_32.c` gives it.
+#[inline]
+#[must_use]
+pub const fn mult_32_16(a: i32, b: i16) -> i32 {
+    mpy_32_16_ss(a, b).0
+}
+
+/// `a · b` for two Q31 values, truncated to Q31 (`Mult_32_32`, `basic_math/math_32.c`). The same
+/// `Mpy_32_32_ss` high word as [`mpy_32_32`].
+#[inline]
+#[must_use]
+pub const fn mult_32_32(a: i32, b: i32) -> i32 {
+    mpy_32_32_ss(a, b).0
+}
+
 /// `L_num + a·b` with the product through [`mpy_32_16_1`] (`Madd_32_16`, `ALLOW_40bits` branch).
 #[inline]
 #[must_use]
@@ -75,13 +92,6 @@ pub fn msub_32_16(l_num: i32, a: i32, b: i16) -> i32 {
 #[must_use]
 pub fn l_extract_lc(l_32: i32) -> (i16, i16) {
     (extract_h(l_32), lshr(extract_l(l_32), 1))
-}
-
-/// `L_num + (hi, lo)·n` on a DPF value (`Mac_32_16`).
-#[inline]
-#[must_use]
-pub fn mac_32_16(l_num: i32, hi: i16, lo: i16, n: i16) -> i32 {
-    l_mac(l_mac(l_num, hi, n), mult(lo, n), 1)
 }
 
 /// `L_num - (hi, lo)·n` on a DPF value (`Msu_32_16`).

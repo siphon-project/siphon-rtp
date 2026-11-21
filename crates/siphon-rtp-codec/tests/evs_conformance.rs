@@ -5,10 +5,11 @@
 //! they are read from the package's own `Readme_EVS_dec.txt` and `Readme_AMRWB_IO_dec.txt`, the
 //! shell scripts upstream ships to run them, so the set under test is exactly upstream's.
 //!
-//! There is no decoder yet, so what this checks today is the ground the decoder will stand on:
-//! every bitstream those scripts name is a well-formed G.192 stream of legal EVS frames, and every
-//! reference output is exactly one 20 ms frame at the requested rate per input frame. The
-//! byte-for-byte decoder gate joins this file with the decoder, one bit rate at a time.
+//! Two checks. Every bitstream those scripts name is a well-formed G.192 stream of legal EVS frames,
+//! and every reference output is exactly one 20 ms frame at the requested rate per input frame.
+//! And the decoder gate: the sequences of every rate in [`DECODER_DONE`] (clean, frame-erased and
+//! DTX alike) must decode byte for byte to the reference `.OUT`. A later phase adds its rates to
+//! that list.
 //!
 //! The sequences are copyrighted and gitignored, so this skips when they are absent (a fresh
 //! checkout stays green) and `SIPHON_RTP_REQUIRE_VECTORS=1` turns that skip into a failure, and also
@@ -20,6 +21,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use siphon_rtp_codec::evs::decoder::EvsDecoder;
 use siphon_rtp_codec::evs::frame::FrameKind;
 use siphon_rtp_codec::evs::g192::G192Reader;
 
@@ -166,4 +168,140 @@ fn every_decoder_sequence_is_well_formed_g192_and_one_output_frame_per_input_fra
         assert!(bad_frames > 0, "no frame-erasure case anywhere in the set");
     }
     assert!(checked > 0 || !required(), "no sequence checked");
+}
+
+/// The bit rates (bit/s) whose NB and WB sequences (7.2 and 8.0 kbit/s ACELP; 32 and 64 kbit/s HQ,
+/// which also run the high-rate HQ core and, with frame erasures, the HQ concealment) the decoder is declared done for. Every case of
+/// `Readme_EVS_dec.txt` with an 8 or 16 kHz output at one of these rates (plain, DTX, `.b10` and
+/// `.f06` frame-erased) is decoded and compared. Extend it as the later phases land.
+const DECODER_DONE: &[u32] = &[7200, 8000, 32000, 64000];
+
+/// The (rate, output kHz) a `stv{8,16}c[_dtx]_<rate>_<kHz>kHz[.b10|.f06].COD` name encodes, or
+/// `None` for the other sequence families (switching, network simulations, other bandwidths).
+fn done_case(case: &Case) -> Option<u32> {
+    let name = case.bitstream.file_name()?.to_str()?;
+    if !matches!(case.output_khz, 8 | 16) {
+        return None;
+    }
+    let stem = name.strip_suffix(".COD")?;
+    let stem = stem
+        .strip_suffix(".b10")
+        .or(stem.strip_suffix(".f06"))
+        .unwrap_or(stem);
+    let stem = stem
+        .strip_prefix("stv8c_")
+        .or(stem.strip_prefix("stv16c_"))?;
+    let stem = stem.strip_prefix("dtx_").unwrap_or(stem);
+    let rate: u32 = stem.split('_').next()?.parse().ok()?;
+    DECODER_DONE.contains(&rate).then_some(rate)
+}
+
+/// Decode `case` and return the first differing sample (frame, offset) or `None` when identical.
+fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, String> {
+    let bitstream = std::fs::read(&case.bitstream).map_err(|error| error.to_string())?;
+    let reference = std::fs::read(&case.reference).map_err(|error| error.to_string())?;
+    let mut decoder =
+        EvsDecoder::new(case.output_khz as u32 * 1000).map_err(|error| error.to_string())?;
+    let frame_samples = decoder.frame_samples();
+    let mut out = vec![0i16; frame_samples];
+    let mut pcm: Vec<u8> = Vec::with_capacity(reference.len());
+    for (index, frame) in G192Reader::new(&bitstream).enumerate() {
+        let frame = frame.map_err(|error| error.to_string())?;
+        let written = decoder
+            .decode_frame(&frame, &mut out)
+            .map_err(|error| format!("frame {index}: {error}"))?;
+        for sample in &out[..written] {
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+    let written = decoder.flush(&mut out).map_err(|error| error.to_string())?;
+    for sample in &out[..written] {
+        pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    if pcm.len() != reference.len() {
+        return Err(format!(
+            "{} bytes, reference {}",
+            pcm.len(),
+            reference.len()
+        ));
+    }
+    Ok(pcm
+        .iter()
+        .zip(&reference)
+        .position(|(a, b)| a != b)
+        .map(|byte| {
+            let sample = byte / 2;
+            (sample / frame_samples, sample % frame_samples)
+        }))
+}
+
+#[test]
+fn declared_done_decoder_sequences_decode_byte_identical() {
+    let Some(root) = vectors_dir() else {
+        assert!(
+            !required(),
+            "SIPHON_RTP_REQUIRE_VECTORS=1 but reference/evs/testvec is absent"
+        );
+        eprintln!("skipping: EVS conformance sequences not installed (sh reference/evs/fetch.sh)");
+        return;
+    };
+    let mut failures = Vec::new();
+    let mut passed = 0usize;
+    for case in cases(&root, "Readme_EVS_dec.txt") {
+        if done_case(&case).is_none() {
+            continue;
+        }
+        let name = case.bitstream.display().to_string();
+        match decode_case(&case) {
+            Ok(None) => passed += 1,
+            Ok(Some((frame, offset))) => {
+                failures.push(format!(
+                    "{name}: first difference in frame {frame} sample {offset}"
+                ));
+            }
+            Err(error) => failures.push(format!("{name}: {error}")),
+        }
+    }
+    eprintln!(
+        "{passed} sequences byte-identical, {} failed",
+        failures.len()
+    );
+    for failure in &failures {
+        eprintln!("FAIL {failure}");
+    }
+    assert!(failures.is_empty(), "{} sequences differ", failures.len());
+    // 7.2 and 8.0 kbit/s: NB and WB; 32 and 64 kbit/s: WB only; each plain and DTX, clean, .b10
+    // and .f06
+    assert!(
+        passed == 0 && !required() || passed == 36,
+        "expected 36 sequences, ran {passed}"
+    );
+}
+
+#[test]
+fn a_mode2_sequence_is_refused_not_decoded() {
+    use siphon_rtp_codec::evs::error::{EvsError, UnsupportedMode};
+    let Some(root) = vectors_dir() else {
+        assert!(
+            !required(),
+            "SIPHON_RTP_REQUIRE_VECTORS=1 but reference/evs/testvec is absent"
+        );
+        return;
+    };
+    // 9.6 kbit/s wideband is a TCX (MODE2) stream
+    let bytes = std::fs::read(root.join("testv/bitstreams/wb/stv16c_9600_16kHz.COD"))
+        .unwrap_or_else(|error| panic!("{error}"));
+    let mut decoder = EvsDecoder::new(16000).unwrap_or_else(|error| panic!("{error}"));
+    let mut out = vec![0i16; decoder.frame_samples()];
+    let frame = G192Reader::new(&bytes)
+        .next()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| panic!("no frame"));
+    assert!(matches!(
+        decoder.decode_frame(&frame, &mut out),
+        Err(EvsError::Unsupported {
+            mode: UnsupportedMode::Mode2,
+            ..
+        })
+    ));
 }
