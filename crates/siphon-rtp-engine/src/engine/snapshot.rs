@@ -673,7 +673,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let rtcp_legs = restored_rtcp_relay_legs(&snapshot, &near, &media.relay_flows);
         let tags = (snapshot.from_tag.clone(), snapshot.to_tag.clone());
         let (near_floor, far_floor) = (near.floor, far.floor);
-        let restored_video = super::call_video::restored_call_video(&snapshot, &near, &far)?;
+        let restored_video = super::call_video::restored_call_video(&snapshot, &near)?;
         let video_flows = self.restore_video_flows(&snapshot, bound)?;
         self.calls.insert(
             snapshot.call_id.clone(),

@@ -44,6 +44,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   from the stored SRTP, `key_mgmt` is written on the video section, and `node_info` lists
   `forward_video_preserve`.
 
+- **Video through `answer_local` and `offer_far`.** With `video_relay: "anchor"` a plain RTP caller's `m=video` is answered up front on engine endpoints (one format, the first offered, the complement direction, so `sendrecv` stays `sendrecv`) and dropped until a far party answers; `offer_far` offers the far party the same formats, a far answer that keeps them relays video both ways and asks each sending party that accepts PLI for one keyframe, and one that does not declines the video alone. A secure, ICE or `ws_uri` caller is refused. `node_info` lists `answer_local_video`.
+
 ## [0.26.1] — 2026-11-21
 
 ### Fixed

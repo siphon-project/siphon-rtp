@@ -223,6 +223,86 @@ impl RoomVideoFormat {
     }
 }
 
+/// Why a stream relayed as it is cannot be carried between a party that sent `offered` format
+/// parameters and one that answered `answered` for the same payload type, or `None` when each party
+/// can decode what the other sends. The relay changes nothing, so the parameters are the only place the
+/// two parties can disagree about what a payload type means.
+///
+/// H.264 (RFC 6184 §8.2.2): the default sub-profile is symmetric and must match; the answered level
+/// must be at least the offered one (the caller sends up to its own), and a higher one is the far
+/// party's own receive capability only when both sides said `level-asymmetry-allowed` (§8.1), else the
+/// far party may send above what the caller was answered. VP8 (RFC 7741 §6.1): `max-fr` and `max-fs`
+/// are what a receiver decodes, so a limit the far party declares must not be below the caller's, and
+/// none the caller declared at all is no bound to compare with. Other codecs have no parameter the
+/// relay judges.
+#[must_use]
+pub fn relay_fmtp_problem(encoding: &str, offered: &str, answered: &str) -> Option<String> {
+    if encoding.eq_ignore_ascii_case("H264") {
+        return h264_relay_problem(offered, answered);
+    }
+    if encoding.eq_ignore_ascii_case("VP8") {
+        for name in ["max-fr", "max-fs"] {
+            let Some(far) = parameter(answered, name).and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let near = parameter(offered, name).and_then(|value| value.parse::<u64>().ok());
+            if near.is_none_or(|near| far < near) {
+                return Some(format!(
+                    "the far party answered VP8 {name}={far}, below what the caller was answered \
+                     (RFC 7741 §6.1): the caller's picture may exceed what the far party decodes"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn h264_relay_problem(offered: &str, answered: &str) -> Option<String> {
+    let level_id = |parameters: &str| {
+        profile_level_id(parameters).and_then(|value| ProfileLevel::parse(&value))
+    };
+    let (Some(near), Some(far)) = (level_id(offered), level_id(answered)) else {
+        return Some(
+            "an H.264 profile-level-id is not six hexadecimal digits (RFC 6184 §8.1)".to_string(),
+        );
+    };
+    if near.sub_profile() != far.sub_profile() {
+        return Some(
+            "the far party answered another H.264 sub-profile than the caller was answered \
+             (RFC 6184 §8.2.2)"
+                .to_string(),
+        );
+    }
+    // RFC 6184 §8.2.2: packetization-mode is symmetric too; FU-A and STAP-A from a mode 1 sender must
+    // not reach a single-NAL (mode 0) receiver, and an absent mode is 0 (§8.1).
+    let (near_mode, far_mode) = (packetization_mode(offered), packetization_mode(answered));
+    if near_mode != far_mode {
+        return Some(format!(
+            "the far party answered H.264 packetization-mode {far_mode} where the caller was \
+             answered packetization-mode {near_mode} (RFC 6184 §8.2.2)"
+        ));
+    }
+    let asymmetry = |parameters: &str| {
+        parameter(parameters, "level-asymmetry-allowed").is_some_and(|value| value == "1")
+    };
+    let (near_level, far_level) = (near.level(), far.level());
+    if far_level < near_level {
+        return Some(format!(
+            "the far party answered H.264 level {far_level}, below the caller's level {near_level}: \
+             the far party cannot decode what the caller sends (RFC 6184 §8.2.2)"
+        ));
+    }
+    if far_level > near_level && !(asymmetry(offered) && asymmetry(answered)) {
+        return Some(format!(
+            "the far party answered H.264 level {far_level}, above the caller's level {near_level}, \
+             without level-asymmetry-allowed on both sides: it may send what the caller cannot \
+             decode (RFC 6184 §8.1)"
+        ));
+    }
+    None
+}
+
 /// The value of the fmtp parameter `name` (RFC 6184 §8.1: `;`-separated `name=value`), name matched
 /// without regard to case.
 fn parameter(parameters: &str, name: &str) -> Option<String> {
@@ -2067,5 +2147,100 @@ mod tests {
             plain.starts_with("m=video 30004 RTP/AVPF 126\r\n"),
             "{plain}"
         );
+    }
+
+    #[test]
+    fn a_relay_needs_the_far_party_to_decode_what_the_caller_sends_and_the_reverse() {
+        // RFC 6184 §8.2.2: the sub-profile is symmetric; a lower answered level cannot decode the
+        // caller's stream, and a higher one is only the far party's own capability when both said
+        // level-asymmetry-allowed.
+        let problem = |offered: &str, answered: &str| relay_fmtp_problem("H264", offered, answered);
+        assert_eq!(
+            problem("profile-level-id=42e01f", "profile-level-id=42e01f"),
+            None
+        );
+        assert_eq!(
+            problem(
+                "profile-level-id=42e01f;packetization-mode=1",
+                "profile-level-id=42E01F;packetization-mode=1"
+            ),
+            None
+        );
+        let lower = problem("profile-level-id=42e01f", "profile-level-id=42e015");
+        assert!(
+            matches!(&lower, Some(reason) if reason.contains("level")),
+            "{lower:?}"
+        );
+        let other_profile = problem("profile-level-id=42e01f", "profile-level-id=64001f");
+        assert!(
+            matches!(&other_profile, Some(reason) if reason.contains("sub-profile")),
+            "{other_profile:?}"
+        );
+        let higher = problem("profile-level-id=42e01f", "profile-level-id=42e028");
+        assert!(
+            matches!(&higher, Some(reason) if reason.contains("level")),
+            "{higher:?}"
+        );
+        assert_eq!(
+            problem(
+                "profile-level-id=42e01f;level-asymmetry-allowed=1",
+                "profile-level-id=42e028;level-asymmetry-allowed=1"
+            ),
+            None
+        );
+        // Absent means Baseline level 1 (RFC 6184 §8.1) on both sides.
+        assert_eq!(
+            problem("packetization-mode=1", "packetization-mode=1"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_vp8_receive_limit_the_caller_may_exceed_is_a_problem() {
+        // RFC 7741 §6.1: max-fr and max-fs are what a receiver can decode.
+        let problem = |offered: &str, answered: &str| relay_fmtp_problem("VP8", offered, answered);
+        assert_eq!(
+            problem("max-fs=1200;max-fr=30", "max-fs=1200;max-fr=30"),
+            None
+        );
+        assert_eq!(problem("max-fs=1200", "max-fs=3600"), None);
+        assert_eq!(problem("", ""), None);
+        assert_eq!(
+            problem("max-fs=1200", ""),
+            None,
+            "an undeclared limit asks for nothing"
+        );
+        assert!(problem("max-fs=3600", "max-fs=1200").is_some());
+        assert!(
+            problem("", "max-fr=15").is_some(),
+            "the caller declared no bound"
+        );
+    }
+
+    #[test]
+    fn a_relay_needs_the_same_packetization_mode_on_both_sides() {
+        // RFC 6184 §8.2.2: the mode is symmetric, absent meaning 0 (§8.1). FU-A and STAP-A from a
+        // mode 1 sender must never reach a single-NAL receiver.
+        let problem = |offered: &str, answered: &str| relay_fmtp_problem("H264", offered, answered);
+        assert_eq!(
+            problem("packetization-mode=1", "packetization-mode=1"),
+            None
+        );
+        assert_eq!(problem("", "packetization-mode=0"), None);
+        let mode_one_to_zero = problem("packetization-mode=1", "packetization-mode=0");
+        assert!(
+            matches!(&mode_one_to_zero, Some(reason) if reason.contains("packetization-mode")),
+            "{mode_one_to_zero:?}"
+        );
+        let absent = problem(
+            "packetization-mode=1;profile-level-id=42e01f",
+            "profile-level-id=42e01f",
+        );
+        assert!(
+            matches!(&absent, Some(reason) if reason.contains("packetization-mode 1") && reason.contains("0")),
+            "{absent:?}"
+        );
+        let zero_to_one = problem("", "packetization-mode=1");
+        assert!(zero_to_one.is_some());
     }
 }

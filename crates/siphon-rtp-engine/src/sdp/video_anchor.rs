@@ -121,6 +121,17 @@ pub struct VideoStream {
     /// The payload types of the `m=` line, which tell the stream's RTP from the audio's inside a
     /// bundle (RFC 8843 §9.2: a payload type is unique across the bundle).
     pub payload_types: Vec<u8>,
+    /// The section's `a=rtpmap` lines as `(payload type, "ENCODING/clock")`, the encoding upper-cased
+    /// (RFC 4566 §6: the encoding name is case-insensitive), so a payload type's meaning can be
+    /// compared between two descriptions of the same stream.
+    pub rtpmaps: Vec<(u8, String)>,
+    /// The section accepts Picture Loss Indication: an `a=rtcp-fb` line of `nack pli` for a payload
+    /// type or `*` (RFC 4585 §4.2, §6.3.1), so the party can be asked for a keyframe.
+    pub picture_loss: bool,
+    /// The section's `a=fmtp` lines as `(payload type, parameters)`.
+    pub fmtps: Vec<(u8, String)>,
+    /// The first SSRC the section declares with `a=ssrc` (RFC 5576 §4.1).
+    pub ssrc: Option<u32>,
     /// The DTLS certificate fingerprint of the section, else the session's (RFC 8122 §5).
     pub fingerprint: Option<Fingerprint>,
     /// The `a=setup` role of the section, else the session's (RFC 4145 §4, RFC 5763 §5).
@@ -290,6 +301,46 @@ pub fn parse_video_stream(sdp: &str) -> Option<VideoStream> {
             .filter_map(|field| field.parse::<u8>().ok())
             .any(|number| payload_types.contains(&number))
     });
+    let rtpmaps: Vec<(u8, String)> = section
+        .iter()
+        .filter_map(|line| {
+            let (number, encoding) = line.strip_prefix("a=rtpmap:")?.split_once(' ')?;
+            Some((number.parse().ok()?, encoding.trim().to_ascii_uppercase()))
+        })
+        .collect();
+    let fmtps = section
+        .iter()
+        .filter_map(|line| {
+            let (number, parameters) = line.strip_prefix("a=fmtp:")?.split_once(' ')?;
+            Some((number.parse().ok()?, parameters.trim().to_string()))
+        })
+        .collect();
+    // RFC 5576 §4.1: `a=ssrc:<id> <attribute>`; the first id names the stream the party sends.
+    let ssrc = section.iter().find_map(|line| {
+        line.strip_prefix("a=ssrc:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u32>()
+            .ok()
+    });
+    // RFC 4585 §4.2: `a=rtcp-fb:<pt|*> nack pli`, for the format an answer keeps (the first one that is
+    // not retransmission, [`first_video_format`]) or every format (`*`); feedback another payload type
+    // accepted says nothing of the stream relayed.
+    let selected = payload_types.iter().copied().find(|payload_type| {
+        !rtpmaps.iter().any(|(number, encoding): &(u8, String)| {
+            number == payload_type && encoding.starts_with("RTX/")
+        })
+    });
+    let picture_loss = section.iter().any(|line| {
+        let mut fields = line
+            .strip_prefix("a=rtcp-fb:")
+            .unwrap_or_default()
+            .split_whitespace();
+        let applies = fields.next().is_some_and(|target| {
+            target == "*" || selected.is_some_and(|selected| target == selected.to_string())
+        });
+        applies && fields.next() == Some("nack") && fields.next() == Some("pli")
+    });
     // RFC 8122 §5, RFC 4145 §4: the section's own attribute, else the session's.
     let attribute = |name: &str| {
         section
@@ -319,10 +370,62 @@ pub fn parse_video_stream(sdp: &str) -> Option<VideoStream> {
         audio_mid,
         payload_collision,
         payload_types,
+        rtpmaps,
+        picture_loss,
+        fmtps,
+        ssrc,
         fingerprint,
         setup,
         ice,
     })
+}
+
+/// The first offered format of the first live video section that is not retransmission (RFC 4588:
+/// an `rtx` payload type only repairs another one, and no repair stream is relayed), the one an
+/// answer that selects a subset keeps (RFC 3264 §6.1).
+#[must_use]
+pub fn first_video_format(sdp: &str) -> Option<u8> {
+    let stream = parse_video_stream(sdp)?;
+    stream.payload_types.iter().copied().find(|payload_type| {
+        !stream
+            .rtpmaps
+            .iter()
+            .any(|(number, encoding)| number == payload_type && encoding.starts_with("RTX/"))
+    })
+}
+
+/// `sdp` with the first live video section reduced to the one format `payload_type`: its `m=` line
+/// lists only it, and the `a=rtpmap`, `a=fmtp` and payload-specific `a=rtcp-fb` lines of every other
+/// format are gone (a wildcard `a=rtcp-fb:*` stays, RFC 4585 §4.2). An answer that offers back one
+/// format keeps the far party from accepting a different one than the caller was told (RFC 3264
+/// §6.1).
+#[must_use]
+pub fn keep_video_format(sdp: &str, payload_type: u8) -> String {
+    let lines = split_lines(sdp);
+    let Some((start, end, _)) = locate(&lines) else {
+        return sdp.to_string();
+    };
+    let wanted = payload_type.to_string();
+    let other_format = |line: &str| {
+        ["a=rtpmap:", "a=fmtp:", "a=rtcp-fb:"]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|number| number != "*" && number != wanted)
+    };
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        if index == start {
+            let mut fields: Vec<&str> = line.split(' ').take(3).collect();
+            fields.push(&wanted);
+            out.push(fields.join(" "));
+        } else if (start + 1..end).contains(&index) && other_format(line) {
+            continue;
+        } else {
+            out.push((*line).to_string());
+        }
+    }
+    out.join(CRLF)
 }
 
 /// How the anchored video section is keyed toward the party it is presented to.
@@ -816,6 +919,85 @@ mod tests {
             flow_directions(MediaDirection::RecvOnly, MediaDirection::SendOnly),
             (false, true)
         );
+    }
+
+    #[test]
+    fn the_stream_reads_its_payload_meanings_and_whether_it_accepts_picture_loss() {
+        let stream = parse_video_stream(OFFER).expect("stream");
+        assert!(stream.picture_loss);
+        assert_eq!(stream.rtpmaps, vec![(96, "H264/90000".to_string())]);
+        let wildcard = OFFER.replace("a=rtcp-fb:96 nack pli", "a=rtcp-fb:* nack pli");
+        assert!(parse_video_stream(&wildcard).expect("stream").picture_loss);
+        let other_feedback = OFFER.replace("a=rtcp-fb:96 nack pli", "a=rtcp-fb:96 nack");
+        assert!(
+            !parse_video_stream(&other_feedback)
+                .expect("stream")
+                .picture_loss,
+            "plain nack and ccm fir are not PLI"
+        );
+        let none = OFFER.replace("a=rtcp-fb:96 nack pli\r\n", "");
+        assert!(!parse_video_stream(&none).expect("stream").picture_loss);
+    }
+
+    #[test]
+    fn the_first_non_rtx_format_is_kept_alone_with_its_own_attributes() {
+        // RFC 3264 §6.1: an answerer may select a subset of the offered formats.
+        let offer = concat!(
+            "v=0\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n",
+            "m=video 6000 RTP/AVPF 97 96 98\r\n",
+            "a=rtpmap:97 rtx/90000\r\na=fmtp:97 apt=96\r\n",
+            "a=rtpmap:96 H264/90000\r\na=fmtp:96 profile-level-id=42e01f\r\n",
+            "a=rtpmap:98 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=rtcp-fb:98 nack\r\n",
+            "a=rtcp-fb:* ccm fir\r\na=ssrc:305419896 cname:x\r\na=sendrecv\r\n",
+        );
+        assert_eq!(first_video_format(offer), Some(96));
+        let kept = keep_video_format(offer, 96);
+        assert!(kept.contains("m=video 6000 RTP/AVPF 96\r\n"), "{kept}");
+        for line in [
+            "a=rtpmap:96 H264/90000",
+            "a=fmtp:96 profile-level-id=42e01f",
+            "a=rtcp-fb:96 nack pli",
+            "a=rtcp-fb:* ccm fir",
+            "a=sendrecv",
+        ] {
+            assert!(kept.contains(line), "{line}: {kept}");
+        }
+        for line in ["rtpmap:97", "fmtp:97", "rtpmap:98", "rtcp-fb:98"] {
+            assert!(!kept.contains(line), "{line}: {kept}");
+        }
+        let stream = parse_video_stream(&kept).expect("stream");
+        assert_eq!(stream.payload_types, vec![96]);
+        assert_eq!(stream.ssrc, Some(305_419_896));
+        assert_eq!(
+            stream.fmtps,
+            vec![(96, "profile-level-id=42e01f".to_string())]
+        );
+        assert_eq!(first_video_format("m=audio 4000 RTP/AVP 0\r\n"), None);
+    }
+
+    #[test]
+    fn picture_loss_counts_only_for_the_selected_format_or_the_wildcard() {
+        // RFC 4585 §4.2: `a=rtcp-fb:<pt|*>`; the format an answer keeps is the first non-rtx one.
+        let offer = |feedback: &str| {
+            format!(
+                "v=0\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\nm=video 6000 RTP/AVPF 96 97\r\n\
+                 a=rtpmap:96 H264/90000\r\na=rtpmap:97 VP8/90000\r\n{feedback}"
+            )
+        };
+        let picture_loss = |feedback: &str| {
+            parse_video_stream(&offer(feedback))
+                .expect("stream")
+                .picture_loss
+        };
+        assert!(
+            !picture_loss("a=rtcp-fb:97 nack pli\r\n"),
+            "PLI for a discarded format"
+        );
+        assert!(picture_loss("a=rtcp-fb:96 nack pli\r\n"));
+        assert!(picture_loss("a=rtcp-fb:* nack pli\r\n"));
+        assert!(picture_loss(
+            "a=rtcp-fb:97 nack pli\r\na=rtcp-fb:96 nack pli\r\n"
+        ));
     }
 }
 

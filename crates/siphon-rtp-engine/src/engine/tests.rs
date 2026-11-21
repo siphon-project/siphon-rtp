@@ -47,6 +47,7 @@ use super::*;
 const CLIENT: ClientId = ClientId(1);
 
 mod actor_reply;
+mod answer_local_video;
 mod call_floor;
 mod call_video;
 mod call_video_dtls;
@@ -681,21 +682,36 @@ struct LatchLearningDatapath {
     /// Run right after a `Redirect` lands on an endpoint, which is the instant its first datagram can
     /// reach the dispatcher: a test reads there whether a handler already owns the endpoint.
     on_redirect: Arc<Mutex<Option<RedirectHook>>>,
+    /// Fault injection: while set, installing a `Drop` flow fails, as a datapath that cannot take a
+    /// rule does.
+    fail_drops: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LatchLearningDatapath {
     fn new() -> Self {
+        Self::over(UdpLoopbackDatapath::new())
+    }
+
+    /// The double over `inner`, for a test that bounds the ports to count leaks.
+    fn over(inner: UdpLoopbackDatapath) -> Self {
         Self {
-            inner: UdpLoopbackDatapath::new(),
+            inner,
             learned: Arc::new(DashMap::new()),
             installs: Arc::new(Mutex::new(Vec::new())),
             on_redirect: Arc::new(Mutex::new(None)),
+            fail_drops: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     /// Call `hook` with the endpoint each time a `Redirect` is installed on one.
     fn on_redirect(&self, hook: impl Fn(EndpointId) + Send + Sync + 'static) {
         *self.on_redirect.lock().expect("redirect hook lock") = Some(Arc::new(hook));
+    }
+
+    /// Make every `Drop` install fail (or succeed again).
+    fn fail_drop_installs(&self, fail: bool) {
+        self.fail_drops
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Record that `endpoint`'s in-kernel ingress latch has learned `source`.
@@ -743,6 +759,11 @@ impl Datapath for LatchLearningDatapath {
             .lock()
             .expect("install log lock")
             .push((endpoint, action));
+        if action == FlowAction::Drop && self.fail_drops.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(siphon_rtp_datapath::DatapathError::UnknownEndpoint(
+                endpoint,
+            ));
+        }
         self.inner.install_flow(endpoint, action)?;
         if action == FlowAction::Redirect {
             let hook = self.on_redirect.lock().expect("redirect hook lock").clone();
