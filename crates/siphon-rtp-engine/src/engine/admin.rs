@@ -259,6 +259,16 @@ fn build_features() -> Vec<String> {
         // `nack`, `nack pli` and `ccm fir` are answered (never `transport-cc` or `goog-remb`) and no
         // header extension is. A controller gates offering a browser member video on this entry.
         "forward_video_webrtc".to_string(),
+        // A `media: preserve` room carries video too: `RTP/SAVP[F]` (or plain) on an endpoint of its
+        // own with no key of the engine's, handed on unchanged from the source under the group keys
+        // (3GPP TS 33.180 §7.5.2), in the one payload type the room's first video seat fixed. Video
+        // RTCP is hop by hop under each seat's `media_srtcp_keys` (§9.4.1): a source switch and a
+        // late joiner are sent one PLI (FIR when only FIR was accepted) under the source's key, a
+        // receiver's NACK is answered from the stored original SRTP, and the controller's `key_mgmt`
+        // is written on the video section as on the audio one. There is no keyframe gate and no
+        // `forward_keyframe` event: the payload is encrypted. A controller gates preserve-room video
+        // on this entry.
+        "forward_video_preserve".to_string(),
         // A two-party relayed call anchors an offered `m=video` stream when the profile says
         // `video_relay: anchor`: an endpoint pair per leg, the gated latch, RTCP and direction
         // attributes respected, plain RTP. A controller gates sending `video_relay` on this entry.

@@ -262,3 +262,68 @@ async fn the_actor_reports_the_keyframe_that_answered_the_switch_with_its_latenc
         .collect();
     assert_eq!(reported, [(300, false)]);
 }
+
+/// Join `seat` to a preserve room (`media: preserve`).
+async fn join_preserving(
+    registry: &ForwardRegistry,
+    datapath: &UdpLoopbackDatapath,
+    seat: ForwardSeatConfig,
+) -> Result<(), ForwardRefusal> {
+    let offer = offered("octet-align=1");
+    let (proposed, _) = RoomCodec::from_offer(&offer).unwrap();
+    registry
+        .join(
+            "group",
+            proposed.with_media(siphon_rtp_proto::ForwardMedia::Preserve),
+            &offer[0],
+            seat,
+            1,
+            None,
+            datapath.clone(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_preserve_room_fixes_one_video_payload_type_and_refuses_another() {
+    let registry = ForwardRegistry::default();
+    let datapath = UdpLoopbackDatapath::new();
+    assert_eq!(registry.room_video_payload_type("group"), None);
+    join_preserving(&registry, &datapath, video_config(1, format("640c1f")))
+        .await
+        .unwrap();
+    assert_eq!(registry.room_video_payload_type("group"), Some(99));
+    let mut other = video_config(2, format("640c1f"));
+    if let Some(video) = other.video.as_mut() {
+        video.payload_type = 100;
+    }
+    let refusal = join_preserving(&registry, &datapath, other)
+        .await
+        .unwrap_err();
+    assert!(
+        refusal.to_string().contains("payload type 100") && refusal.to_string().contains("99"),
+        "{refusal}"
+    );
+    assert_eq!(registry.seat_count(), 1);
+    // The room's own number joins, and the number is forgotten when the last video seat leaves.
+    join_preserving(&registry, &datapath, video_config(3, format("640c1f")))
+        .await
+        .unwrap();
+    registry.leave("group", "seat-1");
+    registry.leave("group", "seat-3");
+    assert_eq!(registry.room_video_payload_type("group"), None);
+}
+
+#[tokio::test]
+async fn a_translating_room_keeps_each_seats_own_video_payload_type() {
+    let registry = ForwardRegistry::default();
+    let datapath = UdpLoopbackDatapath::new();
+    join_with_video(&registry, &datapath, video_config(1, format("640c1f")))
+        .await
+        .unwrap();
+    let mut other = video_config(2, format("640c1f"));
+    if let Some(video) = other.video.as_mut() {
+        video.payload_type = 100;
+    }
+    join_with_video(&registry, &datapath, other).await.unwrap();
+}

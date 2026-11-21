@@ -65,6 +65,19 @@ pub struct RtpPacket<'a> {
 impl<'a> RtpPacket<'a> {
     /// Parse one RTP packet from `buffer`, validating lengths without panicking.
     pub fn parse(buffer: &'a [u8]) -> Result<Self, RtpError> {
+        Self::parse_with(buffer, true)
+    }
+
+    /// Parse only the clear header of an SRTP packet (RFC 3711 §3.1): the fixed header, the CSRC list
+    /// and the header extension. The padding count of RFC 3550 §5.1 is inside the encrypted portion
+    /// of an SRTP packet and the datagram ends in the authentication tag, so the last octet means
+    /// nothing here: `payload` is everything after the header, padding and tag included, and a
+    /// packet with P=1 is never refused for its padding.
+    pub fn parse_clear_header(buffer: &'a [u8]) -> Result<Self, RtpError> {
+        Self::parse_with(buffer, false)
+    }
+
+    fn parse_with(buffer: &'a [u8], strip_padding: bool) -> Result<Self, RtpError> {
         if buffer.len() < FIXED_HEADER_LEN {
             return Err(RtpError::TooShort);
         }
@@ -102,7 +115,7 @@ impl<'a> RtpPacket<'a> {
         }
 
         let mut end = buffer.len();
-        if has_padding {
+        if has_padding && strip_padding {
             let pad = buffer[end - 1] as usize;
             if pad == 0 || pad > end - offset {
                 return Err(RtpError::BadPadding);
@@ -349,6 +362,39 @@ mod tests {
         let mut bad = SAMPLE;
         bad[0] = 0x40; // version 1
         assert_eq!(RtpPacket::parse(&bad), Err(RtpError::BadVersion(1)));
+    }
+
+    #[test]
+    fn the_clear_header_parse_never_reads_the_padding_of_an_srtp_packet() {
+        // RFC 3711 §3.1: with P=1 the padding is inside the encrypted portion, and the datagram ends
+        // in the authentication tag, so its last octet is not a padding count.
+        for last in [0x00u8, 0x10, 0xFF] {
+            let mut buffer = vec![0xA0, 0x60, 0x00, 0x07, 0, 0, 0, 1, 0, 0, 0, 2];
+            buffer.extend_from_slice(&[0x42, 0x43, last]);
+            let packet = RtpPacket::parse_clear_header(&buffer).expect("parse");
+            assert_eq!(
+                (packet.payload_type, packet.sequence, packet.ssrc),
+                (96, 7, 2)
+            );
+            assert_eq!(packet.payload, &buffer[12..], "{last}: nothing is stripped");
+        }
+        // The header is still validated: CSRC list and extension are skipped, truncation refused.
+        let mut extended = vec![0xB1, 0x60, 0x00, 0x07, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 9];
+        extended.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x01, 1, 2, 3, 4, 0xAA]);
+        assert_eq!(
+            RtpPacket::parse_clear_header(&extended)
+                .expect("parse")
+                .payload,
+            &[0xAA]
+        );
+        assert_eq!(
+            RtpPacket::parse_clear_header(&[0xA0; 8]),
+            Err(RtpError::TooShort)
+        );
+        assert_eq!(
+            RtpPacket::parse_clear_header(&[0x20; 12]),
+            Err(RtpError::BadVersion(0))
+        );
     }
 
     #[test]

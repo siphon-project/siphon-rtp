@@ -47,6 +47,7 @@ use crate::seat_gate::{self, SeatGate};
 mod app;
 mod keyframe;
 mod media_srtcp;
+mod preserve_video;
 mod reception;
 mod video;
 
@@ -737,8 +738,17 @@ impl ForwardRoom {
                 .translator
                 .octets_sent()
                 .wrapping_add(seat.counters.forwarded_octets),
-            video_forwarded_packets: seat.video.as_ref().map_or(0, VideoStream::packets_sent),
-            video_forwarded_octets: seat.video.as_ref().map_or(0, VideoStream::octets_sent),
+            // The same for video.
+            video_forwarded_packets: seat
+                .video
+                .as_ref()
+                .map_or(0, VideoStream::packets_sent)
+                .wrapping_add(seat.counters.video_forwarded_packets),
+            video_forwarded_octets: seat
+                .video
+                .as_ref()
+                .map_or(0, VideoStream::octets_sent)
+                .wrapping_add(seat.counters.video_forwarded_octets),
             ..seat.counters
         })
     }
@@ -952,7 +962,7 @@ impl ForwardRoom {
         if seat_gate::is_rtcp(data) {
             return self.ingest_preserved_rtcp(index, packet, plan);
         }
-        let Ok(parsed) = RtpPacket::parse(data) else {
+        let Ok(parsed) = RtpPacket::parse_clear_header(data) else {
             return Ingress::Accepted;
         };
         seat.stats
@@ -1088,7 +1098,11 @@ impl ForwardRoom {
     ) -> Option<(EndpointId, SocketAddr, &'a [u8])> {
         let mut plan = self.plan?;
         match plan.stream {
+            Stream::Video if plan.verbatim != Verbatim::No => {
+                return self.next_preserved_video(packet, plan)
+            }
             Stream::Video => return self.next_video(packet, plan),
+            Stream::Retransmit if self.preserving() => return self.next_preserved_resend(),
             Stream::Retransmit => return self.next_retransmission(),
             Stream::Audio => {}
         }

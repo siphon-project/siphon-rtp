@@ -681,6 +681,7 @@ mod floor;
 mod keyframe;
 mod mode_request;
 mod preserve;
+mod preserve_video;
 mod reception;
 mod transcode;
 mod video;

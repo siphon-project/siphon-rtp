@@ -190,6 +190,9 @@ struct Handle {
     codec: RoomCodec,
     /// The H.264 flavour of the room's video, fixed by its first seat with video.
     video_format: Option<RoomVideoFormat>,
+    /// The payload type of the room's video, fixed by its first seat with video. Only a preserve room
+    /// holds seats to it: it forwards the talker's packets unchanged, so every seat reads one number.
+    video_payload_type: Option<u8>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -248,6 +251,16 @@ impl ForwardRegistry {
         self.rooms
             .get(room_id)
             .and_then(|room| room.video_format.clone())
+    }
+
+    /// The video payload type of an existing preserve room, once a seat with video has fixed it: the
+    /// number every later seat must read and an offer to it must name (RFC 3550 §7.1: a translator
+    /// that forwards unchanged).
+    #[must_use]
+    pub fn room_video_payload_type(&self, room_id: &str) -> Option<u8> {
+        self.rooms
+            .get(room_id)
+            .and_then(|room| room.video_payload_type)
     }
 
     /// The room and tag of the seat on `endpoint`.
@@ -385,6 +398,7 @@ impl ForwardRegistry {
             .map(|video| video.endpoint);
         let has_video = config.video.is_some();
         let video_format = config.video.as_ref().map(|video| video.format.clone());
+        let video_payload_type = config.video.as_ref().map(|video| video.payload_type);
         let tag = config.tag.clone();
         let member = Member {
             tag: tag.clone(),
@@ -421,6 +435,7 @@ impl ForwardRegistry {
                     members: Vec::new(),
                     codec: proposed,
                     video_format: None,
+                    video_payload_type: None,
                     task,
                 }
             });
@@ -454,7 +469,16 @@ impl ForwardRegistry {
                 (Some(fixed), Some(asked)) if fixed != asked => Some(ForwardRefusal::Codec(
                     "the room's video format changed while the seat was being set up".to_string(),
                 )),
-                _ => None,
+                // A preserve room hands the packets on unchanged (RFC 3550 §7.1), so its seats read
+                // one payload type.
+                _ => match (room.codec.media(), room.video_payload_type, video_payload_type) {
+                    (ForwardMedia::Preserve, Some(fixed), Some(asked)) if fixed != asked => {
+                        Some(ForwardRefusal::Codec(format!(
+                            "video payload type {asked} where the preserve room forwards payload type {fixed} unchanged"
+                        )))
+                    }
+                    _ => None,
+                },
             };
             let refusal = match admitted {
                 Err(refusal) => Some(refusal),
@@ -474,6 +498,7 @@ impl ForwardRegistry {
             }
             if room.video_format.is_none() {
                 room.video_format = video_format;
+                room.video_payload_type = video_payload_type;
             }
             room.members.push(member);
             room.mailbox.clone()
@@ -529,6 +554,7 @@ impl ForwardRegistry {
             // With no seat left carrying video, the next one to bring video fixes a format of its own.
             if room.members.iter().all(|seated| !seated.has_video) {
                 room.video_format = None;
+                room.video_payload_type = None;
             }
             let _ = room
                 .mailbox

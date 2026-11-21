@@ -221,6 +221,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let own = sdp::OwnSsrc::with_random_cname(egress_ssrc);
         let video = match self
             .open_video_endpoint(JoinVideo {
+                room_id,
                 transport: &transport,
                 info: &info,
                 offer,
@@ -359,6 +360,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // RFC 8843 §7.3.3: a browser's video the room declined is not in the answer's group.
                 let declined = if transport.dtls_pending() && !video.is_open() {
                     sdp::video::drop_declined_from_bundle(&declined)
+                } else {
+                    declined
+                };
+                // The video section was written whole after the audio's `a=key-mgmt` went in: the
+                // controller's line goes on it too (RFC 4567; one key per client covers audio and
+                // video, 3GPP TS 33.180 §9.4.2).
+                let declined = if media == ForwardMedia::Preserve {
+                    sdp::apply_key_mgmt(&declined, profile.key_mgmt.as_deref())
                 } else {
                     declined
                 };

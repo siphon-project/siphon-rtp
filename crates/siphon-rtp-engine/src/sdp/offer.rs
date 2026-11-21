@@ -205,7 +205,7 @@ pub fn webrtc_seat_offer(
             let _ = write!(sdp, "b=AS:{kbps}{CRLF}");
         }
         let _ = write!(sdp, "a=mid:{WEBRTC_VIDEO_MID}{CRLF}{transport}");
-        super::video::write_offered_format(&mut sdp, video.fmtp);
+        super::video::write_offered_format(&mut sdp, video.fmtp, super::video::OFFER_PAYLOAD_TYPE);
         sdp.push_str("a=sendrecv\r\na=rtcp-mux\r\n");
     }
     sdp

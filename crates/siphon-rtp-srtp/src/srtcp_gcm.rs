@@ -18,8 +18,11 @@
 //!   fails.
 //! * Session key (16) and salt (12) come from the RFC 3711 §4.3 AES-CM PRF at key derivation
 //!   rate 0 with the SRTCP labels (RFC 7714 §11; TS 33.180 §9.4.8).
-//! * Anti-replay (RFC 3711 §3.3.2) over the explicit 31-bit index, recorded only after the tag
-//!   verified. The send index never wraps: RFC 7714 §9.4 forbids reusing an IV under one key, so at
+//! * Anti-replay (RFC 3711 §3.3.2) over the explicit 31-bit index, one window per sender SSRC under
+//!   each key (§3.2.3, §3.4: the SRTCP index and the replay list belong to the SSRC's cryptographic
+//!   context), recorded only after the tag verified. The windows live in a fixed table of
+//!   [`MAX_REPLAY_SSRCS`] slots per key, claimed only by an authenticated packet; a packet of a further
+//!   SSRC is refused ([`SrtpError::ReplayTableFull`]), never given a window another SSRC shares. The send index never wraps: RFC 7714 §9.4 forbids reusing an IV under one key, so at
 //!   `2^31 - 1` protect refuses until the keys are replaced or the index is reseeded.
 
 use aes::Aes128;
@@ -57,6 +60,10 @@ const LAST_INDEX: u32 = INDEX_MASK;
 pub const MAX_SEND_INDEX: u32 = LAST_INDEX;
 /// Keys held at once: the current one plus its predecessor for rekey overlap.
 pub const MAX_KEYS: usize = 2;
+/// Sender SSRCs whose SRTCP replay state one key tracks (RFC 3711 §3.2.3: a context per SSRC). A seat
+/// sends RTCP for its audio, its video and the odd restart of either, so eight is generous; a ninth
+/// SSRC is refused rather than sharing a window.
+pub const MAX_REPLAY_SSRCS: usize = 8;
 /// Smallest valid packet: header, tag, ESRTCP word, MKI (empty plaintext).
 const MIN_PACKET_LEN: usize = CLEAR_HEADER_LEN + GCM_TAG_LEN + ESRTCP_LEN + MKI_LEN;
 
@@ -279,10 +286,78 @@ impl GcmSession {
     }
 }
 
+/// The replay windows of one key, one per sender SSRC, in a table of fixed size.
+struct ReplaySlots {
+    slots: [Option<(u32, ReplayWindow)>; MAX_REPLAY_SSRCS],
+    /// After an HA restore: windows of SSRCs first seen later start closed at this index.
+    resumed: Option<u64>,
+}
+
+impl ReplaySlots {
+    const fn new() -> Self {
+        Self {
+            slots: [None; MAX_REPLAY_SSRCS],
+            resumed: None,
+        }
+    }
+
+    /// The window of `ssrc` as it stands, or `None` when the table has no window for it and no free
+    /// slot to give it: the caller refuses the packet.
+    fn window_of(&self, ssrc: u32) -> Option<ReplayWindow> {
+        if let Some((_, window)) = self
+            .slots
+            .iter()
+            .flatten()
+            .find(|(known, _)| *known == ssrc)
+        {
+            return Some(*window);
+        }
+        if self.slots.iter().any(Option::is_none) {
+            let mut fresh = ReplayWindow::default();
+            if let Some(index) = self.resumed {
+                fresh.close_at(index);
+            }
+            return Some(fresh);
+        }
+        None
+    }
+
+    /// Keep `window` as the state of `ssrc`, after a packet authenticated. The slot was checked to be
+    /// there by [`Self::window_of`].
+    fn store(&mut self, ssrc: u32, window: ReplayWindow) {
+        let position = self
+            .slots
+            .iter()
+            .position(|slot| slot.is_some_and(|(known, _)| known == ssrc))
+            .or_else(|| self.slots.iter().position(Option::is_none));
+        if let Some(position) = position {
+            self.slots[position] = Some((ssrc, window));
+        }
+    }
+
+    /// The highest index recorded under any SSRC, for an HA checkpoint.
+    fn highest(&self) -> Option<u64> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter_map(|(_, window)| window.highest())
+            .max()
+    }
+
+    /// Resume from a checkpoint: `index` and below count as received under every SSRC, known or not
+    /// yet seen (the checkpoint does not say which stream it came from).
+    fn close_at(&mut self, index: u64) {
+        for (_, window) in self.slots.iter_mut().flatten() {
+            window.close_at(index);
+        }
+        self.resumed = Some(index);
+    }
+}
+
 struct KeyEntry {
     master: FloorMasterKey,
     session: GcmSession,
-    replay: ReplayWindow,
+    replay: ReplaySlots,
 }
 
 impl Zeroize for KeyEntry {
@@ -319,24 +394,27 @@ fn record_wiped(mki: u32, entry: &KeyEntry) {
     WIPED.with(|log| log.borrow_mut().push((mki, all_zero)));
 }
 
+/// Whether two master keys are the same key material (key and salt), in constant time.
+fn same_material(a: &FloorMasterKey, b: &FloorMasterKey) -> bool {
+    (a.master_key.ct_eq(&b.master_key).unwrap_u8()
+        & a.master_salt.ct_eq(&b.master_salt).unwrap_u8())
+        == 1
+}
+
 impl KeyEntry {
     fn new(master: FloorMasterKey) -> Self {
         Self {
             session: GcmSession::derive(&master),
             master,
-            replay: ReplayWindow::default(),
+            replay: ReplaySlots::new(),
         }
     }
 
-    /// Same MKI and same key material: the entry (and its replay state) may be kept.
+    /// Same key material, whatever the MKI: the entry (and its replay state) is the key's. The MKI
+    /// only selects a master key on the wire (RFC 3711 §3.2.1) and is not covered by the tag, so
+    /// replay state belongs to the material, never to the label.
     fn is_same_key(&self, other: &FloorMasterKey) -> bool {
-        let material_equal = self.master.master_key.ct_eq(&other.master_key).unwrap_u8()
-            & self
-                .master
-                .master_salt
-                .ct_eq(&other.master_salt)
-                .unwrap_u8();
-        self.master.mki == other.mki && material_equal == 1
+        same_material(&self.master, other)
     }
 }
 
@@ -353,7 +431,8 @@ pub struct SrtcpGcmContext {
 impl SrtcpGcmContext {
     /// Build a context from `keys`; the last one protects outgoing packets. More than
     /// [`MAX_KEYS`] keeps the last [`MAX_KEYS`]. Errors with [`SrtpError::NoKeys`] for an empty
-    /// slice and [`SrtpError::DuplicateMki`] when two keys share an MKI.
+    /// slice, [`SrtpError::DuplicateMki`] when two keys share an MKI and
+    /// [`SrtpError::DuplicateKeyMaterial`] when two keys are one key under two MKIs.
     pub fn new(keys: &[FloorMasterKey]) -> Result<Self, SrtpError> {
         let mut context = Self {
             keys: Vec::with_capacity(MAX_KEYS),
@@ -376,10 +455,18 @@ impl SrtcpGcmContext {
         if kept.len() == 2 && kept[0].mki == kept[1].mki {
             return Err(SrtpError::DuplicateMki);
         }
+        if kept.len() == 2 && same_material(&kept[0], &kept[1]) {
+            return Err(SrtpError::DuplicateKeyMaterial);
+        }
         let mut next = Vec::with_capacity(MAX_KEYS);
         for master in kept {
             match self.keys.iter().position(|entry| entry.is_same_key(master)) {
-                Some(position) => next.push(self.keys.swap_remove(position)),
+                Some(position) => {
+                    // The same key, possibly renamed: it keeps its replay state under the new MKI.
+                    let mut entry = self.keys.swap_remove(position);
+                    entry.master.mki = master.mki;
+                    next.push(entry);
+                }
                 None => next.push(KeyEntry::new(master.clone())),
             }
         }
@@ -479,7 +566,17 @@ impl SrtcpGcmContext {
             .iter_mut()
             .find(|entry| entry.master.mki == mki)
             .ok_or(SrtpError::UnknownMki)?;
-        entry.session.open(body, &mut entry.replay, out)
+        // RFC 3711 §3.2.3, §3.3.2: the replay list is the SSRC's. The SSRC is read before the tag is
+        // checked, so it only selects a window to test against; a window is claimed after the tag
+        // verified. A further SSRC than the table holds is refused, not given a shared window.
+        let ssrc = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+        let mut window = entry
+            .replay
+            .window_of(ssrc)
+            .ok_or(SrtpError::ReplayTableFull)?;
+        entry.session.open(body, &mut window, out)?;
+        entry.replay.store(ssrc, window);
+        Ok(())
     }
 }
 
@@ -1025,5 +1122,180 @@ mod tests {
             dump.push_str(&format!("{byte:02x} "));
         }
         std::fs::write(path, dump + "\n").expect("write");
+    }
+
+    #[test]
+    fn replay_windows_are_per_sender_ssrc() {
+        let mut sender = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        let mut other = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        let mut receiver = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        let (mut audio, mut video, mut out) = (Vec::new(), Vec::new(), Vec::new());
+        // Audio and video of one client are both at index 0 of their own SSRC (RFC 3711 §3.2.3).
+        sender.protect(&rtcp(0xA), true, &mut audio).expect("audio");
+        other.protect(&rtcp(0xB), true, &mut video).expect("video");
+        receiver.unprotect(&audio, &mut out).expect("audio");
+        receiver
+            .unprotect(&video, &mut out)
+            .expect("the video index 0 is not a replay of the audio's");
+        // Each is a replay on its own window.
+        assert_eq!(
+            receiver.unprotect(&audio, &mut out),
+            Err(SrtpError::Replayed)
+        );
+        assert_eq!(
+            receiver.unprotect(&video, &mut out),
+            Err(SrtpError::Replayed)
+        );
+    }
+
+    #[test]
+    fn a_high_index_of_one_ssrc_does_not_move_another_ssrcs_window() {
+        let mut sender = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        let mut other = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        let mut receiver = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        sender.set_send_index(100_000);
+        let (mut audio, mut video, mut out) = (Vec::new(), Vec::new(), Vec::new());
+        sender.protect(&rtcp(0xA), true, &mut audio).expect("audio");
+        receiver
+            .unprotect(&audio, &mut out)
+            .expect("audio at 100000");
+        // With one shared window the video at index 3 would now be older than the window: refused.
+        for _ in 0..3 {
+            other.protect(&rtcp(0xB), true, &mut video).expect("video");
+        }
+        receiver
+            .unprotect(&video, &mut out)
+            .expect("video at 2, far below the audio's index");
+    }
+
+    #[test]
+    fn an_audio_packet_replayed_as_another_ssrcs_is_still_a_replay_of_its_own() {
+        // The packet is the same bytes: its SSRC is in the authenticated header, so it can only ever be
+        // checked on the window of the SSRC it names.
+        let mut sender = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        let mut receiver = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        let (mut wire, mut out) = (Vec::new(), Vec::new());
+        sender.protect(&rtcp(0xA), true, &mut wire).expect("audio");
+        receiver.unprotect(&wire, &mut out).expect("first");
+        assert_eq!(
+            receiver.unprotect(&wire, &mut out),
+            Err(SrtpError::Replayed)
+        );
+        let mut forged = wire.clone();
+        forged[4..8].copy_from_slice(&0xBu32.to_be_bytes());
+        assert_eq!(
+            receiver.unprotect(&forged, &mut out),
+            Err(SrtpError::AuthFailed),
+            "a rewritten SSRC fails the tag; it never gets a fresh window"
+        );
+    }
+
+    #[test]
+    fn a_ninth_ssrc_is_refused_without_sharing_a_window_and_only_authenticated_ones_take_a_slot() {
+        let mut receiver = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        let (mut wire, mut out) = (Vec::new(), Vec::new());
+        // Forged packets of many SSRCs claim nothing.
+        for ssrc in 0..64u32 {
+            let mut senders = SrtcpGcmContext::new(&[master(1, 9)]).expect("ctx");
+            senders
+                .protect(&rtcp(ssrc), true, &mut wire)
+                .expect("protect");
+            assert_eq!(
+                receiver.unprotect(&wire, &mut out),
+                Err(SrtpError::AuthFailed)
+            );
+        }
+        for ssrc in 0..MAX_REPLAY_SSRCS as u32 {
+            let mut sender = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+            sender
+                .protect(&rtcp(100 + ssrc), true, &mut wire)
+                .expect("protect");
+            receiver.unprotect(&wire, &mut out).expect("a slot each");
+        }
+        let mut late = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        late.protect(&rtcp(999), true, &mut wire).expect("protect");
+        assert_eq!(
+            receiver.unprotect(&wire, &mut out),
+            Err(SrtpError::ReplayTableFull)
+        );
+        assert!(out.is_empty());
+        // The held ones are unaffected.
+        let mut known = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        known.set_send_index(5);
+        known.protect(&rtcp(100), true, &mut wire).expect("protect");
+        receiver
+            .unprotect(&wire, &mut out)
+            .expect("a known SSRC still passes");
+    }
+
+    #[test]
+    fn a_restored_replay_anchor_applies_to_ssrcs_seen_later_too() {
+        let mut receiver = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        receiver.resume_received(1, 10);
+        let mut sender = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        let (mut wire, mut out) = (Vec::new(), Vec::new());
+        sender
+            .protect(&rtcp(0xA), true, &mut wire)
+            .expect("index 0");
+        assert_eq!(
+            receiver.unprotect(&wire, &mut out),
+            Err(SrtpError::Replayed)
+        );
+        sender.set_send_index(11);
+        sender
+            .protect(&rtcp(0xA), true, &mut wire)
+            .expect("index 11");
+        receiver
+            .unprotect(&wire, &mut out)
+            .expect("beyond the anchor");
+        assert_eq!(receiver.received_indices(), vec![(1, 11)]);
+    }
+
+    #[test]
+    fn one_key_under_two_mkis_in_a_set_is_refused() {
+        let key = master(1, 0x41);
+        let mut alias = master(1, 0x41);
+        alias.mki = 2;
+        assert!(matches!(
+            SrtcpGcmContext::new(&[key.clone(), alias.clone()]),
+            Err(SrtpError::DuplicateKeyMaterial)
+        ));
+        let mut context = SrtcpGcmContext::new(std::slice::from_ref(&key)).expect("ctx");
+        assert_eq!(
+            context.replace_keys(&[key, alias]),
+            Err(SrtpError::DuplicateKeyMaterial)
+        );
+        assert_eq!(context.sending_mki(), Some(1), "the held set is untouched");
+    }
+
+    #[test]
+    fn a_captured_packet_resent_under_an_alias_mki_is_a_replay() {
+        // The MKI is not authenticated (RFC 7714 §9.2): rewriting it must not give the key a second
+        // replay table. The key is renamed to MKI 2 by a rekey (the same material), and the packet
+        // captured under MKI 1 comes back with the new MKI.
+        let key = master(1, 0x41);
+        let mut renamed = master(1, 0x41);
+        renamed.mki = 2;
+        let mut sender = SrtcpGcmContext::new(std::slice::from_ref(&key)).expect("ctx");
+        let mut receiver = SrtcpGcmContext::new(std::slice::from_ref(&key)).expect("ctx");
+        let (mut wire, mut out) = (Vec::new(), Vec::new());
+        sender
+            .protect(&rtcp(0xA), true, &mut wire)
+            .expect("protect");
+        receiver.unprotect(&wire, &mut out).expect("first");
+        receiver
+            .replace_keys(std::slice::from_ref(&renamed))
+            .expect("the same material, renamed");
+        let mut aliased = wire.clone();
+        let at = aliased.len() - MKI_LEN;
+        aliased[at..].copy_from_slice(&2u32.to_be_bytes());
+        assert_eq!(
+            receiver.unprotect(&aliased, &mut out),
+            Err(SrtpError::Replayed)
+        );
+        assert_eq!(
+            receiver.unprotect(&wire, &mut out),
+            Err(SrtpError::UnknownMki)
+        );
     }
 }

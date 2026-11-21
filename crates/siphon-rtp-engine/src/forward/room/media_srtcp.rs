@@ -86,6 +86,12 @@ impl ForwardRoom {
                         },
                     ),
                     // A replay is routine (a duplicated datagram): trace only.
+                    None if error == siphon_rtp_srtp::SrtpError::ReplayTableFull => {
+                        tracing::warn!(
+                            target: "siphon_rtp::media", room = %self.room_id, tag = %seat.tag,
+                            "media SRTCP from one more sender SSRC than the key tracks; refused"
+                        );
+                    }
                     None => tracing::debug!(
                         target: "siphon_rtp::media", room = %self.room_id, tag = %seat.tag, %error,
                         "media SRTCP datagram dropped"

@@ -64,6 +64,7 @@ mod forward_floor;
 mod forward_offer_turn_relay;
 mod forward_offer_webrtc;
 mod forward_preserve;
+mod forward_preserve_video;
 mod forward_room;
 mod forward_stream_identity;
 mod forward_video;

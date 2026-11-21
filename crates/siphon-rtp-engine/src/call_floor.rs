@@ -850,7 +850,7 @@ mod tests {
     }
 
     fn floor_key(mki: u32) -> FloorMasterKey {
-        FloorMasterKey::from_salt_96(mki, [0x11; 16], &[0x22; 12])
+        FloorMasterKey::from_salt_96(mki, [0x11 ^ mki as u8; 16], &[0x22; 12])
     }
 
     #[test]

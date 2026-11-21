@@ -35,6 +35,15 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   phone keeps sending to the freed media port; on an ephemeral port a parallel bind could take it. The
   test now allocates from a reserved window below the ephemeral range.
 
+### Added
+
+- **Video in `media: preserve` forwarding rooms.** A preserve room carries a seat's `m=video`
+  (`RTP/SAVP[F]` or plain, no engine key, one payload type per room): the source's SRTP is fanned out
+  byte for byte, video RTCP is hop by hop under the seat's media key (replay window per sender SSRC, one outgoing
+  index shared with the audio), a source switch and a late joiner get one sealed PLI, NACKs are served
+  from the stored SRTP, `key_mgmt` is written on the video section, and `node_info` lists
+  `forward_video_preserve`.
+
 ## [0.26.1] — 2026-11-21
 
 ### Fixed

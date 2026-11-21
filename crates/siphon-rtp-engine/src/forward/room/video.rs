@@ -85,9 +85,9 @@ pub struct VideoConfig {
 pub(super) struct VideoStream {
     pub(super) endpoint: EndpointId,
     pub(super) destination: SocketAddr,
-    accepted_source: SourceFilter,
+    pub(super) accepted_source: SourceFilter,
     latch: SymmetricLatch,
-    refusals: RefusalLog,
+    pub(super) refusals: RefusalLog,
     pub(super) payload_type: u8,
     pub(super) sends: bool,
     pub(super) receives: bool,
@@ -255,7 +255,7 @@ fn consume_video_rtcp(
 }
 
 /// The fan-out of one video packet, or of the packets a receiver's NACK asked for.
-fn video_plan(
+pub(super) fn video_plan(
     source: usize,
     point: StreamPoint,
     arrival: u64,
@@ -326,6 +326,18 @@ impl ForwardRoom {
             Ok(data) => data,
             Err(refused) => return refused,
         };
+        if self.preserving() {
+            // The seat's video is SRTP keyed between the UEs: handed on untouched (`preserve_video`).
+            if data.len() < 2 {
+                return Ingress::Accepted; // gated in; too short to be media, but the path is alive
+            }
+            // The decrypt buffer was lent to the gate: it goes back for the plaintext RTCP the
+            // room keeps in it, and is lent on again when the caller restores it.
+            self.clear_in = std::mem::take(clear);
+            let outcome = self.ingest_preserved_video(index, packet);
+            *clear = std::mem::take(&mut self.clear_in);
+            return outcome;
+        }
         self.video_after_gate(index, data, packet.arrival, false)
     }
 

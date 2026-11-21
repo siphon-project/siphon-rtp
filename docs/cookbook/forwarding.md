@@ -411,7 +411,7 @@ interval for receivers' requests. Counters per seat, in the log line when a seat
 so a source that sends an IDR as several slices and is joined in the middle of one starts its receivers
 one picture late. There is no transcoding or level negotiation beyond the exact match above. Plain `RTP/AVP` and
 `RTP/AVPF` seats in a translate room, and browser seats (below): video offered by an SDES seat, by a
-browser on a transport of its own, or in a `media: preserve` room is declined with the reason. One transmission at a time: concurrent video
+browser on a transport of its own is declined with the reason (a `media: preserve` room carries video, see "Video in a preserve room"). One transmission at a time: concurrent video
 sources (3GPP TS 24.581 §4.1.1.2) need per-receiver subscriptions and stable seat ids and are a step of
 their own. Check `node_info` `features` for `forward_video` first.
 
@@ -427,13 +427,38 @@ parameter-set replay, NACK and `forward_keyframe` work as on plain seats, with P
 sent as SRTCP/SRTP under the seat's key. `forward_offer` with `transport_protocol: UDP/TLS/RTP/SAVPF` and
 `profile.video` offers `m=video <audio port> UDP/TLS/RTP/SAVPF 126` in the bundle; the browser's answer
 seats it. A video section outside the audio's BUNDLE group is declined (`video_declined` names RFC 8843),
-and so is a browser's video in a preserve room. A declined browser video leaves the answer's BUNDLE
+and so is a browser's video in a preserve room (a WebRTC seat is refused there). A declined browser video leaves the answer's BUNDLE
 group. Check `node_info` `features` for `forward_video_webrtc`.
 
 The video endpoint is gated exactly like the seat's audio (the signalled source, then the SSRC-consistent
 latch, [Layer 5c-ii](../security-and-nat.md)). `forward_offer` with `profile.video` offers
 `m=video <port> RTP/AVPF 126` with the same format rules, and `forward_answer` reports `streams` and
 `video_declined` too.
+
+### Video in a preserve room
+
+A `media: preserve` room carries video the way it carries audio (3GPP TS 33.180 §7.5.2): the UEs key
+their SRTP between themselves, one group key covering audio and video told apart by SSRC, and the engine
+hands the source's video datagram on byte for byte. The seat's `m=video` is `RTP/SAVP`, `RTP/SAVPF` or
+plain, on an endpoint of its own, with no `a=crypto`, no DTLS and no BUNDLE with the audio, and is
+answered in the offered transport with the offered `a=rtcp-fb`; the controller's `key_mgmt` goes on the
+video section as on the audio one. Every seat uses the one video payload type the room's first video seat
+fixed (another declines with the reason), and `forward_offer` offers that number once it exists (126 for
+the first). The source never hears itself, a seat whose video reception is off (`forward_set_reception`)
+is sent none, and the room fans out with no per-packet allocation.
+
+The payload is encrypted, so the room sees no keyframe: there is no gate, no SPS/PPS replay and no
+`forward_keyframe` event, and the controller relies on the UE sending an IDR when its transmission
+starts. The room's own help is one PLI (one FIR when the source accepted only FIR) to a new source and to
+a late joiner, sealed under the source's media SRTCP key, then nothing. A source with no
+`media_srtcp_keys` is never sent a request (a plaintext one would be refused). Receivers' PLI and FIR
+for the source's stream are passed on at most once a second, and a Generic NACK from a seat that accepted
+`nack` is answered from the stored original SRTP bytes (counted `nack_answered`, `nack_missed`).
+
+Video RTCP is hop by hop under each seat's key (§9.4.1), the same key as the audio's. A keyed seat's video
+RTCP must authenticate on a replay window per sender SSRC (audio and video each count their own SRTCP index; a key tracks 8 sender SSRCs, a ninth is refused),
+and the room's one outgoing index per seat serves both, so no IV is reused (RFC 7714 §9.2). Check
+`node_info` `features` for `forward_video_preserve`.
 
 ### Inviting a browser into the group
 

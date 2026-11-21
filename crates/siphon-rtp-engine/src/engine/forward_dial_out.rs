@@ -52,6 +52,8 @@ pub(super) struct PendingForwardSeat {
     floor: Option<Endpoint>,
     /// The seat's video endpoint, when the offer carried a video section.
     video: Option<Endpoint>,
+    /// The payload type the offered video section names: the answer must keep it (RFC 3264 §6.1).
+    video_payload_type: Option<u8>,
     /// The audio codecs the offer listed, in its order.
     offered: Vec<CodecSpec>,
     /// The telephone-event payload types the offer listed, one per clock rate.
@@ -255,16 +257,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result("forward_offer: video stream", &reason);
             }
         };
-        let (video_endpoint, video_section, video_declined, bundled_video) = match video {
+        let (video_endpoint, video_section, bundled_video, offered_video_type) = match video {
             OfferedVideo::None => (None, None, None, None),
-            OfferedVideo::Declined(reason) => (None, None, Some(reason), None),
-            OfferedVideo::Section { endpoint, section } => {
-                (Some(endpoint), Some(section), None, None)
-            }
+            OfferedVideo::Section {
+                endpoint,
+                section,
+                payload_type,
+            } => (Some(endpoint), Some(section), None, Some(payload_type)),
             OfferedVideo::Bundled {
                 fmtp,
                 bandwidth_kbps,
-            } => (None, None, None, Some((fmtp, bandwidth_kbps))),
+            } => (None, None, Some((fmtp, bandwidth_kbps)), None),
         };
         let advertised = advertised_override.unwrap_or_else(|| endpoint.local_addr.ip());
         let (mut offer, webrtc) = if want_webrtc {
@@ -321,6 +324,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             endpoint,
             floor,
             video: video_endpoint,
+            video_payload_type: offered_video_type,
             offered,
             events,
             profile,
@@ -351,7 +355,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         // The controller's `a=key-mgmt` (RFC 4567), written verbatim on the audio section.
         let offer = sdp::apply_key_mgmt(&offer, key_mgmt.as_deref());
-        ok_forward_seat(Some(offer), Some(from_tag), Vec::new(), video_declined)
+        ok_forward_seat(Some(offer), Some(from_tag), Vec::new(), None)
     }
 
     /// Seat the member a [`siphon_rtp_proto::Command::ForwardOffer`] offered, on its answer
@@ -604,14 +608,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             });
         // The video stream, when the offer carried one: a port, a format that fits the room.
         let video = match (pending.video, &pending.webrtc) {
-            (Some(video), _) => Some(self.negotiate_video(
-                room_id,
-                answer,
-                received_from,
-                &pending.profile,
-                video,
-                gate,
-            )),
+            (Some(video), _) => Some(
+                self.negotiate_video(
+                    room_id,
+                    pending.media,
+                    pending
+                        .video_payload_type
+                        .unwrap_or(sdp::video::OFFER_PAYLOAD_TYPE),
+                    answer,
+                    received_from,
+                    &pending.profile,
+                    video,
+                    gate,
+                ),
+            ),
             // A browser seat's video rides the audio's endpoint, bundled (RFC 8843).
             (None, Some(offered)) if offered.video => Some(self.negotiate_bundled_video(
                 room_id,
