@@ -11,7 +11,6 @@ use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::rtp::RtpPacket;
 
 use super::{Direction, LegMeta, MediaCall, PcapCapture, MAX_PCM};
-use crate::x3::X3Taps;
 
 /// The side decode of a **relay-only** direction: a decoded copy of the ingress for the sinks that
 /// want PCM (a WS tee, a decoded recording), next to a relay that forwards each packet verbatim.
@@ -69,14 +68,14 @@ impl TapDecode {
 /// ([`super::MediaControl::TakeAttachments`]): everything a control verb attached and the engine cannot
 /// reconstruct on its own. Indexed `[leg A, leg B]`, by source leg for the ingress forks and the
 /// DTMF block and by receiving party for the egress taps. SIPREC raw tees are not here: the engine
-/// re-attaches them from its subscriptions.
+/// re-attaches them from its subscriptions. Neither are a lawful interception's taps: they belong to
+/// the call's sessions, so the engine builds them onto the new actor **before** it is registered
+/// (`pretap_relay`, `pretap_single_leg`), and they stay on the old actor until it stops, so no packet
+/// either actor handles in between leaves untapped (ETSI TS 103 221-2 §5.2).
 #[derive(Default)]
 pub struct CarriedAttachments {
     pub forks: [Vec<Box<dyn MediaSink>>; 2],
     pub egress_taps: [Vec<Box<dyn MediaSink>>; 2],
-    pub x3: Option<(X3Taps, X3Taps)>,
-    /// A single-leg call's interception: `(ingress tap, egress tap)`.
-    pub x3_single_leg: Option<(X3Taps, X3Taps)>,
     pub capture: Option<PcapCapture>,
     pub dtmf_blocked: [bool; 2],
 }
@@ -169,16 +168,9 @@ impl MediaCall {
     /// Move out everything attached to this call ([`super::MediaControl::TakeAttachments`]), leaving it
     /// a bare relay or transcode.
     pub fn take_attachments(&mut self) -> CarriedAttachments {
-        // A two-party call has an ingress tap on each leg; a single-leg call has its ingress tap and
-        // an egress tap, both on the direction that faces its caller.
-        let egress = std::mem::take(&mut self.a_to_b.x3_egress);
-        let leg_a = std::mem::take(&mut self.a_to_b.x3);
-        let leg_b = std::mem::take(&mut self.b_to_a.x3);
-        let (x3, x3_single_leg) = match (leg_a.is_empty(), leg_b.is_empty(), egress.is_empty()) {
-            (false, false, _) => (Some((leg_a, leg_b)), None),
-            (false, true, false) => (None, Some((leg_a, egress))),
-            _ => (None, None),
-        };
+        // The interception's taps are deliberately left where they are (ETSI TS 103 221-2 §5.2): a
+        // tap moved out here would leave every packet this actor still handles before it stops
+        // untapped. They go with the actor, and the actor that replaces it is built tapped.
         CarriedAttachments {
             forks: [
                 std::mem::take(&mut self.a_to_b.forks),
@@ -189,8 +181,6 @@ impl MediaCall {
                 std::mem::take(&mut self.b_to_a.egress_taps),
                 std::mem::take(&mut self.a_to_b.egress_taps),
             ],
-            x3,
-            x3_single_leg,
             capture: self.capture.take(),
             dtmf_blocked: [self.a_to_b.dtmf_blocked, self.b_to_a.dtmf_blocked],
         }

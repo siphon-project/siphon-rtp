@@ -6,7 +6,7 @@
 //! a takeover of an intercepted call asks: what else holds the call's media path, and was it the
 //! interception that promoted a plain relay.
 
-use siphon_rtp_datapath::Datapath;
+use siphon_rtp_datapath::{Datapath, EndpointId};
 
 use crate::engine::intercept::X3TapSource;
 use crate::engine::{Engine, PipelineKind, PromotionReason};
@@ -30,6 +30,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         else {
             return Err("the call's WebSocket bridge is no longer installed".to_string());
         };
+        leg.taps().set(self.ws_tap_set(call_id, endpoint, sources)?);
+        Ok(())
+    }
+
+    /// The taps of every delivery in `sources` for the takeover leg on `endpoint`, built without the
+    /// bridge being registered: [`Self::setup_ws_bridge`] sets them on the leg's egress before it
+    /// spawns the tasks that send and receive, so the first frame in either direction is tapped
+    /// (ETSI TS 103 221-2 §5.2).
+    pub(in crate::engine) fn ws_tap_set(
+        &self,
+        call_id: &str,
+        endpoint: EndpointId,
+        sources: &[X3TapSource],
+    ) -> Result<WsTapSet, String> {
         let Some(local) = self
             .owned_call_internal(call_id, |call| {
                 std::iter::once(call.near)
@@ -48,30 +62,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ingress.push(source.factory.tap(local, ingress_direction));
             egress.push(source.factory.tap(local, egress_direction));
         }
-        leg.taps().set(WsTapSet {
+        Ok(WsTapSet {
             ingress: X3Taps::new(ingress),
             egress: X3Taps::new(egress),
-        });
-        Ok(())
+        })
     }
 
-    /// Tap a bridge that has just been registered on a call that is intercepted: the deliveries
-    /// belong to the call, so the leg is tapped from its first packet rather than once the controller
-    /// verb that stood the bridge up returns and carries the set across. A failure is logged and
-    /// left to that carry, which holds the lock and ends the deliveries loudly if it fails too.
-    pub(in crate::engine) fn tap_new_bridge(&self, call_id: &str) {
+    /// Tap a new bridge's leg with the deliveries of the intercepted call **before** the bridge's
+    /// tasks are spawned or its leg is registered: the deliveries belong to the call, so the leg is
+    /// tapped from its first packet in either direction rather than once the controller verb that
+    /// stood the bridge up returns and carries the set across. A failure is logged and left to that
+    /// carry, which holds the lock and ends the deliveries loudly if it fails too.
+    pub(in crate::engine) fn tap_new_bridge_leg(
+        &self,
+        call_id: &str,
+        endpoint: EndpointId,
+        egress: &crate::ws_bridge::WsEgress,
+    ) {
         let sources = self.x3_tap_sources(call_id);
         if sources.is_empty() {
             return;
         }
-        if let Err(reason) = self.install_ws_x3(call_id, &sources) {
-            tracing::error!(
+        match self.ws_tap_set(call_id, endpoint, &sources) {
+            Ok(set) => egress.taps().set(set),
+            Err(reason) => tracing::error!(
                 target: "siphon_rtp::li",
                 call_id,
                 reason,
-                "the new WebSocket bridge could not be tapped on registration; the carry that \
+                "the new WebSocket bridge could not be tapped before it started; the carry that \
                  follows retries and ends the deliveries if it fails too"
-            );
+            ),
         }
     }
 

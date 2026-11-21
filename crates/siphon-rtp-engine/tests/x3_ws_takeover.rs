@@ -23,8 +23,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::x3_mdf::{
-    acceptor, from_target, pki, plain_sdp, rtp_from, rtp_sequence, ssrc_of, to_target, Mdf,
-    PduStream, Phone, Pki, Tls, CORRELATION_ID, SHORT,
+    acceptor, assert_new_streams_delivered_from_first, from_target, pki, plain_sdp, rtp_from,
+    rtp_sequence, ssrc_of, to_target, Mdf, PduStream, Phone, Pki, Tls, CORRELATION_ID, SHORT,
 };
 use futures_util::{SinkExt, StreamExt};
 use siphon_rtp_datapath::Datapath as _;
@@ -331,7 +331,8 @@ async fn talk(
 
 /// What the engine sent `heard` must be in `delivered` byte for byte, from the first datagram
 /// delivered on each stream to the last (what left before the taps went on, or after they came off,
-/// is not owed).
+/// is not owed). A bridge or pipeline built under an interception owes its first frame too:
+/// [`assert_new_streams_delivered_from_first`].
 fn assert_heard_was_delivered(heard: &[Vec<u8>], delivered: &[Vec<u8>]) {
     assert!(!delivered.is_empty(), "something was delivered");
     assert!(!heard.is_empty(), "the engine really sent the caller media");
@@ -665,6 +666,9 @@ async fn an_interception_attached_at_the_offer_is_delivered_once_the_answer_name
     .await;
     assert_eq!(payloads(&mdf, from_target())[..sent.len()], sent[..]);
     assert_heard_was_delivered(&heard, &payloads(&mdf, to_target()));
+    // Nothing was sent to the caller before the answer, so every stream it heard was begun by the
+    // bridge built under the interception, and its first frame is owed.
+    assert_new_streams_delivered_from_first(&heard, &[], &payloads(&mdf, to_target()));
     assert!(x3_ends(rig.drained_events()).is_empty(), "still attached");
 }
 
@@ -820,7 +824,7 @@ async fn a_re_answer_into_a_ws_takeover_keeps_the_interception() {
         CmdResult::Ok { .. }
     ));
     let mut mdf = rig.accept().await;
-    let (sent_first, _) = talk(&caller, &caller, first, CALLER_SSRC, 1, 8).await;
+    let (sent_first, heard_first) = talk(&caller, &caller, first, CALLER_SSRC, 1, 8).await;
 
     let second = rig.answer_local("again", &caller, Some(&bot)).await;
     let (sent_second, heard) = talk(&caller, &caller, second, CALLER_SSRC, 100, 12).await;
@@ -833,6 +837,8 @@ async fn a_re_answer_into_a_ws_takeover_keeps_the_interception() {
     let delivered_from = payloads(&mdf, from_target());
     assert_all_delivered_once(&sent_first, &delivered_from, "before the re-answer");
     assert_all_delivered_once(&sent_second, &delivered_from, "after the re-answer");
+    // The bridge's comfort idle is the first thing it sends: tapped from its first frame.
+    assert_new_streams_delivered_from_first(&heard, &heard_first, &payloads(&mdf, to_target()));
     assert!(!rig.second_connection().await, "same delivery connection");
     assert!(
         x3_ends(rig.drained_events()).is_empty(),

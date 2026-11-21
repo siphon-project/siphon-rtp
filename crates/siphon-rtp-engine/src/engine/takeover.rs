@@ -444,6 +444,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         );
 
+        // Where the downlink goes. Published rather than captured so the leg's own symmetric-RTP
+        // latch and an ICE selection can both re-point it mid-call (RFC 8445 §8.1.1) — a takeover
+        // leg's egress belongs to this drain task, not to a datapath forward rule, so neither the
+        // datapath's latch nor `Datapath::adopt_source` would ever reach it.
+        // Reused verbatim on a re-point (see `WsBridgeSetup::egress`), so a selection or a latch that
+        // has already landed keeps steering the downlink; minted at `a_rtp` for a first attach.
+        let egress_carried = existing_egress.is_some();
+        let egress = existing_egress
+            .unwrap_or_else(|| Arc::new(crate::ws_bridge::WsEgress::new(a_rtp, ice_pending)));
+        // A bridge stood up on an intercepted call is tapped before either task is spawned, so the
+        // first frame in either direction is tapped (the bridge's comfort idle can emit at once and
+        // the drain taps what it sends). A re-point carries the leg's egress state, taps
+        // included, so only a new leg needs it. ETSI TS 103 221-2 §5.2.
+        if !egress_carried {
+            self.tap_new_bridge_leg(call_id, endpoint_a, &egress);
+        }
         // The bridge: pump A's RTP (rtp_in) ↔ WS, render WS downlink to RTP (rtp_out). Whichever way
         // it ends, say so once — a detach that beat it to the latch has already reported `Detached`.
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -475,15 +491,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 );
             })
         };
-        // Where the downlink goes. Published rather than captured so the leg's own symmetric-RTP
-        // latch and an ICE selection can both re-point it mid-call (RFC 8445 §8.1.1) — a takeover
-        // leg's egress belongs to this drain task, not to a datapath forward rule, so neither the
-        // datapath's latch nor `Datapath::adopt_source` would ever reach it.
-        // Reused verbatim on a re-point (see `WsBridgeSetup::egress`), so a selection or a latch that
-        // has already landed keeps steering the downlink; minted at `a_rtp` for a first attach.
-        let egress_carried = existing_egress.is_some();
-        let egress = existing_egress
-            .unwrap_or_else(|| Arc::new(crate::ws_bridge::WsEgress::new(a_rtp, ice_pending)));
         // The drain: forward each rendered downlink RTP packet out A's endpoint toward A, encrypting
         // it first on a secure leg. This is the ONLY egress site a takeover call has — `play_media`,
         // `play_dtmf`, recording, SIPREC and the WS tee all refuse a `PipelineKind::Ws` call, and a
@@ -562,11 +569,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 control,
             },
         );
-        // A bridge stood up on an intercepted call is tapped from its first packet. A re-point carries
-        // the leg's egress state, taps included, so only a new leg needs it.
-        if !egress_carried {
-            self.tap_new_bridge(call_id);
-        }
         tracing::info!(
             target: "siphon_rtp::media",
             call_id,

@@ -338,10 +338,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if echo {
             call.set_echo(true);
         }
-        // An intercepted caller (a bot handing the leg back to the engine) is tapped before the
-        // actor can take its first packet.
+        // An intercepted call is tapped before the actor can take its first packet (ETSI TS 103 221-2
+        // §5.2): an intercepted caller (a bot handing the leg back to the engine) on its own, an
+        // intercepted two-party call on both of its legs.
         if offer_only_restore.is_some() {
             self.pretap_single_leg(call_id, &mut call);
+        } else {
+            self.pretap_relay(call_id, &mut call);
         }
         self.media
             .register(call, self.datapath.clone(), owner_events);
@@ -444,9 +447,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Rebuild a **relay-only** promoted call as a **processing** one (decode → re-encode), for echo
-    /// or a prompt, carrying everything attached to the old actor: the tee and recording sinks, an
-    /// interception's X3 taps, a pcap capture, a DTMF block, and every answered SIPREC
-    /// subscription's raw tee. Nothing a controller attached is lost to the rebuild.
+    /// or a prompt, carrying everything attached to the old actor: the tee and recording sinks, a
+    /// pcap capture, a DTMF block, and every answered SIPREC subscription's raw tee. Nothing a
+    /// controller attached is lost to the rebuild. An interception is not carried but rebuilt: the
+    /// new actor is registered already tapped ([`Self::pretap_relay`]) and the old one keeps its taps
+    /// until it stops, so there is no instant at which a packet leaves untapped (ETSI TS 103 221-2
+    /// §5.2).
     ///
     /// If the processing actor cannot be built, the relay-only one is put back with its
     /// attachments, so a refused prompt leaves the call as it was.
@@ -494,8 +500,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let CarriedAttachments {
             forks,
             egress_taps,
-            x3,
-            x3_single_leg,
             capture,
             dtmf_blocked,
         } = attachments;
@@ -515,14 +519,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.media
                     .control(call_id, MediaControl::AddEgressFork { toward_a, sink });
             }
-        }
-        if let Some(taps) = x3 {
-            self.media
-                .control(call_id, MediaControl::StartX3(Box::new(taps)));
-        }
-        if let Some(taps) = x3_single_leg {
-            self.media
-                .control(call_id, MediaControl::StartX3SingleLeg(Box::new(taps)));
         }
         if let Some(capture) = capture {
             self.media

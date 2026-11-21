@@ -297,8 +297,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Take every recording sink off `call_id`'s media actor, **unfinished**, so the recording can
     /// move with the leg instead of ending with the actor. Empty when nothing records the call.
     ///
-    /// Only recording sinks can be there: an anchor carrying a tee, a subscription, an interception
-    /// or a pcap capture refuses the hand-over before this runs.
+    /// Only the recording sinks (the forks and egress taps) are used from what the actor hands
+    /// over: an anchor carrying a tee, a subscription or a pcap capture refuses the hand-over before
+    /// this runs. An interception does not refuse it and is not moved by this take: its taps stay on
+    /// the actor, and the engine rebuilds them on whatever carries the call next.
     pub(super) async fn take_pipeline_recordings(&self, call_id: &str) -> TakenRecordingTaps {
         if !self.records(call_id) {
             return TakenRecordingTaps::default();

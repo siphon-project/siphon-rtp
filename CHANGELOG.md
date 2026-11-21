@@ -14,6 +14,15 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   ephemeral range, where a concurrent `bind(:0)` could take one between the delete and the restore
   (`EADDRINUSE`). Those tests now allocate from a reserved window below the ephemeral range.
 
+- **Every rebuilt pipeline and WebSocket bridge on an intercepted call is tapped before it can send.** The
+  WebSocket bridge of a `ws_uri` answer spawned its tasks before its leg's taps were set, so the first
+  frame to the caller could leave untapped; the two-party upgrade of a relay to a processing actor took
+  the taps off the old actor and put them back on the new one by control message after it was
+  registered, so both actors could handle packets untapped in between; and the two-party processing
+  promotion had no pre-registration tap at all. The bridge leg's taps are now set before either task
+  spawns, the new actor is built tapped (`pretap_relay`) and the old actor keeps its taps until it stops
+  (ETSI TS 103 221-2 §5.2). Tests drive the first packet into the registry before any carry can run.
+
 ## [0.26.1] — 2026-11-21
 
 ### Fixed
@@ -213,7 +222,6 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   peer's text kept going to its signalled address.
 - **A re-offer from a moved caller re-gates its text stream.** The caller's audio address followed the
   re-offer but its text address did not, so the relay kept gating and aiming text at the old one.
-
 
 - **Lawful-interception X3 delivery no longer ends at the first re-offer.** The taps lived in the
   media pipeline, so the answer to a hold, resume or session refresh dropped them and the delivery
@@ -2772,7 +2780,6 @@ cancels exactly as before, one lock later.
   loud enough to judge instead of unconditionally. `ws_bridge_tick_8k_20ms/aec_on` 5.03 → 4.58 µs
   against 4.44 µs with the verdict removed entirely.
 
-
 ## [0.4.6] — 2026-09-05
 
 Two defects on the WebSocket-takeover downlink, both silent in every place an operator would look: the
@@ -3006,7 +3013,6 @@ and the SDP presented to either party are unchanged.
   WebRTC peer had its media dropped outright rather than merely misaimed. Found while fixing the
   above; the two now share one effective address.
 
-
 ## [0.4.1] — 2026-09-03
 
 Cut immediately, because the defect below does not present as a refused command: the call answers,
@@ -3052,7 +3058,6 @@ configuration that depended on the old behaviour is `codec-mask-X` / `codec-cons
   `cannot decode the ingress codec G729/8000 (payload type 18)`, and the codecs that are planned but
   not built — G.729, G.723.1, EVS — say so by name and repeat that passthrough is unaffected, the
   way the AMR message already did.
-
 
 ## [0.4.0] — 2026-09-01
 

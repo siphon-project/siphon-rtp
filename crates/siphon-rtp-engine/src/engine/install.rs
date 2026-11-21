@@ -526,6 +526,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .with_far_secure_leg(leg)
             .with_rtcp_relays(rtcp_relays);
         let call = call.with_app_events(self.call_app_queue(wiring.call_id));
+        // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
+        // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
+        let mut call = call;
+        self.pretap_relay(wiring.call_id, &mut call);
         self.media
             .register(call, self.datapath.clone(), owner_events);
         Ok(())
@@ -616,6 +620,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         .with_rtcp_relays(rtcp_relays);
         let call = call.with_app_events(self.call_app_queue(wiring.call_id));
+        // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
+        // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
+        let mut call = call;
+        self.pretap_relay(wiring.call_id, &mut call);
         self.media
             .register(call, self.datapath.clone(), owner_events);
         Ok(())
@@ -675,6 +683,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         let call = wiring.media_call(directions);
         let call = call.with_app_events(self.call_app_queue(wiring.call_id));
+        // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
+        // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
+        let mut call = call;
+        self.pretap_relay(wiring.call_id, &mut call);
         self.media
             .register(call, self.datapath.clone(), owner_events);
         Ok(())

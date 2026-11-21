@@ -9301,7 +9301,6 @@ mod tests {
         assert_eq!(taken.egress_taps[1].len(), 0);
         assert_eq!(taken.dtmf_blocked, [true, false]);
         assert!(taken.capture.is_some());
-        assert!(taken.x3.is_none());
         assert_eq!(call.fork_count(false), 0);
         assert!(!call.is_recording());
     }

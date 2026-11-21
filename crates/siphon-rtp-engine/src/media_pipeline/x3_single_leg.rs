@@ -147,14 +147,15 @@ mod tests {
     }
 
     #[test]
-    fn stopping_the_interception_removes_both_taps_and_a_take_carries_them() {
+    fn stopping_the_interception_removes_both_taps_and_a_take_leaves_them_on_the_actor() {
         let mut call = single_leg_call();
         let _delivery = intercept(&mut call);
         assert!(call.is_intercepted());
-        let carried = call.take_attachments();
-        assert!(carried.x3.is_none());
-        assert!(carried.x3_single_leg.is_some(), "the pair is carried");
-        assert!(!call.is_intercepted(), "taken off the old actor");
+        let _carried = call.take_attachments();
+        assert!(
+            call.is_intercepted(),
+            "the taps stay on the old actor until it stops: a packet it still handles is tapped"
+        );
 
         let mut call = single_leg_call();
         let _delivery = intercept(&mut call);
