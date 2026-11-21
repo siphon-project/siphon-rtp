@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -43,12 +44,14 @@ use crate::reply_latch::SymmetricLatch;
 use crate::sdp::video::VIDEO_CLOCK_RATE_HZ;
 use crate::sdp::TelephoneEvent;
 use crate::seat_gate::{self, SeatGate};
+use crate::srtcp_ledger::SrtcpLedger;
 
 mod app;
 mod keyframe;
 mod media_srtcp;
 mod preserve_video;
 mod reception;
+mod stats;
 mod video;
 
 pub(crate) use app::push_failure;
@@ -56,6 +59,7 @@ use app::FloorStream;
 pub use app::{AppRequest, AppSendError, AppTarget, FloorConfig, FloorKeysError};
 use keyframe::{KeyframePlan, Keyframes};
 use reception::{Reception, SenderActivity};
+pub use stats::ForwardSeatStats;
 pub use video::VideoConfig;
 use video::VideoStream;
 
@@ -122,65 +126,6 @@ pub struct ForwardSeatConfig {
     pub media_srtcp: Vec<FloorMasterKey>,
     /// The seat's video stream (3GPP TS 24.281 §6.2), when its offer carried one the engine took.
     pub video: Option<VideoConfig>,
-}
-
-/// What the room counted about one seat, for logs and stats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ForwardSeatStats {
-    /// RTP packets the seat sent while it was not the source: counted and dropped.
-    pub not_source_dropped: u64,
-    /// RTP packets from the seat with a payload type it did not negotiate: dropped.
-    pub unknown_payload_type: u64,
-    /// Packets the room forwarded to the seat.
-    pub forwarded_packets: u32,
-    /// Payload octets the room forwarded to the seat.
-    pub forwarded_octets: u32,
-    /// RTCP APP packets read from the seat (floor stream and audio RTCP), each raised as an event.
-    pub app_events: u64,
-    /// Datagrams with APP-bearing RTCP the room could not read to the end: counted, no event.
-    pub malformed_app: u64,
-    /// Audio SRTCP datagrams of a seat with media keys that did not authenticate under a held key
-    /// (plaintext, unknown MKI, failed tag, replay), in a preserving room: dropped.
-    pub media_srtcp_refused: u64,
-    /// Resealed audio SRTCP the room did not send this seat, as a receiver of a keyed talker, because
-    /// the seat holds no media keys (it is never sent plaintext).
-    pub media_srtcp_unkeyed_receiver: u64,
-    /// Floor datagrams a keyed seat's SRTCP refused (plaintext, unknown MKI, failed tag, replay).
-    pub floor_refused: u64,
-    /// Packets from the seat, while it was the source, that could not be transcoded for the
-    /// cross-codec seats (a payload the decoder refused, or a frame of another length than the
-    /// negotiated one). Same-codec seats were still sent them.
-    pub transcode_dropped: u64,
-    /// Audio RTCP datagrams the seat sent while it was not the source, in a preserving room: counted
-    /// and dropped, never read (they are SRTCP end to end).
-    pub receiver_rtcp_dropped: u64,
-    /// Video RTP packets the seat sent while it was not the source: counted and dropped.
-    pub video_not_source_dropped: u64,
-    /// Video RTP packets the seat sent while it was the source but had offered receive-only video:
-    /// counted and dropped.
-    pub video_receive_only_dropped: u64,
-    /// Video RTP packets with a payload type the seat did not negotiate: dropped.
-    pub video_unknown_payload_type: u64,
-    /// Video packets the room forwarded to the seat.
-    pub video_forwarded_packets: u32,
-    /// Video payload octets the room forwarded to the seat.
-    pub video_forwarded_octets: u32,
-    /// Keyframe requests (PLI, FIR) the room sent the seat as the video source.
-    pub pli_sent: u64,
-    pub fir_sent: u64,
-    /// IDR pictures the seat sent as the video source.
-    pub keyframes_seen: u64,
-    /// Video packets not sent to the seat because it waited for a keyframe.
-    pub video_dropped_awaiting_keyframe: u64,
-    /// Packets sent again to the seat for its NACK, and packets it asked for that were gone.
-    pub nack_answered: u64,
-    pub nack_missed: u64,
-    /// Source changes whose keyframe did not arrive in time (the room forwarded without one).
-    pub keyframe_timeouts: u64,
-    /// Audio and video packets not sent to the seat because its reception of that stream is off
-    /// (`forward_set_reception`).
-    pub reception_off_dropped_audio: u64,
-    pub reception_off_dropped_video: u64,
 }
 
 struct Seat {
@@ -393,13 +338,25 @@ pub struct ForwardRoom {
     secure_out: Vec<u8>,
     /// Starting receivers on a keyframe of the video source (`keyframe.rs`).
     keyframes: Keyframes,
+    /// The send-index counters of the keys the room's seats send SRTCP under.
+    ledger: Arc<SrtcpLedger>,
 }
 
 impl ForwardRoom {
-    /// An empty room carrying `codec`.
+    /// An empty room carrying `codec`, with an SRTCP index ledger of its own: nothing outside the
+    /// room shares an index space with it. The engine builds rooms with [`Self::with_ledger`].
     #[must_use]
     pub fn new(room_id: String, codec: RoomCodec) -> Self {
+        Self::with_ledger(room_id, codec, Arc::default())
+    }
+
+    /// An empty room carrying `codec` whose seats draw every SRTCP send index from `ledger`, the
+    /// engine-wide one: a client key seated in two rooms, or in a room and a floor call, then never
+    /// repeats an index (RFC 7714 §8; [`crate::srtcp_ledger`]).
+    #[must_use]
+    pub fn with_ledger(room_id: String, codec: RoomCodec, ledger: Arc<SrtcpLedger>) -> Self {
         Self {
+            ledger,
             room_id,
             codec,
             seats: Vec::new(),
@@ -559,9 +516,11 @@ impl ForwardRoom {
             ),
             cross,
             clock_rate_hz,
-            floor: config.floor.map(FloorStream::new),
+            floor: config
+                .floor
+                .map(|floor| FloorStream::new(floor, &self.ledger)),
             app_events: config.app_events,
-            media_srtcp: FloorProtection::new(&config.media_srtcp),
+            media_srtcp: FloorProtection::new(&config.media_srtcp, &self.ledger),
             floor_channel: None,
             video: config
                 .video

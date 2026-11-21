@@ -497,7 +497,11 @@ fn a_keyed_seat_sends_protected_floor_and_a_rekey_moves_the_sending_key() {
     );
     assert_eq!(sent[0].2[sent[0].2.len() - 4..], 2u32.to_be_bytes());
     let (keys, index) = room.floor_key_state("seat-1").unwrap();
-    assert_eq!((keys.len(), index), (2, 2));
+    assert_eq!(
+        (keys.len(), index),
+        (2, 1),
+        "the newest key is another key: it counts from its own index 0"
+    );
 
     assert_eq!(
         room.set_floor_keys("nobody", &[floor_master_key(1)]),

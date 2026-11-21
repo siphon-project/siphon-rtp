@@ -91,7 +91,8 @@ impl Refusal {
             SrtpError::NoKeys
             | SrtpError::DuplicateMki
             | SrtpError::DuplicateKeyMaterial
-            | SrtpError::IndexExhausted => None,
+            | SrtpError::IndexExhausted
+            | SrtpError::SendLeaseReached => None,
             SrtpError::TooShort | SrtpError::BadVersion => Some(Self::NotSrtp),
             SrtpError::UnknownMki => Some(Self::UnknownMki),
             SrtpError::AuthFailed => Some(Self::NotAuthenticated),

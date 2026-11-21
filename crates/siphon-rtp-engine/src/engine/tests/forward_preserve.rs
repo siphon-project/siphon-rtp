@@ -9,12 +9,12 @@ use siphon_rtp_media::rtp::{write_packet, RtpHeader};
 use siphon_rtp_proto::{FloorKey, ForwardMedia, RtcpAppStream};
 use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
 
-const ROOM: &str = "secure-group";
+pub(super) const ROOM: &str = "secure-group";
 const SHORT: Duration = Duration::from_secs(2);
 const QUIET: Duration = Duration::from_millis(400);
 const KEY_MGMT: &str = "mikey AQAFgM0XflABAAAAAAAAAAAAAAsAyONQ";
 
-fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
+pub(super) fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     tokio::spawn(run_redirect_dispatcher(
         engine.datapath().rx(),
@@ -154,7 +154,7 @@ async fn drain(phone: &UdpSocket, window: Duration) -> Vec<Vec<u8>> {
     heard
 }
 
-async fn expect(phone: &UdpSocket, count: usize) -> Vec<Vec<u8>> {
+pub(super) async fn expect(phone: &UdpSocket, count: usize) -> Vec<Vec<u8>> {
     let mut heard = Vec::new();
     let mut buffer = [0u8; 2048];
     while heard.len() < count {
@@ -660,7 +660,7 @@ async fn a_locally_answered_call_never_echoes_key_mgmt() {
 // sealed again for each receiver under that receiver's own.
 
 /// Seat `index`'s key: MKI `index`, so a wrong key is an unknown MKI.
-fn media_key(index: u32) -> FloorKey {
+pub(super) fn media_key(index: u32) -> FloorKey {
     FloorKey {
         mki: index,
         key: vec![0x30 + index as u8; 16],
@@ -711,7 +711,7 @@ async fn next_app(events: &flume::Receiver<Event>) -> Event {
         .expect("open queue")
 }
 
-async fn keyed_seat(
+pub(super) async fn keyed_seat(
     engine: &Engine<UdpLoopbackDatapath>,
     tag: &str,
     keys: Vec<FloorKey>,

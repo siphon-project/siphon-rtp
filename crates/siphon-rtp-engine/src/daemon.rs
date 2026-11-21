@@ -237,6 +237,14 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = DEFAULT_FORWARD_ROOM_IDLE_SECS)]
     pub forward_room_idle_secs: u64,
 
+    /// Drop an SRTCP send-index ledger entry (one counter per key the engine seals SRTCP under) that
+    /// nothing has held for this many seconds. `0`, the default, never drops one: a key that comes
+    /// back after its counter was dropped restarts at index 0 and repeats AES-GCM nonces (RFC 7714
+    /// §8). Only set it at or above the lifetime the controller enforces on a client key (3GPP TS
+    /// 33.180 §9.4.2).
+    #[arg(long, default_value_t = 0)]
+    pub srtcp_ledger_retention_secs: u64,
+
     /// Bounded grace period (seconds) to drain live calls on SIGTERM/SIGINT before exiting. The
     /// daemon stops accepting new control connections immediately, then waits up to this long for
     /// the live session count to reach 0.
@@ -417,6 +425,8 @@ pub struct RunConfig {
     /// Free a forwarding room in which no seat has received anything for this many seconds; `0`
     /// disables it.
     pub forward_room_idle_secs: u64,
+    /// Drop an unheld SRTCP send-index ledger entry after this many seconds; `0` never drops one.
+    pub srtcp_ledger_retention_secs: u64,
     /// Bounded SIGTERM/SIGINT drain grace period (seconds).
     pub shutdown_grace_secs: u64,
     /// STUN servers asked for a server-reflexive candidate when gathering; empty ⇒ host-only.
@@ -555,6 +565,12 @@ impl RunConfig {
                 explicit("forward_room_idle_secs"),
                 file.forward_room_idle_secs,
                 DEFAULT_FORWARD_ROOM_IDLE_SECS,
+            ),
+            srtcp_ledger_retention_secs: resolve_defaulted(
+                args.srtcp_ledger_retention_secs,
+                explicit("srtcp_ledger_retention_secs"),
+                file.srtcp_ledger_retention_secs,
+                0,
             ),
             shutdown_grace_secs: resolve_defaulted(
                 args.shutdown_grace_secs,
@@ -998,6 +1014,16 @@ where
         .with_prompt_cache_bytes(usize::try_from(config.prompt_cache_bytes).unwrap_or(usize::MAX))
         .with_ws_connect_timeout(config.ws_connect_timeout)
         .with_media_fetch_limits(config.media_fetch.clone());
+    // 0, the default, never drops a key's SRTCP send-index counter (RFC 7714 §8).
+    engine
+        .conference()
+        .srtcp_ledger()
+        .set_retention_secs(config.srtcp_ledger_retention_secs);
+    tracing::info!(
+        target: "siphon_rtp::media",
+        retention_secs = config.srtcp_ledger_retention_secs,
+        "SRTCP send-index ledger (0 retention never drops a key)"
+    );
     if let Some(x3) = config.x3.clone() {
         // Logged at startup so an operator can see, without placing a call, that this node will
         // accept a warrant — and, just as importantly, so its absence is visible on a node that
@@ -1204,6 +1230,7 @@ where
             if expired > 0 {
                 tracing::warn!(target: "siphon_rtp::media", seats = expired, setup_idle_secs = setup_timeout_ticks, "setup timeout — unanswered conference offers expired");
             }
+            let _ = sweeper.sweep_srtcp_ledger();
             if let Some(turn) = &turn_sweeper {
                 turn.reap();
             }
@@ -1236,6 +1263,8 @@ where
                 ws_bridges: gauge_engine.ws_bridge_count() as u64,
                 ws_tee_frames_sent: gauge_engine.ws_tee_frames_sent(),
                 ws_tee_frames_dropped: gauge_engine.ws_tee_frames_dropped(),
+                srtcp_ledger_entries: conference.srtcp_ledger().len() as u64,
+                srtcp_lease_refused: conference.srtcp_ledger().lease_refused(),
             }
         };
         tokio::spawn(metrics::serve_metrics(metrics_listener, metrics, live));
@@ -1861,6 +1890,26 @@ mod tests {
     }
 
     #[test]
+    fn the_srtcp_ledger_never_evicts_by_default_and_retention_is_configurable_both_ways() {
+        let default = resolve_from(&["siphon-rtp"], FileConfig::default());
+        assert_eq!(default.srtcp_ledger_retention_secs, 0, "never evict");
+        let file = FileConfig {
+            srtcp_ledger_retention_secs: Some(86_400),
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            resolve_from(&["siphon-rtp"], file.clone()).srtcp_ledger_retention_secs,
+            86_400
+        );
+        assert_eq!(
+            resolve_from(&["siphon-rtp", "--srtcp-ledger-retention-secs", "0"], file)
+                .srtcp_ledger_retention_secs,
+            0,
+            "an explicit flag beats the file"
+        );
+    }
+
+    #[test]
     fn the_forward_room_ceiling_defaults_to_an_hour_and_is_configurable_both_ways() {
         let default = resolve_from(&["siphon-rtp"], FileConfig::default());
         assert_eq!(
@@ -1974,6 +2023,7 @@ mod tests {
             held_media_timeout_secs: super::DEFAULT_HELD_MEDIA_TIMEOUT_SECS,
             setup_timeout_secs: super::DEFAULT_SETUP_TIMEOUT_SECS,
             forward_room_idle_secs: super::DEFAULT_FORWARD_ROOM_IDLE_SECS,
+            srtcp_ledger_retention_secs: 0,
             shutdown_grace_secs: 25,
             stun_servers: Vec::new(),
             ice_full: false,

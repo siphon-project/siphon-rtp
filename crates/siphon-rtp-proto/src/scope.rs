@@ -158,6 +158,9 @@ impl Command {
             | Command::Drain
             | Command::Undrain
             | Command::Restore { .. }
+            | Command::CheckpointSrtcpIndices
+            | Command::RestoreSrtcpIndices { .. }
+            | Command::ConfirmSrtcpIndices { .. }
             | Command::Authenticate { .. }
             | Command::ConferenceJoin { .. }
             | Command::ConferenceOffer { .. }
@@ -242,6 +245,7 @@ impl Event {
             | Event::ForwardSourceStarted { .. }
             | Event::ForwardKeyframe { .. }
             | Event::ForwardSeatInactive { .. }
+            | Event::SrtcpCheckpointDue { .. }
             | Event::Unknown => None,
         }
     }

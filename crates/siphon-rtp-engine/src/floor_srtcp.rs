@@ -20,6 +20,7 @@
 //! [`master_keys`] and live in `forward::room::media_srtcp`.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use siphon_rtp_datapath::RxPacket;
 use siphon_rtp_proto::{FloorKey, ProfileFlags, FLOOR_SALT_LEN};
@@ -29,6 +30,7 @@ use zeroize::Zeroize;
 
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::{OpaqueLatch, ReplyLatch};
+use crate::srtcp_ledger::SrtcpLedger;
 
 /// Convert the controller's floor keys into master keys: a 12-octet salt is the 96-bit salt of
 /// RFC 7714 §12 (zero-extended to the RFC 3711 §4.3.1 PRF input), a 14-octet one is used as is.
@@ -96,29 +98,42 @@ pub(crate) struct FloorProtection {
     keys: Vec<FloorMasterKey>,
     /// Plaintext of the packet just opened; reused, so no allocation per packet once warm.
     plain: Vec<u8>,
+    /// Where the send index of each key comes from: the engine-wide ledger, so that nothing sending
+    /// under a key ever repeats an index another sender used (RFC 7714 §8).
+    ledger: Arc<SrtcpLedger>,
+    /// The exhaustion of a send index was logged.
+    exhaustion_logged: bool,
+    /// Reaching a send lease was logged.
+    lease_logged: bool,
 }
 
 impl FloorProtection {
     /// A context over `keys`, or `None` for an empty set (an unkeyed stream) or one the SRTP layer
     /// refuses (callers validate with [`master_keys`] first).
-    pub(crate) fn new(keys: &[FloorMasterKey]) -> Option<Self> {
+    pub(crate) fn new(keys: &[FloorMasterKey], ledger: &Arc<SrtcpLedger>) -> Option<Self> {
         if keys.is_empty() {
             return None;
         }
-        let context = SrtcpGcmContext::new(keys).ok()?;
+        let context = SrtcpGcmContext::with_counters(keys, |key| ledger.counter_for(key)).ok()?;
         Some(Self {
             context,
             keys: kept(keys),
             plain: Vec::with_capacity(crate::app_events::MAX_APP_DATAGRAM),
+            ledger: Arc::clone(ledger),
+            exhaustion_logged: false,
+            lease_logged: false,
         })
     }
 
-    /// Replace the key set (keeps the send index and the replay state of an unchanged key).
+    /// Replace the key set (keeps the replay state of an unchanged key; a key's send index is the
+    /// ledger's, so it carries on from wherever that key last sent, here or anywhere).
     ///
     /// # Errors
     /// The SRTP layer's refusal; the held set is then untouched.
     pub(crate) fn replace_keys(&mut self, keys: &[FloorMasterKey]) -> Result<(), SrtpError> {
-        self.context.replace_keys(keys)?;
+        let ledger = &self.ledger;
+        self.context
+            .replace_keys_with(keys, |key| ledger.counter_for(key))?;
         self.keys = kept(keys);
         Ok(())
     }
@@ -162,7 +177,34 @@ impl FloorProtection {
     /// # Errors
     /// The SRTP layer's refusal, such as an exhausted index.
     pub(crate) fn seal(&mut self, rtcp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
-        self.context.protect(rtcp, true, out)
+        let sealed = self.context.protect(rtcp, true, out);
+        match sealed {
+            Err(SrtpError::IndexExhausted) if !self.exhaustion_logged => {
+                // RFC 7714 §9.4: the index never wraps, so nothing more is sent under this key until
+                // the controller replaces it. Said once per protection; every refused packet is an
+                // error to its caller.
+                self.exhaustion_logged = true;
+                tracing::error!(
+                    target: "siphon_rtp::media",
+                    "SRTCP send index exhausted under a key; refusing to send until the controller replaces it"
+                );
+            }
+            Err(SrtpError::SendLeaseReached) => {
+                // The key reached the end of its lease: a standby seeded from the last checkpoint
+                // would be overtaken if it sent further (RFC 7714 §8). Nothing is sent until the
+                // controller takes a checkpoint (`checkpoint_srtcp_indices`), which extends it.
+                self.ledger.note_lease_refused();
+                if !self.lease_logged {
+                    self.lease_logged = true;
+                    tracing::error!(
+                        target: "siphon_rtp::media",
+                        "SRTCP send lease reached under a key; refusing to send until the controller takes a checkpoint of the index ledger"
+                    );
+                }
+            }
+            _ => {}
+        }
+        sealed
     }
 }
 
@@ -268,9 +310,9 @@ mod tests {
     }
 
     #[test]
-    fn protection_keeps_the_newest_two_keys_and_the_send_index_across_a_rekey() {
+    fn protection_keeps_the_newest_two_keys_and_a_new_key_counts_from_its_own_index() {
         let keys = master_keys(&[key(1, 12), key(2, 12), key(3, 12)]).unwrap();
-        let mut protection = FloorProtection::new(&keys).unwrap();
+        let mut protection = FloorProtection::new(&keys, &Arc::default()).unwrap();
         assert_eq!(protection.keys().len(), 2);
         assert_eq!(protection.keys()[1].mki, 3);
         let rtcp = [
@@ -283,7 +325,57 @@ mod tests {
         protection
             .replace_keys(&master_keys(&[key(3, 12), key(4, 12)]).unwrap())
             .unwrap();
-        assert_eq!(protection.send_index(), 2, "the index only moves forward");
-        assert!(FloorProtection::new(&[]).is_none());
+        assert_eq!(
+            protection.send_index(),
+            0,
+            "the newest key is another key: its index space is its own"
+        );
+        assert!(FloorProtection::new(&[], &Arc::default()).is_none());
+    }
+
+    fn report(ssrc: u32) -> [u8; 8] {
+        let mut header = [0x80, 0xC9, 0x00, 0x01, 0, 0, 0, 0];
+        header[4..].copy_from_slice(&ssrc.to_be_bytes());
+        header
+    }
+
+    fn index_of(wire: &[u8]) -> u32 {
+        let at = wire.len() - 8;
+        u32::from_be_bytes([wire[at], wire[at + 1], wire[at + 2], wire[at + 3]]) & 0x7FFF_FFFF
+    }
+
+    #[test]
+    fn protections_of_one_key_share_one_index_space_and_a_new_one_carries_on() {
+        let ledger: Arc<SrtcpLedger> = Arc::default();
+        let keys = master_keys(&[key(1, 12)]).unwrap();
+        let mut first = FloorProtection::new(&keys, &ledger).unwrap();
+        let mut second = FloorProtection::new(&keys, &ledger).unwrap();
+        let mut out = Vec::new();
+        let mut sent = Vec::new();
+        for _ in 0..3 {
+            first.seal(&report(7), &mut out).unwrap();
+            sent.push(index_of(&out));
+            second.seal(&report(7), &mut out).unwrap();
+            sent.push(index_of(&out));
+        }
+        assert_eq!(sent, vec![0, 1, 2, 3, 4, 5]);
+        // The owner goes away and the key comes back: the index goes on, it does not restart.
+        drop((first, second));
+        let mut again = FloorProtection::new(&keys, &ledger).unwrap();
+        again.seal(&report(7), &mut out).unwrap();
+        assert_eq!(index_of(&out), 6);
+    }
+
+    #[test]
+    fn a_resume_raises_the_ledger_and_never_lowers_it() {
+        let ledger: Arc<SrtcpLedger> = Arc::default();
+        let keys = master_keys(&[key(1, 12)]).unwrap();
+        let mut protection = FloorProtection::new(&keys, &ledger).unwrap();
+        protection.resume(500, &[]);
+        let mut other = FloorProtection::new(&keys, &ledger).unwrap();
+        other.resume(10, &[]);
+        let mut out = Vec::new();
+        other.seal(&report(7), &mut out).unwrap();
+        assert_eq!(index_of(&out), 500, "another holder's resume is not undone");
     }
 }

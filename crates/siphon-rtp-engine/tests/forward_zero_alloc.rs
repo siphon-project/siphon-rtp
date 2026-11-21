@@ -12,6 +12,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
@@ -21,6 +22,7 @@ use siphon_rtp_engine::forward::{
 use siphon_rtp_engine::sdp;
 use siphon_rtp_engine::sdp::video::{RoomVideoFormat, VideoFeedback};
 use siphon_rtp_engine::sdp::MediaDirection;
+use siphon_rtp_engine::srtcp_ledger::SrtcpLedger;
 use siphon_rtp_media::rtcp;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader};
 use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
@@ -107,11 +109,21 @@ fn video_of(index: usize) -> VideoConfig {
 }
 
 fn build_room(media: siphon_rtp_proto::ForwardMedia, keyed: bool, video: bool) -> ForwardRoom {
+    build_room_on(media, keyed, video, Arc::default())
+}
+
+fn build_room_on(
+    media: siphon_rtp_proto::ForwardMedia,
+    keyed: bool,
+    video: bool,
+    ledger: Arc<SrtcpLedger>,
+) -> ForwardRoom {
     let offer = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
                  m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n";
     let codecs = sdp::parse(offer).unwrap().audio_codecs();
     let (codec, _) = RoomCodec::from_offer(&codecs).unwrap();
-    let mut room = ForwardRoom::new("zero-alloc".to_string(), codec.with_media(media));
+    let mut room =
+        ForwardRoom::with_ledger("zero-alloc".to_string(), codec.with_media(media), ledger);
     for index in 0..SEATS {
         room.add_seat(
             ForwardSeatConfig {
@@ -965,4 +977,91 @@ fn a_preserving_rooms_nack_serve_from_the_stored_srtp_makes_no_heap_allocation()
         "NACK serve allocated {steady} times across 299 NACKs (must be zero)"
     );
     assert!(room.seat_stats("seat-2").unwrap().nack_answered >= 598);
+}
+
+#[test]
+fn two_rooms_sealing_on_one_ledger_make_no_heap_allocation_and_never_repeat_an_index() {
+    // Both rooms hold seat keys with the same material, so their reseals draw from one counter per
+    // key: one compare-and-swap each, nothing allocated once warm.
+    let ledger: Arc<SrtcpLedger> = Arc::default();
+    let mut rooms = [
+        build_room_on(
+            siphon_rtp_proto::ForwardMedia::Preserve,
+            true,
+            true,
+            ledger.clone(),
+        ),
+        build_room_on(
+            siphon_rtp_proto::ForwardMedia::Preserve,
+            true,
+            true,
+            ledger.clone(),
+        ),
+    ];
+    let mut talker = SrtcpGcmContext::new(&[media_key(0)]).unwrap();
+    let packets: Vec<RxPacket> = (0..200u64)
+        .map(|sequence| sealed_video_report(&mut talker, 0, sequence * 20_000))
+        .collect();
+    for room in &mut rooms {
+        room.set_source(Some("seat-0")).unwrap();
+        room.ingest(&packets[0]);
+        while room.next_datagram(&packets[0]).is_some() {}
+    }
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut sent = 0usize;
+    for (position, packet) in packets[1..].iter().enumerate() {
+        let room = &mut rooms[position % 2];
+        room.ingest(packet);
+        while let Some((_, _, datagram)) = room.next_datagram(packet) {
+            sent += std::hint::black_box(datagram).len();
+        }
+    }
+    let steady = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(sent > 0);
+    assert_eq!(
+        steady, 0,
+        "ledger-backed reseal allocated {steady} times (must be zero)"
+    );
+    // Seat 1 is a receiver of both rooms under media_key(1): the two warm-up reports and the 199
+    // measured ones each took one index of the one counter, none twice.
+    assert_eq!(ledger.counter_for(&media_key(1)).next(), 2 + 199);
+}
+
+#[test]
+fn a_leased_ledger_adds_no_heap_allocation_to_the_seal() {
+    // Once a checkpoint exists every counter has a lease; the check on the seal is an atomic load.
+    let ledger: Arc<SrtcpLedger> = Arc::default();
+    let mut room = build_room_on(
+        siphon_rtp_proto::ForwardMedia::Preserve,
+        true,
+        true,
+        ledger.clone(),
+    );
+    let _ = ledger.checkpoint(1 << 20, Some(1));
+    room.set_source(Some("seat-0")).unwrap();
+    let mut talker = SrtcpGcmContext::new(&[media_key(0)]).unwrap();
+    let packets: Vec<RxPacket> = (0..200u64)
+        .map(|sequence| sealed_video_report(&mut talker, 0, sequence * 20_000))
+        .collect();
+    room.ingest(&packets[0]);
+    while room.next_datagram(&packets[0]).is_some() {}
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut sent = 0usize;
+    for packet in &packets[1..] {
+        room.ingest(packet);
+        while let Some((_, _, datagram)) = room.next_datagram(packet) {
+            sent += std::hint::black_box(datagram).len();
+        }
+    }
+    let steady = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(sent > 0);
+    assert_eq!(
+        steady, 0,
+        "leased reseal allocated {steady} times (must be zero)"
+    );
+    assert_eq!(ledger.lease_refused(), 0);
 }

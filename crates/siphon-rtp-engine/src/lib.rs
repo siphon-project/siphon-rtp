@@ -45,6 +45,7 @@ pub mod sdp;
 mod seat_gate;
 pub mod server;
 pub mod shutdown;
+pub mod srtcp_ledger;
 pub mod srtp_bridge;
 pub mod text_pipeline;
 pub mod turn_client_settings;

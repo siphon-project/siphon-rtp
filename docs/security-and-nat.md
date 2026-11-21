@@ -1250,6 +1250,70 @@ stops short of the translator. Two different things are protected, on two differ
     dropped and counted, and no request is ever sent to an unkeyed source. A deployment that wants the
     hop protected gives every seat `media_srtcp_keys`.
 
+### Layer 5c-iv: The SRTCP send-index ledger (no GCM IV is ever reused)
+`AEAD_AES_128_GCM` SRTCP (3GPP TS 33.180 §9.4.8, RFC 7714) encrypts under the IV `salt XOR (SSRC, index)`
+(§9.1). A repeated (key, SSRC, index) breaks both confidentiality and integrity (§8), and the
+index is a counter the engine owns on every packet it seals: a keyed forward seat's resealed
+talker RTCP (which keeps the talker's SSRC), its video and audio requests, floor control and APP, and
+two-party floor legs.
+
+- **The counter belongs to the key.** A counter per seat, leg or room restarts at 0 whenever its owner does,
+  and the SSRC cannot be relied on to differ: resealed RTCP carries the talker's own, and a controller may
+  name one. So the engine keeps one `SendIndex` per key in an engine-wide ledger
+  (`srtcp_ledger.rs`), keyed by `HMAC(master_key, label || master_salt)`: one-way (it names the key
+  without revealing it), identical on every node (so a checkpoint is recognised by a standby with no secret
+  distributed), and independent of the MKI because the IV is. Every protection sending under a key draws
+  from its counter: a seat that rejoins, a client key in two rooms or in a room and a call, one key under both
+  the floor and the media keys of a seat (TS 33.180 §9.4.2: one key per client), a key unset and set again.
+- **Per packet it is one atomic load and one add**: lock-free, no allocation (the zero-allocation tests cover
+  it), never decreasing, and at index 2^31 - 1 it refuses (`IndexExhausted`, logged at `error`, RFC 7714 §9.4:
+  never wrap) until the controller replaces the key. A new key starts at its own counter (0): its IV space
+  is its own.
+- **Retention: never, by default.** An entry is the key's high-water mark, and a key that comes back after
+  its entry was dropped restarts at index 0 and repeats nonces (RFC 7714 §8); the engine cannot see a
+  controller replace a key. So nothing is dropped unless the operator opts in with
+  `srtcp_ledger_retention_secs` (TOML) / `--srtcp-ledger-retention-secs`, which drops an entry nothing
+  has held for that long. That is only safe at or above the lifetime the controller enforces on a client
+  key (TS 33.180 §9.4.2). A held entry and an exhausted one are never dropped. Memory is one small
+  entry per distinct key material seen; `siphon_rtp_srtcp_ledger_entries` is the gauge.
+- **Failover is fail-closed.** `checkpoint_srtcp_indices` exports every counter (a key that is installed and
+  has sent nothing included) and `restore_srtcp_indices` seeds a standby 65536 past each (the floor
+  checkpoint margin), never lowering. A margin only holds if the primary never sends that far, so once a
+  checkpoint has been taken **each counter has a lease**: the index in the last *confirmed* checkpoint plus
+  the margin. The first checkpoint's lease takes effect at export (a standby holds that blob or nothing, and
+  nothing is the fresh-keys case). A later export extends no lease: only `confirm_srtcp_indices`, which the
+  controller sends after it has durably stored that generation's blob, does, and a confirmation older than
+  the last confirmed one is ignored. Otherwise a reply lost on its way to the controller would let the
+  primary send past what the standby holds: the standby restores g1 (index 0), the primary was extended by
+  an unstored g2 and sent index 65536, the standby sends 65536 again. A standby may restore the last
+  confirmed blob or a newer unconfirmed one: a newer blob's indices are at or above the confirmed one's
+  (counters only move forward), and the primary is capped at the confirmed one plus the margin, so a
+  standby seeded from either starts above anything the primary sent. A key
+  installed after the first checkpoint is leased from index 0 plus the margin (no checkpoint knows it). At
+  half its window a counter raises the `srtcp_checkpoint_due` event, once per crossing, to the client that
+  took the checkpoint (it names only a count); at the lease the seal is refused (`error`, once per
+  protection, counted in `siphon_rtp_srtcp_lease_refused_total`) until the next confirmed checkpoint extends the
+  lease. Before any checkpoint there is no lease and nothing is refused. A standby that imports a ledger
+  leases from the counter it seeded. **Keys the blob does not list** are safe too: the primary leases every
+  key installed after its first checkpoint from creation, capping it at index 0 plus the margin, so a
+  key absent from a blob has sent below the blob's `unlisted_ceiling` (the margin on a primary; what the
+  last standby seeded after a chain of failovers). A standby that restores a blob raises every key it
+  already holds that the blob does not list to that ceiling, and seeds every key installed later at it
+  with a lease a margin above, so such a key never restarts at 0 under an index the primary used. The
+  counter holds the index and the lease in one atomic word and a checkpoint reads the one and sets the
+  other in a single compare-and-swap, so a send that raced a checkpoint cannot be handed the standby's
+  first index; installing a key and taking or restoring a checkpoint are serialised by one ledger-wide
+  `std::sync::Mutex` (control path only, never held across an `.await`, never taken by the per-packet
+  take), so a key installed during a checkpoint is in the blob or leased from its first index. A two-party floor
+  call restored from `checkpoint` also raises the ledger through its resumed send index. A standby that
+  restores no ledger knows nothing of what the primary sent, so the controller must issue **fresh keys**
+  (RFC 7714 §8). Forward rooms are not checkpointed; rejoining seats on a seeded ledger is what is safe.
+- **The MKI is a label, not a context.** Send counters and replay state are keyed by the key material
+  (RFC 3711 §3.2.1: the MKI selects a master key and is not authenticated), so a captured packet re-sent
+  under an alias MKI is a replay, and a key set listing one key under two MKIs is refused.
+- **The receive side is the SSRC's too.** Replay windows are per sender SSRC under each key (RFC 3711 §3.2.3,
+  §3.3.2), in a fixed table of 8 slots claimed only by authenticated packets; a ninth SSRC is refused.
+
 ### Layer 5f — The RFC 4103 Real-Time Text (RTT) relay path
 A VoLTE/IMS call may carry a second media stream: an `m=text` line (RFC 4103, T.140 over RTP, usually
 RFC 2198 RED-wrapped) alongside the audio. The engine parses it (section-aware SDP), anchors it to a

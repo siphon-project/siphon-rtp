@@ -35,8 +35,29 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   phone keeps sending to the freed media port; on an ephemeral port a parallel bind could take it. The
   test now allocates from a reserved window below the ephemeral range.
 
+### Security
+
+- **SRTCP GCM IVs could repeat.** The send index of an `AEAD_AES_128_GCM` SRTCP key (RFC 7714) was
+  per seat, leg or room and restarted at 0 with its owner, while the IV is the salt XOR (SSRC, index)
+  and resealed talker RTCP keeps the talker's SSRC. A seat leaving and rejoining with its key, one client
+  key in two rooms, a floor and a media stream under one key, an unkeyed then rekeyed seat, and a standby
+  rejoining after a failover could each seal two packets under one (key, SSRC, index): present since
+  media SRTCP keys (0.21.0). Every send index now comes from one engine-wide ledger keyed by an HMAC
+  fingerprint of the key material, drawn with one compare-and-swap per packet, never lowered and refused
+  rather than wrapped at 2^31 - 1. A key is never dropped from the ledger unless the operator sets
+  `srtcp_ledger_retention_secs` (only safe at or above the controller's key lifetime). Once a ledger
+  checkpoint has been taken every counter has a lease a margin past it: the engine raises
+  `srtcp_checkpoint_due` at half and refuses to seal at the lease until the next checkpoint, so a standby
+  seeded from a checkpoint cannot be overtaken. Replay state and send counters are keyed by key material,
+  not by MKI (a captured packet under an alias MKI is a replay; one key under two MKIs is refused). After a
+  restart or a failover with no restored ledger, issue fresh keys.
+
 ### Added
 
+- **`checkpoint_srtcp_indices`, `confirm_srtcp_indices` and `restore_srtcp_indices`.** Export the ledger and seed a standby from it
+  (each counter a margin past the checkpoint, never lowering; a lease moves to a later checkpoint only when the controller confirms it stored it), the `srtcp_checkpoint_due` event,
+  the `srtcp_ledger_retention_secs` setting, the `siphon_rtp_srtcp_ledger_entries` gauge and the
+  `siphon_rtp_srtcp_lease_refused_total` counter, and `node_info` lists `srtcp_index_ledger`.
 - **Video in `media: preserve` forwarding rooms.** A preserve room carries a seat's `m=video`
   (`RTP/SAVP[F]` or plain, no engine key, one payload type per room): the source's SRTP is fanned out
   byte for byte, video RTCP is hop by hop under the seat's media key (replay window per sender SSRC, one outgoing

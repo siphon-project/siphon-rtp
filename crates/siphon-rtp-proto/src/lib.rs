@@ -339,6 +339,26 @@ pub enum Command {
     /// answered with [`CmdResult::Ok`]. (Handler lands in the restore slice; the verb is defined here
     /// so the contract is stable.)
     Restore { snapshot: String },
+    /// Export the engine's SRTCP send-index ledger for HA failover: one counter per key (a keyed
+    /// fingerprint of the key material, never the key) holding the next index that key sends, answered
+    /// with [`CmdResult::SrtcpIndices`]. Every key a forwarding room or floor leg sends SRTCP under has
+    /// such a counter, so an index is never repeated under a key whatever seat, room or call uses it
+    /// (RFC 7714 §8). The blob is **opaque**: the controller stores it and hands it to
+    /// [`Command::RestoreSrtcpIndices`] on a standby. Refresh it on the controller's schedule.
+    CheckpointSrtcpIndices,
+    /// Seed this (standby) engine's SRTCP send-index ledger from a blob produced by
+    /// [`Command::CheckpointSrtcpIndices`], before any key is seated. Each counter starts a safety
+    /// margin past its checkpointed index, because the primary kept sending after the checkpoint, and an
+    /// import never lowers a counter. Answered with [`CmdResult::Ok`]. A standby that restores no ledger
+    /// knows nothing of what the primary sent: the controller must then issue fresh keys (RFC 7714 §8).
+    RestoreSrtcpIndices { snapshot: String },
+    /// The controller has durably stored the [`Command::CheckpointSrtcpIndices`] blob of `generation`
+    /// (the opaque `generation` token the blob carries, which only this engine process can have issued): only now does the engine move its send leases to that
+    /// checkpoint's indices plus the margin. The first checkpoint's lease takes effect at export; every
+    /// later one only on this confirmation, so a reply that never reached the controller cannot let the
+    /// primary send past what the standby holds. Send it only after the blob is stored; a generation
+    /// older than the last confirmed one is ignored. Answered with [`CmdResult::Ok`].
+    ConfirmSrtcpIndices { generation: String },
     /// Inject an audio prompt into a leg. Answers immediately (accept-on-start) with a
     /// [`CmdResult::Ok`] carrying a `play_id`; the eventual [`Event::PlayFinished`] carries the same
     /// `play_id` when the prompt ends (drained / stopped / superseded / aborted). A controller that
@@ -2028,6 +2048,9 @@ pub enum CmdResult {
     /// Answer to [`Command::Checkpoint`]: the opaque HA snapshot blob for the call. The engine owns
     /// the format; the proxy stores it verbatim and returns it via [`Command::Restore`].
     Checkpoint { snapshot: String },
+    /// Answer to [`Command::CheckpointSrtcpIndices`]: the opaque ledger blob. The engine owns the
+    /// format; the controller stores it verbatim and returns it via [`Command::RestoreSrtcpIndices`].
+    SrtcpIndices { snapshot: String },
     /// Failure with a human-readable reason.
     Error { reason: String },
 }
@@ -2291,6 +2314,15 @@ pub enum MediaTimeoutReason {
 #[serde(tag = "event", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Event {
+    /// Some SRTCP send-index counters have used half of the lease window opened by the last
+    /// [`Command::CheckpointSrtcpIndices`]: take another checkpoint soon. Raised once per crossing, to
+    /// the client that took the last checkpoint. Names nothing secret, only how many keys are due. A
+    /// counter that reaches its lease refuses to seal until a checkpoint extends it, so a controller
+    /// that relies on [`Command::RestoreSrtcpIndices`] must checkpoint on this event.
+    SrtcpCheckpointDue {
+        /// Keys whose counters are past half of their window.
+        entries: u32,
+    },
     /// A DTMF digit was detected on a leg. Deserializes 1:1 into SIPhon's `DtmfEvent`.
     Dtmf {
         call_id: String,
@@ -5437,6 +5469,58 @@ mod tests {
         .expect("to_value");
         assert_eq!(result["result"], "checkpoint");
         assert_eq!(result["snapshot"], "{\"version\":1}");
+    }
+
+    #[test]
+    fn srtcp_index_ledger_verbs_wire_shape() {
+        let command = serde_json::to_value(&Request {
+            id: 1,
+            command: Command::CheckpointSrtcpIndices,
+        })
+        .expect("to_value");
+        assert_eq!(command["command"], "checkpoint_srtcp_indices");
+        let command = serde_json::to_value(&Request {
+            id: 2,
+            command: Command::RestoreSrtcpIndices {
+                snapshot: "{\"version\":1}".into(),
+            },
+        })
+        .expect("to_value");
+        assert_eq!(command["command"], "restore_srtcp_indices");
+        assert_eq!(command["snapshot"], "{\"version\":1}");
+        let confirm = serde_json::to_value(&Request {
+            id: 5,
+            command: Command::ConfirmSrtcpIndices {
+                generation: "00000000000000ab-3".into(),
+            },
+        })
+        .expect("to_value");
+        assert_eq!(confirm["command"], "confirm_srtcp_indices");
+        assert_eq!(confirm["generation"], "00000000000000ab-3");
+        let parsed: Request =
+            serde_json::from_str(r#"{"id":3,"command":"checkpoint_srtcp_indices"}"#)
+                .expect("parse");
+        assert!(matches!(parsed.command, Command::CheckpointSrtcpIndices));
+        let result = serde_json::to_value(&Response {
+            id: 4,
+            result: CmdResult::SrtcpIndices {
+                snapshot: "{}".into(),
+            },
+        })
+        .expect("to_value");
+        assert_eq!(result["result"], "srtcp_indices");
+        assert_eq!(result["snapshot"], "{}");
+    }
+
+    #[test]
+    fn srtcp_checkpoint_due_event_wire_shape() {
+        let json =
+            serde_json::to_value(Event::SrtcpCheckpointDue { entries: 3 }).expect("to_value");
+        assert_eq!(json["event"], "srtcp_checkpoint_due");
+        assert_eq!(json["entries"], 3);
+        let back: Event =
+            serde_json::from_str(r#"{"event":"srtcp_checkpoint_due","entries":3}"#).expect("parse");
+        assert_eq!(back, Event::SrtcpCheckpointDue { entries: 3 });
     }
 
     #[test]

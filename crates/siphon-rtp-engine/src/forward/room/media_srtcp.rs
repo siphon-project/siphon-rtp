@@ -176,7 +176,7 @@ impl ForwardRoom {
         }
         match slot.as_mut() {
             Some(protection) => protection.replace_keys(keys),
-            None => FloorProtection::new(keys)
+            None => FloorProtection::new(keys, &self.ledger)
                 .map(|protection| *slot = Some(protection))
                 .ok_or(siphon_rtp_srtp::SrtpError::NoKeys),
         }
