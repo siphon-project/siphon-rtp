@@ -783,6 +783,7 @@ impl ConferenceRegistry {
             qos_codec: (config.mos_codec, config.decoder.rtp_clock_rate_hz().max(1)),
             call_id: config.call.as_ref().map(|call| call.call_id.clone()),
             events: events.clone(),
+            owner: None,
         };
         let mailbox = {
             let mut handle = self

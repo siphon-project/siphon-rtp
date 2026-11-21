@@ -126,7 +126,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         // Re-keying a connection that already owns calls would strand them under an identity
         // nothing can present — the exact failure this mechanism exists to prevent.
-        if self.client_call_count(proposed) > 0 {
+        if self.client_call_count(proposed) > 0 || self.client_owns_joined_seat(proposed) {
             return Err(ControllerAttachError::CallsAlreadyOwned);
         }
 
@@ -194,10 +194,38 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.reap_detached_controller(client);
     }
 
+    /// Whether `client` still owns a conference seat that joined its room, or an interception on one.
+    /// A joined seat is not a call, so the call count does not see it, but its events (`media_timeout`,
+    /// `x3_loss`, `x3_ended`) and the verbs that act on it (`detach_x3`) belong to the same controller
+    /// identity as a call's do: reaping the identity while one is live would strand them under a
+    /// `ClientId` nothing can present again.
+    fn client_owns_joined_seat(&self, client: ClientId) -> bool {
+        self.conference.owns_joined_seat(client.0)
+            || self
+                .x3_seat_sessions
+                .iter()
+                .any(|entry| entry.value().iter().any(|session| session.owner == client))
+    }
+
+    /// [`Self::reap_detached_controller`] for every identity with no connection: the seats and
+    /// interceptions that held one can end without any control connection to notice (an idle reap, a
+    /// failed ICE check), and nothing else would release the identity afterwards.
+    pub(super) fn reap_detached_controllers(&self) {
+        let detached: Vec<ClientId> = self
+            .controllers
+            .iter()
+            .filter(|row| row.attached.is_none())
+            .map(|row| row.client)
+            .collect();
+        for client in detached {
+            self.reap_detached_controller(client);
+        }
+    }
+
     /// Drop a controller identity once nothing depends on it: no connection attached, and no calls
-    /// left under its `ClientId`.
+    /// or joined seats left under its `ClientId`.
     pub(super) fn reap_detached_controller(&self, client: ClientId) {
-        if self.client_call_count(client) > 0 {
+        if self.client_call_count(client) > 0 || self.client_owns_joined_seat(client) {
             return;
         }
         let key = match self.controller_ids.get(&client) {

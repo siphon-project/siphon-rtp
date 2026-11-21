@@ -68,6 +68,7 @@ mod forward_room;
 mod forward_stream_identity;
 mod forward_video;
 mod forward_video_webrtc;
+mod joined_seat_owner;
 mod multi_source_recording;
 mod multi_source_tee;
 mod offer_far;

@@ -193,8 +193,12 @@ packet was sent, read per packet because a seat's reply address can latch after 
 `attach_x3` and `detach_x3` are accepted on a call whose leg is **seated** (not on one that has left
 its room: it relays nothing until it is seated again). A seat that **joined** a room with
 `conference_join` has no call, so it is intercepted by naming the room as `call_id` and the seat's
-tag as `from_tag`; only the control client that seated it can attach to it. Its `x3_started`,
-`x3_loss` and `x3_ended` events carry the room id and the tag. It ends with `call_ended` when the seat
+tag as `from_tag`; only the control client that seated it can attach to it. That ownership is the
+client's identity, not its connection: a controller that presents a `controller_id` and reconnects
+resolves to the same client, so it can still `detach_x3` its seat and receives the seat's `x3_loss`
+and `x3_ended` on the new connection. The identity is kept while it owns a joined seat (even one
+that is only intercepted, with no call under it) and released once the last one is gone. Its
+`x3_started`, `x3_loss` and `x3_ended` events carry the room id and the tag. It ends with `call_ended` when the seat
 leaves (a `conference_leave`, an idle reap or a failed ICE check) and so when its room stops, and
 with `detached` on `detach_x3`.
 

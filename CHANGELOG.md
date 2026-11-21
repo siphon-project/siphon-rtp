@@ -23,6 +23,14 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   spawns, the new actor is built tapped (`pretap_relay`) and the old actor keeps its taps until it stops
   (ETSI TS 103 221-2 §5.2). Tests drive the first packet into the registry before any carry can run.
 
+- **A joined conference seat's interception stays owned across a controller reconnect.** A controller
+  holding only seats that joined with `conference_join` had its identity reaped on disconnect, because
+  a joined seat did not count as an owned call: on reconnect it resolved to a new client, so
+  `detach_x3` on the seat was refused and the seat's `x3_loss` and `x3_ended` went to a channel nothing
+  drained. The identity is now kept while it owns a joined seat or an interception on one and released
+  when the last is gone, and the seat's owner is recorded as a client id rather than compared by event
+  channel.
+
 ## [0.26.1] — 2026-11-21
 
 ### Fixed
@@ -222,6 +230,7 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   peer's text kept going to its signalled address.
 - **A re-offer from a moved caller re-gates its text stream.** The caller's audio address followed the
   re-offer but its text address did not, so the relay kept gating and aiming text at the old one.
+
 
 - **Lawful-interception X3 delivery no longer ends at the first re-offer.** The taps lived in the
   media pipeline, so the answer to a hold, resume or session refresh dropped them and the delivery
@@ -2780,6 +2789,7 @@ cancels exactly as before, one lock later.
   loud enough to judge instead of unconditionally. `ws_bridge_tick_8k_20ms/aec_on` 5.03 → 4.58 µs
   against 4.44 µs with the verdict removed entirely.
 
+
 ## [0.4.6] — 2026-09-05
 
 Two defects on the WebSocket-takeover downlink, both silent in every place an operator would look: the
@@ -3013,6 +3023,7 @@ and the SDP presented to either party are unchanged.
   WebRTC peer had its media dropped outright rather than merely misaimed. Found while fixing the
   above; the two now share one effective address.
 
+
 ## [0.4.1] — 2026-09-03
 
 Cut immediately, because the defect below does not present as a refused command: the call answers,
@@ -3058,6 +3069,7 @@ configuration that depended on the old behaviour is `codec-mask-X` / `codec-cons
   `cannot decode the ingress codec G729/8000 (payload type 18)`, and the codecs that are planned but
   not built — G.729, G.723.1, EVS — say so by name and repeat that passthrough is unaffected, the
   way the AMR message already did.
+
 
 ## [0.4.0] — 2026-09-01
 

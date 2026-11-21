@@ -102,7 +102,12 @@ Derive the id from something that outlives both the connection and the process (
 name) and never mix in a boot epoch or a PID, which defeats the point. Rules:
 
 - Claimed once per connection: re-presenting the same id is a no-op, a different one is
-  refused. It cannot be claimed by a connection that has already created calls.
+  refused. It cannot be claimed by a connection that has already created calls or joined a
+  conference seat.
+- The engine keeps an identity that has no connection for as long as it owns a call or a seat
+  that joined a conference room (`conference_join`), so a reconnect can still `detach_x3` the
+  seat and receives its events. It drops the identity once no connection is attached and none of
+  those is left.
 - At most 128 bytes and not empty.
 - It is an identity claim, not a credential. Where a secret is configured the engine honours
   it only on a connection that presented the matching token; where none is configured any
