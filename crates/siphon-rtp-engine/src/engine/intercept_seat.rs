@@ -26,12 +26,13 @@ use super::{error_result, ok_empty, unknown_call, ClientId, Engine};
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Whether `client` is the control client whose join seated `tag` in `conference_id`. A seat is
     /// invisible to any other client, as a call is (docs/security-and-nat.md §5).
-    fn owns_joined_seat(&self, client: ClientId, conference_id: &str, tag: &str) -> bool {
-        let Some(Some(seated_by)) = self.conference.seat_owner_sink(conference_id, tag) else {
-            return false;
-        };
-        self.event_sink(client)
-            .is_some_and(|sink| sink.same_channel(&seated_by))
+    pub(super) fn owns_joined_seat(
+        &self,
+        client: ClientId,
+        conference_id: &str,
+        tag: &str,
+    ) -> bool {
+        self.conference.joined_seat_owner(conference_id, tag) == Some(client.0)
     }
 
     /// `attach_x3` on a joined seat: it has no call behind it, so the seat is the target, what it sent
@@ -296,5 +297,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.stop_x3_seat(&conference_id, &tag, X3EndReason::CallEnded)
                 .await;
         }
+        // A seat that left the room on its own was the last thing holding its owner's controller
+        // identity, when that owner has no connection.
+        self.reap_detached_controllers();
     }
 }

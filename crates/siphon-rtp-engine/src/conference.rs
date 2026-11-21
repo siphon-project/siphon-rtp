@@ -2413,6 +2413,10 @@ struct ConferenceMember {
     /// Where a timeout of this seat is reported when the reap frees it: the sink of the client whose
     /// join seated it.
     events: Option<flume::Sender<Event>>,
+    /// The control client whose join seated it (its `ClientId`), set once the room has taken the seat
+    /// ([`ConferenceRegistry::set_joined_seat_owner`]). A seat's owner is an identity, not a channel:
+    /// the channel is replaced when the client's controller identity is reaped and minted again.
+    owner: Option<u64>,
 }
 
 /// A handle to a running conference actor.

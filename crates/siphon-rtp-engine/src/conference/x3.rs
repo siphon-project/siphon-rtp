@@ -25,7 +25,6 @@
 //! the target's side. Each delivery says which, from its own warrant ([`SeatX3Source`]).
 
 use siphon_rtp_datapath::EndpointId;
-use siphon_rtp_proto::Event;
 
 use super::{Conference, ConferenceRegistry};
 use crate::x3::{X3TapFactory, X3Taps};
@@ -124,17 +123,38 @@ impl ConferenceRegistry {
         member.call_id.is_none().then_some(member.endpoint)
     }
 
-    /// The event sink of the client whose join seated `tag`, which is the seat's owner: `None` for
-    /// no such seat, `Some(None)` for a seat seated by a client with no sink.
+    /// The control client (its `ClientId`) whose join seated `tag` in `conference_id`, when that seat
+    /// **joined** the room: `None` for no such seat, for a live call's leg (`conference_seat`, whose
+    /// owner is its call's) and for a seat no owner was recorded on.
     #[must_use]
-    pub fn seat_owner_sink(
-        &self,
-        conference_id: &str,
-        tag: &str,
-    ) -> Option<Option<flume::Sender<Event>>> {
+    pub fn joined_seat_owner(&self, conference_id: &str, tag: &str) -> Option<u64> {
         let room = self.rooms.get(conference_id)?;
         let member = room.members.iter().find(|member| member.tag == tag)?;
-        Some(member.events.clone())
+        member.call_id.is_none().then_some(member.owner).flatten()
+    }
+
+    /// Record `owner` as the control client whose join seated `tag`. Returns whether the seat exists.
+    pub fn set_joined_seat_owner(&self, conference_id: &str, tag: &str, owner: u64) -> bool {
+        let Some(mut room) = self.rooms.get_mut(conference_id) else {
+            return false;
+        };
+        let Some(member) = room.members.iter_mut().find(|member| member.tag == tag) else {
+            return false;
+        };
+        member.owner = Some(owner);
+        true
+    }
+
+    /// Whether any seat that joined a room was seated by `owner`: what keeps a controller identity
+    /// alive while it has no connection, since the seat's events and its interception's events still
+    /// have to reach it when it comes back.
+    #[must_use]
+    pub fn owns_joined_seat(&self, owner: u64) -> bool {
+        self.rooms.iter().any(|room| {
+            room.members
+                .iter()
+                .any(|member| member.call_id.is_none() && member.owner == Some(owner))
+        })
     }
 }
 

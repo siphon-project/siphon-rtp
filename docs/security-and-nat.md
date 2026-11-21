@@ -1847,9 +1847,9 @@ Distinct from the media latch but part of the same security surface.
   honoured only on a connection that presented the matching token; where none is configured any
   client can claim any id, which is the posture the whole control plane already has without a
   secret (see *Channel security* below for what closes that). It is claimed once per connection,
-  never over live calls, and is bounded in length — the engine retains a row per identity for as
-  long as that identity owns calls, and drops it as soon as no connection is attached and no call is
-  left under it. **Remaining:** one live connection per identity — a second closes the first, newest
+  never over live calls or joined conference seats, and is bounded in length — the engine retains a
+  row per identity for as long as that identity owns calls or seats that joined a room, and drops it
+  as soon as no connection is attached and none is left under it. **Remaining:** one live connection per identity — a second closes the first, newest
   wins, logged at `warn`. A genuine controller *pool* sharing one identity needs the event sink to
   become a set.
 - **Channel security.** **Landed:** optional shared-secret authentication — when

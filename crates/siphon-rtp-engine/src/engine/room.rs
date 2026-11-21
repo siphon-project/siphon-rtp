@@ -448,6 +448,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             held,
             egress_ssrc,
         } = request;
+        let seat_tag = tag.clone();
         let config = ParticipantConfig {
             tag,
             decoder: codec.decoder,
@@ -494,6 +495,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.free(&to_free).await;
             return Err(refusal);
         }
+        // The seat belongs to the client whose join it is, by identity: a controller that reconnects
+        // resolves to the same `ClientId`, so it still owns the seat and its interception.
+        self.conference
+            .set_joined_seat_owner(conference_id, &seat_tag, client.0);
         // Seated: aim the room's egress at whatever ICE validates for this seat, for as long as it is
         // seated. A no-op on a seat without ICE.
         self.follow_seat_ice(endpoint.id);
@@ -588,6 +593,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             siphon_rtp_proto::X3EndReason::CallEnded,
         )
         .await;
+        self.reap_detached_controllers();
         ok_empty()
     }
 
