@@ -3,7 +3,7 @@
 //! packet only decrypts when the engine's bridge keyed the leg the way the SDP said.
 
 use super::call_video::{
-    anchor, phone_pair, received, receiver_report, video_packet, CAMERA_PAYLOAD,
+    anchor, phone_with_rtcp, received, receiver_report, video_packet, CAMERA_PAYLOAD,
 };
 use super::*;
 use crate::srtp_bridge::run_redirect_dispatcher;
@@ -95,25 +95,26 @@ fn spawn_dispatcher(engine: &Engine<UdpLoopbackDatapath>) {
     ));
 }
 
+/// A video phone: its RTP socket, and the RTCP one on the next port unless the stream is muxed.
+async fn video_phone(mux: bool) -> (UdpSocket, SocketAddr, Option<UdpSocket>) {
+    if mux {
+        let (rtp, addr) = phone().await;
+        (rtp, addr, None)
+    } else {
+        let (rtp, addr, rtcp) = phone_with_rtcp().await;
+        (rtp, addr, Some(rtcp))
+    }
+}
+
 /// Set a call up: A offers video (SDES when `near_secure`), the far leg is offered SDES when
 /// `far_secure` (the profile's far transport, as for audio), B answers in kind.
 async fn secure_call(call_id: &str, near_secure: bool, far_secure: bool, mux: bool) -> SecureCall {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     spawn_dispatcher(&engine);
     let (a_audio, a_audio_addr) = phone().await;
-    let (a_video, a_video_addr) = phone().await;
-    let a_rtcp = if mux {
-        None
-    } else {
-        Some(phone_pair(&a_video_addr).await.0)
-    };
+    let (a_video, a_video_addr, a_rtcp) = video_phone(mux).await;
     let (b_audio, b_audio_addr) = phone().await;
-    let (b_video, b_video_addr) = phone().await;
-    let b_rtcp = if mux {
-        None
-    } else {
-        Some(phone_pair(&b_video_addr).await.0)
-    };
+    let (b_video, b_video_addr, b_rtcp) = video_phone(mux).await;
     let _ = (&a_audio, &b_audio);
     let a_audio_key = near_secure.then(|| key(1));
     let a_video_key = near_secure.then(|| key(2));

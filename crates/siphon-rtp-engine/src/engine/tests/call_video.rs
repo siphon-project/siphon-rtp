@@ -53,11 +53,9 @@ struct VideoCall {
 async fn answered_door_call(call_id: &str, profile: ProfileFlags) -> VideoCall {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (camera_audio, camera_audio_addr) = phone().await;
-    let (camera_rtp, camera_rtp_addr) = phone().await;
-    let (camera_rtcp, _) = phone_pair(&camera_rtp_addr).await;
+    let (camera_rtp, camera_rtp_addr, camera_rtcp) = phone_with_rtcp().await;
     let (desk_audio, desk_audio_addr) = phone().await;
-    let (desk_rtp, desk_rtp_addr) = phone().await;
-    let (desk_rtcp, _) = phone_pair(&desk_rtp_addr).await;
+    let (desk_rtp, desk_rtp_addr, desk_rtcp) = phone_with_rtcp().await;
     let _ = (&camera_audio, &desk_audio);
     let offered = engine
         .handle(
@@ -101,20 +99,25 @@ async fn answered_door_call(call_id: &str, profile: ProfileFlags) -> VideoCall {
     }
 }
 
-/// A socket on the port after `rtp`'s, the RTCP port of a non-muxed stream (RFC 3550 §11).
-pub(super) async fn phone_pair(rtp: &SocketAddr) -> (UdpSocket, SocketAddr) {
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, rtp.port() + 1))
-        .await
-        .or_else(|_| futures_free_bind())
-        .expect("bind rtcp");
-    let addr = socket.local_addr().expect("addr");
-    (socket, addr)
-}
-
-fn futures_free_bind() -> std::io::Result<UdpSocket> {
-    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-    socket.set_nonblocking(true)?;
-    UdpSocket::from_std(socket)
+/// A video phone's RTP socket and the one on the port after it, the RTCP port of a non-muxed stream
+/// (RFC 3550 §11), which is where the engine sends the party's RTCP (its SDP names no other).
+///
+/// The adjacent port belongs to whichever of the suite's parallel tests asked the kernel for an
+/// ephemeral port first, so it is sometimes taken. The pair is then drawn again, never answered with
+/// a socket elsewhere: an RTCP socket off the next port reads nothing the engine sends to the SDP's
+/// address, and the engine's RTCP lands on the other test's socket, which then reads a packet it
+/// never expected.
+pub(super) async fn phone_with_rtcp() -> (UdpSocket, SocketAddr, UdpSocket) {
+    for _ in 0..1000 {
+        let (rtp, rtp_addr) = phone().await;
+        let Some(next) = rtp_addr.port().checked_add(1) else {
+            continue;
+        };
+        if let Ok(rtcp) = UdpSocket::bind((Ipv4Addr::LOCALHOST, next)).await {
+            return (rtp, rtp_addr, rtcp);
+        }
+    }
+    panic!("no free RTP and RTCP port pair on the loopback interface");
 }
 
 pub(super) async fn received(socket: &UdpSocket) -> Option<Vec<u8>> {
