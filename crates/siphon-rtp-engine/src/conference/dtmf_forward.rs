@@ -151,7 +151,7 @@ impl Conference {
             };
             // ETSI TS 103 221-2 X3: a forwarded event is media the intercepted seat is sent too.
             if let Some(x3) = target.call_seat.x3.as_deref() {
-                x3.to_target
+                x3.to_seat
                     .deliver_egress(target.egress_dst, &self.rtp[..length]);
             }
             self.forwarded.push(Outbound {

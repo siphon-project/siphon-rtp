@@ -5,6 +5,18 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **X3 directions on a seated call follow the warrant's target.** A call whose callee was moved into a
+  conference room with `conference_seat` (a REFER with Replaces adopting the far party) delivered the
+  callee's voice as `from_target` and the room's stream toward it as `to_target`, both inverted: the
+  room took the seated party as the target whatever `target_leg` said. The engine now records which
+  party of the call was seated (kept across `conference_leave` and a later seat) and gives each
+  delivery the directions its own `target_leg` fixes (TS 103 221-2 §5.2.6). A seat joined with
+  `conference_join` is still the target.
+
 ## [0.26.0] — 2026-11-20
 
 ### Added

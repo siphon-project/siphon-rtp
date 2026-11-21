@@ -54,6 +54,10 @@ pub(super) struct CallSeat {
     pub(super) remote: SocketAddr,
     /// Whether the leg's endpoint carries a DTLS association, which the bridge keeps across the move.
     pub(super) dtls: bool,
+    /// Whether the seated leg is the call's caller. Seating rewrites the call around the seated leg
+    /// (it becomes the near leg, its tag the call's tag), so this is the one record of which party it
+    /// was, and an interception's directions in the room depend on it (TS 103 221-2 §5.2.6).
+    pub(super) party_is_caller: bool,
     /// The activity tick a `media_timeout` was last raised at: a seated leg that stays silent is
     /// reported once per silence, not on every sweep, and fresh media re-arms the report.
     pub(super) timeout_reported_at: Option<u64>,
@@ -226,7 +230,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // seat while it is still pending — it ingests and sends nothing until it opens — so the
         // first packet the room handles is the first one delivered, and a room that cannot take
         // them refuses the move here, with the call still relaying and still intercepted as it was.
-        if let Err(reason) = self.seat_x3_in_room(call_id, conference_id, from_tag).await {
+        // A leg seated again after `conference_leave` is the party its first seat recorded; on an
+        // answered call the near leg is the caller.
+        let party_is_caller = plan
+            .reseat
+            .as_ref()
+            .map_or(plan.party == Party::Near, |seat| seat.party_is_caller);
+        if let Err(reason) = self
+            .seat_x3_in_room(call_id, conference_id, from_tag, party_is_caller)
+            .await
+        {
             self.conference
                 .release_call_seat(conference_id, from_tag)
                 .await;
@@ -338,6 +351,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             accepted_source: taken.accepted_source,
             remote,
             dtls: plan.dtls,
+            party_is_caller,
             timeout_reported_at: None,
         };
         let recorded = self.calls.get_mut(call_id).map(|mut call| {
@@ -366,19 +380,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         call_id: &str,
         conference_id: &str,
         tag: &str,
+        party_is_caller: bool,
     ) -> Result<(), String> {
         // Under the sessions lock, so an attach or a detach cannot change the set between reading it
         // and installing it on the seat.
         let _changing = self.x3_sessions.lock.lock().await;
-        let factories: Vec<_> = self
-            .x3_tap_sources(call_id)
-            .into_iter()
-            .map(|source| source.factory)
-            .collect();
-        if factories.is_empty() {
+        let sources =
+            super::intercept::seat_sources_of(&self.x3_tap_sources(call_id), party_is_caller);
+        if sources.is_empty() {
             return Ok(());
         }
-        self.install_room_x3(conference_id, tag, &factories).await
+        self.install_room_x3(conference_id, tag, &sources).await
     }
 
     /// Take the call's own taps off the media path it is leaving (a crypto bridge's, or the media
@@ -1020,6 +1032,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// The room a call's leg is seated in, if it is.
+    /// As [`Self::seated_room`], with whether the seated leg is the call's caller.
+    pub(super) fn seated_party(&self, call_id: &str) -> Option<(String, String, bool)> {
+        self.calls.get(call_id).and_then(|call| {
+            call.seat.as_ref().filter(|seat| seat.seated).map(|seat| {
+                (
+                    seat.conference_id.clone(),
+                    seat.tag.clone(),
+                    seat.party_is_caller,
+                )
+            })
+        })
+    }
+
     pub(super) fn seated_room(&self, call_id: &str) -> Option<(String, String)> {
         self.calls.get(call_id).and_then(|call| {
             call.seat

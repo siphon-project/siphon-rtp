@@ -6,6 +6,7 @@ use siphon_rtp_proto::{CmdResult, Event, X3EndReason, X3TargetLeg, Xid};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crate::conference::SeatX3Source;
 use crate::media_pipeline::MediaControl;
 use crate::x3::{
     build_tls_client_config, ingress_directions, run_x3_delivery, split_delivery_address,
@@ -42,7 +43,7 @@ pub(super) struct X3Session {
     /// or room the call is rebuilt with, and the taps are simply installed again on the new one.
     pub(super) factory: X3TapFactory,
     /// Whether the warrant names the caller leg, which fixes each tap's target-relative direction.
-    /// A conference room ignores it: there the target is always the seated party.
+    /// In a conference room it is compared with the seated party ([`super::seat_call::CallSeat`]).
     pub(super) target_is_caller: bool,
     /// Delivered/dropped counts, read at teardown for [`Event::X3Ended`]. Shared with the taps.
     pub(super) counters: Arc<X3Counters>,
@@ -284,8 +285,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .to_string(),
             );
         }
-        // A call whose leg is seated in a conference room is intercepted in the room, where the
-        // seated party is the target. Once the leg has left the room the call relays nothing, so
+        // A call whose leg is seated in a conference room is intercepted in the room, the seat being
+        // the target's leg or its peer as `target_leg` says. Once the leg has left the room the call relays nothing, so
         // there is no media to intercept until it is seated again.
         let in_room = pipeline == PipelineKind::Seated;
         if in_room && !seated {
@@ -551,18 +552,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (taps_a, taps_b) = tap_pairs(sources, a_local, b_local);
 
         match pipeline {
-            // A leg seated in a conference room is tapped by the room that owns its media: the seated
-            // party is the target there, so the warrant's `target_leg` has no say in a room.
+            // A leg seated in a conference room is tapped by the room that owns its media. The seat
+            // is the target's own leg or its peer, as each warrant's `target_leg` and the seated
+            // party say (§5.2.6 is target-relative).
             PipelineKind::Seated => {
-                let Some((conference_id, tag)) = self.seated_room(call_id) else {
+                let Some((conference_id, tag, seat_is_caller)) = self.seated_party(call_id) else {
                     return Err(
                         "the call's leg left its conference room and relays nothing; seat it \
                          again (conference_seat) to intercept it"
                             .to_string(),
                     );
                 };
-                let factories = factories_of(sources);
-                self.install_room_x3(&conference_id, &tag, &factories)
+                let seat_sources = seat_sources_of(sources, seat_is_caller);
+                self.install_room_x3(&conference_id, &tag, &seat_sources)
                     .await?;
                 Ok(Vec::new())
             }
@@ -900,14 +902,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         conference_id: &str,
         tag: &str,
-        factories: &[X3TapFactory],
+        sources: &[SeatX3Source],
     ) -> Result<(), String> {
         let installed = self
             .conference
             .ask(conference_id, |reply| {
                 crate::conference::SeatControl::SetX3 {
                     tag: tag.to_string(),
-                    factories: factories.to_vec(),
+                    sources: sources.to_vec(),
                     reply,
                 }
             })
@@ -1024,10 +1026,15 @@ pub(super) fn tap_pairs(
 }
 
 /// The factories of a set of sessions' tap sources.
-pub(super) fn factories_of(sources: &[X3TapSource]) -> Vec<X3TapFactory> {
+/// The deliveries of a call whose leg is seated, for the room: the seat is each warrant's target when
+/// the seated party is the leg its `target_leg` names, and the target's peer otherwise.
+pub(super) fn seat_sources_of(sources: &[X3TapSource], seat_is_caller: bool) -> Vec<SeatX3Source> {
     sources
         .iter()
-        .map(|source| source.factory.clone())
+        .map(|source| SeatX3Source {
+            factory: source.factory.clone(),
+            seat_is_target: source.target_is_caller == seat_is_caller,
+        })
         .collect()
 }
 

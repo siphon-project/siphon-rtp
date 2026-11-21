@@ -171,15 +171,21 @@ room's own taps are put on the seat while it is still pending, before the leg mo
 room handles goes undelivered. If the room cannot take them, `conference_seat` is refused and the call
 is left exactly as it was, still relaying and still intercepted.
 
-In a room the target is always **the seated party**, whichever leg the warrant named at attach time:
+Directions stay relative to the warrant's **target** (TS 103 221-2 §5.2.6), not to the seat. The
+engine records which party of the call was seated (the caller or the callee, kept across
+`conference_leave` and a later seat), and compares it with each delivery's `target_leg`:
 
-| Room tap | Meaning | Direction |
+| Room tap | Seat is the target's leg | Seat is the target's peer |
 |---|---|---|
-| The seat's ingress, after the source gate and the SRTP unprotect | what the target sent | 3 (from target) |
-| What the room sends the seat, in the clear, built and protected successfully | the room's mixed-minus-self stream for the target | 2 (to target) |
+| The seat's ingress, after the source gate and the SRTP unprotect | 3 (from target): what the target sent | 2 (to target): the peer's voice toward the target |
+| What the room sends the seat, in the clear, built and protected successfully | 2 (to target): the room's mixed-minus-self stream for the target | 3 (from target): the room's stream toward the peer, which carries the target's side |
 
-Direction 2 is the stream the target actually receives: the room's own SSRC, sequence and timestamp
-for that seat, including a telephone-event the room forwards to it, and nothing when the room sends
+The peer case is the far party of the target's call adopted into a room (a REFER with Replaces into
+a conference factory): the call stays intercepted, and the warrant's `target_leg` still names the
+target. A seat that joined with `conference_join` has no call, so it is always the target.
+
+The room's stream toward the seat is exactly what the seat receives: the room's own SSRC, sequence
+and timestamp for that seat, including a telephone-event the room forwards to it, and nothing when the room sends
 the seat nothing (a pending, blocked or discontinuous-transmission frame). It is never another seat's
 raw stream. Its PDU source is the engine address the seat talks to and its destination is where the
 packet was sent, read per packet because a seat's reply address can latch after the attach.

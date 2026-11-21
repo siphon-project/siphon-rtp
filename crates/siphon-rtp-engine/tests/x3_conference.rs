@@ -74,6 +74,10 @@ impl Call {
     fn target_tag(&self) -> String {
         format!("{}-target", self.id)
     }
+
+    fn callee_tag(&self) -> String {
+        format!("{}-callee", self.id)
+    }
 }
 
 /// A seat that joined a room.
@@ -424,6 +428,211 @@ async fn a_target_seated_in_a_room_keeps_one_delivery_in_both_directions() {
             .all(|event| !matches!(event, Event::X3Ended { .. } | Event::X3Loss { .. })),
         "the interception goes on across the merge: {events:?}"
     );
+}
+
+/// The seated party and the room's two other parties talk for `frames` 20 ms frames. Returns what
+/// the seated party heard (the room's stream for its seat).
+async fn seated_party_talks(
+    seated: &Phone,
+    toward_engine: SocketAddr,
+    seated_ssrc: u32,
+    third: &Joined,
+    fourth: &Joined,
+    frames: u16,
+) -> Vec<Vec<u8>> {
+    let mut heard = Vec::new();
+    for sequence in 1000..1000 + frames {
+        seated
+            .send(&rtp_from(seated_ssrc, sequence), toward_engine)
+            .await;
+        third
+            .phone
+            .send(&rtp_from(THIRD_SSRC, sequence), third.toward_engine)
+            .await;
+        fourth
+            .phone
+            .send(&rtp_from(FOURTH_SSRC, sequence), fourth.toward_engine)
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        heard.extend(seated.drain_rtp().await);
+    }
+    heard
+}
+
+/// Read until the seat's own stream and the room's stream toward it are both delivered, then check
+/// every PDU since `from` against the warrant's target: the seat's ingress is `from_target` only when
+/// the seat is the target's leg, and the room's stream toward the seat is then `to_target`; when the
+/// seat is the target's peer the two swap (ETSI TS 103 221-2 §5.2.6 is target-relative).
+async fn assert_seat_directions(
+    mdf: &mut Mdf,
+    from: usize,
+    seated_ssrc: u32,
+    heard: &[Vec<u8>],
+    seat_is_target: bool,
+) {
+    assert!(!heard.is_empty(), "the seated party hears the room");
+    // Every room stream the party heard: after a move, the old room's last packets toward it are
+    // still being delivered when the new room's begin.
+    let room_ssrcs: HashSet<u32> = heard.iter().map(|packet| ssrc_of(packet)).collect();
+    mdf.read_until(|read| {
+        read.iter()
+            .filter(|(_, payload)| ssrc_of(payload) == seated_ssrc)
+            .count()
+            >= 20
+            && read
+                .iter()
+                .filter(|(_, payload)| room_ssrcs.contains(&ssrc_of(payload)))
+                .count()
+                >= 10
+    })
+    .await;
+    let (seat_direction, room_direction) = if seat_is_target {
+        (from_target(), to_target())
+    } else {
+        (to_target(), from_target())
+    };
+    for (direction, payload) in &mdf.seen[from..] {
+        let ssrc = ssrc_of(payload);
+        if ssrc == seated_ssrc {
+            assert_eq!(
+                *direction, seat_direction,
+                "what the seated party sent, relative to the target"
+            );
+        } else {
+            assert!(
+                room_ssrcs.contains(&ssrc),
+                "only the seat's own stream and the room's toward it are delivered"
+            );
+            assert_eq!(
+                *direction, room_direction,
+                "what the room sent the seated party, relative to the target"
+            );
+        }
+    }
+}
+
+/// The target's peer is moved into a room (a REFER with Replaces adopting the far party): the call
+/// stays intercepted, and its directions stay relative to the warrant's target. The callee's voice is
+/// what the target is sent, so it is `to_target`; the room's mix toward the callee carries the
+/// target's side, so it is `from_target`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seating_the_targets_peer_keeps_directions_relative_to_the_target() {
+    let rig = Rig::new().await;
+    let call = rig.two_party("peer").await;
+    assert!(matches!(
+        rig.attach(call.id, &call.target_tag()).await,
+        CmdResult::Ok { .. }
+    ));
+    let mut mdf = rig.accept().await;
+    call.callee
+        .send(&rtp_from(CALLEE_SSRC, 1), call.toward_callee)
+        .await;
+    let before = mdf.read(1).await;
+    assert_eq!(
+        before[0].0,
+        to_target(),
+        "before the seat: the callee's voice"
+    );
+
+    let third = rig.join("room-peer", "third").await;
+    let fourth = rig.join("room-peer", "fourth").await;
+    let seated = rig.seat(call.id, &call.callee_tag(), "room-peer").await;
+    assert!(matches!(seated, CmdResult::Ok { .. }), "{seated:?}");
+
+    let from = mdf.seen.len();
+    let mut heard = seated_party_talks(
+        &call.callee,
+        call.toward_callee,
+        CALLEE_SSRC,
+        &third,
+        &fourth,
+        30,
+    )
+    .await;
+    assert_seat_directions(&mut mdf, from, CALLEE_SSRC, &heard, false).await;
+
+    // The seat keeps its party across a leave and a seat in another room.
+    assert!(matches!(
+        rig.leave("room-peer", &call.callee_tag()).await,
+        CmdResult::Ok { .. }
+    ));
+    let fifth = rig.join("room-peer-2", "fifth").await;
+    let sixth = rig.join("room-peer-2", "sixth").await;
+    assert!(matches!(
+        rig.seat(call.id, &call.callee_tag(), "room-peer-2").await,
+        CmdResult::Ok { .. }
+    ));
+    let from = mdf.seen.len();
+    heard.extend(
+        seated_party_talks(
+            &call.callee,
+            call.toward_callee,
+            CALLEE_SSRC,
+            &fifth,
+            &sixth,
+            30,
+        )
+        .await,
+    );
+    assert_seat_directions(&mut mdf, from, CALLEE_SSRC, &heard, false).await;
+}
+
+/// The mirror: the warrant names the callee and the caller is seated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seating_the_caller_of_a_callee_warrant_mirrors_the_directions() {
+    let rig = Rig::new().await;
+    let call = rig.two_party("mirror").await;
+    assert!(matches!(
+        rig.send(rig.attach_command(call.id, &call.target_tag(), X3TargetLeg::Callee))
+            .await,
+        CmdResult::Ok { .. }
+    ));
+    let mut mdf = rig.accept().await;
+    let third = rig.join("room-mirror", "third").await;
+    let fourth = rig.join("room-mirror", "fourth").await;
+    assert!(matches!(
+        rig.seat(call.id, &call.target_tag(), "room-mirror").await,
+        CmdResult::Ok { .. }
+    ));
+
+    let heard = seated_party_talks(
+        &call.target,
+        call.toward_target,
+        TARGET_SSRC,
+        &third,
+        &fourth,
+        30,
+    )
+    .await;
+    assert_seat_directions(&mut mdf, 0, TARGET_SSRC, &heard, false).await;
+}
+
+/// An attach on a call whose callee is already seated, naming the caller: the room installs the
+/// taps with the seat as the target's peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_on_a_call_whose_peer_is_seated_is_relative_to_the_target() {
+    let rig = Rig::new().await;
+    let call = rig.two_party("late").await;
+    let third = rig.join("room-late", "third").await;
+    let fourth = rig.join("room-late", "fourth").await;
+    assert!(matches!(
+        rig.seat(call.id, &call.callee_tag(), "room-late").await,
+        CmdResult::Ok { .. }
+    ));
+    let attached = rig.attach(call.id, &call.callee_tag()).await;
+    assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+    let mut mdf = rig.accept().await;
+
+    let heard = seated_party_talks(
+        &call.callee,
+        call.toward_callee,
+        CALLEE_SSRC,
+        &third,
+        &fourth,
+        30,
+    )
+    .await;
+    assert_seat_directions(&mut mdf, 0, CALLEE_SSRC, &heard, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
