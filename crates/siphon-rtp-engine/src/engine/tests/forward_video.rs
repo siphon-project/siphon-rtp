@@ -7,15 +7,15 @@ use crate::srtp_bridge::run_redirect_dispatcher;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
 use siphon_rtp_proto::{ControlFormat, ForwardMedia, VideoProfile};
 
-const ROOM: &str = "group-1";
-const SHORT: Duration = Duration::from_secs(2);
-const NEGATIVE: Duration = Duration::from_millis(250);
+pub(super) const ROOM: &str = "group-1";
+pub(super) const SHORT: Duration = Duration::from_secs(2);
+pub(super) const NEGATIVE: Duration = Duration::from_millis(250);
 const FLOOR_FMTP: &str = "mc_queueing;mc_priority=5;mc_granted";
-const CHP_L31: &str = "profile-level-id=640c1f;packetization-mode=1";
+pub(super) const CHP_L31: &str = "profile-level-id=640c1f;packetization-mode=1";
 
 /// An engine with a bounded port pool and the redirect dispatcher running, so a leaked endpoint
 /// shows as a later allocation failing.
-fn engine_of(endpoints: usize) -> Engine<UdpLoopbackDatapath> {
+pub(super) fn engine_of(endpoints: usize) -> Engine<UdpLoopbackDatapath> {
     let engine = Engine::new(UdpLoopbackDatapath::with_max_endpoints(endpoints));
     tokio::spawn(run_redirect_dispatcher(
         engine.datapath().rx(),
@@ -57,14 +57,14 @@ fn offer(
     text
 }
 
-fn profile(video: Option<VideoProfile>) -> ProfileFlags {
+pub(super) fn profile(video: Option<VideoProfile>) -> ProfileFlags {
     ProfileFlags {
         video,
         ..ProfileFlags::default()
     }
 }
 
-fn carry_video() -> Option<VideoProfile> {
+pub(super) fn carry_video() -> Option<VideoProfile> {
     Some(VideoProfile {
         fmtp: None,
         bandwidth_kbps: Some(1200),
@@ -77,7 +77,7 @@ fn with_control(mut flags: ProfileFlags) -> ProfileFlags {
     flags
 }
 
-async fn join(
+pub(super) async fn join(
     engine: &Engine<UdpLoopbackDatapath>,
     media: ForwardMedia,
     tag: &str,
@@ -139,7 +139,7 @@ async fn video_phone(
     }
 }
 
-fn video_packet(
+pub(super) fn video_packet(
     payload_type: u8,
     sequence: u16,
     timestamp: u32,
@@ -159,7 +159,7 @@ fn video_packet(
     buffer
 }
 
-async fn recv_rtp(socket: &UdpSocket, window: Duration) -> Option<Vec<u8>> {
+pub(super) async fn recv_rtp(socket: &UdpSocket, window: Duration) -> Option<Vec<u8>> {
     let deadline = tokio::time::Instant::now() + window;
     let mut buffer = [0u8; 2048];
     while let Ok(Ok((length, _))) =
@@ -172,7 +172,7 @@ async fn recv_rtp(socket: &UdpSocket, window: Duration) -> Option<Vec<u8>> {
     None
 }
 
-async fn set_source(engine: &Engine<UdpLoopbackDatapath>, tag: &str) {
+pub(super) async fn set_source(engine: &Engine<UdpLoopbackDatapath>, tag: &str) {
     let result = engine
         .handle(
             CLIENT,
@@ -185,14 +185,14 @@ async fn set_source(engine: &Engine<UdpLoopbackDatapath>, tag: &str) {
     assert_eq!(result, ok_empty());
 }
 
-fn streams(result: &CmdResult) -> Vec<String> {
+pub(super) fn streams(result: &CmdResult) -> Vec<String> {
     match result {
         CmdResult::Ok { streams, .. } => streams.clone(),
         other => panic!("expected Ok, got {other:?}"),
     }
 }
 
-fn video_declined(result: &CmdResult) -> Option<String> {
+pub(super) fn video_declined(result: &CmdResult) -> Option<String> {
     match result {
         CmdResult::Ok { video_declined, .. } => video_declined.clone(),
         other => panic!("expected Ok, got {other:?}"),
@@ -200,7 +200,7 @@ fn video_declined(result: &CmdResult) -> Option<String> {
 }
 
 /// `(media, port)` for every m-line of an SDP.
-fn m_lines(text: &str) -> Vec<(String, u16)> {
+pub(super) fn m_lines(text: &str) -> Vec<(String, u16)> {
     text.split("\r\n")
         .filter_map(|line| line.strip_prefix("m="))
         .map(|line| {
@@ -501,7 +501,7 @@ async fn a_video_fmtp_with_a_line_break_refuses_the_join_before_anything_is_allo
 }
 
 #[tokio::test]
-async fn a_preserve_room_declines_video_with_the_reason() {
+async fn a_preserve_room_carries_video_and_reports_it_as_a_live_stream() {
     let engine = engine_of(16);
     let _events = engine.register_client(CLIENT);
     let (_, audio) = phone().await;
@@ -514,9 +514,15 @@ async fn a_preserve_room_declines_video_with_the_reason() {
         profile(carry_video()),
     )
     .await;
-    assert_eq!(streams(&result), ["audio"]);
-    assert!(video_declined(&result).unwrap().contains("translate"));
-    assert_eq!(m_lines(&ok_sdp_text(&result))[1], ("video".to_string(), 0));
+    assert_eq!(streams(&result), ["audio", "video"]);
+    assert_eq!(video_declined(&result), None);
+    let answer = ok_sdp_text(&result);
+    assert_ne!(m_lines(&answer)[1], ("video".to_string(), 0), "{answer}");
+    assert_eq!(
+        engine.endpoint_calls.len(),
+        2,
+        "an endpoint of its own for the video"
+    );
 }
 
 #[tokio::test]
@@ -611,7 +617,7 @@ async fn a_video_offer_the_room_would_refuse_leaks_nothing() {
 }
 
 /// The first audio format an offer lists: its payload type, `a=rtpmap` body and `a=fmtp` body.
-fn first_audio(offered: &str) -> (u8, String, Option<String>) {
+pub(super) fn first_audio(offered: &str) -> (u8, String, Option<String>) {
     let audio = offered
         .split("m=audio ")
         .nth(1)
@@ -675,7 +681,11 @@ async fn offer_member(
         .await
 }
 
-async fn answer_member(engine: &Engine<UdpLoopbackDatapath>, tag: &str, sdp: String) -> CmdResult {
+pub(super) async fn answer_member(
+    engine: &Engine<UdpLoopbackDatapath>,
+    tag: &str,
+    sdp: String,
+) -> CmdResult {
     engine
         .handle(
             CLIENT,
@@ -795,7 +805,7 @@ async fn an_expired_unanswered_video_offer_frees_both_endpoints() {
 }
 
 #[tokio::test]
-async fn an_offer_in_a_room_that_cannot_carry_video_says_so() {
+async fn a_forward_offer_on_a_preserve_room_offers_video_too() {
     let engine = engine_of(16);
     let _events = engine.register_client(CLIENT);
     let result = engine
@@ -811,14 +821,14 @@ async fn an_offer_in_a_room_that_cannot_carry_video_says_so() {
         .await;
     let CmdResult::Ok {
         sdp: Some(offered),
-        video_declined: Some(reason),
+        video_declined: None,
         ..
     } = result
     else {
-        panic!("expected an offer with a reason");
+        panic!("expected an offer that carries video");
     };
-    assert!(sdp::video::parse_video(&offered).is_none());
-    assert!(reason.contains("translate"), "{reason}");
+    let video = sdp::video::parse_video(&offered).expect("the offer carries video");
+    assert_eq!(video.transport, "RTP/AVPF", "no key_mgmt: plain RTP");
 }
 
 #[tokio::test]
@@ -920,7 +930,7 @@ async fn a_receiving_seat_below_the_rooms_level_joins_audio_only_naming_the_leve
 
 /// The first RTCP datagram carrying feedback (a PLI, FIR or NACK) that arrives on `socket` within
 /// `window`; the room's periodic Sender Reports are skipped.
-async fn recv_feedback(socket: &UdpSocket, window: Duration) -> Option<Vec<u8>> {
+pub(super) async fn recv_feedback(socket: &UdpSocket, window: Duration) -> Option<Vec<u8>> {
     let deadline = tokio::time::Instant::now() + window;
     let mut buffer = [0u8; 2048];
     while let Ok(Ok((length, _))) =

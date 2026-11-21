@@ -833,3 +833,136 @@ fn browser_video_egress_and_ingest_make_no_heap_allocation() {
         "SRTP video ingest and fan-out allocated {ingest} times across 999 packets x 99 receivers (must be zero)"
     );
 }
+
+#[test]
+fn a_preserving_rooms_video_fan_out_makes_no_heap_allocation_and_forwards_the_same_buffer() {
+    // 100 seats with video: the source's SRTP video is lent to 99 receivers as it arrived, with no
+    // translate, no keyframe gate and no copy (the NACK history stores it in a fixed ring).
+    let mut room = build_room(siphon_rtp_proto::ForwardMedia::Preserve, false, true);
+    let packets: Vec<RxPacket> = (1..=63)
+        .map(|sequence| video_packet(0, sequence, sequence % 3 == 0))
+        .collect();
+    room.set_source(Some("seat-0")).unwrap();
+    room.ingest(&packets[0]);
+    while room.next_datagram(&packets[0]).is_some() {}
+    room.drain_events().for_each(drop);
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut forwarded = 0usize;
+    for _ in 0..100 {
+        for packet in &packets {
+            room.ingest(packet);
+            while let Some((_, _, datagram)) = room.next_datagram(packet) {
+                assert!(std::ptr::eq(datagram.as_ptr(), packet.data.as_ptr()));
+                forwarded += std::hint::black_box(datagram).len();
+            }
+        }
+    }
+    let steady = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(forwarded > 0);
+    assert_eq!(
+        steady, 0,
+        "preserve video fan-out allocated {steady} times across 6300 packets x 99 receivers (must be zero)"
+    );
+    let stats = room.seat_stats("seat-1").unwrap();
+    assert_eq!(stats.video_dropped_awaiting_keyframe, 0, "no keyframe gate");
+}
+
+/// A video SR sealed on `phone`, as a keyed seat sends it on its video endpoint.
+fn sealed_video_report(phone: &mut SrtcpGcmContext, seat: usize, arrival: u64) -> RxPacket {
+    let mut plain = [0u8; 128];
+    let length = rtcp::write_sender_report(
+        0xB000_0000 + seat as u32,
+        0x0000_0001_8000_0000,
+        90_000,
+        1,
+        1200,
+        &[],
+        &mut plain,
+    )
+    .unwrap();
+    let mut wire = Vec::new();
+    phone.protect(&plain[..length], true, &mut wire).unwrap();
+    let mut packet = video_rtcp(seat, wire);
+    packet.arrival = arrival;
+    packet
+}
+
+#[test]
+fn a_keyed_preserving_rooms_video_srtcp_reseal_makes_no_heap_allocation() {
+    // The talker's video SRTCP is opened once on the video stream's own replay window into the room's
+    // buffer and sealed per receiver on the seat's one outgoing index: nothing allocated once warm.
+    let mut room = build_room(siphon_rtp_proto::ForwardMedia::Preserve, true, true);
+    room.set_source(Some("seat-0")).unwrap();
+    let mut talker = SrtcpGcmContext::new(&[media_key(0)]).unwrap();
+    let packets: Vec<RxPacket> = (0..400u64)
+        .map(|sequence| sealed_video_report(&mut talker, 0, sequence * 20_000))
+        .collect();
+    room.ingest(&packets[0]);
+    while room.next_datagram(&packets[0]).is_some() {}
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut sent = 0usize;
+    for packet in &packets[1..] {
+        room.ingest(packet);
+        while let Some((_, _, datagram)) = room.next_datagram(packet) {
+            sent += std::hint::black_box(datagram).len();
+        }
+    }
+    let steady = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(sent > 0);
+    assert_eq!(
+        steady, 0,
+        "video SRTCP reseal allocated {steady} times across 399 datagrams x 99 receivers (must be zero)"
+    );
+    assert_eq!(room.seat_stats("seat-1").unwrap().media_srtcp_refused, 0);
+    assert_eq!(room.seat_stats("seat-0").unwrap().media_srtcp_refused, 0);
+}
+
+#[test]
+fn a_preserving_rooms_nack_serve_from_the_stored_srtp_makes_no_heap_allocation() {
+    let mut room = build_room(siphon_rtp_proto::ForwardMedia::Preserve, true, true);
+    room.set_source(Some("seat-0")).unwrap();
+    let media: Vec<RxPacket> = (1..=63)
+        .map(|sequence| video_packet(0, sequence, false))
+        .collect();
+    for packet in &media {
+        room.ingest(packet);
+        while room.next_datagram(packet).is_some() {}
+    }
+    // Seat 2 lost sequence numbers 10 and 12 over and over; each NACK is sealed in advance, one
+    // index each.
+    let mut receiver = SrtcpGcmContext::new(&[media_key(2)]).unwrap();
+    let nacks: Vec<RxPacket> = (0..300u64)
+        .map(|_| {
+            let mut plain = [0u8; 64];
+            let mut length = rtcp::write_empty_receiver_report(0xB000_0002, &mut plain).unwrap();
+            length +=
+                rtcp::write_nack(0xB000_0002, 0xB000_0000, 10, 0b10, &mut plain[length..]).unwrap();
+            let mut wire = Vec::new();
+            receiver.protect(&plain[..length], true, &mut wire).unwrap();
+            video_rtcp(2, wire)
+        })
+        .collect();
+    room.ingest(&nacks[0]);
+    while room.next_datagram(&nacks[0]).is_some() {}
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut resent = 0usize;
+    for nack in &nacks[1..] {
+        room.ingest(nack);
+        while let Some((_, _, datagram)) = room.next_datagram(nack) {
+            resent += std::hint::black_box(datagram).len();
+        }
+    }
+    let steady = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    ARMED.with(|armed| armed.set(false));
+    assert!(resent > 0, "the stored packets were sent again");
+    assert_eq!(
+        steady, 0,
+        "NACK serve allocated {steady} times across 299 NACKs (must be zero)"
+    );
+    assert!(room.seat_stats("seat-2").unwrap().nack_answered >= 598);
+}

@@ -60,10 +60,21 @@ pub enum SrtpError {
     /// Two keys in one AEAD key set carry the same MKI, so the MKI could not select between them.
     #[error("duplicate MKI")]
     DuplicateMki,
+    /// Two keys in one AEAD key set carry the same key material under different MKIs. The MKI only
+    /// selects a master key (RFC 3711 §3.2.1: it names a key, it is not a context), is not covered by
+    /// the tag, and so cannot tell two copies of one key apart: they would be two replay tables and two
+    /// send counters for one IV space (RFC 7714 §8).
+    #[error("the same key material under two MKIs")]
+    DuplicateKeyMaterial,
     /// The 31-bit SRTCP index reached its last value; RFC 7714 §9.4 forbids wrapping it under the
     /// same key, so nothing more is protected until the keys are replaced or the index reseeded.
     #[error("SRTCP index exhausted")]
     IndexExhausted,
+    /// An SRTCP packet names a sender SSRC the key has no replay window for and no free slot to give
+    /// it (RFC 3711 §3.2.3: the replay list is per SSRC). It is refused rather than sharing another
+    /// SSRC's window, which would let one stream's indices replay or shadow the other's.
+    #[error("no replay window left for this sender SSRC")]
+    ReplayTableFull,
 }
 
 /// Split the optional MKI field (RFC 3711 §3.1 / §3.4) off the end of `protected` — a packet with

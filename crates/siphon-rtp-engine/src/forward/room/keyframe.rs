@@ -22,6 +22,14 @@
 //! [`HISTORY_SLOTS`] packets, sent again through that receiver's translator so the packet carries
 //! the very sequence number it was lost under. No RTX stream (RFC 4588) is offered.
 //!
+//! A preserving room (`media: preserve`) forwards SRTP it cannot read, so it can see no IDR: nothing
+//! is gated, no parameter set is replayed, no `forward_keyframe` is raised and no timeout counted.
+//! A switch, and a late joiner, are instead sent exactly one request (a PLI, or a FIR when only FIR
+//! was accepted, RFC 5104 §4.3.1) sealed under the source's media SRTCP key (3GPP TS 33.180 §9.4.1),
+//! and then the room stops: a schedule that repeats until an IDR arrives could never be satisfied.
+//! A source with no media keys is sent none, since a plaintext request would be refused (see
+//! `preserve_video`).
+//!
 //! Everything here is synchronous and driven by a caller-supplied millisecond clock
 //! ([`ForwardRoom::poll_keyframe`]); the room reads no clock of its own.
 
@@ -34,7 +42,7 @@ use siphon_rtp_media::h264::Scan;
 use siphon_rtp_media::rtcp::{self, Feedback};
 use siphon_rtp_media::rtp::{write_packet, RtpHeader};
 use siphon_rtp_media::translator::Forwarded;
-use siphon_rtp_proto::Event;
+use siphon_rtp_proto::{Event, ForwardMedia};
 
 use super::video::{seal, VideoStream};
 use super::{ticks, ForwardRoom, StreamPoint, MAX_DATAGRAM};
@@ -367,6 +375,41 @@ impl Keyframes {
         }
     }
 
+    /// Queue the stored packet `sequence` of the source stream `ssrc` for the receiver whose NACK is
+    /// being read (a preserving room sends the stored bytes as they were). `false` when the ring no
+    /// longer has it, or the NACK already asked for as many as one datagram may.
+    pub(super) fn queue_stored_resend(&mut self, ssrc: u32, sequence: u16) -> bool {
+        let held = self
+            .history
+            .as_ref()
+            .is_some_and(|history| history.get(ssrc, sequence).is_some());
+        let retransmit = &mut self.retransmit;
+        if !held || retransmit.count >= MAX_RETRANSMISSIONS {
+            return false;
+        }
+        retransmit.sequences[retransmit.count] = sequence;
+        retransmit.count += 1;
+        true
+    }
+
+    /// The next queued resend: the receiver it is for and the source sequence number. `None` when
+    /// they are all taken.
+    pub(super) fn take_queued_resend(&mut self) -> Option<(usize, u16)> {
+        let retransmit = &mut self.retransmit;
+        if retransmit.next >= retransmit.count {
+            return None;
+        }
+        let sequence = retransmit.sequences[retransmit.next];
+        retransmit.next += 1;
+        Some((retransmit.receiver, sequence))
+    }
+
+    /// The stored bytes of the packet `sequence` of the source stream `ssrc`, if the ring still holds
+    /// it.
+    pub(super) fn stored(&self, ssrc: u32, sequence: u16) -> Option<&[u8]> {
+        self.history.as_ref()?.get(ssrc, sequence)
+    }
+
     pub(super) fn retransmissions_pending(&self) -> bool {
         self.retransmit.next < self.retransmit.count
     }
@@ -415,7 +458,7 @@ impl Keyframes {
         }
     }
 
-    fn wanted(&mut self) {
+    pub(super) fn wanted(&mut self) {
         // A request in flight to the source answers every receiver.
         if self.request.is_none() {
             self.receiver_wanted = true;
@@ -487,17 +530,23 @@ impl ForwardRoom {
     pub(super) fn arm_keyframe_gate(&mut self) {
         self.keyframes.reset();
         let carries_video = self.source_carries_video();
+        // A preserving room cannot see an IDR (the payload is encrypted): nothing is gated, and the
+        // new source is owed its own request whatever was asked of the last one.
+        let preserving = self.preserving();
+        if preserving {
+            self.keyframes.last_request_ms = None;
+        }
         for (index, seat) in self.seats.iter_mut().enumerate() {
             if let Some(video) = seat.video.as_mut() {
-                if carries_video && Some(index) != self.source && video.receives {
+                if carries_video && Some(index) != self.source && video.receives && !preserving {
                     video.keyframe.arm();
                 } else {
                     video.keyframe.open();
                 }
             }
         }
-        if carries_video {
-            self.begin_request(true);
+        if carries_video && self.source_can_be_written_to() {
+            self.begin_request(!preserving);
         }
     }
 
@@ -523,10 +572,15 @@ impl ForwardRoom {
             .as_ref()
             .is_some_and(|video| video.receives);
         if receives && Some(index) != self.source && self.source_carries_video() {
-            if let Some(video) = self.seats[index].video.as_mut() {
-                video.keyframe.arm();
+            // Nothing is held back in a preserving room: the joiner is only owed a request.
+            if !self.preserving() {
+                if let Some(video) = self.seats[index].video.as_mut() {
+                    video.keyframe.arm();
+                }
             }
-            self.begin_request(false);
+            if self.source_can_be_written_to() {
+                self.begin_request(false);
+            }
         }
     }
 
@@ -561,7 +615,11 @@ impl ForwardRoom {
                 return Some(0);
             }
             earlier(since.saturating_add(KEYFRAME_MAX_WAIT_MS));
-            if request.sent <= KEYFRAME_RETRIES && self.source_can_be_asked() {
+            if self.preserving() {
+                if self.source_can_be_asked() {
+                    earlier(since.max(self.next_receiver_request_ms()));
+                }
+            } else if request.sent <= KEYFRAME_RETRIES && self.source_can_be_asked() {
                 earlier(
                     request
                         .last_sent
@@ -570,13 +628,18 @@ impl ForwardRoom {
             }
         }
         if self.keyframes.receiver_wanted && self.source_can_be_asked() {
-            earlier(
-                self.keyframes
-                    .last_request_ms
-                    .map_or(0, |sent| sent.saturating_add(RECEIVER_REQUEST_INTERVAL_MS)),
-            );
+            earlier(self.next_receiver_request_ms());
         }
         deadline
+    }
+
+    /// The millisecond at which a request to the source is next allowed: at once, or one
+    /// [`RECEIVER_REQUEST_INTERVAL_MS`] after the last (RFC 4585 §6.3.1: a request costs the sender an
+    /// intra picture).
+    fn next_receiver_request_ms(&self) -> u64 {
+        self.keyframes
+            .last_request_ms
+            .map_or(0, |sent| sent.saturating_add(RECEIVER_REQUEST_INTERVAL_MS))
     }
 
     /// The source is known well enough to be written to: it has sent video (its SSRC is the media
@@ -591,6 +654,7 @@ impl ForwardRoom {
                         && (video.feedback.pli || video.feedback.fir)
                 })
             })
+            && self.source_can_be_written_to()
     }
 
     /// Do what is due at `now_ms`: stamp a new request, send or repeat it to the source, report how
@@ -601,6 +665,10 @@ impl ForwardRoom {
             self.send_receiver_request(now_ms, out);
             return;
         };
+        if self.preserving() {
+            self.poll_preserved_request(request, now_ms, out);
+            return;
+        }
         let since = *request.since.get_or_insert(now_ms);
         let waited = now_ms.saturating_sub(since);
         if request.satisfied {
@@ -645,6 +713,36 @@ impl ForwardRoom {
             }
         }
         self.keyframes.request = Some(request);
+    }
+
+    /// A preserving room's request to the source: one, as soon as the source's video stream is known
+    /// (its SSRC is what the request names) and the last request is an interval behind, then no more.
+    /// A source that never sends video, or loses its keys, is given up on after
+    /// [`KEYFRAME_MAX_WAIT_MS`], silently: the room cannot see a keyframe, so there is none to time
+    /// out waiting for.
+    fn poll_preserved_request(
+        &mut self,
+        mut request: Request,
+        now_ms: u64,
+        out: &mut Vec<Outbound>,
+    ) {
+        let since = *request.since.get_or_insert(now_ms);
+        let waited = now_ms.saturating_sub(since);
+        let spaced = now_ms >= self.next_receiver_request_ms();
+        if spaced && self.source_can_be_asked() {
+            if let Some(source) = self.source {
+                let kind = self.kind_of_request(0);
+                if !self.send_request(source, kind, request.fir_sequence, out) {
+                    self.request_not_built(source);
+                }
+                self.keyframes.last_request_ms = Some(now_ms);
+            }
+            self.keyframes.request = None;
+        } else if waited >= KEYFRAME_MAX_WAIT_MS || !self.source_can_be_written_to() {
+            self.keyframes.request = None;
+        } else {
+            self.keyframes.request = Some(request);
+        }
     }
 
     /// Which request the `attempt`th is: a PLI first, then FIR (the harder ask), by what the source
@@ -720,6 +818,7 @@ impl ForwardRoom {
                         && (video.keyframe_media.ssrc.is_none() || !seat.video_reachable())
                 })
             })
+            && self.source_can_be_written_to()
     }
 
     fn request_not_built(&self, source: usize) {
@@ -771,14 +870,31 @@ impl ForwardRoom {
             return false;
         };
         length += written;
-        // A request to a bundled seat is SRTCP under the seat's key (RFC 3711 §3.4).
-        let Some(sealed) = seal(
-            video.bundled,
-            seat.secure.as_mut(),
-            &buffer[..length],
-            &mut self.secure_out,
-        ) else {
-            return false;
+        // In a preserving room the source's RTCP is protected under its own media key, whatever
+        // writes it (3GPP TS 33.180 §9.4.1), on the seat's one outgoing index shared with its audio
+        // (RFC 7714 §9.2). A request to a bundled seat is SRTCP under the seat's key (RFC 3711 §3.4).
+        let sealed = if self.codec.media() == ForwardMedia::Preserve {
+            let Some(protection) = seat.media_srtcp.as_mut() else {
+                return false;
+            };
+            if let Err(error) = protection.seal(&buffer[..length], &mut self.secure_out) {
+                tracing::warn!(
+                    target: "siphon_rtp::media", room = %self.room_id, tag = %seat.tag, %error,
+                    "media SRTCP could not be protected for a keyframe request"
+                );
+                return false;
+            }
+            true
+        } else {
+            let Some(sealed) = seal(
+                video.bundled,
+                seat.secure.as_mut(),
+                &buffer[..length],
+                &mut self.secure_out,
+            ) else {
+                return false;
+            };
+            sealed
         };
         let wire = if sealed {
             &self.secure_out[..]

@@ -36,7 +36,7 @@ pub(super) fn srtp_like(sequence: u16, ssrc: u32) -> Vec<u8> {
 }
 
 /// An SRTCP-like sender report: a clear RTCP header, then bytes that are not RTCP at all.
-fn srtcp_like(ssrc: u32) -> Vec<u8> {
+pub(super) fn srtcp_like(ssrc: u32) -> Vec<u8> {
     let mut datagram = vec![0x80, 200, 0x00, 0x0C];
     datagram.extend_from_slice(&ssrc.to_be_bytes());
     datagram.extend((0..60u8).map(|byte| byte.wrapping_mul(13) ^ 0x5A));
@@ -193,12 +193,12 @@ fn an_unreachable_seat_is_not_sent_the_datagram() {
 }
 
 /// Seat `index`'s media SRTCP key: the MKI is the seat number, so a wrong key is a wrong MKI.
-fn media_key(index: u8) -> FloorMasterKey {
+pub(super) fn media_key(index: u8) -> FloorMasterKey {
     FloorMasterKey::from_salt_96(u32::from(index), [0x40 + index; 16], &[0x60 + index; 12])
 }
 
 /// What seat `index`'s phone holds: the same key, as its own context.
-fn phone(index: u8) -> SrtcpGcmContext {
+pub(super) fn phone(index: u8) -> SrtcpGcmContext {
     SrtcpGcmContext::new(&[media_key(index)]).unwrap()
 }
 
@@ -228,7 +228,7 @@ fn plain_report(ssrc: u32) -> Vec<u8> {
     buffer[..length].to_vec()
 }
 
-fn sealed(phone: &mut SrtcpGcmContext, plain: &[u8]) -> Vec<u8> {
+pub(super) fn sealed(phone: &mut SrtcpGcmContext, plain: &[u8]) -> Vec<u8> {
     let mut wire = Vec::new();
     phone.protect(plain, true, &mut wire).unwrap();
     wire
@@ -521,4 +521,22 @@ fn a_resealed_datagram_has_the_srtcp_gcm_layout_of_rfc_7714() {
         [0x80, 0, 0, 0]
     );
     assert_eq!(datagram[datagram.len() - 4..], [0, 0, 0, 2]);
+}
+
+#[test]
+fn padded_srtp_audio_is_forwarded_byte_for_byte_whatever_its_last_octet() {
+    let mut room = preserve_room(3);
+    room.set_source(Some("seat-1")).unwrap();
+    for (sequence, last) in [(1u16, 0u8), (2, 250), (3, 7)] {
+        // RFC 3711 §3.1: the padding is inside the encrypted portion, the datagram ends in the tag.
+        let mut datagram = srtp_like(sequence, 0x1111_1111);
+        datagram[0] |= 0x20;
+        let end = datagram.len() - 1;
+        datagram[end] = last;
+        let packet = rx(1, 1_000_000, datagram.clone());
+        assert_eq!(room.ingest(&packet), Ingress::Accepted, "last octet {last}");
+        let sent = forwarded(&mut room, &packet);
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|(_, _, bytes)| bytes == &datagram));
+    }
 }

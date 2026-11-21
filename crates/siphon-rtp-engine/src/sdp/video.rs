@@ -153,6 +153,10 @@ pub struct VideoOffer {
     /// The section is in the same `a=group:BUNDLE` as the first live audio section (RFC 8843 §7.2),
     /// so it shares that section's transport.
     pub bundled: bool,
+    /// The keying line, when the stream is keyed by the engine: an SDES `a=crypto` (RFC 4568) or a
+    /// DTLS `a=fingerprint` (RFC 5763), at the section or the session. A preserve room has no key of
+    /// its own to hold, so it cannot carry such a stream.
+    pub engine_keying: Option<&'static str>,
 }
 
 /// What a seat's offer settled for its video.
@@ -301,6 +305,20 @@ pub fn parse_video(sdp: &str) -> Option<VideoOffer> {
         payloads,
         mid: mid_line(section),
         bundled: bundled_with_audio(&lines, section),
+        engine_keying: engine_keying(&lines[..first_media], section),
+    })
+}
+
+/// The keying line (`a=crypto` or `a=fingerprint`) the session region or the video `section` carries.
+fn engine_keying(session: &[&str], section: &[&str]) -> Option<&'static str> {
+    session.iter().chain(section).find_map(|line| {
+        if line.starts_with("a=crypto:") {
+            Some("a=crypto")
+        } else if line.starts_with("a=fingerprint:") {
+            Some("a=fingerprint")
+        } else {
+            None
+        }
     })
 }
 
@@ -396,7 +414,34 @@ pub fn choose_video(
     offer: &VideoOffer,
     fixed: Option<&RoomVideoFormat>,
 ) -> Result<VideoChoice, String> {
-    choose(offer, fixed, Asymmetry::AsSignalled)
+    choose(offer, fixed, Asymmetry::AsSignalled, Carriage::Translate)
+}
+
+/// [`choose_video`] for a preserve room (`media: preserve`): the room forwards the talker's SRTP
+/// unchanged, so the stream may be `RTP/SAVP` or `RTP/SAVPF` as well as plain, provided the UEs key
+/// it between themselves (3GPP TS 33.180 §7.5.2): a section with an `a=crypto` or an `a=fingerprint`
+/// would have the engine terminate it, and a video that shares the audio's transport (RFC 8843)
+/// would need the engine's key, so both are declined. The answer keeps the offer's transport
+/// (RFC 3264 §6) and its feedback.
+///
+/// # Errors
+/// As [`choose_video`], and the reasons above.
+pub fn choose_preserved_video(
+    offer: &VideoOffer,
+    fixed: Option<&RoomVideoFormat>,
+) -> Result<VideoChoice, String> {
+    choose(offer, fixed, Asymmetry::AsSignalled, Carriage::Preserve)
+}
+
+/// [`choose_answered_video`] for a member's answer to a preserve room's offer.
+///
+/// # Errors
+/// As [`choose_preserved_video`].
+pub fn choose_answered_preserved_video(
+    answer: &VideoOffer,
+    fixed: Option<&RoomVideoFormat>,
+) -> Result<VideoChoice, String> {
+    choose(answer, fixed, Asymmetry::NotAllowed, Carriage::Preserve)
 }
 
 /// [`choose_video`] for a member's answer to the engine's own offer (`forward_offer`). The engine's
@@ -410,7 +455,16 @@ pub fn choose_answered_video(
     answer: &VideoOffer,
     fixed: Option<&RoomVideoFormat>,
 ) -> Result<VideoChoice, String> {
-    choose(answer, fixed, Asymmetry::NotAllowed)
+    choose(answer, fixed, Asymmetry::NotAllowed, Carriage::Translate)
+}
+
+/// Whether the room terminates the seat's media or forwards it as it came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carriage {
+    /// A translating room: plain RTP on an endpoint of its own, or a browser's bundled DTLS-SRTP.
+    Translate,
+    /// A preserving room: SRTP between the UEs passes through, unread.
+    Preserve,
 }
 
 /// Whether the other side of the exchange allows level asymmetry (RFC 6184 §8.2.2).
@@ -433,12 +487,15 @@ fn choose(
     offer: &VideoOffer,
     fixed: Option<&RoomVideoFormat>,
     asymmetry: Asymmetry,
+    carriage: Carriage,
 ) -> Result<VideoChoice, String> {
     // RFC 3264 §6: the answer keeps the offer's transport. Plain RTP is carried on an endpoint of its
     // own, DTLS-SRTP only bundled with the audio; SDES video is not carried yet, and a plain answer
     // to a secure offer would send the seat video it cannot decrypt.
     let webrtc = offer.transport.eq_ignore_ascii_case(WEBRTC_VIDEO_TRANSPORT);
-    if !webrtc
+    if carriage == Carriage::Preserve {
+        check_preserved_transport(offer)?;
+    } else if !webrtc
         && !["RTP/AVP", "RTP/AVPF"]
             .iter()
             .any(|carried| offer.transport.eq_ignore_ascii_case(carried))
@@ -456,8 +513,13 @@ fn choose(
         );
     }
     let feedback_of = |payload_type: u8| {
-        // RFC 4585 §4.2: feedback is for the AVPF profile, `UDP/TLS/RTP/SAVPF` included.
-        if webrtc || offer.transport.eq_ignore_ascii_case("RTP/AVPF") {
+        // RFC 4585 §4.2: feedback is for the AVPF profile, `RTP/SAVPF` and `UDP/TLS/RTP/SAVPF`
+        // included.
+        if webrtc
+            || ["RTP/AVPF", "RTP/SAVPF"]
+                .iter()
+                .any(|feedback| offer.transport.eq_ignore_ascii_case(feedback))
+        {
             offer
                 .payloads
                 .iter()
@@ -536,6 +598,35 @@ fn choose(
         mid: offer.mid.clone(),
         bundled: offer.bundled,
     })
+}
+
+/// Whether a preserve room can carry the video of `offer`: the transports of RFC 3711 and RFC 4585
+/// with no keying of the engine's.
+fn check_preserved_transport(offer: &VideoOffer) -> Result<(), String> {
+    if !["RTP/AVP", "RTP/AVPF", "RTP/SAVP", "RTP/SAVPF"]
+        .iter()
+        .any(|carried| offer.transport.eq_ignore_ascii_case(carried))
+    {
+        return Err(format!(
+            "video over {} is not carried by a preserve room (RTP/AVP, RTP/AVPF, RTP/SAVP and RTP/SAVPF only; \
+             a room that forwards end-to-end SRTP holds no DTLS-SRTP key)",
+            offer.transport
+        ));
+    }
+    if offer.bundled {
+        return Err(
+            "a preserve room carries video on a transport of its own: video bundled with the audio \
+             (a=group:BUNDLE, RFC 8843) would need the engine's key"
+                .to_string(),
+        );
+    }
+    if let Some(keying) = offer.engine_keying {
+        return Err(format!(
+            "the video carries {keying}, which would have the engine terminate SRTP that a preserve \
+             room forwards end to end (3GPP TS 33.180 §7.5.2); the UEs key it with a=key-mgmt"
+        ));
+    }
+    Ok(())
 }
 
 /// The first of `carried` that fits `room`, with the answer's `a=fmtp` parameters for it.
@@ -849,36 +940,42 @@ pub fn drop_declined_from_bundle(answer: &str) -> String {
 }
 
 /// The `a=rtpmap`, `a=fmtp` and `a=rtcp-fb` lines of the one payload type the engine offers.
-pub(super) fn write_offered_format(section: &mut String, fmtp: Option<&str>) {
+pub(super) fn write_offered_format(section: &mut String, fmtp: Option<&str>, payload_type: u8) {
     let _ = write!(
         section,
-        "a=rtpmap:{OFFER_PAYLOAD_TYPE} H264/{VIDEO_CLOCK_RATE_HZ}{CRLF}"
+        "a=rtpmap:{payload_type} H264/{VIDEO_CLOCK_RATE_HZ}{CRLF}"
     );
     if let Some(parameters) = fmtp.filter(|parameters| !parameters.is_empty()) {
-        let _ = write!(section, "a=fmtp:{OFFER_PAYLOAD_TYPE} {parameters}{CRLF}");
+        let _ = write!(section, "a=fmtp:{payload_type} {parameters}{CRLF}");
     }
     // RFC 4585 §4.2: everything the room supports, so the member's answer can accept any of it.
-    for line in VideoFeedback::SUPPORTED.lines(OFFER_PAYLOAD_TYPE) {
+    for line in VideoFeedback::SUPPORTED.lines(payload_type) {
         let _ = write!(section, "{line}{CRLF}");
     }
 }
 
-/// The video section of an offer the engine writes (a `forward_offer`).
+/// The video section of an offer the engine writes (a `forward_offer`), under `payload_type`
+/// ([`OFFER_PAYLOAD_TYPE`], or the number a preserve room's talker already sends, since the room
+/// forwards its packets unchanged). `secure` offers `RTP/SAVPF` with no key of the engine's: the UEs
+/// key the stream between themselves (RFC 4567 `a=key-mgmt`, 3GPP TS 33.180 §7.5.2).
 #[must_use]
 pub fn video_offer_section(
     rtp_port: u16,
     advertised: IpAddr,
     fmtp: Option<&str>,
     bandwidth_kbps: Option<u32>,
+    payload_type: u8,
+    secure: bool,
 ) -> String {
+    let profile = if secure { "RTP/SAVPF" } else { "RTP/AVPF" };
     let mut section = format!(
-        "m=video {rtp_port} RTP/AVPF {OFFER_PAYLOAD_TYPE}{CRLF}c=IN {} {advertised}{CRLF}",
+        "m=video {rtp_port} {profile} {payload_type}{CRLF}c=IN {} {advertised}{CRLF}",
         addrtype(advertised)
     );
     if let Some(kbps) = bandwidth_kbps {
         let _ = write!(section, "b=AS:{kbps}{CRLF}");
     }
-    write_offered_format(&mut section, fmtp);
+    write_offered_format(&mut section, fmtp, payload_type);
     // RFC 5761 §5.1.1: the seat is one muxed endpoint, as the audio is.
     section.push_str("a=sendrecv\r\na=rtcp-mux\r\n");
     section
@@ -1293,6 +1390,8 @@ mod tests {
             "198.51.100.7".parse().unwrap(),
             Some("profile-level-id=640c1f;packetization-mode=1"),
             Some(900),
+            OFFER_PAYLOAD_TYPE,
+            false,
         );
         assert_eq!(
             section,
@@ -1309,7 +1408,14 @@ mod tests {
                 "a=rtcp-mux\r\n",
             )
         );
-        let v6 = video_offer_section(30004, "2001:db8::7".parse().unwrap(), None, None);
+        let v6 = video_offer_section(
+            30004,
+            "2001:db8::7".parse().unwrap(),
+            None,
+            None,
+            OFFER_PAYLOAD_TYPE,
+            false,
+        );
         assert!(
             v6.contains("c=IN IP6 2001:db8::7\r\n") && !v6.contains("fmtp") && !v6.contains("b=AS")
         );
@@ -1447,7 +1553,14 @@ mod tests {
 
     #[test]
     fn the_offer_section_lists_all_three_feedback_types() {
-        let section = video_offer_section(30004, "198.51.100.7".parse().unwrap(), None, None);
+        let section = video_offer_section(
+            30004,
+            "198.51.100.7".parse().unwrap(),
+            None,
+            None,
+            OFFER_PAYLOAD_TYPE,
+            false,
+        );
         for line in [
             "m=video 30004 RTP/AVPF 126\r\n",
             "a=rtcp-fb:126 nack\r\n",
@@ -1826,6 +1939,133 @@ mod tests {
             !declined_pass(alone).contains("a=group"),
             "{}",
             declined_pass(alone)
+        );
+    }
+
+    /// A one-payload H.264 video section on `transport`, with `extra` lines before the direction.
+    fn on_transport(transport: &str, extra: &str) -> String {
+        offer(&format!(
+            "m=video 20200 {transport} 99\r\nc=IN IP4 192.0.2.11\r\na=rtpmap:99 H264/90000\r\n\
+             a=fmtp:99 profile-level-id=640c1f;packetization-mode=1\r\n\
+             a=rtcp-fb:99 nack\r\na=rtcp-fb:99 nack pli\r\na=rtcp-fb:99 ccm fir\r\n{extra}a=sendrecv\r\na=rtcp-mux\r\n"
+        ))
+    }
+
+    #[test]
+    fn a_preserve_room_carries_srtp_video_with_no_key_of_the_engines() {
+        for (transport, feedback) in [
+            ("RTP/SAVP", VideoFeedback::default()),
+            ("RTP/SAVPF", ALL_FEEDBACK),
+            ("RTP/AVP", VideoFeedback::default()),
+            ("RTP/AVPF", ALL_FEEDBACK),
+        ] {
+            let offered = parse_video(&on_transport(transport, "")).unwrap();
+            let choice = choose_preserved_video(&offered, None).unwrap();
+            assert_eq!(
+                choice.transport, transport,
+                "the answer keeps the offer's transport"
+            );
+            assert_eq!(choice.feedback, feedback, "{transport}");
+            assert!(!choice.bundled);
+            // A translating room still refuses the secure ones: it would have to terminate them.
+            let translate = choose_video(&offered, None);
+            assert_eq!(
+                translate.is_ok(),
+                !transport.contains("SAVP"),
+                "{transport}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_preserve_room_refuses_video_the_engine_would_have_to_key() {
+        // SDES: the engine would hold a key for media the room forwards end to end.
+        let crypto = on_transport(
+            "RTP/SAVP",
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd\r\n",
+        );
+        let reason = choose_preserved_video(&parse_video(&crypto).unwrap(), None).unwrap_err();
+        assert!(reason.contains("a=crypto"), "{reason}");
+        // DTLS-SRTP, with the fingerprint at the section or the session.
+        let fingerprint = on_transport("RTP/SAVPF", "a=fingerprint:sha-256 AA:BB\r\n");
+        let reason = choose_preserved_video(&parse_video(&fingerprint).unwrap(), None).unwrap_err();
+        assert!(reason.contains("a=fingerprint"), "{reason}");
+        let session = format!(
+            "v=0\r\na=fingerprint:sha-256 AA:BB\r\n{}",
+            on_transport("RTP/SAVPF", "").replacen("v=0\r\n", "", 1)
+        );
+        assert!(choose_preserved_video(&parse_video(&session).unwrap(), None).is_err());
+        // A browser's transport, and any video that shares the audio's.
+        let webrtc = on_transport("UDP/TLS/RTP/SAVPF", "");
+        let reason = choose_preserved_video(&parse_video(&webrtc).unwrap(), None).unwrap_err();
+        assert!(reason.contains("UDP/TLS/RTP/SAVPF"), "{reason}");
+        let mut bundled = parse_video(&on_transport("RTP/SAVPF", "")).unwrap();
+        bundled.bundled = true;
+        let reason = choose_preserved_video(&bundled, None).unwrap_err();
+        assert!(reason.contains("BUNDLE"), "{reason}");
+    }
+
+    #[test]
+    fn a_preserve_room_answers_the_offered_transport_and_its_feedback() {
+        let sdp = on_transport("RTP/SAVPF", "");
+        let choice = choose_preserved_video(&parse_video(&sdp).unwrap(), None).unwrap();
+        let answer = anchor_video(
+            &sdp,
+            &VideoAnswer {
+                engine: engine(),
+                choice: &choice,
+                bandwidth_kbps: None,
+                own: &OwnSsrc {
+                    ssrc: 77,
+                    cname: "room".to_string(),
+                },
+            },
+        );
+        let section = answer.split("m=video").nth(1).unwrap();
+        assert!(section.starts_with(" 30004 RTP/SAVPF 99\r\n"), "{section}");
+        for line in [
+            "a=rtcp-fb:99 nack\r\n",
+            "a=rtcp-fb:99 nack pli\r\n",
+            "a=rtcp-fb:99 ccm fir\r\n",
+        ] {
+            assert!(section.contains(line), "{line}: {section}");
+        }
+        assert!(!section.contains("a=crypto") && !section.contains("a=fingerprint"));
+    }
+
+    #[test]
+    fn a_member_that_answers_a_preserve_offer_keeps_the_offered_secure_transport() {
+        let answer = on_transport("RTP/SAVPF", "");
+        let choice = choose_answered_preserved_video(&parse_video(&answer).unwrap(), None).unwrap();
+        assert_eq!(choice.transport, "RTP/SAVPF");
+        assert_eq!(choice.feedback, ALL_FEEDBACK);
+        let keyed = on_transport("RTP/SAVPF", "a=crypto:1 X inline:Y\r\n");
+        assert!(choose_answered_preserved_video(&parse_video(&keyed).unwrap(), None).is_err());
+    }
+
+    #[test]
+    fn the_offer_of_a_preserve_room_is_savpf_when_keyed_by_the_ues_and_names_the_rooms_payload_type(
+    ) {
+        let secure =
+            video_offer_section(30004, "198.51.100.7".parse().unwrap(), None, None, 99, true);
+        assert!(
+            secure.starts_with("m=video 30004 RTP/SAVPF 99\r\n"),
+            "{secure}"
+        );
+        assert!(secure.contains("a=rtpmap:99 H264/90000\r\n"));
+        assert!(secure.contains("a=rtcp-fb:99 nack pli\r\n"));
+        assert!(!secure.contains("a=crypto"));
+        let plain = video_offer_section(
+            30004,
+            "198.51.100.7".parse().unwrap(),
+            None,
+            None,
+            126,
+            false,
+        );
+        assert!(
+            plain.starts_with("m=video 30004 RTP/AVPF 126\r\n"),
+            "{plain}"
         );
     }
 }

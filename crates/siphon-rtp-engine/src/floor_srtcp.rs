@@ -244,7 +244,7 @@ mod tests {
     fn key(mki: u32, salt_length: usize) -> FloorKey {
         FloorKey {
             mki,
-            key: vec![0x11; 16],
+            key: vec![0x11 ^ mki as u8; 16],
             salt: vec![0x22; salt_length],
         }
     }

@@ -10,6 +10,11 @@
 //! `video_per_inbound_packet` is the same for one video packet of a seat with a video stream: the
 //! same translator rewrite per receiver, with a 1200-octet payload.
 //!
+//! `video_per_inbound_packet_preserve` is the same packet in a preserving room, which lends the arrived
+//! datagram out unchanged (no translate, no keyframe gate), so its difference to
+//! `video_per_inbound_packet` is the translator's cost; `per_inbound_video_srtcp_preserve` is one video
+//! SRTCP datagram of a keyed source, opened once and sealed per receiver under the receiver's key.
+//!
 //! `video_webrtc_receivers_per_inbound_packet` is that with every receiver a browser: the video is
 //! bundled on the receiver's endpoint and protected under its DTLS-SRTP key (RFC 3711), so the
 //! difference to `video_per_inbound_packet` is the SRTP `protect` per receiver.
@@ -173,18 +178,20 @@ fn video_inbound(sequence: u16) -> RxPacket {
 /// with a larger payload to copy, and the copy into the history a NACK is served from.
 fn video_fan_out(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("forward_fan_out");
-    for seats in [10usize, 100, 500, 1000] {
-        let mut room = build_room(seats, ForwardMedia::Translate, false, true);
-        // The keyframe opens every receiver; the packet measured is the one after it.
-        let keyframe = video_inbound(1);
-        room.ingest(&keyframe);
-        while room.next_datagram(&keyframe).is_some() {}
-        let packet = video_inbound(2);
-        room.drain_events().for_each(drop);
-        group.throughput(Throughput::Elements(seats as u64 - 1));
-        group.bench_function(
-            BenchmarkId::new("video_per_inbound_packet", seats),
-            |bencher| {
+    for (name, media) in [
+        ("video_per_inbound_packet", ForwardMedia::Translate),
+        ("video_per_inbound_packet_preserve", ForwardMedia::Preserve),
+    ] {
+        for seats in [10usize, 100, 500, 1000] {
+            let mut room = build_room(seats, media, false, true);
+            // The keyframe opens every receiver; the packet measured is the one after it.
+            let keyframe = video_inbound(1);
+            room.ingest(&keyframe);
+            while room.next_datagram(&keyframe).is_some() {}
+            let packet = video_inbound(2);
+            room.drain_events().for_each(drop);
+            group.throughput(Throughput::Elements(seats as u64 - 1));
+            group.bench_function(BenchmarkId::new(name, seats), |bencher| {
                 bencher.iter(|| {
                     room.ingest(black_box(&packet));
                     let mut forwarded = 0usize;
@@ -193,8 +200,8 @@ fn video_fan_out(criterion: &mut Criterion) {
                     }
                     black_box(forwarded)
                 });
-            },
-        );
+            });
+        }
     }
     group.finish();
 }
@@ -446,29 +453,36 @@ fn bench_mode(
 fn srtcp_fan_out(criterion: &mut Criterion) {
     const CHUNK: usize = 1024;
     let mut group = criterion.benchmark_group("forward_fan_out");
-    for seats in [10usize, 100, 500, 1000] {
-        let mut room = room_keyed(seats, ForwardMedia::Preserve, true);
-        let mut talker = SrtcpGcmContext::new(&[media_key(0)]).unwrap();
-        let mut plain = [0u8; 128];
-        let length =
-            rtcp::write_sender_report(0xA0A0_A0A0, 0, 320, 1, 62, &[], &mut plain).unwrap();
-        let mut next_packet = move || {
-            let mut wire = Vec::new();
-            talker.protect(&plain[..length], true, &mut wire).unwrap();
-            RxPacket {
-                endpoint: EndpointId(1),
-                source: "192.0.2.1:4000".parse().unwrap(),
-                arrival: 1_000_000,
-                data: Bytes::from(wire),
-            }
-        };
-        let warm = next_packet();
-        room.ingest(&warm);
-        while room.next_datagram(&warm).is_some() {}
-        group.throughput(Throughput::Elements(seats as u64 - 1));
-        group.bench_function(
-            BenchmarkId::new("per_inbound_srtcp_preserve", seats),
-            |bencher| {
+    for (name, video) in [
+        ("per_inbound_srtcp_preserve", false),
+        ("per_inbound_video_srtcp_preserve", true),
+    ] {
+        for seats in [10usize, 100, 500, 1000] {
+            let mut room = build_room(seats, ForwardMedia::Preserve, true, video);
+            let mut talker = SrtcpGcmContext::new(&[media_key(0)]).unwrap();
+            let mut plain = [0u8; 128];
+            let length =
+                rtcp::write_sender_report(0xA0A0_A0A0, 0, 320, 1, 62, &[], &mut plain).unwrap();
+            let (endpoint, source) = if video {
+                (EndpointId(10_000), "192.0.2.1:5000")
+            } else {
+                (EndpointId(1), "192.0.2.1:4000")
+            };
+            let mut next_packet = move || {
+                let mut wire = Vec::new();
+                talker.protect(&plain[..length], true, &mut wire).unwrap();
+                RxPacket {
+                    endpoint,
+                    source: source.parse().unwrap(),
+                    arrival: 1_000_000,
+                    data: Bytes::from(wire),
+                }
+            };
+            let warm = next_packet();
+            room.ingest(&warm);
+            while room.next_datagram(&warm).is_some() {}
+            group.throughput(Throughput::Elements(seats as u64 - 1));
+            group.bench_function(BenchmarkId::new(name, seats), |bencher| {
                 bencher.iter_custom(|iterations| {
                     let mut elapsed = std::time::Duration::ZERO;
                     let mut remaining = iterations as usize;
@@ -489,8 +503,8 @@ fn srtcp_fan_out(criterion: &mut Criterion) {
                     }
                     elapsed
                 });
-            },
-        );
+            });
+        }
     }
     group.finish();
 }

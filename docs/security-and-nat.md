@@ -1127,9 +1127,10 @@ the routing order is unchanged: bridge → media → text → udptl → ws → c
   resolved destination (never into the void), under its own SSRC and payload type. The payload is
   never decoded; only its H.264 framing is read, after the gate and only from the chosen source (and
   the SPS and PPS of any seat, kept to start a receiver on a keyframe), by `siphon-rtp-media::h264`,
-  which reads no further than the packet (fuzzed). Video is plain RTP: a seat whose media is SRTP (SDES, DTLS), a browser seat and a
-  preserve room have their video declined at port 0 with a stated reason, because a plain video answer to
-  a secure offer would send the seat video it cannot decrypt (secure video is a step of its own).
+  which reads no further than the packet (fuzzed). Video is plain RTP: a seat whose media is SDES or DTLS
+  SRTP and a browser video on a transport of its own have their video declined at port 0 with a stated
+  reason, because a plain video answer to a secure offer would send the seat video it cannot decrypt. A
+  browser seat's video is bundled; a preserve room has its own rules (Layer 5c-iii).
   Leaving, a room's end and the inactivity scan treat the video endpoint as one of the seat's.
 - **What the room sends a video seat, and only there.** A source change holds each receiver's video
   until a keyframe (RFC 6184 §5.8), so a seat never receives a stream it cannot start; the packets held
@@ -1211,6 +1212,43 @@ stops short of the translator. Two different things are protected, on two differ
     back); the MIKEY exchange (§9.4.6) belongs to the controller. The floor keys of
     `profile.floor_keys` protect the floor stream only and are never used here, and these never
     protect the floor stream.
+
+- **Video in a preserve room is the same two hops.** A seat's `m=video` is an endpoint of its own,
+  gated by the same `seat_gate::admit` chain as in 5c-ii (layer 2 signalled source, pending refusals,
+  the SSRC-consistent latch), and is accepted as `RTP/SAVP[F]` or plain only with no `a=crypto`, no
+  `a=fingerprint` and no BUNDLE with the audio: any of those would make the engine terminate or key
+  what the room forwards end to end, so the video is declined with the reason. Never bundled, so the
+  room never holds a key for it.
+  - **The media is verbatim, from the source only.** Only the cleartext RTP header (RFC 3711 §3.1) is
+    read: the direction the seat offered (RFC 3264 §6.1), the payload type (the room's one, RFC 3550
+    §7.1) and the SSRC, which is what a request names. The source's datagram is lent to every reachable
+    receiver whose video reception is on (`forward_set_reception`, counted
+    `reception_off_dropped_video`), unrewritten and never for another seat's packet. The room keeps
+    the last 256 datagrams of the source in a fixed ring, emptied at every source change, for NACK.
+  - **No keyframe gate.** The payload is encrypted, so an IDR is invisible: nothing is held back, no
+    parameter set is replayed and no `forward_keyframe` or timeout is raised. A source change and a
+    late joiner are sent one PLI (RFC 4585 §6.3.1; one FIR, RFC 5104 §4.3.1, when only that was
+    accepted), at most once a second, and the room then stops: it cannot see whether it was answered.
+  - **RTCP is hop by hop (§9.4.1), on the seat's one key.** A keyed seat's video RTCP is opened in
+    the same context as its audio RTCP, with a replay window per sender SSRC (RFC 3711 §3.2.3, §3.3.2:
+    the index and the replay list belong to the SSRC), so audio and video each count their own index
+    and a datagram of one stream replayed onto the other's endpoint is still a replay. The windows sit
+    in a fixed table of 8 slots per key, claimed only by a datagram that authenticated; a ninth sender
+    SSRC is refused rather than given a shared window. Replay state belongs to the key material, not to
+    its MKI (RFC 3711 §3.2.1: the MKI selects a key and is not authenticated), so a key renamed by a
+    rekey keeps it, and a key set listing one key and salt under two MKIs is refused. Everything is counted in
+    `media_srtcp_refused` (plaintext, an unknown MKI, a failed tag, a replay, a full table). A keyed source's is
+    sealed again for each keyed receiver under that receiver's key, on the receiver's one outgoing
+    index shared with its audio RTCP (RFC 7714 §9.2: no IV is reused). A keyed receiver's PLI, FIR and
+    Generic NACK are read only after authentication and only for the source's stream; a request toward
+    the source is sealed under the source's key, and is never made toward a source with no media key,
+    because a plaintext request would be refused and TS 33.180 §9.4.1 allows no other kind. A NACK is
+    answered to the receiver that sent it with the stored original SRTP bytes, which the receiver
+    never saw, so its replay check passes.
+  - **An unkeyed seat is outside the hop protection**, as for audio: its RTCP is neither read nor
+    answered. An unkeyed source's video RTCP is forwarded as it came (opaque), an unkeyed receiver's is
+    dropped and counted, and no request is ever sent to an unkeyed source. A deployment that wants the
+    hop protected gives every seat `media_srtcp_keys`.
 
 ### Layer 5f — The RFC 4103 Real-Time Text (RTT) relay path
 A VoLTE/IMS call may carry a second media stream: an `m=text` line (RFC 4103, T.140 over RTP, usually

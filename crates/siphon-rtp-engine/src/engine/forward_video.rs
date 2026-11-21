@@ -1,27 +1,32 @@
-//! Video in a translating forwarding room (3GPP TS 24.281 §6.2): the endpoint a seat's `m=video`
-//! lands on, and the decision whether a seat's video is carried at all.
+//! Video in a forwarding room (3GPP TS 24.281 §6.2): the endpoint a seat's `m=video` lands on, and the
+//! decision whether a seat's video is carried at all.
 //!
 //! Video is opaque to the room, so the decision is about format and transport, never about codecs
 //! the engine could convert. A seat's video is carried when its offer fits the room
 //! ([`sdp::video::choose_video`]: plain RTP/AVP or RTP/AVPF, H264/90000, the room's
 //! `packetization-mode` and `profile-level-id`) and the seat is a plain RTP one in a translating
-//! room. Otherwise the seat joins audio-only and the result says why (`video_declined`), so a
+//! room (a preserve room's seat may be SRTP, below). Otherwise the seat joins audio-only and the result says why (`video_declined`), so a
 //! controller never has to parse the answer to find out.
+//!
+//! A preserve room carries video too ([`sdp::video::choose_preserved_video`]): `RTP/SAVP[F]` or plain,
+//! on an endpoint of its own, with no key of the engine's (3GPP TS 33.180 §7.5.2: the UEs key it
+//! between themselves and the room hands the SRTP on unchanged), and in the one payload type the
+//! room's talker sends (RFC 3550 §7.1).
 //!
 //! A browser seat (`UDP/TLS/RTP/SAVPF`) carries its video bundled with its audio on the seat's one
 //! ICE/DTLS transport (RFC 8843): the video has no endpoint of its own, and what the seat sends and
 //! is sent travels on the seat's endpoint under the seat's DTLS-SRTP key. A video section on a
 //! transport of its own is declined, and so is SDES-SRTP video: a plain answer to a secure offer
-//! would send the seat video it cannot decrypt. Preserve-room video is not carried either: a preserve
-//! room forwards SRTP the engine holds no key for (3GPP TS 33.180 §7.5.2 NOTE 3).
+//! would send the seat video it cannot decrypt.
 
 use siphon_rtp_datapath::{AddressFamily, Datapath, Endpoint, FlowAction, SourceFilter};
 use siphon_rtp_proto::{CmdResult, ForwardMedia, ProfileFlags};
 
 use crate::forward::VideoConfig;
 use crate::sdp::video::{
-    choose_answered_video, choose_video, parse_video, video_offer_section, RoomVideoFormat,
-    VideoAnswer, VideoChoice, WEBRTC_VIDEO_TRANSPORT,
+    choose_answered_preserved_video, choose_answered_video, choose_preserved_video, choose_video,
+    parse_video, video_offer_section, RoomVideoFormat, VideoAnswer, VideoChoice,
+    OFFER_PAYLOAD_TYPE, WEBRTC_VIDEO_TRANSPORT,
 };
 use crate::sdp::{self, EngineMedia, OwnSsrc};
 
@@ -73,6 +78,7 @@ impl VideoSeat {
 
 /// What a join decides a seat's video from.
 pub(super) struct JoinVideo<'a> {
+    pub(super) room_id: &'a str,
     pub(super) transport: &'a SeatTransport,
     /// The seat's audio, parsed: how the seat is keyed.
     pub(super) info: &'a sdp::MediaInfo,
@@ -102,10 +108,14 @@ pub(super) struct VideoOffer<'a> {
 pub(super) enum OfferedVideo {
     /// The profile asked for none.
     None,
-    /// The profile asked for video and the offer carries none, and why.
-    Declined(String),
-    /// The video endpoint and the offer section on it.
-    Section { endpoint: Endpoint, section: String },
+    /// The video endpoint and the offer section on it: `RTP/AVPF`, or `RTP/SAVPF` with no key of the
+    /// engine's in a preserve room that signals `key_mgmt`.
+    Section {
+        endpoint: Endpoint,
+        section: String,
+        /// The payload type the section offers, which the member's answer must keep (RFC 3264 §6.1).
+        payload_type: u8,
+    },
     /// A WebRTC offer's video: a section of the audio's own transport (RFC 8843), written with the
     /// rest of the offer, so there is no endpoint to allocate.
     Bundled {
@@ -135,15 +145,17 @@ pub(super) fn validate_video_profile(profile: &ProfileFlags) -> Result<(), Strin
 /// A WebRTC seat (DTLS-SRTP audio, whose handshake and ICE run on the seat's endpoint) carries video
 /// bundled with its audio (RFC 8843), so it is not refused here; the offer's video section must then
 /// be a bundled `UDP/TLS/RTP/SAVPF` one ([`choose_video`] says so). Every other secure seat is.
+///
+/// A seat of a preserve room is never refused here: the engine holds no key for its SRTP, which the
+/// UEs agree between themselves (3GPP TS 33.180 §7.5.2), and a seat the engine would have to key
+/// (`a=crypto`, DTLS-SRTP) was refused at the join (`refuse_seat_keying`).
 fn refuse_video_seat(
     media: ForwardMedia,
     info: &sdp::MediaInfo,
     transport: &SeatTransport,
 ) -> Option<&'static str> {
     if media == ForwardMedia::Preserve {
-        return Some(
-            "video is carried by translate rooms only (preserve-room video is not carried yet)",
-        );
+        return None;
     }
     if is_webrtc_seat(info, transport) {
         return None;
@@ -254,10 +266,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(reason) = refuse_video_seat(join.media, join.info, join.transport) {
             return Ok(VideoSeat::Declined(reason.to_string()));
         }
-        let choice = match choose_video(&offered, join.fixed) {
+        let chosen = match join.media {
+            ForwardMedia::Preserve => choose_preserved_video(&offered, join.fixed),
+            ForwardMedia::Translate => choose_video(&offered, join.fixed),
+        };
+        let choice = match chosen {
             Ok(choice) => choice,
             Err(reason) => return Ok(VideoSeat::Declined(reason)),
         };
+        if join.media == ForwardMedia::Preserve {
+            if let Err(reason) = self.check_room_video_payload_type(join.room_id, &choice) {
+                return Ok(VideoSeat::Declined(reason));
+            }
+        }
         // RFC 3264 §6: the answer keeps the offer's transport, so a browser seat's video must be a
         // browser's, and a plain seat's must not be.
         let webrtc_seat = is_webrtc_seat(join.info, join.transport);
@@ -375,12 +396,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some(video) = &request.profile.video else {
             return Ok(OfferedVideo::None);
         };
-        if request.media == ForwardMedia::Preserve {
-            return Ok(OfferedVideo::Declined(
-                "video is carried by translate rooms only (preserve-room video is not carried yet)"
-                    .to_string(),
-            ));
-        }
         // The room's format when it has one, else the controller's, else the member's answer fixes it.
         let fmtp = match self.conference.forward().room_video_format(request.room_id) {
             Some(format) => format.fmtp,
@@ -399,13 +414,50 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let advertised = request
             .advertised_override
             .unwrap_or_else(|| endpoint.local_addr.ip());
+        // A preserve room forwards the talker's packets unchanged (RFC 3550 §7.1), so the member must
+        // read the number the talker sends; and a room signalling end-to-end SRTP (`key_mgmt`,
+        // RFC 4567) offers `RTP/SAVPF` with no key of the engine's, as it does for the audio.
+        let preserve = request.media == ForwardMedia::Preserve;
+        let payload_type = preserve
+            .then(|| {
+                self.conference
+                    .forward()
+                    .room_video_payload_type(request.room_id)
+            })
+            .flatten()
+            .unwrap_or(OFFER_PAYLOAD_TYPE);
         let section = video_offer_section(
             endpoint.local_addr.port(),
             advertised,
             fmtp.as_deref(),
             video.bandwidth_kbps,
+            payload_type,
+            preserve && request.profile.key_mgmt.is_some(),
         );
-        Ok(OfferedVideo::Section { endpoint, section })
+        Ok(OfferedVideo::Section {
+            endpoint,
+            section,
+            payload_type,
+        })
+    }
+
+    /// A preserve room forwards the talker's packets unchanged (RFC 3550 §7.1), so a seat's video
+    /// must be in the payload type the room's first video seat fixed.
+    ///
+    /// # Errors
+    /// The reason, when the seat's number differs.
+    fn check_room_video_payload_type(
+        &self,
+        room_id: &str,
+        choice: &VideoChoice,
+    ) -> Result<(), String> {
+        match self.conference.forward().room_video_payload_type(room_id) {
+            Some(room) if room != choice.payload_type => Err(format!(
+                "video payload type {} where the preserve room forwards payload type {room} unchanged",
+                choice.payload_type
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Read a browser member's answer to the bundled video section of a WebRTC `forward_offer`: the
@@ -438,9 +490,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// Read a member's answer to an offered video stream: its video config when it accepted a stream
     /// that fits the room, else the reason it did not.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the answer and its context: the room, the media mode and the endpoint offered"
+    )]
     pub(super) fn negotiate_video(
         &self,
         room_id: &str,
+        media: ForwardMedia,
+        offered_payload_type: u8,
         answer: &str,
         received_from: Option<std::net::IpAddr>,
         profile: &ProfileFlags,
@@ -450,7 +508,35 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let offered = parse_video(answer)
             .ok_or_else(|| "the answer declined the video stream (port 0)".to_string())?;
         let fixed = self.video_format_in_force(room_id, profile)?;
-        let choice = choose_answered_video(&offered, fixed.as_ref())?;
+        let choice = if media == ForwardMedia::Preserve {
+            let choice = choose_answered_preserved_video(&offered, fixed.as_ref())?;
+            // RFC 3264 §6: the answer keeps the offer's transport.
+            let expected = if profile.key_mgmt.is_some() {
+                "RTP/SAVPF"
+            } else {
+                "RTP/AVPF"
+            };
+            if !choice.transport.eq_ignore_ascii_case(expected) {
+                return Err(format!(
+                    "the answer's video is {}, but the offer's was {expected} (RFC 3264 §6)",
+                    choice.transport
+                ));
+            }
+            choice
+        } else {
+            choose_answered_video(&offered, fixed.as_ref())?
+        };
+        // The answer is to the offer that was sent: its number first (RFC 3264 §6.1), then the room as
+        // it stands now, which a join since the offer may have changed.
+        if choice.payload_type != offered_payload_type {
+            return Err(format!(
+                "the answer's video payload type {} is not the offered {offered_payload_type} (RFC 3264 §6.1)",
+                choice.payload_type
+            ));
+        }
+        if media == ForwardMedia::Preserve {
+            self.check_room_video_payload_type(room_id, &choice)?;
+        }
         if AddressFamily::of(choice.remote.ip()) != AddressFamily::of(endpoint.local_addr.ip()) {
             return Err(
                 "the video stream is in another address family than the seat's audio".to_string(),

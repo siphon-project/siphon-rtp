@@ -467,7 +467,7 @@ fn removing_a_seat_forgets_its_floor_endpoint() {
 }
 
 fn floor_master_key(mki: u32) -> FloorMasterKey {
-    FloorMasterKey::from_salt_96(mki, [0x11; 16], &[0x22; 12])
+    FloorMasterKey::from_salt_96(mki, [0x11 ^ mki as u8; 16], &[0x22; 12])
 }
 
 #[test]
