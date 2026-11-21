@@ -31,6 +31,10 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   when the last is gone, and the seat's owner is recorded as a client id rather than compared by event
   channel.
 
+- **The scope-delete relay test no longer reads a stray packet.** After a delete the deleted call's
+  phone keeps sending to the freed media port; on an ephemeral port a parallel bind could take it. The
+  test now allocates from a reserved window below the ephemeral range.
+
 ## [0.26.1] — 2026-11-21
 
 ### Fixed

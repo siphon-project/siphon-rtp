@@ -512,7 +512,10 @@ async fn one_controller_anchors_one_call_id_twice_under_two_scopes() {
 /// Deleting one scope's call leaves the other scope's call, and the unscoped one, relaying.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deleting_one_scope_leaves_the_others_relaying() {
-    let (_engine, control_addr) = serve().await;
+    // The deleted call's phone keeps sending to the port the delete freed. On an ephemeral port a
+    // parallel bind could take it and answer, or relay, with a stray packet, so the engine allocates
+    // from a window below the kernel's ephemeral range, where nothing else binds.
+    let (_engine, control_addr) = serve_in_window((20_600, 20_660)).await;
     let mut control = Control::connect(control_addr).await;
 
     let mut calls = Vec::new();
