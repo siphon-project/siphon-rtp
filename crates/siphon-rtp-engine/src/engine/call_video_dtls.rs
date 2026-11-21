@@ -257,8 +257,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 flows.push((*endpoint, FlowAction::Drop));
             }
         } else if side.bundle.is_some() {
-            self.redirect_endpoints([plain], "install DTLS video redirect")
-                .map_err(|_| "install DTLS video redirect".to_string())?;
+            // Attached before the plain endpoint is redirected, so its first datagram finds the route.
             let attached = bridge.attach_video(&DtlsVideoPlan {
                 secure_endpoint: legs.audio_endpoint,
                 plain_endpoint: plain,
@@ -270,6 +269,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             });
             if !attached {
                 return Err("the leg's audio is not on the userspace DTLS bridge".to_string());
+            }
+            if self
+                .redirect_endpoints([plain], "install DTLS video redirect")
+                .is_err()
+            {
+                bridge.detach_video(legs.audio_endpoint);
+                return Err("install DTLS video redirect".to_string());
             }
             flows.push((plain, FlowAction::Redirect));
         } else {
@@ -298,12 +304,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ice_validated: None,
                 plain_rtcp: None,
             };
-            self.redirect_endpoints([plain, secure], "install DTLS video redirect")
-                .map_err(|_| "install DTLS video redirect".to_string())?;
+            // Registered before either endpoint is redirected: the first datagram finds its flow.
             if !bridge.renegotiate(&plan) {
                 bridge.register(plan);
             }
             bridge.set_rtp_directions(secure, plain, (legs.to_secure, legs.to_plain));
+            if self
+                .redirect_endpoints([plain, secure], "install DTLS video redirect")
+                .is_err()
+            {
+                bridge.deregister([secure, plain]);
+                return Err("install DTLS video redirect".to_string());
+            }
             flows.push((plain, FlowAction::Redirect));
             flows.push((secure, FlowAction::Redirect));
         }

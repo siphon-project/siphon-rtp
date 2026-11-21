@@ -66,12 +66,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             tap_codec: far_codec,
         };
 
-        // Switch both RTP endpoints to Redirect so the dispatcher routes them to the media actor.
-        for endpoint in [layout.near_endpoint, layout.far_endpoint] {
-            self.datapath
-                .install_flow(endpoint, FlowAction::Redirect)
-                .map_err(|error| format!("install relay redirect: {error}"))?;
-        }
         let call = MediaCall::new_relay(
             call_id.to_string(),
             from_tag,
@@ -84,6 +78,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // An intercepted relay is tapped before it can take its first packet.
         self.pretap_relay(call_id, &mut call);
         self.media.register(call, self.datapath.clone(), None);
+        // Switch both RTP endpoints to Redirect so the dispatcher routes them to the media actor,
+        // which is registered first: the first redirected datagram must find it, not be dropped.
+        for endpoint in [layout.near_endpoint, layout.far_endpoint] {
+            if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                self.media.deregister(call_id);
+                return Err(format!("install relay redirect: {error}"));
+            }
+        }
 
         // Record the promotion on the Call so demotion can restore the in-kernel Forward rules.
         if let Some(mut call) = self.calls.get_mut(call_id) {
@@ -292,12 +294,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
 
-        // Switch the RTP endpoint(s) to Redirect so the dispatcher routes them to the media actor.
-        for endpoint in &redirect_endpoints {
-            self.datapath
-                .install_flow(*endpoint, FlowAction::Redirect)
-                .map_err(|error| format!("install processing redirect: {error}"))?;
-        }
         let owner_events = self.event_sink(owner);
         let call = MediaCall::new(call_id.to_string(), from_tag, to_tag, a_to_b, b_to_a, latch);
         // Single-leg local answer / IVR (`offer_only_restore.is_some()` is the single-leg discriminator
@@ -348,6 +344,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         self.media
             .register(call, self.datapath.clone(), owner_events);
+        // Switch the RTP endpoint(s) to Redirect so the dispatcher routes them to the media actor,
+        // which is registered first: the first redirected datagram must find it, not be dropped.
+        for endpoint in &redirect_endpoints {
+            if let Err(error) = self.datapath.install_flow(*endpoint, FlowAction::Redirect) {
+                self.media.deregister(call_id);
+                return Err(format!("install processing redirect: {error}"));
+            }
+        }
 
         // Record the promotion on the Call so demotion can restore the pre-promote datapath state: the
         // 2-leg case keeps its answer-installed `Forward` rules (already in `relay_flows`); the
@@ -775,16 +779,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             secure_ingress: None,
             secure_egress: None,
         };
-        // Switch both text endpoints to Redirect so the dispatcher routes them to the text actor.
-        for endpoint in [layout.near_endpoint, layout.far_endpoint] {
-            self.datapath
-                .install_flow(endpoint, FlowAction::Redirect)
-                .map_err(|error| format!("install text redirect: {error}"))?;
-        }
         let call = TextCall::new(call_id, from_tag, to_tag, a_to_b, b_to_a, layout.latch);
         let owner_events = self.event_sink(owner);
         self.text
             .register(call, self.datapath.clone(), owner_events);
+        // Switch both text endpoints to Redirect so the dispatcher routes them to the text actor,
+        // registered first so the first redirected datagram finds it.
+        for endpoint in [layout.near_endpoint, layout.far_endpoint] {
+            if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                self.text.deregister(call_id);
+                return Err(format!("install text redirect: {error}"));
+            }
+        }
         Ok(())
     }
 

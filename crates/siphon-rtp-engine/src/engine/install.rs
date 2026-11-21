@@ -1245,14 +1245,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     }
                     let near_leg = Arc::new(Mutex::new(near_secure));
                     let far_leg = Arc::new(Mutex::new(far_secure));
-                    // Redirect both text endpoints so the dispatcher routes them to the text actor.
-                    for endpoint in [near_text.id, far_text.id] {
-                        if let Err(error) =
-                            self.datapath.install_flow(endpoint, FlowAction::Redirect)
-                        {
-                            return Err(boxed_error_result("install secure text redirect", &error));
-                        }
-                    }
                     let a_to_b = TextDirectionConfig {
                         ingress_endpoint: near_text.id,
                         accepted_source: near_rule.accepted_source,
@@ -1286,6 +1278,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     self.text
                         .register(text_call, self.datapath.clone(), secure_text_events_sink);
                     secure_text_registered = true;
+                    // Redirect both text endpoints so the dispatcher routes them to the text actor,
+                    // registered first so the first redirected datagram finds it (and its keys).
+                    for endpoint in [near_text.id, far_text.id] {
+                        if let Err(error) =
+                            self.datapath.install_flow(endpoint, FlowAction::Redirect)
+                        {
+                            self.text.deregister(call_id);
+                            return Err(boxed_error_result("install secure text redirect", &error));
+                        }
+                    }
                 }
             }
         }

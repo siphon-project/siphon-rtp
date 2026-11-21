@@ -76,6 +76,7 @@ mod ogg_opus_recording;
 mod record_call_streams;
 mod record_handover;
 mod record_takeover;
+mod redirect_after_register;
 mod stream_identity;
 mod tee_sendonly;
 mod tee_undecodable;
@@ -666,6 +667,9 @@ fn ok_sdp_text(result: &CmdResult) -> String {
 /// sweep reprogrammed.
 // The `learned` map and `installs` log are behind `Arc` so every clone (the engine holds one)
 // shares one view — a deep-cloned `DashMap` would hide a test's injected latch from the engine.
+/// What runs when a `Redirect` lands on an endpoint.
+type RedirectHook = Arc<dyn Fn(EndpointId) + Send + Sync>;
+
 #[derive(Clone)]
 struct LatchLearningDatapath {
     inner: UdpLoopbackDatapath,
@@ -673,6 +677,9 @@ struct LatchLearningDatapath {
     learned: Arc<DashMap<EndpointId, SocketAddr>>,
     /// An ordered log of every `(endpoint, action)` installed, for assertions.
     installs: Arc<Mutex<Vec<(EndpointId, FlowAction)>>>,
+    /// Run right after a `Redirect` lands on an endpoint, which is the instant its first datagram can
+    /// reach the dispatcher: a test reads there whether a handler already owns the endpoint.
+    on_redirect: Arc<Mutex<Option<RedirectHook>>>,
 }
 
 impl LatchLearningDatapath {
@@ -681,7 +688,13 @@ impl LatchLearningDatapath {
             inner: UdpLoopbackDatapath::new(),
             learned: Arc::new(DashMap::new()),
             installs: Arc::new(Mutex::new(Vec::new())),
+            on_redirect: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Call `hook` with the endpoint each time a `Redirect` is installed on one.
+    fn on_redirect(&self, hook: impl Fn(EndpointId) + Send + Sync + 'static) {
+        *self.on_redirect.lock().expect("redirect hook lock") = Some(Arc::new(hook));
     }
 
     /// Record that `endpoint`'s in-kernel ingress latch has learned `source`.
@@ -729,7 +742,14 @@ impl Datapath for LatchLearningDatapath {
             .lock()
             .expect("install log lock")
             .push((endpoint, action));
-        self.inner.install_flow(endpoint, action)
+        self.inner.install_flow(endpoint, action)?;
+        if action == FlowAction::Redirect {
+            let hook = self.on_redirect.lock().expect("redirect hook lock").clone();
+            if let Some(hook) = hook {
+                hook(endpoint);
+            }
+        }
+        Ok(())
     }
 
     fn remove_flow(&self, endpoint: EndpointId) {
