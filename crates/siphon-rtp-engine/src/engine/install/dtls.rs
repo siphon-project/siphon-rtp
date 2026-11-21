@@ -295,6 +295,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .media_call(directions)
             .with_far_secure_pending()
             .with_rtcp_relays(rtcp_relays);
+        // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
+        // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
+        let mut call = call;
+        self.pretap_relay(wiring.call_id, &mut call);
         self.media
             .register(call, self.datapath.clone(), owner_events);
         // Now the handshake half: the bridge owns B's endpoint for the demux and keys the actor when
@@ -362,6 +366,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             "install DTLS offerer transcode redirect",
         )?;
         let call = wiring.media_call(directions).with_caller_secure_pending();
+        // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
+        // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
+        let mut call = call;
+        self.pretap_relay(wiring.call_id, &mut call);
         self.media
             .register(call, self.datapath.clone(), owner_events);
         self.attach_offerer_data_channel(wiring);

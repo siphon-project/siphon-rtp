@@ -13,7 +13,10 @@ use siphon_rtp_proto::{X3EndReason, Xid};
 
 const OWNER_TAG: &str = "tag-a";
 
-fn inject_session(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) -> crate::x3::X3Delivery {
+pub(super) fn inject_session(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+) -> crate::x3::X3Delivery {
     inject_session_as(engine, call_id, Xid::default(), "mdf.example.net:8090")
 }
 

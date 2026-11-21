@@ -24,8 +24,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::x3_mdf::{
-    acceptor, from_target, pki, plain_sdp, rtp_from, rtp_sequence, ssrc_of, to_target, Mdf,
-    PduStream, Phone, Pki, Tls, CORRELATION_ID, SHORT,
+    acceptor, assert_new_streams_delivered_from_first, from_target, pki, plain_sdp, rtp_from,
+    rtp_sequence, ssrc_of, to_target, Mdf, PduStream, Phone, Pki, Tls, CORRELATION_ID, SHORT,
 };
 use siphon_rtp_datapath::Datapath as _;
 use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher;
@@ -265,8 +265,9 @@ async fn caller_talks(
 
 /// Every datagram of `heard` that the interception could have seen must be in `delivered` byte for
 /// byte: from the first one delivered on its stream (SSRC) up to the last. What the engine sent
-/// before the taps went on (an attach lands after the first comfort-noise frames, and a rebuilt
-/// pipeline sends its first frame a moment before its taps are put back) is not owed.
+/// before the taps went on (an attach lands after the first comfort-noise frames) is not owed. A
+/// pipeline rebuilt under an interception owes everything from its first frame:
+/// [`assert_new_streams_delivered_from_first`] checks that.
 fn assert_heard_was_delivered(heard: &[Vec<u8>], delivered: &[Vec<u8>]) {
     assert!(
         !delivered.is_empty(),
@@ -567,6 +568,10 @@ async fn a_far_leg_deleted_after_the_attach_puts_the_single_leg_taps_back() {
     let toward_caller_leg = rig.answer_local("back", &caller).await;
     assert!(matches!(rig.attach("back").await, CmdResult::Ok { .. }));
     let mut mdf = rig.accept().await;
+    // What the caller heard from the pipeline the interception was attached to: its stream is not
+    // the one rebuilt below.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before_rebuild = caller.drain_rtp().await;
     let offered = rig
         .send(Command::OfferFar {
             call_id: "back".into(),
@@ -606,6 +611,7 @@ async fn a_far_leg_deleted_after_the_attach_puts_the_single_leg_taps_back() {
         .map(|(_, payload)| payload.clone())
         .collect();
     assert_heard_was_delivered(&heard, &delivered_to);
+    assert_new_streams_delivered_from_first(&heard, &before_rebuild, &delivered_to);
     assert!(x3_ends(rig.drained_events()).is_empty());
 }
 
@@ -616,7 +622,7 @@ async fn a_re_answer_of_the_same_dialog_keeps_the_interception() {
     let first = rig.answer_local("again", &caller).await;
     assert!(matches!(rig.attach("again").await, CmdResult::Ok { .. }));
     let mut mdf = rig.accept().await;
-    let (sent_first, _) = caller_talks(&caller, first, 1, 8).await;
+    let (sent_first, heard_first) = caller_talks(&caller, first, 1, 8).await;
 
     // The controller answers the same dialog again (a new offer on an engine-answered call).
     let second = rig.answer_local("again", &caller).await;
@@ -640,6 +646,14 @@ async fn a_re_answer_of_the_same_dialog_keeps_the_interception() {
             rtp_sequence(packet)
         );
     }
+    // The rebuilt pipeline's own stream is tapped from its first frame, not from a moment later.
+    let delivered_to: Vec<Vec<u8>> = mdf
+        .seen
+        .iter()
+        .filter(|(direction, _)| *direction == to_target())
+        .map(|(_, payload)| payload.clone())
+        .collect();
+    assert_new_streams_delivered_from_first(&heard, &heard_first, &delivered_to);
     assert!(!rig.second_connection().await, "same delivery connection");
     assert!(
         x3_ends(rig.drained_events()).is_empty(),

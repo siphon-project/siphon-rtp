@@ -212,6 +212,37 @@ pub fn rtp_sequence(packet: &[u8]) -> u16 {
     u16::from_be_bytes([packet[2], packet[3]])
 }
 
+/// Every egress stream the caller starts hearing **after** the interception was in place must be
+/// delivered from its very first datagram: `already_heard` is what the caller had heard before the
+/// rebuild under test (its streams, and so their pre-interception frames, are not owed), and every
+/// other SSRC in `heard` is a stream the engine began on an intercepted call, whose first sequence
+/// (the first one the caller received) has to be among `delivered`, byte for byte. A pipeline or
+/// bridge that is registered before its taps are put on sends that first frame untapped
+/// (ETSI TS 103 221-2 §5.2).
+pub fn assert_new_streams_delivered_from_first(
+    heard: &[Vec<u8>],
+    already_heard: &[Vec<u8>],
+    delivered: &[Vec<u8>],
+) {
+    let known: std::collections::HashSet<u32> =
+        already_heard.iter().map(|packet| ssrc_of(packet)).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut checked = 0;
+    for packet in heard {
+        let ssrc = ssrc_of(packet);
+        if known.contains(&ssrc) || !seen.insert(ssrc) {
+            continue;
+        }
+        checked += 1;
+        assert!(
+            delivered.contains(packet),
+            "the first frame of the new egress stream {ssrc:08x} (sequence {}) was sent untapped",
+            rtp_sequence(packet)
+        );
+    }
+    assert!(checked > 0, "the caller heard a new egress stream to check");
+}
+
 /// A plain `RTP/AVP` PCMU session description for one phone, with a direction attribute.
 pub fn plain_sdp(address: SocketAddr, direction: &str) -> String {
     format!(
