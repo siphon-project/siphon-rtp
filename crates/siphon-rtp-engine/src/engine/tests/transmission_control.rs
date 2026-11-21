@@ -433,7 +433,7 @@ async fn a_reoffer_keeps_mcvideo_whatever_the_reoffers_profile_accepts() {
 
 #[tokio::test]
 async fn a_standby_restores_the_stream_with_its_format_and_a_reoffer_keeps_it() {
-    let range = (50_760u16, 50_800u16);
+    let range = (30_760u16, 30_800u16);
     let node = |min, max| {
         let engine = Engine::new(UdpLoopbackDatapath::with_port_range(
             IpAddr::V4(Ipv4Addr::LOCALHOST),

@@ -481,7 +481,7 @@ async fn teardown_removes_the_video_endpoints_from_the_srtp_bridge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_checkpoint_restores_an_sdes_video_call_with_its_keys_and_rollover() {
-    let (min, max) = (48_100u16, 48_160u16);
+    let (min, max) = (28_100u16, 28_160u16);
     let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
     spawn_dispatcher(&engine_a);

@@ -252,7 +252,7 @@ fn is_floor_request(event: &Event, tag: &str) -> bool {
 
 #[tokio::test]
 async fn a_plain_floor_call_resumes_on_the_standby_with_its_ports_and_ssrc() {
-    let range = (50_000u16, 50_040u16);
+    let range = (30_000u16, 30_040u16);
     let primary = node(range.0, range.1);
     let _events = primary.register_client(CLIENT);
     let app_events = primary.app_event_receiver(CLIENT).unwrap();
@@ -299,7 +299,7 @@ async fn a_plain_floor_call_resumes_on_the_standby_with_its_ports_and_ssrc() {
 
 #[tokio::test]
 async fn a_keyed_floor_call_resumes_with_an_index_past_everything_the_primary_sent() {
-    let range = (50_100u16, 50_140u16);
+    let range = (30_100u16, 30_140u16);
     let primary = node(range.0, range.1);
     let _events = primary.register_client(CLIENT);
     let app_events = primary.app_event_receiver(CLIENT).unwrap();
@@ -386,7 +386,7 @@ async fn a_keyed_floor_call_resumes_with_an_index_past_everything_the_primary_se
 
 #[tokio::test]
 async fn a_restored_latch_stays_closed_to_a_new_source() {
-    let range = (50_200u16, 50_240u16);
+    let range = (30_200u16, 30_240u16);
     let primary = node(range.0, range.1);
     let _events = primary.register_client(CLIENT);
     let app_events = primary.app_event_receiver(CLIENT).unwrap();
@@ -424,7 +424,7 @@ async fn a_restored_latch_stays_closed_to_a_new_source() {
 
 #[tokio::test]
 async fn audio_rtcp_app_is_reported_on_the_standby_of_a_plain_relay_floor_call() {
-    for (muxed, range) in [(true, (50_300u16, 50_340u16)), (false, (50_400, 50_440))] {
+    for (muxed, range) in [(true, (30_300u16, 30_340u16)), (false, (30_400, 30_440))] {
         let primary = node(range.0, range.1);
         let _events = primary.register_client(CLIENT);
         let (a, b) = (party().await, party().await);
@@ -461,7 +461,7 @@ async fn audio_rtcp_app_is_reported_on_the_standby_of_a_plain_relay_floor_call()
 
 #[tokio::test]
 async fn a_floor_call_checkpoint_carries_the_stream_and_a_blob_without_it_still_restores() {
-    let range = (50_500u16, 50_540u16);
+    let range = (30_500u16, 30_540u16);
     let primary = node(range.0, range.1);
     let _events = primary.register_client(CLIENT);
     let (a, b) = (party().await, party().await);
@@ -497,7 +497,7 @@ async fn a_floor_call_checkpoint_carries_the_stream_and_a_blob_without_it_still_
 
 #[tokio::test]
 async fn a_restore_that_cannot_keep_the_index_margin_is_refused_and_binds_nothing() {
-    let range = (50_600u16, 50_640u16);
+    let range = (30_600u16, 30_640u16);
     let primary = node(range.0, range.1);
     let _events = primary.register_client(CLIENT);
     let (a, b) = (party().await, party().await);
@@ -553,7 +553,7 @@ async fn a_restore_that_cannot_keep_the_index_margin_is_refused_and_binds_nothin
 
 #[tokio::test]
 async fn a_reoffer_on_the_standby_keeps_the_floor_parameters_the_controller_supplied() {
-    let range = (50_700u16, 50_740u16);
+    let range = (30_700u16, 30_740u16);
     let primary = node(range.0, range.1);
     let _events = primary.register_client(CLIENT);
     let (a, b) = (party().await, party().await);

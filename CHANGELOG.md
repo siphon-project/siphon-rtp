@@ -5,6 +5,15 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **Restore tests no longer race a parallel ephemeral bind.** Tests that restore a call into a second
+  engine re-bind the exact snapshot ports; with the default datapath those ports sit in the kernel
+  ephemeral range, where a concurrent `bind(:0)` could take one between the delete and the restore
+  (`EADDRINUSE`). Those tests now allocate from a reserved window below the ephemeral range.
+
 ## [0.26.1] — 2026-11-21
 
 ### Fixed

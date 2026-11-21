@@ -178,7 +178,23 @@ impl Control {
 }
 
 async fn serve() -> (Arc<Engine<UdpLoopbackDatapath>>, SocketAddr) {
-    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    serve_with(UdpLoopbackDatapath::new()).await
+}
+
+/// An engine whose media ports come from `(min, max)` instead of the OS ephemeral range.
+async fn serve_in_window(window: (u16, u16)) -> (Arc<Engine<UdpLoopbackDatapath>>, SocketAddr) {
+    serve_with(UdpLoopbackDatapath::with_port_range(
+        std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+        window.0,
+        window.1,
+    ))
+    .await
+}
+
+async fn serve_with(
+    datapath: UdpLoopbackDatapath,
+) -> (Arc<Engine<UdpLoopbackDatapath>>, SocketAddr) {
+    let engine = Arc::new(Engine::new(datapath));
     // The redirect dispatcher feeds every stream handled in userspace (a transcoding pipeline).
     tokio::spawn(run_redirect_dispatcher_with_text(
         engine.datapath().rx(),
@@ -664,8 +680,12 @@ async fn a_playback_event_names_the_scope_of_its_call() {
 /// A call checkpointed in a scope is restored into that scope, beside its namesakes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restored_call_keeps_its_scope() {
-    let (_primary_engine, primary_addr) = serve().await;
-    let (_standby_engine, standby_addr) = serve().await;
+    // Restore re-binds the exact snapshot ports. Both engines allocate from a window below the
+    // kernel's ephemeral range (32768+): a parallel test binding port 0 can then never take a
+    // port the primary freed between its delete and the standby's restore.
+    let window = (20_500u16, 20_560u16);
+    let (_primary_engine, primary_addr) = serve_in_window(window).await;
+    let (_standby_engine, standby_addr) = serve_in_window(window).await;
     let mut primary = Control::connect(primary_addr).await;
     let mut standby = Control::connect(standby_addr).await;
 

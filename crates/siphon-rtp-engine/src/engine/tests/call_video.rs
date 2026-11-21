@@ -824,7 +824,7 @@ async fn node_info_advertises_call_video_anchor() {
 async fn a_checkpoint_restores_the_video_stream_on_its_ports_with_its_gate_and_directions() {
     // The primary is lost; a standby on the same port range re-binds the video sockets and the relay
     // comes back gated on the signalled camera address, one way only.
-    let range = (52_400u16, 52_460u16);
+    let range = (32_400u16, 32_460u16);
     let primary = Engine::new(UdpLoopbackDatapath::with_port_range(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         range.0,
