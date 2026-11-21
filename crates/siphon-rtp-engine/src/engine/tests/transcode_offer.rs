@@ -428,7 +428,7 @@ async fn a_telephone_event_keeps_the_clock_rate_it_was_offered_at() {
 /// at then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restored_call_keeps_the_clock_rate_of_its_telephone_event() {
-    let (min, max) = (46_400u16, 46_440u16);
+    let (min, max) = (26_400u16, 26_440u16);
     let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let active = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
     let (_caller, caller_addr) = phone().await;

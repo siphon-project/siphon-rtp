@@ -1712,7 +1712,7 @@ async fn restore_resumes_a_plain_relay_on_a_standby_at_the_same_ports() {
     // (A dies, freeing its ports), then restored on a fresh "node B" that re-binds the *same*
     // media ports (as a floating-IP standby would) — and media relays through B with no
     // re-negotiation. Both nodes use the same deterministic port range on loopback.
-    let (min, max) = (46_000u16, 46_040u16);
+    let (min, max) = (26_000u16, 26_040u16);
     let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
     let (phone_a, addr_a) = phone().await;
@@ -1803,8 +1803,8 @@ async fn restore_rejects_a_stale_or_duplicate_call() {
     // A blob for a call that is already live is refused (no clobbering a live call).
     let engine = Engine::new(UdpLoopbackDatapath::with_port_range(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
-        47_000,
-        47_020,
+        27_000,
+        27_020,
     ));
     let (_phone_a, addr_a) = phone().await;
     engine
@@ -1869,7 +1869,7 @@ async fn restore_resumes_a_secure_srtp_bridge_on_a_standby() {
     // Secure warm-standby HA: an AVP↔SAVP bridge is set up on node A, checkpointed (capturing the
     // peer's key + the leg rollover + the bridge flows), torn down, then restored on node B which
     // re-binds the same ports and rebuilds the SRTP bridge — and secure media flows through B.
-    let (min, max) = (48_000u16, 48_060u16);
+    let (min, max) = (28_000u16, 28_060u16);
     let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
     let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
@@ -2021,7 +2021,7 @@ async fn restore_resumes_a_transcode_call_on_a_standby() {
     // Transcode warm-standby HA: a PCMU↔PCMA transcoding call is set up on node A, checkpointed,
     // torn down, then restored on node B which re-binds the same ports and rebuilds the
     // transcoding actor — and media transcodes through B (fresh actor state, same ports).
-    let (min, max) = (49_000u16, 49_040u16);
+    let (min, max) = (29_000u16, 29_040u16);
     let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
     let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
@@ -2156,7 +2156,7 @@ async fn restore_resumes_a_secure_transcode_call_on_a_standby() {
     // rebuilds the transcode actor AND the shared SecureLeg (re-keyed + rollover re-seeded), and
     // proves media transcodes+crypts through B both ways with the SRTP rollover *continued* (no
     // ROC reset → no two-time-pad, RFC 3711 §3.3.1).
-    let (min, max) = (49_100u16, 49_160u16);
+    let (min, max) = (29_100u16, 29_160u16);
     let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let b_ssrc = 0x0B0B_0B0Bu32;
 
@@ -16877,7 +16877,7 @@ async fn a_restored_call_keeps_the_dead_path_ceiling_it_was_checkpointed_under()
     // than a call still in setup — giving it the setup ceiling would hold a genuinely dead call open
     // long past the media timeout. Proven the same way: the setup ceiling is disabled and the
     // restored call is still reaped.
-    let (min, max) = (46_200u16, 46_240u16);
+    let (min, max) = (26_200u16, 26_240u16);
     let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
     let (_phone_a, addr_a) = phone().await;
