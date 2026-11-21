@@ -58,16 +58,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .unwrap_or(answered.remote);
         let near_gate = apply_received_from(Some(near_signalled), offer_received_from)
             .unwrap_or(near_signalled);
-        for (endpoint, label) in [(near_image.id, "near"), (far_image.id, "far")] {
-            if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
-                tracing::warn!(
-                    target: "siphon_rtp::fax",
-                    %call_id, %error, leg = label,
-                    "could not redirect a fax endpoint; the T.38 stream is not relayed"
-                );
-                return None;
-            }
-        }
         self.udptl.register(
             UdptlCall::new(
                 call_id.to_string(),
@@ -86,6 +76,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ),
             self.datapath.clone(),
         );
+        // Redirect only once the UDPTL relay is registered, so the first datagram finds it.
+        for (endpoint, label) in [(near_image.id, "near"), (far_image.id, "far")] {
+            if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                tracing::warn!(
+                    target: "siphon_rtp::fax",
+                    %call_id, %error, leg = label,
+                    "could not redirect a fax endpoint; the T.38 stream is not relayed"
+                );
+                self.udptl.deregister(call_id);
+                return None;
+            }
+        }
         tracing::info!(
             target: "siphon_rtp::fax",
             %call_id,

@@ -265,6 +265,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ) -> Result<Vec<(EndpointId, FlowAction)>, String> {
         let mut flows: Vec<(EndpointId, FlowAction)> = Vec::new();
         let mut unbridged = Vec::new();
+        let mut actions = Vec::with_capacity(endpoints.len());
         for endpoint in endpoints {
             let action = if rules.iter().any(|flow| flow.endpoint == *endpoint) {
                 FlowAction::Redirect
@@ -272,16 +273,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 unbridged.push(*endpoint);
                 FlowAction::Drop
             };
-            self.datapath
-                .install_flow(*endpoint, action)
-                .map_err(|error| format!("install video flow: {error}"))?;
-            flows.push((*endpoint, action));
+            actions.push((*endpoint, action));
         }
         // A direction closed by this renegotiation leaves the bridge too, so its old flow cannot
         // keep decrypting what the datapath now drops.
         self.bridge.deregister(unbridged);
+        // The flows are registered before any endpoint is redirected: the first datagram reaches the
+        // dispatcher the instant a `Redirect` lands, and one that finds no flow there is dropped.
+        // Registering opens nothing (a registry sees only what a `Redirect` routes to it), and each
+        // registered flow carries its source gate and latch, so the first packet is already gated.
         if !rules.is_empty() {
             self.bridge.register(bridge_plan(keys, rules, previous));
+        }
+        for (endpoint, action) in actions {
+            if let Err(error) = self.datapath.install_flow(endpoint, action) {
+                // A flow that was not installed must not stay registered.
+                self.bridge
+                    .deregister(rules.iter().map(|flow| flow.endpoint));
+                return Err(format!("install video flow: {error}"));
+            }
+            flows.push((endpoint, action));
         }
         Ok(flows)
     }
