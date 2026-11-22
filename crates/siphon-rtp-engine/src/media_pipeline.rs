@@ -4272,6 +4272,10 @@ pub struct MediaRegistry {
     /// one `media` handle the redirect dispatcher already holds reaches them; kept apart from
     /// `calls` so a relay is never mistaken for a media actor (`is_media_call`, promotion).
     rtcp_relays: crate::rtcp_relay::RtcpRelayRegistry,
+    /// Test probe: whether each call's actor was registered with its egress already withheld, which is
+    /// the state it takes its first playout tick in.
+    #[cfg(test)]
+    started_withholding: DashMap<String, bool>,
 }
 
 /// A handle to a running media-call actor.
@@ -4342,6 +4346,14 @@ impl MediaRegistry {
         }
     }
 
+    /// Whether `call_id`'s actor was registered with its egress already withheld (test probe).
+    #[cfg(test)]
+    pub fn started_withholding_egress(&self, call_id: &str) -> Option<bool> {
+        self.started_withholding
+            .get(call_id)
+            .map(|started| *started)
+    }
+
     /// Register a built [`MediaCall`] and spawn its actor over `datapath`, with `events` as the
     /// owner's async event sink (DTMF events are pushed there). Returns once the actor is spawned.
     pub fn register<D>(&self, call: MediaCall, datapath: D, events: Option<flume::Sender<Event>>)
@@ -4351,6 +4363,9 @@ impl MediaRegistry {
         let mut call = call;
         call.set_rtcp_tap(datapath.rtcp_tap());
         let call_id = call.call_id.clone();
+        #[cfg(test)]
+        self.started_withholding
+            .insert(call_id.clone(), !call.a_to_b.peer_receives);
         let endpoints = call.endpoints();
         let rtcp_endpoints = call.rtcp_endpoints();
         let relay_only = call.is_relay_only();

@@ -338,6 +338,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // §5.2): an intercepted caller (a bot handing the leg back to the engine) on its own, an
         // intercepted two-party call on both of its legs.
         if offer_only_restore.is_some() {
+            // A caller that only sends (`sendonly`, `inactive`) is sent nothing (RFC 3264 §6.1). The
+            // actor's first playout tick fires the moment it is registered, so a control message sent
+            // after the promotion can lose the race and let one comfort-noise frame out: the actor
+            // starts in the withheld state instead.
+            if self
+                .calls
+                .get(call_id)
+                .is_some_and(|stored| !stored.near_direction.receives())
+            {
+                call.set_peer_receives(false);
+            }
             self.pretap_single_leg(call_id, &mut call);
         } else {
             self.pretap_relay(call_id, &mut call);

@@ -230,12 +230,53 @@ async fn a_recording_on_a_call_that_answered_a_sendonly_offer_records_it_and_sen
     // Nothing at all may come back toward a sendonly party: no RTP (RFC 3264 §6.1).
     let mut buffer = [0u8; 2048];
     let quiet = tokio::time::Instant::now() + Duration::from_millis(400);
-    while let Ok(Ok((len, _))) = tokio::time::timeout_at(quiet, sender.recv_from(&mut buffer)).await
+    while let Ok(Ok((len, from))) =
+        tokio::time::timeout_at(quiet, sender.recv_from(&mut buffer)).await
     {
         let is_rtcp = len >= 2 && (200..=204).contains(&buffer[1]);
         assert!(
             is_rtcp,
-            "the engine sent RTP toward a sendonly party ({len} bytes)"
+            "the engine sent RTP toward a sendonly party ({len} bytes) from {from} (engine_near={engine_near} sender={:?}): {:02x?}",
+            sender.local_addr(),
+            &buffer[..len.min(24)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sendonly_callers_pipeline_starts_with_its_egress_already_withheld() {
+    // RFC 3264 §6.1: the actor's first playout tick fires the moment it is registered, so a control
+    // message sent after the promotion can lose the race and let one comfort-noise frame out toward
+    // a party that only sends. The state has to be the one the actor starts in.
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_sender, addr) = phone().await;
+    for (call_id, direction, withheld) in [
+        ("sendonly-start", "sendonly", true),
+        ("inactive-start", "inactive", true),
+        ("sendrecv-start", "sendrecv", false),
+    ] {
+        let sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na={direction}\r\n",
+            ip = addr.ip(),
+            port = addr.port(),
+        );
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    sdp,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        assert!(matches!(result, CmdResult::Ok { .. }), "{result:?}");
+        assert_eq!(
+            engine.media().started_withholding_egress(call_id),
+            Some(withheld),
+            "{direction}"
         );
     }
 }
