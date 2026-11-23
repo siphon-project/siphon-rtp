@@ -31,6 +31,11 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Fixed
 
+- **A WebSocket takeover bridge is registered before the live leg is redirected to it.** The bridge
+  now owns the leg's route, with its source gate, before the `Redirect` lands, and `ws_bridge_started`
+  is announced only once the redirect has succeeded. A refused redirect fails the verb, reports no
+  lifecycle event and leaves the call relaying on its old path.
+
 - **Audio relays and bridges are registered before their endpoints are redirected.** The SRTP and
   DTLS-SRTP bridges, the secure, secure-to-secure, DTLS and plain transcoding media pipelines, their
   restore from a checkpoint, and a restored floor stream installed the `Redirect` first. A datagram

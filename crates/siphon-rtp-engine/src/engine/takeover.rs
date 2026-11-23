@@ -303,38 +303,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None => self.dial_ws(call_id, ws_uri).await?,
         };
 
-        // Switch the displaced relay off (all `Drop`) and redirect A's RTP here in one step, so the
-        // dispatcher routes A to the bridge and B's ingress stops being forwarded onto A's socket.
-        // Empty at negotiation time — there is no relay to displace before the call is answered.
-        //
-        // A relay that only an interception held in the userspace pipeline keeps leg A on its actor
-        // until the bridge is registered and tapped (the caller then stops the actor): leg A stays
-        // redirected, so no packet of it is ever dropped or left untapped at the switch. The
-        // dispatcher offers a packet to the actor before the bridge, so a packet takes exactly one
-        // path and is delivered once.
+        // Which endpoint a relay actor keeps (it is stopped only once the bridge is live; see
+        // `switch_leg_to_bridge`).
         let keep_a: Option<EndpointId> = takeover
             .as_ref()
             .is_some_and(|t| t.release_actor)
             .then_some(endpoint_a);
-        if let Some(takeover) = takeover.as_ref() {
-            for (endpoint, action) in &takeover.displace {
-                if Some(*endpoint) == keep_a {
-                    continue;
-                }
-                if let Err(error) = self.datapath.install_flow(*endpoint, *action) {
-                    let _ = self.restore_displaced_relay_except(takeover, keep_a.as_slice());
-                    return Err(format!("displace relay flow for WS takeover: {error}"));
-                }
-            }
-        }
-        if let Err(error) = self.datapath.install_flow(endpoint_a, FlowAction::Redirect) {
-            // Nothing owns the leg yet, so put the relay back rather than leave the call half
-            // displaced with no bridge and no record to detach.
-            if let Some(takeover) = takeover.as_ref() {
-                let _ = self.restore_displaced_relay_except(takeover, keep_a.as_slice());
-            }
-            return Err(format!("install WS bridge redirect: {error}"));
-        }
 
         // A jitter buffer shallow enough for low-latency voice-AI (target 1, cap 16 — the bridge
         // pops one frame per ptime tick, the consumer's cadence being the sample-tick clock).
@@ -421,28 +395,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (rtp_in_tx, rtp_in_rx) = flume::bounded::<bytes::Bytes>(1024);
         let (rtp_out_tx, rtp_out_rx) = flume::bounded::<bytes::Bytes>(1024);
 
-        // Announce the bridge **before** spawning the task that can report its end. The task starts
-        // running the moment it is spawned, and a WS server that closes on the handshake (or a dial
-        // onto a socket that is already going away) makes `run_bridge` return almost immediately —
-        // so with the announcement after the spawn, `ws_bridge_ended` could be enqueued first and a
-        // controller would receive an end for a stream it was never told had started. Keying
-        // per-stream state on the start event is the obvious way to consume this, and that consumer
-        // would leak or fault on the unknown stream.
-        //
-        // Enqueue order is the fix, not a lock: the event channel is FIFO and the spawn happens
-        // strictly after this `push_event` returns, so the end can only ever be queued behind the
-        // start. Everything from here to the registration below is infallible (the last `?` is the
-        // VAD detector, above), so this cannot announce a bridge that then fails to come up.
-        self.push_event(
-            owner,
-            Event::WsBridgeStarted {
-                call_id: call_id.to_string(),
-                from_tag: from_tag.clone(),
-                stream_id: stream_id.clone(),
-                ws_uri: ws_uri.to_string(),
-                sample_rate: wire_rate,
-            },
-        );
+        // The bridge is announced (`ws_bridge_started`) only once it is live: registered and with the
+        // call's leg redirected to it (below), so a controller is never told of a bridge whose
+        // redirect was refused. The tasks run from the moment they are spawned, and a WS server that
+        // closes on the handshake makes `run_bridge` return almost at once, so the bridge task holds
+        // its `ws_bridge_ended` until the start has been enqueued (the event channel is FIFO, so the
+        // end can only be queued behind the start). A bridge that never comes up is aborted while it
+        // waits here, and reports nothing.
+        let (announced, announced_wait) = tokio::sync::oneshot::channel::<()>();
 
         // Where the downlink goes. Published rather than captured so the leg's own symmetric-RTP
         // latch and an ICE selection can both re-point it mid-call (RFC 8445 §8.1.1) — a takeover
@@ -481,6 +441,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         WsBridgeEndReason::TransportError
                     }
                 };
+                if announced_wait.await.is_err() {
+                    return;
+                }
                 emit_ws_bridge_ended(
                     events.as_ref(),
                     &ended,
@@ -554,6 +517,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .flatten(),
             ),
         });
+        // The bridge now owns the leg's route, so redirecting the live leg to it cannot drop a datagram
+        // (a registry sees only what a `Redirect` routes to it, and the registered route carries the
+        // source gate). A refusal takes the registration back, stops both tasks without reporting
+        // anything, and leaves the call on the path it had.
+        if let Err(reason) = self.switch_leg_to_bridge(takeover.as_ref(), endpoint_a, keep_a) {
+            if let Some(tasks) = self.ws.deregister(call_id) {
+                tasks.joined().await;
+            }
+            return Err(reason);
+        }
+        let (from_tag_started, stream_id_started) = (from_tag.clone(), stream_id.clone());
         self.ws_bridges.insert(
             call_id.to_string(),
             WsBridge {
@@ -569,6 +543,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 control,
             },
         );
+        self.push_event(
+            owner,
+            Event::WsBridgeStarted {
+                call_id: call_id.to_string(),
+                from_tag: from_tag_started,
+                stream_id: stream_id_started,
+                ws_uri: ws_uri.to_string(),
+                sample_rate: wire_rate,
+            },
+        );
+        // The start is enqueued: the bridge task may now report its end.
+        let _ = announced.send(());
         tracing::info!(
             target: "siphon_rtp::media",
             call_id,
@@ -578,6 +564,45 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             converted = wire_rate != leg_pcm_rate,
             "ws bridge attached"
         );
+        Ok(())
+    }
+
+    /// Switch the call's live leg to its registered bridge: switch the displaced relay off (all
+    /// `Drop`) and redirect A's RTP to the bridge, back to back. Empty at negotiation time (there is
+    /// no relay to displace before the call is answered).
+    ///
+    /// A relay that only an interception held in the userspace pipeline keeps leg A on its actor until
+    /// the bridge is registered and tapped (the caller then stops the actor): leg A stays redirected,
+    /// so no packet of it is ever dropped or left untapped at the switch. The dispatcher offers a
+    /// packet to the actor before the bridge, so a packet takes exactly one path and is delivered once.
+    ///
+    /// On any refusal the displaced relay is put back (except `keep_a`, which the actor owns), so the
+    /// call is left on the path it had.
+    fn switch_leg_to_bridge(
+        &self,
+        takeover: Option<&WsRelayTakeover>,
+        endpoint_a: EndpointId,
+        keep_a: Option<EndpointId>,
+    ) -> Result<(), String> {
+        if let Some(takeover) = takeover {
+            for (endpoint, action) in &takeover.displace {
+                if Some(*endpoint) == keep_a {
+                    continue;
+                }
+                if let Err(error) = self.datapath.install_flow(*endpoint, *action) {
+                    let _ = self.restore_displaced_relay_except(takeover, keep_a.as_slice());
+                    return Err(format!("displace relay flow for WS takeover: {error}"));
+                }
+            }
+        }
+        if let Err(error) = self.datapath.install_flow(endpoint_a, FlowAction::Redirect) {
+            // Nothing owns the leg any more, so put the relay back rather than leave the call half
+            // displaced with no bridge and no record to detach.
+            if let Some(takeover) = takeover {
+                let _ = self.restore_displaced_relay_except(takeover, keep_a.as_slice());
+            }
+            return Err(format!("install WS bridge redirect: {error}"));
+        }
         Ok(())
     }
 
