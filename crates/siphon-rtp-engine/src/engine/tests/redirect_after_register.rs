@@ -9,31 +9,43 @@ use super::*;
 use siphon_rtp_proto::{ProfileFlags, VideoRelay};
 
 /// `(endpoint, whether a handler owned it the moment its redirect landed)`, in install order.
-type Redirects = Arc<Mutex<Vec<(EndpointId, bool)>>>;
+pub(super) type Redirects = Arc<Mutex<Vec<(EndpointId, bool)>>>;
 
 /// Which registry has to own an endpoint when its redirect lands.
 #[derive(Clone, Copy)]
-enum Handler {
+pub(super) enum Handler {
     Bridge,
     Media,
     Text,
     Udptl,
-    DtlsBridge,
+    /// Any registry that terminates or relays a call's audio: the SRTP and DTLS bridges or the media
+    /// registry.
+    Audio,
+    /// The call-floor registry.
+    Floor,
 }
 
 fn recording_engine(handler: Handler) -> (Engine<LatchLearningDatapath>, Redirects) {
-    let datapath = LatchLearningDatapath::new();
+    recording_engine_over(LatchLearningDatapath::new(), handler)
+}
+
+pub(super) fn recording_engine_over(
+    datapath: LatchLearningDatapath,
+    handler: Handler,
+) -> (Engine<LatchLearningDatapath>, Redirects) {
     let engine = Engine::new(datapath.clone());
     let redirects: Redirects = Arc::new(Mutex::new(Vec::new()));
     let (seen, bridge, media) = (redirects.clone(), engine.bridge(), engine.media());
-    let (text, udptl, dtls) = (engine.text(), engine.udptl(), engine.dtls_bridge());
+    let (text, udptl) = (engine.text(), engine.udptl());
+    let floors = engine.conference().floors().clone();
     datapath.on_redirect(move |endpoint| {
         let owned = match handler {
             Handler::Bridge => bridge.owns(endpoint),
             Handler::Media => media.owns(endpoint),
             Handler::Text => text.owns(endpoint),
             Handler::Udptl => udptl.owns(endpoint),
-            Handler::DtlsBridge => dtls.owns(endpoint),
+            Handler::Audio => bridge.owns(endpoint) || media.owns(endpoint),
+            Handler::Floor => floors.owns(endpoint),
         };
         seen.lock().expect("redirect log").push((endpoint, owned));
     });
@@ -91,7 +103,7 @@ async fn plain_call(engine: &Engine<LatchLearningDatapath>, call_id: &str) {
     }
 }
 
-fn assert_owned_at_redirect(redirects: &Redirects, what: &str) {
+pub(super) fn assert_owned_at_redirect(redirects: &Redirects, what: &str) {
     let seen = redirects.lock().expect("redirect log").clone();
     assert!(!seen.is_empty(), "{what}: no endpoint was redirected");
     for (endpoint, owned) in seen {
@@ -271,7 +283,7 @@ async fn dtls_video_call(
     call_id: &str,
     bundled: bool,
 ) -> (Engine<LatchLearningDatapath>, Redirects) {
-    let (engine, redirects) = recording_engine(Handler::DtlsBridge);
+    let (engine, redirects) = recording_engine(Handler::Audio);
     let (_a, a_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
     let (_a_video, a_video) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
     let (_b_audio, b_audio) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
@@ -311,52 +323,326 @@ async fn dtls_video_call(
     (engine, redirects)
 }
 
-/// Every endpoint the DTLS video install redirected was owned by the DTLS bridge at that instant. The
-/// audio association's own endpoints are not this install's, so only the video flows are judged.
-fn assert_video_owned_at_redirect(
-    engine: &Engine<LatchLearningDatapath>,
-    call_id: &str,
-    redirects: &Redirects,
-    what: &str,
-) {
-    let video_redirects: Vec<EndpointId> = engine
-        .calls
-        .get(call_id)
-        .expect("call")
-        .video
-        .flows
-        .iter()
-        .filter(|(_, action)| *action == FlowAction::Redirect)
-        .map(|(endpoint, _)| *endpoint)
-        .collect();
-    assert!(!video_redirects.is_empty(), "{what}: no video redirect");
-    let seen = redirects.lock().expect("redirect log").clone();
-    for endpoint in video_redirects {
-        let owned = seen
-            .iter()
-            .find(|(redirected, _)| *redirected == endpoint)
-            .map(|(_, owned)| *owned);
-        assert_eq!(
-            owned,
-            Some(true),
-            "{what}: {endpoint:?} was redirected before the DTLS bridge owned it"
-        );
-    }
-}
-
 #[tokio::test]
 async fn a_bundled_dtls_video_leg_owns_its_endpoint_before_it_is_redirected() {
-    let (engine, redirects) = dtls_video_call("dtls-bundled", true).await;
-    assert_video_owned_at_redirect(&engine, "dtls-bundled", &redirects, "bundled dtls video");
+    let (_engine, redirects) = dtls_video_call("dtls-bundled", true).await;
+    assert_owned_at_redirect(&redirects, "bundled dtls video call");
 }
 
 #[tokio::test]
 async fn an_unbundled_dtls_video_leg_owns_its_endpoints_before_they_are_redirected() {
-    let (engine, redirects) = dtls_video_call("dtls-unbundled", false).await;
-    assert_video_owned_at_redirect(
-        &engine,
-        "dtls-unbundled",
-        &redirects,
-        "unbundled dtls video",
+    let (_engine, redirects) = dtls_video_call("dtls-unbundled", false).await;
+    assert_owned_at_redirect(&redirects, "unbundled dtls video call");
+}
+
+/// Offer from a plain caller with `offer_profile`, answer with `answer_sdp`, and return what every
+/// redirect of the call found owning its endpoint.
+async fn audio_call(
+    call_id: &str,
+    offer_sdp: String,
+    offer_profile: ProfileFlags,
+    answer_sdp: impl FnOnce(&sdp::MediaInfo) -> String,
+) -> Redirects {
+    let (engine, redirects) = recording_engine(Handler::Audio);
+    negotiate(&engine, call_id, offer_sdp, offer_profile, answer_sdp).await;
+    redirects
+}
+
+async fn negotiate<D: Datapath + Clone + Send + 'static>(
+    engine: &Engine<D>,
+    call_id: &str,
+    offer_sdp: String,
+    offer_profile: ProfileFlags,
+    answer_sdp: impl FnOnce(&sdp::MediaInfo) -> String,
+) {
+    let offered = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.into(),
+                from_tag: "a".into(),
+                sdp: offer_sdp,
+                profile: offer_profile.clone(),
+            },
+        )
+        .await;
+    let to_b = sdp::parse(&ok_sdp_text(&offered)).expect("the offer sent to B");
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: call_id.into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp: answer_sdp(&to_b),
+                profile: offer_profile,
+            },
+        )
+        .await;
+    assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
+}
+
+fn secure_far(record: bool) -> ProfileFlags {
+    ProfileFlags {
+        transport_protocol: Some("RTP/SAVP".into()),
+        record_call: record,
+        ..ProfileFlags::default()
+    }
+}
+
+fn savp_key() -> CryptoAttribute {
+    CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("key")
+}
+
+#[tokio::test]
+async fn an_srtp_bridge_owns_both_legs_before_they_are_redirected() {
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let key = savp_key();
+    let redirects = audio_call(
+        "srtp-bridge",
+        sdp_for(a_addr, true),
+        secure_far(false),
+        |_| savp_answer_sdp(b_addr, &key),
+    )
+    .await;
+    assert_owned_at_redirect(&redirects, "srtp bridge");
+}
+
+#[tokio::test]
+async fn a_transcrypt_bridge_owns_both_legs_before_they_are_redirected() {
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let (a_key, b_key) = (savp_key(), savp_key());
+    let redirects = audio_call(
+        "transcrypt-bridge",
+        savp_answer_sdp(a_addr, &a_key),
+        secure_far(false),
+        |_| savp_answer_sdp(b_addr, &b_key),
+    )
+    .await;
+    assert_owned_at_redirect(&redirects, "transcrypt bridge");
+}
+
+#[tokio::test]
+async fn a_secure_transcode_owns_both_legs_before_they_are_redirected() {
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let key = savp_key();
+    let redirects = audio_call(
+        "srtp-media",
+        sdp_single_codec(a_addr, 0, "PCMU"),
+        secure_far(false),
+        |_| savp_answer_codec(b_addr, 8, "PCMA", &key),
+    )
+    .await;
+    assert_owned_at_redirect(&redirects, "secure transcode");
+}
+
+#[tokio::test]
+async fn a_secure_to_secure_media_pipeline_owns_both_legs_before_they_are_redirected() {
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let (a_key, b_key) = (savp_key(), savp_key());
+    let redirects = audio_call(
+        "transcrypt-media",
+        savp_answer_sdp(a_addr, &a_key),
+        secure_far(true),
+        |_| savp_answer_sdp(b_addr, &b_key),
+    )
+    .await;
+    assert_owned_at_redirect(&redirects, "secure to secure media");
+}
+
+#[tokio::test]
+async fn a_transcoding_call_owns_both_legs_before_they_are_redirected() {
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let redirects = audio_call(
+        "plain-media",
+        sdp_single_codec(a_addr, 0, "PCMU"),
+        ProfileFlags::default(),
+        |_| sdp_single_codec(b_addr, 8, "PCMA"),
+    )
+    .await;
+    assert_owned_at_redirect(&redirects, "plain media pipeline");
+}
+
+/// The answer a DTLS-SRTP callee gives: its own certificate, `setup:active`.
+fn dtls_answer(addr: SocketAddr) -> String {
+    let certificate = siphon_rtp_dtls::DtlsCertificate::generate().expect("cert");
+    let fingerprint = certificate.fingerprint();
+    let hex = fingerprint
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+         a=setup:active\r\na=fingerprint:{hash} {hex}\r\n",
+        ip = addr.ip(),
+        port = addr.port(),
+        hash = fingerprint.hash_function,
+    )
+}
+
+fn dtls_far(record: bool) -> ProfileFlags {
+    ProfileFlags {
+        transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+        record_call: record,
+        ..ProfileFlags::default()
+    }
+}
+
+#[tokio::test]
+async fn a_dtls_far_bridge_owns_both_legs_before_they_are_redirected() {
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let redirects = audio_call(
+        "dtls-bridge",
+        sdp_for(a_addr, true),
+        dtls_far(false),
+        |_| dtls_answer(b_addr),
+    )
+    .await;
+    assert_owned_at_redirect(&redirects, "dtls far bridge");
+}
+
+#[tokio::test]
+async fn a_dtls_far_media_pipeline_owns_both_legs_before_they_are_redirected() {
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let redirects = audio_call("dtls-media", sdp_for(a_addr, true), dtls_far(true), |_| {
+        dtls_answer(b_addr)
+    })
+    .await;
+    assert_owned_at_redirect(&redirects, "dtls far media");
+}
+
+#[tokio::test]
+async fn a_dtls_offerer_media_pipeline_owns_both_legs_before_they_are_redirected() {
+    // A DTLS caller toward a plain callee, with recording: the actor holds the decoded audio.
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let certificate = siphon_rtp_dtls::DtlsCertificate::generate().expect("cert");
+    let fingerprint = certificate.fingerprint();
+    let hex = fingerprint
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+         a=setup:actpass\r\na=fingerprint:{hash} {hex}\r\n",
+        ip = a_addr.ip(),
+        port = a_addr.port(),
+        hash = fingerprint.hash_function,
     );
+    let profile = ProfileFlags {
+        transport_protocol: Some("RTP/AVP".into()),
+        record_call: true,
+        ..ProfileFlags::default()
+    };
+    let redirects = audio_call("dtls-offerer-media", offer, profile, |_| {
+        sdp_for(b_addr, true)
+    })
+    .await;
+    assert_owned_at_redirect(&redirects, "dtls offerer media");
+}
+
+/// Fail a call over to a standby on the same ports and return what every redirect of its restore
+/// found owning its endpoint. The standby's ports are the primary's, so the phones keep sending to
+/// them: the first datagram of a restored call arrives the instant its `Redirect` lands.
+async fn restored_redirects(
+    range: (u16, u16),
+    call_id: &str,
+    offer_sdp: String,
+    profile: ProfileFlags,
+    answer_sdp: impl FnOnce(&sdp::MediaInfo) -> String,
+) -> Redirects {
+    let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let primary = Engine::new(UdpLoopbackDatapath::with_port_range(bind, range.0, range.1));
+    let _events = primary.register_client(CLIENT);
+    negotiate(&primary, call_id, offer_sdp, profile, answer_sdp).await;
+    let CmdResult::Checkpoint { snapshot } = primary
+        .handle(
+            CLIENT,
+            Command::Checkpoint {
+                call_id: call_id.into(),
+                from_tag: "a".into(),
+            },
+        )
+        .await
+    else {
+        panic!("expected a checkpoint");
+    };
+    primary
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: call_id.into(),
+                from_tag: "a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    drop(primary);
+    let datapath =
+        LatchLearningDatapath::over(UdpLoopbackDatapath::with_port_range(bind, range.0, range.1));
+    let (standby, redirects) = recording_engine_over(datapath, Handler::Audio);
+    let _events = standby.register_client(CLIENT);
+    let restored = standby.handle(CLIENT, Command::Restore { snapshot }).await;
+    assert!(matches!(restored, CmdResult::Ok { .. }), "{restored:?}");
+    redirects
+}
+
+#[tokio::test]
+async fn a_restored_srtp_bridge_owns_its_endpoints_before_they_are_redirected() {
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let key = savp_key();
+    let redirects = restored_redirects(
+        (31_100, 31_140),
+        "restore-srtp-bridge",
+        sdp_for(a_addr, true),
+        secure_far(false),
+        |_| savp_answer_sdp(b_addr, &key),
+    )
+    .await;
+    assert_owned_at_redirect(&redirects, "restored srtp bridge");
+}
+
+#[tokio::test]
+async fn a_restored_transcoding_call_owns_its_endpoints_before_they_are_redirected() {
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let redirects = restored_redirects(
+        (31_200, 31_240),
+        "restore-media",
+        sdp_single_codec(a_addr, 0, "PCMU"),
+        ProfileFlags::default(),
+        |_| sdp_single_codec(b_addr, 8, "PCMA"),
+    )
+    .await;
+    assert_owned_at_redirect(&redirects, "restored media pipeline");
+}
+
+#[tokio::test]
+async fn a_restored_secure_transcode_owns_its_endpoints_before_they_are_redirected() {
+    let (_a, a_addr) = phone().await;
+    let (_b, b_addr) = phone().await;
+    let key = savp_key();
+    let redirects = restored_redirects(
+        (31_300, 31_340),
+        "restore-srtp-media",
+        sdp_single_codec(a_addr, 0, "PCMU"),
+        secure_far(false),
+        |_| savp_answer_codec(b_addr, 8, "PCMA", &key),
+    )
+    .await;
+    assert_owned_at_redirect(&redirects, "restored secure transcode");
 }

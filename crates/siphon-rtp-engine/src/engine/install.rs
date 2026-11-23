@@ -377,10 +377,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"near leg has no signalled address",
             ));
         };
-        self.redirect_endpoints(
-            near.endpoint_ids().chain(far.endpoint_ids()),
-            "install SRTP bridge redirect",
-        )?;
+        let redirected: Vec<EndpointId> = near.endpoint_ids().chain(far.endpoint_ids()).collect();
         // A leg whose transport an RFC 8445 agent owns is never steered by media: an authenticated
         // connectivity check is the only thing that may move it (docs/security-and-nat.md §4 layer
         // 4), which is what the datapath expresses as `LatchPolicy::Off` on an ICE leg. RTCP keeps
@@ -458,7 +455,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_leg: build(keying.far, previous_far),
             flows,
         });
-        Ok(())
+        // Redirected only now that the flows (each with its source gate and latch) are registered.
+        self.redirect_registered(
+            redirected.iter().copied(),
+            "install SRTP bridge redirect",
+            || {
+                self.bridge.deregister(redirected.iter().copied());
+            },
+        )
     }
 }
 
@@ -495,7 +499,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 boxed_error_result(&format!("secure media pipeline ({direction})"), &reason)
             },
         )?;
-        self.redirect_endpoints([near.rtp.id, far.rtp.id], "install secure media redirect")?;
+        let mut redirected = vec![near.rtp.id, far.rtp.id];
         // Carry the live actor's SRTP rollover into the rebuilt leg (RFC 3711 §3.3.1) — see the SDES
         // bridge; a renegotiation must not restart either counter at 0.
         let mut secure_leg = SecureLeg::new(&far_local.key, &far_remote.key);
@@ -510,10 +514,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp)) =
             (near.rtcp, far.rtcp, near.remote_rtcp)
         {
-            self.redirect_endpoints(
-                [near_rtcp.id, far_rtcp.id],
-                "install secure media RTCP redirect",
-            )?;
+            redirected.extend([near_rtcp.id, far_rtcp.id]);
             rtcp_relays = wiring.rtcp_relays(
                 near_rtcp.id,
                 far_rtcp.id,
@@ -532,7 +533,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.pretap_relay(wiring.call_id, &mut call);
         self.media
             .register(call, self.datapath.clone(), owner_events);
-        Ok(())
+        // Registered first: the first redirected datagram must find its actor.
+        self.redirect_registered(redirected, "install secure media redirect", || {
+            self.media.deregister(wiring.call_id);
+        })
     }
 
     /// The secure↔secure transcode: both parties on SDES-SRTP, and the call needs the decoded audio.
@@ -579,10 +583,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 )
             },
         )?;
-        self.redirect_endpoints(
-            [near.rtp.id, far.rtp.id],
-            "install secure↔secure media redirect",
-        )?;
+        let mut redirected = vec![near.rtp.id, far.rtp.id];
         let mut near_leg = SecureLeg::new(&near_local.key, &near_remote.key);
         if let Some(rollover) = self.media.near_rollover_snapshot(wiring.call_id) {
             near_leg.seed_rollover(&rollover);
@@ -600,10 +601,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp)) =
             (near.rtcp, far.rtcp, near.remote_rtcp)
         {
-            self.redirect_endpoints(
-                [near_rtcp.id, far_rtcp.id],
-                "install secure↔secure media RTCP redirect",
-            )?;
+            redirected.extend([near_rtcp.id, far_rtcp.id]);
             let keying = match &far_leg {
                 Some(far) => RtcpKeying::BothLegs {
                     near: near_leg.clone(),
@@ -626,7 +624,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.pretap_relay(wiring.call_id, &mut call);
         self.media
             .register(call, self.datapath.clone(), owner_events);
-        Ok(())
+        // Registered first: the first redirected datagram must find its actor.
+        self.redirect_registered(redirected, "install secure↔secure media redirect", || {
+            self.media.deregister(wiring.call_id);
+        })
     }
 
     /// Userspace media slow path: redirect both RTP legs to a per-call transcode/record/DTMF actor.
@@ -654,8 +655,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 boxed_error_result(&format!("media pipeline ({direction})"), &reason)
             },
         )?;
-        // Redirect the RTP legs to the actor (mux ⇒ RTCP rides these; the actor relays it).
-        self.redirect_endpoints([near.rtp.id, far.rtp.id], "install media redirect")?;
         // Relay companion RTCP in-datapath when not muxed (RTCP is never transcoded). The gate keys
         // on each side's effective source (`received-from` IP when supplied); the forward destination
         // stays the real signalled address.
@@ -689,7 +688,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.pretap_relay(wiring.call_id, &mut call);
         self.media
             .register(call, self.datapath.clone(), owner_events);
-        Ok(())
+        // Redirect the RTP legs to the actor (mux ⇒ RTCP rides these; the actor relays it), registered
+        // first so the first redirected datagram finds it.
+        self.redirect_registered([near.rtp.id, far.rtp.id], "install media redirect", || {
+            self.media.deregister(wiring.call_id);
+        })
     }
 
     /// Plain relay: the in-datapath Forward fast path. Each endpoint's rule gates its ingress to the

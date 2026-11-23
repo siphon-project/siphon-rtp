@@ -17,6 +17,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   `siphon_rtp_srtcp_ledger_install_refused_total` counts it. A key already held still installs, and a
   `restore_srtcp_indices` blob that would pass the cap is refused whole.
 
+### Fixed
+
+- **Audio relays and bridges are registered before their endpoints are redirected.** The SRTP and
+  DTLS-SRTP bridges, the secure, secure-to-secure, DTLS and plain transcoding media pipelines, their
+  restore from a checkpoint, and a restored floor stream installed the `Redirect` first. A datagram
+  that reaches the dispatcher in that window finds no owner and is dropped. Each now registers first
+  (its source gate and latch are part of the registered plan) and takes the registration back if the
+  redirect cannot be installed.
+
+
 ## [0.27.0] — 2026-11-23
 
 ### Fixed

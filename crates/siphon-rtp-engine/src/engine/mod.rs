@@ -1373,6 +1373,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Ok(())
     }
 
+    /// [`Self::redirect_endpoints`] for endpoints whose owner is **already registered**: the first
+    /// datagram reaches the dispatcher the instant a `Redirect` lands and one with no owner is dropped,
+    /// so every install registers first and redirects last. `undo` takes the registration back when
+    /// the datapath refuses the redirect, so nothing owns an endpoint that is not served.
+    fn redirect_registered(
+        &self,
+        endpoints: impl IntoIterator<Item = EndpointId>,
+        context: &str,
+        undo: impl FnOnce(),
+    ) -> Result<(), Box<CmdResult>> {
+        self.redirect_endpoints(endpoints, context)
+            .inspect_err(|_| undo())
+    }
+
     /// Current live call count for `client`.
     fn client_call_count(&self, client: ClientId) -> usize {
         self.client_calls.get(&client).map_or(0, |count| *count)
