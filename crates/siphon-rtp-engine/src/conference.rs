@@ -2432,7 +2432,6 @@ struct ConferenceHandle {
 /// [`EndpointId`] and holds each room's control handle. Mirrors [`crate::media_pipeline::MediaRegistry`]
 /// so the single redirect dispatcher can route by endpoint across media calls, SRTP bridges, WS
 /// bridges, and conferences alike.
-#[derive(Default)]
 pub struct ConferenceRegistry {
     /// Participant endpoint → the owning room actor's mailbox (the dispatcher's routing table).
     routes: DashMap<EndpointId, flume::Sender<ConferenceInput>>,
@@ -2445,9 +2444,35 @@ pub struct ConferenceRegistry {
     forward: std::sync::Arc<crate::forward::ForwardRegistry>,
     /// The floor-control streams of two-party calls, which share this registry's dispatcher slot.
     floors: std::sync::Arc<crate::call_floor::CallFloorRegistry>,
+    /// The SRTCP send-index ledger the forwarding rooms and the floor legs share (RFC 7714 §8).
+    srtcp_ledger: std::sync::Arc<crate::srtcp_ledger::SrtcpLedger>,
+}
+
+impl Default for ConferenceRegistry {
+    fn default() -> Self {
+        let srtcp_ledger = std::sync::Arc::<crate::srtcp_ledger::SrtcpLedger>::default();
+        Self {
+            routes: DashMap::default(),
+            rooms: DashMap::default(),
+            forward: std::sync::Arc::new(crate::forward::ForwardRegistry::with_ledger(
+                srtcp_ledger.clone(),
+            )),
+            floors: std::sync::Arc::new(crate::call_floor::CallFloorRegistry::with_ledger(
+                srtcp_ledger.clone(),
+            )),
+            srtcp_ledger,
+        }
+    }
 }
 
 impl ConferenceRegistry {
+    /// The ledger of SRTCP send indices, one counter per key, shared by every forwarding room and
+    /// floor leg of the engine ([`crate::srtcp_ledger`]).
+    #[must_use]
+    pub fn srtcp_ledger(&self) -> &std::sync::Arc<crate::srtcp_ledger::SrtcpLedger> {
+        &self.srtcp_ledger
+    }
+
     /// Whether the registry routes datagrams for `endpoint` (the dispatcher's predicate).
     #[must_use]
     pub fn owns(&self, endpoint: EndpointId) -> bool {

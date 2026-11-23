@@ -93,6 +93,15 @@ control = "127.0.0.1:8080"
 # (CLI: --forward-room-idle-secs). Default: 3600.
 # forward_room_idle_secs = 3600
 
+# Drop a key's SRTCP send-index counter once nothing has held it for this many seconds. 0 (the
+# default) never drops one. Every key the engine seals SRTCP under has a counter that only moves
+# forward (RFC 7714 section 8: an AES-GCM IV must never repeat under a key), and a key that comes back
+# after its counter was dropped would start again at index 0 and repeat nonces. Set this only at or
+# above the lifetime your controller enforces on a client key (3GPP TS 33.180 section 9.4.2), and never
+# below the time a seat can be away and rejoin with its key. (CLI: --srtcp-ledger-retention-secs).
+# Default: 0.
+# srtcp_ledger_retention_secs = 0
+
 # --- play_media from an http(s) URL --------------------------------------------------------------
 #
 # `play_media` can fetch a WAV prompt from a URL. The fetch runs on its own task (never on the media

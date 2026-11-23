@@ -29,7 +29,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::{Mki, SrtpKeyMaterial};
 use siphon_rtp_srtp::srtcp::SrtcpContext;
-use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SrtcpGcmContext};
+use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SendIndex, SrtcpGcmContext};
 use siphon_rtp_srtp::{kdf::MASTER_SALT_LEN, SrtpContext, MASTER_KEY_LEN};
 
 /// A test master key (`0x11` repeated) — fixed, not subscriber data.
@@ -296,6 +296,34 @@ fn bench_srtcp_gcm(criterion: &mut Criterion) {
 
     criterion.bench_function("srtcp_gcm_protect", |bencher| {
         let mut context = SrtcpGcmContext::new(&[gcm_key()]).expect("context");
+        let mut out = Vec::with_capacity(256);
+        bencher.iter(|| {
+            context
+                .protect(black_box(&plain), true, &mut out)
+                .expect("protect");
+            black_box(out.len())
+        });
+    });
+
+    // The engine-wide ledger counter every send draws its index from: an atomic load and an add.
+    criterion.bench_function("srtcp_gcm_send_index_take", |bencher| {
+        let counter = SendIndex::new();
+        bencher.iter(|| black_box(counter.take()));
+    });
+
+    // The same with a lease (after the controller took a ledger checkpoint): the limit is the one load
+    // the take reads either way, so a lease should cost nothing extra.
+    criterion.bench_function("srtcp_gcm_send_index_take_leased", |bencher| {
+        let counter = SendIndex::new();
+        counter.lease_to(1 << 30);
+        bencher.iter(|| black_box(counter.take()));
+    });
+
+    criterion.bench_function("srtcp_gcm_protect_leased", |bencher| {
+        let shared = SendIndex::new();
+        shared.lease_to(1 << 30);
+        let mut context =
+            SrtcpGcmContext::with_counters(&[gcm_key()], |_| shared.clone()).expect("context");
         let mut out = Vec::with_capacity(256);
         bencher.iter(|| {
             context

@@ -131,6 +131,8 @@ async fn metrics_and_health_endpoint_over_tcp() {
             ws_bridges: gauge_engine.ws_bridge_count() as u64,
             ws_tee_frames_sent: gauge_engine.ws_tee_frames_sent(),
             ws_tee_frames_dropped: gauge_engine.ws_tee_frames_dropped(),
+            srtcp_ledger_entries: conference.srtcp_ledger().len() as u64,
+            srtcp_lease_refused: conference.srtcp_ledger().lease_refused(),
         }
     };
     tokio::spawn(metrics::serve_metrics(listener, engine.metrics(), live));

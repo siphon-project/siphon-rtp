@@ -622,6 +622,39 @@ the controller's choice of source are what bound who can send: see
 [the security model](../security-and-nat.md#layer-5c-iii-preserve-rooms-end-to-end-srtp-hop-by-hop-srtcp)
 (preserve rooms).
 
+### SRTCP indices, rejoins and failover
+
+An `AEAD_AES_128_GCM` SRTCP packet is encrypted under an IV made of the key's salt, the sender SSRC and
+the SRTCP index, so under one key no (SSRC, index) pair may ever go out twice (RFC 7714 §8: a repeat
+breaks confidentiality and integrity). The engine therefore keeps **one send-index counter per key**, not
+per seat: a seat that leaves and rejoins with its key, one client key seated in two rooms or in a room and
+a two-party floor call, a floor stream and a media stream under one key (TS 33.180 §9.4.2 describes one key
+per client), and a key unset and set again all carry on from the last index sent under that key. The
+counter is lock-free, one compare-and-swap per sealed packet, and stops at index 2^31 - 1 (nothing more is
+sent under that key, and an error is logged, until the controller replaces it). `node_info` lists
+`srtcp_index_ledger`.
+
+The counters live in the engine's memory and are never dropped unless you set
+`srtcp_ledger_retention_secs` (TOML) or `--srtcp-ledger-retention-secs`: only at or above the lifetime your
+controller enforces on a client key, since a key reused after its counter was dropped repeats nonces
+(`siphon_rtp_srtcp_ledger_entries` counts them).
+
+Failover is fail-closed. The first `checkpoint_srtcp_indices` puts a lease on each counter (its index plus
+65536); every later one moves the lease only when you **store its blob and then send
+`confirm_srtcp_indices` with the blob's `generation`** (never before the blob is durably stored: a lost
+reply must not let the primary send past what the standby holds). The engine raises `srtcp_checkpoint_due` when a counter is half way and refuses to seal at the
+lease until the next checkpoint (`siphon_rtp_srtcp_lease_refused_total`), so the primary can never send past
+the point a standby would start from. **Checkpoint on the event, and at least every few minutes** (no key may
+send 32768 SRTCP packets between two checkpoints). Without any checkpoint there is no lease.
+
+The counters live in the engine's memory. To survive a failover, store the opaque blob of
+`checkpoint_srtcp_indices` on your schedule (it names keys by an HMAC under the key and holds no key
+bytes) and send it with `restore_srtcp_indices` to the standby **before** rebuilding any room there: each
+counter starts 65536 indices past the checkpointed one, because the primary kept sending after the
+checkpoint. **If an engine restarts, or fails over with no restored ledger, it knows nothing of what was
+sent: issue fresh keys** (a new MIKEY exchange, RFC 7714 §8) rather than reusing the old ones. The forward
+rooms themselves are not checkpointed, so a standby rejoins its seats; the ledger is what makes that safe.
+
 ## Security and NAT
 
 A dialled-out seat is gated by its answer's signalled source (or `received_from`) and is not offered

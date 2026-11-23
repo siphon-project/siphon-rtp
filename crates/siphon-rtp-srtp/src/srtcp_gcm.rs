@@ -25,6 +25,9 @@
 //!   SSRC is refused ([`SrtpError::ReplayTableFull`]), never given a window another SSRC shares. The send index never wraps: RFC 7714 §9.4 forbids reusing an IV under one key, so at
 //!   `2^31 - 1` protect refuses until the keys are replaced or the index is reseeded.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use aes::Aes128;
 use aes_gcm::aead::consts::{U12, U16};
 use aes_gcm::aead::generic_array::GenericArray;
@@ -64,6 +67,284 @@ pub const MAX_KEYS: usize = 2;
 /// sends RTCP for its audio, its video and the odd restart of either, so eight is generous; a ninth
 /// SSRC is refused rather than sharing a window.
 pub const MAX_REPLAY_SSRCS: usize = 8;
+
+/// Why [`SendIndex::take`] gave no index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendRefused {
+    /// The last index (`2^31 - 1`) has been taken (RFC 7714 §9.4: the index never wraps).
+    Exhausted,
+    /// The index reached the lease: nothing more is sent under the key until the lease is extended.
+    LeaseReached,
+}
+
+/// No lease: the `limit` half of the packed state while the counter is unleased. Above the index space
+/// (`2^31`), so it can never be reached or mistaken for a lease.
+const NO_LEASE: u32 = u32::MAX;
+
+/// The next SRTCP index to send under one key, shared by everything that sends under it.
+///
+/// A GCM IV is the session salt XOR (SSRC, index) (RFC 7714 §9.1), so under one key an index must
+/// never go out twice for one SSRC (§8, §9.4). The counter therefore belongs to the key, not to the
+/// context that happens to hold it: every context sending under the key draws from one `SendIndex`,
+/// whichever stream, seat or room it serves. It only moves forward, lock-free, and stops at
+/// `2^31 - 1` instead of wrapping.
+///
+/// It can also carry a **lease**: an index it may not reach. A standby seeded from a checkpoint starts
+/// a margin past the checkpointed index; a primary that sends further than that margin before it
+/// fails would be overtaken, so once a checkpoint exists the counter refuses at the margin until the
+/// next checkpoint extends the lease. Without a lease nothing changes.
+///
+/// The index and the lease are **one** atomic word (`limit << 32 | next`) and every change is a
+/// compare-and-swap of that whole word. That is what makes the lease safe: a take that read the state
+/// before a checkpoint set the lease cannot commit afterwards (its swap fails and it reads the lease),
+/// and a checkpoint reads the index and sets the lease from it in one step, so no index can be handed
+/// out between the index a checkpoint exports and the lease it grants. A refused take changes nothing.
+#[derive(Debug, Clone)]
+pub struct SendIndex(Arc<AtomicU64>);
+
+impl Default for SendIndex {
+    fn default() -> Self {
+        Self(Arc::new(AtomicU64::new(pack(0, NO_LEASE))))
+    }
+}
+
+const fn pack(next: u32, limit: u32) -> u64 {
+    ((limit as u64) << 32) | next as u64
+}
+
+const fn unpack(state: u64) -> (u32, u32) {
+    (state as u32, (state >> 32) as u32)
+}
+
+/// A state read, to be committed by [`SendIndex::commit_take`]. Public only so that the two steps of
+/// a take can be interleaved with a checkpoint deterministically in tests.
+#[derive(Debug, Clone, Copy)]
+pub struct TakeSnapshot(u64);
+
+impl SendIndex {
+    /// A counter at index 0, for a key nothing has sent under.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The word, with the lease clamped to the end of the index space for comparison.
+    fn bound(limit: u32) -> u32 {
+        limit.min(LAST_INDEX + 1)
+    }
+
+    /// Take the next index, or say why there is none. One compare-and-swap in the common case, no
+    /// lock, no allocation. A refused take changes nothing.
+    ///
+    /// # Errors
+    /// [`SendRefused::Exhausted`] past the last index, [`SendRefused::LeaseReached`] at the lease.
+    pub fn take(&self) -> Result<u32, SendRefused> {
+        loop {
+            match self.commit_take(self.snapshot()) {
+                Ok(Some(index)) => return Ok(index),
+                Ok(None) => {}
+                Err(refused) => return Err(refused),
+            }
+        }
+    }
+
+    /// Step one of a take: read the state.
+    #[must_use]
+    pub fn snapshot(&self) -> TakeSnapshot {
+        TakeSnapshot(self.0.load(Ordering::Acquire))
+    }
+
+    /// Step two: decide on `snapshot` and try to commit it. `Ok(Some(index))` took it, `Ok(None)` means
+    /// the state moved since the snapshot (a take, a checkpoint) and nothing was taken, and the caller
+    /// reads again; `Err` is a refusal under the state that was read.
+    ///
+    /// # Errors
+    /// [`SendRefused::Exhausted`] or [`SendRefused::LeaseReached`], decided on the snapshot.
+    pub fn commit_take(&self, snapshot: TakeSnapshot) -> Result<Option<u32>, SendRefused> {
+        let (next, limit) = unpack(snapshot.0);
+        if next >= Self::bound(limit) {
+            return Err(if limit <= LAST_INDEX {
+                SendRefused::LeaseReached
+            } else {
+                SendRefused::Exhausted
+            });
+        }
+        Ok(self
+            .0
+            .compare_exchange_weak(
+                snapshot.0,
+                pack(next + 1, limit),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+            .then_some(next))
+    }
+
+    /// Change the state with `change` (old `(next, limit)` to new), atomically, and return the old
+    /// pair. `change` may run more than once.
+    fn update(&self, change: impl Fn(u32, u32) -> (u32, u32)) -> (u32, u32) {
+        let mut state = self.0.load(Ordering::Acquire);
+        loop {
+            let (next, limit) = unpack(state);
+            let (new_next, new_limit) = change(next, limit);
+            match self.0.compare_exchange_weak(
+                state,
+                pack(new_next, new_limit),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return (next, limit),
+                Err(observed) => state = observed,
+            }
+        }
+    }
+
+    /// The next index that [`Self::take`] will return (`2^31` once exhausted).
+    #[must_use]
+    pub fn next(&self) -> u32 {
+        unpack(self.0.load(Ordering::Acquire)).0
+    }
+
+    /// Raise the counter to `index` (clamped to the end of the index space). It never lowers: an
+    /// index that went out is never offered again, whatever a checkpoint or a caller says.
+    pub fn raise_to(&self, index: u32) {
+        self.update(|next, limit| (next.max(index.min(LAST_INDEX + 1)), limit));
+    }
+
+    /// Lease to `index`: nothing at or past it is sent. A counter with no lease takes it; one that has a
+    /// lease keeps the longer of the two, so a lease never shortens. `2^31` or more is the whole index
+    /// space.
+    pub fn lease_to(&self, index: u32) {
+        let target = index.min(LAST_INDEX + 1);
+        self.update(|next, limit| {
+            (
+                next,
+                if limit == NO_LEASE {
+                    target
+                } else {
+                    limit.max(target)
+                },
+            )
+        });
+    }
+
+    /// A checkpoint of this counter, in one step: read the next index and lease the counter to that
+    /// index plus `margin`. Returns the index read. Nothing can be handed out between the index read
+    /// and the lease set, so a standby that starts `margin` past the returned index cannot be reached.
+    #[must_use]
+    pub fn checkpoint(&self, margin: u32) -> u32 {
+        let target = |next: u32| next.saturating_add(margin).min(LAST_INDEX + 1);
+        self.update(|next, limit| {
+            (
+                next,
+                if limit == NO_LEASE {
+                    target(next)
+                } else {
+                    limit.max(target(next))
+                },
+            )
+        })
+        .0
+    }
+
+    /// Seed from a checkpoint, in one step: raise the counter to `start` and lease it to `lease` (never
+    /// shortening an existing lease, never lowering the counter).
+    pub fn seed(&self, start: u32, lease: u32) {
+        let (start, lease) = (start.min(LAST_INDEX + 1), lease.min(LAST_INDEX + 1));
+        self.update(|next, limit| {
+            (
+                next.max(start),
+                if limit == NO_LEASE {
+                    lease
+                } else {
+                    limit.max(lease)
+                },
+            )
+        });
+    }
+
+    /// The lease, or `None` when the counter has none.
+    #[must_use]
+    pub fn lease(&self) -> Option<u32> {
+        let (_, limit) = unpack(self.0.load(Ordering::Acquire));
+        (limit <= LAST_INDEX).then_some(limit)
+    }
+
+    /// How many handles share this counter (the ledger's own included).
+    #[must_use]
+    pub fn holders(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+}
+
+/// The replay windows of one key, one per sender SSRC, in a table of fixed size.
+struct ReplaySlots {
+    slots: [Option<(u32, ReplayWindow)>; MAX_REPLAY_SSRCS],
+    /// After an HA restore: windows of SSRCs first seen later start closed at this index.
+    resumed: Option<u64>,
+}
+
+impl ReplaySlots {
+    const fn new() -> Self {
+        Self {
+            slots: [None; MAX_REPLAY_SSRCS],
+            resumed: None,
+        }
+    }
+
+    /// The window of `ssrc` as it stands, or `None` when the table has no window for it and no free
+    /// slot to give it: the caller refuses the packet.
+    fn window_of(&self, ssrc: u32) -> Option<ReplayWindow> {
+        if let Some((_, window)) = self
+            .slots
+            .iter()
+            .flatten()
+            .find(|(known, _)| *known == ssrc)
+        {
+            return Some(*window);
+        }
+        if self.slots.iter().any(Option::is_none) {
+            let mut fresh = ReplayWindow::default();
+            if let Some(index) = self.resumed {
+                fresh.close_at(index);
+            }
+            return Some(fresh);
+        }
+        None
+    }
+
+    /// Keep `window` as the state of `ssrc`, after a packet authenticated. The slot was checked to be
+    /// there by [`Self::window_of`].
+    fn store(&mut self, ssrc: u32, window: ReplayWindow) {
+        let position = self
+            .slots
+            .iter()
+            .position(|slot| slot.is_some_and(|(known, _)| known == ssrc))
+            .or_else(|| self.slots.iter().position(Option::is_none));
+        if let Some(position) = position {
+            self.slots[position] = Some((ssrc, window));
+        }
+    }
+
+    /// The highest index recorded under any SSRC, for an HA checkpoint.
+    fn highest(&self) -> Option<u64> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter_map(|(_, window)| window.highest())
+            .max()
+    }
+
+    /// Resume from a checkpoint: `index` and below count as received under every SSRC, known or not
+    /// yet seen (the checkpoint does not say which stream it came from).
+    fn close_at(&mut self, index: u64) {
+        for (_, window) in self.slots.iter_mut().flatten() {
+            window.close_at(index);
+        }
+        self.resumed = Some(index);
+    }
+}
 /// Smallest valid packet: header, tag, ESRTCP word, MKI (empty plaintext).
 const MIN_PACKET_LEN: usize = CLEAR_HEADER_LEN + GCM_TAG_LEN + ESRTCP_LEN + MKI_LEN;
 
@@ -97,6 +378,33 @@ impl FloorMasterKey {
         }
     }
 }
+
+impl FloorMasterKey {
+    /// A fingerprint of the key material that names its send counter and reveals nothing of it: the
+    /// HMAC-SHA1 (RFC 2104) of a fixed label and the master salt, keyed by the master key.
+    ///
+    /// The GCM IV is derived from the master key and salt alone (RFC 7714 §11: the session salt comes
+    /// from them), so two keys with that material share an IV space whatever their MKIs say; the MKI is
+    /// therefore not part of it. Being a function of the key, it is the same on every node, so an HA
+    /// standby recognises a checkpointed counter without any secret being distributed; being an HMAC
+    /// under the key, it cannot be used to recover or test guesses at the key short of knowing it.
+    #[must_use]
+    pub fn fingerprint(&self) -> [u8; FINGERPRINT_LEN] {
+        use hmac::{Hmac, Mac};
+        // RFC 2104 zero-pads a key shorter than the block: the 64-octet key below is the same HMAC key
+        // as the 16 octets, and the fixed-size constructor cannot fail.
+        let mut block = GenericArray::<u8, aes_gcm::aead::consts::U64>::default();
+        block[..MASTER_KEY_LEN].copy_from_slice(&self.master_key);
+        let mut mac = <Hmac<sha1::Sha1> as Mac>::new(&block);
+        block.zeroize();
+        mac.update(b"siphon-rtp srtcp send index v1");
+        mac.update(&self.master_salt);
+        mac.finalize().into_bytes().into()
+    }
+}
+
+/// The length of [`FloorMasterKey::fingerprint`].
+pub const FINGERPRINT_LEN: usize = 20;
 
 impl Zeroize for FloorMasterKey {
     /// Overwrite the master key and salt with zeros. The MKI is wire data (RFC 3711 §3.1) and stays.
@@ -286,78 +594,12 @@ impl GcmSession {
     }
 }
 
-/// The replay windows of one key, one per sender SSRC, in a table of fixed size.
-struct ReplaySlots {
-    slots: [Option<(u32, ReplayWindow)>; MAX_REPLAY_SSRCS],
-    /// After an HA restore: windows of SSRCs first seen later start closed at this index.
-    resumed: Option<u64>,
-}
-
-impl ReplaySlots {
-    const fn new() -> Self {
-        Self {
-            slots: [None; MAX_REPLAY_SSRCS],
-            resumed: None,
-        }
-    }
-
-    /// The window of `ssrc` as it stands, or `None` when the table has no window for it and no free
-    /// slot to give it: the caller refuses the packet.
-    fn window_of(&self, ssrc: u32) -> Option<ReplayWindow> {
-        if let Some((_, window)) = self
-            .slots
-            .iter()
-            .flatten()
-            .find(|(known, _)| *known == ssrc)
-        {
-            return Some(*window);
-        }
-        if self.slots.iter().any(Option::is_none) {
-            let mut fresh = ReplayWindow::default();
-            if let Some(index) = self.resumed {
-                fresh.close_at(index);
-            }
-            return Some(fresh);
-        }
-        None
-    }
-
-    /// Keep `window` as the state of `ssrc`, after a packet authenticated. The slot was checked to be
-    /// there by [`Self::window_of`].
-    fn store(&mut self, ssrc: u32, window: ReplayWindow) {
-        let position = self
-            .slots
-            .iter()
-            .position(|slot| slot.is_some_and(|(known, _)| known == ssrc))
-            .or_else(|| self.slots.iter().position(Option::is_none));
-        if let Some(position) = position {
-            self.slots[position] = Some((ssrc, window));
-        }
-    }
-
-    /// The highest index recorded under any SSRC, for an HA checkpoint.
-    fn highest(&self) -> Option<u64> {
-        self.slots
-            .iter()
-            .flatten()
-            .filter_map(|(_, window)| window.highest())
-            .max()
-    }
-
-    /// Resume from a checkpoint: `index` and below count as received under every SSRC, known or not
-    /// yet seen (the checkpoint does not say which stream it came from).
-    fn close_at(&mut self, index: u64) {
-        for (_, window) in self.slots.iter_mut().flatten() {
-            window.close_at(index);
-        }
-        self.resumed = Some(index);
-    }
-}
-
 struct KeyEntry {
     master: FloorMasterKey,
     session: GcmSession,
     replay: ReplaySlots,
+    /// The send counter of this key (shared with every other holder of it).
+    counter: SendIndex,
 }
 
 impl Zeroize for KeyEntry {
@@ -402,17 +644,18 @@ fn same_material(a: &FloorMasterKey, b: &FloorMasterKey) -> bool {
 }
 
 impl KeyEntry {
-    fn new(master: FloorMasterKey) -> Self {
+    fn new(master: FloorMasterKey, counter: SendIndex) -> Self {
         Self {
             session: GcmSession::derive(&master),
             master,
             replay: ReplaySlots::new(),
+            counter,
         }
     }
 
-    /// Same key material, whatever the MKI: the entry (and its replay state) is the key's. The MKI
-    /// only selects a master key on the wire (RFC 3711 §3.2.1) and is not covered by the tag, so
-    /// replay state belongs to the material, never to the label.
+    /// Same key material, whatever the MKI: the entry (its replay state and its send counter) is the
+    /// key's. The MKI only selects a master key on the wire (RFC 3711 §3.2.1) and is not covered by
+    /// the tag, so state belongs to the material, never to the label.
     fn is_same_key(&self, other: &FloorMasterKey) -> bool {
         same_material(&self.master, other)
     }
@@ -423,9 +666,6 @@ impl KeyEntry {
 pub struct SrtcpGcmContext {
     /// Oldest first; the last entry is the sending key.
     keys: Vec<KeyEntry>,
-    send_index: u32,
-    /// True once the final index was used; protect refuses until it is reseeded (RFC 7714 §9.4).
-    exhausted: bool,
 }
 
 impl SrtcpGcmContext {
@@ -434,20 +674,38 @@ impl SrtcpGcmContext {
     /// slice, [`SrtpError::DuplicateMki`] when two keys share an MKI and
     /// [`SrtpError::DuplicateKeyMaterial`] when two keys are one key under two MKIs.
     pub fn new(keys: &[FloorMasterKey]) -> Result<Self, SrtpError> {
+        Self::with_counters(keys, |_| SendIndex::new())
+    }
+
+    /// [`Self::new`] with the send counter of each key supplied by `counter_of`, so that every
+    /// context sending under one key draws its indices from one [`SendIndex`] (RFC 7714 §8).
+    pub fn with_counters(
+        keys: &[FloorMasterKey],
+        counter_of: impl FnMut(&FloorMasterKey) -> SendIndex,
+    ) -> Result<Self, SrtpError> {
         let mut context = Self {
             keys: Vec::with_capacity(MAX_KEYS),
-            send_index: 0,
-            exhausted: false,
         };
-        context.replace_keys(keys)?;
+        context.replace_keys_with(keys, counter_of)?;
         Ok(context)
     }
 
     /// Replace the whole key set (same rules as [`Self::new`]). Keys that were already present with
     /// identical material keep their replay state; every other prior key is dropped together with
-    /// its replay state. The send index is kept: it only ever moves forward, so a new key never
-    /// sees a reused (key, index) pair either. On error the existing set is untouched.
+    /// its replay state. A key that is new starts at the index its own counter holds (0 for a key
+    /// nothing has sent under); the IV is per key, so another key's index is no constraint. On error
+    /// the existing set is untouched.
     pub fn replace_keys(&mut self, keys: &[FloorMasterKey]) -> Result<(), SrtpError> {
+        self.replace_keys_with(keys, |_| SendIndex::new())
+    }
+
+    /// [`Self::replace_keys`] with the send counter of each key that is new to the context supplied by
+    /// `counter_of`; a key already held keeps its own.
+    pub fn replace_keys_with(
+        &mut self,
+        keys: &[FloorMasterKey],
+        mut counter_of: impl FnMut(&FloorMasterKey) -> SendIndex,
+    ) -> Result<(), SrtpError> {
         let kept = &keys[keys.len().saturating_sub(MAX_KEYS)..];
         if kept.is_empty() {
             return Err(SrtpError::NoKeys);
@@ -462,12 +720,12 @@ impl SrtcpGcmContext {
         for master in kept {
             match self.keys.iter().position(|entry| entry.is_same_key(master)) {
                 Some(position) => {
-                    // The same key, possibly renamed: it keeps its replay state under the new MKI.
+                    // The same key, possibly renamed: it keeps its state under the new MKI.
                     let mut entry = self.keys.swap_remove(position);
                     entry.master.mki = master.mki;
                     next.push(entry);
                 }
-                None => next.push(KeyEntry::new(master.clone())),
+                None => next.push(KeyEntry::new(master.clone(), counter_of(master))),
             }
         }
         self.keys = next;
@@ -484,7 +742,7 @@ impl SrtcpGcmContext {
     /// index (a reused (key, index) pair reuses the GCM IV, RFC 7714 §9.4).
     #[must_use]
     pub fn send_index(&self) -> u32 {
-        self.send_index
+        self.keys.last().map_or(0, |entry| entry.counter.next())
     }
 
     /// The highest SRTCP index that authenticated under each held key, as `(mki, index)`, for an HA
@@ -509,11 +767,13 @@ impl SrtcpGcmContext {
         }
     }
 
-    /// Resume the outgoing index from a checkpoint (masked to 31 bits). Callers pass the value
+    /// Raise the sending key's outgoing index to a checkpoint's (masked to 31 bits); it never lowers,
+    /// because an index already sent must not be sent again (RFC 7714 §9.4). Callers pass the value
     /// [`Self::send_index`] returned, plus any safety margin they want.
     pub fn set_send_index(&mut self, index: u32) {
-        self.send_index = index & INDEX_MASK;
-        self.exhausted = false;
+        if let Some(entry) = self.keys.last() {
+            entry.counter.raise_to(index & INDEX_MASK);
+        }
     }
 
     /// Protect a compound RTCP packet with the sending key into `out`
@@ -531,20 +791,16 @@ impl SrtcpGcmContext {
         if rtcp[0] >> 6 != 2 {
             return Err(SrtpError::BadVersion);
         }
-        if self.exhausted {
-            return Err(SrtpError::IndexExhausted);
-        }
         let Some(entry) = self.keys.last() else {
             return Err(SrtpError::NoKeys);
         };
-        let index = self.send_index;
+        // RFC 7714 §9.4: the last index is the last; the counter stops there.
+        let index = entry.counter.take().map_err(|refused| match refused {
+            SendRefused::Exhausted => SrtpError::IndexExhausted,
+            SendRefused::LeaseReached => SrtpError::SendLeaseReached,
+        })?;
         entry.session.seal(rtcp, encrypt, index, out)?;
         out.extend_from_slice(&entry.master.mki.to_be_bytes());
-        if index == LAST_INDEX {
-            self.exhausted = true;
-        } else {
-            self.send_index = index + 1;
-        }
         Ok(())
     }
 
@@ -726,7 +982,7 @@ mod tests {
 
     #[test]
     fn zeroize_clears_every_stored_copy_in_a_key_entry() {
-        let mut entry = KeyEntry::new(master(1, 0x11));
+        let mut entry = KeyEntry::new(master(1, 0x11), SendIndex::new());
         entry.zeroize();
         assert_eq!(entry.master.master_key, [0u8; 16]);
         assert_eq!(entry.master.master_salt, [0u8; MASTER_SALT_LEN]);
@@ -736,7 +992,7 @@ mod tests {
     #[test]
     fn dropping_a_key_entry_wipes_it_first() {
         clear_wiped();
-        drop(KeyEntry::new(master(0x42, 0x11)));
+        drop(KeyEntry::new(master(0x42, 0x11), SendIndex::new()));
         assert_eq!(wiped(), vec![(0x42, true)]);
     }
 
@@ -1044,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn send_index_is_monotonic_settable_and_never_wraps() {
+    fn send_index_is_monotonic_raise_only_and_never_wraps() {
         let mut context = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
         let mut wire = Vec::new();
         context.protect(&rtcp(1), true, &mut wire).expect("protect");
@@ -1058,9 +1314,17 @@ mod tests {
             context.protect(&rtcp(1), true, &mut wire),
             Err(SrtpError::IndexExhausted)
         );
+        // An index that went out is never offered again: a checkpoint cannot lower the counter.
         context.set_send_index(10);
-        context.protect(&rtcp(1), true, &mut wire).expect("resumed");
-        assert_eq!(context.send_index(), 11);
+        assert_eq!(
+            context.protect(&rtcp(1), true, &mut wire),
+            Err(SrtpError::IndexExhausted)
+        );
+        let mut fresh = SrtcpGcmContext::new(&[master(1, 1)]).expect("ctx");
+        fresh.set_send_index(10);
+        fresh.set_send_index(4);
+        fresh.protect(&rtcp(1), true, &mut wire).expect("resumed");
+        assert_eq!(fresh.send_index(), 11);
     }
 
     #[test]
@@ -1122,6 +1386,54 @@ mod tests {
             dump.push_str(&format!("{byte:02x} "));
         }
         std::fs::write(path, dump + "\n").expect("write");
+    }
+
+    /// The index a sealed packet carries (the `E|index` word before the MKI).
+    fn index_of(wire: &[u8]) -> u32 {
+        let at = wire.len() - MKI_LEN - ESRTCP_LEN;
+        u32::from_be_bytes([wire[at], wire[at + 1], wire[at + 2], wire[at + 3]]) & INDEX_MASK
+    }
+
+    #[test]
+    fn contexts_sharing_a_counter_never_send_one_index_twice() {
+        let shared = SendIndex::new();
+        let key = master(1, 1);
+        let mut first =
+            SrtcpGcmContext::with_counters(std::slice::from_ref(&key), |_| shared.clone())
+                .expect("ctx");
+        let mut second =
+            SrtcpGcmContext::with_counters(std::slice::from_ref(&key), |_| shared.clone())
+                .expect("ctx");
+        let mut wire = Vec::new();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            first.protect(&rtcp(7), true, &mut wire).expect("protect");
+            seen.push(index_of(&wire));
+            second.protect(&rtcp(7), true, &mut wire).expect("protect");
+            seen.push(index_of(&wire));
+        }
+        assert_eq!(seen, (0..8).collect::<Vec<_>>());
+        assert_eq!(first.send_index(), 8);
+        assert_eq!(shared.holders(), 3);
+    }
+
+    #[test]
+    fn a_new_key_draws_from_its_own_counter_and_a_kept_key_keeps_its_own() {
+        let (one, two) = (master(1, 1), master(2, 2));
+        let mut context = SrtcpGcmContext::new(std::slice::from_ref(&one)).expect("ctx");
+        let mut wire = Vec::new();
+        context.protect(&rtcp(1), true, &mut wire).expect("protect");
+        context.protect(&rtcp(1), true, &mut wire).expect("protect");
+        context.replace_keys(&[one.clone(), two]).expect("rekey");
+        context.protect(&rtcp(1), true, &mut wire).expect("protect");
+        assert_eq!(
+            index_of(&wire),
+            0,
+            "the IV is per key: the new key starts at its own 0"
+        );
+        context.replace_keys(&[one]).expect("back");
+        context.protect(&rtcp(1), true, &mut wire).expect("protect");
+        assert_eq!(index_of(&wire), 2, "the first key goes on where it stopped");
     }
 
     #[test]
@@ -1252,6 +1564,32 @@ mod tests {
     }
 
     #[test]
+    fn the_fingerprint_names_the_key_material_and_not_its_mki_and_reveals_no_key_bytes() {
+        let key = master(1, 0x41);
+        let print = key.fingerprint();
+        assert_eq!(
+            print,
+            master(1, 0x41).fingerprint(),
+            "stable: the same on every node"
+        );
+        let mut renamed = master(1, 0x41);
+        renamed.mki = 99;
+        assert_eq!(
+            print,
+            renamed.fingerprint(),
+            "one IV space whatever the MKI says"
+        );
+        assert_ne!(print, master(1, 0x42).fingerprint());
+        let mut salted = master(1, 0x41);
+        salted.master_salt[0] ^= 1;
+        assert_ne!(print, salted.fingerprint());
+        assert!(!print
+            .windows(4)
+            .any(|window| key.master_key.windows(4).any(|part| part == window)));
+        assert_eq!(print.len(), FINGERPRINT_LEN);
+    }
+
+    #[test]
     fn one_key_under_two_mkis_in_a_set_is_refused() {
         let key = master(1, 0x41);
         let mut alias = master(1, 0x41);
@@ -1297,5 +1635,130 @@ mod tests {
             receiver.unprotect(&wire, &mut out),
             Err(SrtpError::UnknownMki)
         );
+    }
+
+    #[test]
+    fn a_counter_with_a_lease_stops_at_it_until_the_lease_is_extended() {
+        let counter = SendIndex::new();
+        assert_eq!(counter.lease(), None, "no lease until one is given");
+        counter.lease_to(3);
+        assert_eq!(counter.lease(), Some(3));
+        assert_eq!(
+            (counter.take(), counter.take(), counter.take()),
+            (Ok(0), Ok(1), Ok(2))
+        );
+        let at_lease = counter.snapshot().0;
+        for _ in 0..1000 {
+            assert_eq!(counter.take(), Err(SendRefused::LeaseReached));
+        }
+        assert_eq!(
+            counter.snapshot().0,
+            at_lease,
+            "a refused take changes nothing"
+        );
+        counter.lease_to(5);
+        assert_eq!(counter.take(), Ok(3));
+        assert_eq!(counter.take(), Ok(4));
+        assert_eq!(counter.take(), Err(SendRefused::LeaseReached));
+        // A lease never shortens.
+        counter.lease_to(4);
+        assert_eq!(counter.lease(), Some(5));
+    }
+
+    #[test]
+    fn a_take_that_read_the_state_before_a_checkpoint_cannot_commit_after_it() {
+        // The race, forced: a taker reads the unleased state and pauses; a checkpoint reads index 5 and
+        // leases to 5 + 10; the senders use the window up; the paused taker then tries to commit. With
+        // separate index and limit it would hand out 15, the standby's first index.
+        let counter = SendIndex::new();
+        counter.raise_to(5);
+        let paused = counter.snapshot();
+        assert_eq!(counter.checkpoint(10), 5);
+        for expected in 5..15 {
+            assert_eq!(counter.take(), Ok(expected));
+        }
+        assert_eq!(
+            counter.commit_take(paused),
+            Ok(None),
+            "the stale swap fails"
+        );
+        assert_eq!(counter.take(), Err(SendRefused::LeaseReached));
+        assert_eq!(
+            counter.next(),
+            15,
+            "nothing was handed out at or past the lease"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_reads_the_index_and_sets_the_lease_in_one_step() {
+        // Whatever the counter holds when the checkpoint runs, the lease is exactly that plus margin.
+        let counter = SendIndex::new();
+        for _ in 0..7 {
+            counter.take().unwrap();
+        }
+        let exported = counter.checkpoint(100);
+        assert_eq!(exported, 7);
+        assert_eq!(counter.lease(), Some(107));
+        // Taking after the checkpoint never gets past what it granted, however many threads race it.
+        let counter = std::sync::Arc::new(counter);
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    (0..200)
+                        .filter_map(|_| counter.take().ok())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<u32> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            (7..107).collect::<Vec<_>>(),
+            "exactly the leased window, once each"
+        );
+    }
+
+    #[test]
+    fn seeding_raises_and_leases_in_one_step_and_never_lowers() {
+        let counter = SendIndex::new();
+        counter.seed(100, 150);
+        assert_eq!((counter.next(), counter.lease()), (100, Some(150)));
+        counter.seed(10, 20);
+        assert_eq!((counter.next(), counter.lease()), (100, Some(150)));
+    }
+
+    #[test]
+    fn a_leased_context_refuses_to_seal_at_the_bound_and_goes_on_when_extended() {
+        let shared = SendIndex::new();
+        shared.lease_to(2);
+        let mut context =
+            SrtcpGcmContext::with_counters(&[master(1, 1)], |_| shared.clone()).expect("ctx");
+        let mut wire = Vec::new();
+        context.protect(&rtcp(1), true, &mut wire).expect("0");
+        context.protect(&rtcp(1), true, &mut wire).expect("1");
+        assert_eq!(
+            context.protect(&rtcp(1), true, &mut wire),
+            Err(SrtpError::SendLeaseReached)
+        );
+        shared.lease_to(10);
+        context.protect(&rtcp(1), true, &mut wire).expect("2");
+        assert_eq!(index_of(&wire), 2);
+    }
+
+    #[test]
+    fn a_counter_that_is_hammered_past_the_end_never_wraps_to_zero() {
+        let counter = SendIndex::new();
+        counter.raise_to(MAX_SEND_INDEX);
+        assert_eq!(counter.take(), Ok(MAX_SEND_INDEX));
+        for _ in 0..100_000 {
+            assert_eq!(counter.take(), Err(SendRefused::Exhausted));
+        }
+        assert_eq!(counter.next(), MAX_SEND_INDEX + 1);
     }
 }

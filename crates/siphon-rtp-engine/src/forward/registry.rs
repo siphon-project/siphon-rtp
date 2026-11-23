@@ -202,9 +202,21 @@ pub struct ForwardRegistry {
     /// Seat endpoint to the owning room's mailbox: the redirect dispatcher's routing table.
     routes: DashMap<EndpointId, flume::Sender<ForwardInput>>,
     rooms: DashMap<String, Handle>,
+    /// The SRTCP send-index ledger every room's seats draw from (RFC 7714 §8), shared with the other
+    /// registries of the engine so a key never repeats an index across rooms.
+    ledger: std::sync::Arc<crate::srtcp_ledger::SrtcpLedger>,
 }
 
 impl ForwardRegistry {
+    /// A registry whose rooms draw their SRTCP send indices from `ledger`.
+    #[must_use]
+    pub fn with_ledger(ledger: std::sync::Arc<crate::srtcp_ledger::SrtcpLedger>) -> Self {
+        Self {
+            ledger,
+            ..Self::default()
+        }
+    }
+
     /// Whether `endpoint` is a forwarding seat's (the dispatcher's predicate).
     #[must_use]
     pub fn owns(&self, endpoint: EndpointId) -> bool {
@@ -428,7 +440,11 @@ impl ForwardRegistry {
         let mailbox = {
             let mut room = self.rooms.entry(room_id.to_string()).or_insert_with(|| {
                 let (mailbox, inbox) = flume::bounded(MAILBOX_CAPACITY);
-                let room = ForwardRoom::new(room_id.to_string(), proposed.clone());
+                let room = ForwardRoom::with_ledger(
+                    room_id.to_string(),
+                    proposed.clone(),
+                    self.ledger.clone(),
+                );
                 let task = tokio::spawn(run_forward_room(room, inbox, datapath));
                 Handle {
                     mailbox,

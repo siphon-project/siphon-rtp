@@ -48,6 +48,11 @@ pub struct LiveGauges {
     /// overflowed, or a leg frame could not be decoded for the tee — the calls themselves are never
     /// affected, so this is the metric that distinguishes "the stream is thin" from "the call is bad".
     pub ws_tee_frames_dropped: u64,
+    /// Keys with an SRTCP send-index counter in the engine-wide ledger.
+    pub srtcp_ledger_entries: u64,
+    /// SRTCP seals refused because a key reached the end of its checkpoint lease, over this
+    /// process's lifetime.
+    pub srtcp_lease_refused: u64,
 }
 
 /// Process-wide operational counters and gauges, shared via `Arc`.
@@ -424,6 +429,20 @@ impl Metrics {
         );
         metric(
             &mut output,
+            "siphon_rtp_srtcp_ledger_entries",
+            "Keys with an SRTCP send-index counter in the engine-wide ledger (RFC 7714 section 8).",
+            "gauge",
+            live.srtcp_ledger_entries,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_srtcp_lease_refused_total",
+            "SRTCP seals refused because a key reached the end of its checkpoint lease.",
+            "counter",
+            live.srtcp_lease_refused,
+        );
+        metric(
+            &mut output,
             "siphon_rtp_jemalloc_allocated_bytes",
             "Live bytes allocated, per jemalloc stats.allocated.",
             "gauge",
@@ -778,6 +797,8 @@ mod tests {
                 ws_bridges: 3,
                 ws_tee_frames_sent: 1500,
                 ws_tee_frames_dropped: 7,
+                srtcp_ledger_entries: 11,
+                srtcp_lease_refused: 4,
             },
             4096,
         );
@@ -788,6 +809,12 @@ mod tests {
             .contains("# TYPE siphon_rtp_conference_rooms gauge\nsiphon_rtp_conference_rooms 5\n"));
         assert!(body.contains("# TYPE siphon_rtp_ws_tees gauge\nsiphon_rtp_ws_tees 2\n"));
         assert!(body.contains("# TYPE siphon_rtp_ws_bridges gauge\nsiphon_rtp_ws_bridges 3\n"));
+        assert!(body.contains(
+            "# TYPE siphon_rtp_srtcp_ledger_entries gauge\nsiphon_rtp_srtcp_ledger_entries 11\n"
+        ));
+        assert!(body.contains(
+            "# TYPE siphon_rtp_srtcp_lease_refused_total counter\nsiphon_rtp_srtcp_lease_refused_total 4\n"
+        ));
         assert!(body.contains(
             "# TYPE siphon_rtp_ws_tee_frames_dropped_total counter\nsiphon_rtp_ws_tee_frames_dropped_total 7\n"
         ));
@@ -840,9 +867,9 @@ mod tests {
         }
         assert!(body.contains("# TYPE siphon_rtp_scoped_offers_total counter\n"));
         assert!(body.contains("siphon_rtp_scoped_offers_total 0\n"));
-        // Every series carries a HELP + TYPE line (34 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 34);
-        assert_eq!(body.matches("# TYPE ").count(), 34);
+        // Every series carries a HELP + TYPE line (36 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 36);
+        assert_eq!(body.matches("# TYPE ").count(), 36);
     }
 
     #[test]
@@ -864,8 +891,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (33 vs 34).
-        assert_eq!(body.matches("# TYPE ").count(), 33);
+        // One fewer series than the CPU-present case (35 vs 36).
+        assert_eq!(body.matches("# TYPE ").count(), 35);
     }
 
     #[test]

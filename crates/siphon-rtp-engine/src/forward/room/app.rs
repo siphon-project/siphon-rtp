@@ -25,6 +25,7 @@ use crate::app_events::{surface_app_to_queue, AppEventQueue, AppScope};
 use crate::floor_srtcp::{self, FloorDrop, FloorProtection};
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::OpaqueLatch;
+use crate::srtcp_ledger::SrtcpLedger;
 
 /// The floor endpoint of a seat, as the engine resolves it from the offer.
 pub struct FloorConfig {
@@ -55,7 +56,7 @@ pub(super) struct FloorStream {
 }
 
 impl FloorStream {
-    pub(super) fn new(config: FloorConfig) -> Self {
+    pub(super) fn new(config: FloorConfig, ledger: &std::sync::Arc<SrtcpLedger>) -> Self {
         Self {
             endpoint: config.endpoint,
             destination: config.destination,
@@ -63,7 +64,7 @@ impl FloorStream {
             ice_gated: config.ice_gated,
             latch: OpaqueLatch::default(),
             refusals: RefusalLog::default(),
-            protection: FloorProtection::new(&config.keys),
+            protection: FloorProtection::new(&config.keys, ledger),
         }
     }
 
@@ -419,7 +420,7 @@ impl ForwardRoom {
         }
         match floor.protection.as_mut() {
             Some(protection) => protection.replace_keys(keys),
-            None => FloorProtection::new(keys)
+            None => FloorProtection::new(keys, &self.ledger)
                 .map(|protection| floor.protection = Some(protection))
                 .ok_or(siphon_rtp_srtp::SrtpError::NoKeys),
         }

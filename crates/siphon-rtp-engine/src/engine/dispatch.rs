@@ -480,6 +480,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             Command::Checkpoint { call_id, .. } => self.checkpoint(client, &call_id).await,
             Command::Restore { snapshot } => self.restore(client, &snapshot).await,
+            Command::CheckpointSrtcpIndices => self.checkpoint_srtcp_indices(client),
+            Command::RestoreSrtcpIndices { snapshot } => self.restore_srtcp_indices(&snapshot),
+            Command::ConfirmSrtcpIndices { generation } => self.confirm_srtcp_indices(&generation),
             Command::Offer {
                 call_id,
                 from_tag,
@@ -1041,6 +1044,9 @@ pub(super) fn command_name(command: &Command) -> &'static str {
         Command::Undrain => "undrain",
         Command::Checkpoint { .. } => "checkpoint",
         Command::Restore { .. } => "restore",
+        Command::CheckpointSrtcpIndices => "checkpoint_srtcp_indices",
+        Command::RestoreSrtcpIndices { .. } => "restore_srtcp_indices",
+        Command::ConfirmSrtcpIndices { .. } => "confirm_srtcp_indices",
         Command::PlayMedia { .. } => "play_media",
         Command::StopMedia { .. } => "stop_media",
         Command::SetPlayGain { .. } => "set_play_gain",
@@ -1165,6 +1171,9 @@ pub(super) fn command_call_id(command: &Command) -> Option<&str> {
         | Command::Drain
         | Command::Undrain
         | Command::Restore { .. }
+        | Command::CheckpointSrtcpIndices
+        | Command::RestoreSrtcpIndices { .. }
+        | Command::ConfirmSrtcpIndices { .. }
         | Command::Authenticate { .. } => None,
         // [`Command`] is `#[non_exhaustive]`. A correct no-op: this function only picks the
         // correlation id for the control log line, and there is no field to read on a variant this

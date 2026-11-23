@@ -269,6 +269,11 @@ fn build_features() -> Vec<String> {
         // `forward_keyframe` event: the payload is encrypted. A controller gates preserve-room video
         // on this entry.
         "forward_video_preserve".to_string(),
+        // Every key SRTCP is sent under has one engine-wide send-index counter (a keyed fingerprint of
+        // the key material), so no (key, SSRC, index) repeats across seats, rooms, calls, rejoins,
+        // rekeys or streams (RFC 7714 §8). `checkpoint_srtcp_indices` and `restore_srtcp_indices` carry
+        // the counters across a failover. A controller gates relying on them on this entry.
+        "srtcp_index_ledger".to_string(),
         // A two-party relayed call anchors an offered `m=video` stream when the profile says
         // `video_relay: anchor`: an endpoint pair per leg, the gated latch, RTCP and direction
         // attributes respected, plain RTP. A controller gates sending `video_relay` on this entry.

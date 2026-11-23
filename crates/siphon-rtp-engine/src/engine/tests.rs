@@ -79,6 +79,7 @@ mod record_call_streams;
 mod record_handover;
 mod record_takeover;
 mod redirect_after_register;
+mod srtcp_ledger;
 mod stream_identity;
 mod tee_sendonly;
 mod tee_undecodable;

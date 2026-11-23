@@ -70,6 +70,11 @@ pub enum SrtpError {
     /// same key, so nothing more is protected until the keys are replaced or the index reseeded.
     #[error("SRTCP index exhausted")]
     IndexExhausted,
+    /// The send index reached its lease: a checkpoint of the index ledger bounds how far a key may send
+    /// before the next one, so that a standby seeded from it cannot be overtaken (RFC 7714 §8). Nothing
+    /// is sent under the key until the lease is extended.
+    #[error("SRTCP send lease reached")]
+    SendLeaseReached,
     /// An SRTCP packet names a sender SSRC the key has no replay window for and no free slot to give
     /// it (RFC 3711 §3.2.3: the replay list is per SSRC). It is refused rather than sharing another
     /// SSRC's window, which would let one stream's indices replay or shadow the other's.

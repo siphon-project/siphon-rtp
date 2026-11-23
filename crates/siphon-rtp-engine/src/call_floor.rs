@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
@@ -29,6 +29,7 @@ use crate::floor_srtcp::{self, FloorDrop, FloorProtection};
 use crate::forward::AppRequest;
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
 use crate::reply_latch::OpaqueLatch;
+use crate::srtcp_ledger::SrtcpLedger;
 
 /// Datagrams and control operations the actor's mailbox holds before it sheds datagrams.
 const MAILBOX_CAPACITY: usize = 4096;
@@ -152,6 +153,8 @@ pub enum CallFloorError {
 /// The synchronous core: every call's floor legs, ingress and the packet builder. No sockets.
 #[derive(Default)]
 pub struct CallFloors {
+    /// The send-index counters of the keys the legs send SRTCP under, shared engine-wide.
+    ledger: Arc<SrtcpLedger>,
     legs: HashMap<EndpointId, Leg>,
     scratch: Vec<u8>,
     /// The protected form of the packet just built for a keyed leg.
@@ -159,9 +162,18 @@ pub struct CallFloors {
 }
 
 impl CallFloors {
+    /// A core whose legs draw their SRTCP send indices from `ledger` (RFC 7714 §8).
+    #[must_use]
+    pub fn with_ledger(ledger: Arc<SrtcpLedger>) -> Self {
+        Self {
+            ledger,
+            ..Self::default()
+        }
+    }
+
     /// Add a leg. A second registration for the endpoint replaces the first.
     pub fn register(&mut self, mut config: CallFloorLeg) {
-        let mut protection = FloorProtection::new(&config.keys);
+        let mut protection = FloorProtection::new(&config.keys, &self.ledger);
         let restore = config.restore.take();
         let latch = match restore {
             Some(FloorRestore {
@@ -218,9 +230,10 @@ impl CallFloors {
                 .replace_keys(keys)
                 .map_err(|error| CallFloorError::Keys(error.to_string())),
             None => {
-                leg.protection = Some(FloorProtection::new(keys).ok_or_else(|| {
-                    CallFloorError::Keys("the key set could not be applied".to_string())
-                })?);
+                leg.protection =
+                    Some(FloorProtection::new(keys, &self.ledger).ok_or_else(|| {
+                        CallFloorError::Keys("the key set could not be applied".to_string())
+                    })?);
                 Ok(())
             }
         }
@@ -429,9 +442,20 @@ pub struct CallFloorRegistry {
     /// registered only once the far party answers). Dropped with the call.
     offer_keys: DashMap<String, Vec<FloorMasterKey>>,
     mailbox: OnceLock<flume::Sender<Input>>,
+    /// The engine-wide SRTCP send-index ledger the actor's legs draw from.
+    ledger: Arc<SrtcpLedger>,
 }
 
 impl CallFloorRegistry {
+    /// A registry whose legs draw their SRTCP send indices from `ledger`.
+    #[must_use]
+    pub fn with_ledger(ledger: Arc<SrtcpLedger>) -> Self {
+        Self {
+            ledger,
+            ..Self::default()
+        }
+    }
+
     /// Whether `endpoint` is a call's floor endpoint (the dispatcher's predicate).
     #[must_use]
     pub fn owns(&self, endpoint: EndpointId) -> bool {
@@ -457,7 +481,11 @@ impl CallFloorRegistry {
     fn mailbox<D: Datapath + Clone + Send + 'static>(&self, datapath: &D) -> &flume::Sender<Input> {
         self.mailbox.get_or_init(|| {
             let (mailbox, inbox) = flume::bounded(MAILBOX_CAPACITY);
-            tokio::spawn(run_call_floors(inbox, datapath.clone()));
+            tokio::spawn(run_call_floors(
+                inbox,
+                datapath.clone(),
+                Arc::clone(&self.ledger),
+            ));
             mailbox
         })
     }
@@ -630,8 +658,12 @@ impl CallFloorRegistry {
     }
 }
 
-async fn run_call_floors<D: Datapath>(inbox: flume::Receiver<Input>, datapath: D) {
-    let mut floors = CallFloors::default();
+async fn run_call_floors<D: Datapath>(
+    inbox: flume::Receiver<Input>,
+    datapath: D,
+    ledger: Arc<SrtcpLedger>,
+) {
+    let mut floors = CallFloors::with_ledger(ledger);
     while let Ok(input) = inbox.recv_async().await {
         match input {
             Input::Packet(packet) => {
@@ -908,7 +940,8 @@ mod tests {
             .unwrap();
         let (_, _, wire) = floors.build("call-1", "tag-a", &granted()).unwrap();
         assert_eq!(wire[wire.len() - 4..], 6u32.to_be_bytes());
-        assert_eq!(floors.key_state("call-1", "tag-a").unwrap().1, 2);
+        // The newest key is another key: its index space is its own (RFC 7714 §8), so it counts from 0.
+        assert_eq!(floors.key_state("call-1", "tag-a").unwrap().1, 1);
         assert!(matches!(
             floors.set_keys("call-1", "nobody", &[floor_key(1)]),
             Err(CallFloorError::UnknownLeg { .. })
@@ -995,5 +1028,88 @@ mod tests {
             floors.ingest(&rx(7, "192.0.2.1:4100", &FLOOR_REQUEST)),
             Ingress::Refused
         );
+    }
+
+    /// The index of a sealed datagram, and the SSRC in its clear header.
+    fn ssrc_and_index(datagram: &[u8]) -> (u32, u32) {
+        let word = u32::from_be_bytes(
+            datagram[datagram.len() - 8..datagram.len() - 4]
+                .try_into()
+                .unwrap(),
+        );
+        (
+            u32::from_be_bytes(datagram[4..8].try_into().unwrap()),
+            word & 0x7FFF_FFFF,
+        )
+    }
+
+    fn sealed_for(floors: &mut CallFloors, tag: &str) -> (u32, u32) {
+        let (_, _, datagram) = floors.build("call-1", tag, &granted()).unwrap();
+        ssrc_and_index(datagram)
+    }
+
+    #[test]
+    fn two_legs_under_one_key_and_one_ssrc_never_repeat_an_index() {
+        // The controller gives both parties of a call the same key and names the same SSRC: the legs
+        // are two senders under one key (RFC 7714 §8).
+        let events = queue();
+        let mut floors = CallFloors::default();
+        for (endpoint, tag) in [(7, "tag-a"), (8, "tag-b")] {
+            let mut keyed = leg(endpoint, tag, &events);
+            keyed.keys = vec![floor_key(5)];
+            floors.register(keyed);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..3 {
+            for tag in ["tag-a", "tag-b"] {
+                assert!(seen.insert(sealed_for(&mut floors, tag)), "{seen:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_leg_registered_again_or_unkeyed_and_keyed_again_continues_the_index() {
+        let events = queue();
+        let mut floors = CallFloors::default();
+        let keyed = |events: &AppEventQueue| {
+            let mut keyed = leg(7, "tag-a", events);
+            keyed.keys = vec![floor_key(5)];
+            keyed
+        };
+        floors.register(keyed(&events));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2 {
+            assert!(seen.insert(sealed_for(&mut floors, "tag-a")));
+        }
+        // A second registration for the endpoint replaces the first.
+        floors.register(keyed(&events));
+        for _ in 0..2 {
+            assert!(seen.insert(sealed_for(&mut floors, "tag-a")), "{seen:?}");
+        }
+        floors.set_keys("call-1", "tag-a", &[]).unwrap();
+        floors.set_keys("call-1", "tag-a", &[floor_key(5)]).unwrap();
+        for _ in 0..2 {
+            assert!(seen.insert(sealed_for(&mut floors, "tag-a")), "{seen:?}");
+        }
+    }
+
+    #[test]
+    fn a_restored_leg_raises_the_shared_counter_for_every_other_leg_of_the_key() {
+        let events = queue();
+        let ledger: Arc<SrtcpLedger> = Arc::default();
+        let mut floors = CallFloors::with_ledger(ledger.clone());
+        let mut restored = leg(7, "tag-a", &events);
+        restored.keys = vec![floor_key(5)];
+        restored.restore = Some(FloorRestore {
+            latched: None,
+            send_index: 1000,
+            received: Vec::new(),
+        });
+        floors.register(restored);
+        let mut other = leg(8, "tag-b", &events);
+        other.keys = vec![floor_key(5)];
+        floors.register(other);
+        assert_eq!(sealed_for(&mut floors, "tag-b").1, 1000);
+        assert_eq!(ledger.counter_for(&floor_key(5)).next(), 1001);
     }
 }
