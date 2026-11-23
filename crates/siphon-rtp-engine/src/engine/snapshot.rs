@@ -647,17 +647,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .unwrap_or_default(),
         };
 
-        // A floor stream is terminated here, not relayed: its endpoint redirects to the call-floor
-        // actor, whichever way the audio is carried (the same flow `alloc_floor_endpoint` installs).
-        for floor in [near.floor, far.floor].into_iter().flatten() {
-            if let Err(error) = self.datapath.install_flow(floor.id, FlowAction::Redirect) {
-                return Err(boxed_error_result(
-                    "restore: redirect floor endpoint",
-                    &error,
-                ));
-            }
-        }
-
         // Install the datapath flows and resolve the crypto per pipeline.
         let media = match snapshot.pipeline {
             PipelineSnapshot::Passthrough => self.restore_relay_flows(&snapshot, bound)?,
@@ -679,6 +668,35 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (near_floor, far_floor) = (near.floor, far.floor);
         let restored_video = super::call_video::restored_call_video(&snapshot, &near)?;
         let video_flows = self.restore_video_flows(&snapshot, bound)?;
+        // A floor stream is terminated here, not relayed: its endpoint redirects to the call-floor
+        // actor, whichever way the audio is carried (the same flow `alloc_floor_endpoint` installs).
+        // The leg is registered first: its phone keeps sending to the rebound port, and the first
+        // datagram reaches the dispatcher the instant the `Redirect` lands.
+        let [near_prepared, far_prepared] = floors;
+        for (prepared, endpoint, tag) in [
+            (near_prepared, near_floor, Some(tags.0)),
+            (far_prepared, far_floor, tags.1),
+        ] {
+            if let (Some(prepared), Some(endpoint), Some(tag)) = (prepared, endpoint, tag) {
+                self.register_restored_floor(
+                    client,
+                    &snapshot.call_id,
+                    &tag,
+                    endpoint.id,
+                    prepared,
+                );
+                if let Err(error) = self
+                    .datapath
+                    .install_flow(endpoint.id, FlowAction::Redirect)
+                {
+                    self.conference.floors().deregister_call(&snapshot.call_id);
+                    return Err(boxed_error_result(
+                        "restore: redirect floor endpoint",
+                        &error,
+                    ));
+                }
+            }
+        }
         self.calls.insert(
             snapshot.call_id.clone(),
             Call {
@@ -816,23 +834,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.video.flows = video_flows.flows;
             call.video.bridged = video_flows.bridged;
         }
-        // The floor streams and the audio RTCP relay report to the controller that now owns the
-        // call, so they come up after it is registered.
-        let [near_prepared, far_prepared] = floors;
-        for (prepared, endpoint, tag) in [
-            (near_prepared, near_floor, Some(tags.0)),
-            (far_prepared, far_floor, tags.1),
-        ] {
-            if let (Some(prepared), Some(endpoint), Some(tag)) = (prepared, endpoint, tag) {
-                self.register_restored_floor(
-                    client,
-                    &snapshot.call_id,
-                    &tag,
-                    endpoint.id,
-                    prepared,
-                );
-            }
-        }
+        // The audio RTCP relay reports to the controller that now owns the call, so it comes up after
+        // the call is registered.
         if !rtcp_legs.is_empty() {
             self.media.rtcp_relays().register(
                 RtcpRelayCall::new(
@@ -941,10 +944,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 out_dst: plan.out_dst,
             });
         }
-        self.redirect_endpoints(
-            bound.iter().map(|(_, endpoint)| endpoint.id),
-            "restore: install SRTP bridge redirect",
-        )?;
         let mut leg = SecureLeg::new(&far_local.key, &far_remote.key);
         leg.seed_rollover(&restore_rollover(&secure.rollover));
         self.bridge.register(BridgeCallPlan {
@@ -952,6 +951,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_leg: Some(leg),
             flows: bridge_flows,
         });
+        // Redirected only once the flows (source gate and latch included) are registered, so the first
+        // datagram of the rebound ports finds its flow.
+        let redirected: Vec<EndpointId> = bound.iter().map(|(_, endpoint)| endpoint.id).collect();
+        self.redirect_registered(
+            redirected.iter().copied(),
+            "restore: install SRTP bridge redirect",
+            || self.bridge.deregister(redirected.iter().copied()),
+        )?;
         Ok(RestoredMedia {
             far_local_crypto: Some(far_local),
             far_remote_crypto: Some(far_remote),
@@ -1029,14 +1036,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         .map_err(|(direction, reason)| {
             boxed_error_result(&format!("restore: {pipeline} ({direction})"), &reason)
         })?;
-        // Redirect the RTP legs to the actor (rtcp-mux ⇒ RTCP rides them, (de)crypted inside).
-        self.redirect_endpoints(
-            [near.rtp.id, far.rtp.id],
-            &format!(
-                "restore: install {} redirect",
-                pipeline.trim_end_matches(" pipeline")
-            ),
-        )?;
+        // The RTP legs redirect to the actor (rtcp-mux ⇒ RTCP rides them, (de)crypted inside), once it
+        // is registered below.
+        let mut redirected = vec![near.rtp.id, far.rtp.id];
         let mut secure_parts = None;
         if let (Some((far_local, far_remote)), Some(secure_snapshot)) = (keys, secure_snapshot) {
             // Rebuild the shared SecureLeg and seed its rollover *before* wrapping it (the fresh leg
@@ -1050,10 +1052,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp), Some(b_rtcp)) =
                 (near.rtcp, far.rtcp, near.remote_rtcp, far.remote_rtcp)
             {
-                self.redirect_endpoints(
-                    [near_rtcp.id, far_rtcp.id],
-                    "restore: install secure media RTCP redirect",
-                )?;
+                redirected.extend([near_rtcp.id, far_rtcp.id]);
                 rtcp_relays = secure_rtcp_relays(
                     near_rtcp.id,
                     SourceFilter::Exact(a_rtcp.ip()),
@@ -1087,6 +1086,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         self.media
             .register(media_call, self.datapath.clone(), owner_events);
+        self.redirect_registered(
+            redirected,
+            &format!(
+                "restore: install {} redirect",
+                pipeline.trim_end_matches(" pipeline")
+            ),
+            || self.media.deregister(&snapshot.call_id),
+        )?;
         Ok(RestoredMedia {
             pipeline: if secure {
                 PipelineKind::SrtpMedia

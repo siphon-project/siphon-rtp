@@ -681,3 +681,37 @@ async fn a_reoffer_carrying_a_new_floor_key_is_refused_at_the_entry_cap() {
         .await;
     assert!(matches!(accepted, CmdResult::Ok { .. }), "{accepted:?}");
 }
+
+#[tokio::test]
+async fn a_restored_floor_stream_owns_its_endpoints_before_they_are_redirected() {
+    use super::redirect_after_register::{
+        assert_owned_at_redirect, recording_engine_over, Handler,
+    };
+    let range = (31_400u16, 31_440u16);
+    let primary = node(range.0, range.1);
+    let _events = primary.register_client(CLIENT);
+    let (a, b) = (party().await, party().await);
+    set_up(&primary, (&a, &b), (Vec::new(), Vec::new()), true).await;
+    let snapshot = checkpoint(&primary).await;
+    primary
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: CALL.into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    drop(primary);
+    let datapath = LatchLearningDatapath::over(UdpLoopbackDatapath::with_port_range(
+        bind(),
+        range.0,
+        range.1,
+    ));
+    let (standby, redirects) = recording_engine_over(datapath, Handler::Floor);
+    let _events = standby.register_client(CLIENT);
+    let restored = standby.handle(CLIENT, Command::Restore { snapshot }).await;
+    assert!(matches!(restored, CmdResult::Ok { .. }), "{restored:?}");
+    assert_owned_at_redirect(&redirects, "restored floor stream");
+}

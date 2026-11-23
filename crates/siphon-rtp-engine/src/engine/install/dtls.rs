@@ -175,19 +175,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             peer_fingerprint,
             self.datapath.watch_ice_validated(wiring.far.rtp.id),
         );
-        self.redirect_endpoints(
+        let redirected: Vec<siphon_rtp_datapath::EndpointId> =
             [wiring.near.rtp.id, wiring.far.rtp.id]
                 .into_iter()
-                .chain(plan.plain_rtcp.map(|rtcp| rtcp.endpoint)),
-            "install DTLS bridge redirect",
-        )?;
+                .chain(plan.plain_rtcp.map(|rtcp| rtcp.endpoint))
+                .collect();
         // On a renegotiation of a live call, keep the association already running and just re-point
         // it: B keeps its own (RFC 8842 §5.5 — the fingerprint did not change), so a fresh
         // registration would wait for a handshake that never comes.
         if !self.dtls_bridge().renegotiate(&plan) {
             self.dtls_bridge().register(plan);
         }
-        Ok(())
+        // Registered first: the first redirected datagram must find its association.
+        self.redirect_registered(
+            redirected.iter().copied(),
+            "install DTLS bridge redirect",
+            || {
+                self.dtls_bridge().deregister(redirected.iter().copied());
+            },
+        )
     }
 
     /// A terminated DTLS-SRTP **offerer** (A) toward a plain callee → the same userspace DTLS bridge
@@ -227,18 +233,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             role,
             self.datapath.watch_ice_validated(wiring.near.rtp.id),
         );
-        self.redirect_endpoints(
+        let redirected: Vec<siphon_rtp_datapath::EndpointId> =
             [wiring.near.rtp.id, wiring.far.rtp.id]
                 .into_iter()
-                .chain(plan.plain_rtcp.map(|rtcp| rtcp.endpoint)),
-            "install DTLS offerer bridge redirect",
-        )?;
+                .chain(plan.plain_rtcp.map(|rtcp| rtcp.endpoint))
+                .collect();
         // As for a DTLS far leg: a renegotiation that keeps A's association re-points it rather than
         // waiting for a handshake A will never start again (RFC 8842 §5.5).
         if !self.dtls_bridge().renegotiate(&plan) {
             self.dtls_bridge().register(plan);
         }
-        Ok(())
+        // Registered first: the first redirected datagram must find its association.
+        self.redirect_registered(
+            redirected.iter().copied(),
+            "install DTLS offerer bridge redirect",
+            || self.dtls_bridge().deregister(redirected.iter().copied()),
+        )
     }
 
     /// DTLS-SRTP far (B) leg whose media the pipeline must actually see — a different codec per side,
@@ -275,19 +285,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 boxed_error_result(&format!("DTLS media pipeline ({direction})"), &reason)
             },
         )?;
-        // Both endpoints go to `Redirect`. The dispatcher checks the bridge first, so B's datagrams
-        // reach the DTLS demux; A's fall through to the media registry.
-        self.redirect_endpoints([near.rtp.id, far.rtp.id], "install DTLS media redirect")?;
+        // Both endpoints go to `Redirect`, last, once the actor and the bridge own them. The dispatcher
+        // checks the bridge first, so B's datagrams reach the DTLS demux; A's fall through to the
+        // media registry.
+        let mut redirected = vec![near.rtp.id, far.rtp.id];
         // Non-muxed companion RTCP, keyed with the same deferred leg (RFC 3711 SRTCP on its own port,
         // RFC 5761). Pending until the handshake lands, like the RTP directions.
         let mut rtcp_relays = Vec::new();
         if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp)) =
             (near.rtcp, far.rtcp, near.remote_rtcp)
         {
-            self.redirect_endpoints(
-                [near_rtcp.id, far_rtcp.id],
-                "install DTLS media RTCP redirect",
-            )?;
+            redirected.extend([near_rtcp.id, far_rtcp.id]);
             rtcp_relays =
                 wiring.rtcp_relays(near_rtcp.id, far_rtcp.id, a_rtcp, &RtcpKeying::Pending);
         }
@@ -321,7 +329,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 },
             );
         }
-        Ok(())
+        self.redirect_registered(
+            redirected.iter().copied(),
+            "install DTLS media redirect",
+            || {
+                self.media.deregister(wiring.call_id);
+                self.dtls_bridge().deregister(redirected.iter().copied());
+            },
+        )
     }
 
     /// A terminated DTLS-SRTP **offerer** toward a plain callee whose call needs the decoded audio
@@ -359,12 +374,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 )
             },
         )?;
-        // Both endpoints go to `Redirect`. The dispatcher checks the bridge first, so A's datagrams
-        // reach the DTLS demux; B's fall through to the media registry.
-        self.redirect_endpoints(
-            [near.rtp.id, far.rtp.id],
-            "install DTLS offerer transcode redirect",
-        )?;
+        // Both endpoints go to `Redirect`, last, once the actor and the bridge own them. The dispatcher
+        // checks the bridge first, so A's datagrams reach the DTLS demux; B's fall through to the media
+        // registry.
+        let redirected = [near.rtp.id, far.rtp.id];
         let call = wiring.media_call(directions).with_caller_secure_pending();
         // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
         // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
@@ -392,6 +405,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 },
             );
         }
-        Ok(())
+        self.redirect_registered(
+            redirected,
+            "install DTLS offerer transcode redirect",
+            || {
+                self.media.deregister(wiring.call_id);
+                self.dtls_bridge().deregister(redirected);
+            },
+        )
     }
 }
