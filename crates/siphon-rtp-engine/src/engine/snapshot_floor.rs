@@ -95,8 +95,16 @@ fn resumed_send_index(checkpointed: u32) -> Option<u32> {
 
 /// Validate a snapshot's floor stream: the key set must decode and a keyed stream must have room
 /// for the index margin. Refuses with a reason; nothing is bound yet.
-pub(super) fn prepare(snapshot: &FloorSnapshot) -> Result<PreparedFloor, String> {
+///
+/// The keys are also installed in the SRTCP send-index `ledger` here, so a restore the ledger cannot
+/// take (its entry cap, `srtcp_ledger_max_entries`) is refused explicitly with the controller told,
+/// and binds nothing (RFC 7714 §8).
+pub(super) fn prepare(
+    snapshot: &FloorSnapshot,
+    ledger: &crate::srtcp_ledger::SrtcpLedger,
+) -> Result<PreparedFloor, String> {
     let keys = restore_keys(&snapshot.keys)?;
+    ledger.reserve(&keys).map_err(|error| error.to_string())?;
     let send_index = if keys.is_empty() {
         0
     } else {
@@ -228,7 +236,7 @@ mod tests {
 
     #[test]
     fn the_margin_moves_a_keyed_stream_past_the_checkpointed_index() {
-        let prepared = prepare(&snapshot(41, true)).unwrap();
+        let prepared = prepare(&snapshot(41, true), &Default::default()).unwrap();
         assert_eq!(prepared.send_index, 41 + SEND_INDEX_MARGIN);
         assert_eq!(prepared.keys[0].mki, 3);
         assert_eq!(prepared.keys[0].master_salt, [0x22; 14]);
@@ -238,23 +246,32 @@ mod tests {
     fn an_index_that_leaves_no_room_for_the_margin_refuses_instead_of_wrapping() {
         let last_that_fits = MAX_SEND_INDEX - SEND_INDEX_MARGIN;
         assert_eq!(
-            prepare(&snapshot(last_that_fits, true)).unwrap().send_index,
+            prepare(&snapshot(last_that_fits, true), &Default::default())
+                .unwrap()
+                .send_index,
             MAX_SEND_INDEX
         );
-        let error = prepare(&snapshot(last_that_fits + 1, true)).err().unwrap();
+        let error = prepare(&snapshot(last_that_fits + 1, true), &Default::default())
+            .err()
+            .unwrap();
         assert!(error.contains("RFC 7714"), "{error}");
         // The index of a stream in the clear means nothing and never refuses.
-        assert_eq!(prepare(&snapshot(u32::MAX, false)).unwrap().send_index, 0);
+        assert_eq!(
+            prepare(&snapshot(u32::MAX, false), &Default::default())
+                .unwrap()
+                .send_index,
+            0
+        );
     }
 
     #[test]
     fn a_malformed_key_refuses_the_restore() {
         let mut broken = snapshot(0, true);
         broken.keys[0].master_key_hex = "00".into();
-        assert!(prepare(&broken).is_err());
+        assert!(prepare(&broken, &Default::default()).is_err());
         let mut odd = snapshot(0, true);
         odd.keys[0].master_salt_hex = "abc".into();
-        assert!(prepare(&odd).is_err());
+        assert!(prepare(&odd, &Default::default()).is_err());
     }
 
     #[test]

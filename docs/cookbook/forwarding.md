@@ -639,6 +639,15 @@ The counters live in the engine's memory and are never dropped unless you set
 controller enforces on a client key, since a key reused after its counter was dropped repeats nonces
 (`siphon_rtp_srtcp_ledger_entries` counts them).
 
+The ledger is also capped, by `srtcp_ledger_max_entries` (TOML) or `--srtcp-ledger-max-entries`
+(default 100000, about 15 MB at roughly 150 bytes an entry). At the cap a **new** key is refused: the
+verb that carried it (`forward_join`, `forward_offer`, a dial-out, `offer`, `answer`, `answer_local`,
+`set_floor_keys`) fails with a "ledger is full" reason, an error is logged and
+`siphon_rtp_srtcp_ledger_install_refused_total` rises. A key the ledger already holds still installs, and
+no entry is ever evicted to make room (its key would restart at index 0). A `restore_srtcp_indices` blob
+that would take the ledger past the cap is refused whole. Alert on that counter; fix it by raising the
+cap or by setting `srtcp_ledger_retention_secs` so keys the controller no longer uses are released.
+
 Failover is fail-closed. The first `checkpoint_srtcp_indices` puts a lease on each counter (its index plus
 65536); every later one moves the lease only when you **store its blob and then send
 `confirm_srtcp_indices` with the blob's `generation`** (never before the blob is durably stored: a lost

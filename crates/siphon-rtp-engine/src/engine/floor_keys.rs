@@ -27,10 +27,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         keys: &[FloorKey],
         stream: RtcpAppStream,
     ) -> CmdResult {
-        let master = match crate::floor_srtcp::master_keys(keys) {
-            Ok(master) => master,
-            Err(reason) => return error_result("set_floor_keys", &reason),
-        };
+        let master =
+            match crate::floor_srtcp::master_keys_reserved(self.conference.srtcp_ledger(), keys) {
+                Ok(master) => master,
+                Err(reason) => return error_result("set_floor_keys", &reason),
+            };
         match (call_id, conference_id) {
             (Some(_), Some(_)) => error_result(
                 "set_floor_keys",

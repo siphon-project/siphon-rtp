@@ -2,7 +2,9 @@
 //! seat that leaves and rejoins carries on, and a standby seeded from a checkpoint starts a margin
 //! past the primary. The wire is read from what a phone receives.
 
-use super::forward_preserve::{engine_with_dispatcher, expect, keyed_seat, media_key, ROOM};
+use super::forward_preserve::{
+    engine_with_dispatcher, expect, join, keyed_seat, media_key, offer, set_media_keys, ROOM,
+};
 use super::*;
 use siphon_rtp_proto::{ForwardMedia, RtcpAppStream};
 
@@ -327,4 +329,101 @@ async fn confirming_a_generation_that_was_never_taken_or_that_another_node_issue
         )
         .await;
     assert_eq!(ok, ok_empty());
+}
+
+#[tokio::test]
+async fn a_forward_join_with_a_new_key_is_refused_at_the_entry_cap_and_an_existing_key_still_joins()
+{
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let ledger = engine.conference().srtcp_ledger().clone();
+    ledger.set_max_entries(1);
+    let (phone, _) = keyed_seat(&engine, "a", vec![media_key(1)]).await;
+    assert_eq!(app_index(&engine, &phone, "a").await, 0);
+
+    // A second client key is a new entry: the join fails with the reason, and counts.
+    let (_other, addr) = super::phone().await;
+    let refused = join(
+        &engine,
+        ForwardMedia::Preserve,
+        "b",
+        offer(addr, "RTP/SAVP", false, false),
+        ProfileFlags {
+            media_srtcp_keys: vec![media_key(2)],
+            ..ProfileFlags::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(&refused, CmdResult::Error { reason }
+            if reason.contains("forward_join") && reason.contains("ledger is full")),
+        "{refused:?}"
+    );
+    assert_eq!(ledger.len(), 1, "no entry was created or evicted");
+    assert_eq!(ledger.install_refused(), 1);
+    assert_eq!(
+        app_index(&engine, &phone, "a").await,
+        1,
+        "the live key was untouched"
+    );
+
+    // The same key material in another seat adds no entry, so it still joins and shares the counter.
+    let (second, _) = keyed_seat(&engine, "c", vec![media_key(1)]).await;
+    assert_eq!(app_index(&engine, &second, "c").await, 2);
+    assert_eq!(ledger.install_refused(), 1);
+}
+
+#[tokio::test]
+async fn a_restore_of_a_checkpoint_with_more_entries_than_the_cap_is_refused_whole() {
+    let primary = engine_with_dispatcher();
+    let _events = primary.register_client(CLIENT);
+    let (_a, _) = keyed_seat(&primary, "a", vec![media_key(1)]).await;
+    let (_b, _) = keyed_seat(&primary, "b", vec![media_key(2)]).await;
+    let blob = checkpoint(&primary).await;
+
+    let standby = engine_with_dispatcher();
+    let _events = standby.register_client(CLIENT);
+    let ledger = standby.conference().srtcp_ledger().clone();
+    ledger.set_max_entries(1);
+    let refused = standby
+        .handle(
+            CLIENT,
+            Command::RestoreSrtcpIndices {
+                snapshot: blob.clone(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(&refused, CmdResult::Error { reason }
+            if reason.contains("restore_srtcp_indices") && reason.contains("ledger is full")),
+        "{refused:?}"
+    );
+    assert_eq!(ledger.len(), 0, "not even part of it was imported");
+    ledger.set_max_entries(2);
+    let accepted = standby
+        .handle(CLIENT, Command::RestoreSrtcpIndices { snapshot: blob })
+        .await;
+    assert_eq!(accepted, ok_empty());
+    assert_eq!(ledger.len(), 2);
+}
+
+#[tokio::test]
+async fn set_floor_keys_with_a_new_key_is_refused_at_the_entry_cap_and_leaves_the_old_keys() {
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let ledger = engine.conference().srtcp_ledger().clone();
+    ledger.set_max_entries(1);
+    let (phone, _) = keyed_seat(&engine, "a", vec![media_key(1)]).await;
+    let refused = set_media_keys(&engine, None, "a", vec![media_key(2)]).await;
+    assert!(
+        matches!(&refused, CmdResult::Error { reason }
+            if reason.contains("set_floor_keys") && reason.contains("ledger is full")),
+        "{refused:?}"
+    );
+    assert_eq!(ledger.install_refused(), 1);
+    assert_eq!(
+        app_index(&engine, &phone, "a").await,
+        0,
+        "still under key 1"
+    );
 }

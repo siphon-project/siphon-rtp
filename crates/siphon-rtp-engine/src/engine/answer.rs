@@ -996,7 +996,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         sdp: &str,
         profile: &ProfileFlags,
     ) -> CmdResult {
-        if let Err(reason) = crate::media_pipeline::validate_profile(profile) {
+        if let Err(reason) = self.validate_and_reserve(profile) {
             return CmdResult::Error {
                 reason: format!("answer: {reason}"),
             };

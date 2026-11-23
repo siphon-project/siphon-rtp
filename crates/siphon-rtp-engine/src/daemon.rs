@@ -245,6 +245,15 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = 0)]
     pub srtcp_ledger_retention_secs: u64,
 
+    /// The most keys the SRTCP send-index ledger holds (one entry per distinct key material, about
+    /// 150 bytes each). At the cap a new key is refused: the verb that carries it (`forward_join`,
+    /// `forward_offer`, a dial-out, `offer`, `answer`, `answer_local`, `set_floor_keys`) fails and a
+    /// refused-install counter rises; a restore of a checkpoint that would pass it is refused whole.
+    /// An entry is never evicted to make room, because its key would restart at index 0 and repeat
+    /// AES-GCM nonces (RFC 7714 §8).
+    #[arg(long, default_value_t = crate::srtcp_ledger::DEFAULT_MAX_ENTRIES)]
+    pub srtcp_ledger_max_entries: usize,
+
     /// Bounded grace period (seconds) to drain live calls on SIGTERM/SIGINT before exiting. The
     /// daemon stops accepting new control connections immediately, then waits up to this long for
     /// the live session count to reach 0.
@@ -427,6 +436,8 @@ pub struct RunConfig {
     pub forward_room_idle_secs: u64,
     /// Drop an unheld SRTCP send-index ledger entry after this many seconds; `0` never drops one.
     pub srtcp_ledger_retention_secs: u64,
+    /// The most keys the SRTCP send-index ledger holds; a new key past it is refused.
+    pub srtcp_ledger_max_entries: usize,
     /// Bounded SIGTERM/SIGINT drain grace period (seconds).
     pub shutdown_grace_secs: u64,
     /// STUN servers asked for a server-reflexive candidate when gathering; empty ⇒ host-only.
@@ -571,6 +582,12 @@ impl RunConfig {
                 explicit("srtcp_ledger_retention_secs"),
                 file.srtcp_ledger_retention_secs,
                 0,
+            ),
+            srtcp_ledger_max_entries: resolve_defaulted(
+                args.srtcp_ledger_max_entries,
+                explicit("srtcp_ledger_max_entries"),
+                file.srtcp_ledger_max_entries,
+                crate::srtcp_ledger::DEFAULT_MAX_ENTRIES,
             ),
             shutdown_grace_secs: resolve_defaulted(
                 args.shutdown_grace_secs,
@@ -1019,10 +1036,16 @@ where
         .conference()
         .srtcp_ledger()
         .set_retention_secs(config.srtcp_ledger_retention_secs);
+    // A new key past the cap is refused and no entry is evicted to make room (RFC 7714 §8).
+    engine
+        .conference()
+        .srtcp_ledger()
+        .set_max_entries(config.srtcp_ledger_max_entries);
     tracing::info!(
         target: "siphon_rtp::media",
         retention_secs = config.srtcp_ledger_retention_secs,
-        "SRTCP send-index ledger (0 retention never drops a key)"
+        max_entries = config.srtcp_ledger_max_entries,
+        "SRTCP send-index ledger (0 retention never drops a key; a new key past max_entries is refused)"
     );
     if let Some(x3) = config.x3.clone() {
         // Logged at startup so an operator can see, without placing a call, that this node will
@@ -1265,6 +1288,7 @@ where
                 ws_tee_frames_dropped: gauge_engine.ws_tee_frames_dropped(),
                 srtcp_ledger_entries: conference.srtcp_ledger().len() as u64,
                 srtcp_lease_refused: conference.srtcp_ledger().lease_refused(),
+                srtcp_ledger_install_refused: conference.srtcp_ledger().install_refused(),
             }
         };
         tokio::spawn(metrics::serve_metrics(metrics_listener, metrics, live));
@@ -1890,6 +1914,29 @@ mod tests {
     }
 
     #[test]
+    fn the_srtcp_ledger_entry_cap_has_a_default_and_a_file_and_flag_override() {
+        let default = resolve_from(&["siphon-rtp"], FileConfig::default());
+        assert_eq!(
+            default.srtcp_ledger_max_entries,
+            crate::srtcp_ledger::DEFAULT_MAX_ENTRIES
+        );
+        let file = FileConfig {
+            srtcp_ledger_max_entries: Some(5_000),
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            resolve_from(&["siphon-rtp"], file.clone()).srtcp_ledger_max_entries,
+            5_000
+        );
+        assert_eq!(
+            resolve_from(&["siphon-rtp", "--srtcp-ledger-max-entries", "7"], file)
+                .srtcp_ledger_max_entries,
+            7,
+            "an explicit flag beats the file"
+        );
+    }
+
+    #[test]
     fn the_srtcp_ledger_never_evicts_by_default_and_retention_is_configurable_both_ways() {
         let default = resolve_from(&["siphon-rtp"], FileConfig::default());
         assert_eq!(default.srtcp_ledger_retention_secs, 0, "never evict");
@@ -2024,6 +2071,7 @@ mod tests {
             setup_timeout_secs: super::DEFAULT_SETUP_TIMEOUT_SECS,
             forward_room_idle_secs: super::DEFAULT_FORWARD_ROOM_IDLE_SECS,
             srtcp_ledger_retention_secs: 0,
+            srtcp_ledger_max_entries: crate::srtcp_ledger::DEFAULT_MAX_ENTRIES,
             shutdown_grace_secs: 25,
             stun_servers: Vec::new(),
             ice_full: false,

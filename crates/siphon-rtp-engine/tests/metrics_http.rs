@@ -133,6 +133,7 @@ async fn metrics_and_health_endpoint_over_tcp() {
             ws_tee_frames_dropped: gauge_engine.ws_tee_frames_dropped(),
             srtcp_ledger_entries: conference.srtcp_ledger().len() as u64,
             srtcp_lease_refused: conference.srtcp_ledger().lease_refused(),
+            srtcp_ledger_install_refused: conference.srtcp_ledger().install_refused(),
         }
     };
     tokio::spawn(metrics::serve_metrics(listener, engine.metrics(), live));

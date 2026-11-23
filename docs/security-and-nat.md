@@ -1276,6 +1276,16 @@ two-party floor legs.
   has held for that long. That is only safe at or above the lifetime the controller enforces on a client
   key (TS 33.180 §9.4.2). A held entry and an exhausted one are never dropped. Memory is one small
   entry per distinct key material seen; `siphon_rtp_srtcp_ledger_entries` is the gauge.
+- **Entry cap: refuse the new key, never evict.** Without retention nothing bounds the entry count, so
+  `srtcp_ledger_max_entries` (TOML) / `--srtcp-ledger-max-entries` caps it (default 100000, about 15 MB).
+  At the cap the install of a **new** key is refused under the ledger's install mutex (control path only,
+  never the per-packet take): the verb that carried it fails with a clear reason, an `error!` is logged on
+  `siphon_rtp::media` and `siphon_rtp_srtcp_ledger_install_refused_total` counts it. A key already in the
+  ledger adds no entry and still installs. A live or retained entry is never evicted to make room, since
+  its counter is the only record of how far the key has sent and evicting it would let the key restart at
+  0 (RFC 7714 §8). A key that reaches the counter without having been admitted gets an already-exhausted,
+  unstored counter: it can never seal. `restore_srtcp_indices` refuses a blob whose new keys would pass the
+  cap whole and imports nothing, since a partial import would leave the rest of its keys with no floor.
 - **Failover is fail-closed.** `checkpoint_srtcp_indices` exports every counter (a key that is installed and
   has sent nothing included) and `restore_srtcp_indices` seeds a standby 65536 past each (the floor
   checkpoint margin), never lowering. A margin only holds if the primary never sends that far, so once a

@@ -53,6 +53,8 @@ pub struct LiveGauges {
     /// SRTCP seals refused because a key reached the end of its checkpoint lease, over this
     /// process's lifetime.
     pub srtcp_lease_refused: u64,
+    /// New SRTCP keys (and whole restores) refused because the ledger was at its entry cap.
+    pub srtcp_ledger_install_refused: u64,
 }
 
 /// Process-wide operational counters and gauges, shared via `Arc`.
@@ -443,6 +445,13 @@ impl Metrics {
         );
         metric(
             &mut output,
+            "siphon_rtp_srtcp_ledger_install_refused_total",
+            "New SRTCP keys refused because the send-index ledger was at its entry cap.",
+            "counter",
+            live.srtcp_ledger_install_refused,
+        );
+        metric(
+            &mut output,
             "siphon_rtp_jemalloc_allocated_bytes",
             "Live bytes allocated, per jemalloc stats.allocated.",
             "gauge",
@@ -799,6 +808,7 @@ mod tests {
                 ws_tee_frames_dropped: 7,
                 srtcp_ledger_entries: 11,
                 srtcp_lease_refused: 4,
+                srtcp_ledger_install_refused: 6,
             },
             4096,
         );
@@ -814,6 +824,9 @@ mod tests {
         ));
         assert!(body.contains(
             "# TYPE siphon_rtp_srtcp_lease_refused_total counter\nsiphon_rtp_srtcp_lease_refused_total 4\n"
+        ));
+        assert!(body.contains(
+            "# TYPE siphon_rtp_srtcp_ledger_install_refused_total counter\nsiphon_rtp_srtcp_ledger_install_refused_total 6\n"
         ));
         assert!(body.contains(
             "# TYPE siphon_rtp_ws_tee_frames_dropped_total counter\nsiphon_rtp_ws_tee_frames_dropped_total 7\n"
@@ -867,9 +880,9 @@ mod tests {
         }
         assert!(body.contains("# TYPE siphon_rtp_scoped_offers_total counter\n"));
         assert!(body.contains("siphon_rtp_scoped_offers_total 0\n"));
-        // Every series carries a HELP + TYPE line (36 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 36);
-        assert_eq!(body.matches("# TYPE ").count(), 36);
+        // Every series carries a HELP + TYPE line (37 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 37);
+        assert_eq!(body.matches("# TYPE ").count(), 37);
     }
 
     #[test]
@@ -891,8 +904,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (35 vs 36).
-        assert_eq!(body.matches("# TYPE ").count(), 35);
+        // One fewer series than the CPU-present case (36 vs 37).
+        assert_eq!(body.matches("# TYPE ").count(), 36);
     }
 
     #[test]
