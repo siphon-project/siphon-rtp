@@ -147,6 +147,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         })
     }
 
+    /// The candidates and agent configuration of a single-leg answer that runs ICE, none without
+    /// credentials. Neither a single-leg local answer nor a conference seat relays text or fax.
+    async fn gather_local_ice(
+        &self,
+        credentials: Option<&ice::IceCredentials>,
+        (near_rtp, near_rtcp, near_advertised): (
+            siphon_rtp_datapath::Endpoint,
+            Option<siphon_rtp_datapath::Endpoint>,
+            std::net::IpAddr,
+        ),
+    ) -> (Vec<siphon_rtp_ice::Candidate>, Option<IceConfig>) {
+        let Some(credentials) = credentials else {
+            return (Vec::new(), None);
+        };
+        let config = IceConfig {
+            local_ufrag: credentials.ufrag.clone(),
+            local_pwd: credentials.pwd.clone(),
+        };
+        let leg = Leg::audio_only(near_rtp, near_rtcp, near_advertised);
+        let candidates = self.gather_leg_candidates(&leg, &config).await;
+        (candidates, Some(config))
+    }
+
     /// Tear down the single-leg call a re-answer replaces — the same end-of-call path as `delete`,
     /// so the CDR is emitted and its ports, endpoint index entries, datapath flows, pipelines and
     /// quota slot are all released — and re-check the call-id is now free.
@@ -798,6 +821,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
+        // The caller's video, decided before anything is bound so a refusal has no side effect.
+        let plain_caller =
+            matches!(offerer_security, WsTakeoverSecurity::Plain) && !(want_ice || info.is_ice());
+        let local_video =
+            match super::call_video_local::local_video_decision(sdp, profile, plain_caller) {
+                Ok(decision) => decision,
+                Err(reason) => return CmdResult::Error { reason },
+            };
+
         // ONE leg, not two. `offer` allocates a near *and* a far because a B side may still answer it;
         // this verb knows from the start that none is coming, so it binds only the socket pair the
         // caller is told about. That leg is `near`, the caller-facing side by the same convention
@@ -826,6 +858,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The MCPTT floor stream, if the offer carries one: terminated on an endpoint of its own.
         let local_floor = self
             .anchor_local_floor(sdp, profile, near_family, near_bind, &mut endpoints)
+            .await;
+        // The caller's video, on endpoints of its own; a bind failure declines it and says why.
+        let (anchored_video, video_declined) = self
+            .bind_local_video(local_video, near_rtp.local_addr.ip(), &mut endpoints)
             .await;
 
         // The answer goes back to the offerer and advertises the leg it was allocated for — the socket
@@ -865,36 +901,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             None
         };
-        let (ice_candidates, ice_config) = match ice_credentials.as_ref() {
-            Some(credentials) => {
-                let config = IceConfig {
-                    local_ufrag: credentials.ufrag.clone(),
-                    local_pwd: credentials.pwd.clone(),
-                };
-                // Neither a single-leg local answer nor a conference seat relays text or fax.
-                let leg = Leg::audio_only(near_rtp, near_rtcp, near_advertised);
-                let candidates = self.gather_leg_candidates(&leg, &config).await;
-                (candidates, Some(config))
-            }
-            None => (Vec::new(), None),
-        };
-        // The answer is the whole ICE decision for a single-leg call: re-originated with the engine's
-        // own credentials when an agent runs, and otherwise stripped — never the offerer's own echoed.
-        let ice_rewrite = match ice_credentials.as_ref() {
-            Some(credentials) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
-                ufrag: credentials.ufrag.as_str(),
-                pwd: credentials.pwd.as_str(),
-                candidates: &ice_candidates,
-            }),
-            // RFC 8839 §5.3: say why ICE is absent rather than dropping it silently, so the offerer
-            // stops waiting for checks that will never come.
-            None if ice_mismatch => IceRewrite::Mismatch,
-            // `ICE=remove`, or an ICE offer this engine cannot run an agent for: the leg runs on the
-            // signalled address, so the peer's ICE is stripped rather than echoed back at it (the
-            // same thing `offer` does for this directive).
-            None if info.is_ice() => IceRewrite::Strip,
-            None => IceRewrite::Keep,
-        };
+        let (ice_candidates, ice_config) = self
+            .gather_local_ice(
+                ice_credentials.as_ref(),
+                (near_rtp, near_rtcp, near_advertised),
+            )
+            .await;
+        let ice_rewrite = local_ice_rewrite(
+            ice_credentials.as_ref(),
+            &ice_candidates,
+            ice_mismatch,
+            &info,
+        );
         let mut rewritten =
             // A single-leg local answer (IVR/echo) carries audio only: no text, no fax, nothing else.
             // `rewrite` leaves those sections as the offer wrote them and they are declined below.
@@ -926,6 +944,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_advertised,
             profile,
             data_channel,
+            anchored_video
+                .as_ref()
+                .map(|(leg, _)| leg.engine_media(near_advertised)),
         );
         // rtpengine `replace: [origin]`: hide the originator's real IP behind the engine's advertised
         // address (topology hiding).
@@ -957,6 +978,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.settle_x3_hand_over(call_id).await;
         if let Some(floor) = local_floor {
             self.install_local_floor(call_id, profile, floor);
+        }
+        // After the floor is recorded on the call, so a refused video drop frees every endpoint the
+        // call bound, the floor's included.
+        if let Err(refusal) = self.install_anchored_video(call_id, &anchored_video).await {
+            return *refusal;
         }
         // The data channel's plan goes to the endpoint's DTLS driver before that driver is
         // registered (below, in `key_local_pipeline` or the takeover).
@@ -1005,7 +1031,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.near_telephone_event = telephone_event;
         }
         let mut answer_sdp = sdp::force_answer_codec(&rewritten.sdp, &chosen, telephone_event);
-        answer_sdp = answered_as_the_engine(&answer_sdp, info.direction);
+        answer_sdp = answered_as_the_engine(&answer_sdp, info.direction, anchored_video.as_ref());
 
         if let Some(ws_uri) = profile.ws_uri.clone() {
             // A takeover leg's media goes to the WebSocket server, so the interception of a
@@ -1109,7 +1135,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // The pipeline is up and keyed: put a carried interception's taps on it.
         self.carry_x3_across_answer(call_id).await;
-        ok_sdp(answer_sdp, None)
+        super::call_video::with_video_declined(ok_sdp(answer_sdp, None), video_declined)
     }
 }
 
@@ -1251,6 +1277,40 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 /// engine rather than the caller: the direction is the complement of the offered one (RFC 3264
 /// §6.1), and the caller's own `a=ssrc` / `a=msid` / `a=extmap` lines are dropped (RFC 5576, RFC
 /// 8830, RFC 8285), which would otherwise tell a WebRTC caller the engine sends with its SSRC.
-fn answered_as_the_engine(answer: &str, offered: sdp::MediaDirection) -> String {
-    sdp::own_stream_identity(&sdp::answer_direction(answer, offered), None)
+/// The answer is the whole ICE decision for a single-leg call: re-originated with the engine's own
+/// credentials when an agent runs, and otherwise stripped, never the offerer's own echoed.
+fn local_ice_rewrite<'a>(
+    credentials: Option<&'a ice::IceCredentials>,
+    candidates: &'a [siphon_rtp_ice::Candidate],
+    ice_mismatch: bool,
+    info: &sdp::MediaInfo,
+) -> IceRewrite<'a> {
+    match credentials {
+        Some(credentials) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+            ufrag: credentials.ufrag.as_str(),
+            pwd: credentials.pwd.as_str(),
+            candidates,
+        }),
+        // RFC 8839 §5.3: say why ICE is absent rather than dropping it silently, so the offerer
+        // stops waiting for checks that will never come.
+        None if ice_mismatch => IceRewrite::Mismatch,
+        // `ICE=remove`, or an ICE offer this engine cannot run an agent for: the leg runs on the
+        // signalled address, so the peer's ICE is stripped rather than echoed back at it (the
+        // same thing `offer` does for this directive).
+        None if info.is_ice() => IceRewrite::Strip,
+        None => IceRewrite::Keep,
+    }
+}
+
+/// The video section answers its own offered direction, when one is anchored (RFC 3264 §6.1).
+fn answered_as_the_engine(
+    answer: &str,
+    offered: sdp::MediaDirection,
+    video: Option<&(super::call_video::VideoLeg, sdp::VideoStream)>,
+) -> String {
+    let answered = sdp::own_stream_identity(&sdp::answer_direction(answer, offered), None);
+    match video {
+        Some((_, stream)) => sdp::answer_video_direction(&answered, stream.direction),
+        None => answered,
+    }
 }

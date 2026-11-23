@@ -215,6 +215,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         advertised: IpAddr,
         profile: &ProfileFlags,
         data_channel: bool,
+        video: Option<EngineMedia>,
     ) -> String {
         let anchored = match floor {
             Some((endpoint, _, _)) => sdp::anchor_floor(
@@ -235,11 +236,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             anchored
         };
+        // The caller's video, answered on the engine's own endpoints when a locally answered call
+        // anchors it ([`super::call_video_local`]); declined like every other stream otherwise.
+        let anchored = match video {
+            Some(engine) => {
+                let anchored = sdp::anchor_video(&anchored, engine, sdp::VideoKeying::Plain);
+                // One format, the first offered (RFC 3264 §6.1): what the far party must accept too.
+                match sdp::first_video_format(&anchored) {
+                    Some(payload_type) => sdp::keep_video_format(&anchored, payload_type),
+                    None => anchored,
+                }
+            }
+            None => anchored,
+        };
         sdp::decline_unanswered_with_data_channel(
             anchored,
             sdp::Answered {
                 floor: floor.is_some(),
                 data_channel,
+                video: video.is_some(),
                 ..sdp::Answered::default()
             },
         )

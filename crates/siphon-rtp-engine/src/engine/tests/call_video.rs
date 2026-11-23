@@ -698,27 +698,6 @@ fn any_sdp() -> String {
 }
 
 #[tokio::test]
-async fn answer_local_refuses_video_relay_instead_of_ignoring_it() {
-    let command = Command::AnswerLocal {
-        call_id: "no-video".into(),
-        from_tag: "a".into(),
-        sdp: any_sdp(),
-        profile: anchor(),
-    };
-    assert_video_relay_refused("answer_local", command).await;
-}
-
-#[tokio::test]
-async fn offer_far_refuses_video_relay_instead_of_ignoring_it() {
-    let command = Command::OfferFar {
-        call_id: "no-video".into(),
-        from_tag: "a".into(),
-        profile: anchor(),
-    };
-    assert_video_relay_refused("offer_far", command).await;
-}
-
-#[tokio::test]
 async fn subscribe_request_refuses_video_relay_instead_of_ignoring_it() {
     let command = Command::SubscribeRequest {
         call_id: "no-video".into(),

@@ -278,6 +278,13 @@ fn build_features() -> Vec<String> {
         // offering secure video on this entry; DTLS-SRTP video is declined.
         "call_video_sdes".to_string(),
         "call_video_dtls".to_string(),
+        // `answer_local` with `video_relay: anchor` answers a plain RTP caller's `m=video` up front on
+        // the engine's own endpoints (the caller's formats, the complement direction), drops it until
+        // a far party answers, and `offer_far` then offers that party the same formats; the relay
+        // goes live with one PLI toward each sending party that accepts it. A secure, ICE or
+        // WebSocket-bridged caller is refused. A controller gates sending `video_relay` on
+        // `answer_local` and `offer_far` on this entry.
+        "answer_local_video".to_string(),
         // `conference_join` and `conference_answer` honour a `received-from` hint, so a NATed
         // participant that advertises a private `c=` is gated on, and sent the mix at, its public
         // address. A controller gates sending the hint on this entry.

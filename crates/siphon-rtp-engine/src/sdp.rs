@@ -40,7 +40,7 @@ pub use decline::{
     decline_unanswered_media, decline_unanswered_streams, decline_unanswered_with_data_channel,
     Answered,
 };
-pub use direction::answer_direction;
+pub use direction::{answer_direction, answer_video_direction};
 pub use floor::{
     anchor_floor, decline_floor, parse_floor, validate_floor_fmtp, FloorFmtpError, FloorMediaInfo,
     FloorRewrite,
@@ -52,8 +52,8 @@ pub use telephone_event::TelephoneEvent;
 pub mod video;
 mod video_anchor;
 pub use video_anchor::{
-    anchor_video, decline_video, flow_directions, keep_passthrough_connection, offers_video,
-    parse_video_stream, VideoKeying, VideoRewrite, VideoStream,
+    anchor_video, decline_video, first_video_format, flow_directions, keep_passthrough_connection,
+    keep_video_format, offers_video, parse_video_stream, VideoKeying, VideoRewrite, VideoStream,
 };
 
 /// Default packetization when the SDP carries no `a=ptime` (RFC 3551: 20 ms for telephony codecs).

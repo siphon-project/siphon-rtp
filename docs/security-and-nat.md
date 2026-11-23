@@ -1375,6 +1375,16 @@ inbound surface, so it has its own gate and latch and none is inherited from the
   signalled source and has no symmetric latch for either stream. Interception, tees and recordings take the
   audio only. The bridge's crypto buffers are reused, so the DTLS path allocates nothing per packet
   (`dtls_bridge_video_zero_alloc`). A DTLS call is not checkpointed, so neither is its video.
+- **Through `answer_local`.** The caller's video is answered on endpoints of its own before any far party
+  exists, because its answer is frozen (RFC 3264 §8). Those endpoints carry a `Drop` flow until the far party's
+  answer installs the ordinary relay above, built by the same `ingress_rule`: nothing is forwarded, and nothing is
+  sent toward the caller (an answerer may send nothing, RFC 3264 §6.1), before a signalled far address exists, and
+  a stranger is dropped and never latched in either phase (`the_callers_video_is_dropped_and_nothing_is_sent_before_a_far_party_answers`,
+  `a_far_answer_with_the_offered_payload_relays_video_both_ways_and_counts_it`). The caller is answered one video format and the far party offered only it; the far party's answer
+  must carry exactly that format, with a meaning and format parameters (H.264 sub-profile and level) both sides can decode, and a stream that does not is declined alone. Only a
+  plain RTP caller is accepted: a secure, ICE or WebSocket-bridged caller is refused, since the answer cannot be
+  revised once sent. The keyframe request sent when the relay goes live names a media SSRC the party declared in its own SDP or the relay latched from
+  its admitted packets, never one the engine guessed, and goes to the address the relay forwards to.
 - **HA.** The video sockets re-bind on their ports at restore, with the same gate and latch policy and the
   same directions. A secure stream also records its keys and each secure leg's rollover, so the standby's
   first packet past a wrap authenticates; its snapshot has a version of its own, so an older standby refuses

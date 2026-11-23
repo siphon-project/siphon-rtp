@@ -41,7 +41,7 @@ impl VideoLeg {
     }
 
     /// The endpoints this leg presents in SDP, at the leg's advertised address.
-    fn engine_media(&self, advertised_ip: IpAddr) -> EngineMedia {
+    pub(super) fn engine_media(&self, advertised_ip: IpAddr) -> EngineMedia {
         EngineMedia {
             rtp: self.rtp.local_addr,
             rtcp: self.rtcp.map(|endpoint| endpoint.local_addr),
@@ -70,6 +70,15 @@ pub(super) struct CallVideo {
     pub(super) bridged: Vec<VideoFlowRule>,
     /// Each party's DTLS-SRTP keying of the stream, see [`super::call_video_dtls`].
     pub(super) dtls: super::call_video_dtls::VideoDtls,
+    /// Each party's video section accepts Picture Loss Indication (RFC 4585 §4.2).
+    pub(super) near_picture_loss: bool,
+    pub(super) far_picture_loss: bool,
+    /// The SSRC each party declared for its video stream with `a=ssrc` (RFC 5576 §4.1), which names the
+    /// stream a keyframe request is about when the relay has latched none.
+    pub(super) near_ssrc: Option<u32>,
+    pub(super) far_ssrc: Option<u32>,
+    /// The keyframe requests still to send once the relay went live.
+    pub(super) keyframe: super::call_video_local::KeyframeRequests,
 }
 
 /// The leg's video stream rebuilt from its snapshot and the endpoints bound for it.
@@ -96,14 +105,10 @@ pub(super) fn video_leg(
 pub(super) fn restored_call_video(
     snapshot: &crate::ha::CallSnapshot,
     near: &Leg,
-    far: &Leg,
 ) -> Result<CallVideo, Box<siphon_rtp_proto::CmdResult>> {
     let direction = |token: &str| MediaDirection::parse(token).unwrap_or_default();
-    let Some(video) = snapshot
-        .video
-        .as_ref()
-        .filter(|_| near.video.is_some() && far.video.is_some())
-    else {
+    // A call whose far party declined the video keeps the caller's answered stream alone.
+    let Some(video) = snapshot.video.as_ref().filter(|_| near.video.is_some()) else {
         return Ok(CallVideo::default());
     };
     let keys = VideoKeys::restored(video.secure.as_ref()).map_err(|reason| {
@@ -120,6 +125,11 @@ pub(super) fn restored_call_video(
         keys,
         bridged: Vec::new(),
         dtls: super::call_video_dtls::VideoDtls::default(),
+        near_picture_loss: false,
+        far_picture_loss: false,
+        near_ssrc: None,
+        far_ssrc: None,
+        keyframe: super::call_video_local::KeyframeRequests::default(),
     })
 }
 
@@ -167,9 +177,9 @@ pub(super) fn with_video_declined(
 }
 
 /// The refusal of a verb that does not relay a two-party call's video: a mixing room decodes its
-/// seats' audio, a forwarding room carries video by its own `video` profile, and the local answer,
-/// the far offer, a subscription and a WebSocket bridge have no video stream to anchor, so a
-/// `video_relay` choice there would silently do nothing.
+/// seats' audio, a forwarding room carries video by its own `video` profile, and a subscription and a
+/// WebSocket bridge have no video stream to anchor, so a `video_relay` choice there would silently do
+/// nothing. `answer_local` and `offer_far` take it ([`super::call_video_local`]).
 pub(super) fn video_relay_refusal(
     command: &siphon_rtp_proto::Command,
 ) -> Option<siphon_rtp_proto::CmdResult> {
@@ -179,8 +189,6 @@ pub(super) fn video_relay_refusal(
         Command::ConferenceOffer { profile, .. } => ("conference_offer", profile),
         Command::ForwardJoin { profile, .. } => ("forward_join", profile),
         Command::ForwardOffer { profile, .. } => ("forward_offer", profile),
-        Command::AnswerLocal { profile, .. } => ("answer_local", profile),
-        Command::OfferFar { profile, .. } => ("offer_far", profile),
         Command::SubscribeRequest { profile, .. } => ("subscribe_request", profile),
         Command::SubscribeAnswer { profile, .. } => ("subscribe_answer", profile),
         Command::AttachWsBridge {
@@ -233,7 +241,8 @@ impl super::Call {
 
     /// The call's anchored video stream as an HA snapshot, `None` when it carries none.
     pub(super) fn video_snapshot(&self) -> Option<crate::ha::CallVideoSnapshot> {
-        self.near.video.zip(self.far.as_ref()?.video)?;
+        // The caller's answered stream alone (a far party that declined it) is snapshotted too.
+        self.near.video?;
         // The in-kernel rules, or, on a secure stream, the rules its bridge flows carry.
         let forwards = self
             .video
@@ -377,11 +386,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Allocate a video endpoint set (one RTP, plus RTCP unless muxed) on `leg`'s interface.
-    async fn alloc_video_leg(&self, leg: &Leg, muxed: bool) -> Result<VideoLeg, String> {
-        let family = AddressFamily::of(leg.rtp.local_addr.ip());
-        let bind = Some(leg.rtp.local_addr.ip());
+    pub(super) async fn alloc_video_leg(&self, leg: &Leg, muxed: bool) -> Result<VideoLeg, String> {
+        let bind = leg.rtp.local_addr.ip();
+        self.alloc_video_endpoints(AddressFamily::of(bind), bind, muxed)
+            .await
+    }
+
+    /// Allocate a video endpoint set bound to `bind`.
+    pub(super) async fn alloc_video_endpoints(
+        &self,
+        family: AddressFamily,
+        bind: IpAddr,
+        muxed: bool,
+    ) -> Result<VideoLeg, String> {
         let mut endpoints = self
-            .alloc_endpoints(if muxed { 1 } else { 2 }, family, bind)
+            .alloc_endpoints(if muxed { 1 } else { 2 }, family, Some(bind))
             .await?;
         let rtcp = (!muxed).then(|| endpoints.remove(1));
         Ok(VideoLeg {
@@ -451,7 +470,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         match mode {
             VideoRelay::Passthrough => return VideoOutcome::passthrough(),
             VideoRelay::Decline => {
-                self.free_call_video(call_id).await;
+                self.release_declined_video(call_id).await;
                 return VideoOutcome {
                     rewrite: VideoRewrite::Decline,
                     declined: None,
@@ -465,7 +484,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let Some(stream) = sdp::parse_video_stream(sdp) else {
             // No live stream from this party: whatever the call anchored is over.
-            self.free_call_video(call_id).await;
+            self.release_declined_video(call_id).await;
             return VideoOutcome::passthrough();
         };
         let outcome = self
@@ -522,43 +541,47 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             matches!(exchange, Exchange::FirstOffer { .. }),
             profile,
         ) {
-            self.free_call_video(call_id).await;
+            self.release_declined_video(call_id).await;
             return VideoOutcome::declined(reason);
         }
         // A DTLS stream is keyed by its handshake, not by SDES keys.
         if !stream.is_dtls() {
             if let Err(reason) = keys.settle(party, stream, exchange) {
-                self.free_call_video(call_id).await;
+                self.release_declined_video(call_id).await;
                 return VideoOutcome::declined(reason);
             }
         }
         let bundled_near = party == Party::Near && stream.is_dtls() && stream.bundled;
-        if let Some((near_video, _)) = allocated {
+        if let Some(near_video) = near.video {
             if party == Party::Near && near_video.bundled != bundled_near {
-                self.free_call_video(call_id).await;
+                self.release_declined_video(call_id).await;
                 return VideoOutcome::declined(
                     "a re-offer cannot move the video stream in or out of the audio's bundle",
                 );
             }
         }
-        let muxed = match allocated {
-            Some((near_video, _)) => near_video.rtcp.is_none(),
+        // The caller's stream may already own endpoints without a far one (a local answer whose far
+        // party declined its video): the muxing it was answered with stays.
+        let muxed = match near.video {
+            Some(near_video) => near_video.rtcp.is_none(),
             None => stream.rtcp_mux,
         };
-        if allocated.is_some() && stream.rtcp_mux != muxed {
+        if near.video.is_some() && stream.rtcp_mux != muxed {
             // RFC 5761 §5.1.1: the answer chooses; a party that answers the other way would put its
             // RTCP where no endpoint listens, so the stream is declined rather than half carried.
-            self.free_call_video(call_id).await;
+            self.release_declined_video(call_id).await;
             return VideoOutcome::declined(
                 "the party did not keep the rtcp-mux choice the video endpoints were bound for",
             );
         }
         if allocated.is_none() {
             if answering {
-                self.free_call_video(call_id).await;
+                self.release_declined_video(call_id).await;
                 return VideoOutcome::declined("the offer carried no video stream to answer");
             }
-            let near_video = if bundled_near {
+            let near_video = if let Some(existing) = near.video {
+                existing
+            } else if bundled_near {
                 // RFC 8843: the video shares the audio's transport, so it owns no endpoint.
                 VideoLeg {
                     rtp: near.rtp,
@@ -578,8 +601,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let far_video = match self.alloc_video_leg(&far, muxed).await {
                 Ok(video) => video,
                 Err(reason) => {
-                    for endpoint in near_video.endpoint_ids() {
-                        self.release_endpoint(endpoint).await;
+                    // Endpoints the caller's frozen answer already names are not this call's to free.
+                    if near.video.is_none() {
+                        for endpoint in near_video.endpoint_ids() {
+                            self.release_endpoint(endpoint).await;
+                        }
                     }
                     return VideoOutcome::declined(format!("video endpoints: {reason}"));
                 }
@@ -607,8 +633,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             if own_direction {
                 call.video.near_direction = stream.direction;
+                call.video.near_picture_loss = stream.picture_loss;
+                call.video.near_ssrc = stream.ssrc;
             } else {
                 call.video.far_direction = stream.direction;
+                call.video.far_picture_loss = stream.picture_loss;
+                call.video.far_ssrc = stream.ssrc;
             }
             call.video.keys = keys;
             let other = match party {
@@ -896,6 +926,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.video.flows = flows;
             call.video.bridged.clear();
         }
+        // A call grown from a local answer starts each sending decoder on a keyframe.
+        self.arm_keyframe_requests(call_id, near_to_far, far_to_near);
         Ok(())
     }
 }

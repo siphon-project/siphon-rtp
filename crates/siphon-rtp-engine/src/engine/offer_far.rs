@@ -17,12 +17,14 @@
 use siphon_rtp_codec::factory::CodecSpec;
 use siphon_rtp_datapath::{AddressFamily, Datapath, FlowAction};
 use siphon_rtp_proto::{
-    CmdResult, PlayEndReason, ProfileFlags, RecordingEndReason, WsTeeEndReason,
+    CmdResult, PlayEndReason, ProfileFlags, RecordingEndReason, VideoRelay, WsTeeEndReason,
 };
 
 use crate::media_pipeline::MediaControl;
-use crate::sdp::{self, IceRewrite, ImageRewrite, TextRewrite};
+use crate::sdp::{self, IceRewrite, ImageRewrite, TextRewrite, VideoKeying, VideoRewrite};
 
+use super::call_video::with_video_declined;
+use super::call_video_local::far_video_answer_problem;
 use super::negotiate::{
     cannot_bridge, describe_codec, parse_codec_flags, present_leg, resolve_rtcp_mux, same_codec,
     CodecPresentation, LegPresentation, SourcePosture,
@@ -203,6 +205,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Err(reason) => return CmdResult::Error { reason },
         };
         let far_rtp = far_endpoints[0];
+        // The caller was answered video up front ([`super::call_video_local`]): the far party is offered
+        // the same stream on a far video leg, muxed as the caller's was (RFC 5761 §5.1.1).
+        let near_video = self.calls.get(call_id).and_then(|call| call.near.video);
+        let mut video_declined = None;
+        let far_video = match near_video {
+            Some(_) if profile.video_relay == VideoRelay::Decline => {
+                video_declined =
+                    Some("video_relay decline: the far party is offered no video".to_string());
+                None
+            }
+            Some(near_video) => match self
+                .alloc_video_endpoints(
+                    AddressFamily::of(far_rtp.local_addr.ip()),
+                    far_rtp.local_addr.ip(),
+                    near_video.rtcp.is_none(),
+                )
+                .await
+            {
+                Ok(leg) => Some(leg),
+                Err(reason) => {
+                    video_declined = Some(format!("video endpoints: {reason}"));
+                    None
+                }
+            },
+            None => None,
+        };
         let far = Leg {
             rtp: far_rtp,
             rtcp: (!far_mux).then(|| far_endpoints[1]),
@@ -217,13 +245,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             floor: None,
             floor_remote: None,
             floor_format: siphon_rtp_proto::ControlFormat::Mcptt,
-            video: None,
+            video: far_video,
         };
         let far_sdp =
             match far_offer_sdp(&offer_sdp, &info, &far, far_mux, &codec, profile, call_id) {
                 Ok(far_sdp) => far_sdp,
                 Err(reason) => {
-                    self.free(&far_endpoints).await;
+                    self.release_far_leg(&far).await;
                     return error_result("offer_far: SDP rewrite failed", &reason);
                 }
             };
@@ -232,7 +260,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let far_sdp = match super::key_mgmt::keyed_sdp(&far_sdp, profile) {
             Ok(keyed) => keyed,
             Err(reason) => {
-                self.free(&far_endpoints).await;
+                self.release_far_leg(&far).await;
                 return error_result("offer_far: key_mgmt", &reason);
             }
         };
@@ -262,7 +290,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             _ => false,
         };
         if !recorded {
-            self.free(&far_endpoints).await;
+            self.release_far_leg(&far).await;
             return error_result(
                 "offer_far",
                 &"the call changed while the far leg was being bound",
@@ -272,6 +300,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.endpoint_calls.insert(endpoint, call_id.to_string());
         }
         self.watch_for_media([far.rtp.id]);
+        // Nothing is relayed on the far video leg until its party answers.
+        if let Err(reason) = self.park_video(call_id) {
+            tracing::error!(target: "siphon_rtp::media", call_id = %call_id, %reason, "could not park the far video leg");
+        }
         tracing::info!(
             target: "siphon_rtp::media",
             call_id = %call_id,
@@ -279,7 +311,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             codec = %codec.encoding_name,
             "far leg offered on a locally answered call"
         );
-        ok_sdp(far_sdp, None)
+        with_video_declined(ok_sdp(far_sdp, None), video_declined)
     }
 
     /// [`Command::Answer`], routed here first: the far party answering a leg `offer_far` offered
@@ -314,6 +346,31 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             Err(error) => return error_result("answer SDP parse failed", &error),
         }
+        // The caller's video was answered up front and cannot change, so a far video stream that
+        // does not keep the offered formats is declined alone: the audio relay is unaffected.
+        let video_problem = far_video_answer_problem(&local.offer_sdp, sdp_text);
+        if sdp::parse_video_stream(sdp_text).is_some_and(|stream| {
+            stream
+                .fmtps
+                .iter()
+                .any(|(_, parameters)| parameters.contains("sprop-parameter-sets"))
+        }) {
+            // The caller's answer is frozen and a verbatim relay cannot add packets, so the far
+            // party's out-of-band parameter sets are not conveyed (RFC 6184 §8.4); the caller relies
+            // on the in-band SPS and PPS that come with the IDR, which the go-live PLI asks for.
+            tracing::debug!(
+                target: "siphon_rtp::media",
+                call_id = %call_id,
+                "the far party's sprop-parameter-sets are not conveyed to the caller; in-band SPS/PPS with the IDR are relied on"
+            );
+        }
+        let declined_video_answer;
+        let sdp_text = if video_problem.is_some() {
+            declined_video_answer = sdp::decline_video(sdp_text);
+            declined_video_answer.as_str()
+        } else {
+            sdp_text
+        };
         self.stop_call_pipeline(call_id).await;
         match self
             .answer(client, call_id, from_tag, to_tag, sdp_text, profile)
@@ -321,15 +378,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         {
             // The caller already holds its answer and must not be handed another (RFC 3261
             // §13.2.1, RFC 6337 §3.1.1): the same bytes go back, whatever the relay looks like.
-            CmdResult::Ok { to_tag, .. } => {
+            CmdResult::Ok {
+                to_tag,
+                video_declined,
+                ..
+            } => {
                 tracing::info!(
                     target: "siphon_rtp::media",
                     call_id = %call_id,
                     "far party answered; the locally answered caller is relayed to it"
                 );
-                ok_sdp(local.answer_sdp, to_tag)
+                let video_declined = video_problem.or(video_declined).or_else(|| {
+                    self.calls
+                        .get(call_id)
+                        .is_some_and(|call| {
+                            call.near.video.is_some()
+                                && call.far.as_ref().is_some_and(|far| far.video.is_none())
+                        })
+                        .then(|| {
+                            "the far party did not answer the offered video stream".to_string()
+                        })
+                });
+                with_video_declined(ok_sdp(local.answer_sdp, to_tag), video_declined)
             }
             refusal => {
+                // The far video leg stays offered like the audio one, relaying nothing.
+                self.reset_far_video(call_id);
                 // The far leg stays offered, so the controller can still delete it; the caller goes
                 // back to the local pipeline rather than to silence.
                 if let Err(reason) = self.resume_local_pipeline(call_id, &local).await {
@@ -416,12 +490,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
         }
+        // The video relay of the far party that answered stops with it, and a leg that never had one
+        // relays nothing.
+        if let Err(reason) = self.park_video(call_id) {
+            tracing::warn!(target: "siphon_rtp::media", call_id = %call_id, %reason, "could not park the call's video");
+        }
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.pipeline = PipelineKind::Passthrough;
             call.relay_flows.clear();
             call.promotion_reasons.clear();
             call.far_codec = None;
             call.comfort_noise_payload_type = None;
+        }
+    }
+
+    /// Free the endpoints of a far leg that was bound but never recorded on the call.
+    async fn release_far_leg(&self, far: &Leg) {
+        for endpoint in far.all_endpoint_ids() {
+            self.release_endpoint(endpoint).await;
+        }
+    }
+
+    /// Put the call's video back to waiting for a far party: its far party's answer was refused, so
+    /// nothing it said about video stands and the caller's answered stream is dropped again.
+    fn reset_far_video(&self, call_id: &str) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.video.far_direction = sdp::MediaDirection::default();
+            call.video.keyframe = super::call_video_local::KeyframeRequests::default();
+        }
+        if let Err(reason) = self.park_video(call_id) {
+            tracing::warn!(target: "siphon_rtp::media", call_id = %call_id, %reason, "could not park the call's video");
         }
     }
 
@@ -472,6 +570,13 @@ fn forget_far_party(call: &mut Call) {
     call.far_media_started_at_unix_ms = None;
     call.pending_far_reoffer = None;
     call.near_offered_codecs.clear();
+    // The caller's answered video waits for the next far party; what the old one said about its own
+    // video is gone with it.
+    call.video.far_ssrc = None;
+    call.video.far_direction = sdp::MediaDirection::default();
+    call.video.far_picture_loss = false;
+    call.video.keyframe = super::call_video_local::KeyframeRequests::default();
+    call.video.declined = None;
     if let Some(local) = call.local_answer.as_deref_mut() {
         local.far_offered_codecs.clear();
     }
@@ -520,7 +625,28 @@ fn far_offer_sdp(
     };
     let presented = present_leg(offer_sdp, presentation, &profile.replace, call_id)
         .map_err(|error| error.to_string())?;
-    let presented = sdp::decline_unanswered_media(presented, false);
+    // The caller was answered its video up front: the far party is offered the same formats on the
+    // far video leg. Every other stream the caller's answer declined stays declined.
+    let presented = match far.video {
+        Some(video) => VideoRewrite::Anchor {
+            engine: video.engine_media(far.advertised_ip),
+            keying: VideoKeying::Plain,
+        }
+        .apply(&presented),
+        None => presented,
+    };
+    // The caller was answered one format (the first it offered), so the far party is offered that one.
+    let presented = match sdp::first_video_format(&presented).filter(|_| far.video.is_some()) {
+        Some(payload_type) => sdp::keep_video_format(&presented, payload_type),
+        None => presented,
+    };
+    let presented = sdp::decline_unanswered_with_data_channel(
+        presented,
+        sdp::Answered {
+            video: far.video.is_some(),
+            ..sdp::Answered::default()
+        },
+    );
     // The caller's codec under any other payload type (AMR in its other payload format) and every
     // codec the engine cannot transcode to it would let the far party pick something the caller can
     // never be connected to.

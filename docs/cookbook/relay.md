@@ -213,6 +213,15 @@ the stream like the audio:
   media pipeline transcodes or records.
 - `query`, the end-of-call record and `siphon_rtp_video_*` give per-stream packets and bytes, so "no
   picture" reads as zero packets in (the camera never reached the engine) or in with none out.
+- **Through `answer_local`.** A flow that answers before ringing (an announcement, then a ring) can anchor the
+  caller's video too: put `video_relay: "anchor"` on `answer_local`. The caller's `m=video` is answered on engine
+  endpoints with its own payload types and the complement direction, and its video is dropped (nothing is sent
+  toward it) until `offer_far` offers the far party the same formats and that party answers. A far answer that
+  keeps them relays video both ways, and each sending party that accepts `nack pli` is asked once for a keyframe;
+  one that renumbers, adds or drops the one answered format, lowers an H.264 level, or declines the stream, loses the video alone and keeps the audio
+  relay (`video_declined` says why). A limit: the far party's out-of-band `sprop-parameter-sets` are not conveyed
+  to the caller (its answer is frozen); the relay relies on the in-band SPS/PPS sent with the IDR (RFC 6184 §8.4),
+  which the go-live PLI requests. The caller needs plain RTP: a secure, ICE or `ws_uri` caller is refused.
 
 X3 interception on a call with anchored video covers the audio only.
 

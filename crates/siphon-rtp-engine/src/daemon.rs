@@ -1157,6 +1157,9 @@ where
             // closing the in-kernel symmetric-RTP loop (docs/security-and-nat.md §4 layer 3); a no-op
             // on the loopback backend (which resolves the latch inline when forwarding).
             sweeper.refresh_latched_destinations().await;
+            // The one keyframe request each sending video party gets when a locally answered call's
+            // relay goes live, once its stream's SSRC is known from its SDP or the relay (RFC 4585 §6.3.1).
+            sweeper.request_video_keyframes().await;
             // RFC 7675 consent freshness on ICE legs: probe each validated pair and tear down a call
             // whose peer stopped answering. A no-op unless `--ice-consent` is set. Runs *before* the
             // idle reap so a call the peer just refreshed is not also evaluated as idle this tick.
