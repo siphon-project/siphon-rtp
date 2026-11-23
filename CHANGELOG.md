@@ -5,7 +5,7 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.27.0] — 2026-11-23
 
 ### Fixed
 
@@ -35,7 +35,21 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   phone keeps sending to the freed media port; on an ephemeral port a parallel bind could take it. The
   test now allocates from a reserved window below the ephemeral range.
 
+- **A sendonly or inactive caller of a locally answered call is never sent RTP.** The single-leg
+  pipeline was registered before its egress toward a caller that does not receive was withheld, so its
+  first comfort-noise tick could send one frame toward a party that only sends (RFC 3264 §6.1). The
+  pipeline now starts with that egress already withheld.
+
+- **The first packets after a secure video bridge or a promotion are no longer dropped.** The secure and
+  DTLS video bridges, relay and processing promotion, text and UDPTL installed their endpoint redirect
+  before registering the handler, so a datagram arriving in between found no owner and was dropped.
+  The handler is now registered first (its source gate travels with it) and unregistered if the
+  redirect cannot be installed.
+
 ### Security
+
+- **`url` 2.5.9 (RUSTSEC-2026-0592).** The transitive `url` dependency of the DTLS/SCTP stack could
+  overflow the stack in `Url::origin()` on nested `blob:` URLs; bumped to the fixed patch release.
 
 - **SRTCP GCM IVs could repeat.** The send index of an `AEAD_AES_128_GCM` SRTCP key (RFC 7714) was
   per seat, leg or room and restarted at 0 with its owner, while the IV is the salt XOR (SSRC, index)
