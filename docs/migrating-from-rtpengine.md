@@ -177,7 +177,7 @@ transcodable today. Check the [codec matrix](codecs.md) against your `codec-tran
 before cutover.
 
 **Configuration is not `rtpengine.conf`.** The daemon takes CLI flags or an rtpengine-style
-declarative TOML file (`--config`), with familiar knobs (`port-min`/`port-max` are the same
+declarative YAML file (`--config`), with familiar knobs (`port-min`/`port-max` are the same
 concept, and rtpengine's `tos` is `--media-dscp` — which defaults to `EF`/184 rather than to no
 marking, so a node that set `tos = 184` needs no equivalent line), but the schema is its own. See
 [Deployment & operations](deployment.md#the-config-file); do not copy `rtpengine.conf` across.

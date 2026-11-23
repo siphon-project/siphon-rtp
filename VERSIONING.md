@@ -31,7 +31,7 @@ depend on:
 2. **The rtpengine NG/bencode front-end** — the supported commands and their
    semantics, including the documented siphon-rtp extensions.
 3. **CLI flags and documented runtime behavior** — the `siphon-rtp` daemon surface.
-4. **The TOML config schema** — documented keys and their meaning.
+4. **The config-file schema** (YAML; the deprecated TOML form takes the same keys) — documented keys and their meaning.
 
 The published library crates additionally follow semver on their `pub` Rust API, but
 while the project is pre-1.0 that API may change with a minor bump; pin exact

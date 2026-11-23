@@ -73,7 +73,7 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--config <PATH>` | none | Optional TOML config file (rtpengine-style declarative config). Missing or malformed file is a fatal startup error. |
+| `--config <PATH>` | none | Optional config file (rtpengine-style declarative config), YAML (`.yaml` / `.yml`); a `.toml` file is still read but deprecated, and any other extension is refused. Missing or malformed file is a fatal startup error. |
 | `--control <ADDR>` | `127.0.0.1:8080` | Native JSON-over-TCP control listener (length-prefixed JSON, async events). |
 | `--ng <ADDR>` | off | rtpengine NG/bencode control listener (UDP). Off unless given; rtpengine's conventional port is 22222. |
 | `--relay-bind-ip <IP>` | loopback | Bind relay/media sockets to this IP. The production posture; without it media only reaches loopback peers. |
@@ -124,7 +124,7 @@ world-readable file:
 
 ## The config file
 
-Everything the CLI can set, the file can set too (`--config /etc/siphon-rtp/config.toml`). Keys
+Everything the CLI can set, the file can set too (`--config /etc/siphon-rtp/config.yaml`). Keys
 mirror the long flags (`--relay-bind-ip` becomes `relay_bind_ip`). Precedence, highest wins:
 
 1. an explicit CLI flag (something you actually typed),
@@ -133,19 +133,23 @@ mirror the long flags (`--relay-bind-ip` becomes `relay_bind_ip`). Precedence, h
 
 Unknown or mistyped keys are a hard parse error, not a silently ignored line. A fully documented
 sample ships in the repo as
-[`crates/siphon-rtp-engine/config.example.toml`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-engine/config.example.toml).
+[`crates/siphon-rtp-engine/config.example.yaml`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-engine/config.example.yaml).
 
-```toml
-# /etc/siphon-rtp/config.toml
-control       = "192.0.2.10:8080"
-ng            = "192.0.2.10:22222"
-relay_bind_ip = "198.51.100.10"
-port_min      = 30000
-port_max      = 40000
-metrics_addr  = "192.0.2.10:9090"
-node_id       = "rtp-1"
-max_sessions  = 4000
-log_filter    = "info"
+The parser follows the file extension. YAML is the format; a `.toml` file (the format before this one,
+same keys) is still read, with a deprecation warning at startup naming the file and the `.yaml` path to
+move it to. Named interfaces are a YAML list under `interface:` (a TOML `[[interface]]` table array).
+
+```yaml
+# /etc/siphon-rtp/config.yaml
+control: "192.0.2.10:8080"
+ng: "192.0.2.10:22222"
+relay_bind_ip: "198.51.100.10"
+port_min: 30000
+port_max: 40000
+metrics_addr: "192.0.2.10:9090"
+node_id: "rtp-1"
+max_sessions: 4000
+log_filter: "info"
 ```
 
 ## Production posture
@@ -210,7 +214,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/siphon-rtp --config /etc/siphon-rtp/config.toml
+ExecStart=/usr/local/bin/siphon-rtp --config /etc/siphon-rtp/config.yaml
 Environment=RUST_LOG=info
 # secrets.env (mode 0600) carries SIPHON_RTP_CONTROL_SECRET and the TURN/HEP variables.
 EnvironmentFile=/etc/siphon-rtp/secrets.env

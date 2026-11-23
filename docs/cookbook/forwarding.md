@@ -635,11 +635,11 @@ sent under that key, and an error is logged, until the controller replaces it). 
 `srtcp_index_ledger`.
 
 The counters live in the engine's memory and are never dropped unless you set
-`srtcp_ledger_retention_secs` (TOML) or `--srtcp-ledger-retention-secs`: only at or above the lifetime your
+`srtcp_ledger_retention_secs` (config file) or `--srtcp-ledger-retention-secs`: only at or above the lifetime your
 controller enforces on a client key, since a key reused after its counter was dropped repeats nonces
 (`siphon_rtp_srtcp_ledger_entries` counts them).
 
-The ledger is also capped, by `srtcp_ledger_max_entries` (TOML) or `--srtcp-ledger-max-entries`
+The ledger is also capped, by `srtcp_ledger_max_entries` (config file) or `--srtcp-ledger-max-entries`
 (default 100000, about 15 MB at roughly 150 bytes an entry). At the cap a **new** key is refused: the
 verb that carried it (`forward_join`, `forward_offer`, a dial-out, `offer`, `answer`, `answer_local`,
 `set_floor_keys`) fails with a "ledger is full" reason, an error is logged and

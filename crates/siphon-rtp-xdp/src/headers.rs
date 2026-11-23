@@ -128,12 +128,12 @@ pub fn ones_complement_checksum(data: &[u8]) -> u16 {
 /// Accumulate `data` as big-endian 16-bit words into a 32-bit running sum (caller folds + inverts).
 fn sum_be16(data: &[u8]) -> u32 {
     let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (words, remainder) = data.as_chunks::<2>();
+    for word in words {
+        sum += u32::from(u16::from_be_bytes(*word));
     }
     // Odd trailing byte is the high byte of a word whose low byte is zero (RFC 1071 §1).
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += u32::from(u16::from_be_bytes([*last, 0]));
     }
     sum

@@ -12,7 +12,7 @@ vulnerability reporting).
 
 ## Getting set up
 
-You need a stable Rust toolchain. The minimum supported version (MSRV) is **1.88**; CI checks that
+You need a stable Rust toolchain. The minimum supported version (MSRV) is **1.89**; CI checks that
 the shippable crates compile on it.
 
 ```sh

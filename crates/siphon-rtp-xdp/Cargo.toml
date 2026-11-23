@@ -9,7 +9,7 @@
 name = "siphon-rtp-xdp"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 license = "MIT"
 description = "siphon-rtp XDP/AF_XDP datapath backend (userspace loader) — kernel-accelerated RTP relay"
 repository = "https://github.com/siphon-project/siphon-rtp"

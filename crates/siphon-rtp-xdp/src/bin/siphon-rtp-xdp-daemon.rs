@@ -3,7 +3,7 @@
 //!
 //! This binary lives in the excluded `crates/siphon-rtp-xdp` workspace — the *only* place the
 //! eBPF/aya toolchain is pulled in — and depends **up into** the stable engine
-//! (`siphon-rtp-engine`), never the other way round. It reuses the engine's entire CLI/TOML surface
+//! (`siphon-rtp-engine`), never the other way round. It reuses the engine's entire CLI/config-file surface
 //! ([`EngineArgs`] + `FileConfig`) and adds just the two `--xdp-*` knobs, then:
 //!
 //! 1. decides purely from config whether XDP is even a candidate ([`choose_datapath`]);
@@ -209,17 +209,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         siphon_rtp_engine::healthcheck::probe_and_exit("siphon-rtp-xdp-daemon", address).await;
     }
 
-    // Load the optional `--config` TOML file. A missing/malformed file is fatal: fail loudly before
-    // the subscriber exists (no tracing yet) rather than starting with a half-applied config.
-    let file = match &engine.config {
-        Some(path) => match FileConfig::load(path) {
-            Ok(file) => file,
+    // Load the optional `--config` file (YAML, or deprecated TOML, by extension). A missing/malformed
+    // file is fatal: fail loudly before the subscriber exists (no tracing yet) rather than starting
+    // with a half-applied config. The TOML deprecation is warned once the subscriber is up.
+    let (file, file_format) = match &engine.config {
+        Some(path) => match FileConfig::load_with_format(path) {
+            Ok(loaded) => loaded,
             Err(error) => {
                 eprintln!("siphon-rtp-xdp-daemon: {error}");
                 std::process::exit(1);
             }
         },
-        None => FileConfig::default(),
+        None => (
+            FileConfig::default(),
+            siphon_rtp_engine::config::ConfigFormat::Yaml,
+        ),
     };
 
     // Resolve the two XDP knobs with the same precedence the engine applies (explicit CLI > file >
@@ -234,8 +238,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Merge CLI over file over default, once, up front. Everything below reads `config`.
+    let config_path = engine.config.clone();
     let config = RunConfig::resolve(engine, &matches, file);
     init_tracing(&config);
+    if let Some(path) = config_path {
+        file_format.warn_if_deprecated(&path);
+    }
 
     // Optional deterministic media-port range (`--port-min`/`--port-max`). Both-or-neither and
     // min <= max; a half-set or inverted range is a fatal config error (fail loudly, before serving).

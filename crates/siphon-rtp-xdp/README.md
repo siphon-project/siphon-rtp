@@ -18,7 +18,7 @@ The XDP datapath is a **separate binary, not a Cargo feature** on the engine. Th
   the nightly/eBPF toolchain. This is what `cargo install siphon-rtp` and the runtime image ship.
 - **`siphon-rtp-xdp-daemon`** (this crate's `src/bin/siphon-rtp-xdp-daemon.rs`) — the
   kernel-accelerated daemon. It depends **up into** the engine (`siphon-rtp`), reuses its entire
-  CLI/TOML surface, and adds `--xdp-interface <NAME>` + `--xdp-queue <N>`. At startup it probes XDP
+  CLI/config-file surface, and adds `--xdp-interface <NAME>` + `--xdp-queue <N>`. At startup it probes XDP
   capability, tries native then generic-SKB attach, and hands the resulting `XdpDatapath` to
   `siphon_rtp_engine::run_with_datapath` — the *same* generic runner the UDP binary uses, so control,
   TURN, dispatch, sweep, metrics, and NG behave identically over either datapath. On any missing

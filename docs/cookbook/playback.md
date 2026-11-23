@@ -299,7 +299,7 @@ A `stop_media` in the window between the accept and the body cancels the fetch, 
 playback you stopped never starts a second later.
 
 Defaults: 2 s connect, 5 s to first byte, 15 s overall, 8 MiB body, 3 redirects — all
-tunable with `--media-fetch-*` or the TOML equivalents.
+tunable with `--media-fetch-*` or the config-file equivalents.
 
 !!! warning "The engine fetches from its own network position"
     Only `http` and `https` are accepted, and every redirect hop is re-validated against

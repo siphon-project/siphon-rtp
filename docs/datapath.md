@@ -154,7 +154,7 @@ fast path and its `Redirect` stream is the slow path, over ordinary sockets. Und
 The XDP backend lives in `crates/siphon-rtp-xdp`, deliberately **excluded from the main
 workspace** (the eBPF program crate builds on a pinned nightly via aya-build; the stable workspace
 and `cargo test` never touch it). It ships as the separate `siphon-rtp-xdp-daemon` binary, which
-depends up into the engine, reuses the whole CLI/TOML surface, and hands its `XdpDatapath` to the
+depends up into the engine, reuses the whole CLI/config-file surface, and hands its `XdpDatapath` to the
 same `siphon_rtp_engine::run_with_datapath` runner the UDP binary uses — so control, TURN,
 dispatch, sweep, metrics and NG behave identically over either datapath.
 

@@ -7,9 +7,21 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Changed
+
+- **The daemon config file is YAML.** `--config` reads `.yaml` / `.yml` (the documented format, with
+  `config.example.yaml` replacing `config.example.toml`); the parser is chosen by the extension and any
+  other extension is refused. A `.toml` file is still read with the same keys, with a deprecation
+  warning at startup naming the file and the `.yaml` path to move it to. Unknown keys are refused in
+  both. Named interfaces are an `interface:` list in YAML. Adds `serde-saphyr` (safe-Rust
+  YAML, the parser siphon-sip uses).
+
+- **MSRV is 1.89** (was 1.88; the XDP crate was 1.80). `serde-saphyr` 2.x, the YAML config reader,
+  needs it.
+
 ### Added
 
-- **A hard cap on SRTCP send-index ledger entries.** `srtcp_ledger_max_entries` (TOML) /
+- **A hard cap on SRTCP send-index ledger entries.** `srtcp_ledger_max_entries` (config file) /
   `--srtcp-ledger-max-entries`, default 100000 (about 15 MB). At the cap a new key is refused, never an
   old one evicted (an evicted key would restart at index 0 and repeat AES-GCM nonces, RFC 7714 §8): the
   verb that carries it (`forward_join`, `forward_offer`, a dial-out, `offer`, `answer`, `answer_local`,
