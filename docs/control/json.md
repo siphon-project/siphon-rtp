@@ -471,7 +471,7 @@ accept and the body cancels the fetch instead of letting it start playing later.
 
 Every bound is a hard stop, configurable on the daemon:
 
-| Bound | Flag / TOML key | Default |
+| Bound | Flag / config key | Default |
 |---|---|---|
 | DNS + TCP + TLS, per hop | `--media-fetch-connect-timeout-ms` | 2000 ms |
 | Wait for response headers | `--media-fetch-first-byte-timeout-ms` | 5000 ms |

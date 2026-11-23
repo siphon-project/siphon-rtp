@@ -1,4 +1,5 @@
-//! Optional TOML config-file support for the daemon (`--config <PATH>`).
+//! Optional config-file support for the daemon (`--config <PATH>`): YAML, with TOML as a deprecated
+//! fallback chosen by the file extension.
 //!
 //! rtpengine ships `/etc/rtpengine/rtpengine.conf`; operators expect to configure siphon-rtp
 //! declaratively too, instead of assembling a long CLI-arg line in a unit file. This module defines
@@ -26,9 +27,9 @@ use serde::{de, Deserialize, Deserializer};
 use siphon_rtp_datapath::Dscp;
 use thiserror::Error;
 
-/// Failure loading or parsing the `--config` TOML file. Surfaced to the operator as a clear message
-/// (never a panic): a missing/unreadable file and a malformed TOML body are distinct variants so the
-/// error text points at the real problem.
+/// Failure loading or parsing the `--config` file. Surfaced to the operator as a clear message
+/// (never a panic): a missing/unreadable file, a malformed body and a file of an unsupported format
+/// are distinct variants so the error text points at the real problem.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// The config file could not be read (missing, wrong permissions, not a file, …).
@@ -39,17 +40,62 @@ pub enum ConfigError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
-    /// The file was read but its contents are not valid TOML / do not match the schema.
+    /// The file was read but its contents are not valid for its format / do not match the schema.
     #[error("invalid config file {path}: {source}")]
     Parse {
         /// The path that failed to parse.
         path: PathBuf,
-        /// The underlying TOML deserialization error.
-        source: toml::de::Error,
+        /// The underlying YAML or TOML deserialization error.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// The file name does not end in a supported extension, so there is no way to know how to read it.
+    #[error("cannot read config file {path}: unsupported extension (use .yaml or .yml; .toml is deprecated)")]
+    UnsupportedFormat {
+        /// The path with the unsupported extension.
+        path: PathBuf,
     },
 }
 
-/// One `[[interface]]` table in the config file — a named media interface (rtpengine-style). Repeat
+/// The syntax of a config file, chosen by its extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFormat {
+    /// `.yaml` / `.yml`: the documented format.
+    Yaml,
+    /// `.toml`: still read, deprecated.
+    Toml,
+}
+
+impl ConfigFormat {
+    /// The format named by `path`'s extension (case-insensitive), or `None` for any other.
+    #[must_use]
+    pub fn of_path(path: &Path) -> Option<Self> {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        match extension.as_str() {
+            "yaml" | "yml" => Some(Self::Yaml),
+            "toml" => Some(Self::Toml),
+            _ => None,
+        }
+    }
+
+    /// Log the deprecation of a TOML config file, naming it and the YAML file that replaces it. A
+    /// separate step from loading because the daemon reads its config before it has a log
+    /// subscriber (the filter itself comes from the config), so the warning is raised once that exists.
+    pub fn warn_if_deprecated(self, path: &Path) {
+        if self == Self::Toml {
+            tracing::warn!(
+                target: "siphon_rtp::config",
+                file = %path.display(),
+                replacement = %path.with_extension("yaml").display(),
+                "TOML config files are deprecated and will stop being read in a future release: \
+                 move {} to {} (same keys, YAML syntax; see config.example.yaml)",
+                path.display(),
+                path.with_extension("yaml").display(),
+            );
+        }
+    }
+}
+
+/// One `interface` entry in the config file — a named media interface (rtpengine-style). Repeat
 /// the same `name` with a v4 and a v6 `address` to give one interface both families. `advertised`
 /// (optional) is the public IP put into rewritten SDP when it differs from the bind `address` (behind
 /// 1:1 NAT); omit it for a directly reachable interface.
@@ -93,12 +139,12 @@ where
     }
 }
 
-/// The on-disk TOML schema for the daemon. Every field is optional: a config file only sets the keys
+/// The on-disk schema for the daemon (YAML; TOML is read into the same struct, deprecated). Every field is optional: a config file only sets the keys
 /// it overrides, and the rest fall through to the CLI default. Field names mirror the CLI long flags
 /// (`--relay-bind-ip` → `relay_bind_ip`, …). Unknown keys are rejected so a typo'd key is a loud
 /// parse error, not a silently ignored line.
 ///
-/// See `config.example.toml` (next to the crate) for a fully-documented sample.
+/// See `config.example.yaml` (next to the crate) for a fully-documented sample.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
@@ -111,18 +157,18 @@ pub struct FileConfig {
     /// Public IP to advertise in rewritten SDP (`c=`/`o=`/ICE candidate) instead of the bind IP
     /// (`--advertise-ip`). The single-interface 1:1-NAT case (e.g. an AWS Elastic IP): bind a
     /// private/wildcard address, advertise the routable one — same port, family-matched. For a
-    /// multi-network split use `[[interface]]` + the control `direction` instead; this is sugar for a
+    /// multi-network split use `interface` + the control `direction` instead; this is sugar for a
     /// lone `default` interface. The advertised IP never feeds the source gate or latch (not an
     /// RTPbleed vector — see `docs/security-and-nat.md`).
     pub advertise_ip: Option<IpAddr>,
-    /// Named media interfaces (rtpengine-style). Each `[[interface]]` names a local bind address and
+    /// Named media interfaces (rtpengine-style). Each `interface` entry names a local bind address and
     /// an optional advertised public IP; the control `direction` pair then selects which interface the
     /// caller-facing (A) and callee-facing (B) legs land on. When empty, a single `default` interface
     /// is synthesised from `relay_bind_ip` + `advertise_ip`.
     #[serde(default)]
     pub interface: Vec<InterfaceConfig>,
     /// Which named interface to use when a call carries no `direction` (or names an unknown one).
-    /// Defaults to the first `[[interface]]` defined.
+    /// Defaults to the first `interface` defined.
     pub default_interface: Option<String>,
     /// Lowest media port the datapath may bind (`--port-min`). Set together with `port_max` to draw
     /// media ports from a bounded, firewallable range instead of OS-ephemeral ports.
@@ -264,24 +310,59 @@ pub struct FileConfig {
 }
 
 impl FileConfig {
-    /// Load and parse the TOML config file at `path`.
+    /// Load and parse the config file at `path`, reading it as YAML (`.yaml`, `.yml`) or TOML
+    /// (`.toml`, deprecated: the deprecation is logged here). Callers that run before the log
+    /// subscriber exists use [`Self::load_with_format`] and warn later.
     ///
-    /// Returns [`ConfigError::Read`] if the file can't be read and [`ConfigError::Parse`] if its
-    /// contents are not valid TOML or contain an unknown/mistyped key — never panics.
+    /// # Errors
+    /// [`ConfigError::UnsupportedFormat`] for any other extension, [`ConfigError::Read`] if the file
+    /// can't be read and [`ConfigError::Parse`] if its contents are not valid for its format or
+    /// contain an unknown/mistyped key. Never panics.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let (config, format) = Self::load_with_format(path)?;
+        format.warn_if_deprecated(path);
+        Ok(config)
+    }
+
+    /// [`Self::load`] without the deprecation warning, returning the format the file was read as.
+    ///
+    /// # Errors
+    /// As [`Self::load`].
+    pub fn load_with_format(path: &Path) -> Result<(Self, ConfigFormat), ConfigError> {
+        let format = ConfigFormat::of_path(path).ok_or_else(|| ConfigError::UnsupportedFormat {
+            path: path.to_path_buf(),
+        })?;
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::parse_str(&text).map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source,
-        })
+        let parsed = match format {
+            ConfigFormat::Yaml => Self::parse_yaml(&text).map_err(Into::into),
+            ConfigFormat::Toml => Self::parse_toml(&text).map_err(Into::into),
+        };
+        parsed
+            .map(|config| (config, format))
+            .map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })
     }
 
-    /// Parse a TOML string into a [`FileConfig`] (the I/O-free core of [`Self::load`], so tests can
+    /// Parse a YAML string into a [`FileConfig`] (the I/O-free core of [`Self::load`], so tests can
     /// exercise the schema without touching the filesystem).
-    pub fn parse_str(text: &str) -> Result<Self, toml::de::Error> {
+    ///
+    /// # Errors
+    /// The YAML error for malformed input, a mistyped value or an unknown key.
+    pub fn parse_yaml(text: &str) -> Result<Self, serde_saphyr::Error> {
+        serde_saphyr::from_str(text)
+    }
+
+    /// Parse a TOML string into a [`FileConfig`]: the deprecated syntax, deserialized into the same
+    /// struct as [`Self::parse_yaml`].
+    ///
+    /// # Errors
+    /// The TOML error for malformed input, a mistyped value or an unknown key.
+    pub fn parse_toml(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
     }
 }
@@ -356,7 +437,7 @@ mod tests {
             "xdp_queue = 2\n",
         );
 
-        let config = FileConfig::parse_str(toml).expect("valid TOML deserializes");
+        let config = FileConfig::parse_toml(toml).expect("valid TOML deserializes");
 
         assert_eq!(
             config.control,
@@ -422,7 +503,7 @@ mod tests {
             "turn_client_ca_file = \"/etc/siphon-rtp/turn-ca.pem\"\n",
             "turn_client_ttl = 7200\n",
         );
-        let config = FileConfig::parse_str(toml).expect("valid TOML deserializes");
+        let config = FileConfig::parse_toml(toml).expect("valid TOML deserializes");
         assert_eq!(
             config.turn_client,
             Some(vec![
@@ -453,7 +534,7 @@ mod tests {
             "media_fetch_max_redirects = 1\n",
             "media_fetch_allow_host = [\"prompts.internal.example\", \"cdn.internal.example\"]\n",
         );
-        let config = FileConfig::parse_str(toml).expect("valid TOML deserializes");
+        let config = FileConfig::parse_toml(toml).expect("valid TOML deserializes");
         assert_eq!(config.media_fetch_connect_timeout_ms, Some(1_500));
         assert_eq!(config.ws_connect_timeout_ms, Some(2_500));
         assert_eq!(config.media_fetch_first_byte_timeout_ms, Some(4_000));
@@ -475,7 +556,7 @@ mod tests {
     /// The single-interface advertise-IP override deserializes (the 1:1-NAT / Elastic-IP case).
     #[test]
     fn deserializes_advertise_ip() {
-        let config = FileConfig::parse_str("advertise_ip = \"203.0.113.5\"\n").expect("valid");
+        let config = FileConfig::parse_toml("advertise_ip = \"203.0.113.5\"\n").expect("valid");
         assert_eq!(
             config.advertise_ip,
             Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)))
@@ -502,7 +583,7 @@ mod tests {
             "address = \"::\"\n",
             "advertised = \"2001:db8::5\"\n",
         );
-        let config = FileConfig::parse_str(toml).expect("valid interface array");
+        let config = FileConfig::parse_toml(toml).expect("valid interface array");
         assert_eq!(config.default_interface.as_deref(), Some("external"));
         assert_eq!(config.interface.len(), 3);
         assert_eq!(config.interface[0].name, "internal");
@@ -528,20 +609,20 @@ mod tests {
             "address = \"10.0.0.1\"\n",
             "advertize = \"203.0.113.5\"\n", // typo of `advertised`
         );
-        assert!(FileConfig::parse_str(toml).is_err());
+        assert!(FileConfig::parse_toml(toml).is_err());
     }
 
     /// An empty file is valid and yields all-`None` (every key falls through to the CLI default).
     #[test]
     fn empty_file_is_all_none() {
-        let config = FileConfig::parse_str("").expect("empty TOML is valid");
+        let config = FileConfig::parse_toml("").expect("empty TOML is valid");
         assert_eq!(config, FileConfig::default());
     }
 
     /// A partial file only sets the keys it lists; the rest stay `None`.
     #[test]
     fn partial_file_leaves_unset_keys_none() {
-        let config = FileConfig::parse_str("max_control_rps = 1000\n").expect("valid");
+        let config = FileConfig::parse_toml("max_control_rps = 1000\n").expect("valid");
         assert_eq!(config.max_control_rps, Some(1000));
         assert_eq!(config.control, None);
         assert_eq!(config.metrics_addr, None);
@@ -572,27 +653,27 @@ mod tests {
     /// Malformed TOML is a clean `Err`, never a panic (syntactically broken body).
     #[test]
     fn malformed_toml_is_a_clean_error() {
-        let result = FileConfig::parse_str("control = \"not a socket addr\"\n");
+        let result = FileConfig::parse_toml("control = \"not a socket addr\"\n");
         assert!(result.is_err(), "bad socket address must error, not panic");
 
-        let syntax = FileConfig::parse_str("this is not = = toml\n");
+        let syntax = FileConfig::parse_toml("this is not = = toml\n");
         assert!(syntax.is_err(), "broken TOML syntax must error, not panic");
     }
 
     /// An unknown/mistyped key is rejected (`deny_unknown_fields`) so a config typo is loud.
     #[test]
     fn unknown_key_is_rejected() {
-        let result = FileConfig::parse_str("relay_bind_up = \"127.0.0.1\"\n");
+        let result = FileConfig::parse_toml("relay_bind_up = \"127.0.0.1\"\n");
         assert!(result.is_err(), "typo'd key must error, not be ignored");
     }
 
-    /// The shipped `config.example.toml` parses against the live schema — guards the example and the
+    /// The shipped `config.example.yaml` parses against the live schema — guards the example and the
     /// [`FileConfig`] struct from drifting apart (a documented key that no longer exists, or a bad
     /// value, fails here). With every non-`control` key commented out, only `control` is set.
     #[test]
     fn shipped_example_config_parses() {
-        let example = include_str!("../config.example.toml");
-        let config = FileConfig::parse_str(example).expect("config.example.toml must parse");
+        let example = include_str!("../config.example.yaml");
+        let config = FileConfig::parse_yaml(example).expect("config.example.yaml must parse");
         assert_eq!(
             config.control,
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)))
@@ -603,7 +684,7 @@ mod tests {
     /// key is a loud startup error, so this also guards the documented names in the example file.
     #[test]
     fn lawful_interception_keys_parse() {
-        let config = FileConfig::parse_str(concat!(
+        let config = FileConfig::parse_toml(concat!(
             "x3_client_cert = \"/etc/siphon-rtp/li/client.pem\"\n",
             "x3_client_key = \"/etc/siphon-rtp/li/client.key\"\n",
             "x3_ca = \"/etc/siphon-rtp/li/mdf-ca.pem\"\n",
@@ -633,10 +714,12 @@ mod tests {
     /// the string core).
     #[test]
     fn loads_from_a_real_file() {
-        use std::io::Write;
-        let mut file = tempfile::NamedTempFile::new().expect("temp file");
-        writeln!(file, "control = \"127.0.0.1:9000\"\nmax_control_rps = 42").expect("write temp");
-        let config = FileConfig::load(file.path()).expect("on-disk file loads");
+        let directory = write_config(
+            "config.yaml",
+            "control: \"127.0.0.1:9000\"\nmax_control_rps: 42\n",
+        );
+        let config =
+            FileConfig::load(&directory.path().join("config.yaml")).expect("on-disk file loads");
         assert_eq!(
             config.control,
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9000)))
@@ -644,13 +727,12 @@ mod tests {
         assert_eq!(config.max_control_rps, Some(42));
     }
 
-    /// A real on-disk file with malformed TOML is a clean [`ConfigError::Parse`], not a panic.
+    /// A real on-disk file with malformed YAML is a clean [`ConfigError::Parse`], not a panic.
     #[test]
     fn malformed_on_disk_file_yields_parse_error() {
-        use std::io::Write;
-        let mut file = tempfile::NamedTempFile::new().expect("temp file");
-        writeln!(file, "control = = broken").expect("write temp");
-        let error = FileConfig::load(file.path()).expect_err("broken file must error");
+        let directory = write_config("config.yaml", "control: [unclosed\n");
+        let error = FileConfig::load(&directory.path().join("config.yaml"))
+            .expect_err("broken file must error");
         assert!(matches!(error, ConfigError::Parse { .. }));
     }
 
@@ -658,9 +740,197 @@ mod tests {
     /// names the path.
     #[test]
     fn missing_file_yields_read_error() {
-        let path = Path::new("/nonexistent/siphon-rtp/does-not-exist.toml");
+        let path = Path::new("/nonexistent/siphon-rtp/does-not-exist.yaml");
         let error = FileConfig::load(path).expect_err("missing file must error");
         assert!(matches!(error, ConfigError::Read { .. }));
-        assert!(error.to_string().contains("does-not-exist.toml"));
+        assert!(error.to_string().contains("does-not-exist.yaml"));
+    }
+
+    /// The lines of the shipped example that set a key once uncommented, as `(key, value)`. A line is
+    /// a commented key when it reads `# key: value` with a lowercase snake_case key.
+    fn commented_example_keys() -> Vec<(String, String)> {
+        include_str!("../config.example.yaml")
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("# ")?;
+                let (key, value) = rest.split_once(": ")?;
+                let is_key = !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                is_key.then(|| (key.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    /// Every key the example documents parses to the same [`FileConfig`] from YAML (`key: value`) and
+    /// from TOML (`key = value`): one struct, two deserializers, no drift between them.
+    #[test]
+    fn every_documented_key_parses_identically_from_yaml_and_toml() {
+        let keys = commented_example_keys();
+        assert!(
+            keys.len() > 50,
+            "the example documents the keys: {}",
+            keys.len()
+        );
+        let mut seen = std::collections::HashSet::new();
+        for (key, value) in &keys {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let from_yaml = FileConfig::parse_yaml(&format!("{key}: {value}\n"))
+                .unwrap_or_else(|error| panic!("{key}: {value} as YAML: {error}"));
+            let from_toml = FileConfig::parse_toml(&format!("{key} = {value}\n"))
+                .unwrap_or_else(|error| panic!("{key} = {value} as TOML: {error}"));
+            assert_eq!(from_yaml, from_toml, "{key}");
+            assert_ne!(from_yaml, FileConfig::default(), "{key} set nothing");
+        }
+    }
+
+    /// The whole example, every key uncommented at once, is one document in either format.
+    #[test]
+    fn the_example_with_every_key_set_is_the_same_document_in_both_formats() {
+        let mut seen = std::collections::HashSet::new();
+        let (mut yaml, mut toml) = (String::new(), String::new());
+        for (key, value) in commented_example_keys() {
+            if seen.insert(key.clone()) {
+                yaml.push_str(&format!("{key}: {value}\n"));
+                toml.push_str(&format!("{key} = {value}\n"));
+            }
+        }
+        assert_eq!(
+            FileConfig::parse_yaml(&yaml).expect("yaml"),
+            FileConfig::parse_toml(&toml).expect("toml")
+        );
+    }
+
+    #[test]
+    fn interfaces_are_a_list_in_yaml_and_an_array_of_tables_in_toml() {
+        let yaml = concat!(
+            "interface:\n",
+            "  - name: internal\n",
+            "    address: \"10.0.0.1\"\n",
+            "  - name: external\n",
+            "    address: \"0.0.0.0\"\n",
+            "    advertised: \"203.0.113.5\"\n",
+        );
+        let toml = concat!(
+            "[[interface]]\nname = \"internal\"\naddress = \"10.0.0.1\"\n",
+            "[[interface]]\nname = \"external\"\naddress = \"0.0.0.0\"\n",
+            "advertised = \"203.0.113.5\"\n",
+        );
+        let from_yaml = FileConfig::parse_yaml(yaml).expect("yaml");
+        assert_eq!(from_yaml.interface.len(), 2);
+        assert_eq!(from_yaml, FileConfig::parse_toml(toml).expect("toml"));
+    }
+
+    #[test]
+    fn an_unknown_yaml_key_is_refused_like_an_unknown_toml_key() {
+        assert!(FileConfig::parse_yaml("contrl: \"127.0.0.1:8080\"\n").is_err());
+        assert!(FileConfig::parse_toml("contrl = \"127.0.0.1:8080\"\n").is_err());
+        let nested = "interface:\n  - name: a\n    address: \"10.0.0.1\"\n    colour: red\n";
+        assert!(FileConfig::parse_yaml(nested).is_err());
+    }
+
+    fn write_config(name: &str, text: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("temp dir");
+        std::fs::write(directory.path().join(name), text).expect("write");
+        directory
+    }
+
+    #[test]
+    fn the_extension_picks_the_parser() {
+        for (name, text, format) in [
+            ("config.yaml", "max_control_rps: 42\n", ConfigFormat::Yaml),
+            ("config.yml", "max_control_rps: 42\n", ConfigFormat::Yaml),
+            ("CONFIG.YAML", "max_control_rps: 42\n", ConfigFormat::Yaml),
+            ("config.toml", "max_control_rps = 42\n", ConfigFormat::Toml),
+        ] {
+            let directory = write_config(name, text);
+            let (config, found) =
+                FileConfig::load_with_format(&directory.path().join(name)).expect(name);
+            assert_eq!(config.max_control_rps, Some(42), "{name}");
+            assert_eq!(found, format, "{name}");
+        }
+        // The wrong parser for the extension is a parse error, not a silent success.
+        let directory = write_config("config.yaml", "max_control_rps = 42\n");
+        assert!(matches!(
+            FileConfig::load(&directory.path().join("config.yaml")),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unknown_extension_is_refused_naming_the_file_and_the_formats() {
+        for name in ["config.json", "config.conf", "config"] {
+            let directory = write_config(name, "max_control_rps: 42\n");
+            let path = directory.path().join(name);
+            let error = FileConfig::load(&path).expect_err(name);
+            assert!(
+                matches!(error, ConfigError::UnsupportedFormat { .. }),
+                "{name}"
+            );
+            let text = error.to_string();
+            assert!(text.contains(name) && text.contains(".yaml"), "{text}");
+        }
+    }
+
+    /// A tracing writer that keeps what it is given, so a test can read the warning.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn logged(run: impl FnOnce()) -> String {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = captured.0.lock().expect("capture").clone();
+        String::from_utf8(bytes).expect("utf8")
+    }
+
+    #[test]
+    fn a_toml_config_warns_that_it_is_deprecated_and_names_the_yaml_file() {
+        let path = Path::new("/etc/siphon-rtp/config.toml");
+        let output = logged(|| ConfigFormat::Toml.warn_if_deprecated(path));
+        assert!(output.contains("WARN"), "{output}");
+        assert!(output.contains("/etc/siphon-rtp/config.toml"), "{output}");
+        assert!(output.contains("/etc/siphon-rtp/config.yaml"), "{output}");
+        assert!(output.contains("deprecated"), "{output}");
+    }
+
+    #[test]
+    fn a_yaml_config_does_not_warn() {
+        let path = Path::new("/etc/siphon-rtp/config.yaml");
+        let output = logged(|| ConfigFormat::Yaml.warn_if_deprecated(path));
+        assert!(output.is_empty(), "{output}");
+    }
+
+    #[test]
+    fn loading_a_toml_file_through_load_warns() {
+        let directory = write_config("config.toml", "max_control_rps = 1\n");
+        let path = directory.path().join("config.toml");
+        let output = logged(|| {
+            FileConfig::load(&path).expect("loads");
+        });
+        assert!(output.contains("deprecated"), "{output}");
     }
 }

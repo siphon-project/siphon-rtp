@@ -30,7 +30,7 @@ exclude = ["crates/siphon-rtp-xdp"]
 [workspace.package]
 version = "0.27.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/siphon-project/siphon-rtp"
 homepage = "https://github.com/siphon-project/siphon-rtp"
@@ -105,6 +105,9 @@ clap = { version = "4", features = ["derive"] }
 # TOML config-file parsing for the daemon's optional --config file (pure Rust: toml → toml_edit →
 # winnow, zero-C rule). `parse` only — no serialization needed.
 toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
+# YAML config-file parsing (the documented format; TOML stays as a deprecated fallback). Pure safe
+# Rust (saphyr), maintained, and the same spec siphon-sip uses.
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
 # Allocator (arena contention under the async runtime — see plan §perf)
 tikv-jemallocator = "0.6"
 # Dev / test

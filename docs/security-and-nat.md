@@ -1272,12 +1272,12 @@ two-party floor legs.
 - **Retention: never, by default.** An entry is the key's high-water mark, and a key that comes back after
   its entry was dropped restarts at index 0 and repeats nonces (RFC 7714 §8); the engine cannot see a
   controller replace a key. So nothing is dropped unless the operator opts in with
-  `srtcp_ledger_retention_secs` (TOML) / `--srtcp-ledger-retention-secs`, which drops an entry nothing
+  `srtcp_ledger_retention_secs` (config file) / `--srtcp-ledger-retention-secs`, which drops an entry nothing
   has held for that long. That is only safe at or above the lifetime the controller enforces on a client
   key (TS 33.180 §9.4.2). A held entry and an exhausted one are never dropped. Memory is one small
   entry per distinct key material seen; `siphon_rtp_srtcp_ledger_entries` is the gauge.
 - **Entry cap: refuse the new key, never evict.** Without retention nothing bounds the entry count, so
-  `srtcp_ledger_max_entries` (TOML) / `--srtcp-ledger-max-entries` caps it (default 100000, about 15 MB).
+  `srtcp_ledger_max_entries` (config file) / `--srtcp-ledger-max-entries` caps it (default 100000, about 15 MB).
   At the cap the install of a **new** key is refused under the ledger's install mutex (control path only,
   never the per-packet take): the verb that carried it fails with a clear reason, an `error!` is logged on
   `siphon_rtp::media` and `siphon_rtp_srtcp_ledger_install_refused_total` counts it. A key already in the

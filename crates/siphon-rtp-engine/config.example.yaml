@@ -1,6 +1,6 @@
-# siphon-rtp-engine — example TOML config file.
+# siphon-rtp-engine — example YAML config file.
 #
-# Pass it with `--config /etc/siphon-rtp/config.toml`. It is entirely optional: the daemon runs with
+# Pass it with `--config /etc/siphon-rtp/config.yaml`. It is entirely optional: the daemon runs with
 # just CLI flags (or all built-in defaults) and no config file at all.
 #
 # Precedence (highest wins):
@@ -11,6 +11,9 @@
 # So this file overrides the built-in defaults, and any CLI flag you pass overrides this file. Every
 # key is optional — set only the ones you want to override; unset keys fall through to the default.
 # Unknown/mistyped keys are a hard error (so a typo is loud, not silently ignored).
+#
+# The format is chosen by the file extension: .yaml / .yml is YAML (this file). A .toml file is still
+# read, with a deprecation warning, and takes the same keys (`key = value`, `[[interface]]` tables).
 #
 # Secret *values* are deliberately NOT config-file keys and are never on the command line either: the
 # control-plane shared secret, TURN realm/secret, and HEP collector are read from the environment
@@ -25,73 +28,73 @@
 # --- Control plane ------------------------------------------------------------------------------
 
 # JSON-over-TCP control listen address (CLI: --control). Default: "127.0.0.1:8080".
-control = "127.0.0.1:8080"
+control: "127.0.0.1:8080"
 
 # rtpengine NG/bencode control listen address, UDP (CLI: --ng). Off unless set (rtpengine default
 # :22222). Lets SIPhon / Kamailio / OpenSIPS drive the engine over the rtpengine protocol unchanged.
-# ng = "0.0.0.0:22222"
+# ng: "0.0.0.0:22222"
 
 # Per-connection control request cap, requests/second; 0 disables the limit (CLI: --max-control-rps).
-# max_control_rps = 5000
+# max_control_rps: 5000
 
 # --- Media / relay ------------------------------------------------------------------------------
 
 # Bind relay/media sockets to this IP instead of loopback (CLI: --relay-bind-ip) — the production
 # posture so the relay is reachable by real peers. With a 0.0.0.0 bind or a NAT'd host, pair with
 # advertise_ip (below) to advertise the reachable SDP address (and turn_relay_ip for the TURN server).
-# relay_bind_ip = "0.0.0.0"
+# relay_bind_ip: "0.0.0.0"
 
 # Deterministic media port range (CLI: --port-min / --port-max). Set BOTH to draw media ports from a
 # bounded, firewallable window (rtpengine port-min/port-max parity) instead of OS-ephemeral ports;
 # also the prerequisite for HA takeover (a standby re-binds the same port behind a floating IP).
 # Size it for your concurrency: up to 4 ports per call (RTP+RTCP per leg), 2 with rtcp-mux. Unset =
 # OS-ephemeral ports. A half-set or inverted range is a fatal startup error.
-# port_min = 30000
-# port_max = 40000
+# port_min: 30000
+# port_max: 40000
 
 # DiffServ marking on outbound media (CLI: --media-dscp). A name (EF, CS3, AF41, VA, BE, ...) or a
 # raw 0-63. Default: EF (46, RFC 3246; RFC 4594 §4.1 Telephony) = TOS byte 184, the same value as
 # Asterisk's tos_audio and rtpengine's tos. BE (or 0) disables marking and leaves the TOS byte
 # untouched, so an upstream marker is not overwritten. Applies to every media egress path (UDP
 # sockets, AF_XDP TX frames, the in-kernel XDP_TX rewrite); never to control/metrics/HEP/WS sockets.
-# media_dscp = "EF"
+# media_dscp: "EF"
 
 # Bytes of decoded prompt audio to cache, so a hold bed played to many callers is decoded once
 # (CLI: --prompt-cache-bytes). Keyed by path + mtime + size, so re-recording a prompt takes effect on
 # the next play with no cache-clearing step. 0 disables caching. Default: 67108864 (64 MiB).
-# prompt_cache_bytes = 67108864
+# prompt_cache_bytes: 67108864
 # Highest AMR / AMR-WB speech mode the node sends (CLI: --amr-max-mode 0-7, --amr-wb-max-mode 0-8).
 # Unset: the highest mode of each stream's negotiated mode-set, which with no mode-set is 12.2 kbit/s
 # for AMR and 23.85 kbit/s for AMR-WB. 2 holds AMR-WB legs at 12.65 kbit/s. Only on `amr` builds.
-# amr_max_mode = 7
-# amr_wb_max_mode = 2
+# amr_max_mode: 7
+# amr_wb_max_mode: 2
 # Codec mode request (RFC 4867) the node puts in every AMR / AMR-WB payload it sends, asking the peer
 # for no mode above it (CLI: --amr-mode-request, --amr-wb-mode-request). Unset: 15, no request.
-# amr_mode_request = 7
-# amr_wb_mode_request = 2
+# amr_mode_request: 7
+# amr_wb_mode_request: 2
 # File holding the control-plane shared secret, read once at start and trimmed of surrounding
 # whitespace (CLI: --control-secret-file; SIPHON_RTP_CONTROL_SECRET_FILE names it from the
 # environment). Setting this and SIPHON_RTP_CONTROL_SECRET together is a fatal startup error, and an
 # empty file is refused rather than read as "no secret".
-# control_secret_file = "/run/secrets/siphon-rtp-control"
+# control_secret_file: "/run/secrets/siphon-rtp-control"
 
 # Reap a call after this many seconds with no accepted media (CLI: --media-timeout-secs).
 # Counts only while the call is on two-way media — a party on hold may legitimately send nothing
 # (RFC 3264 §8.4), so a held call uses held_media_timeout_secs instead. Default: 30.
-# media_timeout_secs = 30
+# media_timeout_secs: 30
 
 # Reap a *held* call after this many seconds — one where a party signalled a=sendonly, a=recvonly or
 # a=inactive, so no media is owed at all. Hold, park and queue are this state and they last minutes,
 # so this is a backstop against a call nobody comes back to, not a dead-path timer. 0 disables it.
 # (CLI: --held-media-timeout-secs). Default: 7200 (two hours).
-# held_media_timeout_secs = 7200
+# held_media_timeout_secs: 7200
 
 # Free a push-to-talk forwarding room after this many seconds in which *every* seat has received
 # nothing at all (no RTP, RTCP or floor packet). Each seat is reported to the client that seated it as
 # a media_timeout, then the room is freed. A backstop for a room nobody ended: a seat alone is never
 # reaped, and a live group cannot trip it because its receivers send RTCP reports. 0 disables it.
 # (CLI: --forward-room-idle-secs). Default: 3600.
-# forward_room_idle_secs = 3600
+# forward_room_idle_secs: 3600
 
 # Drop a key's SRTCP send-index counter once nothing has held it for this many seconds. 0 (the
 # default) never drops one. Every key the engine seals SRTCP under has a counter that only moves
@@ -100,7 +103,7 @@ control = "127.0.0.1:8080"
 # above the lifetime your controller enforces on a client key (3GPP TS 33.180 section 9.4.2), and never
 # below the time a seat can be away and rejoin with its key. (CLI: --srtcp-ledger-retention-secs).
 # Default: 0.
-# srtcp_ledger_retention_secs = 0
+# srtcp_ledger_retention_secs: 0
 
 # The most keys the SRTCP send-index ledger holds (one entry per distinct key material, about 150 bytes
 # each, so the default is about 15 MB). At the cap a NEW key is refused: the verb that carries it
@@ -111,7 +114,7 @@ control = "127.0.0.1:8080"
 # deployment with more simultaneous client keys, or set srtcp_ledger_retention_secs so keys the
 # controller no longer uses are released. (CLI: --srtcp-ledger-max-entries).
 # Default: 100000.
-# srtcp_ledger_max_entries = 100000
+# srtcp_ledger_max_entries: 100000
 
 # --- play_media from an http(s) URL --------------------------------------------------------------
 #
@@ -123,27 +126,27 @@ control = "127.0.0.1:8080"
 # attach_ws_bridge, a ws_uri or ws_tee profile): name resolution, TCP connect, TLS and the
 # WebSocket upgrade together (CLI: --ws-connect-timeout-ms). The command that asked fails when it
 # runs out; no other command waits for it. Default: 3000.
-# ws_connect_timeout_ms = 3000
+# ws_connect_timeout_ms: 3000
 #
 # DNS + TCP connect + TLS, per redirect hop (CLI: --media-fetch-connect-timeout-ms). Default: 2000.
-# media_fetch_connect_timeout_ms = 2000
+# media_fetch_connect_timeout_ms: 2000
 #
 # Wait for response headers after the request is written (CLI: --media-fetch-first-byte-timeout-ms).
 # Default: 5000.
-# media_fetch_first_byte_timeout_ms = 5000
+# media_fetch_first_byte_timeout_ms: 5000
 #
 # The whole fetch — every redirect hop and the body read together (CLI: --media-fetch-timeout-ms).
 # Default: 15000. This is what stops a server that dribbles one byte per second.
-# media_fetch_timeout_ms = 15000
+# media_fetch_timeout_ms: 15000
 #
 # Largest response body accepted, bytes (CLI: --media-fetch-max-bytes). Default: 8388608 (8 MiB,
 # about 8 minutes of 8 kHz mono WAV). Checked against Content-Length up front AND while reading, so
 # a chunked response that declares nothing is cut off too.
-# media_fetch_max_bytes = 8388608
+# media_fetch_max_bytes: 8388608
 #
 # Redirect hops followed (CLI: --media-fetch-max-redirects). Default: 3. Every hop is re-validated
 # against the scheme rule and the allow-list, so an open redirect cannot walk the fetch elsewhere.
-# media_fetch_max_redirects = 3
+# media_fetch_max_redirects: 3
 #
 # Hosts the engine may fetch from (CLI: --media-fetch-allow-host, repeatable). Exact,
 # case-insensitive match — no wildcards, no suffix matching.
@@ -153,7 +156,7 @@ control = "127.0.0.1:8080"
 # an acceptable default because the control plane is authenticated and owns the call — if you do not
 # fully trust it, set this list, put the engine behind an egress policy, or leave the URL source
 # unused.
-# media_fetch_allow_host = ["prompts.internal.example"]
+# media_fetch_allow_host: ["prompts.internal.example"]
 
 # --- ICE candidate gathering (RFC 8445 §5.1.1) --------------------------------------------------
 #
@@ -167,7 +170,7 @@ control = "127.0.0.1:8080"
 #
 # A server that does not answer costs one bounded delay (logged) and a host-only candidate list; it
 # never fails a call.
-# stun_server = ["198.51.100.1:3478"]
+# stun_server: ["198.51.100.1:3478"]
 
 # --- Full ICE (RFC 8445) ------------------------------------------------------------------------
 #
@@ -179,7 +182,7 @@ control = "127.0.0.1:8080"
 # ICE gets no media and the call is reaped with CDR reason `ice_failed`. See docs/security-and-nat.md
 # §4 layer 4. Supersedes consent freshness on the legs it runs on (consent is the lite-agent
 # behaviour; a full agent runs its own checks).
-# ice_full = false
+# ice_full: false
 
 # --- TURN client: relayed ICE candidates (RFC 8656) ----------------------------------------------
 #
@@ -205,13 +208,13 @@ control = "127.0.0.1:8080"
 # allocation (RFC 8656 §7.2), so `turn_client_ttl` (seconds, default 86400) must outlive the longest
 # call; each new allocation gets a fresh one. Matching coturn config: `use-auth-secret` and
 # `static-auth-secret=<the same secret>`.
-# turn_client = ["turn:turn.example.com:3478"]
-# turn_client_secret_file = "/run/secrets/siphon-rtp-turn-secret"
-# turn_client_ttl = 86400
+# turn_client: ["turn:turn.example.com:3478"]
+# turn_client_secret_file: "/run/secrets/siphon-rtp-turn-secret"
+# turn_client_ttl: 86400
 #
 # PEM CA bundle a `turns:` server must chain to (CLI: --turn-client-ca-file). Replaces the public web
 # roots, which are the default. Refused unless a `turns:` server is configured.
-# turn_client_ca_file = "/etc/siphon-rtp/turn-ca.pem"
+# turn_client_ca_file: "/etc/siphon-rtp/turn-ca.pem"
 
 # --- ICE consent freshness (RFC 7675) -----------------------------------------------------------
 #
@@ -224,16 +227,16 @@ control = "127.0.0.1:8080"
 # signalled c= address (which for a NATed peer is unusable, and probing it would reap live calls).
 # Needs a datapath with the full-agent seam: the UDP backend has it; the XDP fast path logs a warning
 # per endpoint and stays responder-only. See docs/security-and-nat.md §4 layer 4.
-# ice_consent = false
+# ice_consent: false
 
 # Seconds between consent checks on a validated pair; RFC 7675 §5.1 recommends ~5 s, randomised
 # (CLI: --consent-interval-secs). Default: 5.
-# consent_interval_secs = 5
+# consent_interval_secs: 5
 
 # Seconds with no correlated, MESSAGE-INTEGRITY-verified response before the pair is declared dead
 # and the call is torn down — CDR reason `consent_failed` (CLI: --consent-timeout-secs). RFC 7675
 # §5.1 specifies 30 s. Default: 30.
-# consent_timeout_secs = 30
+# consent_timeout_secs: 30
 
 # --- Advertised address & named interfaces (rtpengine-style) ------------------------------------
 #
@@ -243,33 +246,29 @@ control = "127.0.0.1:8080"
 
 # Single-interface case (1:1 NAT, e.g. an AWS Elastic IP): bind a private/wildcard address but
 # advertise a routable public IP in the SDP c=/o=/ICE-candidate lines (CLI: --advertise-ip). Same
-# port; the socket still binds relay_bind_ip. Pair with relay_bind_ip = "0.0.0.0" or the private IP.
+# port; the socket still binds relay_bind_ip. Pair with relay_bind_ip: "0.0.0.0" or the private IP.
 # Emit-only (does not affect bind, the source gate, the symmetric-RTP latch, or TURN). Ignored when
-# [[interface]] entries are set below.
-# advertise_ip = "203.0.113.5"
+# `interface` entries are set below.
+# advertise_ip: "203.0.113.5"
 
-# Multi-network case: named interfaces. Each [[interface]] has a bind `address` and an optional
+# Multi-network case: named interfaces. Each `interface` entry has a bind `address` and an optional
 # `advertised` (public) IP; the control `direction` pair then selects which interface the caller-facing
-# (A) leg and the callee-facing (B) leg land on — e.g. direction = ["external", "internal"] puts the
+# (A) leg and the callee-facing (B) leg land on — e.g. direction ["external", "internal"] puts the
 # A leg on `external` and the B leg on `internal`. Repeat a name with a v4 and a v6 `address` to serve
 # both families on one interface. `default_interface` is used when a call carries no direction (or an
 # unknown one); it defaults to the first interface defined.
 #
-# default_interface = "external"
+# default_interface: "external"
 #
-# [[interface]]
-# name = "internal"
-# address = "10.0.0.1"          # bind + advertise 10.0.0.1 (directly reachable on the core side)
-#
-# [[interface]]
-# name = "external"
-# address = "0.0.0.0"           # bind the wildcard on the access side
-# advertised = "203.0.113.5"    # advertise the public IP to peers
-#
-# [[interface]]
-# name = "external"             # same name → the v6 address of the `external` interface
-# address = "::"
-# advertised = "2001:db8::5"
+# interface:
+#   - name: internal
+#     address: "10.0.0.1"         # bind + advertise 10.0.0.1 (directly reachable on the core side)
+#   - name: external
+#     address: "0.0.0.0"          # bind the wildcard on the access side
+#     advertised: "203.0.113.5"   # advertise the public IP to peers
+#   - name: external              # same name -> the v6 address of the `external` interface
+#     address: "::"
+#     advertised: "2001:db8::5"
 
 # --- Clustering ---------------------------------------------------------------------------------
 #
@@ -279,26 +278,26 @@ control = "127.0.0.1:8080"
 
 # Stable node identifier a dispatcher uses to tell engines apart, reported by `load` / `node_info`
 # (CLI: --node-id). Defaults to the host's HOSTNAME (else "siphon-rtp") when unset.
-# node_id = "rtp-ams-3"
+# node_id: "rtp-ams-3"
 
 # Advertised maximum concurrent sessions for cluster load reporting; 0 = unlimited (CLI:
 # --max-sessions). Drives the normalized load score a dispatcher ranks nodes by. It does NOT cap
 # admission itself — the per-client quota and the datapath port pool do that.
-# max_sessions = 4000
+# max_sessions: 4000
 
 # Bounded grace period (seconds) to drain live calls on SIGTERM/SIGINT before exiting
 # (CLI: --shutdown-grace-secs). Default: 25.
-# shutdown_grace_secs = 25
+# shutdown_grace_secs: 25
 
 # --- Observability ------------------------------------------------------------------------------
 
 # Prometheus metrics + health HTTP listen address (CLI: --metrics-addr). Off unless set. Exposes
 # GET /metrics (OpenMetrics), GET /healthz (liveness), GET /readyz (readiness).
-# metrics_addr = "127.0.0.1:9090"
+# metrics_addr: "127.0.0.1:9090"
 
 # `tracing` env-filter directive used only when the process environment does not set one
 # (RUST_LOG / the default-env filter always win over this). Not a CLI flag.
-# log_filter = "info,siphon_rtp_engine=debug"
+# log_filter: "info,siphon_rtp_engine=debug"
 
 # --- TURN server (coturn replacement) -----------------------------------------------------------
 #
@@ -306,23 +305,23 @@ control = "127.0.0.1:8080"
 # at least one turn_* listener must then be configured (here or via --turn-*).
 
 # TURN UDP listen address, `turn:` (CLI: --turn-udp).
-# turn_udp = "0.0.0.0:3478"
+# turn_udp: "0.0.0.0:3478"
 
 # TURN TCP listen address, `turn:` over TCP, RFC 6062 (CLI: --turn-tcp).
-# turn_tcp = "0.0.0.0:3478"
+# turn_tcp: "0.0.0.0:3478"
 
 # TURN TLS listen address, `turns:` (CLI: --turn-tls). Requires turn_tls_cert + turn_tls_key.
-# turn_tls = "0.0.0.0:5349"
+# turn_tls: "0.0.0.0:5349"
 
 # PEM certificate-chain file for the `turns:` listener (CLI: --turn-tls-cert).
-# turn_tls_cert = "/etc/siphon-rtp/turn.pem"
+# turn_tls_cert: "/etc/siphon-rtp/turn.pem"
 
 # PEM private-key file for the `turns:` listener (CLI: --turn-tls-key).
-# turn_tls_key = "/etc/siphon-rtp/turn.key"
+# turn_tls_key: "/etc/siphon-rtp/turn.key"
 
 # Public IP to advertise in XOR-RELAYED-ADDRESS when the relay socket's bound IP is not the
 # reachable one, e.g. a NAT'd host (CLI: --turn-relay-ip). Defaults to the datapath-assigned address.
-# turn_relay_ip = "203.0.113.7"
+# turn_relay_ip: "203.0.113.7"
 
 # --- Lawful interception, ETSI TS 103 221-2 X3 content delivery ---------------------------------
 #
@@ -336,32 +335,32 @@ control = "127.0.0.1:8080"
 
 # PEM certificate chain the engine presents to the Mediation Function, which authenticates the
 # network element by certificate (CLI: --x3-client-cert).
-# x3_client_cert = "/etc/siphon-rtp/li/client.pem"
+# x3_client_cert: "/etc/siphon-rtp/li/client.pem"
 
 # PEM private-key file for x3_client_cert (CLI: --x3-client-key).
-# x3_client_key = "/etc/siphon-rtp/li/client.key"
+# x3_client_key: "/etc/siphon-rtp/li/client.key"
 
 # PEM CA the Mediation Function's own certificate is verified against (CLI: --x3-ca). The delivery
 # PKI is private, so the public Mozilla bundle the WebSocket client uses is not it.
-# x3_ca = "/etc/siphon-rtp/li/mdf-ca.pem"
+# x3_ca: "/etc/siphon-rtp/li/mdf-ca.pem"
 
 # Network Function ID on every delivered PDU — which network element produced it
 # (CLI: --x3-network-function-id, conditional attribute 6).
-# x3_network_function_id = "siphon-rtp-sbc-01"
+# x3_network_function_id: "siphon-rtp-sbc-01"
 
 # Interception Point ID on every delivered PDU — where within that element the tap sits
 # (CLI: --x3-interception-point-id, conditional attribute 7).
-# x3_interception_point_id = "media-relay-a"
+# x3_interception_point_id: "media-relay-a"
 
 # Intercepted packets buffered per interception before content is dropped
 # (CLI: --x3-buffer-packets). Default 20000, roughly 400 s of one direction at a 20 ms ptime.
 # Deliberately far deeper than the pcap recorder's queue: a Mediation Function outage must be
 # survived, not discarded through. When it does fill, the ARRIVING packet is dropped so what was
 # delivered stays a contiguous prefix, and every drop raises an `x3_loss` event.
-# x3_buffer_packets = 20000
+# x3_buffer_packets: 20000
 
 # Idle seconds before a keepalive PDU is sent on the delivery connection (CLI: --x3-keepalive-secs).
-# x3_keepalive_secs = 30
+# x3_keepalive_secs: 30
 
 # --- XDP / AF_XDP kernel datapath ---------------------------------------------------------------
 #
@@ -372,7 +371,7 @@ control = "127.0.0.1:8080"
 # fast path is IPv4-only); otherwise, or on any attach failure, it falls back to UDP-loopback.
 
 # NIC to attach the XDP/AF_XDP datapath to (CLI: --xdp-interface). Off unless set.
-# xdp_interface = "eth0"
+# xdp_interface: "eth0"
 
 # NIC queue the AF_XDP socket binds, RX/TX (CLI: --xdp-queue). Default: 0.
-# xdp_queue = 0
+# xdp_queue: 0

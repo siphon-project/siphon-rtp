@@ -43,22 +43,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         siphon_rtp_engine::healthcheck::probe_and_exit("siphon-rtp-engine", address).await;
     }
 
-    // Load the optional `--config` TOML file. A missing/malformed file is fatal: fail loudly before
-    // the subscriber exists (no tracing yet) rather than starting with a half-applied config.
-    let file = match &cli.engine.config {
-        Some(path) => match FileConfig::load(path) {
-            Ok(file) => file,
+    // Load the optional `--config` file (YAML, or deprecated TOML, by extension). A missing/malformed
+    // file is fatal: fail loudly before the subscriber exists (no tracing yet) rather than starting
+    // with a half-applied config. The TOML deprecation is warned once the subscriber is up.
+    let (file, file_format) = match &cli.engine.config {
+        Some(path) => match FileConfig::load_with_format(path) {
+            Ok(loaded) => loaded,
             Err(error) => {
                 eprintln!("siphon-rtp-engine: {error}");
                 std::process::exit(1);
             }
         },
-        None => FileConfig::default(),
+        None => (
+            FileConfig::default(),
+            siphon_rtp_engine::config::ConfigFormat::Yaml,
+        ),
     };
 
     // Merge CLI over file over default, once, up front. Everything below reads `config`, not `cli`.
+    let config_path = cli.engine.config.clone();
     let config = RunConfig::resolve(cli.engine, &matches, file);
     init_tracing(&config);
+    if let Some(path) = config_path {
+        file_format.warn_if_deprecated(&path);
+    }
 
     // Optional deterministic media-port range (`--port-min`/`--port-max`). Both-or-neither and
     // min <= max; a half-set or inverted range is a fatal config error (fail loudly, before serving).

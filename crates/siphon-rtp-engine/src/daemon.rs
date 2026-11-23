@@ -7,7 +7,7 @@
 //! `siphon-rtp` binary ([`crate`]'s own `main`) builds a [`UdpLoopbackDatapath`] and calls
 //! [`run_with_datapath`]; the separate `siphon-rtp-xdp-daemon` binary — which lives in the excluded
 //! `crates/siphon-rtp-xdp` workspace and is the *only* place the eBPF/aya toolchain is pulled in —
-//! probes and attaches the kernel datapath, then calls this same runner. Both share one CLI/TOML
+//! probes and attaches the kernel datapath, then calls this same runner. Both share one CLI/config-file
 //! surface via [`EngineArgs`] + [`FileConfig`] + [`RunConfig`], so the two binaries never drift.
 //!
 //! `run_with_datapath` advances the media-timeout sweep's logical clock through the additive
@@ -41,9 +41,9 @@ use crate::{cluster, metrics, server, shutdown, ClientId, Engine};
 /// [`RunConfig`] by [`RunConfig::resolve`].
 #[derive(clap::Args, Debug)]
 pub struct EngineArgs {
-    /// Optional TOML config file (rtpengine-style declarative config). Any value the file sets
+    /// Optional config file, YAML (`.yaml`/`.yml`) or deprecated TOML (rtpengine-style declarative config). Any value the file sets
     /// overrides the built-in default; an explicit CLI flag still overrides the file. See
-    /// `config.example.toml` for the schema. A missing or malformed file is a fatal startup error.
+    /// `config.example.yaml` for the schema. A missing or malformed file is a fatal startup error.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
