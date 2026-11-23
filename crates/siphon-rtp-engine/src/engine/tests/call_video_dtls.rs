@@ -21,7 +21,7 @@ fn hex(fingerprint: &siphon_rtp_dtls::Fingerprint) -> String {
 /// A DTLS caller's offer: audio and one video section, both `UDP/TLS/RTP/SAVPF` with the caller's
 /// certificate. Bundled (RFC 8843), the two share `audio`'s address, a group and mids; unbundled, the
 /// video has its own address.
-fn dtls_offer(
+pub(super) fn dtls_offer(
     audio: SocketAddr,
     video: SocketAddr,
     fingerprint: &siphon_rtp_dtls::Fingerprint,
@@ -53,7 +53,7 @@ fn dtls_offer(
 }
 
 /// A plain, multiplexed callee's answer: audio and video at their own addresses.
-fn plain_answer(audio: SocketAddr, video: SocketAddr, direction: &str) -> String {
+pub(super) fn plain_answer(audio: SocketAddr, video: SocketAddr, direction: &str) -> String {
     format!(
         "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
          m=audio {audio_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
@@ -64,7 +64,7 @@ fn plain_answer(audio: SocketAddr, video: SocketAddr, direction: &str) -> String
     )
 }
 
-fn dtls_caller_profile() -> ProfileFlags {
+pub(super) fn dtls_caller_profile() -> ProfileFlags {
     ProfileFlags {
         transport_protocol: Some("RTP/AVP".to_string()),
         ..anchor()
