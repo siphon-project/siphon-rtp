@@ -1655,6 +1655,13 @@ relay/transcode path is deliberately not wired. That makes the engine A's *only*
 when A negotiated SRTP, A's cryptographic peer. It is a full inbound surface, so it carries its own
 copy of Layers 1–4.
 
+**Order of installation.** The bridge is registered (route, source gate and latch) before leg A's
+`Redirect` lands, because a redirected datagram that finds no owner is dropped; the displaced relay is
+switched off back to back with that redirect; and `ws_bridge_started` is announced only once the
+redirect has succeeded. A refused redirect deregisters the bridge, aborts its tasks without any
+lifecycle event, puts the displaced relay back, and fails the verb, so the call keeps relaying on its
+old path.
+
 > **Status (landed — secure takeover):** a takeover leg on a secure offerer terminates SRTP on its own
 > `WsSecureLeg` (`engine/src/ws_bridge.rs`), keyed by SDES (RFC 4568) in the answer or by the RFC 5764
 > handshake. Only `answer_local` supports it; `offer`/`answer` refuse it (see "Where a secure takeover

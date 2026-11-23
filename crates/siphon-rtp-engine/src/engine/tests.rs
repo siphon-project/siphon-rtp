@@ -88,6 +88,7 @@ mod transmission_control;
 mod turn_client;
 mod turn_client_stream;
 mod webrtc_floor_channel;
+mod ws_takeover_order;
 mod x3_hand_over;
 mod x3_rebuilt_pipeline;
 mod x3_single_leg_ice;
@@ -686,6 +687,8 @@ struct LatchLearningDatapath {
     /// Fault injection: while set, installing a `Drop` flow fails, as a datapath that cannot take a
     /// rule does.
     fail_drops: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, every `Redirect` install fails.
+    fail_redirects: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LatchLearningDatapath {
@@ -701,6 +704,7 @@ impl LatchLearningDatapath {
             installs: Arc::new(Mutex::new(Vec::new())),
             on_redirect: Arc::new(Mutex::new(None)),
             fail_drops: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_redirects: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -712,6 +716,12 @@ impl LatchLearningDatapath {
     /// Make every `Drop` install fail (or succeed again).
     fn fail_drop_installs(&self, fail: bool) {
         self.fail_drops
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make every `Redirect` install fail (or succeed again).
+    fn fail_redirect_installs(&self, fail: bool) {
+        self.fail_redirects
             .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -761,6 +771,15 @@ impl Datapath for LatchLearningDatapath {
             .expect("install log lock")
             .push((endpoint, action));
         if action == FlowAction::Drop && self.fail_drops.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(siphon_rtp_datapath::DatapathError::UnknownEndpoint(
+                endpoint,
+            ));
+        }
+        if action == FlowAction::Redirect
+            && self
+                .fail_redirects
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(siphon_rtp_datapath::DatapathError::UnknownEndpoint(
                 endpoint,
             ));
