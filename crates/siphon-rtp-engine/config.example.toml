@@ -102,6 +102,17 @@ control = "127.0.0.1:8080"
 # Default: 0.
 # srtcp_ledger_retention_secs = 0
 
+# The most keys the SRTCP send-index ledger holds (one entry per distinct key material, about 150 bytes
+# each, so the default is about 15 MB). At the cap a NEW key is refused: the verb that carries it
+# (forward_join, forward_offer, a dial-out, offer, answer, answer_local, set_floor_keys) fails with a
+# reason, an error is logged and siphon_rtp_srtcp_ledger_install_refused_total rises; a restore of a
+# checkpoint that would pass the cap is refused whole. An existing entry is never evicted to make room:
+# its key would restart at index 0 and repeat AES-GCM nonces (RFC 7714 section 8). Raise it for a
+# deployment with more simultaneous client keys, or set srtcp_ledger_retention_secs so keys the
+# controller no longer uses are released. (CLI: --srtcp-ledger-max-entries).
+# Default: 100000.
+# srtcp_ledger_max_entries = 100000
+
 # --- play_media from an http(s) URL --------------------------------------------------------------
 #
 # `play_media` can fetch a WAV prompt from a URL. The fetch runs on its own task (never on the media

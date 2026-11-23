@@ -528,8 +528,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // A floor stream's keys and index are validated before anything is bound, so a refusal
         // costs no port.
+        let ledger = self.conference.srtcp_ledger();
         let prepared = |floor: &Option<crate::ha::FloorSnapshot>| {
-            floor.as_ref().map(snapshot_floor::prepare).transpose()
+            floor
+                .as_ref()
+                .map(|floor| snapshot_floor::prepare(floor, ledger))
+                .transpose()
         };
         let floors = match (
             prepared(&snapshot.near.floor),

@@ -98,6 +98,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         plan
     }
 
+    /// [`crate::media_pipeline::validate_profile`], then install the profile's floor keys in the ledger
+    /// ([`Self::reserve_floor_keys`]): the one check `offer`, `answer` and `answer_local` run before
+    /// anything is allocated.
+    ///
+    /// # Errors
+    /// The reason the profile or the ledger refused.
+    pub(super) fn validate_and_reserve(&self, profile: &ProfileFlags) -> Result<(), String> {
+        crate::media_pipeline::validate_profile(profile)?;
+        self.reserve_floor_keys(profile)
+            .map_err(|reason| format!("floor_keys: {reason}"))
+    }
+
+    /// Install the profile's floor keys in the SRTCP send-index ledger before a call is set up
+    /// (RFC 7714 §8): a ledger at its entry cap refuses a new key here, so the offer, answer or
+    /// `answer_local` that carries it fails with the reason, and nothing is allocated.
+    ///
+    /// # Errors
+    /// The reason the ledger refused the keys.
+    pub(super) fn reserve_floor_keys(&self, profile: &ProfileFlags) -> Result<(), String> {
+        crate::floor_srtcp::master_keys_reserved(
+            self.conference.srtcp_ledger(),
+            &profile.floor_keys,
+        )
+        .map(|_| ())
+    }
+
     /// Hold the offerer's floor keys until the answer registers its floor leg (the offerer's keys
     /// come from the offer's profile, the answerer's from the answer's).
     pub(super) fn hold_offer_floor_keys(&self, call_id: &str, keys: Vec<FloorMasterKey>) {

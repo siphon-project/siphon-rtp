@@ -174,7 +174,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Err(reason) = refuse_seat_keying(&info, media) {
             return error_result("forward_join", &reason);
         }
-        let media_srtcp = match crate::floor_srtcp::master_keys(&profile.media_srtcp_keys) {
+        let media_srtcp = match crate::floor_srtcp::master_keys_reserved(
+            self.conference.srtcp_ledger(),
+            &profile.media_srtcp_keys,
+        ) {
             Ok(keys) => keys,
             Err(reason) => return error_result("forward_join: media_srtcp_keys", &reason),
         };
@@ -423,7 +426,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ));
         }
         let destination = peer_media_address(offered.remote, profile.received_from);
-        let keys = match crate::floor_srtcp::master_keys(&profile.floor_keys) {
+        let keys = match crate::floor_srtcp::master_keys_reserved(
+            self.conference.srtcp_ledger(),
+            &profile.floor_keys,
+        ) {
             Ok(keys) => keys,
             Err(reason) => {
                 self.free(&[endpoint]).await;

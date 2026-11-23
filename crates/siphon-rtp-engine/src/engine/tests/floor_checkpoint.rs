@@ -579,3 +579,105 @@ async fn a_reoffer_on_the_standby_keeps_the_floor_parameters_the_controller_supp
         "{presented}"
     );
 }
+
+#[tokio::test]
+async fn a_restore_whose_floor_keys_the_full_ledger_cannot_take_is_refused_and_binds_nothing() {
+    let range = (30_800u16, 30_840u16);
+    let primary = node(range.0, range.1);
+    let _events = primary.register_client(CLIENT);
+    let (a, b) = (party().await, party().await);
+    set_up(
+        &primary,
+        (&a, &b),
+        (vec![key(0xA1, 0x31)], Vec::new()),
+        true,
+    )
+    .await;
+    let record = checkpoint(&primary).await;
+    primary
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: CALL.into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    drop(primary);
+    let standby = node(range.0, range.1);
+    let _events = standby.register_client(CLIENT);
+    let ledger = standby.conference().srtcp_ledger().clone();
+    ledger.set_max_entries(0);
+    let CmdResult::Error { reason } = standby
+        .handle(
+            CLIENT,
+            Command::Restore {
+                snapshot: record.clone(),
+            },
+        )
+        .await
+    else {
+        panic!("expected a refusal");
+    };
+    assert!(
+        reason.contains("restore: floor stream") && reason.contains("ledger is full"),
+        "{reason}"
+    );
+    assert!(standby.owned_call_internal(CALL, |_| ()).is_none());
+    assert_eq!(ledger.len(), 0);
+    assert_eq!(ledger.install_refused(), 1);
+    // Nothing stayed bound, and with room the same record restores.
+    ledger.set_max_entries(10);
+    let restored = standby
+        .handle(CLIENT, Command::Restore { snapshot: record })
+        .await;
+    assert!(matches!(restored, CmdResult::Ok { .. }), "{restored:?}");
+}
+
+#[tokio::test]
+async fn a_reoffer_carrying_a_new_floor_key_is_refused_at_the_entry_cap() {
+    let range = (30_900u16, 30_940u16);
+    let primary = node(range.0, range.1);
+    let _events = primary.register_client(CLIENT);
+    let (a, b) = (party().await, party().await);
+    set_up(
+        &primary,
+        (&a, &b),
+        (vec![key(0xA1, 0x31)], Vec::new()),
+        true,
+    )
+    .await;
+    let ledger = primary.conference().srtcp_ledger().clone();
+    ledger.set_max_entries(ledger.len());
+    let refused = primary
+        .handle(
+            CLIENT,
+            Command::Reoffer {
+                call_id: CALL.into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_with_floor(a.audio_addr, a.floor_addr, true),
+                profile: profile(vec![key(0xB2, 0x42)]),
+            },
+        )
+        .await;
+    assert!(
+        matches!(&refused, CmdResult::Error { reason }
+            if reason.contains("floor_keys") && reason.contains("ledger is full")),
+        "{refused:?}"
+    );
+    assert_eq!(ledger.install_refused(), 1);
+    // The key the call already holds still re-offers.
+    let accepted = primary
+        .handle(
+            CLIENT,
+            Command::Reoffer {
+                call_id: CALL.into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_with_floor(a.audio_addr, a.floor_addr, true),
+                profile: profile(vec![key(0xA1, 0x31)]),
+            },
+        )
+        .await;
+    assert!(matches!(accepted, CmdResult::Ok { .. }), "{accepted:?}");
+}

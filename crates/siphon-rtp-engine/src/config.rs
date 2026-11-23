@@ -165,6 +165,9 @@ pub struct FileConfig {
     /// Drop an SRTCP send-index ledger entry nothing has held for this many seconds; `0` never drops
     /// one (`--srtcp-ledger-retention-secs`).
     pub srtcp_ledger_retention_secs: Option<u64>,
+    /// The most keys the SRTCP send-index ledger holds; a new key past it is refused, never an old
+    /// one evicted (`--srtcp-ledger-max-entries`).
+    pub srtcp_ledger_max_entries: Option<usize>,
     /// Bounded SIGTERM/SIGINT drain grace period, seconds (`--shutdown-grace-secs`).
     pub shutdown_grace_secs: Option<u64>,
     /// STUN servers asked for a server-reflexive ICE candidate when gathering (`--stun-server`).
@@ -337,6 +340,7 @@ mod tests {
             "setup_timeout_secs = 240\n",
             "forward_room_idle_secs = 1800\n",
             "srtcp_ledger_retention_secs = 2592000\n",
+            "srtcp_ledger_max_entries = 250000\n",
             "shutdown_grace_secs = 30\n",
             "turn_udp = \"0.0.0.0:3478\"\n",
             "turn_tcp = \"0.0.0.0:3478\"\n",
@@ -387,6 +391,7 @@ mod tests {
         assert_eq!(config.setup_timeout_secs, Some(240));
         assert_eq!(config.forward_room_idle_secs, Some(1800));
         assert_eq!(config.srtcp_ledger_retention_secs, Some(2_592_000));
+        assert_eq!(config.srtcp_ledger_max_entries, Some(250_000));
         assert_eq!(config.shutdown_grace_secs, Some(30));
         assert_eq!(
             config.turn_tls_cert.as_deref(),

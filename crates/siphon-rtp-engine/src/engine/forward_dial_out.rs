@@ -584,10 +584,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             peer_media_address(info.remote_rtp, received_from)
         };
         // The seat's floor SRTCP keys are the offering profile's own (TS 33.180 §9.4).
-        let floor_keys = crate::floor_srtcp::master_keys(&pending.profile.floor_keys)
-            .map_err(|reason| format!("floor_keys: {reason}"))?;
-        let media_srtcp = crate::floor_srtcp::master_keys(&pending.profile.media_srtcp_keys)
-            .map_err(|reason| format!("media_srtcp_keys: {reason}"))?;
+        let floor_keys = crate::floor_srtcp::master_keys_reserved(
+            self.conference.srtcp_ledger(),
+            &pending.profile.floor_keys,
+        )
+        .map_err(|reason| format!("floor_keys: {reason}"))?;
+        let media_srtcp = crate::floor_srtcp::master_keys_reserved(
+            self.conference.srtcp_ledger(),
+            &pending.profile.media_srtcp_keys,
+        )
+        .map_err(|reason| format!("media_srtcp_keys: {reason}"))?;
         // The floor stream, when the answer accepts it (a port, not 0) in the seat's address family.
         let floor = pending
             .floor

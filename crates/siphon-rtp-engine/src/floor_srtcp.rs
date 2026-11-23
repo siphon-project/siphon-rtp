@@ -77,6 +77,23 @@ pub fn master_keys(keys: &[FloorKey]) -> Result<Vec<FloorMasterKey>, String> {
     Ok(converted)
 }
 
+/// [`master_keys`], and install the keys in `ledger` ([`SrtcpLedger::reserve`]) so a verb that carries
+/// them fails here, before it allocates anything, when the ledger is at its entry cap. A refused
+/// install creates no entry and evicts none (RFC 7714 §8).
+///
+/// # Errors
+/// The reason, for keys [`master_keys`] refuses or a ledger at its cap.
+pub fn master_keys_reserved(
+    ledger: &SrtcpLedger,
+    keys: &[FloorKey],
+) -> Result<Vec<FloorMasterKey>, String> {
+    let converted = master_keys(keys)?;
+    ledger
+        .reserve(&converted)
+        .map_err(|error| error.to_string())?;
+    Ok(converted)
+}
+
 /// `media_srtcp_keys` protect the forwarded audio RTCP of a `media: preserve` forwarding-room seat
 /// (3GPP TS 33.180 §9.4.1, [`crate::forward`]). A two-party call or a mixing room terminates its
 /// media and writes its own RTCP, so a key there would silently protect nothing: refused.

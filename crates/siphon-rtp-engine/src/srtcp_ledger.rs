@@ -23,6 +23,16 @@
 //! An entry that is held is never dropped, nor one whose index is exhausted. Memory is one small entry
 //! per distinct key material seen since start (or within the retention window).
 //!
+//! **Entry cap.** Retention is opt-in, so by default nothing drops an entry, and a controller that
+//! keeps issuing new keys would grow the ledger without bound. [`SrtcpLedger::set_max_entries`] caps
+//! it ([`DEFAULT_MAX_ENTRIES`]). At the cap a **new** key is refused, loudly: the verb that carried it
+//! fails, `siphon_rtp_srtcp_ledger_install_refused_total` counts it, and an error is logged. A key the
+//! ledger already holds still installs (it adds no entry), and **no live or retained entry is ever
+//! evicted to make room**: its counter is the only record of how far the key has sent, and evicting it
+//! would let the key restart at index 0 and repeat nonces (RFC 7714 §8). The check runs under the
+//! install mutex, on the control path only. A restore whose blob would take the ledger past the cap is
+//! refused whole: importing part of it would leave the rest of its keys with no floor under them.
+//!
 //! **HA.** [`SrtcpLedger::checkpoint`] and [`SrtcpLedger::import`] carry the counters across a failover
 //! (the `checkpoint_srtcp_indices` and `restore_srtcp_indices` verbs). Every entry is exported,
 //! including a key that is installed and has sent nothing. The primary keeps sending after the
@@ -52,8 +62,37 @@
 use dashmap::DashMap;
 use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SendIndex, FINGERPRINT_LEN, MAX_SEND_INDEX};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// The default cap on entries: one per distinct key material. An entry costs about 150 bytes: the
+/// map slot (20 byte fingerprint padded to 24, the 24 byte `Entry`, hashbrown control byte and
+/// load-factor slack, about 90 bytes) plus the 32 byte allocation behind the shared `SendIndex` (an
+/// `Arc` of two counts and one `AtomicU64`). 100 000 entries is therefore about 15 MB, far below any
+/// realistic count of live client keys (a seat holds one or two), and a full checkpoint of it is
+/// about 3.5 MB. A deployment with more simultaneous keys raises it (`srtcp_ledger_max_entries`).
+pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
+/// A key's install was refused because the ledger holds its maximum number of entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerFull {
+    /// Entries the ledger holds.
+    pub entries: usize,
+    /// The cap (`srtcp_ledger_max_entries`).
+    pub max_entries: usize,
+}
+
+impl std::fmt::Display for LedgerFull {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the SRTCP send-index ledger is full ({} of {} entries): a new key cannot be installed, and no existing entry is evicted to make room (raise srtcp_ledger_max_entries, or let retention release keys the controller no longer uses)",
+            self.entries, self.max_entries
+        )
+    }
+}
+
+impl std::error::Error for LedgerFull {}
 
 /// One key's counter and what the ledger tracks about it.
 struct Entry {
@@ -115,6 +154,10 @@ pub struct SrtcpLedger {
     generations: Mutex<Generations>,
     /// Seals refused because a counter reached its lease.
     lease_refused: AtomicU64,
+    /// The most entries the ledger holds; a new key past it is refused.
+    max_entries: AtomicUsize,
+    /// New keys (or whole restores) refused at the cap.
+    install_refused: AtomicU64,
 }
 
 /// Which checkpoints exist and which of them bounds the leases.
@@ -174,6 +217,8 @@ impl Default for SrtcpLedger {
             owner: AtomicU64::new(u64::MAX),
             generations: Mutex::new(Generations::default()),
             lease_refused: AtomicU64::new(0),
+            max_entries: AtomicUsize::new(DEFAULT_MAX_ENTRIES),
+            install_refused: AtomicU64::new(0),
         }
     }
 }
@@ -195,6 +240,72 @@ impl SrtcpLedger {
     /// dropped repeats nonces (RFC 7714 §8).
     pub fn set_retention_secs(&self, secs: u64) {
         self.retention_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// Cap the ledger at `max_entries` entries (see the module docs). Lowering it below the current
+    /// count evicts nothing: it only refuses new keys until retention has released enough.
+    pub fn set_max_entries(&self, max_entries: usize) {
+        self.max_entries.store(max_entries, Ordering::Relaxed);
+    }
+
+    /// The cap on entries.
+    #[must_use]
+    pub fn max_entries(&self) -> usize {
+        self.max_entries.load(Ordering::Relaxed)
+    }
+
+    /// Installs refused at the cap since start.
+    #[must_use]
+    pub fn install_refused(&self) -> u64 {
+        self.install_refused.load(Ordering::Relaxed)
+    }
+
+    /// Count and log a refusal at the cap. Called with the control lock held.
+    fn refuse(&self, what: &str) -> LedgerFull {
+        let refused = LedgerFull {
+            entries: self.entries.len(),
+            max_entries: self.max_entries(),
+        };
+        self.install_refused.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            target: "siphon_rtp::media",
+            entries = refused.entries,
+            max_entries = refused.max_entries,
+            "SRTCP send-index ledger is full: {what} refused; no entry is evicted (RFC 7714 section 8)"
+        );
+        refused
+    }
+
+    /// Install `keys`: give each one a counter, creating the entries of keys the ledger has not seen.
+    /// This is the admission point of every verb that carries SRTCP keys, so it runs before the keys
+    /// reach a room, a seat or a floor leg. A key already held adds no entry and so always installs; if
+    /// the new keys would take the ledger past its cap, **none** is created and the whole set is
+    /// refused ([`LedgerFull`]). Never evicts (RFC 7714 §8). Control path only; serialised with
+    /// checkpoints by the install mutex.
+    ///
+    /// # Errors
+    /// [`LedgerFull`] when the set holds more new keys than the cap leaves room for.
+    pub fn reserve(&self, keys: &[FloorMasterKey]) -> Result<(), LedgerFull> {
+        let _control = self.control();
+        let mut fresh: Vec<[u8; FINGERPRINT_LEN]> = Vec::new();
+        for key in keys {
+            let fingerprint = key.fingerprint();
+            if !self.entries.contains_key(&fingerprint) && !fresh.contains(&fingerprint) {
+                fresh.push(fingerprint);
+            }
+        }
+        if self.entries.len().saturating_add(fresh.len()) > self.max_entries() {
+            return Err(self.refuse("a new key install"));
+        }
+        for fingerprint in fresh {
+            self.entries.insert(fingerprint, self.new_entry());
+        }
+        for key in keys {
+            if let Some(entry) = self.entries.get(&key.fingerprint()) {
+                entry.unheld_since.store(0, Ordering::Relaxed);
+            }
+        }
+        Ok(())
     }
 
     /// A new entry: starts where a key installed now must (0 on a primary), and under a lease regime
@@ -225,12 +336,24 @@ impl SrtcpLedger {
     /// join, a rekey), never per packet, and serialised with checkpoints: under a lease regime the new
     /// counter is leased before it is published, so no checkpoint can miss a key that then sends
     /// unbounded. An installed key has an entry, and a checkpoint carries it, before it sends anything.
+    ///
+    /// Every verb reserves its keys first ([`Self::reserve`]), so a key arriving here has an entry. One
+    /// that does not, and would exceed the cap, gets a counter that is **already exhausted and not
+    /// stored**: it can never seal, so it can never repeat a nonce, and the refusal is counted and
+    /// logged (fail closed: never an unbounded entry, never a counter that restarts at 0).
     #[must_use]
     pub fn counter_for(&self, key: &FloorMasterKey) -> SendIndex {
         let _control = self.control();
+        let fingerprint = key.fingerprint();
+        if !self.entries.contains_key(&fingerprint) && self.entries.len() >= self.max_entries() {
+            self.refuse("a key that was not reserved");
+            let counter = SendIndex::new();
+            counter.raise_to(u32::MAX);
+            return counter;
+        }
         let entry = self
             .entries
-            .entry(key.fingerprint())
+            .entry(fingerprint)
             .or_insert_with(|| self.new_entry());
         entry.unheld_since.store(0, Ordering::Relaxed);
         entry.counter.clone()
@@ -350,8 +473,24 @@ impl SrtcpLedger {
     /// lowers, so importing is safe at any time and in any order. A margin that would pass the last
     /// index leaves the key exhausted: it sends nothing until the controller replaces it (RFC 7714
     /// §9.4). Returns how many listed entries were applied.
-    pub fn import(&self, checkpoint: &LedgerCheckpoint, margin: u32) -> usize {
+    ///
+    /// # Errors
+    /// [`LedgerFull`] when the blob lists more keys the ledger does not hold than the cap leaves room
+    /// for. The **whole** blob is then refused and nothing is changed: importing part of it would
+    /// leave the rest of its keys without the floor the standby needs for them (RFC 7714 §8).
+    pub fn import(&self, checkpoint: &LedgerCheckpoint, margin: u32) -> Result<usize, LedgerFull> {
         let _control = self.control();
+        let fresh = checkpoint
+            .entries
+            .iter()
+            .map(|entry| entry.fingerprint)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|fingerprint| !self.entries.contains_key(fingerprint))
+            .count();
+        if self.entries.len().saturating_add(fresh) > self.max_entries() {
+            return Err(self.refuse("a restore"));
+        }
         self.lease_margin.store(margin.max(1), Ordering::Release);
         {
             // A standby may restore the last confirmed blob or a newer unconfirmed one: both are at or
@@ -392,7 +531,7 @@ impl SrtcpLedger {
             slot.checkpointed.fetch_max(ceiling, Ordering::Relaxed);
             slot.notified.store(false, Ordering::Relaxed);
         }
-        checkpoint.entries.len()
+        Ok(checkpoint.entries.len())
     }
 
     /// How many counters have used half of their lease window since the checkpoint and have not been
@@ -531,7 +670,7 @@ mod tests {
         // The key then sends once on the primary, which fails: the standby knows only the checkpoint.
         installed.take().unwrap();
         let standby = SrtcpLedger::default();
-        standby.import(&exported, MARGIN);
+        standby.import(&exported, MARGIN).unwrap();
         assert_eq!(
             standby.counter_for(&key(1, 7)).next(),
             MARGIN,
@@ -546,7 +685,7 @@ mod tests {
         drain(&primary.counter_for(&key(1, 7)), 5);
         let exported = primary.checkpoint(MARGIN, None);
         let standby = SrtcpLedger::default();
-        assert_eq!(standby.import(&exported, MARGIN), 1);
+        assert_eq!(standby.import(&exported, MARGIN), Ok(1));
         let counter = standby.counter_for(&key(1, 7));
         assert_eq!(counter.next(), 5 + MARGIN);
         assert_eq!(
@@ -556,8 +695,8 @@ mod tests {
         );
         assert_eq!(counter.take(), Err(SendRefused::LeaseReached));
         // An older checkpoint, or the same one twice, lowers nothing.
-        standby.import(&exported, 0);
-        standby.import(&exported, 10);
+        standby.import(&exported, 0).unwrap();
+        standby.import(&exported, 10).unwrap();
         assert_eq!(counter.next(), 5 + MARGIN);
         // Past the last index the key is exhausted, never wrapped.
         let near_end = LedgerCheckpoint {
@@ -568,7 +707,7 @@ mod tests {
             }],
             unlisted_ceiling: 0,
         };
-        standby.import(&near_end, 1 << 16);
+        standby.import(&near_end, 1 << 16).unwrap();
         assert_eq!(
             standby.counter_for(&key(3, 3)).take(),
             Err(SendRefused::Exhausted)
@@ -707,7 +846,7 @@ mod tests {
         assert_eq!(highest, MARGIN - 1, "capped at g1 + margin");
         // The standby restores g1 and starts sending.
         let standby = SrtcpLedger::default();
-        standby.import(&g1, MARGIN);
+        standby.import(&g1, MARGIN).unwrap();
         let on_standby = standby.counter_for(&key(1, 1));
         assert!(
             on_standby.next() > highest,
@@ -733,7 +872,7 @@ mod tests {
             highest = index;
         }
         let standby = SrtcpLedger::default();
-        standby.import(&g2, MARGIN);
+        standby.import(&g2, MARGIN).unwrap();
         assert!(standby.counter_for(&key(1, 1)).next() > highest);
     }
 
@@ -757,7 +896,7 @@ mod tests {
         assert_eq!(blob.unlisted_ceiling, MARGIN);
         // A fresh standby: K is installed after the restore.
         let standby = SrtcpLedger::default();
-        standby.import(&blob, MARGIN);
+        standby.import(&blob, MARGIN).unwrap();
         let on_standby = standby.counter_for(&key(9, 9));
         assert_eq!(
             on_standby.next(),
@@ -773,7 +912,7 @@ mod tests {
         let early = SrtcpLedger::default();
         let held = early.counter_for(&key(9, 9));
         assert_eq!(held.next(), 0);
-        early.import(&blob, MARGIN);
+        early.import(&blob, MARGIN).unwrap();
         assert_eq!(held.next(), MARGIN);
         assert_eq!(held.lease(), Some(MARGIN));
     }
@@ -783,7 +922,7 @@ mod tests {
         let primary = SrtcpLedger::default();
         let first = primary.checkpoint(MARGIN, Some(1));
         let standby = SrtcpLedger::default();
-        standby.import(&first, MARGIN);
+        standby.import(&first, MARGIN).unwrap();
         // The standby opens its window with a checkpoint of its own that the controller stored.
         let own = standby.checkpoint(MARGIN, Some(1));
         standby.confirm(&own.generation, MARGIN).unwrap();
@@ -797,7 +936,7 @@ mod tests {
             "above the first standby's lease on new keys"
         );
         let next_standby = SrtcpLedger::default();
-        next_standby.import(&second, MARGIN);
+        next_standby.import(&second, MARGIN).unwrap();
         assert_eq!(next_standby.counter_for(&key(8, 8)).next(), 2 * MARGIN);
     }
 
@@ -809,7 +948,7 @@ mod tests {
         let g1 = a.checkpoint(MARGIN, Some(1));
         drain(&on_a, 10);
         let b = SrtcpLedger::default();
-        b.import(&g1, MARGIN);
+        b.import(&g1, MARGIN).unwrap();
         let on_b = b.counter_for(&key(1, 1));
         assert_eq!((on_b.next(), on_b.lease()), (MARGIN, Some(MARGIN)));
         assert_eq!(
@@ -837,11 +976,11 @@ mod tests {
         );
         // B fails. C restores B's confirmed blob, the newest stored: it starts above everything B sent.
         let c = SrtcpLedger::default();
-        c.import(&b_export, MARGIN);
+        c.import(&b_export, MARGIN).unwrap();
         assert!(c.counter_for(&key(1, 1)).next() > *sent_by_b.last().unwrap());
         // Had B never opened its window, C restoring G1 repeats nothing: B sent nothing.
         let never = SrtcpLedger::default();
-        never.import(&g1, MARGIN);
+        never.import(&g1, MARGIN).unwrap();
         assert_eq!(
             never.counter_for(&key(1, 1)).take(),
             Err(SendRefused::LeaseReached)
@@ -854,7 +993,7 @@ mod tests {
         let a = SrtcpLedger::default();
         let g1 = a.checkpoint(MARGIN, Some(1));
         let b = SrtcpLedger::default();
-        b.import(&g1, MARGIN);
+        b.import(&g1, MARGIN).unwrap();
         let late = b.counter_for(&key(9, 9));
         assert_eq!((late.next(), late.lease()), (MARGIN, Some(MARGIN)));
         assert_eq!(late.take(), Err(SendRefused::LeaseReached));
@@ -881,7 +1020,7 @@ mod tests {
         drain(&on_a, 40);
         let a_g2 = a.checkpoint(MARGIN, None);
         let b = SrtcpLedger::default();
-        b.import(&g1, MARGIN);
+        b.import(&g1, MARGIN).unwrap();
         let b_first = b.checkpoint(MARGIN, Some(1));
         b.confirm(&b_first.generation, MARGIN).unwrap();
         let b_second = b.checkpoint(MARGIN, None);
@@ -1059,5 +1198,111 @@ mod tests {
             (0..4000).collect::<Vec<_>>(),
             "no index twice, none skipped"
         );
+    }
+
+    #[test]
+    fn installs_succeed_up_to_the_cap_and_the_next_new_key_is_refused_and_counted() {
+        let ledger = SrtcpLedger::default();
+        ledger.set_max_entries(3);
+        for seed in 1..=3 {
+            ledger.reserve(&[key(1, seed)]).unwrap();
+        }
+        assert_eq!(ledger.len(), 3);
+        let refused = ledger.reserve(&[key(1, 4)]).unwrap_err();
+        assert_eq!(refused.max_entries, 3);
+        assert_eq!(ledger.len(), 3, "the refused key took no entry");
+        assert_eq!(ledger.install_refused(), 1);
+    }
+
+    #[test]
+    fn a_key_already_in_the_ledger_installs_at_the_cap_and_keeps_its_counter() {
+        let ledger = SrtcpLedger::default();
+        ledger.set_max_entries(1);
+        let counter = ledger.counter_for(&key(1, 1));
+        drain(&counter, 5);
+        ledger.reserve(&[key(9, 1)]).unwrap();
+        assert_eq!(
+            ledger.counter_for(&key(9, 1)).next(),
+            5,
+            "same material, same counter"
+        );
+        assert_eq!(ledger.install_refused(), 0);
+    }
+
+    #[test]
+    fn a_set_with_one_new_key_too_many_is_refused_whole_and_creates_nothing() {
+        let ledger = SrtcpLedger::default();
+        ledger.set_max_entries(2);
+        ledger.reserve(&[key(1, 1)]).unwrap();
+        assert!(ledger.reserve(&[key(1, 2), key(2, 3)]).is_err());
+        assert_eq!(ledger.len(), 1, "no partial install");
+    }
+
+    #[test]
+    fn a_full_ledger_never_evicts_a_live_entry_to_make_room() {
+        let ledger = SrtcpLedger::default();
+        ledger.set_max_entries(1);
+        ledger.set_retention_secs(10);
+        let held = ledger.counter_for(&key(1, 1));
+        drain(&held, 7);
+        assert!(ledger.reserve(&[key(1, 2)]).is_err());
+        assert_eq!(held.next(), 7);
+        assert_eq!(
+            ledger.counter_for(&key(1, 1)).next(),
+            7,
+            "the held key did not restart at 0 (RFC 7714 section 8)"
+        );
+    }
+
+    #[test]
+    fn a_counter_asked_for_past_the_cap_fails_closed_and_is_not_stored() {
+        let ledger = SrtcpLedger::default();
+        ledger.set_max_entries(1);
+        let _first = ledger.counter_for(&key(1, 1));
+        let beyond = ledger.counter_for(&key(1, 2));
+        assert_eq!(beyond.take(), Err(SendRefused::Exhausted), "it never seals");
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.install_refused(), 1);
+    }
+
+    #[test]
+    fn a_restore_of_an_over_cap_blob_is_refused_whole() {
+        let source = SrtcpLedger::default();
+        for seed in 1..=3 {
+            drain(&source.counter_for(&key(1, seed)), 4);
+        }
+        let blob = source.checkpoint(MARGIN, None);
+        let standby = SrtcpLedger::default();
+        standby.set_max_entries(2);
+        standby.reserve(&[key(1, 1)]).unwrap();
+        let refused = standby.import(&blob, MARGIN).unwrap_err();
+        assert_eq!(refused.max_entries, 2);
+        assert_eq!(standby.len(), 1, "nothing was imported");
+        assert_eq!(
+            standby.counter_for(&key(1, 1)).next(),
+            0,
+            "the entry it already held was not raised either"
+        );
+        assert_eq!(standby.install_refused(), 1);
+        standby.set_max_entries(3);
+        assert_eq!(standby.import(&blob, MARGIN), Ok(3));
+    }
+
+    #[test]
+    fn a_restore_counts_only_keys_the_ledger_does_not_already_hold() {
+        let source = SrtcpLedger::default();
+        for seed in 1..=2 {
+            drain(&source.counter_for(&key(1, seed)), 4);
+        }
+        let blob = source.checkpoint(MARGIN, None);
+        let standby = SrtcpLedger::default();
+        standby.set_max_entries(2);
+        standby.reserve(&[key(1, 1), key(1, 2)]).unwrap();
+        assert_eq!(standby.import(&blob, MARGIN), Ok(2));
+    }
+
+    #[test]
+    fn the_default_cap_is_the_documented_constant() {
+        assert_eq!(SrtcpLedger::default().max_entries(), DEFAULT_MAX_ENTRIES);
     }
 }

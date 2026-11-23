@@ -260,6 +260,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         sdp: &str,
         profile: &ProfileFlags,
     ) -> CmdResult {
+        // Floor keys the re-offer carries are installed in the SRTCP ledger before anything changes.
+        if let Err(reason) = self.reserve_floor_keys(profile) {
+            return CmdResult::Error {
+                reason: format!("re-offer: floor_keys: {reason}"),
+            };
+        }
+        self.reoffer_admitted(client, call_id, from_tag, sdp, profile)
+            .await
+    }
+
+    async fn reoffer_admitted(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+        sdp: &str,
+        profile: &ProfileFlags,
+    ) -> CmdResult {
         let info = match sdp::parse(sdp) {
             Ok(info) => info,
             Err(error) => {

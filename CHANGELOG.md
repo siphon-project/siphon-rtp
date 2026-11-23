@@ -5,6 +5,18 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Added
+
+- **A hard cap on SRTCP send-index ledger entries.** `srtcp_ledger_max_entries` (TOML) /
+  `--srtcp-ledger-max-entries`, default 100000 (about 15 MB). At the cap a new key is refused, never an
+  old one evicted (an evicted key would restart at index 0 and repeat AES-GCM nonces, RFC 7714 §8): the
+  verb that carries it (`forward_join`, `forward_offer`, a dial-out, `offer`, `answer`, `answer_local`,
+  `set_floor_keys`) fails with a "ledger is full" reason, an error is logged and
+  `siphon_rtp_srtcp_ledger_install_refused_total` counts it. A key already held still installs, and a
+  `restore_srtcp_indices` blob that would pass the cap is refused whole.
+
 ## [0.27.0] — 2026-11-23
 
 ### Fixed

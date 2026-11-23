@@ -160,10 +160,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(checkpoint) => checkpoint,
             Err(reason) => return error_result("restore_srtcp_indices", &reason),
         };
-        let applied = self
+        let applied = match self
             .conference
             .srtcp_ledger()
-            .import(&checkpoint, SEND_INDEX_MARGIN);
+            .import(&checkpoint, SEND_INDEX_MARGIN)
+        {
+            Ok(applied) => applied,
+            Err(refused) => return error_result("restore_srtcp_indices", &refused),
+        };
         tracing::info!(
             target: "siphon_rtp::media",
             keys = applied,

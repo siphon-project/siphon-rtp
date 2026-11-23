@@ -29,7 +29,7 @@ pub(super) fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
 
 /// A PCMU offer on `profile` (`RTP/SAVP` or `RTP/AVP`), optionally with the offerer's own
 /// `a=key-mgmt` and `a=crypto`.
-fn offer(rtp: SocketAddr, profile: &str, key_mgmt: bool, crypto: bool) -> String {
+pub(super) fn offer(rtp: SocketAddr, profile: &str, key_mgmt: bool, crypto: bool) -> String {
     let mut text = format!(
         "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
          m=audio {port} {profile} 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
@@ -52,7 +52,7 @@ fn key_mgmt_profile(key_mgmt: Option<&str>) -> ProfileFlags {
     }
 }
 
-async fn join(
+pub(super) async fn join(
     engine: &Engine<UdpLoopbackDatapath>,
     media: ForwardMedia,
     tag: &str,
@@ -791,7 +791,7 @@ async fn a_keyed_talkers_srtcp_reaches_each_receiver_under_its_own_key_and_recei
     }
 }
 
-async fn set_media_keys(
+pub(super) async fn set_media_keys(
     engine: &Engine<UdpLoopbackDatapath>,
     call_id: Option<&str>,
     tag: &str,
