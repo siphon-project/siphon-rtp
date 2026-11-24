@@ -8,6 +8,8 @@
 //! Benched paths:
 //!   - `srtp_protect_160` / `srtp_unprotect_160` — one G.711 frame (12-byte header + 160-byte
 //!     payload, 20 ms @ 8 kHz): the dominant cost, run at 50 packets/s per stream per direction.
+//!     `protect` also runs the send-window check that refuses a repeated (SSRC, index) (RFC 3711 §9.1), so
+//!     each iteration carries a fresh sequence number; measured +3 % against the unchecked sender.
 //!   - `srtp_unprotect_160_mki` — the same frame from a peer whose key signalled a 4-byte MKI
 //!     (RFC 3711 §3.1): the extra cost is locating and comparing the field ahead of the tag.
 //!   - `srtcp_protect` / `srtcp_unprotect` — a compound RTCP SR (RFC 3711 §3.4): explicit index,
@@ -78,9 +80,16 @@ fn bench_srtp(criterion: &mut Criterion) {
     criterion.bench_function("srtp_protect_160", |bencher| {
         let mut context = srtp_context();
         let mut out = Vec::with_capacity(256);
+        // A fresh sequence number per packet: the sender refuses an index it has already sent
+        // (RFC 3711 §9.1), so a repeated packet would time the refusal. The increment is in the
+        // measurement on purpose; it is two bytes.
+        let mut packet = plain.clone();
+        let mut sequence = 0x1234u16;
         bencher.iter(|| {
+            sequence = sequence.wrapping_add(1);
+            packet[2..4].copy_from_slice(&sequence.to_be_bytes());
             context
-                .protect(black_box(&plain), &mut out)
+                .protect(black_box(&packet), &mut out)
                 .expect("protect");
             black_box(out.len())
         });
@@ -195,8 +204,12 @@ fn bench_secure_leg(criterion: &mut Criterion) {
     criterion.bench_function("secure_leg_protect_rtp", |bencher| {
         let mut leg = SecureLeg::new(&local, &remote);
         let mut out = Vec::with_capacity(256);
+        let mut packet = plain.clone();
+        let mut sequence = 0x2000u16;
         bencher.iter(|| {
-            let kind = leg.protect(black_box(&plain), &mut out).expect("protect");
+            sequence = sequence.wrapping_add(1);
+            packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+            let kind = leg.protect(black_box(&packet), &mut out).expect("protect");
             black_box(kind)
         });
     });
@@ -263,6 +276,7 @@ fn bench_transcrypt(criterion: &mut Criterion) {
         bencher.iter(|| {
             if index == 0 {
                 near = SecureLeg::new(&a_local, &a_remote); // fresh replay window so the ring repeats
+                far = SecureLeg::new(&b_local, &b_remote); // and a fresh send window, for the same
             }
             near.unprotect(black_box(&ring[index]), &mut plain)
                 .expect("ingress decrypt");

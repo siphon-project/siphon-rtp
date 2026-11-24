@@ -795,15 +795,18 @@ fn browser_video_egress_and_ingest_make_no_heap_allocation() {
         while room.next_datagram(packet).is_some() {}
     }
     room.drain_events().for_each(drop);
+    // Fresh sequence numbers all the way: a sender never sends one SRTP index twice under a key
+    // (RFC 3711 §9.1), so repeating the warm-up packets would time the refusal, not the egress.
+    let measured: Vec<RxPacket> = (64..64 + 20 * 63u16)
+        .map(|sequence| video_packet(0, sequence, sequence % 3 == 0))
+        .collect();
     ARMED.with(|armed| armed.set(true));
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     let mut forwarded = 0usize;
-    for _ in 0..20 {
-        for packet in &from_plain {
-            room.ingest(packet);
-            while let Some((_, _, datagram)) = room.next_datagram(packet) {
-                forwarded += std::hint::black_box(datagram).len();
-            }
+    for packet in &measured {
+        room.ingest(packet);
+        while let Some((_, _, datagram)) = room.next_datagram(packet) {
+            forwarded += std::hint::black_box(datagram).len();
         }
     }
     let egress = ALLOCATIONS.load(Ordering::Relaxed) - before;

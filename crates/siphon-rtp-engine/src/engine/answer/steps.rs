@@ -101,8 +101,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// presented because a transcoding call presents each party only its own codec; and, where a
     /// pipeline carries a secure offerer's keying, that offerer's settled DTLS answer (see
     /// `settle_secure_offerer`).
-    pub(super) fn resolve_answer_pipeline(
+    pub(super) async fn resolve_answer_pipeline(
         &self,
+        call_id: &str,
         near_codec: Option<&CodecSpec>,
         (info, profile, reversed): (&sdp::MediaInfo, &ProfileFlags, bool),
         (far_local_crypto, near_local_crypto, far_dtls): (
@@ -126,6 +127,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 reason: format!("answer: {reason}"),
             })
         })?;
+        // A call held for a split stays on the actor's kind (promote/secure_hold.rs).
+        let pipeline = self
+            .settle_held_pipeline(
+                call_id,
+                pipeline,
+                (
+                    info.fingerprint.as_ref(),
+                    near_dtls.map(|keying| &keying.peer_fingerprint),
+                ),
+            )
+            .await
+            .pipeline();
         let settled = settle_secure_offerer(
             pipeline,
             (near_local_crypto.is_some(), near_dtls),

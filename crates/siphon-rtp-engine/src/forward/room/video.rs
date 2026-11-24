@@ -82,6 +82,90 @@ pub struct VideoConfig {
     pub bundled: bool,
 }
 
+/// How many recently sent protected video packets a bundled receiver's stream remembers, for NACK
+/// answers.
+const SEALED_HISTORY: usize = 64;
+/// The room's datagram buffer size: the most a remembered packet can be.
+const SEALED_CAPACITY: usize = 1500;
+
+/// The last protected video packets sent to one bundled receiver, as they went on the wire.
+///
+/// A NACK is answered with these exact bytes (RFC 4585 §6.2.1): protecting the packet again would
+/// have the sender encrypt at an index it already used, and nothing guarantees the bytes are the
+/// same ones (RFC 3711 §9.1). Bounded and preallocated, so remembering a packet allocates nothing.
+struct SealedHistory {
+    /// Each packet by its extended index, rollover and sequence number together (RFC 3711 §3.3.1): a
+    /// 16-bit sequence number alone names a different packet after every wrap.
+    entries: Vec<(i64, bool, Vec<u8>)>,
+    next: usize,
+    /// The highest extended index remembered, which later sequence numbers are placed against.
+    top: i64,
+}
+
+impl SealedHistory {
+    fn new() -> Self {
+        Self {
+            entries: (0..SEALED_HISTORY)
+                .map(|_| (0, false, Vec::with_capacity(SEALED_CAPACITY)))
+                .collect(),
+            next: 0,
+            top: 0,
+        }
+    }
+
+    /// The extended index of `sequence`: the one nearest the highest remembered (RFC 3711 §3.3.1).
+    fn index_of(&self, sequence: u16) -> i64 {
+        let top_sequence = (self.top & 0xFFFF) as u16;
+        let delta = i16::from_ne_bytes(sequence.wrapping_sub(top_sequence).to_ne_bytes());
+        self.top + i64::from(delta)
+    }
+
+    fn remember(&mut self, sequence: u16, wire: &[u8]) {
+        if wire.len() > SEALED_CAPACITY {
+            return; // a datagram the room never builds; not worth a reallocation
+        }
+        let index = if self.entries.iter().any(|entry| entry.1) {
+            self.index_of(sequence)
+        } else {
+            i64::from(sequence)
+        };
+        self.top = self.top.max(index);
+        // The same index sent again replaces its entry, so two ciphertexts never answer one NACK.
+        let slot = self
+            .entries
+            .iter()
+            .position(|entry| entry.1 && entry.0 == index)
+            .unwrap_or_else(|| {
+                let slot = self.next;
+                self.next = (self.next + 1) % SEALED_HISTORY;
+                slot
+            });
+        let entry = &mut self.entries[slot];
+        entry.0 = index;
+        entry.1 = true;
+        entry.2.clear();
+        entry.2.extend_from_slice(wire);
+    }
+
+    fn recall(&self, sequence: u16) -> Option<&[u8]> {
+        let index = self.index_of(sequence);
+        self.entries
+            .iter()
+            .find(|entry| entry.1 && entry.0 == index)
+            .map(|entry| entry.2.as_slice())
+    }
+
+    /// Give up everything remembered.
+    fn clear(&mut self) {
+        for entry in &mut self.entries {
+            entry.1 = false;
+            entry.2.clear();
+        }
+        self.next = 0;
+        self.top = 0;
+    }
+}
+
 pub(super) struct VideoStream {
     pub(super) endpoint: EndpointId,
     pub(super) destination: SocketAddr,
@@ -107,6 +191,8 @@ pub(super) struct VideoStream {
     pub(super) bundled: bool,
     /// Whether the room sends this stream, for its report kind (RFC 3550 §6.4).
     activity: super::reception::SenderActivity,
+    /// What was sent to a bundled receiver, as sent: the answer to its NACK.
+    sealed: Option<Box<SealedHistory>>,
 }
 
 impl VideoStream {
@@ -136,7 +222,30 @@ impl VideoStream {
             keyframe_media: SourceMedia::default(),
             bundled: config.bundled,
             activity: super::reception::SenderActivity::default(),
+            sealed: config.bundled.then(|| Box::new(SealedHistory::new())),
         }
+    }
+
+    /// Remember the protected packet just sent for `plain`'s sequence number, for a NACK.
+    pub(super) fn remember_sealed(&mut self, plain: &[u8], wire: &[u8]) {
+        if let (Some(history), Some(sequence)) = (self.sealed.as_mut(), plain.get(2..4)) {
+            history.remember(u16::from_be_bytes([sequence[0], sequence[1]]), wire);
+        }
+    }
+
+    /// Forget what was sealed: the key or SSRC context it was sealed under is gone.
+    pub(super) fn forget_sealed(&mut self) {
+        if let Some(history) = self.sealed.as_mut() {
+            history.clear();
+        }
+    }
+
+    /// The exact bytes sent at `plain`'s sequence number, when still remembered.
+    pub(super) fn recall_sealed(&self, plain: &[u8]) -> Option<&[u8]> {
+        let sequence = plain.get(2..4)?;
+        self.sealed
+            .as_ref()?
+            .recall(u16::from_be_bytes([sequence[0], sequence[1]]))
     }
 
     /// A talker change: the next packet starts a new run.
@@ -586,6 +695,11 @@ impl ForwardRoom {
             ) else {
                 continue;
             };
+            if sealed {
+                if let Some(video) = receiver.video.as_mut() {
+                    video.remember_sealed(&self.scratch[..length], &self.secure_out);
+                }
+            }
             let wire = if sealed {
                 &self.secure_out[..]
             } else {
@@ -677,6 +791,58 @@ impl ForwardRoom {
             if sending {
                 video.stats.record_sent_report(ntp_timestamp, now_micros);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sealed_history_tests {
+    use super::*;
+
+    #[test]
+    fn a_sequence_number_after_a_wrap_is_not_answered_with_the_packet_before_it() {
+        // RFC 3711 §3.3.1: 100 and 100 + 65536 are two packets with two keystreams.
+        let mut history = SealedHistory::new();
+        history.remember(100, b"first");
+        history.remember(32_867, b"half");
+        history.remember(98, b"wrapped");
+        assert_eq!(
+            history.recall(100),
+            None,
+            "index 100 of the next rollover was never sent, and the earlier one is not its answer"
+        );
+        history.remember(100, b"again");
+        assert_eq!(history.recall(100), Some(&b"again"[..]));
+        assert_eq!(history.recall(98), Some(&b"wrapped"[..]));
+    }
+
+    #[test]
+    fn the_same_index_sent_again_replaces_its_entry() {
+        let mut history = SealedHistory::new();
+        history.remember(7, b"one");
+        history.remember(7, b"two");
+        assert_eq!(history.recall(7), Some(&b"two"[..]));
+        assert_eq!(history.entries.iter().filter(|entry| entry.1).count(), 1);
+    }
+
+    #[test]
+    fn a_cleared_history_answers_nothing() {
+        let mut history = SealedHistory::new();
+        history.remember(7, b"one");
+        history.clear();
+        assert_eq!(history.recall(7), None);
+        history.remember(8, b"two");
+        assert_eq!(history.recall(8), Some(&b"two"[..]));
+    }
+
+    #[test]
+    fn a_history_reaching_across_a_wrap_keeps_both_sides() {
+        let mut history = SealedHistory::new();
+        for sequence in [65_534u16, 65_535, 0, 1] {
+            history.remember(sequence, &sequence.to_be_bytes());
+        }
+        for sequence in [65_534u16, 65_535, 0, 1] {
+            assert_eq!(history.recall(sequence), Some(&sequence.to_be_bytes()[..]));
         }
     }
 }

@@ -376,7 +376,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .map(super::snapshot::restore_rollover),
             );
             let flows = self
-                .install_video_bridge(&keys, &bridged, &endpoints, previous)
+                .install_video_bridge(&keys, &bridged, &endpoints, (None, None), previous)
                 .map_err(|reason| refuse(format!("video bridge: {reason}")))?;
             return Ok(RestoredVideoFlows { flows, bridged });
         }
@@ -918,9 +918,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .filter(|(_, allowed)| *allowed)
                 .map(|(flow, _)| *flow)
                 .collect();
-            let previous = self
-                .live_video_rollover(&planned.iter().map(|(flow, _)| *flow).collect::<Vec<_>>());
-            let flows = self.install_video_bridge(&keys, &open, &endpoints, previous)?;
+            let every: Vec<VideoFlowRule> = planned.iter().map(|(flow, _)| *flow).collect();
+            let live = self.live_video_legs(&every);
+            let previous = self.live_video_rollover(&every);
+            let flows = self.install_video_bridge(&keys, &open, &endpoints, live, previous)?;
             if let Some(mut call) = self.calls.get_mut(call_id) {
                 call.video.flows = flows;
                 call.video.bridged = open;

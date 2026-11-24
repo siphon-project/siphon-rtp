@@ -34,6 +34,8 @@ pub struct SrtcpContext {
     session_auth: [u8; 20],
     /// Our outgoing SRTCP index — starts at 0, used-then-incremented (RFC 3711 §3.4).
     send_index: u32,
+    /// How many packets were refused because the 31-bit index space of this key is used up.
+    exhausted_refusals: u64,
     /// Receive-side replay filter over the peer's explicit SRTCP index (RFC 3711 §3.3.2). Only used
     /// on the inbound (unprotect) direction; unused on an outbound-only context.
     recv_replay: ReplayWindow,
@@ -71,6 +73,7 @@ impl SrtcpContext {
             session_salt,
             session_auth,
             send_index: 0,
+            exhausted_refusals: 0,
             recv_replay: ReplayWindow::default(),
             mki: None,
         }
@@ -86,12 +89,23 @@ impl SrtcpContext {
         }
     }
 
+    /// The MKI this context emits and expects from now on, keystream, index and replay state kept.
+    pub fn set_mki(&mut self, mki: Option<Mki>) {
+        self.mki = mki;
+    }
+
     /// The current outgoing SRTCP index (RFC 3711 §3.4). Carried across an HA failover so a standby
     /// does not re-use indices the primary already sent (a receiver rejects a re-used index as a
     /// replay). See [`Self::set_send_index`].
     #[must_use]
     pub fn send_index(&self) -> u32 {
         self.send_index
+    }
+
+    /// How many packets [`Self::protect`] has refused because the index space of this key is used up.
+    #[must_use]
+    pub fn exhausted_refusals(&self) -> u64 {
+        self.exhausted_refusals
     }
 
     /// Seed the outgoing SRTCP index from an HA checkpoint, so egress SRTCP continues past the
@@ -110,8 +124,14 @@ impl SrtcpContext {
             return Err(SrtpError::BadVersion);
         }
         let ssrc = u32::from_be_bytes([rtcp[4], rtcp[5], rtcp[6], rtcp[7]]);
+        // The index is 31 bits and never wraps under one key (RFC 3711 §3.4, §9.2): reusing one
+        // reuses its keystream (§3.3.1). Used up, nothing more is protected until the key is replaced.
+        if self.send_index > INDEX_MASK {
+            self.exhausted_refusals = self.exhausted_refusals.saturating_add(1);
+            return Err(SrtpError::IndexExhausted);
+        }
         let index = self.send_index;
-        self.send_index = (self.send_index + 1) & INDEX_MASK;
+        self.send_index += 1;
 
         out.clear();
         out.extend_from_slice(rtcp);
@@ -224,6 +244,34 @@ mod tests {
             .unprotect(&srtcp, &mut recovered)
             .expect("unprotect");
         assert_eq!(recovered, plain);
+    }
+
+    #[test]
+    fn the_srtcp_index_never_wraps_under_one_key() {
+        // RFC 3711 §3.4 / §3.3.1 / §9.2: 2^31 indices under one key, then a new key. Wrapping would
+        // reuse the keystream of every packet since the start.
+        let mut sender = SrtcpContext::new(&[0x11; 16], &[0x22; 14]);
+        sender.set_send_index(INDEX_MASK - 1);
+        let mut out = Vec::new();
+        let report = {
+            let mut report = vec![0x80, 200, 0x00, 0x06];
+            report.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+            report.extend_from_slice(&[0u8; 20]);
+            report
+        };
+        sender.protect(&report, &mut out).expect("second to last");
+        sender.protect(&report, &mut out).expect("the last index");
+        assert_eq!(sender.send_index(), INDEX_MASK + 1);
+        assert_eq!(
+            sender.protect(&report, &mut out),
+            Err(SrtpError::IndexExhausted)
+        );
+        assert_eq!(
+            sender.protect(&report, &mut out),
+            Err(SrtpError::IndexExhausted),
+            "and stays refused until the key changes"
+        );
+        assert_eq!(sender.exhausted_refusals(), 2);
     }
 
     #[test]

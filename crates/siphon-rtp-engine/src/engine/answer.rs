@@ -1089,12 +1089,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        let (pipeline, near_dtls_settled) = match self.resolve_answer_pipeline(
-            near_codec.as_ref(),
-            (&info, profile, reversed.is_some()),
-            (far_local_crypto, near_local_crypto, far_dtls),
-            near_dtls.as_ref(),
-        ) {
+        let (pipeline, near_dtls_settled) = match self
+            .resolve_answer_pipeline(
+                call_id,
+                near_codec.as_ref(),
+                (&info, profile, reversed.is_some()),
+                (far_local_crypto, near_local_crypto, far_dtls),
+                near_dtls.as_ref(),
+            )
+            .await
+        {
             Ok(resolved) => resolved,
             Err(result) => return *result,
         };
@@ -1260,6 +1264,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let pinned = self.pin_call_recordings(call_id, answered_before);
         // For a passthrough relay, remember the installed forward actions so `block` can flip the
         // endpoints to `Drop` and `unblock` can restore them.
+        // A held call's old actor stops here, right before its replacement is installed.
+        self.carry_held_actor(call_id).await;
         let relay_flows = match self.install_answer_pipeline(
             pipeline,
             &wiring,
@@ -1269,7 +1275,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             owner_events,
         ) {
             Ok(flows) => flows,
-            Err(result) => return *result,
+            Err(result) => {
+                self.restore_held_actor(call_id).await;
+                return *result;
+            }
         };
 
         let AnsweredStreams {

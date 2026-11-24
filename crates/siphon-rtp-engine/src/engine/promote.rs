@@ -8,6 +8,9 @@ use crate::text_pipeline::{TextCall, TextDirectionConfig};
 use super::negotiate::{apply_received_from, build_direction};
 use super::{Engine, PipelineKind, PromoteMode, PromotionReason};
 
+pub(in crate::engine) mod secure_hold;
+pub(in crate::engine) mod secure_release;
+
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Promote a plain passthrough relay (the in-kernel `FlowAction::Forward` fast path) to a
     /// userspace **relay-only** [`MediaCall`], so a SIPREC raw tee has an actor to attach to. The
@@ -417,6 +420,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (pipeline, fax_passthrough) = self
             .owned_call_internal(call_id, |call| (call.pipeline, call.fax_passthrough))
             .ok_or_else(|| "call no longer exists".to_string())?;
+        if reason == PromotionReason::WsSplit {
+            self.ws_split_refusal(call_id)?;
+        }
         // A call pinned to opaque relay (`fax_passthrough`) cannot host a feature that decodes it.
         // The offer/answer refused the profile-driven ones; this is the mid-call half of the same
         // rule, and it has to live here rather than in each verb because every one of them funnels
@@ -440,7 +446,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         // Mirror `subscribe_request`'s guard: promote only a plain relay not already in the pipeline.
         // After promotion the call's pipeline is `Media`, so a second hold skips this and just records.
-        if pipeline == PipelineKind::Passthrough && !self.media.is_media_call(call_id) {
+        if reason == PromotionReason::WsSplit && pipeline.is_crypto_bridge() {
+            // A crypto bridge relays ciphertext it cannot decode: its legs move into the actor, keys and
+            // stream positions with them (promote/secure_hold.rs). Other reasons keep their refusals.
+            self.hold_secure(call_id).await?;
+        } else if pipeline == PipelineKind::Passthrough && !self.media.is_media_call(call_id) {
             match mode {
                 PromoteMode::RelayOnly => self.promote_passthrough(call_id).await?,
                 PromoteMode::Processing => {
@@ -575,6 +585,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         // A lawful interception belongs to the call: put its taps on the path just installed.
         self.carry_x3_across_answer(call_id).await;
+        self.clear_hold_carry(call_id);
         self.start_record_call_streams(call_id, profile).await;
         self.maybe_promote_text_for_events(call_id).await;
     }
@@ -666,6 +677,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// echo promotes to a **processing** (non-relay-only) actor that must still demote when it clears.
     pub(super) async fn demote_if_idle(&self, call_id: &str) {
         if self.call_has_userspace_hold(call_id) {
+            return;
+        }
+        if self.is_secure_held(call_id) {
+            // Boxed: the release re-taps the call's tees, whose own teardown can release a hold.
+            if let Err(reason) = Box::pin(self.release_secure_hold(call_id)).await {
+                tracing::error!(target: "siphon_rtp::media", call_id, reason, "held call could not go back to its bridge");
+            }
             return;
         }
         let promoted_from_passthrough = self.media.is_media_call(call_id)

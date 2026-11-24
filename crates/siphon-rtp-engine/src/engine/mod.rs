@@ -699,6 +699,9 @@ struct Call {
     /// A `conference_seat` is moving this call's leg right now. Held for the whole move so a second
     /// seat, or anything else that would rebuild the call's media path, cannot interleave with it.
     seating: bool,
+    /// Set while a crypto-bridged call is held in the decoding media actor (see
+    /// [`promote::secure_hold`]); `None` on every other call.
+    secure_hold: Option<promote::secure_hold::SecureHold>,
 }
 
 /// A runtime reason a plain passthrough relay is held in the userspace media pipeline (promoted off
@@ -745,6 +748,11 @@ enum PromotionReason {
     /// the rest of its dialog and is torn down by `delete` (an IVR call does not fall back to a
     /// kernel relay). Harmless on an already-transcoding call (demotion is gated on `relay_flows`).
     MediaOp,
+    /// A split bridge holds this call in the decoding actor so both of its legs can be taken to one
+    /// stereo stream. Unlike the reasons above it reaches a **crypto bridge** (`Srtp*`, `Dtls*`) too,
+    /// whose legs move into the actor with their keys and stream positions
+    /// ([`promote::secure_hold`]).
+    WsSplit,
 }
 
 /// How [`Engine::hold_in_userspace`] promotes a plain passthrough relay into the userspace media

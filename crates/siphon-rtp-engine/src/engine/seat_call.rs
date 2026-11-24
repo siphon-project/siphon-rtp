@@ -610,6 +610,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             PromotionReason::DtmfBlock => Some("a DTMF block (block_dtmf)"),
             PromotionReason::Echo => Some("echo mode (echo)"),
             PromotionReason::WsTee => Some("a WebSocket tee (attach_ws_tee)"),
+            // A split holds both legs in the actor, which a room cannot take from it.
+            PromotionReason::WsSplit => Some("a split bridge (ws split)"),
             // An interception follows the leg into the room ([`Engine::conference_seat`]).
             PromotionReason::X3 => None,
             PromotionReason::TextEvents | PromotionReason::Secure => {

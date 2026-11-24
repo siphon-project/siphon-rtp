@@ -12,12 +12,15 @@
 //! DTLS-SRTP video is not carried: it is declined with the reason, never relayed unkeyed.
 
 use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, ForwardRule, LatchPolicy};
+use std::sync::{Arc, Mutex};
+
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 
 use super::{Engine, Party};
 use crate::sdp::{VideoKeying, VideoStream};
-use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeLeg};
+use crate::srtp_bridge::hold::SharedBridgePlan;
+use crate::srtp_bridge::{BridgeFlowPlan, BridgeLeg};
 
 /// One party's two SDES keys for its video leg: the engine's own toward the party (what the party
 /// decrypts the engine's video with) and the party's own (what the engine decrypts its video with).
@@ -187,21 +190,38 @@ pub(super) struct VideoFlowRule {
     pub(super) rule: ForwardRule,
 }
 
-/// The bridge plan of a secure video stream: one video [`SecureLeg`] per secure party, seeded from
-/// the rollover the previous negotiation had (RFC 3711 §3.3.1), and one flow per bridged endpoint
-/// naming which party's key decrypts its ingress and which encrypts its egress.
+/// The video legs a bridge already holds, one per party that had keys.
+pub(super) type LiveVideoLegs = (Option<Arc<Mutex<SecureLeg>>>, Option<Arc<Mutex<SecureLeg>>>);
+
+/// The bridge plan of a secure video stream: one video [`SecureLeg`] per secure party, and one flow
+/// per bridged endpoint naming which party's key decrypts its ingress and which encrypts its egress.
+///
+/// A party that already has a live leg keeps it and only the side whose key changed is re-keyed
+/// (RFC 3711 §9.1: a key must never protect one index twice, so the live send window is what stops a
+/// renegotiation from sending the same index again). Only a party with no live leg gets a new one,
+/// seeded from the rollover the previous negotiation had (RFC 3711 §3.3.1) with everything at or
+/// below its sent mark closed.
 fn bridge_plan(
     keys: &VideoKeys,
     rules: &[VideoFlowRule],
+    live: LiveVideoLegs,
     previous: (Option<SecureLegRollover>, Option<SecureLegRollover>),
-) -> BridgeCallPlan {
-    let build = |side: &SideKeys, previous: Option<SecureLegRollover>| {
+) -> SharedBridgePlan {
+    let build = |side: &SideKeys,
+                 live: Option<Arc<Mutex<SecureLeg>>>,
+                 previous: Option<SecureLegRollover>| {
         let (local, remote) = side.local.zip(side.remote)?;
+        if let Some(live) = live {
+            live.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .adopt(Some(&local.key), Some(&remote.key));
+            return Some(live);
+        }
         let mut leg = SecureLeg::new(&local.key, &remote.key);
         if let Some(rollover) = previous.as_ref() {
             leg.seed_rollover(rollover);
         }
-        Some(leg)
+        Some(Arc::new(Mutex::new(leg)))
     };
     let leg_of = |party: Party| match party {
         Party::Near => BridgeLeg::Near,
@@ -226,14 +246,26 @@ fn bridge_plan(
             })
         })
         .collect();
-    BridgeCallPlan {
-        near_leg: build(&keys.near, previous.0),
-        far_leg: build(&keys.far, previous.1),
+    SharedBridgePlan {
+        near_leg: build(&keys.near, live.0, previous.0),
+        far_leg: build(&keys.far, live.1, previous.1),
         flows,
+        carried: Vec::new(),
     }
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// The live video legs of each party, read from the bridge's flows before a renegotiation
+    /// replaces them, so a renegotiation that repeats a key keeps the very leg that sent.
+    pub(super) fn live_video_legs(&self, rules: &[VideoFlowRule]) -> LiveVideoLegs {
+        let (mut near, mut far) = (None, None);
+        for flow in rules {
+            near = near.or_else(|| self.bridge.party_leg(flow.endpoint, BridgeLeg::Near));
+            far = far.or_else(|| self.bridge.party_leg(flow.endpoint, BridgeLeg::Far));
+        }
+        (near, far)
+    }
+
     /// The live video rollover of each secure party, read from the bridge's flows before a
     /// renegotiation replaces them. Each flow's two legs are its ingress party's and the other's.
     pub(super) fn live_video_rollover(
@@ -261,6 +293,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         keys: &VideoKeys,
         rules: &[VideoFlowRule],
         endpoints: &[EndpointId],
+        live: LiveVideoLegs,
         previous: (Option<SecureLegRollover>, Option<SecureLegRollover>),
     ) -> Result<Vec<(EndpointId, FlowAction)>, String> {
         let mut flows: Vec<(EndpointId, FlowAction)> = Vec::new();
@@ -283,7 +316,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Registering opens nothing (a registry sees only what a `Redirect` routes to it), and each
         // registered flow carries its source gate and latch, so the first packet is already gated.
         if !rules.is_empty() {
-            self.bridge.register(bridge_plan(keys, rules, previous));
+            self.bridge
+                .register_shared(bridge_plan(keys, rules, live, previous));
         }
         for (endpoint, action) in actions {
             if let Err(error) = self.datapath.install_flow(endpoint, action) {

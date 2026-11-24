@@ -50,6 +50,17 @@ pub enum SrtpError {
     /// replay); either way the caller drops it and never forwards it.
     #[error("replayed packet")]
     Replayed,
+    /// The sender was asked to protect a packet whose sequence number is half the sequence space or
+    /// more away from the stream's highest, which no receiver can place in the right rollover
+    /// (RFC 3711 §3.3.1 estimates it from the highest sequence number seen) and which, at rollover
+    /// counter 0, would estimate a counter below 0. Nothing is produced, and no state recorded.
+    #[error("sequence number jump too large to number under one SRTP rollover")]
+    SequenceJump,
+    /// The sender was asked to protect a packet whose `(SSRC, index)` it has already sent, or one so
+    /// old that it can no longer be proven unsent. Two packets under one key, SSRC and index share a
+    /// keystream, which RFC 3711 §9.1 forbids, so nothing is produced.
+    #[error("SRTP index already sent under this key")]
+    IndexReused,
     /// The packet's MKI field names a master key this context does not hold (RFC 3711 §3.3 step 1:
     /// the MKI selects the key, so there is nothing to authenticate against).
     #[error("unknown MKI")]
@@ -66,7 +77,8 @@ pub enum SrtpError {
     /// send counters for one IV space (RFC 7714 §8).
     #[error("the same key material under two MKIs")]
     DuplicateKeyMaterial,
-    /// The 31-bit SRTCP index reached its last value; RFC 7714 §9.4 forbids wrapping it under the
+    /// The 31-bit SRTCP index reached its last value; RFC 3711 §3.4 / §9.2 (and RFC 7714 §9.4 for GCM)
+    /// forbid wrapping it under the
     /// same key, so nothing more is protected until the keys are replaced or the index reseeded.
     #[error("SRTCP index exhausted")]
     IndexExhausted,
@@ -248,6 +260,8 @@ pub struct SrtpContext {
     session_salt: [u8; MASTER_SALT_LEN],
     session_auth: [u8; 20],
     streams: HashMap<u32, StreamState>,
+    /// How many packets [`Self::protect`] has refused for reusing an index.
+    reuse_refusals: u64,
     /// The MKI every packet under this key carries (RFC 3711 §3.1), when the key signalled one.
     mki: Option<Mki>,
 }
@@ -283,6 +297,7 @@ impl SrtpContext {
             session_salt,
             session_auth,
             streams: HashMap::new(),
+            reuse_refusals: 0,
             mki: None,
         }
     }
@@ -312,6 +327,45 @@ impl SrtpContext {
             .collect()
     }
 
+    /// The highest RTP sequence number this context has sent or seen for `ssrc`: where a sender's own
+    /// numbering of that stream stands, whatever any other record of it says (RFC 3711 §3.3.1).
+    #[must_use]
+    pub fn highest_sequence(&self, ssrc: u32) -> Option<u16> {
+        self.streams.get(&ssrc)?.highest_seq
+    }
+
+    /// Whether this context was derived from the master key and salt of `material`, so from the same
+    /// session keys. The MKI only names the key on the wire (RFC 3711 §3.4) and is not part of its
+    /// identity: a context whose MKI alone changed keeps its send window, see [`Self::set_mki`].
+    /// How a leg learns that a re-offer did not change a key.
+    #[must_use]
+    pub fn same_key(&self, material: &SrtpKeyMaterial) -> bool {
+        let other = Self::from_key_material(material);
+        self.session_key == other.session_key
+            && self.session_salt == other.session_salt
+            && self.session_auth == other.session_auth
+    }
+
+    /// The MKI this context emits and expects from now on, with the keystream and send window kept.
+    pub fn set_mki(&mut self, mki: Option<Mki>) {
+        self.mki = mki;
+    }
+
+    /// [`Self::seed_stream`] for a context that **sends**: a rebuild that cannot keep the live context
+    /// does not know which indices were sent before the checkpoint, only the highest, so every index at
+    /// or below it is closed: nothing sent before may be sent again under the same key (RFC 3711
+    /// §9.1), and only what follows the highest goes out.
+    pub fn seed_outbound_stream(&mut self, rollover: StreamRollover) {
+        self.seed_stream(rollover);
+        if let (Some(seq), Some(state)) =
+            (rollover.highest_seq, self.streams.get_mut(&rollover.ssrc))
+        {
+            state
+                .replay
+                .close_at((u64::from(rollover.roc) << 16) | u64::from(seq));
+        }
+    }
+
     /// Seed a stream's rollover state from an HA checkpoint, so a standby continues a live stream's
     /// SRTP packet index instead of resetting to `0` — which would compute the wrong ROC (and fail
     /// authentication) once the sequence has wrapped. Overwrites any existing state for the SSRC.
@@ -335,10 +389,46 @@ impl SrtpContext {
 
     /// Encrypt + authenticate an RTP packet into `out` (cleared first): `header || AES-CM(payload) ||
     /// [MKI] || HMAC-SHA1-80`. The MKI sits outside the authenticated portion (RFC 3711 §3.1).
+    ///
+    /// **An index is sent at most once per SSRC.** The sender keeps, per SSRC, the highest index sent
+    /// and a 64-wide bitmap below it (the §3.3.2 replay list applied outbound), and refuses with
+    /// [`SrtpError::IndexReused`] anything already sent or older than the window, whoever owns the
+    /// stream at the time: a hand-over between owners of this context cannot reuse a keystream
+    /// (RFC 3711 §9.1). A reordered packet whose index was never sent still goes out. State is
+    /// allocated only when a new SSRC appears.
     pub fn protect(&mut self, rtp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
         let (header_len, ssrc, seq) = parse_rtp_header(rtp)?;
-        let (index, roc) = self.streams.entry(ssrc).or_default().index_for(seq);
+        let stream = self.streams.entry(ssrc).or_default();
+        // Decide on a copy, commit only a packet that is produced.
+        let mut next = *stream;
+        let roc_before = next.roc;
+        let (index, roc) = next.index_for(seq);
+        // A sender's rollover counter only ever rises (RFC 3711 §3.3.1): an estimate of the counter
+        // before the one in force is an old packet of the previous rollover, and before the very
+        // first rollover there is none, so the arithmetic would wrap to 2^32-1 and the window would
+        // be anchored there for good.
+        if roc_before == 0 && roc == u32::MAX {
+            self.reuse_refusals = self.reuse_refusals.saturating_add(1);
+            return Err(SrtpError::SequenceJump);
+        }
+        if next.replay.is_replay(index) {
+            self.reuse_refusals = self.reuse_refusals.saturating_add(1);
+            return Err(SrtpError::IndexReused);
+        }
+        next.replay.record(index);
+        *stream = next;
+        self.seal_at(rtp, header_len, ssrc, (index, roc), out)
+    }
 
+    /// `header || AES-CM(payload) || [MKI] || tag` for the packet at `index`.
+    fn seal_at(
+        &self,
+        rtp: &[u8],
+        header_len: usize,
+        ssrc: u32,
+        (index, roc): (u64, u32),
+        out: &mut Vec<u8>,
+    ) -> Result<(), SrtpError> {
         out.clear();
         out.extend_from_slice(rtp);
         let iv = cipher_iv(&self.session_salt, ssrc, index);
@@ -350,6 +440,12 @@ impl SrtpContext {
         }
         out.extend_from_slice(&tag);
         Ok(())
+    }
+
+    /// How many packets [`Self::protect`] has refused because their `(SSRC, index)` had been sent.
+    #[must_use]
+    pub fn reuse_refusals(&self) -> u64 {
+        self.reuse_refusals
     }
 
     /// Reject replays, verify the tag, and decrypt an SRTP packet into `out` (cleared first), yielding
@@ -505,6 +601,152 @@ mod tests {
             .unprotect(&srtp, &mut recovered)
             .expect("unprotect");
         assert_eq!(recovered, plain);
+    }
+
+    #[test]
+    fn an_index_already_sent_is_refused_not_encrypted_again() {
+        // Two packets under one key, SSRC and index share a keystream (RFC 3711 §9.1).
+        let mut sender = context();
+        let mut out = Vec::new();
+        sender.protect(&rtp(100, 7, 0x11), &mut out).expect("first");
+        assert_eq!(
+            sender.protect(&rtp(100, 7, 0x22), &mut out),
+            Err(SrtpError::IndexReused)
+        );
+        assert_eq!(sender.reuse_refusals(), 1);
+        // The same sequence under another SSRC is another stream.
+        sender
+            .protect(&rtp(100, 8, 0x11), &mut out)
+            .expect("other SSRC");
+    }
+
+    #[test]
+    fn a_forward_jump_of_half_the_sequence_space_is_refused_and_does_not_poison_the_window() {
+        // Rollover counter 0, seq 1000 then 50000: the estimate underflows to 2^32-1, whose index would
+        // become the window's top and refuse everything after it.
+        let mut sender = context();
+        let mut out = Vec::new();
+        sender.protect(&rtp(1000, 7, 0x11), &mut out).expect("1000");
+        assert_eq!(
+            sender.protect(&rtp(50_000, 7, 0x11), &mut out),
+            Err(SrtpError::SequenceJump)
+        );
+        assert_eq!(sender.reuse_refusals(), 1, "counted");
+        sender
+            .protect(&rtp(1001, 7, 0x11), &mut out)
+            .expect("the stream carries on: nothing was recorded");
+        assert_eq!(sender.rollover_state()[0].roc, 0);
+    }
+
+    #[test]
+    fn a_context_seeded_after_a_rebuild_closes_everything_at_or_below_the_restored_mark() {
+        let mut live = context();
+        let mut out = Vec::new();
+        for seq in [99u16, 100] {
+            live.protect(&rtp(seq, 7, 0x11), &mut out).expect("sent");
+        }
+        let checkpoint = live.rollover_state()[0];
+        let mut rebuilt = context();
+        rebuilt.seed_outbound_stream(checkpoint);
+        for seq in [98u16, 99, 100] {
+            assert_eq!(
+                rebuilt.protect(&rtp(seq, 7, 0x22), &mut out),
+                Err(SrtpError::IndexReused),
+                "{seq} was sent before the rebuild"
+            );
+        }
+        rebuilt
+            .protect(&rtp(101, 7, 0x22), &mut out)
+            .expect("what follows goes");
+    }
+
+    #[test]
+    fn a_change_of_mki_alone_keeps_the_key_identity_and_the_send_window() {
+        let mut keyed = SrtpKeyMaterial::from_inline_bytes(&[3; 30]).expect("key");
+        let mut context = SrtpContext::from_key_material(&keyed);
+        let mut out = Vec::new();
+        context.protect(&rtp(100, 7, 0xAA), &mut out).expect("sent");
+        keyed.mki = Some(Mki::new(9, 2).expect("mki"));
+        assert!(context.same_key(&keyed), "same master key and salt");
+        context.set_mki(keyed.mki);
+        assert_eq!(
+            context.protect(&rtp(100, 7, 0xBB), &mut out),
+            Err(SrtpError::IndexReused),
+            "the keystream of (7, 100) was used once already"
+        );
+        context.protect(&rtp(101, 7, 0xBB), &mut out).expect("next");
+    }
+
+    #[test]
+    fn a_context_knows_whether_a_key_is_the_one_it_was_built_from() {
+        let key = SrtpKeyMaterial::from_inline_bytes(&[3; 30]).expect("key");
+        let other = SrtpKeyMaterial::from_inline_bytes(&[4; 30]).expect("key");
+        let context = SrtpContext::from_key_material(&key);
+        assert!(context.same_key(&key));
+        assert!(!context.same_key(&other));
+    }
+
+    #[test]
+    fn a_reordered_packet_that_was_never_sent_still_goes_out_once() {
+        let mut sender = context();
+        let mut out = Vec::new();
+        sender.protect(&rtp(100, 7, 0x11), &mut out).expect("100");
+        sender
+            .protect(&rtp(99, 7, 0x11), &mut out)
+            .expect("99 was never sent");
+        assert_eq!(
+            sender.protect(&rtp(99, 7, 0x11), &mut out),
+            Err(SrtpError::IndexReused)
+        );
+        assert_eq!(
+            sender.protect(&rtp(100, 7, 0x11), &mut out),
+            Err(SrtpError::IndexReused)
+        );
+    }
+
+    #[test]
+    fn an_index_older_than_the_send_window_is_refused() {
+        let mut sender = context();
+        let mut out = Vec::new();
+        sender.protect(&rtp(1000, 7, 0x11), &mut out).expect("top");
+        // 64 behind the top is out of the window: it cannot be proven unsent.
+        assert_eq!(
+            sender.protect(&rtp(1000 - 64, 7, 0x11), &mut out),
+            Err(SrtpError::IndexReused)
+        );
+        sender
+            .protect(&rtp(1000 - 63, 7, 0x11), &mut out)
+            .expect("inside the window");
+    }
+
+    #[test]
+    fn the_send_window_follows_the_sequence_across_its_wrap() {
+        let mut sender = context();
+        let mut out = Vec::new();
+        for seq in [65_534u16, 65_535, 0, 1] {
+            sender
+                .protect(&rtp(seq, 7, 0x11), &mut out)
+                .expect("in order");
+        }
+        assert_eq!(
+            sender.protect(&rtp(65_535, 7, 0x11), &mut out),
+            Err(SrtpError::IndexReused),
+            "65535 of the previous rollover was sent"
+        );
+        sender
+            .protect(&rtp(65_533, 7, 0x11), &mut out)
+            .expect("never sent");
+        sender.protect(&rtp(2, 7, 0x11), &mut out).expect("next");
+    }
+
+    #[test]
+    fn a_refused_packet_leaves_the_stream_state_untouched() {
+        let mut sender = context();
+        let mut out = Vec::new();
+        sender.protect(&rtp(10, 7, 0x11), &mut out).expect("10");
+        let _ = sender.protect(&rtp(10, 7, 0x11), &mut out);
+        sender.protect(&rtp(11, 7, 0x11), &mut out).expect("11");
+        assert_eq!(sender.rollover_state()[0].highest_seq, Some(11));
     }
 
     #[test]

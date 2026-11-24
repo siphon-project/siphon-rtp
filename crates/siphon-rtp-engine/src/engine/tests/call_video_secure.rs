@@ -449,6 +449,79 @@ async fn a_reoffer_keeps_the_secure_stream_and_carries_the_srtp_rollover() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reoffer_with_unchanged_keys_never_sends_an_index_it_already_sent() {
+    // RFC 3711 §9.1: one keystream per (key, SSRC, index). A renegotiation that rebuilt the video
+    // legs under the same keys restored only the top index, so an already-sent index went out again
+    // with different bytes.
+    let mut call = secure_call("video-no-reuse", true, true, true).await;
+    for sequence in [99u16, 100] {
+        let (a, b) = (&mut call.a, &mut call.b);
+        assert_eq!(
+            relay(a, b, &video_packet(sequence), false).await,
+            Some(video_packet(sequence)),
+            "A to B at {sequence}"
+        );
+    }
+    let reoffer = Command::Reoffer {
+        call_id: "video-no-reuse".into(),
+        from_tag: "a".into(),
+        sdp: call_sdp(
+            (call.a_addresses.0, call.a_audio_key.as_ref()),
+            (call.a_addresses.1, call.a_video_key.as_ref()),
+            call.mux,
+        ),
+        profile: anchor(),
+    };
+    assert!(matches!(
+        call.engine.handle(CLIENT, reoffer).await,
+        CmdResult::Ok { .. }
+    ));
+    let answer = Command::Answer {
+        call_id: "video-no-reuse".into(),
+        from_tag: "a".into(),
+        to_tag: "b".into(),
+        sdp: call_sdp(
+            (call.b_addresses.0, call.b_audio_key.as_ref()),
+            (call.b_addresses.1, call.b_video_key.as_ref()),
+            call.mux,
+        ),
+        profile: anchor(),
+    };
+    assert!(matches!(
+        call.engine.handle(CLIENT, answer).await,
+        CmdResult::Ok { .. }
+    ));
+    // A source that replays sequence 99 with other bytes, from a fresh sender context under A's key.
+    let engine_key = sdp::parse_video_stream(&call.to_a)
+        .expect("video")
+        .crypto
+        .first()
+        .copied()
+        .expect("engine key");
+    let mut forger = SecureLeg::new(&call.a_video_key.expect("key").key, &engine_key.key);
+    let mut other = video_packet(99);
+    other[12..].copy_from_slice(b"DIFFERNT");
+    let mut wire = Vec::new();
+    forger.protect(&other, &mut wire).expect("protect");
+    call.a
+        .rtp
+        .send_to(&wire, call.a.engine_rtp)
+        .await
+        .expect("send");
+    assert_eq!(
+        received(&call.b.rtp).await,
+        None,
+        "an index sent before the renegotiation must not be sent again under the same key"
+    );
+    // The stream itself carries on.
+    let (a, b) = (&mut call.a, &mut call.b);
+    assert_eq!(
+        relay(a, b, &video_packet(101), false).await,
+        Some(video_packet(101))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn teardown_removes_the_video_endpoints_from_the_srtp_bridge() {
     let call = secure_call("teardown", true, true, false).await;
     let endpoints: Vec<_> = {

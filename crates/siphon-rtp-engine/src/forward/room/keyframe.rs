@@ -988,21 +988,22 @@ impl ForwardRoom {
                 receiver.counters.nack_missed += 1;
                 continue;
             };
+            // A bundled receiver is answered with the very datagram it was sent: protecting the packet
+            // again would encrypt at an index this sender has already used (RFC 3711 §9.1), and a
+            // retransmission is the same packet (RFC 4585 §6.2.1). One that is no longer remembered is
+            // not answered.
+            let bundled = video.bundled;
+            if bundled {
+                let Some(remembered) = video.recall_sealed(&self.scratch[..length]) else {
+                    receiver.counters.nack_missed += 1;
+                    continue;
+                };
+                self.secure_out.clear();
+                self.secure_out.extend_from_slice(remembered);
+            }
             let (endpoint, destination) = receiver.video_route()?;
-            let bundled = receiver.video.as_ref().is_some_and(|video| video.bundled);
-            // SRTP again, under the seat's key: the same packet index gives the same bytes, which is
-            // what a receiver that never saw the first one needs (RFC 3711 §3.3.1).
-            let Some(sealed) = seal(
-                bundled,
-                receiver.secure.as_mut(),
-                &self.scratch[..length],
-                &mut self.secure_out,
-            ) else {
-                receiver.counters.nack_missed += 1;
-                continue;
-            };
             receiver.counters.nack_answered += 1;
-            let wire = if sealed {
+            let wire: &[u8] = if bundled {
                 &self.secure_out[..]
             } else {
                 &self.scratch[..length]

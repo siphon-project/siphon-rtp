@@ -16,6 +16,11 @@
 //! - `bundled_video_secure_to_plain` and `bundled_video_plain_to_secure` — a 1200 byte video packet
 //!   (RFC 8843: one association, told from the audio by payload type) crossing the same leg. The
 //!   delta against `secure_rtp_to_plain` is the demux, and the larger payload.
+//! - `egress_track_forward` and `egress_track_rewrite` — what each relayed packet pays to record the
+//!   stream a hold in the decoding actor may have to continue (`siphon_rtp_engine::egress_track`):
+//!   the steady state, and the renumbering a released call keeps for the rest of its life (a copy of
+//!   the packet into the bridge's own buffer and two header writes). Both are already inside every
+//!   `handle` point above; these two isolate them.
 //! - `unkeyed_drop` — SRTP arriving before any handshake has keyed the leg. It has to stay cheaper
 //!   than a keyed packet: a peer that floods before the handshake must not cost more than one that
 //!   completes it.
@@ -46,6 +51,7 @@ use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, RxPacket, SourceFilter};
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, DtlsSession, Fingerprint};
 use siphon_rtp_engine::dtls_bridge::{DtlsBridge, DtlsCallPlan, DtlsVideoPlan, PlainRtcp};
+use siphon_rtp_engine::egress_track::{continue_stream, EgressTrack, StreamPosition};
 use siphon_rtp_srtp::leg::SecureLeg;
 use tokio::net::UdpSocket;
 
@@ -404,5 +410,46 @@ fn dtls_bridge_handle(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, dtls_bridge_handle);
+/// The per-packet cost of recording (and, after a release, renumbering) the stream a bridge flow
+/// forwards.
+fn egress_track(c: &mut Criterion) {
+    let mut group = c.benchmark_group("egress_track");
+    let packet = rtp_packet(1000, 0x0A0A_0A0A);
+    let steady = EgressTrack::default();
+    let mut scratch = Vec::new();
+    group.bench_function("egress_track_forward", |bencher| {
+        bencher.iter(|| {
+            let sent =
+                continue_stream(&steady, black_box(&packet), &mut scratch, |_| None).is_some();
+            steady.commit();
+            black_box(sent)
+        })
+    });
+    let continuing = EgressTrack::continuing(Some(StreamPosition {
+        ssrc: 0x0A0A_0A0A,
+        sequence: 5000,
+        timestamp: 800_000,
+    }));
+    group.bench_function("egress_track_rewrite", |bencher| {
+        bencher.iter(|| {
+            let sent =
+                continue_stream(&continuing, black_box(&packet), &mut scratch, |_| None).is_some();
+            continuing.commit();
+            black_box(sent)
+        })
+    });
+    // A guarded flow (one that feeds an SRTP leg) also follows the stream for restarts of its numbering.
+    let guarded = EgressTrack::guarded();
+    group.bench_function("egress_track_guarded", |bencher| {
+        bencher.iter(|| {
+            let sent =
+                continue_stream(&guarded, black_box(&packet), &mut scratch, |_| None).is_some();
+            guarded.commit();
+            black_box(sent)
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(benches, dtls_bridge_handle, egress_track);
 criterion_main!(benches);

@@ -27,11 +27,14 @@ use siphon_rtp_datapath::{
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use crate::dtls_bridge::DtlsBridge;
+use crate::egress_track::{continue_stream, EgressTrack};
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::plain_tap::{PlainTapSender, PlainTaps};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::video_injector::{Verdict, VideoInjector};
 use crate::x3::X3Taps;
+
+pub(crate) mod hold;
 
 /// The SSRC of an RTP media datagram, or `None` for anything else (RTCP, STUN, DTLS). What the
 /// symmetric latch keys a stream on (RFC 3550 §8), shared with the other `Redirect` consumers.
@@ -138,6 +141,9 @@ struct Flow {
     /// The first-IDR injector of a far-to-caller video flow on an `answer_local` call
     /// ([`crate::video_injector`]), while it is armed. Plain/plain flows only.
     injector: Option<Arc<VideoInjector>>,
+    /// What this flow forwards toward its peer last, so a hold in the decoding actor and the release
+    /// that follows continue one RTP stream (`crate::egress_track`, RFC 3711 §3.3.1).
+    track: Arc<EgressTrack>,
 }
 
 /// The bridge registry: redirected endpoint → its `Flow`. Shared (`Arc`) between the control path
@@ -177,6 +183,8 @@ pub(crate) struct Scratch {
     pub(crate) sealed: Vec<u8>,
     /// The parameter-set packets a [`VideoInjector`] puts ahead of a datagram.
     pub(crate) injected: Vec<u8>,
+    /// A datagram renumbered to continue a stream a hold interrupted ([`crate::egress_track`]).
+    pub(crate) rewritten: Vec<u8>,
 }
 
 /// A few [`Scratch`]es, so a datagram takes one for its life and gives it back, whatever way it
@@ -220,6 +228,7 @@ impl Drop for ScratchLoan<'_> {
         scratch.decrypted.clear();
         scratch.sealed.clear();
         scratch.injected.clear();
+        scratch.rewritten.clear();
         if let Ok(mut pool) = self.pool.0.lock() {
             pool.push(scratch);
         }
@@ -256,8 +265,18 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
     /// dispatcher finds no owner and the datagrams are dropped. Fail closed, and loudly — a partially
     /// installed bridge is worse than an absent one.
     pub fn register(&self, plan: BridgeCallPlan) {
-        let near = plan.near_leg.map(|leg| Arc::new(Mutex::new(leg)));
-        let far = plan.far_leg.map(|leg| Arc::new(Mutex::new(leg)));
+        self.register_shared(hold::SharedBridgePlan {
+            near_leg: plan.near_leg.map(|leg| Arc::new(Mutex::new(leg))),
+            far_leg: plan.far_leg.map(|leg| Arc::new(Mutex::new(leg))),
+            flows: plan.flows,
+            carried: Vec::new(),
+        });
+    }
+
+    /// [`Self::register`] over legs that already exist as shared handles, which is how a call comes
+    /// back from the decoding actor holding the very `SecureLeg`s it left with.
+    pub(crate) fn register_shared(&self, plan: hold::SharedBridgePlan) {
+        let (near, far) = (plan.near_leg, plan.far_leg);
         let resolve = |which: Option<BridgeLeg>| match which {
             None => Ok(None),
             Some(party) => {
@@ -314,6 +333,34 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 .get(&endpoint)
                 .map(|previous| (previous.x3.clone(), previous.plain_taps.clone()))
                 .unwrap_or_default();
+            // What a hold carried over, which is newer than anything a replaced flow still holds.
+            let carried = plan
+                .carried
+                .iter()
+                .find(|carried| carried.endpoint == endpoint);
+            let (x3, plain_taps) = carried.map_or((x3, plain_taps), |carried| {
+                (carried.taps.x3.clone(), carried.taps.plain.clone())
+            });
+            // The record of what the flow forwarded, and the offset a release left on it, belongs to
+            // the stream under one key (RFC 3711 §3.3.1): a re-registration that keeps the key keeps
+            // it, and a new key starts a new stream.
+            let kept_track = self.flows.get(&endpoint).and_then(|previous| {
+                let same_key = match (&previous.egress_leg, &egress_leg) {
+                    (Some(old), Some(new)) => Arc::ptr_eq(&old.leg, &new.leg),
+                    (None, None) => true,
+                    _ => false,
+                };
+                same_key.then(|| previous.track.clone())
+            });
+            let track = match carried {
+                Some(carried) if carried.awaiting => Arc::new(EgressTrack::awaiting()),
+                Some(carried) => Arc::new(EgressTrack::continuing(carried.resume)),
+                None => kept_track.unwrap_or_default(),
+            };
+            // A flow that feeds an SRTP leg renumbers a stream whose sequence restarts or jumps.
+            if egress_leg.is_some() {
+                track.guard();
+            }
             self.flows.insert(
                 endpoint,
                 Flow {
@@ -321,9 +368,13 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     // A fresh latch per registration: a renegotiation re-points the leg, and
                     // carrying the old latch would keep replying to the pre-renegotiation source
                     // until the peer's next packet happened to re-latch it.
-                    latch: flow
-                        .latch
-                        .then(|| Arc::new(Mutex::new(SymmetricLatch::default()))),
+                    latch: flow.latch.then(|| {
+                        Arc::new(Mutex::new(
+                            carried
+                                .map(|carried| carried.taps.latch.clone())
+                                .unwrap_or_default(),
+                        ))
+                    }),
                     out_endpoint: flow.out_endpoint,
                     out_dst: flow.out_dst,
                     ingress_leg,
@@ -332,6 +383,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     refusals: Arc::new(RefusalLog::default()),
                     plain_taps,
                     injector: None,
+                    track,
                 },
             );
         }
@@ -553,6 +605,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             refusals,
             plain_taps,
             injector,
+            track,
         )) = self.flows.get(&packet.endpoint).map(|flow| {
             (
                 flow.accepted_source,
@@ -565,6 +618,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 flow.refusals.clone(),
                 flow.plain_taps.clone(),
                 flow.injector.clone(),
+                flow.track.clone(),
             )
         })
         else {
@@ -585,6 +639,12 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             self.datapath.note_dropped(packet.endpoint);
             return;
         }
+        // A flow that forwards nothing yet (a hand-over in progress) learns nothing either: a source
+        // that wins the first-packet race must not become the latch of a flow that then carries on.
+        if track.refusing() {
+            self.datapath.note_dropped(packet.endpoint);
+            return;
+        }
 
         // Decrypt what arrived (if this side faces a secure peer), then encrypt what leaves (if the
         // other side does). One sequence covers all three shapes: a one-sided bridge leaves one of
@@ -599,6 +659,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             decrypted,
             sealed,
             injected,
+            rewritten,
         } = &mut *scratch;
         let plaintext: &[u8] = if let Some(side) = &ingress_leg {
             let transformed = {
@@ -620,28 +681,6 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             decrypted
         } else {
             &packet.data
-        };
-
-        let out: &[u8] = if let Some(side) = &egress_leg {
-            let transformed = {
-                let Ok(mut leg) = side.leg.lock() else {
-                    tracing::error!("bridge secure-leg mutex poisoned; dropping packet");
-                    return;
-                };
-                leg.protect(plaintext, sealed)
-            };
-            if let Err(error) = transformed {
-                tracing::debug!(
-                    ?error,
-                    party = ?side.party,
-                    "bridge egress encrypt failed; dropping packet"
-                );
-                self.datapath.note_dropped(packet.endpoint);
-                return;
-            }
-            sealed
-        } else {
-            plaintext
         };
 
         // Symmetric RTP: adopt the source this leg's media actually arrives from, so the reply goes
@@ -687,6 +726,44 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 }
             }
         }
+
+        // The stream toward the peer, continued across a hold in the decoding actor (RFC 3711 §3.3.1,
+        // `crate::egress_track`). After the latch, so a packet the latch rejects is never recorded as
+        // sent; before the egress transform, so what is encrypted carries the continued numbering.
+        let Some(forwarded) = continue_stream(&track, plaintext, rewritten, |ssrc| {
+            // The sender's own record of the stream, asked only for one the flow is not following.
+            let side = egress_leg.as_ref()?;
+            let leg = side.leg.try_lock().ok()?;
+            leg.highest_sent(ssrc)
+        }) else {
+            self.datapath.note_dropped(packet.endpoint);
+            return;
+        };
+        let out: &[u8] = if let Some(side) = &egress_leg {
+            let transformed = {
+                let Ok(mut leg) = side.leg.lock() else {
+                    tracing::error!("bridge secure-leg mutex poisoned; dropping packet");
+                    return;
+                };
+                let result = leg.protect(forwarded, sealed);
+                (result, leg.reuse_refusals())
+            };
+            if let (Err(error), refused) = transformed {
+                crate::egress_track::log_protect_failure(&error, "srtp-bridge", refused);
+                track.refused(&error, |ssrc| {
+                    let side = egress_leg.as_ref()?;
+                    let leg = side.leg.lock().ok()?;
+                    leg.highest_sent(ssrc)
+                });
+                self.datapath.note_dropped(packet.endpoint);
+                return;
+            }
+            sealed
+        } else {
+            forwarded
+        };
+        // Sent as far as the sender is concerned: only now does it become the flow's high-water mark.
+        track.commit();
 
         // Accepted: past the source gate and past the crypto. Stamp the endpoint's liveness for the
         // engine's idle sweep (docs/security-and-nat.md §4 layer 6). The `Redirect` arm never touches
@@ -2018,5 +2095,232 @@ mod tests {
             .bridge
             .add_plain_tap(EndpointId(9_999), "rec-1", tap));
         harness.bridge.remove_plain_tap(EndpointId(9_999), "rec-1"); // idempotent
+    }
+    // ---- Holding the flows in the decoding actor and taking them back (srtp_bridge/hold.rs) ----
+
+    /// What a held call hands the next owner, read from the live harness.
+    fn endpoints(harness: &Harness) -> [EndpointId; 2] {
+        [harness.plain_endpoint, harness.secure_endpoint]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_view_reads_the_flows_and_the_leg_without_changing_the_bridge() {
+        let (harness, (phone_a, _), (_phone_b, addr_b)) = live_bridge().await;
+        phone_a
+            .send_to(&rtp(1, 0x1111_1111), harness.plain_addr)
+            .await
+            .expect("send");
+        let view = harness
+            .bridge
+            .hold_view(&endpoints(&harness))
+            .expect("a bridged call");
+        assert_eq!(view.plans.len(), 2);
+        let toward_b = view
+            .plans
+            .iter()
+            .find(|plan| plan.endpoint == harness.plain_endpoint)
+            .expect("the plain flow");
+        assert_eq!(toward_b.out_dst, addr_b);
+        assert_eq!(toward_b.egress_leg, Some(BridgeLeg::Far));
+        assert!(view.far_leg.is_some() && view.near_leg.is_none());
+        assert!(harness.bridge.owns(harness.plain_endpoint), "nothing moved");
+        assert!(
+            harness.bridge.hold_view(&[EndpointId(9_999)]).is_none(),
+            "an endpoint the bridge does not own is not a call to hold"
+        );
+        assert!(harness.bridge.hold_view(&[]).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn holding_seals_the_flows_at_the_last_packet_they_forwarded() {
+        let (harness, (phone_a, _), (phone_b, _)) = live_bridge().await;
+        for sequence in 40..43 {
+            phone_a
+                .send_to(&rtp(sequence, 0x1111_1111), harness.plain_addr)
+                .await
+                .expect("send");
+            let _ = recv(&phone_b).await;
+        }
+        let held = harness.bridge.hold(&endpoints(&harness));
+        assert_eq!(held.len(), 2);
+        let plain = held
+            .iter()
+            .find(|flow| flow.endpoint == harness.plain_endpoint)
+            .expect("the plain flow");
+        let last = plain.last.expect("it forwarded");
+        assert_eq!(last.position.ssrc, 0x1111_1111);
+        assert_eq!(last.position.sequence, 42);
+        assert!(!harness.bridge.owns(harness.plain_endpoint));
+        assert!(!harness.bridge.owns(harness.secure_endpoint));
+
+        // Whatever still reaches the dispatcher is nobody's: it is not forwarded.
+        phone_a
+            .send_to(&rtp(43, 0x1111_1111), harness.plain_addr)
+            .await
+            .expect("send");
+        assert!(
+            timeout(NEGATIVE, phone_b.recv_from(&mut [0u8; 2048]))
+                .await
+                .is_err(),
+            "a released flow forwards nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rebuilt_flow_continues_the_stream_the_actor_left_over_the_same_leg() {
+        use crate::egress_track::StreamPosition;
+        let (harness, (phone_a, _), (phone_b, _)) = live_bridge().await;
+        let mut at_b = SrtpContext::from_key_material(&harness.local);
+        phone_a
+            .send_to(&rtp(40, 0x1111_1111), harness.plain_addr)
+            .await
+            .expect("send");
+        let mut plain = Vec::new();
+        at_b.unprotect(&recv(&phone_b).await, &mut plain)
+            .expect("B decrypts");
+
+        let view = harness
+            .bridge
+            .hold_view(&endpoints(&harness))
+            .expect("view");
+        let held = harness.bridge.hold(&endpoints(&harness));
+        // The actor sent sequences 41..=60 under the same SSRC, so its next one is 61.
+        harness.bridge.register_shared(hold::SharedBridgePlan {
+            near_leg: view.near_leg,
+            far_leg: view.far_leg,
+            flows: view.plans,
+            carried: held
+                .into_iter()
+                .map(|flow| hold::CarriedFlow {
+                    awaiting: false,
+                    endpoint: flow.endpoint,
+                    resume: (flow.endpoint == harness.plain_endpoint).then_some(StreamPosition {
+                        ssrc: 0x1111_1111,
+                        sequence: 61,
+                        timestamp: 9_760,
+                    }),
+                    taps: flow.taps,
+                })
+                .collect(),
+        });
+
+        // The peer's own numbering is unrelated; B must still see 61, 62 under the same SSRC, and
+        // its independent context decrypts both (same key, same ROC bookkeeping).
+        for (peer_sequence, expected) in [(7u16, 61u16), (8, 62)] {
+            phone_a
+                .send_to(&rtp(peer_sequence, 0x1111_1111), harness.plain_addr)
+                .await
+                .expect("send");
+            let mut clear = Vec::new();
+            at_b.unprotect(&recv(&phone_b).await, &mut clear)
+                .expect("B decrypts the continued stream");
+            assert_eq!(u16::from_be_bytes([clear[2], clear[3]]), expected);
+            assert_eq!(&clear[8..12], &0x1111_1111u32.to_be_bytes());
+        }
+        // A different SSRC is a new stream and is not renumbered.
+        phone_a
+            .send_to(&rtp(500, 0x2222_2222), harness.plain_addr)
+            .await
+            .expect("send");
+        let mut clear = Vec::new();
+        at_b.unprotect(&recv(&phone_b).await, &mut clear)
+            .expect("decrypts");
+        assert_eq!(u16::from_be_bytes([clear[2], clear[3]]), 500);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bridge_never_sends_the_same_srtp_index_twice() {
+        // RFC 3711 §9.1: one keystream per (key, SSRC, index). The send window of the leg refuses a
+        // packet it has already sent, whoever relays it.
+        let (harness, (phone_a, _), (phone_b, _)) = live_bridge().await;
+        let mut at_b = SrtpContext::from_key_material(&harness.local);
+        for _ in 0..2 {
+            phone_a
+                .send_to(&rtp(5, 0x1111_1111), harness.plain_addr)
+                .await
+                .expect("send");
+        }
+        let mut clear = Vec::new();
+        at_b.unprotect(&recv(&phone_b).await, &mut clear)
+            .expect("the first goes out");
+        assert!(
+            timeout(NEGATIVE, phone_b.recv_from(&mut [0u8; 2048]))
+                .await
+                .is_err(),
+            "its duplicate is refused at the sender"
+        );
+        // A reordered packet whose index was never sent still goes.
+        for sequence in [8u16, 7] {
+            phone_a
+                .send_to(&rtp(sequence, 0x1111_1111), harness.plain_addr)
+                .await
+                .expect("send");
+            at_b.unprotect(&recv(&phone_b).await, &mut clear)
+                .expect("reordered but unsent");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_re_registration_that_keeps_the_key_keeps_the_continued_numbering() {
+        use crate::egress_track::StreamPosition;
+        let (harness, (phone_a, _), (phone_b, _)) = live_bridge().await;
+        let mut at_b = SrtpContext::from_key_material(&harness.local);
+        phone_a
+            .send_to(&rtp(40, 0x1111_1111), harness.plain_addr)
+            .await
+            .expect("send");
+        let mut clear = Vec::new();
+        at_b.unprotect(&recv(&phone_b).await, &mut clear)
+            .expect("B decrypts");
+
+        let view = harness
+            .bridge
+            .hold_view(&endpoints(&harness))
+            .expect("view");
+        let held = harness.bridge.hold(&endpoints(&harness));
+        let plan = |view: &hold::BridgeView, held: Vec<hold::HeldFlow>| hold::SharedBridgePlan {
+            near_leg: view.near_leg.clone(),
+            far_leg: view.far_leg.clone(),
+            flows: view.plans.clone(),
+            carried: held
+                .into_iter()
+                .map(|flow| hold::CarriedFlow {
+                    awaiting: false,
+                    endpoint: flow.endpoint,
+                    resume: (flow.endpoint == harness.plain_endpoint).then_some(StreamPosition {
+                        ssrc: 0x1111_1111,
+                        sequence: 61,
+                        timestamp: 9_760,
+                    }),
+                    taps: flow.taps,
+                })
+                .collect(),
+        };
+        harness.bridge.register_shared(plan(&view, held));
+        phone_a
+            .send_to(&rtp(7, 0x1111_1111), harness.plain_addr)
+            .await
+            .expect("send");
+        at_b.unprotect(&recv(&phone_b).await, &mut clear)
+            .expect("61");
+        assert_eq!(u16::from_be_bytes([clear[2], clear[3]]), 61);
+
+        // The same call is registered again over the same leg (an unchanged-key re-offer).
+        harness.bridge.register_shared(hold::SharedBridgePlan {
+            near_leg: view.near_leg.clone(),
+            far_leg: view.far_leg.clone(),
+            flows: view.plans.clone(),
+            carried: Vec::new(),
+        });
+        phone_a
+            .send_to(&rtp(8, 0x1111_1111), harness.plain_addr)
+            .await
+            .expect("send");
+        at_b.unprotect(&recv(&phone_b).await, &mut clear)
+            .expect("62");
+        assert_eq!(
+            u16::from_be_bytes([clear[2], clear[3]]),
+            62,
+            "the offset a release left survives a re-registration under the same key"
+        );
     }
 }

@@ -49,19 +49,31 @@ impl AnswerWiring<'_> {
             ice_validated,
             // A's separate RTCP port when A does not multiplex, gated to A's effective RTCP source
             // like the RTP side. B, the DTLS peer, multiplexes (see `PlainRtcp`).
-            plain_rtcp: self
-                .near
-                .rtcp
-                .zip(self.near.remote_rtcp)
-                .map(|(endpoint, a_rtcp)| crate::dtls_bridge::PlainRtcp {
-                    endpoint: endpoint.id,
-                    source: bridge_source_filter(
-                        self.profile,
-                        self.near_gate_rtcp.unwrap_or(a_rtcp),
-                    ),
-                    dst: self.near_rtcp_dst.unwrap_or(a_rtcp),
-                }),
+            plain_rtcp: self.near_plain_rtcp(),
         }
+    }
+
+    /// A's separate RTCP port, when A does not multiplex, gated to A's effective RTCP source and
+    /// aimed at the address this answer settled. Read by the plan above and by a held call's
+    /// re-offer, which takes its RTCP routing from the new answer.
+    pub(super) fn near_plain_rtcp(&self) -> Option<crate::dtls_bridge::PlainRtcp> {
+        self.near
+            .rtcp
+            .zip(self.near.remote_rtcp)
+            .map(|(endpoint, a_rtcp)| crate::dtls_bridge::PlainRtcp {
+                endpoint: endpoint.id,
+                source: bridge_source_filter(self.profile, self.near_gate_rtcp.unwrap_or(a_rtcp)),
+                dst: self.near_rtcp_dst.unwrap_or(a_rtcp),
+            })
+    }
+
+    /// B's separate RTCP port, when B does not multiplex: [`Self::near_plain_rtcp`]'s twin.
+    pub(super) fn far_plain_rtcp(&self) -> Option<crate::dtls_bridge::PlainRtcp> {
+        self.far.rtcp.map(|endpoint| crate::dtls_bridge::PlainRtcp {
+            endpoint: endpoint.id,
+            source: bridge_source_filter(self.profile, self.far_gate_rtcp),
+            dst: self.far_rtcp_dst,
+        })
     }
 
     /// The DTLS-SRTP plan for a terminated DTLS **offerer**: A's leg is keyed by the handshake the
@@ -99,11 +111,7 @@ impl AnswerWiring<'_> {
             gate_on_ice: ice_validated.is_some()
                 || self.agent_endpoints.contains(&self.near.rtp.id),
             ice_validated,
-            plain_rtcp: self.far.rtcp.map(|endpoint| crate::dtls_bridge::PlainRtcp {
-                endpoint: endpoint.id,
-                source: bridge_source_filter(self.profile, self.far_gate_rtcp),
-                dst: self.far_rtcp_dst,
-            }),
+            plain_rtcp: self.far_plain_rtcp(),
         }
     }
 }
@@ -303,6 +311,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .media_call(directions)
             .with_far_secure_pending()
             .with_rtcp_relays(rtcp_relays);
+        // A call held for a split carries its stream positions, taps and plain RTCP port across.
+        let call = self.apply_hold_carry(
+            wiring.call_id,
+            call,
+            Some((
+                far.rtp.id,
+                wiring.far_media_dst,
+                false,
+                wiring.near_plain_rtcp(),
+            )),
+            (wiring.near.remote_rtp, Some(wiring.info.remote_rtp)),
+        );
         // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
         // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
         let mut call = call;
@@ -379,6 +399,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // registry.
         let redirected = [near.rtp.id, far.rtp.id];
         let call = wiring.media_call(directions).with_caller_secure_pending();
+        let call = self.apply_hold_carry(
+            wiring.call_id,
+            call,
+            Some((
+                near.rtp.id,
+                wiring.near_media_dst.unwrap_or(inputs.a_rtp),
+                true,
+                wiring.far_plain_rtcp(),
+            )),
+            (wiring.near.remote_rtp, Some(wiring.info.remote_rtp)),
+        );
         // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
         // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
         let mut call = call;
