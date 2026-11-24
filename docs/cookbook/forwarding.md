@@ -660,7 +660,10 @@ The counters live in the engine's memory. To survive a failover, store the opaqu
 `checkpoint_srtcp_indices` on your schedule (it names keys by an HMAC under the key and holds no key
 bytes) and send it with `restore_srtcp_indices` to the standby **before** rebuilding any room there: each
 counter starts 65536 indices past the checkpointed one, because the primary kept sending after the
-checkpoint. **If an engine restarts, or fails over with no restored ledger, it knows nothing of what was
+checkpoint. Restoring is safe on every connection: a blob the same running engine exported is a no-op
+(a plain `ok`; the engine logs "same engine, nothing to restore") and the live rooms keep sealing. A blob
+from another process (or one with no valid origin tag) leaves every key of that engine without a send
+window until you checkpoint, store and `confirm_srtcp_indices` once after rebuilding the rooms. **If an engine restarts, or fails over with no restored ledger, it knows nothing of what was
 sent: issue fresh keys** (a new MIKEY exchange, RFC 7714 §8) rather than reusing the old ones. The forward
 rooms themselves are not checkpointed, so a standby rejoins its seats; the ledger is what makes that safe.
 

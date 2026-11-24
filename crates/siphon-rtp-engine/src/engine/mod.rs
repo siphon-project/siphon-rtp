@@ -68,6 +68,8 @@ mod snapshot_floor;
 mod srtcp_indices;
 use near_dtls::NearDtls;
 use results::{ok_empty, ok_sdp};
+/// Parse a `restore_srtcp_indices` blob (exposed for the fuzz target of that parser).
+pub use srtcp_indices::decode as decode_srtcp_indices_blob;
 mod sweep;
 mod takeover;
 mod teardown;

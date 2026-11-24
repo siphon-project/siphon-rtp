@@ -772,20 +772,72 @@ pub fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Decode a lowercase/uppercase hex string, or `None` on an odd length or a non-hex digit.
+/// Decode a lowercase/uppercase hex string, or `None` on an odd length or any byte that is not an
+/// ASCII hex digit. It reads bytes and never slices the `str`: input is hostile (a restore blob), and
+/// slicing at a byte offset panics inside a multi-byte character. `u8::from_str_radix` is not used
+/// either, since it accepts a leading `+`.
 #[must_use]
 pub fn from_hex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+    // The length is even, so the remainder of the split into pairs is empty.
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[high, low]| Some(digit(*high)? << 4 | digit(*low)?))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn from_hex_decodes_ascii_hex_and_rejects_everything_else_without_panicking() {
+        assert_eq!(from_hex(""), Some(Vec::new()));
+        assert_eq!(from_hex("00ff7F"), Some(vec![0x00, 0xFF, 0x7F]));
+        assert_eq!(from_hex("aBcD"), Some(vec![0xAB, 0xCD]), "mixed case");
+        assert_eq!(from_hex("abc"), None, "odd length");
+        assert_eq!(from_hex("zz"), None);
+        assert_eq!(
+            from_hex("+f"),
+            None,
+            "from_str_radix would take a plus sign"
+        );
+        assert_eq!(from_hex("-f"), None);
+        assert_eq!(from_hex(" f"), None);
+        // Multi-byte characters: even byte length, boundaries inside a character.
+        for hostile in [
+            "\u{1F4A3}",
+            "a\u{e9}b",
+            "\u{e9}\u{e9}",
+            "00\u{1F4A3}00",
+            "\u{0}\u{0}",
+        ] {
+            assert_eq!(from_hex(hostile), None, "{hostile:?}");
+        }
+        // Every two-byte pair, including all non-ASCII leading bytes, never panics.
+        for first in 0u8..=255 {
+            for second in 0u8..=255 {
+                if let Ok(text) = std::str::from_utf8(&[first, second]) {
+                    let expected = text
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit())
+                        .then(|| u8::from_str_radix(text, 16).ok())
+                        .flatten();
+                    assert_eq!(from_hex(text), expected.map(|byte| vec![byte]));
+                }
+            }
+        }
+    }
+
     use super::*;
     use std::net::Ipv4Addr;
 

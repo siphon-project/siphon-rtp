@@ -1025,7 +1025,9 @@ where
     }
     crate::sdp::set_amr_policy(false, config.amr);
     crate::sdp::set_amr_policy(true, config.amr_wb);
-    let mut engine = Engine::new(datapath.clone())
+    // No randomness for the SRTCP ledger: refuse to start rather than run a ledger that cannot tell
+    // its own checkpoint from a forged one (RFC 7714 section 8).
+    let mut engine = Engine::try_new(datapath.clone())?
         .with_cluster(cluster.clone())
         .with_interfaces(interfaces)
         .with_prompt_cache_bytes(usize::try_from(config.prompt_cache_bytes).unwrap_or(usize::MAX))

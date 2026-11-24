@@ -264,6 +264,21 @@ impl SendIndex {
         });
     }
 
+    /// Raise the counter to at least `floor` and close the send window, **in one step**: the new
+    /// counter and the lease are the same index, so nothing is sent until a later lease (a confirmed
+    /// checkpoint) reopens it. A restore uses it for a key whose sends nothing durable yet bounds. It
+    /// must be one compare-and-swap: a raise followed by a separate close would let a concurrent
+    /// sender take the raised index in between, and a later standby that restores the same blob would
+    /// send it again (RFC 7714 §8). Unlike every other lease change it **shortens** a lease, which is
+    /// always safe for nonce uniqueness (it only sends less). Never lowers the counter.
+    pub fn raise_and_close(&self, floor: u32) {
+        let floor = floor.min(LAST_INDEX + 1);
+        self.update(|next, _| {
+            let raised = next.max(floor);
+            (raised, raised)
+        });
+    }
+
     /// The lease, or `None` when the counter has none.
     #[must_use]
     pub fn lease(&self) -> Option<u32> {
@@ -405,6 +420,42 @@ impl FloorMasterKey {
 
 /// The length of [`FloorMasterKey::fingerprint`].
 pub const FINGERPRINT_LEN: usize = 20;
+
+/// The length of an [`origin_tag`].
+pub const ORIGIN_TAG_LEN: usize = 20;
+
+/// The length of the secret an [`origin_tag`] is keyed with.
+pub const ORIGIN_SECRET_LEN: usize = 32;
+
+/// `HMAC-SHA1(secret, message)` (RFC 2104, RFC 2202): a process proves it produced `message` by
+/// keying the tag with a secret only it holds. HMAC does not rest on the collision resistance of the
+/// hash, so SHA-1 is sound for a tag. It is used rather than HMAC-SHA-256 because `sha1` and `hmac` are
+/// already dependencies here (for [`FloorMasterKey::fingerprint`]) and SHA-256 is not: a new edge in
+/// the dependency graph buys nothing for a tag under a secret.
+/// The secret is zero-padded to the block, which RFC 2104 defines as the same HMAC key.
+#[must_use]
+pub fn origin_tag(secret: &[u8; ORIGIN_SECRET_LEN], message: &[u8]) -> [u8; ORIGIN_TAG_LEN] {
+    use hmac::{Hmac, Mac};
+    let mut block = GenericArray::<u8, aes_gcm::aead::consts::U64>::default();
+    block[..ORIGIN_SECRET_LEN].copy_from_slice(secret);
+    let mut mac = <Hmac<sha1::Sha1> as Mac>::new(&block);
+    block.zeroize();
+    mac.update(message);
+    mac.finalize().into_bytes().into()
+}
+
+/// Whether `tag` is the [`origin_tag`] of `message` under `secret`, compared in constant time (the
+/// `hmac` crate's `verify_slice`).
+#[must_use]
+pub fn origin_tag_verifies(secret: &[u8; ORIGIN_SECRET_LEN], message: &[u8], tag: &[u8]) -> bool {
+    use hmac::{Hmac, Mac};
+    let mut block = GenericArray::<u8, aes_gcm::aead::consts::U64>::default();
+    block[..ORIGIN_SECRET_LEN].copy_from_slice(secret);
+    let mut mac = <Hmac<sha1::Sha1> as Mac>::new(&block);
+    block.zeroize();
+    mac.update(message);
+    mac.verify_slice(tag).is_ok()
+}
 
 impl Zeroize for FloorMasterKey {
     /// Overwrite the master key and salt with zeros. The MKI is wire data (RFC 3711 §3.1) and stays.
@@ -838,6 +889,56 @@ impl SrtcpGcmContext {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_origin_tag_matches_the_rfc_2202_hmac_sha1_vector_and_detects_any_change() {
+        // RFC 2202 test case 1: key 0x0b x 20, data "Hi There". The 20 octet key zero-padded to 32 is
+        // the same HMAC key (RFC 2104 section 2).
+        let mut secret = [0u8; ORIGIN_SECRET_LEN];
+        secret[..20].fill(0x0b);
+        let tag = origin_tag(&secret, b"Hi There");
+        assert_eq!(
+            tag,
+            [
+                0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b, 0xc0, 0xb6, 0xfb, 0x37,
+                0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00
+            ]
+        );
+        assert!(origin_tag_verifies(&secret, b"Hi There", &tag));
+        assert!(!origin_tag_verifies(&secret, b"Hi there", &tag));
+        assert!(!origin_tag_verifies(
+            &[0u8; ORIGIN_SECRET_LEN],
+            b"Hi There",
+            &tag
+        ));
+        assert!(!origin_tag_verifies(&secret, b"Hi There", &tag[..19]));
+    }
+
+    #[test]
+    fn raise_and_close_is_one_step_so_no_take_can_slip_between_the_raise_and_the_close() {
+        let counter = SendIndex::new();
+        counter.seed(10, 500);
+        assert_eq!(counter.take(), Ok(10));
+        // A taker that read the state before the restore cannot commit after it.
+        let paused = counter.snapshot();
+        counter.raise_and_close(65_536);
+        assert_eq!(counter.commit_take(paused), Ok(None), "the state moved");
+        assert_eq!(counter.next(), 65_536);
+        assert_eq!(counter.lease(), Some(65_536), "a longer lease is not kept");
+        assert_eq!(counter.take(), Err(SendRefused::LeaseReached));
+        // Never lowers the counter, and a later lease reopens it.
+        counter.raise_and_close(100);
+        assert_eq!(counter.next(), 65_536);
+        counter.lease_to(65_600);
+        assert_eq!(counter.take(), Ok(65_536));
+        // An unleased counter is closed too, and the last index is the end (RFC 7714 section 9.4).
+        let unleased = SendIndex::new();
+        unleased.raise_and_close(7);
+        assert_eq!(unleased.take(), Err(SendRefused::LeaseReached));
+        let ending = SendIndex::new();
+        ending.raise_and_close(u32::MAX);
+        assert_eq!(ending.take(), Err(SendRefused::Exhausted));
+    }
+
     use super::*;
 
     fn hex(text: &str) -> Vec<u8> {

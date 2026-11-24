@@ -49,9 +49,33 @@
 //! **Keys the checkpoint does not list.** The primary caps every key installed after its first
 //! checkpoint at index 0 plus the margin (it leases it from creation), so a key absent from a blob has
 //! sent below `unlisted_ceiling` (the margin, or what the last standby seeded). A standby that restores
-//! a blob therefore raises every key it already holds that the blob does not list to that ceiling, and
-//! seeds every key installed later at it with a lease a margin above. The blob carries the ceiling so
-//! that a chain of failovers stays sound.
+//! a blob therefore raises every key it already holds that the blob does not list to at least that
+//! ceiling, and seeds every key installed later at it. The blob carries the ceiling so that a chain of
+//! failovers stays sound.
+//!
+//! **A restore of the engine's own blob is a no-op; any other restore gates every key.** The restore
+//! verb is also what a controller sends on every reconnect, to an engine that may never have
+//! restarted, so it must not take down the keys that engine is serving. (1) Every exported blob
+//! carries an origin tag, `HMAC(secret, canonical bytes)`, under a random secret generated when this
+//! ledger was built and never exported. A blob whose tag verifies under this ledger's secret was
+//! exported by this very ledger, whose counters only rise and are already at or above it: the import
+//! changes nothing ([`Imported::skipped`]). The epoch in the generation token is not proof (it is
+//! readable from any blob): a blob that names this epoch without a verifying tag is another engine's,
+//! or forged, or an earlier process's whose epoch collided, and it is gated like any other. (2) A blob
+//! whose whole bytes were imported here before is skipped too (the first import already raised
+//! everything it could). (3) Any other blob closes the send window of **every** key (the lease is set
+//! to the counter, so the per-packet take gains no flag) until one of this engine's own exports, taken
+//! after the import, is confirmed: each listed key is seeded a margin past its index, each key the
+//! engine held that the blob does not list is raised to at least the ceiling, and each key installed
+//! afterwards starts at the ceiling.
+//!
+//! Why a held, unlisted key must be gated too (RFC 7714 §8: one nonce, one packet, under a key): A
+//! exports a checkpoint without K. B holds K and has sent nothing under it. B imports A's blob and
+//! raises K to the ceiling M. If B sealed index M and then failed before its own checkpoint was
+//! durably stored, a standby C restoring the still-current A blob would install K at the ceiling M too
+//! and seal M again. Only a confirmed checkpoint of B bounds what B sends after an import, so until
+//! one is, B sends nothing under any key. Raising a counter never repeats a nonce; it is the sending
+//! that needs a durable bound.
 //!
 //! **Concurrency.** The per-packet path is the counter alone (`SendIndex`: index and lease in one
 //! atomic word). Installing a key and taking or restoring a checkpoint are control-path operations and
@@ -60,10 +84,14 @@
 //! index, never published unleased and missing.
 
 use dashmap::DashMap;
-use siphon_rtp_srtp::srtcp_gcm::{FloorMasterKey, SendIndex, FINGERPRINT_LEN, MAX_SEND_INDEX};
+use siphon_rtp_srtp::srtcp_gcm::{
+    origin_tag, origin_tag_verifies, FloorMasterKey, SendIndex, FINGERPRINT_LEN, MAX_SEND_INDEX,
+    ORIGIN_SECRET_LEN, ORIGIN_TAG_LEN,
+};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use zeroize::Zeroizing;
 
 /// The default cap on entries: one per distinct key material. An entry costs about 150 bytes: the
 /// map slot (20 byte fingerprint padded to 24, the 24 byte `Entry`, hashbrown control byte and
@@ -73,17 +101,23 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 /// about 3.5 MB. A deployment with more simultaneous keys raises it (`srtcp_ledger_max_entries`).
 pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
-/// A key's install was refused because the ledger holds its maximum number of entries.
+/// A key's install or a restore was refused: the ledger holds its maximum number of entries, or it is
+/// poisoned (it was built without system randomness and refuses everything).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LedgerFull {
     /// Entries the ledger holds.
     pub entries: usize,
     /// The cap (`srtcp_ledger_max_entries`).
     pub max_entries: usize,
+    /// The ledger is poisoned, not full.
+    pub poisoned: bool,
 }
 
 impl std::fmt::Display for LedgerFull {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.poisoned {
+            return formatter.write_str(POISONED_REASON);
+        }
         write!(
             formatter,
             "the SRTCP send-index ledger is full ({} of {} entries): a new key cannot be installed, and no existing entry is evicted to make room (raise srtcp_ledger_max_entries, or let retention release keys the controller no longer uses)",
@@ -93,6 +127,9 @@ impl std::fmt::Display for LedgerFull {
 }
 
 impl std::error::Error for LedgerFull {}
+
+/// Why a poisoned ledger refuses (see [`SrtcpLedger::poisoned`]).
+pub const POISONED_REASON: &str = "the SRTCP send-index ledger is poisoned: the operating system gave no randomness for its epoch and origin secret, so no key can be installed, no SRTCP can be sealed, and no checkpoint can be exported, confirmed or restored; restart the engine (RFC 7714 section 8)";
 
 /// One key's counter and what the ledger tracks about it.
 struct Entry {
@@ -133,6 +170,67 @@ pub struct LedgerCheckpoint {
     pub generation: String,
     pub entries: Vec<LedgerEntry>,
     pub unlisted_ceiling: u32,
+    /// `HMAC(secret of the exporting ledger, canonical bytes of the rest)`: proves to the ledger that
+    /// exported it, and only to it, that this blob is its own ([`SrtcpLedger::import`]). `None` on a
+    /// blob from before the tag existed, which is therefore always foreign.
+    pub origin_tag: Option<[u8; ORIGIN_TAG_LEN]>,
+}
+
+impl LedgerCheckpoint {
+    /// The bytes the origin tag covers: every field but the tag, in a fixed unambiguous layout.
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(
+            48 + self.generation.len() + self.entries.len() * (FINGERPRINT_LEN + 4),
+        );
+        bytes.extend_from_slice(b"siphon-rtp srtcp ledger blob v2");
+        bytes.extend_from_slice(
+            &u32::try_from(self.generation.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(self.generation.as_bytes());
+        bytes.extend_from_slice(&self.unlisted_ceiling.to_be_bytes());
+        bytes.extend_from_slice(
+            &u64::try_from(self.entries.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for entry in &self.entries {
+            bytes.extend_from_slice(&entry.fingerprint);
+            bytes.extend_from_slice(&entry.next_index.to_be_bytes());
+        }
+        bytes
+    }
+}
+
+/// The ledger could not be built: the operating system gave no randomness for its epoch and origin
+/// secret. There is no safe substitute (a guessable epoch or secret would let a forged blob pass for
+/// the engine's own and open a send window), so the engine must not start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerInitError {
+    pub reason: String,
+}
+
+impl std::fmt::Display for LedgerInitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the SRTCP send-index ledger could not be created: no randomness for its epoch and origin secret ({}); refusing to start",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for LedgerInitError {}
+
+/// What [`SrtcpLedger::import`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Imported {
+    /// How many listed entries were applied (0 when skipped).
+    pub applied: usize,
+    /// Nothing was changed: the blob was exported by this very ledger (same process), or its
+    /// generation was already imported here.
+    pub skipped: bool,
 }
 
 /// The send-index counters of every key the engine sends SRTCP under.
@@ -158,6 +256,13 @@ pub struct SrtcpLedger {
     max_entries: AtomicUsize,
     /// New keys (or whole restores) refused at the cap.
     install_refused: AtomicU64,
+    /// A random secret of this ledger, which keys the origin tag of every blob it exports: only the
+    /// ledger that exported a blob can tell that it is its own. Never leaves the process.
+    origin_secret: Zeroizing<[u8; ORIGIN_SECRET_LEN]>,
+    /// Built without randomness: refuses every install, seal, export, confirm and restore.
+    poisoned: bool,
+    /// The poisoned refusal was logged (once; the counter counts every one).
+    poison_logged: AtomicBool,
 }
 
 /// Which checkpoints exist and which of them bounds the leases.
@@ -167,37 +272,32 @@ struct Generations {
     epoch: u64,
     taken: u32,
     confirmed: u32,
-    /// This node restored a ledger: it has no send window at all until one of its own exports is
-    /// confirmed (no checkpoint of its own has told a later standby how far it may go).
+    /// This node imported a ledger of another process. Its first checkpoint then leases nothing at
+    /// export (see [`SrtcpLedger::checkpoint`]), and a key it installs from now on is gated.
     restored: bool,
-    /// One of its own exports has been confirmed since the restore: its window is open.
+    /// One of its own exports, taken after the last foreign import, has been confirmed: a key
+    /// installed from now on is leased from the ceiling like any primary's, not gated.
     window_open: bool,
+    /// A digest (keyed by the origin secret) of the whole of each foreign blob imported most recently,
+    /// tag included, at most [`REMEMBERED_EXPORTS`]: the same blob again has nothing left to repair.
+    imported: Vec<[u8; ORIGIN_TAG_LEN]>,
     /// The counters of the recent checkpoints not yet superseded by a confirmation, by generation.
     exports: Vec<(u32, Vec<LedgerEntry>)>,
 }
 
-impl Default for Generations {
-    fn default() -> Self {
-        let mut bytes = [0u8; 8];
-        if getrandom::fill(&mut bytes).is_err() {
-            // Only uniqueness matters, not secrecy: the clock and the address of a local will do.
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos() as u64);
-            bytes = (nanos ^ u64::from(std::process::id()).rotate_left(32)).to_be_bytes();
-        }
+impl Generations {
+    fn new(epoch: u64) -> Self {
         Self {
-            epoch: u64::from_be_bytes(bytes),
+            epoch,
             taken: 0,
             confirmed: 0,
             restored: false,
             window_open: false,
+            imported: Vec::new(),
             exports: Vec::new(),
         }
     }
-}
 
-impl Generations {
     fn token(&self, number: u32) -> String {
         format!("{:016x}-{number}", self.epoch)
     }
@@ -207,7 +307,73 @@ impl Generations {
 const REMEMBERED_EXPORTS: usize = 8;
 
 impl Default for SrtcpLedger {
+    /// For the embedders and benches that build a room or registry without going through the
+    /// daemon, which uses [`Self::try_new`] and refuses to start with an error. With no randomness
+    /// this returns a [poisoned](Self::poisoned) ledger: it never has a guessable epoch or secret.
     fn default() -> Self {
+        Self::new_or_poisoned_with(|bytes| {
+            getrandom::fill(bytes).map_err(|error| error.to_string())
+        })
+    }
+}
+
+impl SrtcpLedger {
+    /// A ledger with a random epoch and a random origin secret from the operating system.
+    ///
+    /// # Errors
+    /// [`LedgerInitError`] when the system gives no randomness: there is no fallback, since a
+    /// predictable epoch or secret would let a forged blob pass for this ledger's own. The engine
+    /// must not start (the failure is logged at `error`).
+    pub fn try_new() -> Result<Self, LedgerInitError> {
+        Self::try_new_with(|bytes| getrandom::fill(bytes).map_err(|error| error.to_string()))
+    }
+
+    /// [`Self::try_new`] with the source of randomness injected (the test seam for its failure).
+    ///
+    /// # Errors
+    /// [`LedgerInitError`] when `fill` fails.
+    pub fn try_new_with(
+        fill: impl FnOnce(&mut [u8]) -> Result<(), String>,
+    ) -> Result<Self, LedgerInitError> {
+        let mut bytes = Zeroizing::new([0u8; 8 + ORIGIN_SECRET_LEN]);
+        if let Err(reason) = fill(bytes.as_mut_slice()) {
+            tracing::error!(
+                target: "siphon_rtp::media",
+                %reason,
+                "no randomness for the SRTCP send-index ledger epoch and origin secret; the engine must not start (RFC 7714 section 8)"
+            );
+            return Err(LedgerInitError { reason });
+        }
+        Ok(Self::build(&bytes, false))
+    }
+
+    /// A ledger for the paths that cannot report an error ([`Default`]): [`Self::try_new_with`], or
+    /// a [poisoned](Self::poisoned) ledger when `fill` fails.
+    pub fn new_or_poisoned_with(fill: impl FnOnce(&mut [u8]) -> Result<(), String>) -> Self {
+        Self::try_new_with(fill).unwrap_or_else(|_| Self::poisoned())
+    }
+
+    /// The ledger of an engine that has no system randomness and could not refuse to start. It fails
+    /// closed: no key installs ([`Self::reserve`] refuses and counts it in
+    /// `siphon_rtp_srtcp_ledger_install_refused_total`), every counter it hands out is exhausted so
+    /// nothing seals, and checkpoint, confirm and restore refuse. No nonce is ever issued without an
+    /// epoch and secret from the operating system (RFC 7714 section 8).
+    #[must_use]
+    pub fn poisoned() -> Self {
+        Self::build(&[0u8; 8 + ORIGIN_SECRET_LEN], true)
+    }
+
+    /// Whether this ledger is [poisoned](Self::poisoned).
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    fn build(bytes: &[u8; 8 + ORIGIN_SECRET_LEN], poisoned: bool) -> Self {
+        let mut epoch = [0u8; 8];
+        epoch.copy_from_slice(&bytes[..8]);
+        let mut secret = Zeroizing::new([0u8; ORIGIN_SECRET_LEN]);
+        secret.copy_from_slice(&bytes[8..]);
         Self {
             entries: DashMap::new(),
             control: Mutex::new(()),
@@ -215,15 +381,32 @@ impl Default for SrtcpLedger {
             lease_margin: AtomicU32::new(0),
             new_key_start: AtomicU32::new(0),
             owner: AtomicU64::new(u64::MAX),
-            generations: Mutex::new(Generations::default()),
+            generations: Mutex::new(Generations::new(u64::from_be_bytes(epoch))),
             lease_refused: AtomicU64::new(0),
             max_entries: AtomicUsize::new(DEFAULT_MAX_ENTRIES),
             install_refused: AtomicU64::new(0),
+            origin_secret: secret,
+            poisoned,
+            poison_logged: AtomicBool::new(false),
         }
     }
-}
 
-impl SrtcpLedger {
+    /// Count a refusal by a poisoned ledger; log the first at `error`.
+    fn refuse_poisoned(&self, what: &str) -> LedgerFull {
+        self.install_refused.fetch_add(1, Ordering::Relaxed);
+        if !self.poison_logged.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                target: "siphon_rtp::media",
+                "{what} refused: {POISONED_REASON}"
+            );
+        }
+        LedgerFull {
+            entries: 0,
+            max_entries: 0,
+            poisoned: true,
+        }
+    }
+
     fn control(&self) -> MutexGuard<'_, ()> {
         // The guarded state is the atomics themselves, so a panic elsewhere leaves nothing to repair.
         self.control.lock().unwrap_or_else(PoisonError::into_inner)
@@ -265,6 +448,7 @@ impl SrtcpLedger {
         let refused = LedgerFull {
             entries: self.entries.len(),
             max_entries: self.max_entries(),
+            poisoned: false,
         };
         self.install_refused.fetch_add(1, Ordering::Relaxed);
         tracing::error!(
@@ -286,6 +470,9 @@ impl SrtcpLedger {
     /// # Errors
     /// [`LedgerFull`] when the set holds more new keys than the cap leaves room for.
     pub fn reserve(&self, keys: &[FloorMasterKey]) -> Result<(), LedgerFull> {
+        if self.poisoned {
+            return Err(self.refuse_poisoned("a new key install"));
+        }
         let _control = self.control();
         let mut fresh: Vec<[u8; FINGERPRINT_LEN]> = Vec::new();
         for key in keys {
@@ -315,7 +502,8 @@ impl SrtcpLedger {
         let margin = self.lease_margin.load(Ordering::Acquire);
         if margin > 0 {
             let start = self.new_key_start.load(Ordering::Acquire);
-            // A node that restored a ledger has no window until one of its own exports is confirmed.
+            // A key installed on a node that restored a foreign ledger has no window until one of its
+            // own exports (taken after the restore) is confirmed.
             let window = if self.window_closed() { 0 } else { margin };
             entry.counter.seed(start, start.saturating_add(window));
             entry.checkpointed.store(start, Ordering::Relaxed);
@@ -343,6 +531,12 @@ impl SrtcpLedger {
     /// logged (fail closed: never an unbounded entry, never a counter that restarts at 0).
     #[must_use]
     pub fn counter_for(&self, key: &FloorMasterKey) -> SendIndex {
+        if self.poisoned {
+            self.refuse_poisoned("a key that was not reserved");
+            let counter = SendIndex::new();
+            counter.raise_to(u32::MAX);
+            return counter;
+        }
         let _control = self.control();
         let fingerprint = key.fingerprint();
         if !self.entries.contains_key(&fingerprint) && self.entries.len() >= self.max_entries() {
@@ -374,7 +568,8 @@ impl SrtcpLedger {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         // The first checkpoint's lease applies at export only for a node that never restored a ledger:
-        // a restored node has no window until one of its own exports is confirmed.
+        // a restored node's keys have no window until one of its own exports is confirmed. A key it
+        // held and the blob did not list has no lease at all, and is bounded at export instead (below).
         let first = generations.taken == 0 && !generations.restored;
         generations.taken += 1;
         let number = generations.taken;
@@ -387,7 +582,9 @@ impl SrtcpLedger {
             .entries
             .iter()
             .map(|entry| {
-                let next = if first {
+                let next = if first || entry.counter.lease().is_none() {
+                    // No lease yet: it takes effect at export, since a standby holds this blob or
+                    // nothing at all.
                     let next = entry.counter.checkpoint(margin);
                     entry.checkpointed.store(next, Ordering::Relaxed);
                     entry.notified.store(false, Ordering::Relaxed);
@@ -410,14 +607,24 @@ impl SrtcpLedger {
                 generations.exports.remove(0);
             }
         }
-        LedgerCheckpoint {
+        let mut checkpoint = LedgerCheckpoint {
             generation,
             entries,
             unlisted_ceiling: self
                 .new_key_start
                 .load(Ordering::Acquire)
                 .saturating_add(margin),
+            origin_tag: None,
+        };
+        // A poisoned ledger has no secret: its (empty) blob proves nothing and is never tagged. The
+        // verbs refuse to export from it ([`Self::is_poisoned`]).
+        if !self.poisoned {
+            checkpoint.origin_tag = Some(origin_tag(
+                &self.origin_secret,
+                &checkpoint.canonical_bytes(),
+            ));
         }
+        checkpoint
     }
 
     /// The controller has durably stored checkpoint `generation`: every counter in it is now leased to
@@ -428,6 +635,9 @@ impl SrtcpLedger {
     /// # Errors
     /// A generation that was never taken, or whose export is no longer remembered.
     pub fn confirm(&self, token: &str, margin: u32) -> Result<bool, String> {
+        if self.poisoned {
+            return Err(POISONED_REASON.to_string());
+        }
         let _control = self.control();
         let mut generations = self
             .generations
@@ -466,20 +676,42 @@ impl SrtcpLedger {
         Ok(true)
     }
 
-    /// Seed from a checkpoint: each listed counter `margin` past its index and leased a further
-    /// `margin`; each key already held but not listed raised to the checkpoint's `unlisted_ceiling`
-    /// (the primary capped any key installed after its first checkpoint below it) and leased a margin
-    /// above; and every key installed later starts at the ceiling with the same lease. A counter never
-    /// lowers, so importing is safe at any time and in any order. A margin that would pass the last
-    /// index leaves the key exhausted: it sends nothing until the controller replaces it (RFC 7714
-    /// §9.4). Returns how many listed entries were applied.
+    /// Seed from a checkpoint ([module docs](self), "A restore"). A blob this very ledger exported
+    /// (its origin tag verifies under this ledger's secret), or one whose whole bytes were already
+    /// imported here, is skipped whole: [`Imported::skipped`], nothing changes. Otherwise **every**
+    /// key gets a zero send window (its lease closed at its counter) until one of this ledger's own
+    /// exports, taken after the import, is confirmed: each listed counter is seeded `margin` past its
+    /// index, each held key the blob does not list is raised to at least the ceiling, and every key
+    /// installed later starts at the ceiling. A counter never lowers, so importing is safe at any time
+    /// and in any order. A margin that would pass the last index leaves the key exhausted: it sends
+    /// nothing until the controller replaces it (RFC 7714 §9.4). Exports taken before the import can
+    /// no longer be confirmed: they predate the seeds.
     ///
     /// # Errors
     /// [`LedgerFull`] when the blob lists more keys the ledger does not hold than the cap leaves room
     /// for. The **whole** blob is then refused and nothing is changed: importing part of it would
     /// leave the rest of its keys without the floor the standby needs for them (RFC 7714 §8).
-    pub fn import(&self, checkpoint: &LedgerCheckpoint, margin: u32) -> Result<usize, LedgerFull> {
+    pub fn import(
+        &self,
+        checkpoint: &LedgerCheckpoint,
+        margin: u32,
+    ) -> Result<Imported, LedgerFull> {
+        if self.poisoned {
+            return Err(self.refuse_poisoned("a restore"));
+        }
         let _control = self.control();
+        let digest = self.blob_digest(checkpoint);
+        if self.already_has(checkpoint, &digest) {
+            // Own blob: counters only rise and this blob was taken from them, so nothing in it can be
+            // above. A blob imported before: the first import raised every listed counter to its
+            // seed, every held unlisted key to the ceiling and seeded later keys at it, and counters
+            // never lower, so a second one has nothing left to repair. It would only re-close the
+            // window of keys installed since, and void the exports taken since.
+            return Ok(Imported {
+                applied: 0,
+                skipped: true,
+            });
+        }
         let fresh = checkpoint
             .entries
             .iter()
@@ -493,17 +725,19 @@ impl SrtcpLedger {
         }
         self.lease_margin.store(margin.max(1), Ordering::Release);
         {
-            // A standby may restore the last confirmed blob or a newer unconfirmed one: both are at or
-            // above what the primary was capped at, so either is safe to seed from. But it seeds a
-            // counter and *no send window*: every lease equals the seeded counter until one of this
-            // node's own exports is confirmed, because nothing yet tells a later standby how far
-            // this node went (two standbys restoring one blob would otherwise both send from it).
             let mut generations = self
                 .generations
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             generations.restored = true;
             generations.window_open = false;
+            generations.imported.push(digest);
+            if generations.imported.len() > REMEMBERED_EXPORTS {
+                generations.imported.remove(0);
+            }
+            // An earlier export lists counters from before the seeds: confirming it must not open
+            // the window the seeds closed.
+            generations.exports.clear();
         }
         let ceiling = checkpoint.unlisted_ceiling;
         self.new_key_start.fetch_max(ceiling, Ordering::AcqRel);
@@ -518,7 +752,7 @@ impl SrtcpLedger {
                 .entry(entry.fingerprint)
                 .or_insert_with(Entry::new);
             let start = entry.next_index.saturating_add(margin);
-            slot.counter.seed(start, start);
+            slot.counter.raise_and_close(start);
             slot.checkpointed.fetch_max(start, Ordering::Relaxed);
             slot.notified.store(false, Ordering::Relaxed);
         }
@@ -527,11 +761,59 @@ impl SrtcpLedger {
             .iter()
             .filter(|slot| !listed.contains(slot.key()))
         {
-            slot.counter.seed(ceiling, ceiling);
+            // Held here, not listed: raised to the ceiling, and gated like every other key. Nothing
+            // durable bounds what this engine sends under it after the import until its own export
+            // is confirmed, and a later standby that restores this same blob seeds the key at the
+            // ceiling too: ungated, this engine could seal the ceiling index before it fails, and
+            // that standby would seal it again (RFC 7714 section 8).
+            slot.counter.raise_and_close(ceiling);
             slot.checkpointed.fetch_max(ceiling, Ordering::Relaxed);
             slot.notified.store(false, Ordering::Relaxed);
         }
-        Ok(checkpoint.entries.len())
+        Ok(Imported {
+            applied: checkpoint.entries.len(),
+            skipped: false,
+        })
+    }
+
+    /// A digest of the whole blob, tag included, keyed by this ledger's secret.
+    fn blob_digest(&self, checkpoint: &LedgerCheckpoint) -> [u8; ORIGIN_TAG_LEN] {
+        let mut message = checkpoint.canonical_bytes();
+        match checkpoint.origin_tag {
+            Some(tag) => {
+                message.push(1);
+                message.extend_from_slice(&tag);
+            }
+            None => message.push(0),
+        }
+        origin_tag(&self.origin_secret, &message)
+    }
+
+    /// Whether a blob has nothing to add: this ledger exported it (its tag verifies under this
+    /// ledger's own secret, so matching the epoch is not enough), or its digest was imported already.
+    fn already_has(&self, checkpoint: &LedgerCheckpoint, digest: &[u8; ORIGIN_TAG_LEN]) -> bool {
+        let generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let epoch_matches = checkpoint
+            .generation
+            .split_once('-')
+            .is_some_and(|(epoch, _)| *epoch == format!("{:016x}", generations.epoch));
+        if epoch_matches {
+            let proven = checkpoint.origin_tag.is_some_and(|tag| {
+                origin_tag_verifies(&self.origin_secret, &checkpoint.canonical_bytes(), &tag)
+            });
+            if proven {
+                return true;
+            }
+            tracing::warn!(
+                target: "siphon_rtp::media",
+                generation = %checkpoint.generation,
+                "an SRTCP index checkpoint names this engine's epoch but its origin tag does not verify: treated as another engine's, every key gated"
+            );
+        }
+        generations.imported.contains(digest)
     }
 
     /// How many counters have used half of their lease window since the checkpoint and have not been
@@ -685,7 +967,10 @@ mod tests {
         drain(&primary.counter_for(&key(1, 7)), 5);
         let exported = primary.checkpoint(MARGIN, None);
         let standby = SrtcpLedger::default();
-        assert_eq!(standby.import(&exported, MARGIN), Ok(1));
+        assert_eq!(
+            standby.import(&exported, MARGIN).map(|done| done.applied),
+            Ok(1)
+        );
         let counter = standby.counter_for(&key(1, 7));
         assert_eq!(counter.next(), 5 + MARGIN);
         assert_eq!(
@@ -706,6 +991,7 @@ mod tests {
                 next_index: MAX_SEND_INDEX - 3,
             }],
             unlisted_ceiling: 0,
+            origin_tag: None,
         };
         standby.import(&near_end, 1 << 16).unwrap();
         assert_eq!(
@@ -908,13 +1194,15 @@ mod tests {
             Some(MARGIN),
             "and no send window until its own export is confirmed"
         );
-        // A standby that already held K when the blob arrives: raised, not left untouched.
+        // A standby that already held K when the blob arrives: raised to the ceiling, not left
+        // untouched, and gated like every key until its own export is confirmed.
         let early = SrtcpLedger::default();
         let held = early.counter_for(&key(9, 9));
         assert_eq!(held.next(), 0);
         early.import(&blob, MARGIN).unwrap();
         assert_eq!(held.next(), MARGIN);
         assert_eq!(held.lease(), Some(MARGIN));
+        assert_eq!(held.take(), Err(SendRefused::LeaseReached));
     }
 
     #[test]
@@ -1008,6 +1296,382 @@ mod tests {
         // A key installed after the window opened is leased from the ceiling as on a primary.
         let after = b.counter_for(&key(10, 10));
         assert_eq!((after.next(), after.lease()), (MARGIN, Some(2 * MARGIN)));
+    }
+
+    #[test]
+    fn restoring_the_engines_own_checkpoint_changes_nothing() {
+        // A controller that reconnects to the engine it checkpointed restores its stored blob. The
+        // engine never restarted, so its counters are at or above the blob: nothing may be gated.
+        let ledger = SrtcpLedger::default();
+        let counter = ledger.counter_for(&key(1, 1));
+        drain(&counter, 5);
+        let own = ledger.checkpoint(MARGIN, Some(1));
+        drain(&counter, 3);
+        let lease = counter.lease();
+        assert_eq!(lease, Some(5 + MARGIN));
+        assert_eq!(
+            ledger.import(&own, MARGIN),
+            Ok(Imported {
+                applied: 0,
+                skipped: true
+            })
+        );
+        assert_eq!(counter.next(), 8, "no counter moved");
+        assert_eq!(counter.lease(), lease, "no lease moved");
+        assert_eq!(counter.take(), Ok(8), "and it keeps sealing");
+        let late = ledger.counter_for(&key(2, 2));
+        assert_eq!(
+            late.lease(),
+            Some(MARGIN),
+            "a key installed afterwards is leased as on any primary, not gated"
+        );
+        assert_eq!(late.take(), Ok(0));
+        // A second checkpoint still takes the primary path: its lease waits for the confirmation.
+        let second = ledger.checkpoint(MARGIN, None);
+        assert_eq!(ledger.confirm(&second.generation, MARGIN), Ok(true));
+        assert_eq!(counter.lease(), Some(9 + MARGIN));
+    }
+
+    #[test]
+    fn a_foreign_restore_gates_every_key_until_its_own_export_is_confirmed() {
+        let primary = SrtcpLedger::default();
+        drain(&primary.counter_for(&key(2, 2)), 10);
+        let blob = primary.checkpoint(MARGIN, Some(1));
+        assert_eq!(blob.unlisted_ceiling, MARGIN);
+
+        let engine = SrtcpLedger::default();
+        let serving = engine.counter_for(&key(1, 1));
+        let listed_and_held = engine.counter_for(&key(2, 2));
+        drain(&serving, 3);
+        engine.import(&blob, MARGIN).unwrap();
+        // The key only this engine holds: raised to the ceiling, and gated.
+        assert_eq!(serving.next(), MARGIN, "at least the ceiling");
+        assert_eq!(serving.take(), Err(SendRefused::LeaseReached));
+        // A listed key and a key installed afterwards: no send window either.
+        assert_eq!(listed_and_held.next(), 10 + MARGIN);
+        assert_eq!(listed_and_held.take(), Err(SendRefused::LeaseReached));
+        let installed_later = engine.counter_for(&key(3, 3));
+        assert_eq!(installed_later.next(), MARGIN);
+        assert_eq!(installed_later.take(), Err(SendRefused::LeaseReached));
+        // This engine's own export, once confirmed, opens them all.
+        let own = engine.checkpoint(MARGIN, Some(2));
+        assert_eq!(
+            serving.take(),
+            Err(SendRefused::LeaseReached),
+            "an unconfirmed export opens nothing"
+        );
+        assert_eq!(engine.confirm(&own.generation, MARGIN), Ok(true));
+        assert_eq!(serving.take(), Ok(MARGIN));
+        assert_eq!(listed_and_held.take(), Ok(10 + MARGIN));
+        assert_eq!(installed_later.take(), Ok(MARGIN));
+    }
+
+    #[test]
+    fn a_held_key_under_its_own_lease_loses_its_window_on_a_foreign_restore() {
+        let primary = SrtcpLedger::default();
+        let blob = primary.checkpoint(MARGIN, Some(1));
+        let engine = SrtcpLedger::default();
+        let serving = engine.counter_for(&key(1, 1));
+        drain(&serving, 3);
+        let _ = engine.checkpoint(MARGIN, Some(2));
+        assert_eq!(serving.lease(), Some(3 + MARGIN));
+        engine.import(&blob, MARGIN).unwrap();
+        assert_eq!(serving.next(), MARGIN);
+        assert_eq!(serving.lease(), Some(MARGIN), "its window is closed");
+        assert_eq!(serving.take(), Err(SendRefused::LeaseReached));
+        let own = engine.checkpoint(MARGIN, None);
+        engine.confirm(&own.generation, MARGIN).unwrap();
+        assert_eq!(serving.take(), Ok(MARGIN));
+    }
+
+    #[test]
+    fn a_standby_that_failed_before_storing_its_own_checkpoint_has_sealed_nothing_under_a_held_unlisted_key(
+    ) {
+        // A exports G (K not listed). B holds K, sent nothing, imports G: K is raised to the ceiling M.
+        // B fails before its own checkpoint is durably stored. C restores the still-current G,
+        // installs K at M, confirms its own export and seals M. B must not have sealed M.
+        let mut issued: HashSet<u32> = HashSet::new();
+        let a = SrtcpLedger::default();
+        let g = a.checkpoint(MARGIN, Some(1));
+        let b = SrtcpLedger::default();
+        let b_k = b.counter_for(&key(5, 5));
+        b.import(&g, MARGIN).unwrap();
+        assert_eq!(b_k.next(), MARGIN, "raised to the ceiling");
+        for _ in 0..1000 {
+            if let Ok(index) = b_k.take() {
+                assert!(issued.insert(index), "{index} sealed twice");
+            }
+        }
+        assert!(
+            issued.is_empty(),
+            "B had no durable bound: it sends nothing"
+        );
+        let c = SrtcpLedger::default();
+        c.import(&g, MARGIN).unwrap();
+        let c_k = c.counter_for(&key(5, 5));
+        let own = c.checkpoint(MARGIN, Some(3));
+        c.confirm(&own.generation, MARGIN).unwrap();
+        assert_eq!(c_k.take(), Ok(MARGIN));
+        assert!(
+            !issued.contains(&MARGIN),
+            "B never sealed the ceiling index"
+        );
+    }
+
+    #[test]
+    fn a_blob_is_the_engines_own_only_when_its_origin_tag_verifies() {
+        let engine = SrtcpLedger::default();
+        let counter = engine.counter_for(&key(1, 1));
+        drain(&counter, 5);
+        let own = engine.checkpoint(MARGIN, Some(1));
+        assert!(own.origin_tag.is_some());
+        assert!(engine.import(&own, MARGIN).unwrap().skipped, "the own blob");
+
+        // Forged: this engine's epoch and generation naming, another engine's contents.
+        let other = SrtcpLedger::default();
+        drain(&other.counter_for(&key(7, 7)), 9);
+        let foreign = other.checkpoint(MARGIN, Some(1));
+        let forged = LedgerCheckpoint {
+            generation: own.generation.clone(),
+            ..foreign.clone()
+        };
+        assert!(!engine.import(&forged, MARGIN).unwrap().skipped);
+        let seven = engine.counter_for(&key(7, 7));
+        assert_eq!(seven.next(), 9 + MARGIN);
+        assert_eq!(seven.take(), Err(SendRefused::LeaseReached), "gated");
+        assert_eq!(
+            counter.take(),
+            Err(SendRefused::LeaseReached),
+            "so is every key"
+        );
+
+        // The own blob's tag copied onto edited contents does not verify either.
+        let engine_two = SrtcpLedger::default();
+        let counter_two = engine_two.counter_for(&key(1, 1));
+        let own_two = engine_two.checkpoint(MARGIN, Some(1));
+        let edited = LedgerCheckpoint {
+            entries: vec![LedgerEntry {
+                fingerprint: key(1, 1).fingerprint(),
+                next_index: 7,
+            }],
+            ..own_two
+        };
+        assert!(!engine_two.import(&edited, MARGIN).unwrap().skipped);
+        assert_eq!(counter_two.next(), 7 + MARGIN);
+    }
+
+    #[test]
+    fn a_blob_from_an_earlier_process_with_a_colliding_epoch_is_gated() {
+        let fixed_epoch = |secret: u8| {
+            move |bytes: &mut [u8]| {
+                bytes[..8].copy_from_slice(&[0xAB; 8]);
+                bytes[8..].fill(secret);
+                Ok(())
+            }
+        };
+        let before_restart = SrtcpLedger::try_new_with(fixed_epoch(1)).unwrap();
+        drain(&before_restart.counter_for(&key(1, 1)), 40);
+        let stored = before_restart.checkpoint(MARGIN, Some(1));
+        let after_restart = SrtcpLedger::try_new_with(fixed_epoch(2)).unwrap();
+        let counter = after_restart.counter_for(&key(1, 1));
+        assert_eq!(
+            stored.generation.split_once('-').unwrap().0,
+            "abababababababab",
+            "the epochs collide"
+        );
+        let imported = after_restart.import(&stored, MARGIN).unwrap();
+        assert!(!imported.skipped, "another process's secret: not proven");
+        assert_eq!(counter.next(), 40 + MARGIN);
+        assert_eq!(counter.take(), Err(SendRefused::LeaseReached));
+    }
+
+    #[test]
+    fn a_blob_without_an_origin_tag_is_never_the_engines_own() {
+        let engine = SrtcpLedger::default();
+        let counter = engine.counter_for(&key(1, 1));
+        let mut own = engine.checkpoint(MARGIN, Some(1));
+        own.origin_tag = None;
+        assert!(!engine.import(&own, MARGIN).unwrap().skipped);
+        assert_eq!(counter.take(), Err(SendRefused::LeaseReached));
+    }
+
+    #[test]
+    fn a_ledger_built_without_randomness_is_poisoned_and_refuses_everything() {
+        let ledger = SrtcpLedger::new_or_poisoned_with(|_| Err("no entropy".to_string()));
+        assert!(ledger.is_poisoned());
+        let refused = ledger.reserve(&[key(1, 1)]).unwrap_err();
+        assert!(refused.poisoned);
+        assert!(refused.to_string().contains("poisoned"));
+        assert_eq!(ledger.install_refused(), 1, "counted");
+        // Nothing seals: the counter is exhausted and nothing is stored.
+        let counter = ledger.counter_for(&key(1, 1));
+        assert_eq!(counter.take(), Err(SendRefused::Exhausted));
+        assert_eq!(ledger.len(), 0);
+        assert_eq!(ledger.install_refused(), 2);
+        // Checkpoint blobs prove nothing, and confirm and restore refuse.
+        assert_eq!(ledger.checkpoint(MARGIN, None).origin_tag, None);
+        assert!(ledger
+            .confirm("x-1", MARGIN)
+            .unwrap_err()
+            .contains("poisoned"));
+        let healthy = SrtcpLedger::default();
+        let blob = healthy.checkpoint(MARGIN, None);
+        assert!(ledger.import(&blob, MARGIN).unwrap_err().poisoned);
+        assert!(!SrtcpLedger::default().is_poisoned());
+    }
+
+    #[test]
+    fn a_ledger_cannot_be_built_without_randomness() {
+        let refused = SrtcpLedger::try_new_with(|_| Err("no entropy".to_string()));
+        assert!(
+            matches!(&refused, Err(error) if error.reason == "no entropy"),
+            "{:?}",
+            refused.is_ok()
+        );
+        let message = refused.err().map(|error| error.to_string()).unwrap();
+        assert!(message.contains("refusing to start"), "{message}");
+        assert!(SrtcpLedger::try_new().is_ok());
+    }
+
+    #[test]
+    fn restoring_a_blob_already_restored_changes_nothing_and_keeps_the_open_window() {
+        let primary = SrtcpLedger::default();
+        drain(&primary.counter_for(&key(2, 2)), 10);
+        let blob = primary.checkpoint(MARGIN, Some(1));
+        let engine = SrtcpLedger::default();
+        engine.import(&blob, MARGIN).unwrap();
+        let own = engine.checkpoint(MARGIN, Some(2));
+        engine.confirm(&own.generation, MARGIN).unwrap();
+        // A key installed now is leased from the ceiling: the window is open.
+        let late = engine.counter_for(&key(3, 3));
+        assert_eq!(late.lease(), Some(2 * MARGIN));
+        // The controller reconnects and restores the same stored blob again.
+        let again = engine.import(&blob, MARGIN).unwrap();
+        assert!(again.skipped);
+        assert_eq!(late.take(), Ok(MARGIN), "no window was closed");
+        let later = engine.counter_for(&key(4, 4));
+        assert_eq!(later.lease(), Some(2 * MARGIN), "new keys still seal");
+        // An export taken before the second restore can still be confirmed.
+        let pending = engine.checkpoint(MARGIN, None);
+        engine.import(&blob, MARGIN).unwrap();
+        assert_eq!(engine.confirm(&pending.generation, MARGIN), Ok(true));
+        // A modified blob (same generation, different ceiling) is not the one already imported.
+        let modified = LedgerCheckpoint {
+            unlisted_ceiling: blob.unlisted_ceiling + 1,
+            ..blob.clone()
+        };
+        assert!(!engine.import(&modified, MARGIN).unwrap().skipped);
+        // Different blobs are applied, and the memory is bounded.
+        for round in 0..(2 * REMEMBERED_EXPORTS) {
+            let other = LedgerCheckpoint {
+                generation: format!("ffff{round:012x}-1"),
+                entries: Vec::new(),
+                unlisted_ceiling: 0,
+                origin_tag: None,
+            };
+            assert!(!engine.import(&other, MARGIN).unwrap().skipped);
+        }
+        assert!(engine.generations.lock().unwrap().imported.len() <= REMEMBERED_EXPORTS);
+    }
+
+    #[test]
+    fn a_take_racing_a_foreign_restore_cannot_hand_out_an_index_the_restore_raised_to() {
+        // The takers read the state before the restore and commit after it: they must not get the
+        // index the restore raised the counter to, for a held unlisted key (which has its own longer
+        // lease) and for a listed one. Raise and close are one step on the packed word, so there is
+        // no state in between in which the raised index could be taken.
+        let primary = SrtcpLedger::default();
+        drain(&primary.counter_for(&key(2, 2)), 10);
+        let blob = primary.checkpoint(MARGIN, Some(1));
+        let engine = SrtcpLedger::default();
+        let held_unlisted = engine.counter_for(&key(1, 1));
+        let listed = engine.counter_for(&key(2, 2));
+        let _ = engine.checkpoint(MARGIN, Some(2));
+        assert_eq!(
+            held_unlisted.lease(),
+            Some(MARGIN),
+            "a lease longer than the seed"
+        );
+        let paused = [held_unlisted.snapshot(), listed.snapshot()];
+        engine.import(&blob, MARGIN).unwrap();
+        assert_eq!(held_unlisted.commit_take(paused[0]), Ok(None));
+        assert_eq!(listed.commit_take(paused[1]), Ok(None));
+        for counter in [&held_unlisted, &listed] {
+            assert_eq!(counter.lease(), Some(counter.next()), "limit == next");
+            assert_eq!(counter.take(), Err(SendRefused::LeaseReached));
+        }
+        assert_eq!(held_unlisted.next(), MARGIN, "raised to the ceiling");
+        assert_eq!(listed.next(), 10 + MARGIN);
+    }
+
+    #[test]
+    fn a_pending_export_from_before_a_foreign_restore_opens_nothing() {
+        let primary = SrtcpLedger::default();
+        let on_primary = primary.counter_for(&key(2, 2));
+        let blob = primary.checkpoint(MARGIN, Some(1));
+        drain(&on_primary, 900);
+        let engine = SrtcpLedger::default();
+        let held = engine.counter_for(&key(1, 1));
+        let _first = engine.checkpoint(MARGIN, Some(2));
+        let before = engine.checkpoint(MARGIN, None);
+        engine.import(&blob, MARGIN).unwrap();
+        assert!(engine.confirm(&before.generation, MARGIN).is_err());
+        let listed = engine.counter_for(&key(2, 2));
+        assert_eq!(listed.take(), Err(SendRefused::LeaseReached));
+        drop(held);
+    }
+
+    #[test]
+    fn no_index_repeats_across_a_failover_chain_where_the_standby_serves_its_own_key() {
+        // A is the primary, B a standby that already serves a key of its own (which A also lists after
+        // G1 as an installed-later key), C the standby after B. Every (key, index) pair sealed by any
+        // of them must be new.
+        let mut issued: HashSet<(u8, u32)> = HashSet::new();
+        let mut seal = |seed: u8, counter: &SendIndex, count: Option<u32>| {
+            let mut taken = 0;
+            while count.is_none_or(|limit| taken < limit) {
+                let Ok(index) = counter.take() else { break };
+                assert!(
+                    issued.insert((seed, index)),
+                    "key {seed} index {index} sealed twice"
+                );
+                taken += 1;
+            }
+        };
+        let a = SrtcpLedger::default();
+        let a_old = a.counter_for(&key(1, 1));
+        seal(1, &a_old, Some(10));
+        let g1 = a.checkpoint(MARGIN, Some(1));
+        // A installs a key after G1 and sends until its lease stops it; G1 does not list it.
+        let a_late = a.counter_for(&key(9, 9));
+        seal(9, &a_late, None);
+        seal(1, &a_old, None);
+
+        // B serves key 9 itself (never sent on it before the failover) and key 7 only it knows.
+        let b = SrtcpLedger::default();
+        let b_nine = b.counter_for(&key(9, 9));
+        let b_seven = b.counter_for(&key(7, 7));
+        seal(7, &b_seven, Some(20));
+        b.import(&g1, MARGIN).unwrap();
+        seal(7, &b_seven, Some(5));
+        seal(9, &b_nine, Some(5));
+        let b_old = b.counter_for(&key(1, 1));
+        assert_eq!(b_old.take(), Err(SendRefused::LeaseReached), "gated");
+        let own = b.checkpoint(MARGIN, Some(2));
+        b.confirm(&own.generation, MARGIN).unwrap();
+        seal(1, &b_old, None);
+        seal(9, &b_nine, None);
+        seal(7, &b_seven, None);
+
+        // C restores B's confirmed blob after B fails.
+        let c = SrtcpLedger::default();
+        c.import(&own, MARGIN).unwrap();
+        let own_c = c.checkpoint(MARGIN, Some(3));
+        c.confirm(&own_c.generation, MARGIN).unwrap();
+        for seed in [1, 7, 9] {
+            let counter = c.counter_for(&key(u32::from(seed), seed));
+            seal(seed, &counter, None);
+        }
     }
 
     #[test]
@@ -1285,7 +1949,10 @@ mod tests {
         );
         assert_eq!(standby.install_refused(), 1);
         standby.set_max_entries(3);
-        assert_eq!(standby.import(&blob, MARGIN), Ok(3));
+        assert_eq!(
+            standby.import(&blob, MARGIN).map(|done| done.applied),
+            Ok(3)
+        );
     }
 
     #[test]
@@ -1298,7 +1965,10 @@ mod tests {
         let standby = SrtcpLedger::default();
         standby.set_max_entries(2);
         standby.reserve(&[key(1, 1), key(1, 2)]).unwrap();
-        assert_eq!(standby.import(&blob, MARGIN), Ok(2));
+        assert_eq!(
+            standby.import(&blob, MARGIN).map(|done| done.applied),
+            Ok(2)
+        );
     }
 
     #[test]
