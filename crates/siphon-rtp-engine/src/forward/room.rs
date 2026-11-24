@@ -656,6 +656,12 @@ impl ForwardRoom {
         let seat = &mut self.seats[index];
         seat.secure = Some(leg);
         seat.secure_pending = false;
+        // What was sealed under the key just replaced is not an answer to a NACK under this one: the
+        // same index would go out again under a different keystream, or the old ciphertext under a key
+        // the peer no longer holds (RFC 3711 §9.1).
+        if let Some(video) = seat.video.as_mut() {
+            video.forget_sealed();
+        }
         tracing::info!(
             target: "siphon_rtp::media", room = %self.room_id, tag,
             "DTLS-SRTP handshake complete; forwarding seat keyed"

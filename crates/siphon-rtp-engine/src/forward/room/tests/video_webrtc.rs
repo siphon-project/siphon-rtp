@@ -330,6 +330,47 @@ fn a_nack_from_a_webrtc_receiver_is_answered_as_the_same_srtp_packet_on_its_endp
 }
 
 #[test]
+fn a_nack_for_a_packet_the_room_no_longer_remembers_is_not_answered_by_encrypting_it_again() {
+    // RFC 3711 §9.1: the answer to a NACK is the datagram that was sent, so a packet that has left the
+    // receiver's bounded history cannot be answered, and the sender never encrypts at an index it has
+    // already used to find out.
+    let mut room = mixed_room(&[1], &[2]);
+    room.set_source(Some("seat-1")).unwrap();
+    let first = plain_sends(&mut room, 1, 1_000, 1, &fu_a(true, false, &[1, 2]));
+    assert_eq!(first.len(), 1);
+    for sequence in 2..=80u16 {
+        let sent = plain_sends(&mut room, 1, 1_000 * u64::from(sequence), sequence, &SLICE);
+        assert_eq!(sent.len(), 1);
+    }
+    let mut nack = vec![0u8; 16];
+    rtcp::write_nack(0x2222_2222, 0xF000_0002, 2000, 0, &mut nack).unwrap();
+    let request = rx_secure(&mut phone(2), 2, 90_000, &nack);
+    assert_eq!(room.ingest(&request), Ingress::Accepted);
+    let resent = forwarded(&mut room, &request);
+    assert!(resent.is_empty(), "{resent:?}");
+    let stats = room.seat_stats("seat-2").unwrap();
+    assert_eq!((stats.nack_answered, stats.nack_missed), (0, 1));
+}
+
+#[test]
+fn a_nack_after_the_seats_key_is_replaced_is_not_answered_with_what_the_old_key_sealed() {
+    // RFC 3711 §9.1: what was sealed under the replaced key is not the answer under the new one.
+    let mut room = mixed_room(&[1], &[2]);
+    room.set_source(Some("seat-1")).unwrap();
+    let first = plain_sends(&mut room, 1, 1_000, 1, &fu_a(true, false, &[1, 2]));
+    assert_eq!(first.len(), 1);
+    room.attach_secure_leg("seat-2", room_leg(2));
+    let mut nack = vec![0u8; 16];
+    rtcp::write_nack(0x2222_2222, 0xF000_0002, 2000, 0, &mut nack).unwrap();
+    let request = rx_secure(&mut phone(2), 2, 3_000, &nack);
+    assert_eq!(room.ingest(&request), Ingress::Accepted);
+    let resent = forwarded(&mut room, &request);
+    assert!(resent.is_empty(), "{resent:?}");
+    let stats = room.seat_stats("seat-2").unwrap();
+    assert_eq!((stats.nack_answered, stats.nack_missed), (0, 1));
+}
+
+#[test]
 fn a_pli_from_a_webrtc_receiver_reaches_the_source_but_an_audio_report_does_not() {
     let mut room = mixed_room(&[1], &[2]);
     plain_sends(&mut room, 1, 0, 1, &SLICE);

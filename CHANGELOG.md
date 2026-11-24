@@ -7,6 +7,24 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **A call on a crypto bridge can be held in the decoding actor and released back, with no re-INVITE.**
+  `Srtp`, `SrtpOfferer`, `SrtpTranscrypt`, `Dtls` and `DtlsOfferer` calls move into the media actor
+  (`PromotionReason::WsSplit`, engine-internal for now) with the same `SecureLeg`s (keys, rollover,
+  replay windows, SRTCP index) and the DTLS association kept; each egress stream continues under the
+  SSRC the bridge was sending with the next sequence number, and the bridge renumbers its flows to
+  continue the actor's stream on release, so a receiver's SRTP estimate never slips (RFC 3711 §3.3.1).
+  Taps (X3, tee, recording) ride along. A re-offer while held keeps the hold and the keys; a DTLS
+  re-handshake releases it first. Refused with `ws-split-seated`, `ws-split-answer-local`,
+  `ws-split-already-bridged` or `ws-split-not-answered`. The SRTP sender now refuses to send an
+  `(SSRC, index)` it has already sent under a key (RFC 3711 §9.1), whoever relays the stream, and
+  refuses to wrap the SRTCP index; bridge flows renumber a plain source whose sequence restarts or
+  jumps, so that never becomes an outage. A renegotiation that repeats a key keeps the live SRTP leg
+  (video, text and decoded SDES calls included) and re-keys only the side that changed, a leg that
+  has to be rebuilt closes everything at or below its restored mark, and the sender's own record
+  places a stream a flow no longer follows.
+
 ## [0.28.1] — 2026-11-24
 
 ### Fixed

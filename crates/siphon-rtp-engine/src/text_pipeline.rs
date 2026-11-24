@@ -557,6 +557,14 @@ impl TextRegistry {
         Some((near, far))
     }
 
+    /// The live `(near, far)` SRTP contexts of a secure text call, as the handles the actor holds,
+    /// for a renegotiation that keeps them (and their send windows) when a key is unchanged.
+    #[must_use]
+    pub fn secure_legs(&self, call_id: &str) -> Option<SecureTextLegs> {
+        let handle = self.calls.get(call_id)?;
+        handle.secure_legs.clone()
+    }
+
     /// Send a control op to a call's text actor, returning `false` if there is no such text call.
     pub fn control(&self, call_id: &str, control: TextControl) -> bool {
         match self.calls.get(call_id) {

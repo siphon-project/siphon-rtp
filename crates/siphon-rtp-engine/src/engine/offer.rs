@@ -1008,6 +1008,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 local_answer: None,
                 seat: None,
                 seating: false,
+                secure_hold: None,
             },
         );
         self.index_new_call(&call_id, client);

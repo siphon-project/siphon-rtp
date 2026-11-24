@@ -15,8 +15,8 @@ use siphon_rtp_datapath::{source_latch_verdict, SourceLatch, SourceLatchVerdict}
 /// datagrams are ever offered here — on a secure leg the caller offers a packet only *after* SRTP
 /// `unprotect` succeeds — so a forged, auth-failing packet can never move the reply direction (the
 /// fix for the pre-auth, no-SSRC-check re-latch).
-#[derive(Default)]
-pub(crate) struct SymmetricLatch {
+#[derive(Default, Clone)]
+pub struct SymmetricLatch {
     latch: Option<SourceLatch<SocketAddr>>,
 }
 

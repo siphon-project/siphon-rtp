@@ -28,12 +28,15 @@ use siphon_rtp_srtp::leg::{is_rtcp, PacketKind, SecureLeg};
 use tokio::task::JoinHandle;
 
 use crate::dtls_session::{spawn_session, DriverPlan, SessionOutcome};
+use crate::egress_track::{continue_in_place, continue_stream, EgressTrack};
 use crate::floor_channel::FloorChannelPlan;
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::plain_tap::{PlainTapSender, PlainTaps};
 use crate::seat_gate::rtcp_is_about_video;
-use crate::srtp_bridge::ScratchPool;
+use crate::srtp_bridge::{Scratch, ScratchPool};
 use crate::x3::X3Taps;
+
+pub(crate) mod hold;
 
 /// How many inbound DTLS records a leg's driver will queue. Bounded so a stalled association cannot
 /// grow an unbounded queue on a traffic spike; [`DtlsBridge::handle`] drops the newest when it is
@@ -273,6 +276,9 @@ struct Flow {
     /// RTP on this flow is dropped: the direction a video stream was negotiated closed (RFC 3264
     /// §6.1). RTCP still flows, as receiver feedback travels against the media.
     rtp_closed: bool,
+    /// The RTP stream this flow forwards toward its peer, so a hold in the decoding actor and the
+    /// release after it continue one stream (`crate::egress_track`).
+    track: Arc<EgressTrack>,
 }
 
 /// The two SSRCs a bundled video stream is told apart by in RTCP: the DTLS peer's own video sender
@@ -575,6 +581,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             video: None,
             rtp_closed: false,
             rtcp_out: None,
+            track: Arc::default(),
         }
     }
 
@@ -772,6 +779,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 video: None,
                 rtp_closed: false,
                 rtcp_out: None,
+                track: Arc::new(EgressTrack::guarded()),
             },
         );
         // The plain peer's separate RTCP port, when it has one: RTCP only, as SRTCP on the same leg.
@@ -804,6 +812,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 rtp_closed: false,
                 // Decrypted RTCP goes to the plain peer's own RTCP port when it has one.
                 rtcp_out: plan.plain_rtcp.map(|rtcp| (rtcp.endpoint, rtcp.dst)),
+                track: Arc::default(),
             },
         );
         self.sessions.insert(plan.secure_endpoint, session);
@@ -887,6 +896,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 video: None,
                 rtp_closed: false,
                 rtcp_out: None,
+                track: Arc::default(),
             },
         );
         self.sessions.insert(plan.secure_endpoint, session);
@@ -961,6 +971,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 refusals: Arc::new(RefusalLog::default()),
                 video: Some(route),
                 rtp_closed: !plan.to_secure,
+                track: Arc::new(EgressTrack::guarded()),
             },
         );
         drop(previous);
@@ -1257,6 +1268,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             rtcp_out,
             refusals,
             (video, rtp_closed),
+            track,
         )) = self.flows.get(&packet.endpoint).map(|flow| {
             (
                 flow.direction.clone(),
@@ -1273,6 +1285,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 flow.rtcp_out,
                 flow.refusals.clone(),
                 (flow.video.clone(), flow.rtp_closed),
+                flow.track.clone(),
             )
         })
         else {
@@ -1354,7 +1367,23 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         }
         let Some(out_dst) = out_dst else { return };
         let mut scratch = self.scratch.take();
-        let out = &mut scratch.decrypted;
+        let Scratch {
+            decrypted: out,
+            rewritten,
+            ..
+        } = &mut *scratch;
+        // The stream toward the DTLS peer, continued across a hold in the decoding actor.
+        // The sender's own record of a stream, asked only for one the flow is not following.
+        let sent = |ssrc| secure.lock().ok()?.as_ref()?.highest_sent(ssrc);
+        let toward_peer: &[u8] = if matches!(direction, Direction::Encrypt) {
+            let Some(datagram) = continue_stream(&track, &packet.data, rewritten, sent) else {
+                self.datapath.note_dropped(packet.endpoint);
+                return;
+            };
+            datagram
+        } else {
+            &packet.data
+        };
         let transformed = {
             let Ok(mut guard) = secure.lock() else {
                 tracing::error!("DTLS secure-leg mutex poisoned; dropping packet");
@@ -1367,20 +1396,22 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 return;
             };
             match direction {
-                Direction::Encrypt => leg.protect(&packet.data, out),
+                Direction::Encrypt => (leg.protect(toward_peer, out), leg.reuse_refusals()),
                 // `Pipeline` returned above; only the two relaying directions reach the crypto here.
                 Direction::Decrypt { .. } | Direction::Pipeline { .. } => {
-                    leg.unprotect(&packet.data, out)
+                    (leg.unprotect(&packet.data, out), 0)
                 }
             }
         };
+        let (transformed, refused) = transformed;
         let kind = match transformed {
             Ok(kind) => kind,
             Err(error) => {
                 if matches!(direction, Direction::Decrypt { .. }) {
                     refusals.log_undecryptable(&error, &packet.data, "secure", context);
                 } else {
-                    tracing::debug!(?error, "DTLS bridge encrypt failed; dropping packet");
+                    crate::egress_track::log_protect_failure(&error, "dtls-bridge", refused);
+                    track.refused(&error, sent);
                 }
                 self.datapath.note_dropped(packet.endpoint);
                 return;
@@ -1402,6 +1433,17 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             }
             None => (out_endpoint, out_dst),
         };
+        // What the DTLS peer sent, continued toward the plain peer across a hold in the decoding actor.
+        if matches!(direction, Direction::Decrypt { .. })
+            && !is_video
+            && kind == PacketKind::Rtp
+            && !continue_in_place(&track, out.as_mut_slice())
+        {
+            self.datapath.note_dropped(packet.endpoint);
+            return;
+        }
+        // Sent as far as the sender is concerned: only now does it become the flow's high-water mark.
+        track.commit();
         // The same for a leg of an association of its own, whose direction was negotiated closed.
         if rtp_closed && kind == PacketKind::Rtp && matches!(direction, Direction::Decrypt { .. }) {
             self.datapath.note_dropped(packet.endpoint);
@@ -1964,9 +2006,11 @@ mod tests {
         /// Seal `plain` as the DTLS peer and send it to the leg's one address, retrying across the
         /// window between the peer keying and the engine installing its leg.
         async fn peer_sends(&mut self, plain: &[u8], to_audio_phone: bool) -> Option<Vec<u8>> {
+            // Sealed once: a real peer never sends one index twice (RFC 3711 §9.1), so the retry
+            // resends the same datagram, which the engine drops until it is keyed.
+            let mut sealed = Vec::new();
+            self.peer_leg.protect(plain, &mut sealed).expect("protect");
             for _ in 0..25 {
-                let mut sealed = Vec::new();
-                self.peer_leg.protect(plain, &mut sealed).expect("protect");
                 self.peer
                     .send_to(&sealed, self.audio.local_addr)
                     .await
@@ -2700,5 +2744,300 @@ mod tests {
             !bridge.owns(plain_rtcp.id),
             "and released when the plain peer multiplexes again"
         );
+    }
+    // ---- Holding a keyed leg in the decoding actor and taking it back (dtls_bridge/hold.rs) ----
+
+    /// A registered DTLS bridge whose peer B has completed its handshake, with phone A beside it.
+    struct KeyedBridge {
+        _datapath: UdpLoopbackDatapath,
+        bridge: Arc<DtlsBridge<UdpLoopbackDatapath>>,
+        plain: Endpoint,
+        secure: Endpoint,
+        phone_a: UdpSocket,
+        addr_a: SocketAddr,
+        peer_b: Arc<UdpSocket>,
+        peer_leg: SecureLeg,
+        peer_cert: DtlsCertificate,
+    }
+
+    async fn keyed_bridge() -> KeyedBridge {
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        for endpoint in [plain.id, secure.id] {
+            datapath
+                .install_flow(endpoint, FlowAction::Redirect)
+                .expect("redirect");
+        }
+        let phone_a = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a");
+        let addr_a = phone_a.local_addr().expect("addr a");
+        let peer_b = Arc::new(
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind b"),
+        );
+        let addr_b = peer_b.local_addr().expect("addr b");
+        let engine_cert = DtlsCertificate::generate().expect("engine cert");
+        let peer_cert = DtlsCertificate::generate().expect("peer cert");
+        let bridge = Arc::new(DtlsBridge::new(datapath.clone()));
+        bridge.register(DtlsCallPlan {
+            plain_endpoint: plain.id,
+            plain_source: SourceFilter::Exact(addr_a.ip()),
+            plain_dst: addr_a,
+            secure_endpoint: secure.id,
+            secure_source: SourceFilter::Exact(addr_b.ip()),
+            secure_dst: addr_b,
+            secure_local: secure.local_addr,
+            certificate: engine_cert.clone(),
+            role: DtlsRole::Server,
+            peer_fingerprint: peer_cert.fingerprint(),
+            gate_on_ice: false,
+            ice_validated: None,
+            plain_rtcp: None,
+        });
+        let rx = datapath.rx();
+        let dispatch = bridge.clone();
+        tokio::spawn(async move {
+            while let Ok(packet) = rx.recv_async().await {
+                dispatch.handle(packet).await;
+            }
+        });
+        let peer_leg = peer_handshake(
+            peer_b.clone(),
+            secure.local_addr,
+            &peer_cert,
+            &engine_cert.fingerprint(),
+        )
+        .await;
+        // The engine installs its half of the key a moment after the peer finishes.
+        for _ in 0..100 {
+            if bridge.has_key(secure.id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        KeyedBridge {
+            _datapath: datapath,
+            bridge,
+            plain,
+            secure,
+            phone_a,
+            addr_a,
+            peer_b,
+            peer_leg,
+            peer_cert,
+        }
+    }
+
+    fn call_target() -> PipelineTarget {
+        PipelineTarget::Call {
+            media: Arc::new(crate::media_pipeline::MediaRegistry::default()),
+            call_id: "held".to_string(),
+            party: KeyedParty::Callee,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leg_that_is_not_keyed_or_not_relaying_cannot_be_held() {
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        let addr: SocketAddr = "127.0.0.2:5000".parse().expect("addr");
+        let peer_cert = DtlsCertificate::generate().expect("cert");
+        let bridge = DtlsBridge::new(datapath.clone());
+        bridge.register(DtlsCallPlan {
+            plain_endpoint: plain.id,
+            plain_source: SourceFilter::Any,
+            plain_dst: addr,
+            secure_endpoint: secure.id,
+            secure_source: SourceFilter::Any,
+            secure_dst: addr,
+            secure_local: secure.local_addr,
+            certificate: DtlsCertificate::generate().expect("engine cert"),
+            role: DtlsRole::Server,
+            peer_fingerprint: peer_cert.fingerprint(),
+            gate_on_ice: false,
+            ice_validated: None,
+            plain_rtcp: None,
+        });
+        assert_eq!(
+            bridge.hold_view(secure.id, plain.id).err(),
+            Some("the DTLS handshake has not completed")
+        );
+        assert_eq!(
+            bridge.hold(secure.id, plain.id, call_target()).err(),
+            Some("the DTLS handshake has not completed")
+        );
+        assert!(bridge.owns(plain.id), "a refused hold changes nothing");
+        assert_eq!(
+            bridge.hold_view(plain.id, secure.id).err(),
+            Some("the DTLS leg is not relaying"),
+            "the plain side of a bridge is not the DTLS leg"
+        );
+        assert_eq!(
+            bridge.hold_view(EndpointId(9_999), plain.id).err(),
+            Some("no DTLS flow on the endpoint")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_association_fingerprint_decides_whether_a_held_leg_can_be_kept() {
+        let keyed = keyed_bridge().await;
+        let fingerprint = keyed.peer_cert.fingerprint();
+        assert!(!keyed.bridge.fingerprint_differs(
+            keyed.secure.id,
+            &fingerprint.hash_function,
+            &fingerprint.bytes
+        ));
+        let other = DtlsCertificate::generate().expect("other").fingerprint();
+        assert!(keyed.bridge.fingerprint_differs(
+            keyed.secure.id,
+            &other.hash_function,
+            &other.bytes
+        ));
+        assert!(
+            !keyed.bridge.fingerprint_differs(
+                EndpointId(9_999),
+                &other.hash_function,
+                &other.bytes
+            ),
+            "no association, nothing to differ from"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_keyed_leg_is_held_and_released_around_the_same_key_and_stream() {
+        use crate::egress_track::StreamPosition;
+        let mut keyed = keyed_bridge().await;
+        // Media crosses before the hold, so each flow has a position to hand over.
+        let mut buffer = [0u8; 2048];
+        for sequence in 10..13 {
+            let mut sealed = Vec::new();
+            keyed
+                .peer_leg
+                .protect(&rtp(sequence, 0x0B0B_0B0B), &mut sealed)
+                .expect("protect");
+            keyed
+                .peer_b
+                .send_to(&sealed, keyed.secure.local_addr)
+                .await
+                .expect("send");
+            let _ = timeout(RECV_TIMEOUT, keyed.phone_a.recv_from(&mut buffer))
+                .await
+                .expect("A hears B")
+                .expect("recv");
+        }
+        let view = keyed
+            .bridge
+            .hold_view(keyed.secure.id, keyed.plain.id)
+            .expect("a keyed relaying leg");
+        assert_eq!(view.plain_dst, keyed.addr_a);
+
+        let held = keyed
+            .bridge
+            .hold(keyed.secure.id, keyed.plain.id, call_target())
+            .expect("held");
+        assert_eq!(
+            held.toward_plain.expect("B was heard").position.sequence,
+            12
+        );
+        assert!(held.toward_secure.is_none(), "A had sent nothing");
+        assert!(
+            !keyed.bridge.owns(keyed.plain.id),
+            "the plain side is the actor's"
+        );
+        assert!(
+            keyed.bridge.is_keyed(keyed.secure.id),
+            "the DTLS leg now feeds a pipeline"
+        );
+        assert!(
+            keyed.bridge.take_retained(keyed.secure.id).is_some(),
+            "kept for a renegotiation"
+        );
+
+        // While held the bridge does not relay: the media goes to the (here empty) pipeline.
+        let mut sealed = Vec::new();
+        keyed
+            .peer_leg
+            .protect(&rtp(13, 0x0B0B_0B0B), &mut sealed)
+            .expect("protect");
+        keyed
+            .peer_b
+            .send_to(&sealed, keyed.secure.local_addr)
+            .await
+            .expect("send");
+        assert!(
+            timeout(
+                Duration::from_millis(150),
+                keyed.phone_a.recv_from(&mut buffer)
+            )
+            .await
+            .is_err(),
+            "a held leg is not relayed by the bridge"
+        );
+
+        // Released: the same key relays again, and the DTLS peer's next packet continues the stream the
+        // actor left (next sequence 40), whatever number the peer itself used.
+        let leg = Arc::try_unwrap(held.leg)
+            .ok()
+            .and_then(|leg| leg.into_inner().ok())
+            .expect("the bridge's retained copy was taken, so the leg has one owner");
+        keyed
+            .bridge
+            .release(
+                keyed.secure.id,
+                hold::DtlsGiveBack {
+                    leg,
+                    plain_endpoint: keyed.plain.id,
+                    plain_gate: SourceFilter::Exact(keyed.addr_a.ip()),
+                    plain_dst: keyed.addr_a,
+                    plain_rtcp: None,
+                    next_toward_plain: Some(StreamPosition {
+                        ssrc: 0x0B0B_0B0B,
+                        sequence: 40,
+                        timestamp: 6_400,
+                    }),
+                    next_toward_secure: None,
+                    positions_lost: false,
+                    secure_taps: crate::media_pipeline::HeldTaps::default(),
+                    plain_taps: crate::media_pipeline::HeldTaps::default(),
+                },
+            )
+            .expect("released");
+        assert!(keyed.bridge.owns(keyed.plain.id));
+        let mut sealed = Vec::new();
+        keyed
+            .peer_leg
+            .protect(&rtp(14, 0x0B0B_0B0B), &mut sealed)
+            .expect("protect");
+        keyed
+            .peer_b
+            .send_to(&sealed, keyed.secure.local_addr)
+            .await
+            .expect("send");
+        let (len, _) = timeout(RECV_TIMEOUT, keyed.phone_a.recv_from(&mut buffer))
+            .await
+            .expect("A hears B again")
+            .expect("recv");
+        assert_eq!(u16::from_be_bytes([buffer[2], buffer[3]]), 40);
+        assert_eq!(len, rtp(14, 0).len());
+        // And the plain side encrypts under the same key, which B's own context decrypts.
+        keyed
+            .phone_a
+            .send_to(&rtp(900, 0x0A0A_0A0A), keyed.plain.local_addr)
+            .await
+            .expect("A sends");
+        let (len, _) = timeout(RECV_TIMEOUT, keyed.peer_b.recv_from(&mut buffer))
+            .await
+            .expect("B hears A")
+            .expect("recv");
+        let mut clear = Vec::new();
+        keyed
+            .peer_leg
+            .unprotect(&buffer[..len], &mut clear)
+            .expect("B decrypts under the same association");
+        assert_eq!(u16::from_be_bytes([clear[2], clear[3]]), 900);
     }
 }

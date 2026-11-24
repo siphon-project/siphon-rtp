@@ -8,9 +8,12 @@ use siphon_rtp_datapath::{EndpointId, SourceFilter};
 use siphon_rtp_srtp::leg::SecureLeg;
 
 use super::{
-    CallHandle, FinalCallQuality, MediaCall, MediaControl, MediaInput, MediaRegistry,
-    ACTOR_TEARDOWN_GRACE,
+    secure_hold::HeldBack, CallHandle, FinalCallQuality, MediaCall, MediaControl, MediaInput,
+    MediaRegistry, ACTOR_TEARDOWN_GRACE,
 };
+
+/// A call's SRTP contexts as `(near, far)`; either is `None` for a party that is not secure.
+pub type SecureLegs = (Option<Arc<Mutex<SecureLeg>>>, Option<Arc<Mutex<SecureLeg>>>);
 
 /// What a media actor hands back when its call's legs move to another owner
 /// ([`MediaControl::Surrender`]).
@@ -24,13 +27,31 @@ pub struct SurrenderedCall {
     pub gates: [(EndpointId, SourceFilter); 2],
     /// Per-direction quality, whose SSRCs say which stream each party has been receiving.
     pub quality: FinalCallQuality,
+    /// Where each direction's egress stream stands, where it was sending and what taps it carried:
+    /// A's ingress direction first, then B's. What a call held for a split gives back to its bridge
+    /// ([`MediaCall::held_back`]).
+    pub held: [HeldBack; 2],
+    /// The companion RTCP relays: ingress endpoint, the gate in force on it and where it forwards.
+    pub rtcp: Vec<(EndpointId, SourceFilter, std::net::SocketAddr)>,
 }
 
 impl MediaCall {
     /// What the actor hands over when its call's legs move to another owner
     /// ([`MediaControl::Surrender`]): each party's SRTP contexts, the gate on each ingress, and the
     /// final quality.
-    pub fn surrender(&self) -> SurrenderedCall {
+    pub fn surrender(&mut self) -> SurrenderedCall {
+        let quality = self.final_quality();
+        let rtcp = self
+            .rtcp
+            .iter()
+            .map(|relay| {
+                (
+                    relay.ingress_endpoint,
+                    relay.accepted_source,
+                    relay.egress_dst,
+                )
+            })
+            .collect();
         SurrenderedCall {
             near_leg: self.a_to_b.secure_ingress.clone(),
             far_leg: self.b_to_a.secure_ingress.clone(),
@@ -38,12 +59,24 @@ impl MediaCall {
                 (self.a_to_b.ingress_endpoint, self.a_to_b.accepted_source),
                 (self.b_to_a.ingress_endpoint, self.b_to_a.accepted_source),
             ],
-            quality: self.final_quality(),
+            quality,
+            held: self.held_back(),
+            rtcp,
         }
     }
 }
 
 impl MediaRegistry {
+    /// The SRTP contexts a running call's actor holds, as `(near, far)`: the live objects, for a
+    /// caller that is about to put the bridge back around them. The actor's own handles, kept at
+    /// registration (a leg a DTLS handshake delivers later is not among them).
+    #[must_use]
+    pub fn secure_legs(&self, call_id: &str) -> SecureLegs {
+        self.calls.get(call_id).map_or((None, None), |handle| {
+            (handle.near_secure_leg.clone(), handle.secure_leg.clone())
+        })
+    }
+
     /// Take `call_id`'s actor out of the registry and have it hand its legs over
     /// ([`MediaControl::Surrender`]), returning only once it has exited, so the caller holds the only
     /// remaining reference to each party's SRTP contexts. `None` when there is no such call or the

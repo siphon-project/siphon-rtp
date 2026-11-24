@@ -49,17 +49,20 @@ use siphon_rtp_proto::{Event, PlayEndReason, ProfileFlags, RtcpAppStream};
 
 use crate::app_events::{surface_app_packets, AppEventQueue, AppScope};
 use crate::ingress::{Ingress, Refusal, RefusalContext, RefusalLog};
+use crate::plain_tap::PlainTaps;
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Taps;
 
 mod ingress_clock;
 mod relay_tap;
+mod secure_hold;
 mod surrender;
 mod x3_single_leg;
 use ingress_clock::IngressClock;
 pub use relay_tap::CarriedAttachments;
 use relay_tap::TapDecode;
-pub use surrender::SurrenderedCall;
+pub use secure_hold::{HeldBack, HeldEgress, HeldResume, HeldTaps};
+pub use surrender::{SecureLegs, SurrenderedCall};
 
 /// The playout-clock tick driving injected media (PlayMedia / PlayDtmf): one egress packet per
 /// 20 ms, the telephony default ptime (RFC 3551).
@@ -754,6 +757,11 @@ pub struct Direction {
     /// Lawful-interception tap on what this direction **sends** toward the party, set only on the
     /// one direction of a single-leg call that faces its caller (media_pipeline/x3_single_leg.rs).
     x3_egress: X3Taps,
+    /// Plaintext-RTP taps of a tee or decoded recording moved over from a crypto bridge flow while
+    /// the call is held here (media_pipeline/secure_hold.rs). Empty otherwise.
+    plain_taps: PlainTaps,
+    /// Where RTCP goes when the party it faces keeps it on a port of its own (secure_hold.rs).
+    rtcp_out: Option<(EndpointId, SocketAddr)>,
     decoder: Box<dyn Decoder>,
     encoder: Box<dyn Encoder>,
     /// Audio channels the decoder emits per frame (`decoder.params().channels`) — 1 for every
@@ -1589,6 +1597,8 @@ impl Direction {
             raw_tee: Vec::new(),
             x3: X3Taps::default(),
             x3_egress: X3Taps::default(),
+            plain_taps: PlainTaps::default(),
+            rtcp_out: None,
             decoder: config.decoder,
             encoder: config.encoder,
             ingress_channels,
@@ -1674,6 +1684,8 @@ impl Direction {
             raw_tee: Vec::new(),
             x3: X3Taps::default(),
             x3_egress: X3Taps::default(),
+            plain_taps: PlainTaps::default(),
+            rtcp_out: None,
             decoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             encoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             // A relay-only direction never decodes, so the channel fold and the decode-error counter
@@ -2209,6 +2221,10 @@ impl Direction {
         if !self.x3.is_empty() {
             self.x3.deliver(source, data);
         }
+        // A tee's or a recording's copy, taken off the bridge while this call is held (RTCP is not audio).
+        if !self.plain_taps.is_empty() && !(64..=95).contains(&(data[1] & 0x7f)) {
+            self.plain_taps.offer(data);
+        }
 
         // Telemetry: the party's RTCP, as plaintext, for the HEP export. A leg carried here never
         // passes the datapath's own relay tap, so without this a secure, transcoded or locally
@@ -2641,13 +2657,20 @@ impl Direction {
             return;
         }
         let data = if let Some(leg) = self.secure_egress.as_ref() {
-            let mut sealed = Vec::new();
             let Ok(mut guard) = leg.lock() else { return };
-            if guard.protect(plaintext, &mut sealed).is_err() {
-                return;
+            // Sealed into the leg's own reusable buffer; the one allocation left is the datagram's
+            // owned bytes, exactly what a plaintext leg pays.
+            match guard.protect_buffered(plaintext) {
+                Ok(sealed) => Bytes::copy_from_slice(sealed),
+                Err(error) => {
+                    crate::egress_track::log_protect_failure(
+                        &error,
+                        "media-pipeline",
+                        guard.reuse_refusals(),
+                    );
+                    return;
+                }
             }
-            drop(guard);
-            Bytes::from(sealed)
         } else {
             Bytes::copy_from_slice(plaintext)
         };
@@ -2655,9 +2678,13 @@ impl Direction {
         if !self.x3_egress.is_empty() {
             self.x3_egress.deliver_egress(self.egress_dst, plaintext);
         }
+        let (endpoint, dst) = match self.rtcp_out {
+            Some(rtcp) if (64..=95).contains(&(plaintext[1] & 0x7f)) => rtcp,
+            _ => (self.egress_endpoint, self.egress_dst),
+        };
         out.push(Outbound {
-            endpoint: self.egress_endpoint,
-            dst: self.egress_dst,
+            endpoint,
+            dst,
             data,
         });
     }
@@ -3029,9 +3056,12 @@ impl MediaCall {
     /// `a=rtcp-mux`), so there is no companion relay to key.
     pub fn attach_caller_secure_leg(&mut self, leg: Arc<Mutex<SecureLeg>>) {
         self.a_to_b.secure_ingress = Some(leg.clone());
-        self.b_to_a.secure_egress = Some(leg);
+        self.b_to_a.secure_egress = Some(leg.clone());
         self.a_to_b.secure_pending = false;
         self.b_to_a.secure_pending = false;
+        for relay in &mut self.rtcp {
+            relay.attach_secure_leg(&leg);
+        }
     }
 
     /// Mark a **single-leg** call's one party as secure, keyed later by the DTLS handshake.
@@ -4242,6 +4272,9 @@ pub enum MediaControl {
         endpoint: EndpointId,
         remote: SocketAddr,
     },
+    /// The bridge has let go of a held call: continue its egress streams, adopt its taps and, unless a
+    /// DTLS key is still to come, start taking media (media_pipeline/secure_hold.rs).
+    ResumeHeld(Box<HeldResume>),
     /// Tear the call down: flush recordings and exit the actor loop.
     Stop,
 }
@@ -4753,6 +4786,7 @@ async fn run_media_call<D>(
                         call.attach_secure_leg(leg);
                         tracing::debug!(target: "siphon_rtp::media", "DTLS-SRTP key installed on the media pipeline");
                     }
+                    MediaInput::Control(MediaControl::ResumeHeld(resume)) => call.resume_held(*resume),
                     MediaInput::Control(MediaControl::Surrender { reply }) => {
                         let _ = reply.send(call.surrender());
                         break;
@@ -4899,7 +4933,7 @@ mod tests {
     }
 
     /// Build a µ-law(A) ↔ A-law(B) transcoding call, both legs 8 kHz/20 ms.
-    fn ulaw_alaw_call() -> MediaCall {
+    pub(crate) fn ulaw_alaw_call() -> MediaCall {
         ulaw_alaw_call_on(1, 2)
     }
 

@@ -826,6 +826,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 local_answer: None,
                 seat: None,
                 seating: false,
+                secure_hold: None,
             },
         );
         // Register the reconstructed call under the requesting (standby) client.

@@ -992,6 +992,131 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
     `a_conference_leave_retires_the_seats_dtls_bridge` and
     `reaping_an_idle_conference_seat_retires_its_dtls_bridge`.
 
+### Layer 5d-ii — Holding a crypto-bridged call in the decoding actor, and releasing it
+
+> **Status (landed — `PromotionReason::WsSplit`, no control verb yet):** a call on a crypto bridge
+> (`Srtp`, `SrtpOfferer`, `SrtpTranscrypt`, `Dtls`, `DtlsOfferer`) can be moved at runtime into the
+> decoding `MediaCall` actor and moved back, **with no re-INVITE and no rebuilt crypto state**. It is
+> the foundation a split bridge (both legs to one stereo stream) stands on; this change adds no wire
+> verb, only the engine's `hold_in_userspace(WsSplit, Processing)` and `release_userspace_hold`.
+> Code: `engine/promote/secure_hold.rs`, `srtp_bridge/hold.rs`, `dtls_bridge/hold.rs`,
+> `media_pipeline/secure_hold.rs`, `egress_track.rs`.
+
+A bridge relays ciphertext it never decodes, so nothing that needs the audio can attach to such a call.
+Holding moves the two legs' media into an actor that decodes it. What changes owner, and what must not:
+
+| What | On hold | On release |
+|---|---|---|
+| The `SecureLeg`s (master key, per-SSRC rollover, replay window, SRTCP index) | the **same objects** go to the actor (SDES: the bridge flows' shared handles; DTLS: the leg moves out of the relaying flow, the bridge keeping a retained copy for a renegotiation) | the same objects go back (`surrender` hands them over, the flows are rebuilt around them) |
+| The DTLS association (handshake driver, retransmission answers, ICE destination watch) | never leaves the bridge; the secure flow becomes a *pipeline flow*, which keeps the RFC 7983 demux and hands media on still encrypted | the flow turns back into the relaying flow |
+| Each party's egress RTP stream | the actor continues the **SSRC** the bridge was sending, with `sequence + 1` and a timestamp advanced by the elapsed clock in whole frames (RFC 3550 §5.1) | the rebuilt flow numbers the peer's stream so it continues the actor's, by a constant sequence/timestamp offset for the rest of the call |
+| The taps a flow carried (X3, a tee's or a recording's plaintext tap) | the same senders move to the actor's direction | and back |
+
+**Why continuity, and not a new SSRC.** On an SRTP leg the receiver estimates the rollover counter
+from the sequence numbers of one SSRC (RFC 3711 §3.3.1). Continuing the SSRC with a contiguous sequence
+keeps that estimate right; a restarted sequence under the same SSRC would make every packet past it
+fail authentication at the receiver. A *different* SSRC is legitimate (RFC 3550 §8.2) and is what the
+plain `Passthrough` relay does, because a kernel `Forward` cannot renumber a stream: its actor sends
+under a fresh SSRC and the release returns the carrier's own, verbatim. The bridge flows record the
+position of what they forward (`EgressTrack`: one short mutex per packet, no allocation, proven by
+`tests/egress_track_zero_alloc.rs`) and are **sealed** when the hold takes them: a packet a flow had
+already begun forwarding is either recorded (and so included in the position the actor continues from)
+or refused, never sent twice. The offset applies only to the SSRC the actor was sending; any other SSRC
+is a new source and numbers itself.
+
+**No handler-less window (§4 layer 2), in either direction.** On hold the actor is registered **first**,
+inert (both directions gated until it has the final stream position, so it cannot emit under the
+wrong SSRC), and only then do the flows let go. On release it is mirrored: the bridge's flows are
+registered **first**, refusing everything (`EgressTrack::awaiting`) until they know where each stream
+stands; the dispatcher checks the bridge before the media registry, so the endpoints are never
+ownerless. Only then is the actor stopped, its final positions, gates, destinations and taps read, and
+the flows told, which starts them. If the actor cannot report (a wedged mailbox), the flows start under a
+**fresh random SSRC** per peer stream (peer sequence and timestamp kept) rather than leave the call
+without a media path: the actor sends on a clock of its own, so under the old SSRC it may be past the
+peer's numbering and resuming that numbering could reuse an SRTP index. A new SSRC is a new SRTP
+context at ROC 0 on both ends (RFC 3711 §3.2.1, §3.3.1) and a legitimate change (RFC 3550 §8.2). A DTLS key is taken out of its shared handle by swapping, never by unwrapping the
+`Arc`, so a straggling holder cannot make the release fail.
+
+**No index is ever used twice (RFC 3711 §3.3.1, §9.1) — by construction.** The sender context of every
+`SecureLeg` (`siphon-rtp-srtp`) keeps, per SSRC, the highest index it sent and a 64-wide bitmap below
+it (the §3.3.2 replay list applied outbound), and `protect` refuses with `SrtpError::IndexReused`
+anything already sent or older than the window; a reordered packet whose index was never sent still
+goes. It also refuses (`SequenceJump`, nothing recorded) a sequence number that a receiver would place
+in a rollover that never was: at rollover counter 0 an estimate below 0 would wrap to 2^32-1 and anchor
+the window there for good. It is one fixed-size record per SSRC (allocated when the SSRC first
+appears), it lives in the one leg every owner shares, and so it survives hold, release and re-offer
+without anyone cooperating. A re-offer that changes only the peer's key keeps the leg and its send
+window (`SecureLeg::rekey` replaces only the side whose key changed, carrying that side's counters). The
+SRTCP index never wraps either: used up (2^31), `protect` refuses (`IndexExhausted`) until a new key
+(§3.4, §9.2). Refusals are counted (`SecureLeg::reuse_refusals`) and logged at `error!` with their
+context. It is the safety net, never the way a stream is meant to behave: **a refusal must not become
+an outage**, so each flow that feeds an SRTP leg also numbers its stream correctly.
+
+- A flow records the **high-water** mark of each of its last eight SSRCs, committed only once the
+  packet was protected (a refused packet leaves no mark, and the stream that advanced least recently is
+  the one given up), keeps the position it was to resume until **its own** SSRC shows up, and after a
+  release refuses any packet of the continued SSRC from before the first it took over.
+- A **discontinuity** in what a plain peer sends (its sequence jumps back beyond reordering, or forward
+  by half the space or more, which a receiver reads as a jump back: a restart after a re-INVITE to
+  another media server, an SSRC reused after a gap) is renumbered: the flow carries on from its own
+  high-water mark + 1 with a timestamp moved on by the quiet in whole frames, for that stream epoch. A
+  translator may renumber a stream (RFC 3550 §7.1, §8.2). Normal loss and reordering keep the peer's
+  numbering verbatim, and the no-discontinuity path allocates nothing.
+- The record and the offset follow the flow across a re-registration for as long as its key is
+  unchanged.
+- **The SRTP sender is the authority on where a stream stands.** A stream the flow is not following
+  (its epoch given up, a restart renumbered earlier, a leg restored with its window closed) whose first
+  packet is at or below what the leg has sent under that SSRC is renumbered from the leg's position at
+  once, not from the peer's numbering, so a peer resuming below a restored mark is heard immediately; epochs that renumber are the last to be given up; and a packet
+  the sender refuses as a reused index or an unplaceable jump, far from where it stands, renumbers the
+  stream from the sender's position (a duplicate inside the send window is the window's to refuse).
+  The timestamp step is learned only from consecutive packets less than a second apart and may change
+  by a few frames at a time, so a suppressed silence is never mistaken for a frame.
+- **A renegotiation that repeats a key keeps the live leg** (a key is its master key and salt: an MKI
+  that alone changes only changes the MKI emitted; SDES audio, video, text, a decoded
+  call's re-answer): only a side whose key changed is re-keyed, in place, so the send window survives.
+  A leg that has to be rebuilt (an HA restore, a seat whose leg is still shared) closes every index at
+  or below the restored mark, so nothing sent before may be sent again under the same key (RFC 3711
+  §9.1).
+- A NACK is answered with **the datagram that was sent**, from a bounded, preallocated per-receiver
+  history keyed on the packet's extended index (rollover and sequence number, RFC 3711 §3.3.1)
+  (RFC 4585 §6.2.1); a packet that has left it is not answered, and the history is emptied when the
+  seat's key is replaced. The sender never encrypts a second time at an index it has used.
+
+**The latch is carried, so a stranger does not win a race (RTPBleed).** On a symmetric plain leg
+(`SourceFilter::Any`, no ICE) the learned source and SSRC are all that keep a stranger from becoming the
+reply destination. The latch of each party's ingress moves with the call, bridge flow to actor on
+hold, actor to bridge flow on release and actor to replacement on a re-offer carry. A bridge flow that
+is registered awaiting its stream forwards nothing and learns nothing (checked before the latch), and
+the actor starts gated, so no first-packet race exists in a hand-over. A latch is carried only while the
+address the peer signalled is the same: a re-offer that moves the peer starts from the gate its new SDP
+draws, as any re-offer does, so the moved peer is served and nothing is opened. Proven by
+`a_stranger_who_sends_first_after_a_hold_or_a_release_meets_the_established_latch`.
+
+**RTPBleed.** The actor re-enforces exactly the gate the flow carried (the signalled source, or open on
+an ICE leg whose gate the datapath's layer 4 owns, narrowed to the selected pair by `IceSelected`), and
+latches symmetrically only on an authenticated packet. A stranger is dropped while held as it is on the
+bridge (`secure_hold::*` tests send a valid-looking packet of another SSRC from another address while
+held). Packets that arrive before the actor is keyed are dropped, never decoded as plaintext.
+
+**Re-offer while held.** The answer keeps the actor's kind (`settle_held_pipeline`), so it rebuilds
+the *actor* the way every transcoding call's re-answer does, but the old actor is **stopped first**
+(`carry_held_actor`, right before the install) and its live `SecureLeg`s, final stream positions,
+taps and plain-RTCP route go to the replacement: the same SDES leg objects when the keys did not
+change (a new key gets a new leg that carries the old counters), the DTLS leg re-keying the replacement
+from the bridge's retained handle. Snapshotting counters off a running actor and rebuilding would let
+two contexts under one key number the same SRTCP index, and would restart the replay window. An install
+that fails restores the old actor from what it left (`restore_held_actor`). A DTLS re-handshake (a
+changed peer certificate, RFC 8842 §3.1) cannot be kept: the hold is released first, back onto the
+bridge, and the answer then installs the new association the ordinary way, so there is never a
+half-keyed leg. The release returns `HeldAnswer::ReleasedForRekey`, which a later change turns into an
+event.
+
+**Refusals.** `ws-split-seated`, `ws-split-answer-local`, `ws-split-already-bridged` (a WebSocket
+takeover or a hold already on the call) and `ws-split-not-answered`; a DTLS leg that is not keyed yet,
+or that carries bundled video (RFC 8843), is refused with its reason rather than half-moved. A
+plain peer's separate RTCP port on a DTLS leg is carried while held: its RTCP goes out as SRTCP on the leg's key, and the DTLS peer's decrypted RTCP goes to that port. A re-offer takes that routing from its new answer, so a plain peer that moved its RTCP port is followed.
+
 ### Layer 5c — The conference (MCU) Redirect path
 The N-party conference mixer (`engine/src/conference.rs`) is another `FlowAction::Redirect` consumer,
 so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the send-only SIPREC tee,

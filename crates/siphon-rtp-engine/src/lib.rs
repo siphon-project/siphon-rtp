@@ -22,6 +22,7 @@ pub mod config;
 pub mod daemon;
 pub mod dtls_bridge;
 mod dtls_session;
+pub mod egress_track;
 pub mod engine;
 pub mod floor_channel;
 pub mod floor_srtcp;

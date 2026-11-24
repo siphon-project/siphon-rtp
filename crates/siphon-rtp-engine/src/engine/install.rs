@@ -17,7 +17,7 @@ use crate::ice::IceCredentials;
 use crate::media_pipeline::{DirectionConfig, EchoProfile, MediaCall, RtcpRelay};
 use crate::rtcp_relay::{RtcpRelayCall, RtcpRelayLeg};
 use crate::sdp;
-use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeLeg};
+use crate::srtp_bridge::{BridgeFlowPlan, BridgeLeg};
 use crate::text_pipeline::{TextCall, TextDirectionConfig};
 
 use super::answer::{ingress_rule, with_ptime_override};
@@ -448,13 +448,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             if let Some(rollover) = previous.as_ref() {
                 leg.seed_rollover(rollover);
             }
-            Some(leg)
+            Some(Arc::new(Mutex::new(leg)))
         };
-        self.bridge.register(BridgeCallPlan {
-            near_leg: build(keying.near, previous_near),
-            far_leg: build(keying.far, previous_far),
-            flows,
-        });
+        // A re-offer that keeps a party's keys keeps that party's live `SecureLeg`: its send window is
+        // what stops an SRTP index being sent twice under one key (RFC 3711 §9.1), and a rebuilt leg
+        // would start that window empty. New keys are a new stream and get a new leg.
+        let keep = |party: BridgeLeg, keys: &Option<(CryptoAttribute, CryptoAttribute)>| {
+            let (local, remote) = keys.as_ref()?;
+            let (recorded_local, recorded_remote) =
+                self.owned_call_internal(wiring.call_id, |call| match party {
+                    BridgeLeg::Near => (call.near_local_crypto, call.near_remote_crypto),
+                    BridgeLeg::Far => (call.far_local_crypto, call.far_remote_crypto),
+                })?;
+            let live = self.bridge.party_leg(near.rtp.id, party)?;
+            // Only the key that changed is replaced, in place: a peer that changes just its own key
+            // must not make this leg forget what it already sent under the key it still sends with.
+            live.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .rekey(
+                    (recorded_local != Some(*local)).then_some(&local.key),
+                    (recorded_remote != Some(*remote)).then_some(&remote.key),
+                );
+            Some(live)
+        };
+        let near_leg =
+            keep(BridgeLeg::Near, &keying.near).or_else(|| build(keying.near, previous_near));
+        let far_leg = keep(BridgeLeg::Far, &keying.far).or_else(|| build(keying.far, previous_far));
+        self.bridge
+            .register_shared(crate::srtp_bridge::hold::SharedBridgePlan {
+                near_leg,
+                far_leg,
+                flows,
+                carried: Vec::new(),
+            });
         // Redirected only now that the flows (each with its source gate and latch) are registered.
         self.redirect_registered(
             redirected.iter().copied(),
@@ -502,11 +528,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let mut redirected = vec![near.rtp.id, far.rtp.id];
         // Carry the live actor's SRTP rollover into the rebuilt leg (RFC 3711 §3.3.1) — see the SDES
         // bridge; a renegotiation must not restart either counter at 0.
-        let mut secure_leg = SecureLeg::new(&far_local.key, &far_remote.key);
-        if let Some(rollover) = self.media.rollover_snapshot(wiring.call_id) {
-            secure_leg.seed_rollover(&rollover);
-        }
-        let leg = Arc::new(Mutex::new(secure_leg));
+        // A call held for a split hands its live leg to the replacement (promote/secure_release.rs).
+        let leg = self
+            .carried_sdes_leg(wiring.call_id, true, (&far_local, &far_remote))
+            .or_else(|| {
+                // A re-answer that repeats a key keeps the actor's live leg, and so its send window
+                // (RFC 3711 §9.1); only a changed key is replaced, in place.
+                let live = self.media.secure_legs(wiring.call_id).1?;
+                live.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .adopt(Some(&far_local.key), Some(&far_remote.key));
+                Some(live)
+            })
+            .unwrap_or_else(|| {
+                let mut secure_leg = SecureLeg::new(&far_local.key, &far_remote.key);
+                if let Some(rollover) = self.media.rollover_snapshot(wiring.call_id) {
+                    secure_leg.seed_rollover(&rollover);
+                }
+                Arc::new(Mutex::new(secure_leg))
+            });
         // Non-muxed companion RTCP: relayed through the shared SecureLeg — A's RTCP encrypted toward
         // secure B, B's SRTCP decrypted toward plaintext A — so a non-muxed secure-transcode leg keeps
         // RTCP flowing (RFC 3711 SRTCP; RFC 5761 keeps it on its own port). Muxed calls leave this empty.
@@ -527,6 +567,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .with_far_secure_leg(leg)
             .with_rtcp_relays(rtcp_relays);
         let call = call.with_app_events(self.call_app_queue(wiring.call_id));
+        let call = self.apply_hold_carry(
+            wiring.call_id,
+            call,
+            None,
+            (wiring.near.remote_rtp, Some(wiring.info.remote_rtp)),
+        );
         // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
         // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
         let mut call = call;
@@ -584,18 +630,40 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         )?;
         let mut redirected = vec![near.rtp.id, far.rtp.id];
-        let mut near_leg = SecureLeg::new(&near_local.key, &near_remote.key);
-        if let Some(rollover) = self.media.near_rollover_snapshot(wiring.call_id) {
-            near_leg.seed_rollover(&rollover);
-        }
+        // A call held for a split hands its live legs to the replacement (promote/secure_release.rs).
+        let near_leg = self
+            .carried_sdes_leg(wiring.call_id, false, (&near_local, &near_remote))
+            .or_else(|| {
+                let live = self.media.secure_legs(wiring.call_id).0?;
+                live.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .adopt(Some(&near_local.key), Some(&near_remote.key));
+                Some(live)
+            })
+            .unwrap_or_else(|| {
+                let mut near_leg = SecureLeg::new(&near_local.key, &near_remote.key);
+                if let Some(rollover) = self.media.near_rollover_snapshot(wiring.call_id) {
+                    near_leg.seed_rollover(&rollover);
+                }
+                Arc::new(Mutex::new(near_leg))
+            });
         let far_leg = far_keys.map(|(far_local, far_remote)| {
-            let mut far_leg = SecureLeg::new(&far_local.key, &far_remote.key);
-            if let Some(rollover) = self.media.rollover_snapshot(wiring.call_id) {
-                far_leg.seed_rollover(&rollover);
-            }
-            Arc::new(Mutex::new(far_leg))
+            self.carried_sdes_leg(wiring.call_id, true, (&far_local, &far_remote))
+                .or_else(|| {
+                    let live = self.media.secure_legs(wiring.call_id).1?;
+                    live.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .adopt(Some(&far_local.key), Some(&far_remote.key));
+                    Some(live)
+                })
+                .unwrap_or_else(|| {
+                    let mut far_leg = SecureLeg::new(&far_local.key, &far_remote.key);
+                    if let Some(rollover) = self.media.rollover_snapshot(wiring.call_id) {
+                        far_leg.seed_rollover(&rollover);
+                    }
+                    Arc::new(Mutex::new(far_leg))
+                })
         });
-        let near_leg = Arc::new(Mutex::new(near_leg));
         // Non-muxed companion RTCP, keyed on both sides for the same reason the RTP directions are.
         let mut rtcp_relays = Vec::new();
         if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp)) =
@@ -618,6 +686,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         .with_rtcp_relays(rtcp_relays);
         let call = call.with_app_events(self.call_app_queue(wiring.call_id));
+        let call = self.apply_hold_carry(
+            wiring.call_id,
+            call,
+            None,
+            (wiring.near.remote_rtp, Some(wiring.info.remote_rtp)),
+        );
         // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
         // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
         let mut call = call;
@@ -1239,15 +1313,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // renegotiation re-registers the text actor, and restarting either counter at 0
                     // breaks a stream that has already run past a sequence wrap, exactly as it does
                     // on the audio legs above.
-                    let previous_rollover = self.text.rollover_snapshots(call_id);
-                    let mut near_secure = SecureLeg::new(&near_local.key, &near_remote.key);
-                    let mut far_secure = SecureLeg::new(&far_local.key, &far_remote.key);
-                    if let Some((near_rollover, far_rollover)) = previous_rollover.as_ref() {
-                        near_secure.seed_rollover(near_rollover);
-                        far_secure.seed_rollover(far_rollover);
-                    }
-                    let near_leg = Arc::new(Mutex::new(near_secure));
-                    let far_leg = Arc::new(Mutex::new(far_secure));
+                    // A renegotiation that repeats a key keeps the actor's live leg and its send window
+                    // (RFC 3711 §9.1); only a changed key is replaced, in place.
+                    let (near_leg, far_leg) = match self.text.secure_legs(call_id) {
+                        Some((near_live, far_live)) => {
+                            near_live
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .adopt(Some(&near_local.key), Some(&near_remote.key));
+                            far_live
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .adopt(Some(&far_local.key), Some(&far_remote.key));
+                            (near_live, far_live)
+                        }
+                        None => (
+                            Arc::new(Mutex::new(SecureLeg::new(
+                                &near_local.key,
+                                &near_remote.key,
+                            ))),
+                            Arc::new(Mutex::new(SecureLeg::new(&far_local.key, &far_remote.key))),
+                        ),
+                    };
                     let a_to_b = TextDirectionConfig {
                         ingress_endpoint: near_text.id,
                         accepted_source: near_rule.accepted_source,
