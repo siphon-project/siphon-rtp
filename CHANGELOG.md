@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.28.1] — 2026-11-24
+
 ### Fixed
 
 - **An `answer_local` caller now gets the far party's out-of-band H.264 parameter sets.** When the far
