@@ -5,6 +5,19 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
+## [Unreleased]
+
+### Fixed
+
+- **An `answer_local` caller now gets the far party's out-of-band H.264 parameter sets.** When the far
+  answer carries `sprop-parameter-sets` (RFC 6184 §8.1, packetization mode 0 or 1) the caller's frozen
+  answer cannot, so the engine holds the far video back for its first IDR and sends the SPS and PPS that
+  IDR lacks just ahead of it, as single NAL unit packets under the two preceding sequence numbers (no
+  renumbering, nothing to rewrite in reports), then returns the stream to the kernel path. In-band sets
+  win over the SDP ones, and if no IDR arrives in about 2 seconds the stream is forwarded unchanged and
+  the far party asked for one more keyframe. Packetization mode 2 keeps the old behaviour. The go-live
+  keyframe request now also finds the far stream's SSRC while it rides the bridge.
+
 ## [0.28.0] — 2026-11-23
 
 ### Changed

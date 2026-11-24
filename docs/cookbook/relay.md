@@ -219,9 +219,12 @@ the stream like the audio:
   toward it) until `offer_far` offers the far party the same formats and that party answers. A far answer that
   keeps them relays video both ways, and each sending party that accepts `nack pli` is asked once for a keyframe;
   one that renumbers, adds or drops the one answered format, lowers an H.264 level, or declines the stream, loses the video alone and keeps the audio
-  relay (`video_declined` says why). A limit: the far party's out-of-band `sprop-parameter-sets` are not conveyed
-  to the caller (its answer is frozen); the relay relies on the in-band SPS/PPS sent with the IDR (RFC 6184 §8.4),
-  which the go-live PLI requests. The caller needs plain RTP: a secure, ICE or `ws_uri` caller is refused.
+  relay (`video_declined` says why). The far party's out-of-band `sprop-parameter-sets` cannot go in the caller's
+  frozen answer, so the engine hands them over in-band: it holds the far video back until the first IDR, sends
+  the SPS and PPS that IDR lacks just ahead of it (RFC 6184 §5.6, contiguous sequence numbers, nothing renumbered
+  afterwards) and returns the stream to the kernel path. A limit: packetization mode 2 and an unusable
+  `sprop-parameter-sets` are not covered; there the relay relies on the in-band SPS/PPS sent with the IDR
+  (RFC 6184 §8.4), which the go-live PLI requests. The caller needs plain RTP: a secure, ICE or `ws_uri` caller is refused.
 
 X3 interception on a call with anchored video covers the audio only.
 

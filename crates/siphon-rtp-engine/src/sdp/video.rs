@@ -14,6 +14,9 @@
 //! re-originates the section on the finished answer, as the control stream module does for the control stream.
 
 mod h264_profile;
+mod sprop;
+
+pub use sprop::sprop_parameter_sets;
 
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};

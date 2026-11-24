@@ -50,6 +50,7 @@ pub mod srtp_bridge;
 pub mod text_pipeline;
 pub mod turn_client_settings;
 pub mod udptl_pipeline;
+pub mod video_injector;
 pub mod ws_bridge;
 pub mod ws_x3;
 pub mod x3;

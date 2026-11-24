@@ -79,6 +79,15 @@ pub(super) struct CallVideo {
     pub(super) far_ssrc: Option<u32>,
     /// The keyframe requests still to send once the relay went live.
     pub(super) keyframe: super::call_video_local::KeyframeRequests,
+    /// The far party's `sprop-parameter-sets` (RFC 6184 §8.1) of an `answer_local` call, which its
+    /// caller's frozen answer cannot carry: the injector hands them over in-band
+    /// ([`crate::video_injector`]). Only set for packetization modes 0 and 1.
+    pub(super) far_sprop: Option<Box<siphon_rtp_media::h264::ParameterSets>>,
+    /// The injector now carrying the far party's video toward the caller, while it is armed.
+    pub(super) injector: Option<std::sync::Arc<crate::video_injector::VideoInjector>>,
+    /// The injector has delivered the sets (or given up): a renegotiation does not arm another,
+    /// the caller's decoder already has them.
+    pub(super) sprop_spent: bool,
 }
 
 /// The leg's video stream rebuilt from its snapshot and the endpoints bound for it.
@@ -130,6 +139,9 @@ pub(super) fn restored_call_video(
         near_ssrc: None,
         far_ssrc: None,
         keyframe: super::call_video_local::KeyframeRequests::default(),
+        far_sprop: None,
+        injector: None,
+        sprop_spent: false,
     })
 }
 
@@ -846,6 +858,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 },
             );
         }
+        // A negotiation that replaces the flows cancels the injector of the previous one; a plain
+        // relay re-arms it below while the caller still lacks the sets.
+        self.disarm_video_injector(call_id);
         let near_rule = ingress_rule(far.rtp.id, Some(far_gate), near_gate, profile, false);
         let far_rule = ingress_rule(near.rtp.id, near_gate, Some(far_gate), profile, false);
         let muxed = near.rtcp.is_none() || far.rtcp.is_none();
@@ -912,19 +927,34 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             return Ok(());
         }
-        // A stream that was secure and is plain now leaves the bridge before the kernel takes it.
-        self.bridge.deregister(endpoints);
+        // RFC 6184 §8.1: the far party's out-of-band parameter sets reach the caller in-band, ahead
+        // of the first IDR (`crate::video_injector`). Decided now, so the far endpoint is never given
+        // a `Forward` rule it would relay the first IDR by: it goes to the bridge flow directly, below.
+        let injector = self.plan_video_injector(call_id, &far_rule, far_to_near);
+        let injected = |endpoint: EndpointId| injector.is_some() && endpoint == far.rtp.id;
+        // A stream that was secure and is plain now leaves the bridge before the kernel takes it; the
+        // injected endpoint's flow is replaced in one step below instead.
+        self.bridge.deregister(
+            endpoints
+                .into_iter()
+                .filter(|endpoint| !injected(*endpoint)),
+        );
         let mut flows: Vec<(EndpointId, FlowAction)> = Vec::new();
         for (flow, allowed) in planned {
             let action = video_action(allowed, flow.rule);
-            self.datapath
-                .install_flow(flow.endpoint, action)
-                .map_err(|error| format!("install video flow: {error}"))?;
+            if !injected(flow.endpoint) {
+                self.datapath
+                    .install_flow(flow.endpoint, action)
+                    .map_err(|error| format!("install video flow: {error}"))?;
+            }
             flows.push((flow.endpoint, action));
         }
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.video.flows = flows;
             call.video.bridged.clear();
+        }
+        if let Some(injector) = injector {
+            self.activate_video_injector(call_id, far.rtp.id, far_rule, injector);
         }
         // A call grown from a local answer starts each sending decoder on a keyframe.
         self.arm_keyframe_requests(call_id, near_to_far, far_to_near);

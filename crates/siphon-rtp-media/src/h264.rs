@@ -83,6 +83,88 @@ fn classify_single<'a>(unit: &'a [u8], found: &mut Scan<'a>) {
     }
 }
 
+/// The largest SPS or PPS kept (a whole NAL unit, header included).
+pub const MAX_PARAMETER_SET: usize = 512;
+
+/// The last SPS and PPS of a stream, in buffers fixed at their largest, so noting one never
+/// allocates. Shared by everything that must start a receiver on a keyframe: the forwarding room
+/// replays them to a switched receiver, and the `answer_local` video injector sends the far
+/// party's out-of-band sets ahead of its first IDR (RFC 6184 §8.1).
+#[derive(Clone)]
+pub struct ParameterSets {
+    sps: [u8; MAX_PARAMETER_SET],
+    sps_length: usize,
+    pps: [u8; MAX_PARAMETER_SET],
+    pps_length: usize,
+}
+
+impl std::fmt::Debug for ParameterSets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ParameterSets")
+            .field("sps_length", &self.sps_length)
+            .field("pps_length", &self.pps_length)
+            .finish()
+    }
+}
+
+impl ParameterSets {
+    /// An empty set, boxed because the two buffers are 1 KiB.
+    #[must_use]
+    pub fn new() -> Box<Self> {
+        Box::new(Self {
+            sps: [0; MAX_PARAMETER_SET],
+            sps_length: 0,
+            pps: [0; MAX_PARAMETER_SET],
+            pps_length: 0,
+        })
+    }
+
+    /// The SPS NAL unit, header included, when one is held.
+    #[must_use]
+    pub fn sps(&self) -> Option<&[u8]> {
+        (self.sps_length > 0).then(|| &self.sps[..self.sps_length])
+    }
+
+    /// The PPS NAL unit, header included, when one is held.
+    #[must_use]
+    pub fn pps(&self) -> Option<&[u8]> {
+        (self.pps_length > 0).then(|| &self.pps[..self.pps_length])
+    }
+
+    /// Keep the SPS and PPS of `found`, copied: the packet's buffer is not ours. One larger than
+    /// [`MAX_PARAMETER_SET`] is ignored.
+    pub fn note(&mut self, found: &Scan<'_>) {
+        for (part, is_sps) in [(found.sps, true), (found.pps, false)] {
+            if let Some(unit) = part {
+                self.store(unit, is_sps);
+            }
+        }
+    }
+
+    /// Keep `unit` as the SPS (`is_sps`) or the PPS. Returns `false`, keeping what was held, for an
+    /// empty unit or one larger than [`MAX_PARAMETER_SET`].
+    pub fn store(&mut self, unit: &[u8], is_sps: bool) -> bool {
+        if unit.is_empty() || unit.len() > MAX_PARAMETER_SET {
+            return false;
+        }
+        let (buffer, length) = if is_sps {
+            (&mut self.sps, &mut self.sps_length)
+        } else {
+            (&mut self.pps, &mut self.pps_length)
+        };
+        buffer[..unit.len()].copy_from_slice(unit);
+        *length = unit.len();
+        true
+    }
+
+    /// Whether neither an SPS nor a PPS is held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sps_length == 0 && self.pps_length == 0
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -182,6 +264,28 @@ mod tests {
         for header in [0x79u8, 0x7A, 0x7B, 0x7D] {
             assert_eq!(scan(&[header, 0x85, 0x88, 0x84]), Scan::default());
         }
+    }
+
+    #[test]
+    fn parameter_sets_keep_the_last_sps_and_pps_and_refuse_an_oversize_one() {
+        let mut sets = ParameterSets::new();
+        assert!(sets.is_empty());
+        sets.note(&scan(&SPS));
+        sets.note(&scan(&PPS));
+        assert_eq!((sets.sps(), sets.pps()), (Some(&SPS[..]), Some(&PPS[..])));
+        let newer = [0x67, 0x42, 0x00, 0x1E];
+        sets.note(&scan(&newer));
+        assert_eq!(sets.sps(), Some(&newer[..]), "the last one wins");
+        let oversize = vec![0x67; MAX_PARAMETER_SET + 1];
+        assert!(!sets.store(&oversize, true));
+        assert!(!sets.store(&[], false));
+        assert_eq!(
+            sets.sps(),
+            Some(&newer[..]),
+            "a refused unit keeps what was held"
+        );
+        assert!(sets.store(&vec![0x68; MAX_PARAMETER_SET], false));
+        assert_eq!(sets.pps().map(<[u8]>::len), Some(MAX_PARAMETER_SET));
     }
 
     use proptest::prelude::*;

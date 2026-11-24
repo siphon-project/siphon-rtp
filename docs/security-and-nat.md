@@ -1459,6 +1459,31 @@ inbound surface, so it has its own gate and latch and none is inherited from the
   plain RTP caller is accepted: a secure, ICE or WebSocket-bridged caller is refused, since the answer cannot be
   revised once sent. The keyframe request sent when the relay goes live names a media SSRC the party declared in its own SDP or the relay latched from
   its admitted packets, never one the engine guessed, and goes to the address the relay forwards to.
+  - **The far party's `sprop-parameter-sets` (RFC 6184 §8.1).** The caller cannot be told them in its frozen
+    answer, so a far answer that carries a usable list in packetization mode 0 or 1 arms a first-IDR injector
+    (`video_injector`) on the far-to-caller flow. The flow is a plain `SrtpBridge` flow registered **before**
+    the far endpoint is redirected, so the first redirected datagram already finds its owner
+    (`an_injected_far_video_leg_owns_its_endpoint_before_it_is_redirected`) and the gate below runs first: the
+    bridge re-enforces the signalled-source gate and the latch, and a stranger is dropped before the injector
+    sees it, so it can neither start the injection nor reach the caller
+    (`a_stranger_cannot_drive_the_injector_or_reach_the_caller`). Order inside the bridge: source gate, latch,
+    liveness stamp, injector, send; the injector never relaxes a gate, only withholds. Before the first IDR it
+    drops every far RTP packet that does not begin one (RTCP, muxed on the port, passes); at the IDR it sends the
+    sets that packet lacks under the two sequence numbers before it, so nothing is renumbered. While the flow is
+    in userspace every packet at or before the number before the IDR is dropped (wrap-aware), and it stays there
+    until the sequence is 64 packets past the IDR (RFC 3550 §A.1 reordering tolerance) or the timeout, so a late
+    original cannot reach the caller under a number the sets used. The far endpoint is never given a `Forward`
+    rule first: it goes from parked straight to the redirect the bridge owns, so no packet is relayed ahead of
+    the injector. A set that cannot be sent holds the whole IDR back and the far party is asked for another.
+    Each sweep acts on an injector only while it is still the call's, under the call's map entry, so a
+    renegotiation or park that replaced the flow is never overwritten. Where the
+    flow forwards to is the signalled caller address, the bridge's own latch for the caller's endpoint, or the
+    datapath's latched source for it, in that order, so a NATed caller is still reached (an XDP backend keeps
+    no latched source, and the signalled address is used). Once settled (or, when no IDR comes, three sweeps after arming, the stream then
+    forwarding unchanged) the sweep returns the endpoint to the recorded
+    `Forward` rule and a sweep later removes the bridge flow. The injection is cancelled by a renegotiation,
+    by parking the video, by deleting the far leg and by teardown. Not covered: packetization mode 2, and a
+    secure caller (refused on this path anyway).
 - **HA.** The video sockets re-bind on their ports at restore, with the same gate and latch policy and the
   same directions. A secure stream also records its keys and each secure leg's rollover, so the standby's
   first packet past a wrap authenticates; its snapshot has a version of its own, so an older standby refuses
