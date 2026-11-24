@@ -1,20 +1,24 @@
 //! WB and SWB bandwidth-extension decoding (TS 26.442 `lib_dec/swb_bwe_dec_fx.c`; TS 26.445
 //! §6.3.4, §6.3.5).
 //!
-//! `swb_bwe_dec_fx` itself is not here yet: it synthesises the SWB band through
-//! `SWB_BWE_decoding_fx`, `time_envelop_shaping_fx` and `time_reduce_pre_echo_fx`
-//! (`lib_com/swb_bwe_com_fx.c`), none of which is ported. Everything else in the file is.
+//! `swb_bwe_dec` synthesises the SWB band of an ACELP frame through `swb_bwe_decoding`,
+//! `time_envelop_shaping` and `time_reduce_pre_echo` (`lib_com/swb_bwe_com_fx.c`).
 
 use crate::evs::basop::{l_extract_lc, mult_32_16};
 use crate::evs::cnst::{
-    ACELP_CORE, ALDO_WINDOW, DIM11, DIM12, DIM1ST, DIM2ND, DIM3RD, DIM4TH, DIM_FB, DIM_TR1,
-    HARMONIC, HQ_CORE, HQ_GENERIC_SP_EXC, HQ_GEN_FB, L_FRAME16K, L_FRAME48K, MODE1, NORMAL,
-    N_WS2N_FRAMES, SHARP_WIDTH, SWB_FENV, SWB_FENV_TRANS, SWB_TENV, WB_BWE,
+    ACELP_CORE, ALDO_WINDOW, DE_OFFSET1, DIM11, DIM12, DIM1ST, DIM2ND, DIM3RD, DIM4TH, DIM_FB,
+    DIM_TR1, FB_BAND_BEGIN, FB_BAND_END, FB_BAND_WIDTH, FB_BWE, FB_GAIN_QDELTA_FX, FB_GAIN_QLOW_FX,
+    HARMONIC, HQ_CORE, HQ_GENERIC_SP_EXC, HQ_GEN_FB, L_FRAME16K, L_FRAME32K, L_FRAME48K, L_SUBFR,
+    MODE1, NORMAL, NUM_BITS_FB_FRAMEGAIN, N_WS2N_FRAMES, SHARP_WIDTH, SWB_FENV, SWB_FENV_TRANS,
+    SWB_TENV, TRANSIENT, WB_BWE,
 };
 use crate::evs::com::bitstream::get_next_indice;
+use crate::evs::com::math_op::isqrt_lc;
 use crate::evs::com::math_op::{i_mult2, pow2};
-use crate::evs::com::swb_bwe_com::{wb_bwe_decoding, wb_bwe_gain_pred};
-use crate::evs::com::tools::{copy_scale_sig32_16, find_max_norm32};
+use crate::evs::com::swb_bwe_com::{
+    swb_bwe_decoding, time_envelop_shaping, time_reduce_pre_echo, wb_bwe_decoding, wb_bwe_gain_pred,
+};
+use crate::evs::com::tools::{copy_scale_sig32_16, find_max_norm32, usdequant};
 use crate::evs::com::trans_direct::direct_transform;
 use crate::evs::com::trans_inv::inverse_transform;
 use crate::evs::com::window_ola::window_ola;
@@ -25,14 +29,17 @@ use crate::evs::rom::{
     ENV_TR_CDBK1_FX, ENV_TR_CDBK2_FX, F_2_5_FX, MEAN_ENV_FB_FX, MEAN_ENV_FX, MEAN_ENV_TR_FX,
 };
 use crate::itu::basic_ops::{
-    abs_s, add, div_s, extract_l, l_add, l_deposit_l, l_mac, l_mult, l_shl, l_shr, l_sub, mult_r,
-    norm_l, norm_s, round_word, shl, shr, sub,
+    abs_s, add, div_s, extract_h, extract_l, l_add, l_deposit_h, l_deposit_l, l_mac, l_mult, l_shl,
+    l_shr, l_sub, mult, mult_r, norm_l, norm_s, round_word, shl, shr, sub,
 };
-use crate::itu::stl2009::{i_mult, l_msu0, l_mult0};
+use crate::itu::stl2009::{i_mult, l_mac0, l_msu0, l_mult0};
 
 /// `MAX_Q_NEW_INPUT` (file-local `#define`): the highest Q the MDCT of the core synthesis is
 /// scaled to before the 16-bit conversion.
 const MAX_Q_NEW_INPUT: i16 = 8;
+
+/// `Q_32_BITS` (file-local `#define`): the Q of the 32-bit SWB spectrum above its `Q_syn`.
+const Q_32_BITS: i16 = 15;
 
 const FRAME_MAX: usize = L_FRAME48K as usize;
 
@@ -398,6 +405,247 @@ pub fn wb_bwe_dec(
     q_syn_hb
 }
 
+/// `swb_bwe_dec_fx`: synthesise the SWB band of an ACELP frame into `hb_synth` from the core
+/// synthesis `synth` (Q`*qpost`, rescaled in place by the MDCT windowing). `*qpost` becomes the Q of
+/// the rescaled synthesis; returns the Q of `hb_synth`.
+// Index loops mirror the reference's pointer walks so the two can be diffed.
+#[allow(clippy::needless_range_loop)]
+pub fn swb_bwe_dec(
+    st: &mut DecoderState,
+    synth: &mut [i16],
+    hb_synth: &mut [i16],
+    output_frame: i16,
+    qpost: &mut i16,
+    coder_type: i16,
+) -> i16 {
+    let mut ysynth = [0i16; FRAME_MAX];
+    let mut l_wtda_synth = [0i32; 2 * FRAME_MAX];
+    let mut ysynth_32 = [0i32; FRAME_MAX];
+    let mut t_audio32_tmp = [0i32; FRAME_MAX];
+    let mut swb_tenv = [0i16; SWB_TENV as usize];
+    let mut swb_fenv = [0i16; SWB_FENV as usize];
+    let mut frica_flag: i16 = 0;
+
+    // windowing of the ACELP core synthesis
+    let mut new_input_fx_exp = *qpost;
+    wtda(
+        synth,
+        0,
+        &mut new_input_fx_exp,
+        &mut l_wtda_synth,
+        Some(&mut st.l_old_wtda_swb[..]),
+        &mut st.old_wtda_swb_fx_exp,
+        ALDO_WINDOW,
+        ALDO_WINDOW, // window overlap of current frame (0: full, 2: none, or 3: half)
+        output_frame,
+    );
+    *qpost = sub(new_input_fx_exp, 15);
+    // DCT of the ACELP core synthesis
+    direct_transform(
+        &l_wtda_synth,
+        &mut ysynth_32,
+        0,
+        output_frame,
+        &mut new_input_fx_exp,
+    );
+    let q_syn = wb_bwe_dec_to_16(&ysynth_32, &mut ysynth, output_frame, new_input_fx_exp);
+
+    let mode = swb_bwe_dec_envelopes(st, &ysynth, &mut swb_tenv, &mut swb_fenv, q_syn, coder_type);
+
+    // reconstruction of MDCT spectrum of the error signal
+    ysynth_32[..output_frame as usize].fill(0);
+    let st_offset = if sub(st.l_frame, L_FRAME16K) == 0 {
+        80
+    } else {
+        6
+    };
+    swb_bwe_decoding(
+        &ysynth,
+        &mut swb_fenv,
+        &mut ysynth_32,
+        L_FRAME32K - 80,
+        mode,
+        &mut frica_flag,
+        &mut st.prev_energy,
+        &mut st.prev_swb_fenv,
+        &mut st.prev_l_swb_norm,
+        st.tilt_wb,
+        &mut st.Seed,
+        st_offset,
+        &mut st.prev_weight,
+        st.extl,
+        q_syn,
+        st.last_extl,
+    );
+
+    if sub(st.prev_frica_flag, 1) == 0 && frica_flag == 0 {
+        for i in 0..L_SUBFR as usize {
+            let tmp = sub(32767, extract_l(l_mult0(i as i16, 512))); // Q15
+            st.mem_imdct[i] = mult_r(st.mem_imdct[i], tmp); // Q_synth
+        }
+        st.mem_imdct[L_SUBFR as usize..output_frame as usize].fill(0);
+    }
+
+    // decode information
+    if sub(st.extl, FB_BWE) == 0 {
+        swb_bwe_dec_fb_band(st, &mut ysynth_32, &swb_fenv, mode);
+    }
+
+    let mut q_syn_hb = add(q_syn, Q_32_BITS);
+    inverse_transform(
+        &ysynth_32,
+        &mut q_syn_hb,
+        &mut t_audio32_tmp,
+        0,
+        output_frame,
+        output_frame,
+    );
+    window_ola(
+        &t_audio32_tmp,
+        hb_synth,
+        &mut q_syn_hb,
+        &mut st.mem_imdct,
+        &mut st.mem_imdct_exp,
+        output_frame,
+        ALDO_WINDOW,
+        ALDO_WINDOW,
+        0,
+        0,
+        None,
+    );
+    let l_subfr = mult(output_frame, 8192);
+
+    if sub(mode, TRANSIENT) == 0 {
+        let mut swb_tenv_tmp = [0i32; SWB_TENV as usize];
+        for i in 0..SWB_TENV as usize {
+            swb_tenv_tmp[i] = l_mult0(swb_tenv[i], 26214); // Q15
+        }
+        // time envelope shaping when the current frame is TRANSIENT frame
+        time_envelop_shaping(hb_synth, &swb_tenv_tmp, output_frame, &mut q_syn_hb);
+        q_syn_hb = sub(q_syn_hb, 3);
+        st.prev_td_energy = swb_tenv[3];
+    } else if sub(frica_flag, 1) == 0 && st.prev_frica_flag == 0 {
+        time_reduce_pre_echo(
+            synth,
+            hb_synth,
+            st.prev_td_energy,
+            l_subfr,
+            *qpost,
+            q_syn_hb,
+        );
+    } else {
+        let tmp = i_mult2(3, l_subfr) as usize;
+        let mut l_tmp = l_deposit_l(0);
+        for i in 0..l_subfr as usize {
+            l_tmp = l_mac0(l_tmp, hb_synth[tmp + i], hb_synth[tmp + i]); // (2*Q_syn_hb)
+        }
+        l_tmp = mult_32_16(l_tmp, div_s(1, l_subfr)); // (2*Q_syn_hb)
+
+        st.prev_td_energy = 0;
+        if l_tmp != 0 {
+            let mut exp = norm_l(l_tmp);
+            let frac = extract_h(l_shl(l_tmp, exp));
+            exp = sub(exp, sub(30, shl(q_syn_hb, 1)));
+
+            let tmp = div_s(16384, frac);
+            let l_tmp = isqrt_lc(l_deposit_h(tmp), &mut exp); // Q(31-exp)
+            st.prev_td_energy = round_word(l_shl(l_tmp, sub(exp, 15))); // Q0
+        }
+    }
+
+    st.prev_frica_flag = frica_flag;
+    st.prev_mode = mode;
+    q_syn_hb
+}
+
+/// `swb_bwe_dec_fx`'s parameter stage: the BWE class and envelopes of the frame, from the bitstream,
+/// from the parameter prediction of a bandwidth switch, or (lost frame) from the last frame.
+/// Updates `prev_ener_shb`.
+fn swb_bwe_dec_envelopes(
+    st: &mut DecoderState,
+    ysynth: &[i16],
+    swb_tenv: &mut [i16],
+    swb_fenv: &mut [i16],
+    q_syn: i16,
+    coder_type: i16,
+) -> i16 {
+    if st.bfi != 0 {
+        // SHB FEC
+        let mode = if sub(st.prev_mode, TRANSIENT) != 0 {
+            st.prev_mode
+        } else {
+            NORMAL
+        };
+        swb_fenv[..SWB_FENV as usize].copy_from_slice(&st.prev_swb_fenv);
+        return mode;
+    }
+
+    let mode = if st.bws_cnt > 0 {
+        // estimate parameters
+        para_pred_bws(st, ysynth, swb_fenv, q_syn, coder_type)
+    } else {
+        // de-quantization
+        swb_bwe_gain_deq(st, ACELP_CORE, swb_tenv, swb_fenv, 0, -1)
+    };
+
+    let mut l = SWB_FENV;
+    if sub(mode, TRANSIENT) == 0 {
+        l = SWB_FENV_TRANS;
+    }
+    let mut l_tmp: i32 = 0;
+    for &value in &swb_fenv[..l as usize] {
+        l_tmp = l_add(l_tmp, i32::from(value));
+    }
+    let exp = norm_s(l);
+    let tmp = div_s(shl(1, sub(14, exp)), l); // Q(29-exp)
+    l_tmp = mult_32_16(l_tmp, tmp); // Q(1+29-exp+1-16)->Q(15-exp)
+    st.prev_ener_shb = round_word(l_shl(l_tmp, add(exp, 2))); // Q1
+    mode
+}
+
+/// `swb_bwe_dec_fx`'s FB stage: decode the FB frame gain and copy the 14-16 kHz spectrum up into
+/// the FB band (`FB_BAND_BEGIN..FB_BAND_END`), scaled by the gain.
+fn swb_bwe_dec_fb_band(st: &mut DecoderState, ysynth_32: &mut [i32], swb_fenv: &[i16], mode: i16) {
+    let fb_ener_adjust: i16 = if st.bfi == 0 {
+        let idx_gain = get_next_indice(st, NUM_BITS_FB_FRAMEGAIN) as i16;
+        usdequant(idx_gain, FB_GAIN_QLOW_FX, FB_GAIN_QDELTA_FX) // Q15
+    } else {
+        st.prev_fb_ener_adjust
+    };
+
+    st.prev_fb_ener_adjust = fb_ener_adjust;
+    let ener_adjust_quan: i16 = if sub(mode, TRANSIENT) == 0 {
+        shr(fb_ener_adjust, 2) // Q13
+    } else if swb_fenv[7] != 0 {
+        let tmp = div_s(1, swb_fenv[7]); // Q14
+                                         // s_min(.., 32767) of a Word16 is the identity
+        shr(i_mult(swb_fenv[13], tmp), 2) // Q13
+    } else {
+        0 // Q13
+    };
+
+    let mut j: i16 = 0;
+    let mut i = FB_BAND_BEGIN as usize;
+    while i < (FB_BAND_BEGIN + DE_OFFSET1) as usize {
+        let tmp = sub(32767, i_mult(j, 1024));
+        let tmp = mult_r(tmp, ener_adjust_quan); // Q13
+
+        let tmp2 = i_mult(j, 256); // Q13
+        let tmp2 = mult_r(tmp2, fb_ener_adjust); // Q13
+
+        let tmp = add(tmp, tmp2); // Q13
+        ysynth_32[i] = ysynth_32[i - FB_BAND_WIDTH as usize];
+        ysynth_32[i] = l_shl(mult_32_16(ysynth_32[i], tmp), 2); // 15+Q_syn
+        j = add(j, 1);
+        i += 1;
+    }
+    while i < FB_BAND_END as usize {
+        ysynth_32[i] = ysynth_32[i - FB_BAND_WIDTH as usize];
+        ysynth_32[i] = mult_32_16(ysynth_32[i], fb_ener_adjust); // 15+Q_syn
+        i += 1;
+    }
+}
+
 /// The 32 → 16-bit conversion of the core MDCT shared by the BWE decoders: upscale as far as the
 /// spectrum allows but no higher than Q`MAX_Q_NEW_INPUT`. Returns the Q of `ysynth`.
 fn wb_bwe_dec_to_16(
@@ -608,5 +856,40 @@ fn swb_bwe_gain_deq_normal(
             l_tmp = l_shr(l_tmp, 9); // From Q25 to Q16
             swb_fenv[n_band + nenv] = pow2_q16(l_tmp, 13, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lost_frame_reuses_the_previous_envelope_and_mode() {
+        let mut st = Box::new(DecoderState::zeroed());
+        st.bfi = 1;
+        st.prev_mode = TRANSIENT;
+        st.prev_swb_fenv = [7; 14];
+        let mut tenv = [0i16; 4];
+        let mut fenv = [0i16; 14];
+        let mode = swb_bwe_dec_envelopes(&mut st, &[0; 320], &mut tenv, &mut fenv, 0, 0);
+        assert_eq!(mode, NORMAL);
+        assert_eq!(fenv, [7; 14]);
+    }
+
+    #[test]
+    fn fb_band_of_a_lost_frame_scales_by_the_previous_gain() {
+        let mut st = Box::new(DecoderState::zeroed());
+        st.bfi = 1;
+        st.prev_fb_ener_adjust = 16384;
+        let mut spectrum = vec![0i32; FRAME_MAX];
+        spectrum[FB_BAND_BEGIN as usize + DE_OFFSET1 as usize - FB_BAND_WIDTH as usize + 5] =
+            1 << 20;
+        let fenv = [0i16; 14];
+        swb_bwe_dec_fb_band(&mut st, &mut spectrum, &fenv, NORMAL);
+        assert_eq!(st.prev_fb_ener_adjust, 16384);
+        assert_eq!(
+            spectrum[FB_BAND_BEGIN as usize + DE_OFFSET1 as usize + 5],
+            1 << 19
+        );
     }
 }

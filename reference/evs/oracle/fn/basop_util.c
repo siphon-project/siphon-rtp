@@ -73,6 +73,17 @@ static void case_sqrt32(void)
     arrow(); put1("mantissa", r); put1("exponent", e); end_line();
 }
 
+static void case_sqrt16(void)
+{
+    Word16 m = random16(), e = (Word16)random_range(-40, 40);
+    if (m < 0) m = (m == (Word16)0x8000) ? 32767 : (Word16)-m;
+    if (next_random() & 1) m = (Word16)(m >> random_range(0, 14));
+    if (next_random() % 16 == 0) m = 0;
+    put1("mantissa", m); put1("exponent", e);
+    Word16 r = Sqrt16(m, &e);
+    arrow(); put1("mantissa", r); put1("exponent", e); end_line();
+}
+
 static void case_get_scale_factor(void)
 {
     Word16 x[MAXN]; Word32 y[MAXN];
@@ -309,7 +320,7 @@ int main(int argc, char **argv)
 {
     static const struct { const char *name; void (*fn)(void); } table[] = {
         {"log2", case_log2}, {"inv_log2", case_inv_log2}, {"divide_mant_exp", case_divide_mant_exp},
-        {"sqrt32", case_sqrt32}, {"get_scale_factor", case_get_scale_factor},
+        {"sqrt32", case_sqrt32}, {"sqrt16", case_sqrt16}, {"get_scale_factor", case_get_scale_factor},
         {"divide3232_uu_1616", case_divide3232_uu_1616}, {"divide3232", case_divide3232},
         {"divide3232_plain", case_divide3232_plain},
         {"divide3216", case_divide3216}, {"sin_cos", case_sin_cos}, {"integer", case_integer},

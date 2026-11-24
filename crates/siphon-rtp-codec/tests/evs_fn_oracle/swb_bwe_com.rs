@@ -1,9 +1,9 @@
 //! `lib_com/swb_bwe_com_fx.c` against `fn_swb_bwe_com`.
 
-use siphon_rtp_codec::evs::cnst::{L_FRAME16K, WB_BWE};
+use siphon_rtp_codec::evs::cnst::{L_FRAME16K, L_FRAME32K, SWB_FENV, WB_BWE};
 use siphon_rtp_codec::evs::com::swb_bwe_com::{
-    calc_norm_envelop, calc_normal_length, calc_tilt_bwe, save_old_syn, wb_bwe_decoding,
-    wb_bwe_gain_pred,
+    calc_norm_envelop, calc_normal_length, calc_tilt_bwe, save_old_syn, swb_bwe_decoding,
+    time_envelop_shaping, time_reduce_pre_echo, wb_bwe_decoding, wb_bwe_gain_pred,
 };
 
 use crate::common::{corpus, mismatch, Case};
@@ -186,5 +186,120 @@ fn save_old_syn_matches_the_reference() {
         check(case, "old_syn", &old_syn, &case.out_i16s("old_syn"));
         check(case, "mem", &mem, &case.out_i16s("mem"));
         check(case, "mem_deemph", &mem_deemph, &case.out_i16("mem_deemph"));
+    }
+}
+
+#[test]
+fn swb_bwe_decoding_matches_the_reference_over_consecutive_frames() {
+    let Some(cases) = corpus("swb_bwe_com", "swb_bwe_decoding") else {
+        return;
+    };
+    for case in &cases {
+        let mut prev_energy = case.i16("prev_energy");
+        let mut prev_fenv = case.i16s("prev_fenv");
+        let mut prev_norm = case.i16("prev_norm");
+        let mut seed = case.i16("seed");
+        let mut prev_weight = case.i16("prev_weight");
+        for frame in 0..3 {
+            let mut signal = vec![12345; L_FRAME32K as usize];
+            let mut fenv = case.i16s(&format!("fenv{frame}"));
+            assert_eq!(fenv.len(), SWB_FENV as usize);
+            let mut frica_flag = 0;
+            swb_bwe_decoding(
+                &case.i16s(&format!("freq{frame}")),
+                &mut fenv,
+                &mut signal,
+                L_FRAME32K - 80,
+                case.i16(&format!("mode{frame}")),
+                &mut frica_flag,
+                &mut prev_energy,
+                &mut prev_fenv,
+                &mut prev_norm,
+                case.i16(&format!("tilt{frame}")),
+                &mut seed,
+                case.i16("st_offset"),
+                &mut prev_weight,
+                case.i16("extl"),
+                case.i16("q_syn"),
+                case.i16(&format!("last_extl{frame}")),
+            );
+            let out = |name: &str| format!("{name}{frame}");
+            check(
+                case,
+                &out("signal"),
+                &signal,
+                &case.out_i32s(&out("signal")),
+            );
+            check(case, &out("fenv"), &fenv, &case.out_i16s(&out("fenv")));
+            check(
+                case,
+                &out("frica"),
+                &frica_flag,
+                &case.out_i16(&out("frica")),
+            );
+            check(
+                case,
+                &out("prev_energy"),
+                &prev_energy,
+                &case.out_i16(&out("prev_energy")),
+            );
+            check(
+                case,
+                &out("prev_fenv"),
+                &prev_fenv,
+                &case.out_i16s(&out("prev_fenv")),
+            );
+            check(
+                case,
+                &out("prev_norm"),
+                &prev_norm,
+                &case.out_i16(&out("prev_norm")),
+            );
+            check(case, &out("seed"), &seed, &case.out_i16(&out("seed")));
+            check(
+                case,
+                &out("prev_weight"),
+                &prev_weight,
+                &case.out_i16(&out("prev_weight")),
+            );
+        }
+    }
+}
+
+#[test]
+fn time_envelop_shaping_matches_the_reference() {
+    let Some(cases) = corpus("swb_bwe_com", "time_envelop_shaping") else {
+        return;
+    };
+    for case in &cases {
+        let mut werr = case.i16s("werr");
+        let mut q_synth = case.i16("q_synth");
+        time_envelop_shaping(
+            &mut werr,
+            &case.i32s("tenv"),
+            case.i16("length"),
+            &mut q_synth,
+        );
+        check(case, "werr", &werr, &case.out_i16s("werr"));
+        check(case, "q_synth", &q_synth, &case.out_i16("q_synth"));
+    }
+}
+
+#[test]
+fn time_reduce_pre_echo_matches_the_reference() {
+    let Some(cases) = corpus("swb_bwe_com", "time_reduce_pre_echo") else {
+        return;
+    };
+    for case in &cases {
+        let mut error = case.i16s("error");
+        time_reduce_pre_echo(
+            &case.i16s("synth"),
+            &mut error,
+            case.i16("prev_td"),
+            case.i16("l"),
+            case.i16("q_syn"),
+            case.i16("q_synth"),
+        );
+        check(case, "error", &error, &case.out_i16s("error"));
     }
 }

@@ -7,9 +7,9 @@
 //!
 //! Two checks. Every bitstream those scripts name is a well-formed G.192 stream of legal EVS frames,
 //! and every reference output is exactly one 20 ms frame at the requested rate per input frame.
-//! And the decoder gate: the sequences of every rate in [`DECODER_DONE`] (clean, frame-erased and
-//! DTX alike) must decode byte for byte to the reference `.OUT`. A later phase adds its rates to
-//! that list.
+//! And the decoder gate: every decoder sequence either decodes byte for byte to the reference
+//! `.OUT` or stops at a named [`EvsError::Unsupported`] boundary of the port, and the number that
+//! decode identically matches [`DECODER_IDENTICAL`], which each later phase raises.
 //!
 //! The sequences are copyrighted and gitignored, so this skips when they are absent (a fresh
 //! checkout stays green) and `SIPHON_RTP_REQUIRE_VECTORS=1` turns that skip into a failure, and also
@@ -19,9 +19,12 @@
 #![cfg(feature = "evs")]
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
+mod evs_cases;
+
+use evs_cases::{cases, required, vectors_dir, Case};
 use siphon_rtp_codec::evs::decoder::EvsDecoder;
+use siphon_rtp_codec::evs::error::EvsError;
 use siphon_rtp_codec::evs::frame::FrameKind;
 use siphon_rtp_codec::evs::g192::G192Reader;
 
@@ -30,63 +33,6 @@ const SCRIPTS: &[(&str, usize)] = &[
     ("Readme_EVS_dec.txt", 979),
     ("Readme_AMRWB_IO_dec.txt", 1590),
 ];
-
-/// One `$DEC_BIN rate in out` line and the `$DIFF_BIN reference out` line that follows it.
-struct Case {
-    output_khz: usize,
-    bitstream: PathBuf,
-    reference: PathBuf,
-}
-
-fn vectors_dir() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("SIPHON_RTP_EVS_VECTORS") {
-        let path = PathBuf::from(path);
-        return path.is_dir().then_some(path);
-    }
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/evs/testvec");
-    dir.is_dir().then_some(dir)
-}
-
-fn required() -> bool {
-    std::env::var("SIPHON_RTP_REQUIRE_VECTORS").is_ok_and(|value| value == "1")
-}
-
-fn cases(root: &Path, script: &str) -> Vec<Case> {
-    let text = std::fs::read_to_string(root.join(script))
-        .unwrap_or_else(|error| panic!("reading {script}: {error}"));
-    let mut cases = Vec::new();
-    let mut pending: Option<(usize, PathBuf)> = None;
-    for line in text.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        match fields.first() {
-            Some(&"$DEC_BIN") => {
-                // `$DEC_BIN <kHz> <in> <out>`. Every decoder case upstream ships takes the output
-                // rate and nothing else; an option appearing here means the script changed under
-                // us, and is refused rather than silently ignored.
-                assert_eq!(
-                    fields.len(),
-                    4,
-                    "{script}: unexpected decoder options in {line:?}"
-                );
-                let output_khz = fields[1]
-                    .parse()
-                    .unwrap_or_else(|_| panic!("{script}: {line:?}"));
-                pending = Some((output_khz, root.join(fields[2])));
-            }
-            Some(&"$DIFF_BIN") => {
-                if let Some((output_khz, bitstream)) = pending.take() {
-                    cases.push(Case {
-                        output_khz,
-                        bitstream,
-                        reference: root.join(fields[1]),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    cases
-}
 
 #[test]
 fn every_decoder_sequence_is_well_formed_g192_and_one_output_frame_per_input_frame() {
@@ -170,34 +116,81 @@ fn every_decoder_sequence_is_well_formed_g192_and_one_output_frame_per_input_fra
     assert!(checked > 0 || !required(), "no sequence checked");
 }
 
-/// The bit rates (bit/s) whose NB and WB sequences (7.2 and 8.0 kbit/s ACELP; 32 and 64 kbit/s HQ,
-/// which also run the high-rate HQ core and, with frame erasures, the HQ concealment) the decoder is declared done for. Every case of
-/// `Readme_EVS_dec.txt` with an 8 or 16 kHz output at one of these rates (plain, DTX, `.b10` and
-/// `.f06` frame-erased) is decoded and compared. Extend it as the later phases land.
-const DECODER_DONE: &[u32] = &[7200, 8000, 32000, 64000];
+/// How many sequences of `Readme_EVS_dec.txt` decode byte-identical, per (bit rate, output kHz).
+/// The bit rate is the one a `..._<rate>_<kHz>kHz` sequence name carries (`stv16c_dtx_13200_16kHz`);
+/// the switching, network-simulation and channel-aware families name no single rate and count as
+/// `0`. Every other sequence must stop at a named [`EvsError::Unsupported`] boundary: a decoder
+/// that emits audio which differs from the reference, or fails any other way, fails the gate.
+/// Exact counts rather than a floor, so a case that moves from identical to refused is caught too.
+/// A later phase raises the counts it unlocks.
+const DECODER_IDENTICAL: &[((u32, usize), usize)] = &[
+    ((5900, 8), 9),
+    ((5900, 16), 9),
+    ((7200, 8), 18),
+    ((7200, 16), 18),
+    ((8000, 8), 18),
+    ((8000, 16), 18),
+    ((13200, 8), 12),
+    ((13200, 16), 6),
+    ((13200, 32), 6),
+    ((32000, 16), 18),
+    ((64000, 16), 18),
+    ((64000, 32), 18),
+    ((64000, 48), 18),
+];
 
-/// The (rate, output kHz) a `stv{8,16}c[_dtx]_<rate>_<kHz>kHz[.b10|.f06].COD` name encodes, or
-/// `None` for the other sequence families (switching, network simulations, other bandwidths).
-fn done_case(case: &Case) -> Option<u32> {
-    let name = case.bitstream.file_name()?.to_str()?;
-    if !matches!(case.output_khz, 8 | 16) {
-        return None;
+/// The (bit rate, output kHz) bucket of `case` in [`DECODER_IDENTICAL`]: the first `_<digits>_`
+/// field of four or more digits in the sequence name, or `0` when it has none.
+fn rate_bucket(case: &Case) -> (u32, usize) {
+    let name = case
+        .bitstream
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let rate = name
+        .split('_')
+        .skip(1)
+        .find(|field| field.len() >= 4 && field.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|field| field.parse().ok())
+        .unwrap_or(0);
+    (rate, case.output_khz)
+}
+
+/// What decoding one sequence came to.
+enum Outcome {
+    Identical,
+    /// Stopped at a boundary of the port that is not built yet.
+    Refused(String),
+    /// Audio that differs from the reference, or any other failure.
+    Failed(String),
+}
+
+fn outcome(case: &Case) -> Outcome {
+    match decode_case(case) {
+        Ok(None) => Outcome::Identical,
+        Ok(Some((frame, offset))) => {
+            Outcome::Failed(format!("first difference in frame {frame} sample {offset}"))
+        }
+        Err(DecodeFailure::Unsupported(reason)) => Outcome::Refused(reason),
+        Err(DecodeFailure::Other(reason)) => Outcome::Failed(reason),
     }
-    let stem = name.strip_suffix(".COD")?;
-    let stem = stem
-        .strip_suffix(".b10")
-        .or(stem.strip_suffix(".f06"))
-        .unwrap_or(stem);
-    let stem = stem
-        .strip_prefix("stv8c_")
-        .or(stem.strip_prefix("stv16c_"))?;
-    let stem = stem.strip_prefix("dtx_").unwrap_or(stem);
-    let rate: u32 = stem.split('_').next()?.parse().ok()?;
-    DECODER_DONE.contains(&rate).then_some(rate)
+}
+
+/// Why [`decode_case`] did not produce a comparable output.
+enum DecodeFailure {
+    /// [`EvsError::Unsupported`]: a frame needs a part of the decoder not ported yet.
+    Unsupported(String),
+    Other(String),
+}
+
+impl From<String> for DecodeFailure {
+    fn from(reason: String) -> Self {
+        Self::Other(reason)
+    }
 }
 
 /// Decode `case` and return the first differing sample (frame, offset) or `None` when identical.
-fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, String> {
+fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, DecodeFailure> {
     let bitstream = std::fs::read(&case.bitstream).map_err(|error| error.to_string())?;
     let reference = std::fs::read(&case.reference).map_err(|error| error.to_string())?;
     let mut decoder =
@@ -209,7 +202,12 @@ fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, String> {
         let frame = frame.map_err(|error| error.to_string())?;
         let written = decoder
             .decode_frame(&frame, &mut out)
-            .map_err(|error| format!("frame {index}: {error}"))?;
+            .map_err(|error| match error {
+                EvsError::Unsupported { .. } => {
+                    DecodeFailure::Unsupported(format!("frame {index}: {error}"))
+                }
+                other => DecodeFailure::Other(format!("frame {index}: {other}")),
+            })?;
         for sample in &out[..written] {
             pcm.extend_from_slice(&sample.to_le_bytes());
         }
@@ -219,11 +217,11 @@ fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, String> {
         pcm.extend_from_slice(&sample.to_le_bytes());
     }
     if pcm.len() != reference.len() {
-        return Err(format!(
+        return Err(DecodeFailure::Other(format!(
             "{} bytes, reference {}",
             pcm.len(),
             reference.len()
-        ));
+        )));
     }
     Ok(pcm
         .iter()
@@ -236,7 +234,7 @@ fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, String> {
 }
 
 #[test]
-fn declared_done_decoder_sequences_decode_byte_identical() {
+fn every_decoder_sequence_decodes_byte_identical_or_is_refused_at_a_named_boundary() {
     let Some(root) = vectors_dir() else {
         assert!(
             !required(),
@@ -245,42 +243,70 @@ fn declared_done_decoder_sequences_decode_byte_identical() {
         eprintln!("skipping: EVS conformance sequences not installed (sh reference/evs/fetch.sh)");
         return;
     };
-    let mut failures = Vec::new();
-    let mut passed = 0usize;
-    for case in cases(&root, "Readme_EVS_dec.txt") {
-        if done_case(&case).is_none() {
-            continue;
+    let all = cases(&root, "Readme_EVS_dec.txt");
+    // One sequence per worker at a time: each holds a decoder and two whole files.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results = std::sync::Mutex::new(Vec::new());
+    let workers = std::thread::available_parallelism().map_or(4, |count| count.get().min(16));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(case) = all.get(index) else { break };
+                let result = (
+                    rate_bucket(case),
+                    case.bitstream.display().to_string(),
+                    outcome(case),
+                );
+                results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(result);
+            });
         }
-        let name = case.bitstream.display().to_string();
-        match decode_case(&case) {
-            Ok(None) => passed += 1,
-            Ok(Some((frame, offset))) => {
-                failures.push(format!(
-                    "{name}: first difference in frame {frame} sample {offset}"
-                ));
+    });
+    let results = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let mut identical: BTreeMap<(u32, usize), usize> = BTreeMap::new();
+    let (mut refused, mut failures) = (BTreeMap::<String, usize>::new(), Vec::new());
+    for (bucket, name, result) in results {
+        match result {
+            Outcome::Identical => *identical.entry(bucket).or_default() += 1,
+            Outcome::Refused(reason) => {
+                // `frame N: <what is not supported>`: count by the boundary, not the frame
+                let boundary = reason
+                    .split_once(": ")
+                    .map_or(reason.as_str(), |(_, boundary)| boundary);
+                *refused.entry(boundary.to_owned()).or_default() += 1;
             }
-            Err(error) => failures.push(format!("{name}: {error}")),
+            Outcome::Failed(reason) => failures.push(format!("{name}: {reason}")),
         }
     }
     eprintln!(
-        "{passed} sequences byte-identical, {} failed",
+        "{} sequences byte-identical, {} refused at a boundary, {} failed",
+        identical.values().sum::<usize>(),
+        refused.values().sum::<usize>(),
         failures.len()
     );
+    for (boundary, count) in &refused {
+        eprintln!("  {count} refused: {boundary}");
+    }
     for failure in &failures {
         eprintln!("FAIL {failure}");
     }
-    assert!(failures.is_empty(), "{} sequences differ", failures.len());
-    // 7.2 and 8.0 kbit/s: NB and WB; 32 and 64 kbit/s: WB only; each plain and DTX, clean, .b10
-    // and .f06
-    assert!(
-        passed == 0 && !required() || passed == 36,
-        "expected 36 sequences, ran {passed}"
+    assert!(failures.is_empty(), "{} sequences failed", failures.len());
+    let expected: BTreeMap<(u32, usize), usize> = DECODER_IDENTICAL.iter().copied().collect();
+    assert_eq!(
+        identical, expected,
+        "byte-identical sequences per (bit rate, output kHz) changed"
     );
 }
 
 #[test]
 fn a_mode2_sequence_is_refused_not_decoded() {
-    use siphon_rtp_codec::evs::error::{EvsError, UnsupportedMode};
+    use siphon_rtp_codec::evs::error::UnsupportedMode;
     let Some(root) = vectors_dir() else {
         assert!(
             !required(),

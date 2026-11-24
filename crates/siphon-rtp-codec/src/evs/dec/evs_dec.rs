@@ -22,6 +22,7 @@ use crate::evs::com::log2::log2_norm_lc;
 use crate::evs::com::tcx_ltp::tcx_ltp_post;
 use crate::evs::com::tools::{add_vec, copy_scale_sig, random, scale_sig, scale_sig32, set16};
 use crate::evs::dec::acelp_core_dec::acelp_core_dec;
+use crate::evs::dec::cng_dec::swb_cng_dec;
 use crate::evs::dec::core_switching_dec::{
     bandwidth_switching_detect, bw_switching_pre_proc, core_switching_post_dec,
     core_switching_pre_dec,
@@ -29,7 +30,9 @@ use crate::evs::dec::core_switching_dec::{
 use crate::evs::dec::decision_matrix_dec::decision_matrix_dec;
 use crate::evs::dec::hq_core_dec::hq_core_dec;
 use crate::evs::dec::state::DecoderState;
-use crate::evs::dec::swb_bwe_dec::wb_bwe_dec;
+use crate::evs::dec::swb_bwe_dec::{swb_bwe_dec, wb_bwe_dec};
+use crate::evs::dec::swb_bwe_dec_hr::swb_bwe_dec_hr;
+use crate::evs::dec::swb_tbe_dec::{fb_tbe_dec, swb_tbe_dec, wb_tbe_dec};
 use crate::evs::dec::syn_outp::syn_output;
 use crate::evs::dec::updt_dec::{updt_bw_switching, updt_dec_common};
 use crate::evs::error::{EvsError, UnsupportedMode};
@@ -57,6 +60,9 @@ struct FrameWork {
     old_syn_12k8_16k: [i16; L_FRAME16K as usize],
     sid_bw: i16,
     unbits: i16,
+    /// The FB TBE excitation `swb_tbe_dec` hands `fb_tbe_dec` (`fb_exc_fx`), and its Q.
+    fb_exc: [i16; L_FRAME16K as usize],
+    q_fb_exc: i16,
     coder_type: i16,
     sharp_flag: i16,
     hq_core_type: i16,
@@ -79,9 +85,8 @@ fn sin_table256(index: i16) -> i16 {
 /// `frame_mode` is `FRAMEMODE_NORMAL` or `FRAMEMODE_MISSING`.
 ///
 /// # Errors
-/// [`EvsError::Unsupported`] for a frame that needs MODE2 (TCX), AMR-WB IO, or a bandwidth
-/// extension decoder this port does not run yet; the state is then mid-frame and the decoder
-/// must not be used further.
+/// [`EvsError::Unsupported`] for a frame that needs MODE2 (TCX) or AMR-WB IO, which this port
+/// does not run yet; the state is then mid-frame and the decoder must not be used further.
 pub fn evs_dec(
     st: &mut DecoderState,
     output_sp: &mut [i16],
@@ -98,6 +103,8 @@ pub fn evs_dec(
         old_syn_12k8_16k: [0; L_FRAME16K as usize],
         sid_bw: -1,
         unbits: 0,
+        fb_exc: [0; L_FRAME16K as usize],
+        q_fb_exc: 0,
         coder_type: INACTIVE,
         sharp_flag: 0,
         hq_core_type: -1,
@@ -288,10 +295,17 @@ fn evs_dec_core(st: &mut DecoderState, w: &mut FrameWork) -> Result<(), EvsError
 /// SHB comfort noise.
 fn evs_dec_extension(st: &mut DecoderState, w: &mut FrameWork) -> Result<(), EvsError> {
     if sub(st.extl, WB_TBE) == 0 {
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Bandwidth,
-            reference_call: "wb_tbe_dec_fx",
-        });
+        // WB TBE decoder
+        let q_exc = st.q_exc;
+        wb_tbe_dec(
+            st,
+            w.coder_type,
+            &w.bwe_exc_extended,
+            q_exc,
+            &w.voice_factors,
+            &mut w.hb_synth,
+            &mut w.hb_synth_exp,
+        );
     } else if sub(st.extl, WB_BWE) == 0 && st.bws_cnt == 0 {
         // WB BWE decoder
         w.hb_synth_exp = wb_bwe_dec(
@@ -317,10 +331,25 @@ fn evs_dec_extension(st: &mut DecoderState, w: &mut FrameWork) -> Result<(), Evs
         && st.ppp_mode_dec == 0
         && !(sub(st.nelp_mode_dec, 1) == 0 && sub(st.bfi, 1) == 0);
     if sub(st.extl, SWB_TBE) == 0 || sub(st.extl, FB_TBE) == 0 || shb_bws {
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Bandwidth,
-            reference_call: "swb_tbe_dec_fx",
-        });
+        let q_exc = st.q_exc;
+        swb_tbe_dec(
+            st,
+            w.coder_type,
+            &w.bwe_exc_extended,
+            q_exc,
+            &w.voice_factors,
+            &w.old_syn_12k8_16k,
+            &mut w.fb_exc,
+            &mut w.q_fb_exc,
+            &mut w.hb_synth,
+            &mut w.hb_synth_exp,
+            &w.pitch_buf,
+        );
+
+        // FB TBE decoder / synthesis
+        if sub(w.output_frame, L_FRAME48K) == 0 && sub(st.extl, FB_TBE) == 0 {
+            fb_tbe_dec(st, &w.fb_exc, w.q_fb_exc, &mut w.hb_synth, w.hb_synth_exp);
+        }
     } else if sub(st.extl, SWB_BWE) == 0
         || sub(st.extl, FB_BWE) == 0
         || (st.output_fs >= 32000
@@ -330,15 +359,25 @@ fn evs_dec_extension(st: &mut DecoderState, w: &mut FrameWork) -> Result<(), Evs
             && st.ppp_mode_dec == 0
             && !(sub(st.nelp_mode_dec, 1) == 0 && sub(st.bfi, 1) == 0))
     {
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Bandwidth,
-            reference_call: "swb_bwe_dec_fx",
-        });
+        // SWB BWE decoder
+        w.hb_synth_exp = swb_bwe_dec(
+            st,
+            &mut w.synth,
+            &mut w.hb_synth,
+            w.output_frame,
+            &mut w.qpostd,
+            w.coder_type,
+        );
     } else if sub(st.extl, SWB_BWE_HIGHRATE) == 0 || sub(st.extl, FB_BWE_HIGHRATE) == 0 {
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Bandwidth,
-            reference_call: "swb_bwe_dec_hr_fx",
-        });
+        w.hb_synth_exp = swb_bwe_dec_hr(
+            st,
+            &w.old_syn_12k8_16k,
+            w.qpostd,
+            &mut w.hb_synth,
+            w.output_frame,
+            w.unbits,
+            &w.pitch_buf,
+        );
     }
 
     // FEC - recovery after lost HQ core (smoothing of the BWE component)
@@ -360,10 +399,11 @@ fn evs_dec_extension(st: &mut DecoderState, w: &mut FrameWork) -> Result<(), Evs
 
     // SWB CNG
     if sub(w.output_frame, L_FRAME32K) >= 0 {
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Bandwidth,
-            reference_call: "swb_CNG_dec_fx",
-        });
+        // SHB CNG decoder
+        swb_cng_dec(st, &w.synth, &mut w.hb_synth, w.sid_bw, w.qpostd);
+        if st.core_brate <= i32::from(SID_2K40) && st.bws_cnt == 0 {
+            w.hb_synth_exp = 3;
+        }
     }
     Ok(())
 }

@@ -2,9 +2,9 @@
 //! library type. One [`G192Frame`] in, one 20 ms frame of 16-bit PCM out, with the decoder's
 //! algorithmic delay removed from the start of the stream exactly as the reference does.
 //!
-//! Only MODE1 (ACELP / HQ) frames decode today; a frame that needs MODE2 (TCX), AMR-WB IO or a
-//! bandwidth extension this port does not have yet is refused with [`EvsError::Unsupported`] and
-//! never produces audio (see [`crate::evs::dec::evs_dec::evs_dec`]).
+//! Only MODE1 (ACELP / HQ) frames decode today; a frame that needs MODE2 (TCX) or AMR-WB IO is
+//! refused with [`EvsError::Unsupported`] and never produces audio (see
+//! [`crate::evs::dec::evs_dec::evs_dec`]).
 
 use crate::evs::basop::mult_32_16;
 use crate::evs::cnst::{DEC, L_FRAME48K, MAX_FRAME_COUNTER};
