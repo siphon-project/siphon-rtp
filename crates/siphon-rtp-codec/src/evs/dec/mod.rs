@@ -61,6 +61,7 @@ pub mod rst_dec;
 pub mod stat_noise_uv_dec;
 pub mod state;
 pub mod swb_bwe_dec;
+pub mod swb_bwe_dec_hr;
 pub mod swb_bwe_dec_lr;
 pub mod swb_tbe_dec;
 pub mod syn_outp;

@@ -76,6 +76,7 @@ pub mod scale_mem;
 pub mod stab_est;
 pub mod stat_noise_uv_mod;
 pub mod swb_bwe_com;
+pub mod swb_bwe_com_hr;
 pub mod swb_bwe_com_lr;
 pub mod swb_tbe_com;
 pub mod syn_12k8;

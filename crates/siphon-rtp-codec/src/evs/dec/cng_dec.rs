@@ -1,7 +1,7 @@
 //! Comfort-noise decoding of an inactive ACELP frame: the SID parameters (LSPs, energy, spectral
 //! envelope) and the hangover averaging that smooths the transition from active speech (TS 26.442
 //! `lib_dec/cng_dec_fx.c`; TS 26.445 §6.7.2). `swb_CNG_dec_fx` and its local `shb_CNG_decod_fx`
-//! (the SWB TBE comfort noise) are not part of the ACELP core and are not ported here.
+//! (the SWB TBE comfort noise) are in `cng_dec/swb_cng.rs`.
 
 use crate::evs::basop::{l_extract_lc, mpy_32_16_1, mult_32_16};
 use crate::evs::cnst::{
@@ -25,6 +25,9 @@ use crate::itu::basic_ops::{
     shl, shr, sub,
 };
 use crate::itu::stl2009::{l_mac0, l_mult0, mac_r};
+
+mod swb_cng;
+pub use swb_cng::swb_cng_dec;
 
 const ORDER: usize = M as usize;
 const ENVELOPE_BANDS: usize = NUM_ENV_CNG as usize;

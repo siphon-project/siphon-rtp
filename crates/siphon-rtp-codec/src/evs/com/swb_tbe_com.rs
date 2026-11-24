@@ -22,6 +22,25 @@ use crate::itu::basic_ops::{
 use crate::itu::oper_32b::mpy_32_16;
 use crate::itu::stl2009::mac_r;
 
+mod fb_synthesis;
+mod hilbert;
+mod mix_factors;
+mod post_filter;
+mod scale_shaped;
+mod shb_excitation;
+mod wb_excitation;
+
+pub use fb_synthesis::{elliptic_bpf_48k_generic, synthesise_fb_high_band};
+pub use hilbert::{
+    create_random_vector, flip_and_downmix_generic, flip_spectrum, flip_spectrum_and_decimby4,
+    hilbert_transform, hilbert_transform_sp,
+};
+pub use mix_factors::estimate_mix_factors;
+pub use post_filter::{calc_st_filt_tbe, filt_mu, post_short_term, scale_st_swb, swb_formant_fac};
+pub use scale_shaped::{scale_shaped_shb, scale_shaped_wb};
+pub use shb_excitation::gen_shaped_shb_excitation;
+pub use wb_excitation::{gen_shaped_wb_excitation, gen_shb_synth, gen_wb_synth};
+
 /// `L_SUBFR * HIBND_ACB_L_FAC`: one 12.8 kHz subframe at the 32 kHz TBE excitation rate.
 const L_SUBFR_HIBND: usize = L_SUBFR as usize * 5 / 2;
 

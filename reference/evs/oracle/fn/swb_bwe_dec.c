@@ -181,6 +181,106 @@ static void case_wb_bwe_dec(void)
     free(st);
 }
 
+/* The BWE memories swb_bwe_dec_fx reads and writes, in one fixed order the Rust side mirrors. */
+static void put_swb_state(const char *prefix, Decoder_State_fx *st)
+{
+    char name[48];
+    Word16 s[] = {st->old_wtda_swb_fx_exp, st->mem_imdct_exp_fx, st->prev_L_swb_norm_fx, st->Seed_fx,
+                  st->prev_mode_fx, st->prev_Energy_fx, st->prev_weight_fx, st->prev_frica_flag_fx,
+                  st->prev_td_energy_fx, st->prev_fb_ener_adjust_fx, st->prev_ener_shb_fx, st->attenu_fx,
+                  st->bws_cnt_fx, st->bws_cnt1_fx, st->next_bit_pos_fx, st->BER_detect};
+    sprintf(name, "%s_state", prefix); put16(name, s, 16);
+    sprintf(name, "%s_fenv", prefix); put16(name, st->prev_SWB_fenv_fx, SWB_FENV);
+    sprintf(name, "%s_wtda", prefix); put16(name, st->L_old_wtda_swb_fx, L_FRAME48k);
+    sprintf(name, "%s_imdct", prefix); put16(name, st->mem_imdct_fx, L_FRAME48k);
+}
+
+/* A time-domain ACELP synthesis: a random walk, white noise, both, or bursts, at a random level. */
+static void random_synthesis(Word16 *x, int n)
+{
+    int kind = next_random() % 6;
+    int level = 1 << random_range(5, 13);
+    if (kind == 0) { memset(x, 0, n * sizeof(Word16)); return; }
+    if (kind == 1 || kind == 4) random_signal(x, n, level);
+    else for (int i = 0; i < n; i++) x[i] = (Word16)random_range(-level / 4, level / 4);
+    if (kind == 3) for (int i = 0; i < n; i++) x[i] = (Word16)(x[i] + random_range(-level / 8, level / 8));
+    if (kind == 4 || kind == 5) {
+        /* bursts: a loud stretch somewhere in the frame, the rest quiet */
+        int start = random_range(0, n - 1), length = random_range(8, n / 3);
+        for (int i = 0; i < n; i++) if (i < start || i > start + length) x[i] = (Word16)(x[i] >> 4);
+    }
+}
+
+/* swb_bwe_dec_fx over three frames on one state. 32 kHz output (SWB_BWE) or 48 kHz (SWB_BWE or FB_BWE),
+ * both core rates, lost frames, bandwidth-switching frames. */
+static void case_swb_bwe_dec(void)
+{
+    static const Word16 frames[] = {L_FRAME32k, L_FRAME48k, L_FRAME48k};
+    static const Word16 extls[] = {SWB_BWE, SWB_BWE, FB_BWE};
+    static const Word16 last_extls[] = {-1, WB_BWE, SWB_BWE, SWB_BWE, FB_BWE, FB_BWE, WB_TBE};
+    Decoder_State_fx *st = calloc(1, sizeof(Decoder_State_fx));
+    int which = next_random() % 3;
+    Word16 output_frame = frames[which];
+    st->extl_fx = extls[which];
+    st->L_frame_fx = (Word16)(next_random() & 1 ? L_FRAME16k : L_FRAME);
+    st->old_wtda_swb_fx_exp = (Word16)random_range(0, 4);
+    st->mem_imdct_exp_fx = (Word16)random_range(0, 4);
+    st->prev_L_swb_norm_fx = (Word16)random_range(1, 40);
+    st->Seed_fx = random16();
+    st->prev_mode_fx = (Word16)random_range(0, 3);
+    st->prev_Energy_fx = (Word16)(next_random() % 4 ? random_range(0, 4000) : random_range(0, 32767));
+    st->prev_weight_fx = (Word16)random_range(6554, 16384);
+    st->prev_frica_flag_fx = (Word16)random_range(0, 1);
+    st->prev_td_energy_fx = (Word16)random_range(0, 32767);
+    st->prev_fb_ener_adjust_fx = (Word16)random_range(0, 32767);
+    st->prev_ener_shb_fx = (Word16)random_range(0, 4000);
+    st->tilt_wb_fx = (Word16)(next_random() % 3 ? random_range(0, 32767) : random_range(14000, 32767));
+    st->attenu_fx = (Word16)random_range(3277, 31129);
+    st->bws_cnt_fx = (Word16)(next_random() % 3 ? 0 : random_range(1, N_WS2N_FRAMES));
+    st->bws_cnt1_fx = (Word16)(next_random() % 2 ? 0 : random_range(1, N_NS2W_FRAMES));
+    for (int i = 0; i < SWB_FENV; i++) st->prev_SWB_fenv_fx[i] = (Word16)random_range(0, 1 << random_range(4, 12));
+    random_signal(st->L_old_wtda_swb_fx, L_FRAME48k, 1 << random_range(4, 13));
+    random_signal(st->mem_imdct_fx, L_FRAME48k, 1 << random_range(4, 13));
+    put1("output_frame", output_frame);
+    Word16 init[] = {st->extl_fx, st->L_frame_fx, st->tilt_wb_fx};
+    put16("init_cfg", init, 3);
+    put_swb_state("init", st);
+    for (int f = 0; f < FRAMES; f++) {
+        Word16 synth[L_FRAME48k], hb[L_FRAME48k], qpost = (Word16)random_range(-1, 3), coder_type = (Word16)random_range(0, 5);
+        char name[32];
+        random_synthesis(synth, output_frame);
+        for (int i = 0; i < L_FRAME48k; i++) hb[i] = -7;
+        random_bits(st, 80);
+        st->bfi_fx = (Word16)(next_random() % 6 == 0);
+        st->last_extl_fx = f > 0 && next_random() % 2 ? st->extl_fx : last_extls[next_random() % 7];
+        st->prev_coder_type_fx = (Word16)random_range(0, 5);
+        st->last_core_fx = (Word16)(next_random() % 3 ? ACELP_CORE : HQ_CORE);
+        st->last_codec_mode = (Word16)(next_random() % 4 ? MODE1 : MODE2);
+        st->core_brate_fx = next_random() % 2 ? ACELP_13k20 : ACELP_9k60;
+        st->last_core_brate_fx = next_random() % 3 ? st->core_brate_fx : ACELP_16k40;
+        st->prev_enerLH_fx = random_energy();
+        st->enerLH_fx = next_random() % 2 ? st->prev_enerLH_fx + (Word32)random_range(-(st->prev_enerLH_fx / 3), st->prev_enerLH_fx / 3) : random_energy();
+        st->prev_enerLL_fx = random_energy();
+        st->enerLL_fx = next_random() % 2 ? st->prev_enerLL_fx + (Word32)random_range(-(st->prev_enerLL_fx / 3), st->prev_enerLL_fx / 3) : random_energy();
+        st->tilt_wb_fx = (Word16)(next_random() % 3 ? random_range(0, 32767) : random_range(14000, 32767));
+        Word16 in16[] = {qpost, coder_type, st->bfi_fx, st->last_extl_fx, st->prev_coder_type_fx, st->last_core_fx,
+                         st->last_codec_mode, st->next_bit_pos_fx, st->tilt_wb_fx};
+        Word32 in32[] = {st->core_brate_fx, st->last_core_brate_fx, st->enerLH_fx, st->prev_enerLH_fx, st->enerLL_fx, st->prev_enerLL_fx};
+        sprintf(name, "f%d_in16", f); put16(name, in16, 9);
+        sprintf(name, "f%d_in32", f); put32(name, in32, 6);
+        sprintf(name, "f%d_bits", f); put_u16(name, bit_buffer, 80);
+        sprintf(name, "f%d_synth", f); put16(name, synth, output_frame);
+        Word16 q_hb = swb_bwe_dec_fx(st, synth, hb, output_frame, &qpost, coder_type);
+        Word16 q[] = {q_hb, qpost};
+        sprintf(name, "f%d_q", f); put16(name, q, 2);
+        sprintf(name, "f%d_osynth", f); put16(name, synth, output_frame);
+        sprintf(name, "f%d_hb", f); put16(name, hb, output_frame);
+        sprintf(name, "f%d", f); put_swb_state(name, st);
+    }
+    printf(" ->"); end_line();
+    free(st);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 5 || strcmp(argv[1], "corpus")) { fprintf(stderr, "usage: corpus FUNCTION COUNT SEED\n"); return 2; }
@@ -190,6 +290,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[2], "wb_bwe_gain_deq")) case_wb_bwe_gain_deq();
         else if (!strcmp(argv[2], "swb_bwe_gain_deq")) case_swb_bwe_gain_deq();
         else if (!strcmp(argv[2], "wb_bwe_dec")) case_wb_bwe_dec();
+        else if (!strcmp(argv[2], "swb_bwe_dec")) case_swb_bwe_dec();
         else { fprintf(stderr, "unknown function %s\n", argv[2]); return 2; }
     }
     return 0;

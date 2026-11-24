@@ -152,6 +152,105 @@ static void case_wb_bwe_decoding(void)
     end_line();
 }
 
+/* SWB_BWE_decoding_fx over three consecutive frames: prev_Energy, prev_SWB_fenv, prev_L_swb_norm, Seed
+ * and prev_weight carry from frame to frame. The decoder calls it with swb_flength 560 and a
+ * st_offset of 80 (16 kHz core) or 6 (12.8 kHz core), extl SWB_BWE or FB_BWE. */
+static void case_swb_bwe_decoding(void)
+{
+    int level = 1 << random_range(4, 15);
+    Word16 prev_energy = (Word16)(next_random() % 4 ? random_range(0, 4000) : random_range(0, 32767));
+    Word16 prev_fenv[SWB_FENV], prev_norm = (Word16)random_range(1, 40), seed = random16();
+    Word16 prev_weight = (Word16)random_range(6554, 16384);
+    Word16 q_syn = (Word16)random_range(-2, 8);
+    Word16 st_offset = (Word16)(next_random() & 1 ? 80 : 6);
+    Word16 extl = (Word16)(next_random() & 1 ? SWB_BWE : FB_BWE);
+    for (int i = 0; i < SWB_FENV; i++) prev_fenv[i] = (Word16)random_range(0, 4000);
+    put1("prev_energy", prev_energy); put16("prev_fenv", prev_fenv, SWB_FENV); put1("prev_norm", prev_norm);
+    put1("seed", seed); put1("prev_weight", prev_weight); put1("q_syn", q_syn); put1("st_offset", st_offset);
+    put1("extl", extl);
+    Word16 freq[3][L_FRAME16k], fenv[3][SWB_FENV], mode[3], last_extl[3], tilt[3];
+    static const Word16 last_extls[] = {-1, WB_BWE, SWB_BWE, SWB_BWE, FB_BWE, FB_BWE};
+    for (int f = 0; f < 3; f++) {
+        if (next_random() % 4) {
+            random_signal(freq[f], L_FRAME16k, level);
+            for (int i = 0; i < L_FRAME16k; i++) if (next_random() & 1) freq[f][i] = (Word16)-freq[f][i];
+            if (next_random() % 5 == 0) for (int i = 0; i < 16; i++) freq[f][i] = (Word16)(freq[f][i] << 6);
+        } else random_spectrum(freq[f], L_FRAME16k);
+        if (next_random() % 6 == 0) {
+            /* a flat, loud top end: the noise-excitation decision */
+            for (int i = 224; i < L_FRAME16k; i++) freq[f][i] = (Word16)random_range(-level, level);
+        }
+        for (int i = 0; i < SWB_FENV; i++) fenv[f][i] = (Word16)(next_random() % 8 == 0 ? 0 : random_range(0, 4000));
+        if (next_random() & 1) for (int i = 1; i < SWB_FENV; i++) fenv[f][i] = (Word16)random_range(fenv[f][0] / 2, fenv[f][0] + 200);
+        mode[f] = (Word16)random_range(0, 3);
+        last_extl[f] = last_extls[next_random() % 6];
+        tilt[f] = (Word16)(next_random() % 3 ? random_range(0, 32767) : random_range(14000, 32767));
+        char name[16];
+        sprintf(name, "freq%d", f); put16(name, freq[f], L_FRAME16k);
+        sprintf(name, "fenv%d", f); put16(name, fenv[f], SWB_FENV);
+        sprintf(name, "mode%d", f); put1(name, mode[f]);
+        sprintf(name, "last_extl%d", f); put1(name, last_extl[f]);
+        sprintf(name, "tilt%d", f); put1(name, tilt[f]);
+    }
+    arrow();
+    for (int f = 0; f < 3; f++) {
+        Word32 signal[L_FRAME32k];
+        Word16 frica_flag = 0;
+        for (int i = 0; i < L_FRAME32k; i++) signal[i] = 12345;
+        SWB_BWE_decoding_fx(freq[f], fenv[f], signal, L_FRAME32k - 80, mode[f], &frica_flag, &prev_energy, prev_fenv,
+                            &prev_norm, tilt[f], &seed, st_offset, &prev_weight, extl, q_syn, last_extl[f]);
+        char name[16];
+        sprintf(name, "signal%d", f); put32(name, signal, L_FRAME32k);
+        sprintf(name, "fenv%d", f); put16(name, fenv[f], SWB_FENV);
+        sprintf(name, "frica%d", f); put1(name, frica_flag);
+        sprintf(name, "prev_energy%d", f); put1(name, prev_energy);
+        sprintf(name, "prev_fenv%d", f); put16(name, prev_fenv, SWB_FENV);
+        sprintf(name, "prev_norm%d", f); put1(name, prev_norm);
+        sprintf(name, "seed%d", f); put1(name, seed);
+        sprintf(name, "prev_weight%d", f); put1(name, prev_weight);
+    }
+    end_line();
+}
+
+/* A signal of `n` samples in four quarters, each at its own random level, so the energy ratios the
+ * time-shaping functions look at (onsets, decays) occur. */
+static void random_quarters(Word16 *x, int n, int top_level)
+{
+    for (int quarter = 0; quarter < 4; quarter++) {
+        int level = 1 << random_range(2, top_level);
+        random_signal(x + quarter * (n / 4), n / 4, level);
+        for (int i = 0; i < n / 4; i++) if (next_random() & 1) x[quarter * (n / 4) + i] = (Word16)-x[quarter * (n / 4) + i];
+    }
+}
+
+static void case_time_envelop_shaping(void)
+{
+    Word16 length = (Word16)(next_random() & 1 ? L_FRAME32k : L_FRAME48k);
+    Word16 werr[L_FRAME48k], q_synth = (Word16)random_range(-2, 12);
+    Word32 tenv[SWB_TENV];
+    random_quarters(werr, length, 12);
+    for (int i = 0; i < SWB_TENV; i++) tenv[i] = next_random() % 3 ? (Word32)random_range(0, 3000) * 26214 : (Word32)random_range(0, 40000);
+    put16("werr", werr, length); put32("tenv", tenv, SWB_TENV); put1("length", length); put1("q_synth", q_synth);
+    time_envelop_shaping_fx(werr, tenv, length, &q_synth);
+    arrow(); put16("werr", werr, length); put1("q_synth", q_synth); end_line();
+}
+
+static void case_time_reduce_pre_echo(void)
+{
+    Word16 output_frame = (Word16)(next_random() & 1 ? L_FRAME32k : L_FRAME48k);
+    Word16 l = (Word16)mult(output_frame, 8192);
+    Word16 synth[L_FRAME48k], error[L_FRAME48k];
+    Word16 prev_td = (Word16)random_range(0, 32767), q_syn = (Word16)random_range(-3, 3), q_synth = (Word16)random_range(-2, 12);
+    random_quarters(synth, output_frame, 13);
+    random_quarters(error, output_frame, 12);
+    /* often an onset: the last quarters far louder than the first */
+    if (next_random() % 2) for (int i = l; i < output_frame; i++) synth[i] = (Word16)(synth[i] >> random_range(0, 3));
+    put16("synth", synth, output_frame); put16("error", error, output_frame); put1("prev_td", prev_td);
+    put1("l", l); put1("q_syn", q_syn); put1("q_synth", q_synth);
+    time_reduce_pre_echo_fx(synth, error, prev_td, l, q_syn, q_synth);
+    arrow(); put16("error", error, output_frame); end_line();
+}
+
 static void case_save_old_syn(void)
 {
     Word16 syn[L_FRAME16k], old_syn[L_FRAME16k], mem[34];
@@ -178,6 +277,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[2], "calc_norm_envelop")) case_calc_norm_envelop();
         else if (!strcmp(argv[2], "wb_bwe_decoding")) case_wb_bwe_decoding();
         else if (!strcmp(argv[2], "save_old_syn")) case_save_old_syn();
+        else if (!strcmp(argv[2], "swb_bwe_decoding")) case_swb_bwe_decoding();
+        else if (!strcmp(argv[2], "time_envelop_shaping")) case_time_envelop_shaping();
+        else if (!strcmp(argv[2], "time_reduce_pre_echo")) case_time_reduce_pre_echo();
         else { fprintf(stderr, "unknown function %s\n", argv[2]); return 2; }
     }
     return 0;

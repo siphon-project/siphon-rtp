@@ -142,6 +142,74 @@ static void case_cng_dec(int amr)
     free(st);
 }
 
+/* swb_CNG_dec_fx on a decoder initialised by init_decoder_fx at 32 or 48 kHz, with the SHB comfort
+ * noise state of a call that has been through SIDs, active frames and TBE frames: the SHB LSPs of the
+ * last two TBE frames, the energy trackers (Q8 log energies), the burst/transition counters, the
+ * synthesis memories and the Hilbert / all-pass states GenSHBSynth_fx updates. A SWB SID carries 4
+ * bits; the other frames are no-data frames or active rates. */
+static void case_swb_cng_dec(void)
+{
+    static const Word32 rates[] = {SID_2k40, SID_2k40, SID_2k40, FRAME_NO_DATA, FRAME_NO_DATA, 13200, 32000, 7200};
+    static const Word16 extls[] = {-1, WB_TBE, SWB_TBE, FB_TBE, SWB_BWE, SWB_TBE, FB_TBE};
+    Decoder_State_fx *st = calloc(1, sizeof(Decoder_State_fx));
+    Word16 synth[L_FRAME32k], shb_synth[L_FRAME48k], sid_bw = (Word16)random_range(0, 1), qsyn = (Word16)random_range(-2, 4);
+    st->output_Fs_fx = next_random() % 2 ? 32000 : 48000;
+    st->output_frame_fx = extract_l(Mult_32_16(st->output_Fs_fx, 0x0290));
+    init_decoder_fx(st);
+    rd_record_cldfb(st);
+    randomise_cng(st, 0);
+    st->extl_fx = SWB_CNG;
+    st->cng_type_fx = (Word16)(next_random() % 8 ? LP_CNG : FD_CNG);
+    st->core_brate_fx = rates[next_random() % 8];
+    st->last_core_brate_fx = next_random() % 2 ? SID_2k40 : rates[next_random() % 8];
+    st->total_brate_fx = st->core_brate_fx;
+    st->bfi_fx = (Word16)(next_random() % 6 == 0);
+    st->L_frame_fx = (Word16)(next_random() & 1 ? L_FRAME : L_FRAME16k);
+    st->first_CNG_fx = (Word16)(next_random() % 3 != 0);
+    st->last_core_fx = (Word16)(next_random() % 4 ? ACELP_CORE : HQ_CORE);
+    st->last_extl_fx = extls[next_random() % 7];
+    st->prev_Q_bwe_syn2 = (Word16)random_range(0, 6);
+    conceal_lsf(st->lsp_shb_prev_fx, 16384);
+    conceal_lsf(st->lsp_shb_prev_prev_fx, 16384);
+    st->shb_dtx_count_fx = (Word16)(next_random() % 4 ? random_range(0, 40) : random_range(0, 1000));
+    st->last_shb_cng_ener_fx = (Word16)random_range(-3000, 3000);
+    st->shb_cng_ener_fx = (Word16)(next_random() % 3 ? st->last_shb_cng_ener_fx + random_range(-200, 200) : random_range(-3000, 3000));
+    st->wb_cng_ener_fx = (Word16)random_range(0, 6000);
+    st->last_wb_cng_ener_fx = (Word16)(next_random() % 3 ? st->wb_cng_ener_fx + random_range(-100, 100) : random_range(0, 6000));
+    st->last_shb_ener_fx = (Word16)random_range(-3000, 3000);
+    st->swb_cng_seed_fx = random16();
+    st->last_vad_fx = (Word16)random_range(0, 1);
+    st->trans_cnt_fx = (Word16)(next_random() % 3 ? 0 : random_range(0, 5));
+    st->burst_cnt_fx = (Word16)random_range(0, 12);
+    st->syn_dm_phase_fx = (Word16)random_range(0, 3);
+    random_signal(st->state_lpc_syn_fx, LPC_SHB_ORDER, 1 << random_range(2, 12));
+    for (int i = 0; i < HILBERT_MEM_SIZE; i++) st->genSHBsynth_Hilbert_Mem_fx[i] = (Word32)random_range(-(1 << 20), 1 << 20) * random_range(1, 8);
+    random_signal(st->genSHBsynth_state_lsyn_filt_shb_local_fx, 2 * ALLPASSSECTIONS_STEEP, 1 << random_range(2, 12));
+    random_signal(st->interpol_3_2_cng_dec_fx, INTERP_3_2_MEM_LEN, 1 << random_range(2, 12));
+    /* the core synthesis at 32 kHz at Q qsyn: a random walk of a random level, sometimes silent */
+    random_signal(synth, L_FRAME32k, 1 << random_range(2, 14));
+    if (next_random() % 12 == 0) memset(synth, 0, sizeof synth);
+    for (int i = 0; i < L_FRAME48k; i++) shb_synth[i] = -7;
+    put1("output_fs", st->output_Fs_fx);
+    put1("output_frame", st->output_frame_fx);
+    put1("sid_bw", sid_bw);
+    put1("qsyn", qsyn);
+    put16("synth", synth, L_FRAME32k);
+    put_u16("bits", bits, NBITS);
+    char *before = capture_state(st);
+    put_state_in(before);
+    swb_CNG_dec_fx(st, synth, shb_synth, sid_bw, qsyn);
+    arrow();
+    put16("shb_synth", shb_synth, L_FRAME48k);
+    char *after = capture_state(st);
+    put_changed(before, after);
+    free(before);
+    free(after);
+    end_line();
+    destroy_decoder(st);
+    free(st);
+}
+
 /* isf_dec_amr_wb_fx on every AMR-WB IO rate and the SID. */
 static void case_isf_dec_amr_wb(void)
 {
@@ -186,6 +254,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[2], "cng_dec")) case_cng_dec(0);
         else if (!strcmp(argv[2], "cng_dec_amr_wb")) case_cng_dec(1);
         else if (!strcmp(argv[2], "isf_dec_amr_wb")) case_isf_dec_amr_wb();
+        else if (!strcmp(argv[2], "swb_cng_dec")) case_swb_cng_dec();
         else { fprintf(stderr, "unknown function %s\n", argv[2]); return 2; }
     }
     return 0;

@@ -44,6 +44,11 @@ harness = false
 name = "silk_nlsf_bench"
 harness = false
 
+# EVS decode per 20 ms frame over the conformance sequences (skips the ones not installed).
+[[bench]]
+name = "evs_bench"
+harness = false
+
 # Deterministic instruction-count gate (valgrind/callgrind). Unlike the criterion wall-clock benches,
 # these are stable enough on a shared CI runner to fail on a >N% regression. See ci.yml `perf-gate`.
 [[bench]]

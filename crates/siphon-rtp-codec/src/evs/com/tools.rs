@@ -13,7 +13,8 @@ use crate::evs::com::math_op::isqrt_lc;
 use crate::evs::rom::{A_HP400_FX, B_HP400_FX};
 use crate::itu::basic_ops::{
     abs_s, add, div_s, extract_h, extract_l, l_abs, l_add, l_deposit_h, l_deposit_l, l_mac, l_msu,
-    l_mult, l_shl, l_shr, l_sub, mult_r, negate, norm_l, norm_s, round_word, shl, shr, shr_r, sub,
+    l_mult, l_shl, l_shr, l_shr_r, l_sub, mult_r, negate, norm_l, norm_s, round_word, shl, shr,
+    shr_r, sub,
 };
 use crate::itu::oper_32b::{l_extract, mpy_32, mpy_32_16};
 use crate::itu::stl2009::{
@@ -884,6 +885,110 @@ pub fn pz_filter_dp(
     }
 }
 
+/// `root_a_fx`: `sqrt(1 / a)` for a Q`q_a` value `a`, as a Q31 mantissa with its exponent in
+/// `exp_out`. A non-positive `a` yields 0 with exponent 0.
+pub fn root_a(a: i32, q_a: i16, exp_out: &mut i16) -> i32 {
+    if a <= 0 {
+        *exp_out = 0;
+        return 0;
+    }
+    let mut exp = norm_l(a);
+    let mut tmp = extract_h(l_shl(a, exp));
+    exp = sub(exp, sub(30, q_a));
+    tmp = div_s(16384, tmp);
+    let l_tmp = l_deposit_h(tmp);
+    let l_tmp = isqrt_lc(l_tmp, &mut exp);
+    *exp_out = exp;
+    l_tmp
+}
+
+/// `root_a_over_b_fx`: `sqrt(a / b)` for a Q`q_a` value `a` and a Q`q_b` value `b`, as a Q31
+/// mantissa with its exponent in `exp_out`. A non-positive operand yields 0 with exponent 0.
+pub fn root_a_over_b(a: i32, q_a: i16, b: i32, q_b: i16, exp_out: &mut i16) -> i32 {
+    if a <= 0 || b <= 0 {
+        *exp_out = 0;
+        return 0;
+    }
+    let mut exp_num = norm_l(b);
+    let mut num = round_word(l_shl(b, exp_num));
+    exp_num = sub(sub(30, exp_num), q_b);
+
+    let mut exp_den = norm_l(a);
+    let den = round_word(l_shl(a, exp_den));
+    exp_den = sub(sub(30, exp_den), q_a);
+
+    let scale = shr(sub(den, num), 15);
+    num = shl(num, scale);
+    exp_num = sub(exp_num, scale);
+
+    let tmp = div_s(num, den);
+    let mut exp = sub(exp_num, exp_den);
+    let l_tmp = l_deposit_h(tmp);
+    let l_tmp = isqrt_lc(l_tmp, &mut exp);
+    *exp_out = exp;
+    l_tmp
+}
+
+/// `Add_flt32_flt32`: sum of two floating-point values (Q31 mantissa, exponent), renormalised.
+pub fn add_flt32_flt32(a: i32, exp_a: i16, b: i32, exp_b: i16, exp_out: &mut i16) -> i32 {
+    let temp = sub(exp_a.min(exp_b), 1);
+    let exp_a = sub(exp_a, temp);
+    let a = l_shr(a, exp_a);
+    let exp_b = sub(exp_b, temp);
+    let b = l_shr(b, exp_b);
+    let l_temp = l_add(a, b);
+    let temp2 = norm_l(l_temp);
+    *exp_out = add(temp, temp2);
+    l_shl(l_temp, temp2)
+}
+
+/// `Mul_flt32_Q15`: a floating-point value times a Q15 fraction, renormalised (`exp_v` in/out).
+pub fn mul_flt32_q15(value: i32, exp_v: &mut i16, frac: i16) -> i32 {
+    let l_temp = mult_32_16(value, frac);
+    let temp = norm_l(l_temp);
+    *exp_v = add(temp, *exp_v);
+    l_shl(l_temp, temp)
+}
+
+/// `Div_flt32_flt32`: quotient of two floating-point values (Q31 mantissa, exponent), renormalised.
+pub fn div_flt32_flt32(a: i32, exp_a: i16, b: i32, exp_b: i16, exp_out: &mut i16) -> i32 {
+    let mut temp = div_s(16384, round_word(b));
+    let l_temp = mult_32_16(a, temp);
+    let mut temp2 = sub(31 - 1, exp_b);
+    temp2 = add(temp2, exp_a);
+    temp = norm_l(l_temp);
+    *exp_out = add(temp, temp2);
+    l_shl(l_temp, temp)
+}
+
+/// `sum2_fx_mod`: `Σ (2·vec[i]²) >> 9`, saturating.
+#[must_use]
+pub fn sum2_mod(vec: &[i16], lvec: i16) -> i32 {
+    let mut l_tmp = 0;
+    for &value in &vec[..lvec.max(0) as usize] {
+        l_tmp = l_add(l_tmp, l_shr(l_mult(value, value), 9));
+    }
+    l_tmp
+}
+
+/// `usquant_fx`: uniform scalar quantiser of `x` with the lowest level `qlow`, the step `delta`
+/// and `cbsize` levels; returns the index and writes the quantised value to `xq`.
+pub fn usquant(x: i16, xq: &mut i16, qlow: i16, delta: i16, cbsize: i16) -> i16 {
+    let exp = norm_s(delta);
+    let tmp = div_s(shl(1, sub(14, exp)), delta);
+    let mut l_tmp = l_mult(sub(x, qlow), tmp);
+    let mut idx = extract_l(l_shr_r(
+        l_add(l_tmp, i32::from(shl(1, sub(30, exp)))),
+        sub(31, exp),
+    ));
+    idx = idx.min(sub(cbsize, 1));
+    idx = idx.max(0);
+    l_tmp = l_deposit_l(qlow);
+    l_tmp = l_mac(l_tmp, idx, delta);
+    *xq = round_word(l_shl(l_tmp, 16));
+    idx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +1013,42 @@ mod tests {
         let mut seed = 0;
         assert_eq!(random(&mut seed), 13849);
         assert_eq!(random(&mut seed), (13849i32 * 31821 + 13849) as i16);
+    }
+
+    #[test]
+    fn root_a_family_rejects_non_positive_operands() {
+        let mut exp = 7;
+        assert_eq!(root_a(0, 20, &mut exp), 0);
+        assert_eq!(exp, 0);
+        exp = 7;
+        assert_eq!(root_a_over_b(5, 3, 0, 3, &mut exp), 0);
+        assert_eq!(exp, 0);
+    }
+
+    #[test]
+    fn flt32_helpers_renormalise() {
+        let mut exp = 0;
+        // 0.25 + 0.25 with equal exponents is 0.5 normalised to 0x4000_0000.
+        let sum = add_flt32_flt32(0x2000_0000, 1, 0x2000_0000, 1, &mut exp);
+        assert_eq!(sum, 0x4000_0000);
+        let mut exp_v = 3;
+        let product = mul_flt32_q15(0x4000_0000, &mut exp_v, 16384);
+        assert_eq!(product, 0x4000_0000);
+        assert_eq!(exp_v, 4);
+    }
+
+    #[test]
+    fn usquant_clamps_the_index_to_the_codebook() {
+        let mut xq = 0;
+        let idx = usquant(32000, &mut xq, 4096, 2048, 8);
+        assert!((0..8).contains(&idx));
+        assert_eq!(idx, usquant(i16::MAX, &mut xq, 4096, 2048, 8));
+        assert_eq!(usquant(i16::MIN, &mut xq, 4096, 2048, 8), 0);
+        assert_eq!(xq, 4096);
+    }
+
+    #[test]
+    fn sum2_mod_scales_the_energy_down_by_nine_bits() {
+        assert_eq!(sum2_mod(&[512, 512], 2), 2 * ((2 * 512 * 512) >> 9));
     }
 }

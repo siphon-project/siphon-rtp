@@ -1136,3 +1136,6 @@ pub fn qlsf_arsn_tcvq_dec_16k(y: &mut [i16], indice: &[i16], n_bits: i16) -> i16
 
     safety_net
 }
+
+mod lpc_conv;
+pub use lpc_conv::{a2rc, compute_poly_product, lsp2lpc, lsp_convolve, poscos, space_lsfs};

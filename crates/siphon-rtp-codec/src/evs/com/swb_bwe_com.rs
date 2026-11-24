@@ -5,6 +5,12 @@
 //! prediction and decoding, the normalisation length and envelope, the tilt measure, the
 //! old-synthesis update and the HQ generic BWE decoding.
 
+mod swb_decoding;
+mod time_shaping;
+
+pub use swb_decoding::swb_bwe_decoding;
+pub use time_shaping::{time_envelop_shaping, time_reduce_pre_echo};
+
 use crate::evs::basop::{div_32, mult_32_16, mult_32_32};
 use crate::evs::cnst::{
     ACELP_8K00, ACELP_CORE, AUDIO, DIM_FB, FB_BWE, GENERIC, HARMONIC, HQ_CORE, HQ_GENERIC_END_FREQ,

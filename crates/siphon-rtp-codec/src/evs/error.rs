@@ -10,8 +10,6 @@ pub enum UnsupportedMode {
     Mode2,
     /// AMR-WB interoperable mode (`amr_wb_dec_fx`) and the switch from it (`updt_IO_switch_dec_fx`).
     AmrWbIo,
-    /// A bandwidth-extension decoder of MODE1 whose reference function is not ported yet.
-    Bandwidth,
     /// The channel-aware (RF) partial copy.
     ChannelAware,
 }
@@ -21,7 +19,6 @@ impl core::fmt::Display for UnsupportedMode {
         formatter.write_str(match self {
             Self::Mode2 => "MODE2 (TCX core)",
             Self::AmrWbIo => "AMR-WB IO",
-            Self::Bandwidth => "bandwidth extension",
             Self::ChannelAware => "channel-aware partial copy",
         })
     }

@@ -84,6 +84,20 @@ fn sqrt32_matches_the_reference() {
 }
 
 #[test]
+fn sqrt16_matches_the_reference() {
+    each("sqrt16", |case| {
+        let mut exponent = case.i16("exponent");
+        let mantissa = sqrt16(case.i16("mantissa"), &mut exponent);
+        check(
+            case,
+            "mantissa/exponent",
+            &(mantissa, exponent),
+            &(case.out_i16("mantissa"), case.out_i16("exponent")),
+        );
+    });
+}
+
+#[test]
 fn get_scale_factor_matches_the_reference() {
     each("get_scale_factor", |case| {
         let len = case.i16("len");

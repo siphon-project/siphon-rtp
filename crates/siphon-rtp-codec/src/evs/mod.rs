@@ -10,14 +10,15 @@
 //! **Status: the MODE1 decoder runs end to end, for the frames it covers.** [`decoder::EvsDecoder`]
 //! is the `decoder.c` loop over a G.192 stream (bit reading, `evs_dec_fx`, output conversion,
 //! start-of-stream delay compensation); [`dec::evs_dec`] is the per-frame dispatcher and
-//! [`dec::hq_core_dec`] the HQ core. The NB and WB sequences of TS 26.444 at 7.2, 8.0 (ACELP) and
-//! 32, 64 kbit/s (HQ), clean, frame-erased and DTX, decode byte for byte to the reference output
-//! (`tests/evs_conformance.rs` lists them). Not ported yet, and refused with
-//! [`error::EvsError::Unsupported`] naming the reference call (never decoded to silence): MODE2
-//! (TCX; `dec_acelp_tcx_frame`), AMR-WB IO (`amr_wb_dec_fx`, `updt_IO_switch_dec_fx`), and the
-//! bandwidth-extension decoders `wb_tbe_dec_fx`, `swb_tbe_dec_fx` / `fb_tbe_dec_fx`,
-//! `swb_bwe_dec_fx`, `swb_bwe_dec_hr_fx` and `swb_CNG_dec_fx`. The codec factory does not offer
-//! EVS until the decoder passes every TS 26.444 decoder sequence.
+//! [`dec::hq_core_dec`] the HQ core, with the MODE1 bandwidth extensions (WB, SWB and FB TBE, SWB
+//! BWE, the high-rate BWE and SWB comfort noise). Every TS 26.444 sequence that stays in MODE1
+//! (ACELP at 5.9 VBR, 7.2, 8.0 and 13.2, HQ at 32 and 64 kbit/s, NB to FB, clean, frame-erased and
+//! DTX) decodes byte for byte to the reference output; `tests/evs_conformance.rs` runs every
+//! sequence and pins how many. Not ported yet, and refused with [`error::EvsError::Unsupported`]
+//! naming the reference call (never decoded to silence): MODE2 (TCX; `dec_acelp_tcx_frame`, which
+//! the 13.2 and 32 kbit/s streams also reach when a frame switches to TCX) and AMR-WB IO
+//! (`amr_wb_dec_fx`, `updt_IO_switch_dec_fx`). The codec factory does not offer EVS until the
+//! decoder passes every TS 26.444 decoder sequence.
 //!
 //! Gated behind the off-by-default `evs` Cargo feature, which gates **transcoding** only: relaying
 //! EVS never executes a codec and never reaches this module. EVS is covered by an active patent

@@ -180,6 +180,47 @@ pub fn sqrt32(mantissa: i32, exponent: &mut i16) -> i32 {
     mantissa
 }
 
+/// `Sqrt16_common`: the 16-bit square-root mantissa of a normalised `m` (`m >= 2^14` or zero) with
+/// exponent `e`, by table interpolation; an odd exponent multiplies by `sqrt(1/2)`.
+#[must_use]
+pub fn sqrt16_common(m: i16, e: i16) -> i16 {
+    let mut m = m;
+
+    // get table index (upper 6 bits minus 32): index = (m >> 9) - 32
+    let index = mac_r(-32768 - (32 << 16), m, 1 << 6);
+
+    // get fractional part for interpolation (lower 9 bits)
+    let frac = m & 0x1FF; // Q9
+
+    // interpolate (the table is not read for m == 0, whose index is -32)
+    if m != 0 {
+        let index = index.clamp(0, 31) as usize;
+        m = mac_r(SQRTTABLE[index], SQRTDIFFTABLE[index], frac);
+    }
+
+    // handle odd exponents
+    if e & 1 != 0 {
+        m = mult_r(m, 0x5a82);
+    }
+    m
+}
+
+/// `Sqrt16`: square root of `mantissa · 2^exponent` (`mantissa >= 0`); the result's exponent is
+/// written back to `exponent`.
+pub fn sqrt16(mantissa: i16, exponent: &mut i16) -> i16 {
+    // normalize
+    let pre_shift = norm_s(mantissa);
+    let e = sub(*exponent, pre_shift);
+    let mantissa = shl(mantissa, pre_shift);
+
+    // calc mantissa
+    let mantissa = sqrt16_common(mantissa, e);
+
+    // e = (e + 1) >> 1
+    *exponent = mult_r(e, 1 << 14);
+    mantissa
+}
+
 /// `getScaleFactor16`: headroom of `x[0..len_x]` in `[0, 15]`, 0 if all values are zero.
 #[must_use]
 pub fn get_scale_factor16(x: &[i16], len_x: i16) -> i16 {

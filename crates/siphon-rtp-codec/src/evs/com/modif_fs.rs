@@ -5,7 +5,8 @@
 
 use crate::evs::basop::div_32;
 use crate::evs::cnst::{
-    ALLPASSSECTIONS_STEEP, LEN_WIN_SSS, L_FILT_MAX, L_FRAME, L_FRAME16K, L_FRAME48K, M, RS_INV_FAC,
+    ALLPASSSECTIONS_STEEP, LEN_WIN_SSS, L_FILT_MAX, L_FRAME, L_FRAME16K, L_FRAME32K, L_FRAME48K, M,
+    RS_INV_FAC,
 };
 use crate::evs::com::basop_util::idiv1616;
 use crate::evs::com::deemph::deemph;
@@ -15,14 +16,14 @@ use crate::evs::com::lpc_tools::{autocorr, e_lpc_lev_dur};
 use crate::evs::com::math_op::i_mult2;
 use crate::evs::com::preemph::preemph_copy_in_place;
 use crate::evs::com::syn_filt::syn_kern_16;
-use crate::evs::com::tools::copy_scale_sig;
+use crate::evs::com::tools::{copy_scale_sig, scale_sig};
 use crate::evs::rom::{
     ResamplingCfgFx, AP1_STEEP_FX, AP2_STEEP_FX, CT2_FX, CU15_FX, CU4_FX, RESAMPLING_CFG_TBL_FX,
     WIND_SSS_FX,
 };
 use crate::itu::basic_ops::{
-    add, div_s, extract_h, l_abs, l_deposit_h, l_deposit_l, l_mac, l_msu, l_mult, l_negate, l_shl,
-    l_sub, mult_r, norm_s, round_word, shl, shr, sub,
+    abs_s, add, div_s, extract_h, l_abs, l_deposit_h, l_deposit_l, l_mac, l_msu, l_mult, l_negate,
+    l_shl, l_sub, mult_r, negate, norm_s, round_word, shl, shr, sub,
 };
 use crate::itu::oper_32b::l_comp;
 use crate::itu::stl2009::{i_mult, lshr, mac_r};
@@ -710,5 +711,267 @@ pub fn retro_interp5_4(pst_old_syn: &mut [i16]) {
         // the last group ends at index 0: pf4 and pf5 are not used past it
         pf4 = pf4.wrapping_sub(4);
         pf5 = pf5.wrapping_sub(5);
+    }
+}
+
+/// `Decimate_allpass_steep_fx`: 2:1 decimation of `in_fx[0..n]` into `out_fx[0..n/2]` by two
+/// three-section all-pass chains (the even samples through one, the odd samples through the
+/// other, the outputs averaged), with the state `state_fx[0..=2·ALLPASSSECTIONS_STEEP]`.
+pub fn decimate_allpass_steep(in_fx: &[i16], state_fx: &mut [i16], n: i16, out_fx: &mut [i16]) {
+    decimate_even_branch(Some(in_fx), state_fx, n, out_fx);
+    decimate_odd_branch(Some(in_fx), state_fx, n, out_fx);
+}
+
+/// [`decimate_allpass_steep`] with the output written over the input (`in_fx == out_fx` in the
+/// reference, as `GenTransition_fx` calls it). The reference's second chain then reads
+/// `in_fx[2k - 1]` after the first chain has already overwritten the first `n/2` samples, and this
+/// reproduces that order exactly.
+pub fn decimate_allpass_steep_in_place(io_fx: &mut [i16], state_fx: &mut [i16], n: i16) {
+    decimate_even_branch(None, state_fx, n, io_fx);
+    decimate_odd_branch(None, state_fx, n, io_fx);
+}
+
+/// The sample `index` of the decimator input: `separate` when the input is its own slice, else the
+/// output slice the reference aliases it with.
+fn decimate_input(separate: Option<&[i16]>, io_fx: &[i16], index: usize) -> i16 {
+    separate.map_or_else(|| io_fx[index], |in_fx| in_fx[index])
+}
+
+/// The even-sample all-pass chain of [`decimate_allpass_steep`], writing `out_fx[0..n/2]`.
+fn decimate_even_branch(
+    separate: Option<&[i16]>,
+    state_fx: &mut [i16],
+    n: i16,
+    out_fx: &mut [i16],
+) {
+    const S: usize = ALLPASSSECTIONS_STEEP as usize;
+    let n = n.max(0) as usize;
+
+    for k in 0..n / 2 {
+        let input = decimate_input(separate, out_fx, 2 * k);
+        let mut lacc = l_deposit_h(state_fx[0]);
+        lacc = l_mac(lacc, AP1_STEEP_FX[0], input);
+        let mut lacc1 = l_deposit_h(input);
+        let temp1 = extract_h(lacc);
+        lacc1 = l_msu(lacc1, AP1_STEEP_FX[0], temp1);
+        state_fx[0] = extract_h(lacc1);
+
+        lacc1 = l_deposit_h(state_fx[1]);
+        lacc1 = l_mac(lacc1, AP1_STEEP_FX[1], temp1);
+        let temp2 = extract_h(lacc1);
+        lacc = l_msu(lacc, AP1_STEEP_FX[1], temp2);
+        state_fx[1] = extract_h(lacc);
+
+        lacc = l_deposit_h(state_fx[S - 1]);
+        out_fx[k] = extract_h(l_mac(lacc, AP1_STEEP_FX[S - 1], temp2));
+        state_fx[S - 1] = extract_h(l_msu(lacc1, AP1_STEEP_FX[S - 1], out_fx[k]));
+    }
+}
+
+/// The odd-sample all-pass chain of [`decimate_allpass_steep`], averaged into `out_fx[0..n/2]`
+/// (which [`decimate_even_branch`] has filled).
+fn decimate_odd_branch(separate: Option<&[i16]>, state_fx: &mut [i16], n: i16, out_fx: &mut [i16]) {
+    const S: usize = ALLPASSSECTIONS_STEEP as usize;
+    let n = n.max(0) as usize;
+    let mut temp = [0i16; 3];
+
+    // first odd sample: the one before the frame comes from the state
+    let mut lacc = l_deposit_h(state_fx[S]);
+    lacc = l_mac(lacc, AP2_STEEP_FX[0], state_fx[2 * S]);
+    let mut lacc1 = l_deposit_h(state_fx[2 * S]);
+    let temp1 = extract_h(lacc);
+    lacc1 = l_msu(lacc1, AP2_STEEP_FX[0], temp1);
+    state_fx[S] = extract_h(lacc1);
+    temp[0] = temp1;
+
+    lacc1 = l_deposit_h(state_fx[S + 1]);
+    lacc1 = l_mac(lacc1, AP2_STEEP_FX[1], temp1);
+    let temp2 = extract_h(lacc1);
+    temp[1] = temp2;
+    lacc = l_msu(lacc, AP2_STEEP_FX[1], temp2);
+    state_fx[S + 1] = extract_h(lacc);
+
+    lacc = l_deposit_h(state_fx[2 * S - 1]);
+    lacc = l_mac(lacc, AP2_STEEP_FX[S - 1], temp2);
+    temp[2] = extract_h(lacc);
+    lacc1 = l_msu(lacc1, AP2_STEEP_FX[S - 1], temp[2]);
+    state_fx[2 * S - 1] = extract_h(lacc1);
+
+    let sum = mult_r(out_fx[0], 16384);
+    out_fx[0] = add(sum, mult_r(temp[S - 1], 16384));
+
+    for k in 1..n / 2 {
+        let input = decimate_input(separate, out_fx, 2 * k - 1);
+        let mut lacc = l_deposit_h(state_fx[S]);
+        lacc = l_mac(lacc, AP2_STEEP_FX[0], input);
+        let mut lacc1 = l_deposit_h(input);
+        let temp1 = extract_h(lacc);
+        lacc1 = l_msu(lacc1, AP2_STEEP_FX[0], temp1);
+        state_fx[S] = extract_h(lacc1);
+        temp[0] = temp1;
+
+        lacc1 = l_deposit_h(state_fx[S + 1]);
+        lacc1 = l_mac(lacc1, AP2_STEEP_FX[1], temp1);
+        let temp2 = extract_h(lacc1);
+        temp[1] = temp2;
+        lacc = l_msu(lacc, AP2_STEEP_FX[1], temp2);
+        state_fx[S + 1] = extract_h(lacc);
+
+        lacc = l_deposit_h(state_fx[2 * S - 1]);
+        lacc = l_mac(lacc, AP2_STEEP_FX[S - 1], temp[1]);
+        temp[2] = extract_h(lacc);
+        lacc1 = l_msu(lacc1, AP2_STEEP_FX[S - 1], temp[2]);
+        state_fx[2 * S - 1] = extract_h(lacc1);
+
+        let sum = mult_r(out_fx[k], 16384);
+        out_fx[k] = add(sum, mult_r(temp[S - 1], 16384));
+    }
+    // the last input sample (`in_fx[N - 1]`, read after the loops: the output has only n/2 samples)
+    state_fx[2 * S] = decimate_input(separate, out_fx, n - 1);
+}
+
+/// `interpolate_3_over_2_allpass_fx`: 3:2 interpolation of `input_fx[0..len]` into
+/// `out_fx[0..3·len/2]` (three all-pass branches decimated by 2, a 5-tap low-pass), with the
+/// memory `mem_fx[0..15]` and the branch coefficients `filt_coeff_fx[0..9]`. The reference lets
+/// the output alias the input (it copies the input to a scaled local buffer first); that case is
+/// [`interpolate_3_over_2_allpass_in_place`].
+pub fn interpolate_3_over_2_allpass(
+    input_fx: &[i16],
+    len: i16,
+    out_fx: &mut [i16],
+    mem_fx: &mut [i16],
+    filt_coeff_fx: &[i16],
+) {
+    let mut input_fx_temp = [0i16; L_FRAME32K as usize];
+    let s = interpolate_3_over_2_scale(input_fx, len, mem_fx);
+    copy_scale_sig(input_fx, &mut input_fx_temp, len, s);
+    interpolate_3_over_2_filter(&input_fx_temp, len, out_fx, mem_fx, filt_coeff_fx, s);
+}
+
+/// [`interpolate_3_over_2_allpass`] with the output written over the input (`input_fx == out_fx`
+/// in the reference).
+pub fn interpolate_3_over_2_allpass_in_place(
+    io_fx: &mut [i16],
+    len: i16,
+    mem_fx: &mut [i16],
+    filt_coeff_fx: &[i16],
+) {
+    let mut input_fx_temp = [0i16; L_FRAME32K as usize];
+    let s = interpolate_3_over_2_scale(io_fx, len, mem_fx);
+    copy_scale_sig(io_fx, &mut input_fx_temp, len, s);
+    interpolate_3_over_2_filter(&input_fx_temp, len, io_fx, mem_fx, filt_coeff_fx, s);
+}
+
+/// The headroom shift `s` of [`interpolate_3_over_2_allpass`]: the peak of the input and the
+/// memory, normalised to leave two bits.
+fn interpolate_3_over_2_scale(input_fx: &[i16], len: i16, mem_fx: &[i16]) -> i16 {
+    let mut s = 0i16;
+    for &value in &input_fx[..len.max(0) as usize] {
+        s = s.max(abs_s(value));
+    }
+    for &value in &mem_fx[..15] {
+        s = s.max(abs_s(value));
+    }
+    sub(norm_s(s), 2).max(0)
+}
+
+fn interpolate_3_over_2_filter(
+    input_fx_temp: &[i16],
+    len: i16,
+    out_fx: &mut [i16],
+    mem_fx: &mut [i16],
+    filt_coeff_fx: &[i16],
+    s: i16,
+) {
+    let mut out1_buff = [0i16; 2 * L_FRAME48K as usize];
+    scale_sig(mem_fx, 15, s);
+
+    let mut out1 = 0usize;
+    for &input in &input_fx_temp[..len.max(0) as usize] {
+        // Upper branch
+        let vu0 = add(mem_fx[0], mult_r(filt_coeff_fx[0], sub(input, mem_fx[1])));
+        let vu1 = add(mem_fx[1], mult_r(filt_coeff_fx[1], sub(vu0, mem_fx[2])));
+        mem_fx[3] = add(mem_fx[2], mult_r(filt_coeff_fx[2], sub(vu1, mem_fx[3])));
+        mem_fx[1] = vu0;
+        mem_fx[2] = vu1;
+        out1_buff[out1] = mem_fx[3];
+        out1 += 1;
+
+        // Middle branch
+        let vm0 = add(mem_fx[0], mult_r(filt_coeff_fx[3], sub(input, mem_fx[4])));
+        let vm1 = add(mem_fx[4], mult_r(filt_coeff_fx[4], sub(vm0, mem_fx[5])));
+        mem_fx[6] = add(mem_fx[5], mult_r(filt_coeff_fx[5], sub(vm1, mem_fx[6])));
+        mem_fx[4] = vm0;
+        mem_fx[5] = vm1;
+        out1_buff[out1] = mem_fx[6];
+        out1 += 1;
+
+        // Lower branch
+        let vl0 = add(mem_fx[0], mult_r(filt_coeff_fx[6], sub(input, mem_fx[7])));
+        let vl1 = add(mem_fx[7], mult_r(filt_coeff_fx[7], sub(vl0, mem_fx[8])));
+        mem_fx[9] = add(mem_fx[8], mult_r(filt_coeff_fx[8], sub(vl1, mem_fx[9])));
+        mem_fx[0] = input;
+        mem_fx[7] = vl0;
+        mem_fx[8] = vl1;
+        out1_buff[out1] = mem_fx[9];
+        out1 += 1;
+    }
+
+    // LPF: every second sample of the interleaved branches
+    let loop_len = shr(i_mult(len, 3), 1).max(0) as usize;
+    for i in 0..loop_len {
+        let mem_temp = out1_buff[shl(i as i16, 1) as usize];
+        out_fx[i] = add(
+            mult_r(1550, add(mem_temp, mem_fx[10])),
+            mult_r(-4965, add(mem_fx[11], mem_fx[14])),
+        );
+        out_fx[i] = add(out_fx[i], mult_r(20125, add(mem_fx[12], mem_fx[13])));
+        mem_fx[10] = mem_fx[11];
+        mem_fx[11] = mem_fx[12];
+        mem_fx[12] = mem_fx[13];
+        mem_fx[13] = mem_fx[14];
+        mem_fx[14] = mem_temp;
+    }
+    scale_sig(out_fx, i_mult(3, shr(len, 1)), negate(s));
+    scale_sig(mem_fx, 15, negate(s));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decimate_allpass_steep_of_silence_is_silence() {
+        let input = [0i16; 16];
+        let mut state = [0i16; 7];
+        let mut out = [1i16; 8];
+        decimate_allpass_steep(&input, &mut state, 16, &mut out);
+        assert_eq!(out, [0; 8]);
+        assert_eq!(state, [0; 7]);
+    }
+
+    #[test]
+    fn decimate_allpass_steep_keeps_the_last_input_in_the_state() {
+        let mut input = [0i16; 16];
+        input[15] = 1234;
+        let mut state = [0i16; 7];
+        let mut out = [0i16; 8];
+        decimate_allpass_steep(&input, &mut state, 16, &mut out);
+        assert_eq!(state[6], 1234);
+    }
+
+    #[test]
+    fn interpolate_3_over_2_in_place_matches_the_separate_buffers() {
+        let coeff = [3000i16, 9000, 15000, 5000, 11000, 17000, 7000, 13000, 19000];
+        let input: [i16; 20] = core::array::from_fn(|i| (i as i16 * 937 - 4000) % 9000);
+        let mut mem_a = [100i16; 15];
+        let mut mem_b = mem_a;
+        let mut out = [0i16; 30];
+        interpolate_3_over_2_allpass(&input, 20, &mut out, &mut mem_a, &coeff);
+        let mut io = [0i16; 30];
+        io[..20].copy_from_slice(&input);
+        interpolate_3_over_2_allpass_in_place(&mut io, 20, &mut mem_b, &coeff);
+        assert_eq!(out, io);
+        assert_eq!(mem_a, mem_b);
     }
 }
