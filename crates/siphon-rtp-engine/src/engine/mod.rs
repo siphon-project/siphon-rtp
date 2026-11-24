@@ -21,6 +21,7 @@ mod answer;
 mod answer_local;
 mod call_video;
 mod call_video_dtls;
+mod call_video_inject;
 mod call_video_local;
 mod call_video_secure;
 mod configure;

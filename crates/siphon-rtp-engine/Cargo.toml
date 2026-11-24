@@ -200,6 +200,10 @@ harness = false
 name = "conference_x3_bench"
 harness = false
 
+[[bench]]
+name = "video_injector_bench"
+harness = false
+
 [lints]
 workspace = true
 

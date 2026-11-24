@@ -646,3 +646,91 @@ async fn a_restored_secure_transcode_owns_its_endpoints_before_they_are_redirect
     .await;
     assert_owned_at_redirect(&redirects, "restored secure transcode");
 }
+
+#[tokio::test]
+async fn an_injected_far_video_leg_owns_its_endpoint_before_it_is_redirected() {
+    let (engine, redirects) = recording_engine(Handler::Audio);
+    let (_caller_audio, caller_audio) = phone().await;
+    let (_caller_video, caller_video) = phone().await;
+    let (_callee_audio, callee_audio) = phone().await;
+    let (_callee_video, callee_video) = phone().await;
+    let caller_offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {audio_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\na=rtcp-mux\r\n\
+         m=video {video_port} RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n\
+         a=fmtp:96 profile-level-id=42e01f;packetization-mode=1\r\na=sendrecv\r\na=rtcp-mux\r\n",
+        ip = caller_audio.ip(),
+        audio_port = caller_audio.port(),
+        video_port = caller_video.port(),
+    );
+    let callee_answer = format!(
+        "v=0\r\no=- 2 2 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {audio_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\na=rtcp-mux\r\n\
+         m=video {video_port} RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n\
+         a=fmtp:96 profile-level-id=42e01f;packetization-mode=1;sprop-parameter-sets=Z0LAHtoCgPZA,aM48gA==\r\n\
+         a=sendrecv\r\na=rtcp-mux\r\n",
+        ip = callee_audio.ip(),
+        audio_port = callee_audio.port(),
+        video_port = callee_video.port(),
+    );
+    let profile = ProfileFlags {
+        video_relay: VideoRelay::Anchor,
+        ..ProfileFlags::default()
+    };
+    for command in [
+        Command::AnswerLocal {
+            call_id: "injected".into(),
+            from_tag: "a".into(),
+            sdp: caller_offer,
+            profile: profile.clone(),
+        },
+        Command::OfferFar {
+            call_id: "injected".into(),
+            from_tag: "a".into(),
+            profile: ProfileFlags::default(),
+        },
+        Command::Answer {
+            call_id: "injected".into(),
+            from_tag: "a".into(),
+            to_tag: "b".into(),
+            sdp: callee_answer,
+            profile: ProfileFlags::default(),
+        },
+    ] {
+        let result = engine.handle(CLIENT, command).await;
+        assert!(matches!(result, CmdResult::Ok { .. }), "{result:?}");
+    }
+    assert_owned_at_redirect(&redirects, "injected far video");
+    let far_video = engine
+        .calls
+        .get("injected")
+        .and_then(|call| call.far.as_ref().and_then(|far| far.video))
+        .expect("the far video leg")
+        .rtp
+        .id;
+    assert!(
+        engine.bridge().owns(far_video),
+        "the far video endpoint is carried by the bridge"
+    );
+    // The far video endpoint is never given a Forward rule it would relay the first IDR by: it goes
+    // from parked straight to the redirect the bridge already owns.
+    let installed: Vec<FlowAction> = engine
+        .datapath()
+        .take_installs()
+        .into_iter()
+        .filter(|(endpoint, _)| *endpoint == far_video)
+        .map(|(_, action)| action)
+        .collect();
+    assert!(
+        !installed
+            .iter()
+            .any(|action| matches!(action, FlowAction::Forward(_))),
+        "no Forward before the Redirect: {installed:?}"
+    );
+    assert_eq!(installed.last(), Some(&FlowAction::Redirect));
+    let seen = redirects.lock().expect("redirect log").clone();
+    assert!(
+        seen.contains(&(far_video, true)),
+        "the far video endpoint was redirected, owned: {seen:?}"
+    );
+}

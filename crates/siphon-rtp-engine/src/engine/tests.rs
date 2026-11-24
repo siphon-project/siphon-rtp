@@ -47,6 +47,7 @@ use super::*;
 const CLIENT: ClientId = ClientId(1);
 
 mod actor_reply;
+mod answer_local_sprop;
 mod answer_local_video;
 mod call_floor;
 mod call_video;
@@ -689,6 +690,8 @@ struct LatchLearningDatapath {
     fail_drops: Arc<std::sync::atomic::AtomicBool>,
     /// When set, every `Redirect` install fails.
     fail_redirects: Arc<std::sync::atomic::AtomicBool>,
+    /// How many of the next datagram sends fail, as a socket that refuses a datagram does.
+    fail_sends: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl LatchLearningDatapath {
@@ -705,7 +708,14 @@ impl LatchLearningDatapath {
             on_redirect: Arc::new(Mutex::new(None)),
             fail_drops: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_redirects: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_sends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Make the next `count` datagram sends fail.
+    fn fail_next_sends(&self, count: usize) {
+        self.fail_sends
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Call `hook` with the endpoint each time a `Redirect` is installed on one.
@@ -812,7 +822,23 @@ impl Datapath for LatchLearningDatapath {
         data: &[u8],
     ) -> impl std::future::Future<Output = Result<usize, siphon_rtp_datapath::DatapathError>> + Send
     {
-        self.inner.send(endpoint, dst, data)
+        use std::sync::atomic::Ordering;
+        let refused = self
+            .fail_sends
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        let sent = self.inner.send(endpoint, dst, data);
+        async move {
+            if refused {
+                Err(siphon_rtp_datapath::DatapathError::UnknownEndpoint(
+                    endpoint,
+                ))
+            } else {
+                sent.await
+            }
+        }
     }
 
     fn stats(&self, endpoint: EndpointId) -> Option<siphon_rtp_datapath::EndpointStats> {

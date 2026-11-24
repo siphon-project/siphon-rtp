@@ -349,20 +349,37 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The caller's video was answered up front and cannot change, so a far video stream that
         // does not keep the offered formats is declined alone: the audio relay is unaffected.
         let video_problem = far_video_answer_problem(&local.offer_sdp, sdp_text);
-        if sdp::parse_video_stream(sdp_text).is_some_and(|stream| {
-            stream
-                .fmtps
-                .iter()
-                .any(|(_, parameters)| parameters.contains("sprop-parameter-sets"))
-        }) {
-            // The caller's answer is frozen and a verbatim relay cannot add packets, so the far
-            // party's out-of-band parameter sets are not conveyed (RFC 6184 §8.4); the caller relies
-            // on the in-band SPS and PPS that come with the IDR, which the go-live PLI asks for.
+        // RFC 6184 §8.1: the far party's out-of-band parameter sets. The caller's answer is frozen
+        // (RFC 3264 §8) so it cannot be told them; the engine sends them in-band ahead of the first
+        // IDR instead ([`crate::video_injector`]). Packetization mode 2 forbids single NAL unit packets
+        // (RFC 6184 §5.4), so a mode 2 stream keeps relying on the in-band sets and the go-live PLI.
+        let far_sprop = if video_problem.is_none() {
+            sdp::parse_video_stream(sdp_text).and_then(|stream| {
+                stream
+                    .fmtps
+                    .iter()
+                    .find_map(|(_, parameters)| sdp::video::sprop_parameter_sets(parameters))
+            })
+        } else {
+            None
+        };
+        if far_sprop.is_none()
+            && video_problem.is_none()
+            && sdp::parse_video_stream(sdp_text).is_some_and(|stream| {
+                stream
+                    .fmtps
+                    .iter()
+                    .any(|(_, parameters)| parameters.contains("sprop-parameter-sets"))
+            })
+        {
             tracing::debug!(
                 target: "siphon_rtp::media",
                 call_id = %call_id,
-                "the far party's sprop-parameter-sets are not conveyed to the caller; in-band SPS/PPS with the IDR are relied on"
+                "the far party's sprop-parameter-sets are not conveyed to the caller (packetization mode 2 or unusable); in-band SPS/PPS with the IDR are relied on"
             );
+        }
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.video.far_sprop = far_sprop;
         }
         let declined_video_answer;
         let sdp_text = if video_problem.is_some() {
@@ -517,6 +534,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.video.far_direction = sdp::MediaDirection::default();
             call.video.keyframe = super::call_video_local::KeyframeRequests::default();
+            call.video.far_sprop = None;
         }
         if let Err(reason) = self.park_video(call_id) {
             tracing::warn!(target: "siphon_rtp::media", call_id = %call_id, %reason, "could not park the call's video");
@@ -576,6 +594,9 @@ fn forget_far_party(call: &mut Call) {
     call.video.far_direction = sdp::MediaDirection::default();
     call.video.far_picture_loss = false;
     call.video.keyframe = super::call_video_local::KeyframeRequests::default();
+    call.video.far_sprop = None;
+    call.video.injector = None;
+    call.video.sprop_spent = false;
     call.video.declined = None;
     if let Some(local) = call.local_answer.as_deref_mut() {
         local.far_offered_codecs.clear();

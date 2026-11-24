@@ -30,6 +30,7 @@ use crate::dtls_bridge::DtlsBridge;
 use crate::ingress::{Refusal, RefusalContext, RefusalLog};
 use crate::plain_tap::{PlainTapSender, PlainTaps};
 use crate::reply_latch::{ReplyLatch, SymmetricLatch};
+use crate::video_injector::{Verdict, VideoInjector};
 use crate::x3::X3Taps;
 
 /// The SSRC of an RTP media datagram, or `None` for anything else (RTCP, STUN, DTLS). What the
@@ -134,6 +135,9 @@ struct Flow {
     /// The taps on this endpoint's plaintext RTP ([`SrtpBridge::add_plain_tap`]). The bridge never
     /// decodes, so a tee or a decoded recording on a bridged call decodes its copy in its own task.
     plain_taps: PlainTaps,
+    /// The first-IDR injector of a far-to-caller video flow on an `answer_local` call
+    /// ([`crate::video_injector`]), while it is armed. Plain/plain flows only.
+    injector: Option<Arc<VideoInjector>>,
 }
 
 /// The bridge registry: redirected endpoint → its `Flow`. Shared (`Arc`) between the control path
@@ -171,6 +175,8 @@ pub struct SrtpBridge<D: Datapath> {
 pub(crate) struct Scratch {
     pub(crate) decrypted: Vec<u8>,
     pub(crate) sealed: Vec<u8>,
+    /// The parameter-set packets a [`VideoInjector`] puts ahead of a datagram.
+    pub(crate) injected: Vec<u8>,
 }
 
 /// A few [`Scratch`]es, so a datagram takes one for its life and gives it back, whatever way it
@@ -213,6 +219,7 @@ impl Drop for ScratchLoan<'_> {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.decrypted.clear();
         scratch.sealed.clear();
+        scratch.injected.clear();
         if let Ok(mut pool) = self.pool.0.lock() {
             pool.push(scratch);
         }
@@ -324,12 +331,28 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     x3,
                     refusals: Arc::new(RefusalLog::default()),
                     plain_taps,
+                    injector: None,
                 },
             );
         }
         for endpoint in stale {
             self.latched.remove(&endpoint);
         }
+    }
+
+    /// Put a first-IDR injector on `endpoint`'s registered flow, so everything the flow relays passes
+    /// through it until it settles. Call it after [`Self::register`] and before the endpoint is
+    /// redirected, so not one packet is relayed ahead of it. Returns whether the flow exists.
+    pub fn attach_video_injector(
+        &self,
+        endpoint: EndpointId,
+        injector: Arc<VideoInjector>,
+    ) -> bool {
+        let Some(mut flow) = self.flows.get_mut(&endpoint) else {
+            return false;
+        };
+        flow.injector = Some(injector);
+        true
     }
 
     /// Drop the flows for `endpoints` (a call's endpoints) — the bridge half of call teardown. Also
@@ -529,6 +552,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             x3,
             refusals,
             plain_taps,
+            injector,
         )) = self.flows.get(&packet.endpoint).map(|flow| {
             (
                 flow.accepted_source,
@@ -540,6 +564,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 flow.x3.clone(),
                 flow.refusals.clone(),
                 flow.plain_taps.clone(),
+                flow.injector.clone(),
             )
         })
         else {
@@ -570,7 +595,11 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
         // The two buffers are the bridge's own and come back to it when this datagram is done, so
         // the steady state allocates nothing per packet (they grow once, to the largest datagram).
         let mut scratch = self.scratch.take();
-        let Scratch { decrypted, sealed } = &mut *scratch;
+        let Scratch {
+            decrypted,
+            sealed,
+            injected,
+        } = &mut *scratch;
         let plaintext: &[u8] = if let Some(side) = &ingress_leg {
             let transformed = {
                 let Ok(mut leg) = side.leg.lock() else {
@@ -679,12 +708,34 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             plain_taps.offer(plaintext);
         }
 
+        // The first-IDR injector (RFC 6184 §8.1, see `crate::video_injector`): past the source gate,
+        // the latch and the liveness stamp, so a stranger can drive none of it and the call stays
+        // alive while the far party is being held back for its IDR.
+        let mut injection = None;
+        if let Some(injector) = &injector {
+            match injector.admit(out, injected) {
+                Verdict::Drop => {
+                    self.datapath.note_dropped(packet.endpoint);
+                    return;
+                }
+                Verdict::Forward(found) => injection = Some(found),
+            }
+        }
+
         // Prefer where the peer's own flow saw its media come from over the address it signalled —
-        // the same precedence the datapath's `Forward` path applies, and for the same reason.
+        // the same precedence the datapath's `Forward` path applies, and for the same reason. An
+        // injected flow's far end is a leg the datapath still relays for, which learns its own
+        // symmetric source (RFC 3550 §8) that this bridge never saw.
         let destination = self
             .latched
             .get(&out_endpoint)
-            .map_or(out_dst, |latched| *latched);
+            .map(|latched| *latched)
+            .or_else(|| {
+                injector
+                    .as_ref()
+                    .and_then(|_| self.datapath.latched_source(out_endpoint))
+            })
+            .unwrap_or(out_dst);
         // Telemetry: the plaintext RTCP either party sent. A bridged leg never passes the datapath's
         // relay tap, so this is the only place its reports can be exported from.
         if siphon_rtp_srtp::leg::is_rtcp(plaintext) {
@@ -695,6 +746,25 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                 destination,
                 plaintext,
             );
+        }
+        if let Some(found) = injection {
+            for sets in found.packets(injected) {
+                if let Err(error) = self.datapath.send(out_endpoint, destination, sets).await {
+                    // The caller would get the IDR without the sets it was promised: forward nothing
+                    // of this picture, wait for the next IDR inside the timeout and have the far
+                    // party asked for it (`VideoInjector::abandon_idr`).
+                    tracing::warn!(
+                        target: "siphon_rtp::media",
+                        endpoint = ?packet.endpoint, %error,
+                        "bridge could not send an injected parameter set; the IDR is held back"
+                    );
+                    if let Some(injector) = &injector {
+                        injector.abandon_idr();
+                    }
+                    self.datapath.note_dropped(packet.endpoint);
+                    return;
+                }
+            }
         }
         if let Err(error) = self.datapath.send(out_endpoint, destination, out).await {
             tracing::debug!(%error, "bridge forward send failed");

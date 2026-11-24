@@ -1209,6 +1209,10 @@ where
             // The one keyframe request each sending video party gets when a locally answered call's
             // relay goes live, once its stream's SSRC is known from its SDP or the relay (RFC 4585 §6.3.1).
             sweeper.request_video_keyframes().await;
+            // An answer_local call's far video is held back for its first IDR so the caller can be
+            // handed the far party's out-of-band parameter sets (RFC 6184 §8.1); this returns it to
+            // the kernel path once it has been.
+            sweeper.sweep_video_injectors();
             // RFC 7675 consent freshness on ICE legs: probe each validated pair and tear down a call
             // whose peer stopped answering. A no-op unless `--ice-consent` is set. Runs *before* the
             // idle reap so a call the peer just refreshed is not also evaluated as idle this tick.

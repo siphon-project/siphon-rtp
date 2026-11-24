@@ -38,7 +38,7 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 
 use siphon_rtp_datapath::EndpointId;
-use siphon_rtp_media::h264::Scan;
+use siphon_rtp_media::h264::{ParameterSets, Scan};
 use siphon_rtp_media::rtcp::{self, Feedback};
 use siphon_rtp_media::rtp::{write_packet, RtpHeader};
 use siphon_rtp_media::translator::Forwarded;
@@ -62,8 +62,6 @@ pub(crate) const KEYFRAME_MAX_WAIT_MS: u64 = 2000;
 pub(crate) const RECEIVER_REQUEST_INTERVAL_MS: u64 = 1000;
 /// Packets of the source the room can send again.
 const HISTORY_SLOTS: usize = 256;
-/// The largest SPS or PPS the room keeps to replay (a whole NAL unit, header included).
-const MAX_PARAMETER_SET: usize = 512;
 /// The most packets one NACK datagram makes the room send again; the rest are counted as missed.
 const MAX_RETRANSMISSIONS: usize = 32;
 /// The payload type a replayed parameter set is built under: the receiver's translator overwrites it
@@ -121,33 +119,6 @@ pub(super) const STEP_SPS: u8 = 1;
 pub(super) const STEP_PPS: u8 = 2;
 pub(super) const STEP_PACKET: u8 = 3;
 
-/// The last SPS and PPS a seat sent, in buffers fixed at their largest.
-pub(super) struct ParameterSets {
-    sps: [u8; MAX_PARAMETER_SET],
-    sps_length: usize,
-    pps: [u8; MAX_PARAMETER_SET],
-    pps_length: usize,
-}
-
-impl ParameterSets {
-    fn new() -> Box<Self> {
-        Box::new(Self {
-            sps: [0; MAX_PARAMETER_SET],
-            sps_length: 0,
-            pps: [0; MAX_PARAMETER_SET],
-            pps_length: 0,
-        })
-    }
-
-    fn sps(&self) -> Option<&[u8]> {
-        (self.sps_length > 0).then(|| &self.sps[..self.sps_length])
-    }
-
-    fn pps(&self) -> Option<&[u8]> {
-        (self.pps_length > 0).then(|| &self.pps[..self.pps_length])
-    }
-}
-
 /// What the room knows of the media a seat sends, for starting a receiver on it.
 #[derive(Default)]
 pub(super) struct SourceMedia {
@@ -160,18 +131,8 @@ pub(super) struct SourceMedia {
 impl SourceMedia {
     /// Keep the SPS and PPS of `found`, copied: the packet's buffer is not the room's.
     pub(super) fn note(&mut self, found: &Scan<'_>) {
-        for (part, is_sps) in [(found.sps, true), (found.pps, false)] {
-            let Some(unit) = part.filter(|unit| unit.len() <= MAX_PARAMETER_SET) else {
-                continue;
-            };
-            let sets = self.sets.get_or_insert_with(ParameterSets::new);
-            let (buffer, length) = if is_sps {
-                (&mut sets.sps, &mut sets.sps_length)
-            } else {
-                (&mut sets.pps, &mut sets.pps_length)
-            };
-            buffer[..unit.len()].copy_from_slice(unit);
-            *length = unit.len();
+        if found.sps.is_some() || found.pps.is_some() {
+            self.sets.get_or_insert_with(ParameterSets::new).note(found);
         }
     }
 }

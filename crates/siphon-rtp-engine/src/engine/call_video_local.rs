@@ -58,6 +58,20 @@ impl KeyframeRequests {
         }
     }
 
+    /// Ask the far party once more, after the first request went unanswered: `accepted` is whether
+    /// its video section accepted Picture Loss Indication. Keeps the request already pending for the
+    /// near party, and the call's engine SSRC.
+    pub(super) fn ask_far_again(&mut self, accepted: bool) {
+        if !accepted {
+            return;
+        }
+        if self.sender_ssrc == 0 {
+            self.sender_ssrc = random_ssrc();
+        }
+        self.far = true;
+        self.sweeps_left = KEYFRAME_SWEEPS;
+    }
+
     fn pending(&self) -> bool {
         self.sweeps_left > 0 && (self.near || self.far)
     }
@@ -286,6 +300,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .collect()
             })
             .unwrap_or_default();
+        let far_endpoints: Vec<_> = self
+            .calls
+            .get(call_id)
+            .and_then(|call| call.far.as_ref().and_then(|far| far.video))
+            .map(|video| video.endpoint_ids().collect())
+            .unwrap_or_default();
         let mut flows = Vec::with_capacity(endpoints.len());
         for endpoint in endpoints {
             self.datapath
@@ -296,6 +316,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.video.flows = flows;
             call.video.bridged.clear();
+        }
+        // Whatever armed injector carried the far video is cancelled with it: its flow leaves the
+        // bridge and no parameter set is sent to a far party that is gone or not answering.
+        let armed = self
+            .calls
+            .get(call_id)
+            .is_some_and(|call| call.video.injector.is_some());
+        if armed {
+            self.disarm_video_injector(call_id);
+            self.bridge.deregister(far_endpoints);
         }
         Ok(())
     }
@@ -397,8 +427,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     Party::Near => near_declared,
                     Party::Far => far_declared,
                 };
-                let Some(media_ssrc) =
-                    declared.or_else(|| self.datapath.latched_ssrc(video.rtp.id))
+                // A far endpoint carried by the first-IDR injector is a bridge flow, whose own latch
+                // learned the stream the datapath's never sees.
+                let Some(media_ssrc) = declared
+                    .or_else(|| self.datapath.latched_ssrc(video.rtp.id))
+                    .or_else(|| self.bridge.latched_ssrc(video.rtp.id))
                 else {
                     continue;
                 };

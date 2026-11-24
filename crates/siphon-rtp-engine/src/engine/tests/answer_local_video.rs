@@ -9,10 +9,10 @@ use super::call_video::{
 use super::*;
 use siphon_rtp_proto::VideoRelay;
 
-const CALL: &str = "al-video-call";
+pub(super) const CALL: &str = "al-video-call";
 
 /// A caller's offer: µ-law audio (muxed) and one H.264 video section with its RTCP on the next port.
-fn caller_offer(audio: SocketAddr, video: SocketAddr, direction: &str) -> String {
+pub(super) fn caller_offer(audio: SocketAddr, video: SocketAddr, direction: &str) -> String {
     format!(
         "v=0\r\no=caller 10 10 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
          m=audio {audio_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\na=rtcp-mux\r\n\
@@ -24,7 +24,7 @@ fn caller_offer(audio: SocketAddr, video: SocketAddr, direction: &str) -> String
 }
 
 /// The far party's answer: µ-law audio and `video_line` (a whole `m=video` section) when given.
-fn far_answer(audio: SocketAddr, video_section: &str) -> String {
+pub(super) fn far_answer(audio: SocketAddr, video_section: &str) -> String {
     format!(
         "v=0\r\no=callee 20 20 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
          m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\na=rtcp-mux\r\n\
@@ -34,7 +34,7 @@ fn far_answer(audio: SocketAddr, video_section: &str) -> String {
     )
 }
 
-fn far_video_section(video: SocketAddr, payload_type: u8, direction: &str) -> String {
+pub(super) fn far_video_section(video: SocketAddr, payload_type: u8, direction: &str) -> String {
     format!(
         "m=video {port} RTP/AVPF {payload_type}\r\na=rtpmap:{payload_type} H264/90000\r\n\
          a=fmtp:{payload_type} profile-level-id=42e01f;packetization-mode=1\r\n\
@@ -43,7 +43,7 @@ fn far_video_section(video: SocketAddr, payload_type: u8, direction: &str) -> St
     )
 }
 
-fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
+pub(super) fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
     use crate::srtp_bridge::run_redirect_dispatcher;
     let engine = Engine::new(UdpLoopbackDatapath::new());
     tokio::spawn(run_redirect_dispatcher(
@@ -58,15 +58,15 @@ fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
 }
 
 /// The caller's sockets: audio, video RTP and video RTCP.
-struct Caller {
-    _audio: UdpSocket,
-    video: UdpSocket,
-    video_rtcp: UdpSocket,
-    audio_addr: SocketAddr,
-    video_addr: SocketAddr,
+pub(super) struct Caller {
+    pub(super) _audio: UdpSocket,
+    pub(super) video: UdpSocket,
+    pub(super) video_rtcp: UdpSocket,
+    pub(super) audio_addr: SocketAddr,
+    pub(super) video_addr: SocketAddr,
 }
 
-async fn caller() -> Caller {
+pub(super) async fn caller() -> Caller {
     let (audio, audio_addr) = phone().await;
     let (video, video_addr, video_rtcp) = phone_with_rtcp().await;
     Caller {
@@ -78,7 +78,7 @@ async fn caller() -> Caller {
     }
 }
 
-async fn answer_locally(
+pub(super) async fn answer_locally(
     engine: &Engine<UdpLoopbackDatapath>,
     call_id: &str,
     offer: String,
@@ -97,7 +97,7 @@ async fn answer_locally(
         .await
 }
 
-async fn offer_far(
+pub(super) async fn offer_far(
     engine: &Engine<UdpLoopbackDatapath>,
     call_id: &str,
     profile: ProfileFlags,
@@ -114,7 +114,7 @@ async fn offer_far(
         .await
 }
 
-async fn answer_far(
+pub(super) async fn answer_far(
     engine: &Engine<UdpLoopbackDatapath>,
     call_id: &str,
     to_tag: &str,
@@ -134,7 +134,11 @@ async fn answer_far(
         .await
 }
 
-async fn delete(engine: &Engine<UdpLoopbackDatapath>, call_id: &str, to_tag: Option<&str>) {
+pub(super) async fn delete(
+    engine: &Engine<UdpLoopbackDatapath>,
+    call_id: &str,
+    to_tag: Option<&str>,
+) {
     let result = engine
         .handle(
             CLIENT,
@@ -169,17 +173,21 @@ fn video_section(sdp_text: &str) -> Vec<&str> {
 
 /// A call that has been answered locally with video anchored, the far leg offered and (when
 /// `far_video` is given) answered.
-struct Grown {
-    engine: Engine<UdpLoopbackDatapath>,
-    caller: Caller,
-    callee_video: UdpSocket,
-    callee_video_rtcp: UdpSocket,
-    local_answer: String,
-    far_offer: String,
-    answered: CmdResult,
+pub(super) struct Grown {
+    pub(super) engine: Engine<UdpLoopbackDatapath>,
+    pub(super) caller: Caller,
+    pub(super) callee_video: UdpSocket,
+    pub(super) callee_video_rtcp: UdpSocket,
+    pub(super) local_answer: String,
+    pub(super) far_offer: String,
+    pub(super) answered: CmdResult,
 }
 
-async fn grown(call_id: &str, caller_direction: &str, far_video: Option<(u8, &str)>) -> Grown {
+pub(super) async fn grown(
+    call_id: &str,
+    caller_direction: &str,
+    far_video: Option<(u8, &str)>,
+) -> Grown {
     grown_edited(
         call_id,
         caller_direction,
@@ -191,7 +199,7 @@ async fn grown(call_id: &str, caller_direction: &str, far_video: Option<(u8, &st
 }
 
 /// [`grown`] with the caller's offer and the far video section edited by the test.
-async fn grown_edited(
+pub(super) async fn grown_edited(
     call_id: &str,
     caller_direction: &str,
     far_video: Option<(u8, &str)>,
@@ -664,7 +672,7 @@ async fn offer_far_still_refuses_what_it_refused_with_video_relay_on_a_call_with
     );
 }
 
-fn video_rtp(sequence: u16, ssrc: u32) -> Vec<u8> {
+pub(super) fn video_rtp(sequence: u16, ssrc: u32) -> Vec<u8> {
     let mut packet = vec![0x80, 96];
     packet.extend_from_slice(&sequence.to_be_bytes());
     packet.extend_from_slice(&[0, 0, 0, 0]);
@@ -675,7 +683,7 @@ fn video_rtp(sequence: u16, ssrc: u32) -> Vec<u8> {
 
 /// `(sender ssrc, media ssrc)` of the Picture Loss Indication that ends the compound `datagram`
 /// (RFC 4585 §6.1, §6.3.1), after a receiver report and a source description (RFC 3550 §6.1).
-fn parse_picture_loss(datagram: &[u8]) -> (u32, u32) {
+pub(super) fn parse_picture_loss(datagram: &[u8]) -> (u32, u32) {
     let packets = siphon_rtp_media::rtcp::feedback_packets(datagram).collect::<Vec<_>>();
     assert_eq!(packets.len(), 1, "one feedback message: {datagram:02x?}");
     assert_eq!(
