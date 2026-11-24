@@ -615,7 +615,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // A tee and a decoded recording decode beside a relay-only actor; only echo and a
                 // prompt need the call itself decoded and re-encoded.
                 let processing = reasons.iter().any(|reason| {
-                    matches!(reason, PromotionReason::Echo | PromotionReason::MediaOp)
+                    matches!(
+                        reason,
+                        PromotionReason::Echo | PromotionReason::MediaOp | PromotionReason::WsSplit
+                    )
                 });
                 let promoted = if processing {
                     self.promote_to_processing(call_id, reasons.contains(&PromotionReason::Echo))
@@ -638,6 +641,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         if self.ws_tees.contains_key(call_id) {
             self.retap_ws_tee(call_id).await;
+        }
+        // …and the split bridge, onto the actor the answer registered (already isolated).
+        if self.ws_splits.contains_key(call_id) {
+            self.retap_ws_split(call_id).await;
         }
         // Decoded recordings, the same way: their sinks lived on the actor the answer replaced.
         // `answer` pinned their assemblers before it installed, so the files are still open here.

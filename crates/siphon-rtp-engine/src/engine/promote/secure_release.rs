@@ -51,13 +51,19 @@ pub(in crate::engine) enum HeldAnswer {
     /// A DTLS re-handshake ended the hold (the call is back on its bridge); the answer installs its
     /// resolved kind. What a later change turns into an event.
     ReleasedForRekey(PipelineKind),
+    /// A DTLS re-handshake on a call a split holds: refused, the call keeps its association and its
+    /// isolation.
+    SplitRefusesRekey(PipelineKind),
 }
 
 impl HeldAnswer {
     /// The kind the answer installs.
     pub(in crate::engine) fn pipeline(self) -> PipelineKind {
         match self {
-            Self::Unheld(kind) | Self::Kept(kind) | Self::ReleasedForRekey(kind) => kind,
+            Self::Unheld(kind)
+            | Self::Kept(kind)
+            | Self::ReleasedForRekey(kind)
+            | Self::SplitRefusesRekey(kind) => kind,
         }
     }
 }
@@ -338,6 +344,38 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     // ---- A re-offer while held -----------------------------------------------------------------
 
+    /// Whether the answer presents a DTLS certificate other than the one the call's secure party is
+    /// on, for a call whose own kind carries DTLS in the decoding actor (no bridge hold behind it).
+    fn dtls_peer_rekeyed(
+        &self,
+        call_id: &str,
+        fingerprints: (
+            Option<&crate::sdp::Fingerprint>,
+            Option<&crate::sdp::Fingerprint>,
+        ),
+    ) -> bool {
+        let Some((pipeline, near, far)) = self
+            .owned_call_internal(call_id, |call| Some((call.pipeline, call.near, call.far?)))
+            .flatten()
+        else {
+            return false;
+        };
+        let (secure, changed) = match pipeline {
+            PipelineKind::Dtls | PipelineKind::DtlsMedia => (far.rtp.id, fingerprints.0),
+            PipelineKind::DtlsOfferer | PipelineKind::DtlsOffererMedia => {
+                (near.rtp.id, fingerprints.1)
+            }
+            _ => return false,
+        };
+        changed.is_some_and(|fingerprint| {
+            self.dtls_bridge().fingerprint_differs(
+                secure,
+                &fingerprint.hash_function,
+                &fingerprint.bytes,
+            )
+        })
+    }
+
     /// What the answer to a re-offer resolved to, for a call that may be held: while a split is held
     /// the call stays on the actor's kind, so the answer rebuilds the **actor**. A DTLS re-handshake
     /// (a changed peer certificate, RFC 8842 §3.1) cannot be kept: the new association keys a leg the
@@ -358,6 +396,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             })
             .flatten()
         else {
+            // Not held on a bridge, but a split may sit on a call that was a decoding DTLS call from
+            // the start (`DtlsMedia`, `DtlsOffererMedia`): a new certificate there is the same
+            // re-handshake, and the answer would install a new association under the split.
+            if self.has_split_verb(call_id) && self.dtls_peer_rekeyed(call_id, fingerprints) {
+                return HeldAnswer::SplitRefusesRekey(resolved);
+            }
             return HeldAnswer::Unheld(resolved);
         };
         let (secure, changed) = match hold.original {
@@ -372,6 +416,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &fingerprint.bytes,
             )
         });
+        if rekeyed && self.has_split_verb(call_id) {
+            // A split's isolation is lifted by its detach and by nothing else. Releasing the hold
+            // would put the new association on a bridge that relays one party to the other, and the
+            // actor cannot carry an association it does not have, so the answer is refused and the
+            // call stays as it is, on its old association, until the controller detaches.
+            return HeldAnswer::SplitRefusesRekey(resolved);
+        }
         if rekeyed {
             tracing::info!(
                 target: "siphon_rtp::media",

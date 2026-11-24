@@ -706,6 +706,94 @@ tee's lifetime and demotes it again on detach. A tee cannot be attached to a tak
 `Redirect` path carries ciphertext without decoding. Like `ws_uri`, the tee is native-JSON only;
 the NG/bencode front-end does not carry it.
 
+## Splitting a live call to one bot
+
+A tee listens and a takeover replaces one leg. A **split** puts a bot *between* the two parties of
+a call: each party hears only what the bot sends back for it, and the bot hears both. That is the
+shape of live interpreting (each party hears the other, translated), of whisper coaching, and of
+any feature where an AI speaks into a call that is otherwise a plain conversation. When the
+feature is switched off the direct path comes back as it was, with no re-INVITE.
+
+```json
+{ "id": 9, "command": "attach_ws_split", "call_id": "call-9@198.51.100.2", "from_tag": "caller",
+  "ws_uri": "wss://bot.example.net/call", "sample_rate": 16000 }
+```
+
+```json
+{ "id": 10, "command": "detach_ws_split", "call_id": "call-9@198.51.100.2", "from_tag": "caller" }
+```
+
+**One socket, two channels.** The `start` frame announces `"direction": "duplex"`, `"channels": 2`
+and `tracks: ["inbound", "outbound"]`, in L16 little-endian at `sample_rate` (`8000`, `16000` by
+default, `24000` or `48000`). Both directions are interleaved stereo:
+
+| Channel | Uplink (engine to bot) | Downlink (bot to engine) |
+| --- | --- | --- |
+| 0 | what the offerer said (the `from_tag` party) | played to the offerer |
+| 1 | what the answerer said | played to the answerer |
+
+A frame may be any length, as long as it is whole stereo samples in total; the engine reassembles
+20 ms chunks per channel. The legs keep their own codecs: the engine decodes each party, resamples
+to the wire rate, and encodes the bot's audio back into whatever each leg negotiated (G.711, AMR,
+Opus), on the RTP stream the leg was already receiving.
+
+**The downlink is clock driven, not event driven.** Every 20 ms each party is played one chunk of
+its own channel, or silence if the bot has sent nothing for it, so the two parties never wait on each
+other: a bot that translates one direction at a time leaves the other channel quiet and that party
+hears silence while the stream stays alive. The queue behind each party holds one second and drops
+its oldest audio past that, because a bot answers faster than real time in bursts and a
+synthesised sentence should not be cut short, but audio that is a second late is not worth playing.
+A `clear` control frame from the bot flushes both queues (barge-in); `stop` ends the split.
+
+**Nothing crosses while it is attached.** A party's audio goes to the bot and nowhere else, DTMF
+events included (they are still reported to the controller). Recordings, a WebSocket tee and
+SIPREC keep the parties' *own* voices, not the bot's; a `both` recording's second channel is the
+other party as it would have been heard, so a transcript made from it is the conversation, not the
+translation.
+
+**What it works on.** An answered two-party call: a plain relay, a transcoding call, SDES-SRTP on
+either leg or both, and DTLS-SRTP with or without ICE on either leg (a browser caller to a plain
+carrier, or the carrier calling a browser). Each leg's SRTP contexts and DTLS association are used
+as they are, never rebuilt, so the far end sees one stream throughout. Refused up front, with the
+call untouched and the bot never dialled: a call the engine answered itself (`ws-split-answer-local`),
+a leg seated in a conference room, an unanswered call (`ws-split-not-answered`), a call with a split
+or a takeover already on it (`ws-split-already-bridged`), and a source of a multi-source tee
+(`ws-split-secondary-source`).
+
+**Uplink processing.** `offerer_profile` and `answerer_profile` take the same profile object as
+`attach_ws_bridge`, and a split runs only its `noise_suppression`; the rest (echo cancellation,
+`ws_vad*`, `ws_barge_in`) is refused with `ws-split-profile` rather than accepted and ignored.
+
+**The one rule: isolation ends only when you detach.** Once `attach_ws_split` has succeeded (you
+have its ok and `ws_split_started`), the call's parties never hear each other again until a
+`detach_ws_split` you sent has succeeded. Before that, an attach that is refused or fails puts
+the previous path back and the call is as it was. The bot going
+away, a re-offer, an internal failure, a failover to a standby and a delete do not lift it (a delete
+ends the call, so there is nothing to hear). If a detach fails (it answers with an error saying the
+media actor did not confirm), nothing changed and the call is still isolated: send it again. A detach
+that failed is never applied later behind your back, and one whose answer was lost is settled by
+sending it again.
+
+**Hold, resume and session refreshes** re-INVITE the call, and the split follows them: the socket
+and the queues stay, the replacement media path starts out isolated, and nothing of one party
+reaches the other in between. A DTLS re-handshake (the far end presents a new certificate) cannot
+be followed and cannot be allowed to reconnect the parties, so its answer is refused
+(`ws-split-renegotiation`): detach first, then re-INVITE. If the engine cannot re-attach the split
+to the rebuilt media path it ends the stream with `ws_split_ended{renegotiated}` and leaves the call
+isolated and silent.
+
+**After any `ws_split_ended`, detach.** `ws_split_started` and `ws_split_ended` bracket the stream,
+once each. `reason` is `detached`, `ws_closed`, `ws_stopped`, `ws_error`, `call_deleted`,
+`renegotiated` or `restored` (a standby restored a call that was checkpointed while split, with no
+socket). Whatever the reason other than `detached` and `call_deleted`, the call is isolated and
+silent in both directions until you act: the engine does *not* put the parties back in touch by
+itself, since that would suddenly connect two people who were relying on an interpreter.
+`detach_ws_split` restores direct audio; detach and attach again to reconnect a bot. Attaching while
+a dead split is still on the call is refused (`ws-split-already-bridged`) so the two states are
+never mixed.
+
+A native-JSON verb, like the tee and the takeover; `node_info` lists the `ws_split` feature.
+
 ## How to verify
 
 - `tracing` logs the dial at offer time; a failed dial fails the offer with the reason.

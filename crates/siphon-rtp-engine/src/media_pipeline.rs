@@ -56,12 +56,14 @@ use crate::x3::X3Taps;
 mod ingress_clock;
 mod relay_tap;
 mod secure_hold;
+mod split;
 mod surrender;
 mod x3_single_leg;
 use ingress_clock::IngressClock;
 pub use relay_tap::CarriedAttachments;
 use relay_tap::TapDecode;
 pub use secure_hold::{HeldBack, HeldEgress, HeldResume, HeldTaps};
+pub use split::{ConfirmError, DetachOutcome, SplitAttach, CONTROL_CONFIRM_TIMEOUT};
 pub use surrender::{SecureLegs, SurrenderedCall};
 
 /// The playout-clock tick driving injected media (PlayMedia / PlayDtmf): one egress packet per
@@ -944,6 +946,9 @@ pub struct Direction {
     /// whole call, for the end-of-call CDR ([`Event::CallSummary`]). Folded one sample per periodic
     /// quality tick (~5 s) by [`Direction::accumulate_quality`]; never touched on the per-packet path.
     quality: QualityAggregate,
+    /// Isolated for a split bridge (media_pipeline/split.rs): nothing decoded here is re-encoded toward
+    /// the other party, and this party's egress plays the bot's audio on the playout tick instead.
+    split: Option<Box<split::SplitEgress>>,
 }
 
 /// One periodic quality reading for a direction: an ITU-T G.107 MOS and the RFC 3550 loss/jitter it
@@ -1663,6 +1668,7 @@ impl Direction {
             ingress: IngressStats::new(ingress_rtp_clock_rate_hz),
             ingress_mos_codec: config.ingress_mos_codec,
             quality: QualityAggregate::default(),
+            split: None,
         }
     }
 
@@ -1752,6 +1758,7 @@ impl Direction {
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             // A relay-only direction never samples quality (see above), so the aggregate stays empty.
             quality: QualityAggregate::default(),
+            split: None,
         }
     }
 
@@ -1972,6 +1979,10 @@ impl Direction {
         if self.injection.is_some() {
             // The superseding prompt is tick-clocked and mixes any overlay in on the way out.
             return self.tick_injection(out);
+        }
+        if self.split.is_some() {
+            self.tick_split(out);
+            return None;
         }
         if comfort_enabled && !self.blocked && self.comfort.is_some() {
             self.emit_comfort(out);
@@ -2367,7 +2378,7 @@ impl Direction {
             // A comfort-idle single-leg leg (`comfort.is_some()`) also never relays: it faces the
             // caller on both directions, so repacketizing the event onto this egress would echo the
             // caller's own DTMF tone back to it. The `Event::Dtmf` above still fired.
-            if !self.dtmf_blocked && self.comfort.is_none() {
+            if !self.dtmf_blocked && self.comfort.is_none() && self.split.is_none() {
                 self.relay_telephone_event(&parsed, out);
             }
             return Ok(admitted);
@@ -2580,7 +2591,13 @@ impl Direction {
         // detector / reception stats, and the stream still latches (`Some(stream_ssrc)`); the idle
         // egress is a continuous comfort-noise stream driven by the playout tick instead (see
         // `tick_egress`). A player overrides it; the `echo` verb reflects via `echo_into`.
+        // A split bridge isolates the parties the same way: what was decoded fed the forks above and
+        // goes no further; the party hears the bot on the playout tick (media_pipeline/split.rs).
         if self.comfort.is_some() {
+            return;
+        }
+        if self.split.is_some() {
+            self.feed_split_taps(decoded);
             return;
         }
 
@@ -4097,7 +4114,10 @@ impl MediaCall {
     /// that is the only clock carrying it.
     #[must_use]
     pub fn needs_egress_tick(&self) -> bool {
-        self.has_injection() || self.has_overlay() || (!self.echo && self.a_to_b.comfort.is_some())
+        self.has_injection()
+            || self.has_overlay()
+            || self.is_split()
+            || (!self.echo && self.a_to_b.comfort.is_some())
     }
 
     /// Mark this call as a **single-leg** local-answer / IVR call whose caller-facing egress idles on
@@ -4275,6 +4295,25 @@ pub enum MediaControl {
     /// The bridge has let go of a held call: continue its egress streams, adopt its taps and, unless a
     /// DTLS key is still to come, start taking media (media_pipeline/secure_hold.rs).
     ResumeHeld(Box<HeldResume>),
+    /// Isolate the two parties and play each its playout queue (media_pipeline/split.rs).
+    SplitAttach(Box<split::SplitAttach>),
+    /// Take a split's forks (labelled `tag`) off and end the isolation, **if** the split is still the
+    /// one `epoch` was issued under; a stale one, applied late after its sender gave up, is ignored
+    /// (media_pipeline/split.rs).
+    SplitDetach {
+        epoch: u64,
+        tag: String,
+        reply: Option<tokio::sync::oneshot::Sender<split::DetachOutcome>>,
+    },
+    /// Isolate both parties now, silent until [`MediaControl::SplitAttach`] arrives. `epoch` is the
+    /// split's generation, read by every later control that would lift the isolation.
+    SplitIsolate {
+        epoch: Arc<std::sync::atomic::AtomicU64>,
+    },
+    /// Reply once every control sent before this one has been applied (media_pipeline/split.rs).
+    Barrier {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     /// Tear the call down: flush recordings and exit the actor loop.
     Stop,
 }
@@ -4305,6 +4344,8 @@ pub struct MediaRegistry {
     /// one `media` handle the redirect dispatcher already holds reaches them; kept apart from
     /// `calls` so a relay is never mistaken for a media actor (`is_media_call`, promotion).
     rtcp_relays: crate::rtcp_relay::RtcpRelayRegistry,
+    /// Calls with a split bridge on them: an actor registered for one starts isolated.
+    split_calls: DashMap<String, Arc<std::sync::atomic::AtomicU64>>,
     /// Test probe: whether each call's actor was registered with its egress already withheld, which is
     /// the state it takes its first playout tick in.
     #[cfg(test)]
@@ -4396,6 +4437,9 @@ impl MediaRegistry {
         let mut call = call;
         call.set_rtcp_tap(datapath.rtcp_tap());
         let call_id = call.call_id.clone();
+        if let Some(epoch) = self.split_calls.get(&call_id) {
+            call.begin_split(epoch.clone());
+        }
         #[cfg(test)]
         self.started_withholding
             .insert(call_id.clone(), !call.a_to_b.peer_receives);
@@ -4787,6 +4831,19 @@ async fn run_media_call<D>(
                         tracing::debug!(target: "siphon_rtp::media", "DTLS-SRTP key installed on the media pipeline");
                     }
                     MediaInput::Control(MediaControl::ResumeHeld(resume)) => call.resume_held(*resume),
+                    MediaInput::Control(MediaControl::SplitAttach(attach)) => call.attach_split(*attach),
+                    MediaInput::Control(MediaControl::SplitDetach { epoch, tag, reply }) => {
+                        let outcome = call.end_split(epoch, &tag);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(outcome);
+                        }
+                    }
+                    MediaInput::Control(MediaControl::SplitIsolate { epoch }) => {
+                        call.begin_split(epoch);
+                    }
+                    MediaInput::Control(MediaControl::Barrier { reply }) => {
+                        let _ = reply.send(());
+                    }
                     MediaInput::Control(MediaControl::Surrender { reply }) => {
                         let _ = reply.send(call.surrender());
                         break;

@@ -323,6 +323,10 @@ fn build_features() -> Vec<String> {
         "answer_local_direction".to_string(),
         "record_multi_source".to_string(),
         "ws_tee_multi_source".to_string(),
+        // `attach_ws_split` / `detach_ws_split`: both legs of a live two-party call on one duplex
+        // stereo WebSocket, the parties isolated from each other, on a plain relay and on every
+        // crypto bridge (docs/control/json.md). A controller gates the verb on this entry.
+        "ws_split".to_string(),
         // `conference_join`, `conference_offer` and `conference_seat` take `dtmf: "forward"`, and
         // `conference_route` can switch it live: the room regenerates that seat's RFC 4733
         // telephone-events toward every other seat, in each seat's own payload type and clock. A

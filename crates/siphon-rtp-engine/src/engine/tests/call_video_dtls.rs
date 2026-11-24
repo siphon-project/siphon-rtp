@@ -175,9 +175,11 @@ impl DtlsCall {
     /// Seal `plain` as A and send it to the engine, retrying across the window between A finishing its
     /// handshake and the engine installing its leg, until `to` receives something.
     async fn a_sends(&mut self, plain: &[u8], to_video: bool) -> Option<Vec<u8>> {
+        // Sealed once and resent: sealing the same packet again would reuse its SRTP index (RFC 3711
+        // §9.1), which the sender refuses.
+        let mut sealed = Vec::new();
+        self.a_leg.protect(plain, &mut sealed).expect("protect");
         for _ in 0..25 {
-            let mut sealed = Vec::new();
-            self.a_leg.protect(plain, &mut sealed).expect("protect");
             self.a
                 .send_to(&sealed, self.engine_near)
                 .await
@@ -462,9 +464,10 @@ async fn an_unbundled_dtls_caller_runs_a_second_association_on_the_video_endpoin
     .await;
     let from_a = video_packet(1);
     let mut at_b = None;
+    // Sealed once and resent (RFC 3711 §9.1: the same packet sealed again reuses its index).
+    let mut sealed = Vec::new();
+    video_leg.protect(&from_a, &mut sealed).expect("protect");
     for _ in 0..25 {
-        let mut sealed = Vec::new();
-        video_leg.protect(&from_a, &mut sealed).expect("protect");
         a_video
             .send_to(&sealed, video.remote_rtp)
             .await

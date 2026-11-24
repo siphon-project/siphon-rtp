@@ -1007,6 +1007,11 @@ pub enum Command {
     /// so detaching one is refused rather than answered with a call that has no audio path at all.
     /// Re-point it with [`Command::AttachWsBridge`], or end it with [`Command::Delete`].
     DetachWsBridge { call_id: String, from_tag: String },
+    /// Stream both legs of a live two-party call to one duplex stereo WebSocket and isolate the
+    /// parties from each other ([`ws_split`]).
+    AttachWsSplit(WsSplitAttach),
+    /// End a split and put the direct path back, without a re-INVITE ([`ws_split`]).
+    DetachWsSplit(WsSplitDetach),
     /// Begin **lawful-interception content delivery** (ETSI TS 103 221-2 X3) for a call: the engine
     /// frames every accepted media packet on both legs as an X3 PDU and ships it to the Mediation
     /// Function over its own mutually-authenticated TLS connection.
@@ -2711,6 +2716,10 @@ pub enum Event {
         stream_id: String,
         reason: WsBridgeEndReason,
     },
+    /// A split started ([`Command::AttachWsSplit`]); see [`ws_split`].
+    WsSplitStarted(WsSplitStarted),
+    /// A split ended, once per started one ([`ws_split`]).
+    WsSplitEnded(WsSplitEnded),
     /// Unknown / future event kind (forward-compat).
     #[serde(other)]
     Unknown,
@@ -2825,7 +2834,12 @@ pub use recording::{
 pub use video::{VideoProfile, VideoProfileError, VideoRelay, VideoStats};
 pub mod scope;
 pub mod vq_rtcpxr;
+pub mod ws_split;
 pub use scope::{normalize_scope, validate_scope, ScopeError, Scoped, MAX_SCOPE_LEN};
+pub use ws_split::{
+    resolve_ws_split_sample_rate, WsSplitAttach, WsSplitDetach, WsSplitEndReason, WsSplitEnded,
+    WsSplitRateError, WsSplitStarted, WS_SPLIT_DEFAULT_SAMPLE_RATE, WS_SPLIT_SAMPLE_RATES,
+};
 
 #[cfg(test)]
 mod tests {

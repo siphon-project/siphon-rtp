@@ -19,6 +19,7 @@ pub mod audio;
 pub mod multi_source;
 pub mod protocol;
 pub mod session;
+pub mod split;
 pub mod taps;
 pub mod tee;
 pub mod wire_rate;
@@ -29,7 +30,10 @@ pub use protocol::{
     ControlMessage, Direction, Encoding, Endianness, MediaFormat, PlaySource, StartData,
 };
 pub use session::{BridgeSession, TickResult};
-pub use tee::{plan_ws_tee, run_ws_tee, TeeChannel, TeeEndReason, WsTeePlan, WsTeeSink};
+pub use split::{playout, run_ws_split, PlayoutReader, PlayoutWriter, SplitEndReason};
+pub use tee::{
+    plan_ws_tee, run_ws_tee, start_message, TeeChannel, TeeEndReason, WsTeePlan, WsTeeSink,
+};
 pub use wire_rate::{validate_wire_sample_rate, wire_resampler, WireRateError};
 pub use ws::{run_bridge, BridgeEndReason, BridgeError, WS_WRITE_TIMEOUT};
 

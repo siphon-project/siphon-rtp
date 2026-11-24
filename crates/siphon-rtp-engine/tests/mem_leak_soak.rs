@@ -3101,3 +3101,112 @@ async fn anchored_video_offer_reoffer_delete_does_not_leak() {
     }
     gate.assert_no_leak();
 }
+
+/// One split churn cycle: offer → answer → attach a split (promoting the relay into the decoding
+/// actor, dialling the bot, forking both legs, isolating them) → detach (or, on odd cycles, delete
+/// the call under it) → delete.
+async fn ws_split_cycle(engine: &Engine<UdpLoopbackDatapath>, uri: &str, index: usize) {
+    let call_id = format!("split-soak-{index}");
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for("198.51.100.1", 40_000),
+                    profile: Default::default(),
+                },
+            )
+            .await,
+        "offer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for("203.0.113.1", 41_000),
+                    profile: Default::default(),
+                },
+            )
+            .await,
+        "answer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::AttachWsSplit(siphon_rtp_proto::WsSplitAttach {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri.to_string(),
+                    sample_rate: None,
+                    offerer_profile: None,
+                    answerer_profile: None,
+                }),
+            )
+            .await,
+        "attach_ws_split",
+    );
+    if index.is_multiple_of(2) {
+        assert_ok(
+            &engine
+                .handle(
+                    CLIENT,
+                    Command::DetachWsSplit(siphon_rtp_proto::WsSplitDetach {
+                        call_id: call_id.clone(),
+                        from_tag: "tag-a".into(),
+                    }),
+                )
+                .await,
+            "detach_ws_split",
+        );
+    }
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id,
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_split_attach_detach_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let (uri, live) = tee_sink_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    let mut gate = LeakGate::new("ws split", 100, 40).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            ws_split_cycle(&engine, &uri, index).await;
+            index += 1;
+        }
+        drain_tee_server(&live).await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(engine.ws_split_count(), 0, "every split went with its call");
+        assert_eq!(
+            engine.media().split_marked_count(),
+            0,
+            "no call stays marked for a split"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}

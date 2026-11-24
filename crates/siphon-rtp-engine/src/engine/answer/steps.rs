@@ -8,6 +8,7 @@ use siphon_rtp_srtp::sdes::CryptoAttribute;
 
 use crate::engine::install::{AnswerText, AnswerWiring, AnsweredText};
 use crate::engine::negotiate::{resolve_pipeline, settle_secure_offerer, NearDtlsAnswer};
+use crate::engine::promote::secure_release::HeldAnswer;
 use crate::engine::{Engine, Leg, PipelineKind};
 use crate::sdp;
 
@@ -128,7 +129,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             })
         })?;
         // A call held for a split stays on the actor's kind (promote/secure_hold.rs).
-        let pipeline = self
+        let held = self
             .settle_held_pipeline(
                 call_id,
                 pipeline,
@@ -137,8 +138,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_dtls.map(|keying| &keying.peer_fingerprint),
                 ),
             )
-            .await
-            .pipeline();
+            .await;
+        if matches!(held, HeldAnswer::SplitRefusesRekey(_)) {
+            return Err(Box::new(CmdResult::Error {
+                reason: "answer: ws-split-renegotiation: a DTLS re-handshake cannot be followed \
+                         while a split holds the call (the parties stay isolated); send \
+                         detach_ws_split first"
+                    .to_string(),
+            }));
+        }
+        let pipeline = held.pipeline();
+        // A split on a call that was plain when it began cannot go back to a crypto bridge because
+        // the re-offer made a leg secure: the bridge would relay one party to the other.
+        let pipeline = self.keep_split_on_actor(call_id, pipeline);
         let settled = settle_secure_offerer(
             pipeline,
             (near_local_crypto.is_some(), near_dtls),

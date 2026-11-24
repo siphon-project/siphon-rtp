@@ -411,3 +411,46 @@ async fn a_recording_format_the_engine_does_not_know_never_starts_a_recording() 
         "the call survives the refused frame"
     );
 }
+
+/// The split verbs, as text: an unknown call is refused by name, a detach with nothing to detach is
+/// not an error, and `node_info` advertises the verb so a controller can gate on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_split_verbs_answer_on_the_wire() {
+    let (_engine, control_addr) = serve().await;
+    let mut control = RawControl::connect(control_addr).await;
+    let (_phone, addr) = phone().await;
+
+    let refused = control
+        .request(
+            r#"{"id":1,"command":"attach_ws_split","call_id":"nobody","from_tag":"a","ws_uri":"ws://127.0.0.1:1/s"}"#,
+        )
+        .await;
+    let refused: serde_json::Value = serde_json::from_str(&refused).expect("JSON");
+    assert_eq!(refused["result"], "error");
+    assert!(refused["reason"]
+        .as_str()
+        .expect("reason")
+        .contains("unknown call"));
+
+    let offer = control
+        .request(&format!(
+            r#"{{"id":2,"command":"offer","call_id":"c1","from_tag":"a","sdp":"{}"}}"#,
+            sdp_json(addr)
+        ))
+        .await;
+    engine_addr(&offer);
+    let detached = control
+        .request(r#"{"id":3,"command":"detach_ws_split","call_id":"c1","from_tag":"a"}"#)
+        .await;
+    let detached: serde_json::Value = serde_json::from_str(&detached).expect("JSON");
+    assert_eq!(
+        detached["result"], "ok",
+        "detaching nothing is not an error"
+    );
+
+    let info = control.request(r#"{"id":4,"command":"node_info"}"#).await;
+    assert!(
+        info.contains(r#""ws_split""#),
+        "node_info lists the feature: {info}"
+    );
+}

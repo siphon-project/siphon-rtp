@@ -150,6 +150,8 @@ impl Command {
             Command::SendRtcpApp { call_id, .. } | Command::SetFloorKeys { call_id, .. } => {
                 call_id.as_mut()
             }
+            Command::AttachWsSplit(attach) => Some(&mut attach.call_id),
+            Command::DetachWsSplit(detach) => Some(&mut detach.call_id),
             Command::Ping
             | Command::List
             | Command::Statistics
@@ -240,6 +242,8 @@ impl Event {
             | Event::X3Ended { call_id, .. }
             | Event::WsBridgeStarted { call_id, .. }
             | Event::WsBridgeEnded { call_id, .. } => Some(call_id),
+            Event::WsSplitStarted(started) => Some(&mut started.call_id),
+            Event::WsSplitEnded(ended) => Some(&mut ended.call_id),
             Event::CallQuality { call_id, .. } | Event::RtcpApp { call_id, .. } => call_id.as_mut(),
             Event::ActiveSpeaker { .. }
             | Event::ForwardSourceStarted { .. }

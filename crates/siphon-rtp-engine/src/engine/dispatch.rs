@@ -654,6 +654,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Command::DetachWsBridge { call_id, .. } => {
                 self.detach_ws_bridge(client, &call_id).await
             }
+            Command::AttachWsSplit(attach) => self.attach_ws_split(client, &attach).await,
+            Command::DetachWsSplit(detach) => self.detach_ws_split(client, &detach.call_id).await,
             Command::AttachX3 {
                 call_id,
                 from_tag,
@@ -1080,6 +1082,8 @@ pub(super) fn command_name(command: &Command) -> &'static str {
         Command::DetachWsTee { .. } => "detach_ws_tee",
         Command::AttachWsBridge { .. } => "attach_ws_bridge",
         Command::DetachWsBridge { .. } => "detach_ws_bridge",
+        Command::AttachWsSplit(_) => "attach_ws_split",
+        Command::DetachWsSplit(_) => "detach_ws_split",
         Command::AttachX3 { .. } => "attach_x3",
         Command::DetachX3 { .. } => "detach_x3",
         Command::Authenticate { .. } => "authenticate",
@@ -1136,6 +1140,8 @@ pub(super) fn command_call_id(command: &Command) -> Option<&str> {
         | Command::AttachX3 { call_id, .. }
         | Command::DetachX3 { call_id, .. }
         | Command::ConferenceSeat { call_id, .. } => Some(call_id),
+        Command::AttachWsSplit(attach) => Some(&attach.call_id),
+        Command::DetachWsSplit(detach) => Some(&detach.call_id),
         Command::ConferenceJoin { conference_id, .. }
         | Command::ConferenceOffer { conference_id, .. }
         | Command::ConferenceAnswer { conference_id, .. }

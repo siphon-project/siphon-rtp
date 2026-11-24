@@ -24,6 +24,20 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   (video, text and decoded SDES calls included) and re-keys only the side that changed, a leg that
   has to be rebuilt closes everything at or below its restored mark, and the sender's own record
   places a stream a flow no longer follows.
+- **`attach_ws_split` / `detach_ws_split`: both legs of a live call on one duplex stereo WebSocket,
+  the parties isolated from each other.** For live interpreting and coaching. Channel 0 is the
+  offerer and channel 1 the answerer, both ways; each party is played only its own channel, on a
+  20 ms clock (silence when the bot is quiet, one bounded second of queue per party, oldest dropped),
+  encoded in its leg's own codec on the stream it was already receiving. Works on a plain relay, a
+  transcoding call and every crypto bridge (SDES, SDES to SDES, DTLS-SRTP with or without ICE, either
+  leg), with no re-INVITE and the same SSRC and contiguous sequence numbers across attach and detach.
+  Recordings, a tee, SIPREC and interception keep the parties' own voices. A re-offer is followed; a
+  DTLS re-handshake is refused while split. `ws_split_started` / `ws_split_ended` (once, with a
+  reason); once isolated, a call's parties hear each other again only after a `detach_ws_split` the
+  controller sent has succeeded: not after the bot goes, a re-offer, a failure, a failover (a checkpoint
+  carries the isolation, `restored`) or a delete.
+  Refused with `ws-split-secondary-source`, `ws-split-sample-rate` and `ws-split-profile` besides the
+  tokens above. `node_info` features gain `ws_split`.
 
 ## [0.28.1] — 2026-11-24
 

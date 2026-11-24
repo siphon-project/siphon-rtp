@@ -1117,6 +1117,51 @@ takeover or a hold already on the call) and `ws-split-not-answered`; a DTLS leg 
 or that carries bundled video (RFC 8843), is refused with its reason rather than half-moved. A
 plain peer's separate RTCP port on a DTLS leg is carried while held: its RTCP goes out as SRTCP on the leg's key, and the DTLS peer's decrypted RTCP goes to that port. A re-offer takes that routing from its new answer, so a plain peer that moved its RTCP port is followed.
 
+
+### Layer 5d-iii — The split bridge: two parties and a bot, nothing between them
+
+`attach_ws_split` holds a call in the decoding actor (5d-ii) and plays each party a bot instead of
+the other party. What it adds to the media path is an *isolation*, and the rule is that it fails
+closed:
+
+- **Isolation is a property of the direction, set before the direction is fed.** An isolated
+  direction still goes through every ingress check (source gate, reply latch, SRTP authentication,
+  replay window) and still decodes, which is what feeds the uplink to the bot, the recordings and
+  the interception taps, but what it decoded is never encoded toward the other party
+  (RFC 3550 §5.1: the party's egress stream is the engine's own, so nothing of the other party's
+  audio is in it). DTMF telephone-events are detected and reported and not relayed.
+- **A replacement actor starts isolated.** A re-offer, a promotion or a rebuild registers a new
+  actor for the call; `MediaRegistry::mark_split` makes `register` begin every actor registered for
+  a split call isolated and silent, before it takes a packet, and the split's queues are attached
+  afterwards. There is no interval in which one party's audio reaches the other because the
+  actor that carried the isolation was replaced.
+- **The gate does not move.** The bot is not a media source: it has no flow, no endpoint and no
+  address on the datapath, only a WebSocket the engine dialled. A stranger is refused by the same
+  gate and latch as on a held call (layers 1 to 3; no RTPbleed: a split never latches to whatever
+  sends first), and a stranger's packet reaches neither the other party nor the bot.
+- **The playout is the engine's own egress.** What the bot sends is rendered on the actor's tick as
+  the direction's egress stream, protected by the leg's own SRTP context (the sender refuses an
+  `(SSRC, index)` it already sent, RFC 3711 §9.1), so a secure leg stays secure and the receiver
+  sees one SSRC with contiguous sequence numbers across attach and detach.
+- **Nothing but a detach lifts it, once the attach has succeeded.** Until then a refused or failed
+  attach puts the previous path back (and, if the actor does not answer the undo, leaves the call
+  isolated for a detach to clean up). After it, a bot that goes away, a re-offer the split cannot be
+  re-attached to, a failure, a failover and a delete all leave the parties apart. The end is
+  reported once (`ws_split_ended`) and the controller detaches; the engine never reconnects two
+  people who were relying on an intermediary. A detach is confirmed by the actor before anything
+  changes, and one the engine gave up on is never applied late: the split's generation moves on
+  first, and the actor ignores a control issued under an earlier one.
+- **A checkpoint carries it.** A snapshot of a split call has its own version and a
+  `split_isolated` flag, and restores only onto the decoding actor, registered isolated and silent
+  (an actor registered for a marked call always starts so); a standby that does not know splits
+  refuses the version rather than reconnect the parties.
+- **A delete lifts nothing.** The transport and the registry entry go; the actor keeps the parties
+  apart until it stops, however long recordings and interception take to finish, and the mark is
+  cleared once it has, so the call-id can be used again.
+- **A DTLS re-handshake is refused while split.** A new certificate is a new association the actor
+  does not have, and releasing the hold would put it on a bridge that relays one party to the
+  other (RFC 8842 §3.1), so the answer fails and the call keeps its association and isolation.
+
 ### Layer 5c — The conference (MCU) Redirect path
 The N-party conference mixer (`engine/src/conference.rs`) is another `FlowAction::Redirect` consumer,
 so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the send-only SIPREC tee,
