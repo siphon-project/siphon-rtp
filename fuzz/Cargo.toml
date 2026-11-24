@@ -154,3 +154,13 @@ path = "fuzz_targets/h264_scan_fuzz.rs"
 test = false
 doc = false
 bench = false
+
+# The SRTCP send-index ledger restore blob (`restore_srtcp_indices`): JSON from the controller with hex
+# fields. Hostile text (multi-byte characters inside a hex field, odd lengths, huge counts) must decode
+# or error and import or refuse, never panic.
+[[bin]]
+name = "srtcp_ledger_blob_fuzz"
+path = "fuzz_targets/srtcp_ledger_blob_fuzz.rs"
+test = false
+doc = false
+bench = false

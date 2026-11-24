@@ -1308,14 +1308,41 @@ two-party floor legs.
   key installed after its first checkpoint from creation, capping it at index 0 plus the margin, so a
   key absent from a blob has sent below the blob's `unlisted_ceiling` (the margin on a primary; what the
   last standby seeded after a chain of failovers). A standby that restores a blob raises every key it
-  already holds that the blob does not list to that ceiling, and seeds every key installed later at it
-  with a lease a margin above, so such a key never restarts at 0 under an index the primary used. The
+  already holds that the blob does not list to at least that ceiling, and seeds every key installed later
+  at it, so such a key never restarts at 0 under an index the primary used. The
   counter holds the index and the lease in one atomic word and a checkpoint reads the one and sets the
   other in a single compare-and-swap, so a send that raced a checkpoint cannot be handed the standby's
   first index; installing a key and taking or restoring a checkpoint are serialised by one ledger-wide
   `std::sync::Mutex` (control path only, never held across an `.await`, never taken by the per-packet
   take), so a key installed during a checkpoint is in the blob or leased from its first index. A two-party floor
-  call restored from `checkpoint` also raises the ledger through its resumed send index. A standby that
+  call restored from `checkpoint` also raises the ledger through its resumed send index.
+  **A restore of the engine's own blob is a no-op; any other restore gates every key.** A controller
+  restores its stored blob on every connection, a reconnect to an engine that never restarted included, so
+  that must not stop the keys the engine serves. Every exported blob carries an origin tag,
+  `HMAC-SHA1(secret, canonical bytes)` (SHA-1 because `hmac` and `sha1` are already dependencies, and an HMAC
+  does not rest on collision resistance), under a random 32-byte secret generated when the ledger is built
+  and never exported. A blob whose tag verifies (constant time) under this ledger's secret was exported by this
+  very ledger, whose counters only rise and are already at or above it: the restore changes nothing. The epoch
+  in the generation token is not proof, since any blob shows it: a blob that names this epoch without a
+  verifying tag (forged, edited, from an earlier process whose epoch collided, or from before the tag existed,
+  blob version 1) is another engine's and is gated like any other, with a warning. A blob whose whole bytes
+  (tag included) were imported here before is skipped as well: the first import raised everything it could,
+  counters never lower, and re-closing the window would stop keys installed since. The last 8 are remembered.
+  Any other blob closes the send window of **every** key (the lease is set to the counter, so the per-packet
+  take gains no flag) until one of this engine's own exports, taken after the restore, is confirmed: each
+  listed key is seeded a margin past its index, each key the engine held that the blob does not list is raised
+  to at least the ceiling, and each key installed afterwards starts at the ceiling. An export taken before
+  the restore can no longer be confirmed. **Why a held, unlisted key must be gated too (RFC 7714 §8):** A
+  exports a checkpoint without K; B holds K and has sent nothing under it. B restores A's blob and raises K to
+  the ceiling M. Were K left open, B could seal M and fail before its own checkpoint is durably stored; a
+  standby C restoring the still-current A blob installs K at M too and seals M again, one nonce twice. Only a
+  confirmed checkpoint of B bounds what B sends after a restore, so until one is, B sends nothing under any
+  key. Raising a counter never repeats a nonce; it is the sending that needs a durable bound. The epoch and
+  the secret come from the operating system with no fallback: a daemon that cannot get them refuses to start,
+  and an embedder that builds an engine without the daemon gets a **poisoned** ledger that refuses every key
+  install (counted in `siphon_rtp_srtcp_ledger_install_refused_total`), seals nothing, and refuses export,
+  confirm and restore. What no restore can repair is one key live on two engines at once before the failure:
+  that is the controller issuing the same key twice. A standby that
   restores no ledger knows nothing of what the primary sent, so the controller must issue **fresh keys**
   (RFC 7714 §8). Forward rooms are not checkpointed; rejoining seats on a seeded ledger is what is safe.
 - **The MKI is a label, not a context.** Send counters and replay state are keyed by the key material

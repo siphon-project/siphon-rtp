@@ -2449,8 +2449,38 @@ pub struct ConferenceRegistry {
 }
 
 impl Default for ConferenceRegistry {
+    /// A registry with a fresh ledger. The ledger needs system randomness and has no fallback to a
+    /// guessable one: when there is none the registry holds a
+    /// [poisoned](crate::srtcp_ledger::SrtcpLedger::poisoned) ledger that refuses every key and every
+    /// seal. The daemon builds its engine with [`Self::try_new`] and refuses to start instead.
     fn default() -> Self {
-        let srtcp_ledger = std::sync::Arc::<crate::srtcp_ledger::SrtcpLedger>::default();
+        Self::with_ledger(crate::srtcp_ledger::SrtcpLedger::default())
+    }
+}
+
+impl ConferenceRegistry {
+    /// A registry whose SRTCP ledger is built from system randomness.
+    ///
+    /// # Errors
+    /// [`crate::srtcp_ledger::LedgerInitError`] when the system gives no randomness.
+    pub fn try_new() -> Result<Self, crate::srtcp_ledger::LedgerInitError> {
+        Ok(Self::with_ledger(
+            crate::srtcp_ledger::SrtcpLedger::try_new()?,
+        ))
+    }
+
+    /// [`Self::try_new`] with the randomness injected (the test seam of the startup failure).
+    #[cfg(test)]
+    fn try_new_with(
+        fill: impl FnOnce(&mut [u8]) -> Result<(), String>,
+    ) -> Result<Self, crate::srtcp_ledger::LedgerInitError> {
+        Ok(Self::with_ledger(
+            crate::srtcp_ledger::SrtcpLedger::try_new_with(fill)?,
+        ))
+    }
+
+    fn with_ledger(ledger: crate::srtcp_ledger::SrtcpLedger) -> Self {
+        let srtcp_ledger = std::sync::Arc::new(ledger);
         Self {
             routes: DashMap::default(),
             rooms: DashMap::default(),
@@ -2463,9 +2493,7 @@ impl Default for ConferenceRegistry {
             srtcp_ledger,
         }
     }
-}
 
-impl ConferenceRegistry {
     /// The ledger of SRTCP send indices, one counter per key, shared by every forwarding room and
     /// floor leg of the engine ([`crate::srtcp_ledger`]).
     #[must_use]
@@ -2846,6 +2874,13 @@ impl ConferenceRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_registry_cannot_be_built_without_randomness_and_so_the_engine_cannot_start() {
+        let refused = ConferenceRegistry::try_new_with(|_| Err("no entropy".to_string()));
+        assert!(matches!(refused, Err(ref error) if error.reason == "no entropy"));
+        assert!(ConferenceRegistry::try_new().is_ok());
+    }
+
     // Test seam: reaches the private registry, so it lives here rather than above the gate.
     impl ConferenceRegistry {
         /// Swap a room's control mailbox for one nobody reads and hand back its receiver: a room

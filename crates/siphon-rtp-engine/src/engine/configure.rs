@@ -37,6 +37,46 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     where
         D: Clone,
     {
+        // No system randomness: the ledger is poisoned (it refuses every key and every seal), never
+        // one with a guessable epoch or secret. The daemon uses `try_new` and refuses to start.
+        Self::build(
+            datapath,
+            max_calls_per_client,
+            Arc::new(ConferenceRegistry::default()),
+        )
+    }
+
+    /// [`Self::new`] that reports a failure to build the SRTCP send-index ledger (no system
+    /// randomness) instead of aborting: the daemon refuses to start on it.
+    ///
+    /// # Errors
+    /// [`crate::srtcp_ledger::LedgerInitError`] when the system gives no randomness.
+    pub fn try_new(datapath: D) -> Result<Self, crate::srtcp_ledger::LedgerInitError>
+    where
+        D: Clone,
+    {
+        Self::try_with_max_calls_per_client(datapath, usize::MAX)
+    }
+
+    /// [`Self::with_max_calls_per_client`] that reports a ledger failure (see [`Self::try_new`]).
+    ///
+    /// # Errors
+    /// [`crate::srtcp_ledger::LedgerInitError`] when the system gives no randomness.
+    pub fn try_with_max_calls_per_client(
+        datapath: D,
+        max_calls_per_client: usize,
+    ) -> Result<Self, crate::srtcp_ledger::LedgerInitError>
+    where
+        D: Clone,
+    {
+        let conference = Arc::new(ConferenceRegistry::try_new()?);
+        Ok(Self::build(datapath, max_calls_per_client, conference))
+    }
+
+    fn build(datapath: D, max_calls_per_client: usize, conference: Arc<ConferenceRegistry>) -> Self
+    where
+        D: Clone,
+    {
         let bridge = Arc::new(SrtpBridge::new(datapath.clone()));
         // Mint the engine's DTLS-SRTP certificate once; its fingerprint is stable across all legs.
         let dtls_certificate = match DtlsCertificate::generate() {
@@ -61,7 +101,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             bridge,
             media: Arc::new(MediaRegistry::default()),
             ws: Arc::new(WsRegistry::default()),
-            conference: Arc::new(ConferenceRegistry::default()),
+            conference,
             seat_ice_followers: DashMap::new(),
             pending_seats: DashMap::new(),
             pending_forward_seats: DashMap::new(),

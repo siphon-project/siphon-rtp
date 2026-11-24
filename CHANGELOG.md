@@ -18,6 +18,18 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   the far party asked for one more keyframe. Packetization mode 2 keeps the old behaviour. The go-live
   keyframe request now also finds the far stream's SSRC while it rides the bridge.
 
+- **A reconnecting controller no longer stops the SRTCP keys a live engine serves.**
+  `restore_srtcp_indices` gated every key on the engine until the controller's next confirmed
+  checkpoint, so a controller that restores its stored blob on each connection broke the floor and RTCP
+  sealing of every live room on an engine that never restarted. A blob this same process exported is now
+  a no-op (a plain `ok`, logged as "same engine, nothing to restore"): every checkpoint blob (now version
+  2) carries an `origin_tag`, an HMAC under a per-process secret, and only a verifying tag counts. A
+  blob that only names this engine's epoch, has no tag, or comes from another process still gates every
+  key until the engine's own export is confirmed, as before, and re-restoring a blob already restored is
+  a no-op too. The ledger's epoch and secret come from the operating system with no fallback: the
+  daemon refuses to start without them, and an embedded engine gets a poisoned ledger that refuses every
+  key and every seal. No nonce is repeated (RFC 7714 §8).
+
 ## [0.28.0] — 2026-11-23
 
 ### Changed

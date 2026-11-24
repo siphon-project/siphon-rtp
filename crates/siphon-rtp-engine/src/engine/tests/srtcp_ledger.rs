@@ -427,3 +427,122 @@ async fn set_floor_keys_with_a_new_key_is_refused_at_the_entry_cap_and_leaves_th
         "still under key 1"
     );
 }
+
+#[tokio::test]
+async fn a_controller_that_reconnects_and_restores_its_own_blob_keeps_the_live_room_sealing() {
+    // The MCX scenario: the controller restores its stored blob on every connection, the engine
+    // never restarted. The floor messages of the live room must not stop.
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let (phone, _) = keyed_seat(&engine, "a", vec![media_key(1)]).await;
+    for expected in 0..3 {
+        assert_eq!(app_index(&engine, &phone, "a").await, expected);
+    }
+    // The controller checkpoints, stores the blob and confirms it.
+    let stored = checkpoint(&engine).await;
+    open_window(&engine).await;
+    assert_eq!(app_index(&engine, &phone, "a").await, 3);
+
+    // It reconnects and restores the stored blob before anything else.
+    let _events = engine.register_client(CLIENT);
+    let restored = engine
+        .handle(
+            CLIENT,
+            Command::RestoreSrtcpIndices {
+                snapshot: stored.clone(),
+            },
+        )
+        .await;
+    assert_eq!(restored, ok_empty());
+    assert_eq!(
+        app_index(&engine, &phone, "a").await,
+        4,
+        "no gap, no refusal: nothing moved"
+    );
+    // A key the room gains afterwards seals too: no node-wide window was closed.
+    let (other_phone, _) = keyed_seat(&engine, "b", vec![media_key(2)]).await;
+    assert_eq!(app_index(&engine, &other_phone, "b").await, 0);
+    // And the same blob again, any number of times, is the same no-op.
+    let again = engine
+        .handle(CLIENT, Command::RestoreSrtcpIndices { snapshot: stored })
+        .await;
+    assert_eq!(again, ok_empty());
+    assert_eq!(app_index(&engine, &phone, "a").await, 5);
+}
+
+#[tokio::test]
+async fn a_restore_of_another_engines_blob_gates_every_key_until_the_engines_own_export_is_confirmed(
+) {
+    // Primary P sent 3 indices under key 2 and checkpointed it.
+    let primary = engine_with_dispatcher();
+    let _events = primary.register_client(CLIENT);
+    let (phone, _) = keyed_seat(&primary, "x", vec![media_key(2)]).await;
+    for _ in 0..3 {
+        app_index(&primary, &phone, "x").await;
+    }
+    let blob = checkpoint(&primary).await;
+
+    // This engine serves key 1 (unlisted) when the controller restores P's blob onto it.
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let (phone_one, _) = keyed_seat(&engine, "a", vec![media_key(1)]).await;
+    assert_eq!(app_index(&engine, &phone_one, "a").await, 0);
+    let restored = engine
+        .handle(CLIENT, Command::RestoreSrtcpIndices { snapshot: blob })
+        .await;
+    assert_eq!(restored, ok_empty());
+    // Key 1 (held, unlisted), key 2 (listed) and key 3 (new): none has a window until this
+    // engine's own export is confirmed. Nothing durable bounds what it would send.
+    let (phone_two, _) = keyed_seat(&engine, "b", vec![media_key(2)]).await;
+    let (phone_three, _) = keyed_seat(&engine, "c", vec![media_key(3)]).await;
+    for tag in ["a", "b", "c"] {
+        let refused = send_app(&engine, tag).await;
+        assert!(
+            matches!(&refused, CmdResult::Error { reason } if reason.contains("SRTCP protect failed")),
+            "{tag}: {refused:?}"
+        );
+    }
+    open_window(&engine).await;
+    assert_eq!(app_index(&engine, &phone_one, "a").await, 1 << 16);
+    assert_eq!(app_index(&engine, &phone_two, "b").await, 3 + (1 << 16));
+    assert_eq!(app_index(&engine, &phone_three, "c").await, 1 << 16);
+}
+
+#[tokio::test]
+async fn a_blob_whose_origin_tag_was_forged_or_dropped_is_applied_not_skipped() {
+    let engine = engine_with_dispatcher();
+    let _events = engine.register_client(CLIENT);
+    let (phone, _) = keyed_seat(&engine, "a", vec![media_key(1)]).await;
+    assert_eq!(app_index(&engine, &phone, "a").await, 0);
+    let stored = checkpoint(&engine).await;
+    // The same blob with one octet of the tag changed, and with the tag removed (a version 1 blob).
+    let mut forged: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    let tag = forged["origin_tag"].as_str().unwrap().to_string();
+    let flipped = format!(
+        "{:02x}{}",
+        u8::from_str_radix(&tag[..2], 16).unwrap() ^ 1,
+        &tag[2..]
+    );
+    forged["origin_tag"] = serde_json::Value::String(flipped);
+    let mut untagged: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    untagged["version"] = 1.into();
+    untagged.as_object_mut().unwrap().remove("origin_tag");
+    for blob in [forged, untagged] {
+        let restored = engine
+            .handle(
+                CLIENT,
+                Command::RestoreSrtcpIndices {
+                    snapshot: blob.to_string(),
+                },
+            )
+            .await;
+        assert_eq!(restored, ok_empty());
+        let refused = send_app(&engine, "a").await;
+        assert!(
+            matches!(&refused, CmdResult::Error { reason } if reason.contains("SRTCP protect failed")),
+            "gated: {refused:?}"
+        );
+        open_window(&engine).await;
+        assert!(app_index(&engine, &phone, "a").await >= 1 << 16);
+    }
+}
