@@ -18,11 +18,9 @@ fn check<T: PartialEq + std::fmt::Debug>(case: &Case, name: &str, rust: &T, refe
 }
 
 /// Run one corpus through the Rust function chosen by `through_hvq_dec`; returns how many cases
-/// decoded without a bit-error flag and how many raised one.
-fn run(function: &str, through_hvq_dec: bool) -> (usize, usize) {
-    let Some(cases) = corpus_sized("peak_vq_dec", function, 200) else {
-        return (0, 0);
-    };
+/// decoded without a bit-error flag and how many raised one, or `None` when the oracle is not built.
+fn run(function: &str, through_hvq_dec: bool) -> Option<(usize, usize)> {
+    let cases = corpus_sized("peak_vq_dec", function, 200)?;
     let (mut clean, mut flagged) = (0, 0);
     for (index, case) in cases.iter().enumerate() {
         if case.outputs.contains_key("skip") {
@@ -88,12 +86,14 @@ fn run(function: &str, through_hvq_dec: bool) -> (usize, usize) {
         }
         state_dump::check(&mut st, &state_after(case), "st.", &context);
     }
-    (clean, flagged)
+    Some((clean, flagged))
 }
 
 #[test]
 fn hvq_dec_matches_the_reference_on_the_whole_state() {
-    let (clean, flagged) = run("hvq_dec", true);
+    let Some((clean, flagged)) = run("hvq_dec", true) else {
+        return;
+    };
     assert!(
         clean > 20 && flagged > 20,
         "clean {clean}, flagged {flagged}"
@@ -102,7 +102,9 @@ fn hvq_dec_matches_the_reference_on_the_whole_state() {
 
 #[test]
 fn peak_vq_dec_matches_the_reference_on_the_whole_state() {
-    let (clean, flagged) = run("peak_vq_dec", false);
+    let Some((clean, flagged)) = run("peak_vq_dec", false) else {
+        return;
+    };
     assert!(
         clean > 20 && flagged > 20,
         "clean {clean}, flagged {flagged}"
