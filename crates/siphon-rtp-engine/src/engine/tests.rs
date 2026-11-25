@@ -90,6 +90,7 @@ mod transmission_control;
 mod turn_client;
 mod turn_client_stream;
 mod webrtc_floor_channel;
+mod ws_split;
 mod ws_takeover_order;
 mod x3_hand_over;
 mod x3_rebuilt_pipeline;
@@ -13370,11 +13371,12 @@ async fn dtls_srtp_offer_answer_bridges_media_end_to_end() {
     // B → engine SRTP is decrypted and relayed to A as plaintext. Retry to absorb the tiny window
     // between B finishing and the engine installing its leg.
     let media = rtp(0x0B0B_0B0B);
+    // Sealed once: a retry resends the same ciphertext, as a real sender resends a lost datagram. Sealing
+    // the same packet again would reuse its SRTP index, which the sender refuses (RFC 3711 §9.1).
     let mut sealed = Vec::new();
+    peer_leg.protect(&media, &mut sealed).expect("peer protect");
     let mut relayed = None;
     for _ in 0..25 {
-        sealed.clear();
-        peer_leg.protect(&media, &mut sealed).expect("peer protect");
         peer_b.send_to(&sealed, engine_far).await.expect("b send");
         let mut buffer = [0u8; 2048];
         if let Ok(Ok((len, _))) =
@@ -14275,11 +14277,12 @@ async fn a_dtls_offerer_is_bridged_to_a_plain_callee_end_to_end() {
     let media = rtp(0x0A0A_0A0A);
     let mut buffer = [0u8; 2048];
     let mut at_b = None;
+    // Sealed once and resent: sealing the same packet again would reuse its SRTP index (RFC 3711 §9.1).
+    let mut sealed = Vec::new();
+    caller_leg
+        .protect(&media, &mut sealed)
+        .expect("caller protect");
     for _ in 0..25 {
-        let mut sealed = Vec::new();
-        caller_leg
-            .protect(&media, &mut sealed)
-            .expect("caller protect");
         socket_a
             .send_to(&sealed, engine_near)
             .await
@@ -20992,11 +20995,12 @@ async fn assert_offerer_bridge_relays_both_ways(
     let media = rtp(0x0A0A_0A0A);
     let mut buffer = [0u8; 2048];
     let mut at_b = None;
+    // Sealed once and resent: sealing the same packet again would reuse its SRTP index (RFC 3711 §9.1).
+    let mut sealed = Vec::new();
+    caller_leg
+        .protect(&media, &mut sealed)
+        .expect("caller protect");
     for _ in 0..25 {
-        let mut sealed = Vec::new();
-        caller_leg
-            .protect(&media, &mut sealed)
-            .expect("caller protect");
         socket_a
             .send_to(&sealed, engine_near)
             .await

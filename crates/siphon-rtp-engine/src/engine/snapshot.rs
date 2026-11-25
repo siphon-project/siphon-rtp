@@ -391,7 +391,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
         }
-        snapshot.version = if snapshot.has_video() {
+        snapshot.version = if snapshot.split_isolated || snapshot.has_video() {
             snapshot.expected_version()
         } else {
             crate::ha::CallSnapshot::version_for(call_scope, snapshot.floor_format())
@@ -502,6 +502,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Supported: a plain relay, a secure SDES-SRTP bridge (`Srtp`), a plaintext transcode (`Media`),
         // and a secure transcode (`SrtpMedia`). `Ws` (external WS-bridge session, unrecoverable from a
         // snapshot) and `Dtls` (handshake-derived keys, not signalled) keep their rejection.
+        // A call a split held restores onto the decoding actor, isolated, or not at all: a relay or a
+        // bridge would hand the parties to each other.
+        if snapshot.split_isolated
+            && !matches!(
+                snapshot.pipeline,
+                PipelineSnapshot::Media | PipelineSnapshot::SrtpMedia
+            )
+        {
+            return CmdResult::Error {
+                reason: format!(
+                    "restore of a split call as {:?} is refused: only the decoding actor can keep \
+                     its parties isolated",
+                    snapshot.pipeline
+                ),
+            };
+        }
         match snapshot.pipeline {
             PipelineSnapshot::Passthrough => {}
             PipelineSnapshot::Srtp if snapshot.secure.is_some() => {}
@@ -549,10 +565,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(bound) => bound,
             Err(reason) => return *reason,
         };
+        // A call a split held comes back isolated: marked before its actor is registered, so the
+        // actor starts isolated and silent.
+        let split = snapshot
+            .split_isolated
+            .then(|| (snapshot.call_id.clone(), snapshot.from_tag.clone()));
+        if let Some((call_id, _)) = &split {
+            self.media.mark_split(call_id);
+        }
         // Whichever step refuses from here on, the endpoints bound above are rolled back.
         if let Err(result) = self.restore_bound(client, snapshot, &bound, floors) {
+            if let Some((call_id, _)) = &split {
+                self.media.unmark_split(call_id);
+            }
             self.free_bound(&bound).await;
             return *result;
+        }
+        if let Some((call_id, from_tag)) = split {
+            self.adopt_restored_split(client, &call_id, &from_tag);
         }
         ok_empty()
     }

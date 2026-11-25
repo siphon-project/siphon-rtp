@@ -93,7 +93,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     #[must_use]
     pub fn command_dials(command: &Command) -> bool {
         match command {
-            Command::AttachWsTee { .. } | Command::AttachWsBridge { .. } => true,
+            Command::AttachWsTee { .. }
+            | Command::AttachWsBridge { .. }
+            | Command::AttachWsSplit(_) => true,
             Command::Offer { profile, .. }
             | Command::Reoffer { profile, .. }
             | Command::Answer { profile, .. }

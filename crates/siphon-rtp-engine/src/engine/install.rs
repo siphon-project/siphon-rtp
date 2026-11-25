@@ -769,6 +769,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         })
     }
 
+    /// Put one of a plain relay's `Forward` rules on the datapath, unless a split bridge holds the
+    /// call. Then the endpoints are the actor's `Redirect`, and a `Forward` rule would take them back
+    /// and cross the two parties for as long as it took to put the actor back; the rule is only
+    /// recorded (in the call's `relay_flows`), for the detach to install.
+    fn install_relay_flow(
+        &self,
+        call_id: &str,
+        endpoint: EndpointId,
+        action: FlowAction,
+    ) -> Result<(), siphon_rtp_datapath::DatapathError> {
+        if self.has_split_verb(call_id) {
+            return Ok(());
+        }
+        self.datapath.install_flow(endpoint, action)
+    }
+
     /// Plain relay: the in-datapath Forward fast path. Each endpoint's rule gates its ingress to the
     /// peer's effective source and latches per policy (RTPBleed fix — docs/security-and-nat.md §4):
     /// `near` receives from A (`near_gate_rtp`, A's `received-from` public IP when supplied, else the
@@ -826,7 +842,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_rule
         };
         let near_action = FlowAction::Forward(near_rule);
-        if let Err(error) = self.datapath.install_flow(near.rtp.id, near_action) {
+        if let Err(error) = self.install_relay_flow(call_id, near.rtp.id, near_action) {
             return Err(boxed_error_result("install near->far RTP flow", &error));
         }
         relay_flows.push((near.rtp.id, near_action));
@@ -839,7 +855,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         );
         let far_rule = if muxed { rtcp_rule(far_rule) } else { far_rule };
         let far_action = FlowAction::Forward(far_rule);
-        if let Err(error) = self.datapath.install_flow(far.rtp.id, far_action) {
+        if let Err(error) = self.install_relay_flow(call_id, far.rtp.id, far_action) {
             return Err(boxed_error_result("install far->near RTP flow", &error));
         }
         relay_flows.push((far.rtp.id, far_action));
@@ -876,7 +892,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_ice,
             ));
             let near_rtcp_action = FlowAction::Forward(near_rtcp_rule);
-            if let Err(error) = self.datapath.install_flow(near_rtcp.id, near_rtcp_action) {
+            if let Err(error) = self.install_relay_flow(call_id, near_rtcp.id, near_rtcp_action) {
                 return Err(boxed_error_result("install near->far RTCP flow", &error));
             }
             relay_flows.push((near_rtcp.id, near_rtcp_action));
@@ -888,7 +904,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_ice,
             ));
             let far_rtcp_action = FlowAction::Forward(far_rtcp_rule);
-            if let Err(error) = self.datapath.install_flow(far_rtcp.id, far_rtcp_action) {
+            if let Err(error) = self.install_relay_flow(call_id, far_rtcp.id, far_rtcp_action) {
                 return Err(boxed_error_result("install far->near RTCP flow", &error));
             }
             relay_flows.push((far_rtcp.id, far_rtcp_action));

@@ -528,8 +528,9 @@ pub fn plan_ws_tee(format: MediaFormat, stereo_source: bool, callee_only: bool) 
 }
 
 /// The `start` message a tee sends as its first text frame. `direction` is always
-/// [`Direction::Send`]: a v1 tee is send-only, so a server must not expect its audio to reach the call
-/// (that is the duplex tee, a later addition).
+/// [`Direction::Send`]: a v1 tee is send-only, so a server must not expect its audio to reach the call.
+/// The split bridge ([`super::split`]) announces the same stream as [`Direction::Duplex`] through
+/// [`start_message`].
 #[must_use]
 pub fn tee_start_message(
     stream_id: &str,
@@ -537,10 +538,22 @@ pub fn tee_start_message(
     format: MediaFormat,
     tracks: Vec<String>,
 ) -> ControlMessage {
+    start_message(stream_id, call_id, format, tracks, Direction::Send)
+}
+
+/// The `start` message of a stream over a tee's wire plan, announcing `direction`.
+#[must_use]
+pub fn start_message(
+    stream_id: &str,
+    call_id: &str,
+    format: MediaFormat,
+    tracks: Vec<String>,
+    direction: Direction,
+) -> ControlMessage {
     ControlMessage::Start(StartData {
         stream_id: stream_id.to_string(),
         call_id: call_id.to_string(),
-        direction: Direction::Send,
+        direction,
         media: format,
         tracks,
         metadata: None,

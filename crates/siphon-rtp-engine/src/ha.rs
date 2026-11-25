@@ -81,6 +81,12 @@ pub const SNAPSHOT_VERSION_VIDEO: u16 = 8;
 /// unencrypted picture on a secure leg. Under its own version such a standby refuses the blob.
 pub const SNAPSHOT_VERSION_VIDEO_SECURE: u16 = 9;
 
+/// The version of a snapshot of a call a split bridge holds ([`CallSnapshot::split_isolated`]), which
+/// takes precedence over every other. A standby from before splits would ignore the flag and restore
+/// the call as an ordinary one, reconnecting two parties who were kept apart; under its own version
+/// such a standby refuses the blob instead.
+pub const SNAPSHOT_VERSION_SPLIT: u16 = 10;
+
 /// A portable snapshot of one live call's negotiated state (see the module docs). All fields are
 /// plain data (strings / integers / enums / `std::net` addresses), so the whole thing round-trips
 /// through JSON and compares exactly.
@@ -107,6 +113,11 @@ pub struct CallSnapshot {
     /// snapshot written before this field restores as unpinned — the behaviour it was written with.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fax_passthrough: bool,
+    /// Whether a split bridge holds the call: its parties are isolated from each other and must
+    /// still be after a restore. The restored call registers its actor isolated and silent, with no
+    /// socket, and the restoring engine reports `ws_split_ended` (`restored`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub split_isolated: bool,
     /// Each leg's SIP `Call-ID`, the correlation id of its HEP captures — carried so a restored call
     /// keeps filing its media under the call's signalling. Defaulted: an older snapshot restores
     /// correlated by the engine `call_id`, as it was written.
@@ -694,7 +705,9 @@ impl CallSnapshot {
     /// else the one its scope and floor stream call for ([`Self::version_for`]).
     #[must_use]
     pub fn expected_version(&self) -> u16 {
-        if self
+        if self.split_isolated {
+            SNAPSHOT_VERSION_SPLIT
+        } else if self
             .video
             .as_ref()
             .is_some_and(|video| video.secure.is_some())
@@ -841,6 +854,22 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    #[test]
+    fn a_snapshot_of_a_split_call_has_its_own_version_and_round_trips() {
+        let mut snapshot = sample();
+        assert!(!snapshot.to_json().expect("json").contains("split_isolated"));
+        snapshot.split_isolated = true;
+        assert_eq!(snapshot.expected_version(), SNAPSHOT_VERSION_SPLIT);
+        snapshot.version = SNAPSHOT_VERSION_SPLIT;
+        let blob = snapshot.to_json().expect("serialises");
+        assert!(blob.contains("\"split_isolated\":true"));
+        assert_eq!(CallSnapshot::from_json(&blob).expect("parses"), snapshot);
+        // A standby that does not know splits reads another version and refuses it; this one
+        // refuses the flag under any other.
+        snapshot.version = SNAPSHOT_VERSION;
+        assert!(CallSnapshot::from_json(&snapshot.to_json().expect("json")).is_err());
+    }
+
     fn sample() -> CallSnapshot {
         CallSnapshot {
             version: SNAPSHOT_VERSION,
@@ -851,6 +880,7 @@ mod tests {
             to_tag: Some("bob-tag".into()),
             pipeline: PipelineSnapshot::Passthrough,
             fax_passthrough: false,
+            split_isolated: false,
             near_sip_call_id: Some("a84b4c76e66710@pc33.example.com".into()),
             far_sip_call_id: None,
             ice: Some(IceSnapshot {

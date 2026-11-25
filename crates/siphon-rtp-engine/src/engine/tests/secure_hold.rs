@@ -16,11 +16,11 @@ use crate::media_pipeline::MediaControl;
 use crate::srtp_bridge::run_redirect_dispatcher;
 use siphon_rtp_dtls::DtlsCertificate;
 
-const LOUD: u8 = 0x00;
+pub(super) const LOUD: u8 = 0x00;
 /// µ-law encoding of PCM zero: what a silenced egress carries.
-const SILENT: u8 = 0xFF;
+pub(super) const SILENT: u8 = 0xFF;
 
-fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
+pub(super) fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     tokio::spawn(run_redirect_dispatcher(
         engine.datapath().rx(),
@@ -35,25 +35,25 @@ fn engine_with_dispatcher() -> Engine<UdpLoopbackDatapath> {
 
 /// One RTP packet a phone heard.
 #[derive(Clone, Debug)]
-struct HeardPacket {
-    ssrc: u32,
-    sequence: u16,
-    timestamp: u32,
-    payload: Vec<u8>,
+pub(super) struct HeardPacket {
+    pub(super) ssrc: u32,
+    pub(super) sequence: u16,
+    pub(super) timestamp: u32,
+    pub(super) payload: Vec<u8>,
 }
 
 /// What a phone heard in a window.
-#[derive(Default, Debug)]
-struct Heard {
-    media: Vec<HeardPacket>,
+#[derive(Clone, Default, Debug)]
+pub(super) struct Heard {
+    pub(super) media: Vec<HeardPacket>,
     /// RTCP datagrams as they arrived (still sealed on a secure leg).
-    rtcp: Vec<Vec<u8>>,
+    pub(super) rtcp: Vec<Vec<u8>>,
     /// Datagrams that failed to authenticate or decrypt under the phone's own context.
-    rejected: usize,
+    pub(super) rejected: usize,
 }
 
 impl Heard {
-    fn absorb(&mut self, other: Heard) {
+    pub(super) fn absorb(&mut self, other: Heard) {
         self.media.extend(other.media);
         self.rtcp.extend(other.rtcp);
         self.rejected += other.rejected;
@@ -62,20 +62,25 @@ impl Heard {
 
 /// A test phone: a socket, the engine address it talks to, its own SRTP context if its leg is secure,
 /// and the stream it sends.
-struct Phone {
-    socket: Arc<UdpSocket>,
-    engine: SocketAddr,
-    leg: Option<SecureLeg>,
-    ssrc: u32,
-    next_sequence: u16,
+pub(super) struct Phone {
+    pub(super) socket: Arc<UdpSocket>,
+    pub(super) engine: SocketAddr,
+    pub(super) leg: Option<SecureLeg>,
+    pub(super) ssrc: u32,
+    pub(super) next_sequence: u16,
     /// The last datagram this phone sent, for a test that replays it.
-    last_sent: Vec<u8>,
+    pub(super) last_sent: Vec<u8>,
     /// Whether a sealed RTCP datagram ends in an RFC 3711 §3.4 index (HMAC-SHA1-80 suites).
-    sdes_suite: bool,
+    pub(super) sdes_suite: bool,
 }
 
 impl Phone {
-    fn new(socket: Arc<UdpSocket>, engine: SocketAddr, leg: Option<SecureLeg>, ssrc: u32) -> Self {
+    pub(super) fn new(
+        socket: Arc<UdpSocket>,
+        engine: SocketAddr,
+        leg: Option<SecureLeg>,
+        ssrc: u32,
+    ) -> Self {
         Self {
             socket,
             engine,
@@ -87,7 +92,7 @@ impl Phone {
         }
     }
 
-    fn seal(&mut self, packet: &[u8]) -> Vec<u8> {
+    pub(super) fn seal(&mut self, packet: &[u8]) -> Vec<u8> {
         match self.leg.as_mut() {
             Some(leg) => {
                 let mut sealed = Vec::new();
@@ -100,7 +105,7 @@ impl Phone {
 
     /// Send one G.711 frame carrying `payload_byte`, `skip` sequence numbers after the last one (an
     /// upstream loss).
-    async fn send_frame(&mut self, payload_byte: u8, skip: u16) {
+    pub(super) async fn send_frame(&mut self, payload_byte: u8, skip: u16) {
         self.next_sequence = self.next_sequence.wrapping_add(skip);
         let packet = g711_rtp(0, self.next_sequence, self.ssrc, payload_byte);
         self.next_sequence = self.next_sequence.wrapping_add(1);
@@ -113,7 +118,7 @@ impl Phone {
     }
 
     /// Send a minimal RTCP sender report from this phone's SSRC.
-    async fn send_report(&mut self) {
+    pub(super) async fn send_report(&mut self) {
         let mut report = vec![0x80, 200, 0x00, 0x06];
         report.extend_from_slice(&self.ssrc.to_be_bytes());
         report.extend_from_slice(&[0u8; 20]);
@@ -125,7 +130,7 @@ impl Phone {
     }
 
     /// Everything that reaches this phone within `window`, decrypted under its own context.
-    async fn listen(&mut self, window: Duration) -> Heard {
+    pub(super) async fn listen(&mut self, window: Duration) -> Heard {
         let mut heard = Heard::default();
         let mut buffer = [0u8; 2048];
         let deadline = tokio::time::Instant::now() + window;
@@ -165,40 +170,40 @@ impl Phone {
 }
 
 /// The SRTCP index of a sealed report on an HMAC-SHA1-80 leg: the 31 bits before the 10-byte tag.
-fn srtcp_index(sealed: &[u8]) -> u32 {
+pub(super) fn srtcp_index(sealed: &[u8]) -> u32 {
     let at = sealed.len() - 14;
     u32::from_be_bytes([sealed[at], sealed[at + 1], sealed[at + 2], sealed[at + 3]]) & 0x7fff_ffff
 }
 
 /// A call up on one crypto bridge kind (or none, for the plain relay), its two phones and what it
 /// resolves to.
-struct Rig {
-    engine: Engine<UdpLoopbackDatapath>,
-    call_id: &'static str,
-    a: Phone,
-    b: Phone,
-    original: PipelineKind,
-    held: PipelineKind,
+pub(super) struct Rig {
+    pub(super) engine: Engine<UdpLoopbackDatapath>,
+    pub(super) call_id: &'static str,
+    pub(super) a: Phone,
+    pub(super) b: Phone,
+    pub(super) original: PipelineKind,
+    pub(super) held: PipelineKind,
     /// What a re-offer of the call sends, where the scenario has one.
-    reoffer: Option<Reoffer>,
+    pub(super) reoffer: Option<Reoffer>,
 }
 
 /// A re-offer from A, B's answer to it, and what a new DTLS association would be answered with.
-struct Reoffer {
-    sdp: String,
-    profile: ProfileFlags,
-    answer: String,
+pub(super) struct Reoffer {
+    pub(super) sdp: String,
+    pub(super) profile: ProfileFlags,
+    pub(super) answer: String,
     /// B's address.
-    far_addr: SocketAddr,
+    pub(super) far_addr: SocketAddr,
 }
 
 impl Rig {
-    fn kind(&self) -> PipelineKind {
+    pub(super) fn kind(&self) -> PipelineKind {
         self.engine.calls.get(self.call_id).expect("call").pipeline
     }
 
     /// One frame each way, `skip` sequence numbers lost first, then listen for a frame time.
-    async fn exchange(&mut self, loud: u8, skip: u16) -> (Heard, Heard) {
+    pub(super) async fn exchange(&mut self, loud: u8, skip: u16) -> (Heard, Heard) {
         self.a.send_frame(loud, skip).await;
         self.b.send_frame(loud, skip).await;
         tokio::time::sleep(Duration::from_millis(12)).await;
@@ -207,7 +212,12 @@ impl Rig {
         (heard_a, heard_b)
     }
 
-    async fn run(&mut self, frames: usize, loud: u8, skip_at: Option<usize>) -> (Heard, Heard) {
+    pub(super) async fn run(
+        &mut self,
+        frames: usize,
+        loud: u8,
+        skip_at: Option<usize>,
+    ) -> (Heard, Heard) {
         let (mut at_a, mut at_b) = (Heard::default(), Heard::default());
         for frame in 0..frames {
             let skip = if skip_at == Some(frame) { 7 } else { 0 };
@@ -220,7 +230,7 @@ impl Rig {
 
     /// Frames each way until both phones have heard one: the window between a handshake finishing
     /// and the engine installing its key.
-    async fn warm_up(&mut self) {
+    pub(super) async fn warm_up(&mut self) {
         for _ in 0..60 {
             let (heard_a, heard_b) = self.exchange(LOUD, 0).await;
             if !heard_a.media.is_empty() && !heard_b.media.is_empty() {
@@ -231,7 +241,7 @@ impl Rig {
         panic!("the call never relayed media both ways");
     }
 
-    async fn hold(&self) -> Result<(), String> {
+    pub(super) async fn hold(&self) -> Result<(), String> {
         self.engine
             .hold_in_userspace(
                 self.call_id,
@@ -241,7 +251,7 @@ impl Rig {
             .await
     }
 
-    async fn release(&self) {
+    pub(super) async fn release(&self) {
         self.engine
             .release_userspace_hold(self.call_id, PromotionReason::WsSplit)
             .await;
@@ -250,7 +260,7 @@ impl Rig {
 
 /// `heard` is one unbroken stream of `ssrc`: the sequence number rises by one on every packet, the
 /// timestamp moves forward by whole 20 ms frames, and nothing failed to decrypt.
-fn assert_one_stream(heard: &Heard, ssrc: u32, who: &str) {
+pub(super) fn assert_one_stream(heard: &Heard, ssrc: u32, who: &str) {
     assert_eq!(heard.rejected, 0, "{who}: every datagram decrypts");
     assert!(heard.media.len() >= 8, "{who}: heard media: {heard:?}");
     for pair in heard.media.windows(2) {
@@ -269,7 +279,7 @@ fn assert_one_stream(heard: &Heard, ssrc: u32, who: &str) {
     assert_eq!(heard.media[0].ssrc, ssrc, "{who}: the stream's SSRC");
 }
 
-fn only_silence(heard: &Heard) -> bool {
+pub(super) fn only_silence(heard: &Heard) -> bool {
     !heard.media.is_empty()
         && heard
             .media
@@ -278,7 +288,7 @@ fn only_silence(heard: &Heard) -> bool {
 }
 
 /// The whole cycle, against one rig.
-async fn assert_hold_cycle(mut rig: Rig) {
+pub(super) async fn assert_hold_cycle(mut rig: Rig) {
     rig.warm_up().await;
     // Reports cross before the hold, under the leg's SRTCP index.
     let mut reports_a = Vec::new();
@@ -449,11 +459,11 @@ async fn assert_hold_cycle(mut rig: Rig) {
 
 // ---- rigs ----------------------------------------------------------------------------------
 
-fn sdes_key() -> CryptoAttribute {
+pub(super) fn sdes_key() -> CryptoAttribute {
     CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("key")
 }
 
-async fn plain_rig() -> Rig {
+pub(super) async fn plain_rig() -> Rig {
     let engine = engine_with_dispatcher();
     let (phone_a, addr_a) = phone().await;
     let (phone_b, addr_b) = phone().await;
@@ -483,12 +493,12 @@ async fn plain_rig() -> Rig {
 }
 
 /// A plain A and an SDES B (`PipelineKind::Srtp`).
-async fn srtp_rig() -> Rig {
+pub(super) async fn srtp_rig() -> Rig {
     srtp_rig_with(&[]).await
 }
 
 /// [`srtp_rig`] with profile `flags` on the offer and the answer (`symmetric` opens A's gate).
-async fn srtp_rig_with(flags: &[&str]) -> Rig {
+pub(super) async fn srtp_rig_with(flags: &[&str]) -> Rig {
     let flags: Vec<String> = flags.iter().map(|flag| (*flag).to_string()).collect();
     let engine = engine_with_dispatcher();
     let (phone_a, addr_a) = phone().await;
@@ -548,7 +558,7 @@ async fn srtp_rig_with(flags: &[&str]) -> Rig {
 }
 
 /// An SDES A and a plain B (`PipelineKind::SrtpOfferer`).
-async fn srtp_offerer_rig() -> Rig {
+pub(super) async fn srtp_offerer_rig() -> Rig {
     let engine = engine_with_dispatcher();
     let (phone_a, addr_a) = phone().await;
     let (phone_b, addr_b) = phone().await;
@@ -587,7 +597,7 @@ async fn srtp_offerer_rig() -> Rig {
 }
 
 /// An SDES A and an SDES B under different keys (`PipelineKind::SrtpTranscrypt`).
-async fn srtp_transcrypt_rig() -> Rig {
+pub(super) async fn srtp_transcrypt_rig() -> Rig {
     let engine = engine_with_dispatcher();
     let (phone_a, addr_a) = phone().await;
     let (phone_b, addr_b) = phone().await;
@@ -643,7 +653,7 @@ async fn srtp_transcrypt_rig() -> Rig {
 }
 
 /// A plain A and a DTLS-SRTP B (`PipelineKind::Dtls`).
-async fn dtls_rig() -> Rig {
+pub(super) async fn dtls_rig() -> Rig {
     let engine = engine_with_dispatcher();
     let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
     let peer_b = Arc::new(
@@ -700,7 +710,7 @@ async fn dtls_rig() -> Rig {
 
 /// A plain A and a DTLS-SRTP B behind ICE (`PipelineKind::Dtls` on an ICE-gated leg): B's handshake
 /// starts only on the source its connectivity check validated (RFC 8445 §12.1.1).
-async fn dtls_ice_rig() -> Rig {
+pub(super) async fn dtls_ice_rig() -> Rig {
     let engine = engine_with_dispatcher();
     let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
     let peer_b = Arc::new(
@@ -786,7 +796,7 @@ async fn dtls_ice_rig() -> Rig {
 }
 
 /// A DTLS-SRTP A behind ICE and a plain B (`PipelineKind::DtlsOfferer`).
-async fn dtls_offerer_rig() -> Rig {
+pub(super) async fn dtls_offerer_rig() -> Rig {
     let engine = engine_with_dispatcher();
     let socket_a = Arc::new(
         UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
@@ -873,7 +883,7 @@ async fn an_ice_dtls_offerer_bridge_is_held_and_released_on_one_stream_under_its
 // ---- the re-offer, the refusals and the taps -----------------------------------------------------
 
 impl Rig {
-    async fn reoffer(&self) {
+    pub(super) async fn reoffer(&self) {
         let reoffer = self.reoffer.as_ref().expect("a rig with a re-offer");
         let result = reoffer_from(
             &self.engine,
@@ -900,7 +910,7 @@ impl Rig {
 /// The call is re-offered while held and answered: it stays held, on the actor's kind, with the same
 /// live SRTP contexts (a packet B already sent is still a replay), and each party keeps receiving one
 /// stream, the SSRC and sequence the bridge had been sending, through the re-offer and the release.
-async fn assert_reoffer_while_held(mut rig: Rig) {
+pub(super) async fn assert_reoffer_while_held(mut rig: Rig) {
     rig.warm_up().await;
     let (mut at_a, mut at_b) = rig.run(6, LOUD, None).await;
     rig.hold().await.expect("held");
@@ -1189,7 +1199,7 @@ async fn the_taps_a_bridge_carried_ride_along_a_hold_and_a_release() {
 
 /// Deleting a call while it is held tears down what the hold moved: the actor, the bridge flows and
 /// the DTLS association's tasks all drain, with nothing left owning an endpoint.
-async fn assert_delete_while_held_drains(mut rig: Rig) {
+pub(super) async fn assert_delete_while_held_drains(mut rig: Rig) {
     rig.warm_up().await;
     rig.hold().await.expect("held");
     rig.run(3, LOUD, None).await;
@@ -1229,7 +1239,7 @@ async fn deleting_a_held_dtls_call_drains_the_actor_and_the_association() {
 }
 
 /// An RTP socket and the RTCP socket one port above it (RFC 3550 §11.1: the default pairing).
-async fn phone_with_rtcp(ip: Ipv4Addr) -> (UdpSocket, UdpSocket, SocketAddr) {
+pub(super) async fn phone_with_rtcp(ip: Ipv4Addr) -> (UdpSocket, UdpSocket, SocketAddr) {
     for _ in 0..200 {
         let rtp = UdpSocket::bind((ip, 0)).await.expect("bind rtp");
         let addr = rtp.local_addr().expect("addr");
@@ -1361,7 +1371,7 @@ async fn a_non_muxed_sdes_call_keeps_its_rtcp_flowing_through_a_hold() {
 /// An actor that stops answering cannot be stopped cleanly: the bridge must already own the
 /// endpoints, and carry on from the peers' own numbering, rather than leave the call without a media
 /// path.
-async fn assert_release_survives_an_unresponsive_actor(mut rig: Rig) {
+pub(super) async fn assert_release_survives_an_unresponsive_actor(mut rig: Rig) {
     rig.warm_up().await;
     rig.hold().await.expect("held");
     rig.run(3, LOUD, None).await;
@@ -1563,7 +1573,7 @@ async fn an_interception_delivers_both_directions_through_a_hold_and_a_release()
 }
 
 /// An SDES leg behind ICE (`ice: force` gates both of the engine's legs on a check).
-async fn srtp_ice_rig() -> Rig {
+pub(super) async fn srtp_ice_rig() -> Rig {
     let engine = engine_with_dispatcher();
     let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
     let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
@@ -1638,7 +1648,7 @@ async fn an_ice_sdes_bridge_is_held_and_released_on_one_stream_under_its_own_key
 /// the peer sends, so under the continued SSRC it can be far ahead of the peer's numbering. If it
 /// then cannot report its position at release, resuming the peer's numbering under that SSRC would
 /// reuse SRTP indices (RFC 3711 §3.3.1, §9.1); the bridge must change SSRC instead (RFC 3550 §8.2).
-async fn assert_no_index_reuse_when_the_actor_ran_ahead_and_cannot_report(mut rig: Rig) {
+pub(super) async fn assert_no_index_reuse_when_the_actor_ran_ahead_and_cannot_report(mut rig: Rig) {
     use siphon_rtp_media::fanout::MediaSink as _;
     use siphon_rtp_media::player::{PcmPlayer, PcmRepeat, WavSource};
     use siphon_rtp_media::wav::WavRecorder;
@@ -1889,7 +1899,7 @@ async fn a_dtls_reoffer_while_held_takes_the_plain_peers_new_rtcp_port() {
 /// A plain source whose numbering jumps (legal plain RTP: a re-INVITE to another media server behind a
 /// B2BUA, an SSRC reused after a gap) must not become an outage on the secure leg behind it: the
 /// bridge carries on from its own position, so an independent receiver decrypts every packet.
-async fn assert_a_discontinuity_is_no_outage(mut rig: Rig, first: u16, then: u16) {
+pub(super) async fn assert_a_discontinuity_is_no_outage(mut rig: Rig, first: u16, then: u16) {
     rig.warm_up().await;
     rig.a.next_sequence = first;
     let (_, mut at_b) = rig.run(10, LOUD, None).await;

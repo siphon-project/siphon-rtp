@@ -31,6 +31,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // gets its `ws_tee_ended` rather than a silently dead stream.
             self.end_multi_source_tees_for_call(call_id).await;
             self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+            // …and a split bridge's transport and registry entry, leaving the isolation where it is:
+            // the actor keeps its parties apart until it stops, however long the rest takes.
+            self.drop_ws_split_for_delete(call_id).await;
             // …and any decoded recording on it, **before** the media actor is deregistered. This is
             // what turns a hangup into a finished, playable file rather than a valid WAV declaring
             // zero samples: it detaches the sinks, waits for the writer to finalize the header, and
@@ -44,6 +47,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.stop_x3(call_id, X3EndReason::CallEnded).await;
             self.bridge.deregister(endpoints.iter().copied());
             self.media.deregister(call_id);
+            // The isolation went with the actor; the mark must not outlive it, or a call made under
+            // this id later would start isolated.
+            self.media.unmark_split(call_id);
             self.media.rtcp_relays().deregister(call_id);
             self.conference.floors().deregister_call(call_id);
             self.call_floor_channels
@@ -316,6 +322,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // `ws_tee_ended` (with the lifetime frame counters) rather than a silently dead stream.
         self.end_multi_source_tees_for_call(call_id).await;
         self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+        // …and a split bridge's transport and entry, never its isolation: nothing is lifted on a
+        // call that is going away, so no audio crosses while recordings and interception finish.
+        self.drop_ws_split_for_delete(call_id).await;
         // …and any decoded recording, while the media actor still holds its sinks. Detaching them is
         // what makes the writer finalize the header and emit `recording_finished` naming `call_ended`,
         // and awaiting it is what keeps the call from being reported gone while its file is still
@@ -328,6 +337,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.stop_x3(call_id, X3EndReason::CallEnded).await;
         self.bridge.deregister(endpoints.iter().copied());
         self.media.deregister(call_id);
+        // The isolation went with the actor; the mark must not outlive it, or a call made under
+        // this id later would start isolated.
+        self.media.unmark_split(call_id);
         self.media.rtcp_relays().deregister(call_id);
         self.text.deregister(call_id);
         self.udptl.deregister(call_id);

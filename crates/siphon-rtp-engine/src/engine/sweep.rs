@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use crate::ice::driver::{AgentOutcome, ConsentOutcome};
 
-use super::Engine;
+use super::{Engine, PromotionReason};
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Reap calls whose media has been idle for at least `idle_ticks`, freeing their ports/FDs and
@@ -552,6 +552,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // same rule as the audio relay (a NATed peer's text or picture needs the learned address
             // as much as its voice does).
             let call = &mut *call;
+            // A call a split holds keeps its endpoints on the actor: its stored `Forward` rules are
+            // for the detach to install, not for a latch refresh to.
+            if call.promotion_reasons.contains(&PromotionReason::WsSplit) {
+                continue;
+            }
             let flows = call
                 .relay_flows
                 .iter_mut()

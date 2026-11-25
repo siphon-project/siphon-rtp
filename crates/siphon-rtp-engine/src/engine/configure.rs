@@ -131,6 +131,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             turn_client: None,
             ice_relays: Arc::new(DashMap::new()),
             ws_tees: DashMap::new(),
+            ws_splits: DashMap::new(),
             prompts: Arc::new(crate::prompt_cache::PromptCache::new(
                 DEFAULT_PROMPT_CACHE_BYTES,
             )),

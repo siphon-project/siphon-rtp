@@ -65,6 +65,7 @@ mod seat_call;
 mod seat_transport;
 mod snapshot;
 mod snapshot_floor;
+mod split;
 mod srtcp_indices;
 use near_dtls::NearDtls;
 use results::{ok_empty, ok_sdp};
@@ -120,6 +121,7 @@ use snapshot::{
     codec_snapshot, crypto_snapshot, latch_snapshot, leg_snapshot, pipeline_snapshot,
     source_filter_snapshot,
 };
+use split::WsSplit;
 use takeover::WsBridge;
 use tee::WsTee;
 use telemetry::HepExport;
@@ -927,6 +929,7 @@ impl Call {
             to_tag: self.to_tag.clone(),
             pipeline: pipeline_snapshot(self.pipeline),
             fax_passthrough: self.fax_passthrough,
+            split_isolated: self.promotion_reasons.contains(&PromotionReason::WsSplit),
             near_sip_call_id: self.near_sip_call_id.clone(),
             far_sip_call_id: self.far_sip_call_id.clone(),
             ice: self.ice.as_ref().map(|ice| ha::IceSnapshot {
@@ -1237,6 +1240,9 @@ pub struct Engine<D: Datapath> {
     /// one. Held here (not in the media actor) because the transport task, the WS socket and the
     /// dropped/forwarded counters outlive individual control ops and must be torn down on `delete`.
     ws_tees: DashMap<String, WsTee>,
+    /// Live split bridges, keyed by call-id: both legs of the call on one duplex stereo WebSocket
+    /// (`attach_ws_split`). One per call; held here for the same reason `ws_tees` is.
+    ws_splits: DashMap<String, WsSplit>,
     /// Decoded host-file prompts, so a bed played to many callers is decoded once
     /// ([`crate::prompt_cache`]).
     prompts: Arc<crate::prompt_cache::PromptCache>,
