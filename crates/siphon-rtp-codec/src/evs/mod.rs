@@ -7,18 +7,19 @@
 //! exact. `reference/evs/README.md` records where that material comes from, how the out-of-tree
 //! oracle build is made, and why it is compiled with `-fwrapv`.
 //!
-//! **Status: the MODE1 decoder runs end to end, for the frames it covers.** [`decoder::EvsDecoder`]
-//! is the `decoder.c` loop over a G.192 stream (bit reading, `evs_dec_fx`, output conversion,
-//! start-of-stream delay compensation); [`dec::evs_dec`] is the per-frame dispatcher and
-//! [`dec::hq_core_dec`] the HQ core, with the MODE1 bandwidth extensions (WB, SWB and FB TBE, SWB
-//! BWE, the high-rate BWE and SWB comfort noise). Every TS 26.444 sequence that stays in MODE1
-//! (ACELP at 5.9 VBR, 7.2, 8.0 and 13.2, HQ at 32 and 64 kbit/s, NB to FB, clean, frame-erased and
-//! DTX) decodes byte for byte to the reference output; `tests/evs_conformance.rs` runs every
-//! sequence and pins how many. Not ported yet, and refused with [`error::EvsError::Unsupported`]
-//! naming the reference call (never decoded to silence): MODE2 (TCX; `dec_acelp_tcx_frame`, which
-//! the 13.2 and 32 kbit/s streams also reach when a frame switches to TCX) and AMR-WB IO
-//! (`amr_wb_dec_fx`, `updt_IO_switch_dec_fx`). The codec factory does not offer EVS until the
-//! decoder passes every TS 26.444 decoder sequence.
+//! **Status: the MODE1 and MODE2 decoders run end to end.** [`decoder::EvsDecoder`] is the
+//! `decoder.c` loop over a G.192 stream (bit reading, `evs_dec_fx`, output conversion,
+//! start-of-stream delay compensation); [`dec::evs_dec`] is the per-frame dispatcher. MODE1 is the
+//! ACELP core ([`dec::acelp_core_dec`]) and the HQ core ([`dec::hq_core_dec`]) with the bandwidth
+//! extensions (WB, SWB and FB TBE, SWB BWE, the high-rate BWE and SWB comfort noise); MODE2 is the
+//! LPD core ([`dec::dec_lpd`]: ACELP, TCX-20 and TCX-10 with IGF, TNS, tonal and waveform
+//! concealment, the channel-aware partial copy), the FD-CNG and the CLDFB post-processing
+//! ([`dec::dec_acelp_tcx_main`]). Every TS 26.444 decoder sequence except those that switch to
+//! AMR-WB IO decodes byte for byte to the reference output (clean, frame-erased, DTX and
+//! channel-aware); `tests/evs_conformance.rs` runs every sequence and pins how many. Not ported
+//! yet, and refused with [`error::EvsError::Unsupported`] naming the reference call (never decoded
+//! to silence): AMR-WB IO (`amr_wb_dec_fx`, `updt_IO_switch_dec_fx`). The codec factory does not
+//! offer EVS until the decoder passes every TS 26.444 decoder sequence.
 //!
 //! Gated behind the off-by-default `evs` Cargo feature, which gates **transcoding** only: relaying
 //! EVS never executes a codec and never reaches this module. EVS is covered by an active patent

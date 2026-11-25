@@ -4,7 +4,14 @@
 //! path reaches, `InitTnsConfigs`, and the two synthesis-windowing functions the FD-CNG decoder's
 //! transition from an active TCX frame (`generate_comfort_noise_dec`) reaches.
 
-use crate::evs::cnst::{ACELP_32K, ACELP_CORE, LD_FSCALE_DENOM, L_FRAME_MAX, L_LOOK_12K8, M};
+mod spectrum;
+
+pub use spectrum::*;
+
+use crate::evs::cnst::{
+    ACELP_32K, ACELP_CORE, FULL_OVERLAP, HALF_OVERLAP, LD_FSCALE_DENOM, L_FRAME_MAX, L_LOOK_12K8,
+    M, MIN_OVERLAP, RECTANGULAR_OVERLAP, TRANSITION_OVERLAP,
+};
 use crate::evs::com::basop_util::idiv1616_u;
 use crate::evs::com::lerp::lerp;
 use crate::evs::com::syn_filt::e_util_synthesis_in_place;
@@ -14,7 +21,7 @@ use crate::evs::dec::state::{STnsConfig, TcxConfig};
 use crate::evs::rom::types::PWord16;
 use crate::evs::rom::L_FRAME_INV;
 use crate::itu::basic_ops::{
-    add, div_s, extract_l, l_mac, l_mult, l_shr, l_sub, mult_r, norm_s, shl, shr, sub,
+    add, div_s, extract_l, l_mac, l_mult, l_shr, l_sub, mult_r, negate, norm_s, shl, shr, sub,
 };
 use crate::itu::stl2009::{l_mult0, mac_r};
 
@@ -158,6 +165,246 @@ pub struct AcelpTransition<'a> {
     pub syn_overl: &'a [i16],
     /// `A_zir`: the LP filter of the ZIR.
     pub a_zir: &'a [i16],
+}
+
+/// The overlap lengths and window slopes `tcx_get_windows` selects for one TCX frame.
+#[derive(Debug, Clone, Copy)]
+pub struct TcxWindows<'a> {
+    /// `*left_overlap`
+    pub left_overlap: i16,
+    /// `*left_win`: empty where the reference has `NULL` (rectangular overlap).
+    pub left_win: &'a [PWord16],
+    /// `*right_overlap`
+    pub right_overlap: i16,
+    /// `*right_win`: empty where the reference has `NULL` (rectangular overlap).
+    pub right_win: &'a [PWord16],
+}
+
+/// `tcx_get_windows`: the left and right overlap length and window slope of a TCX frame for the
+/// given overlap modes, at the core rate or (`fullband != 0`) at the output rate. The reference
+/// asserts the modes are among those it lists; an unlisted mode yields no overlap here.
+fn tcx_get_windows(
+    tcx_cfg: &TcxConfig,
+    left_mode: i16,
+    right_mode: i16,
+    fullband: i8,
+) -> TcxWindows<'_> {
+    let none: &[PWord16] = &[];
+    let (left_overlap, left_win, right_overlap, right_win);
+    if fullband == 0 {
+        // Left part
+        (left_overlap, left_win) = match left_mode {
+            TRANSITION_OVERLAP => (
+                // ACELP->TCX transition
+                tcx_cfg.tcx_mdct_window_trans_length,
+                tcx_cfg.tcx_mdct_window_trans,
+            ),
+            MIN_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_min_length,
+                tcx_cfg.tcx_mdct_window_minimum,
+            ),
+            HALF_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_half_length,
+                tcx_cfg.tcx_mdct_window_half,
+            ),
+            FULL_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_length,
+                &tcx_cfg.tcx_aldo_window_1_trunc[..],
+            ),
+            _ => (0, none),
+        };
+
+        // Right part
+        (right_overlap, right_win) = match right_mode {
+            MIN_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_min_length,
+                tcx_cfg.tcx_mdct_window_minimum,
+            ),
+            HALF_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_half_length,
+                tcx_cfg.tcx_mdct_window_half,
+            ),
+            FULL_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_delay,
+                &tcx_cfg.tcx_aldo_window_2[..],
+            ),
+            _ => (0, none),
+        };
+    } else {
+        // Left part
+        (left_overlap, left_win) = match left_mode {
+            TRANSITION_OVERLAP => (
+                // ACELP->TCX transition
+                tcx_cfg.tcx_mdct_window_trans_length_fb,
+                tcx_cfg.tcx_mdct_window_trans_fb,
+            ),
+            MIN_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_min_length_fb,
+                tcx_cfg.tcx_mdct_window_minimum_fb,
+            ),
+            HALF_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_half_length_fb,
+                tcx_cfg.tcx_mdct_window_half_fb,
+            ),
+            RECTANGULAR_OVERLAP => (0, none),
+            FULL_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_length_fb,
+                &tcx_cfg.tcx_aldo_window_1_fb_trunc[..],
+            ),
+            _ => (0, none),
+        };
+
+        // Right part
+        (right_overlap, right_win) = match right_mode {
+            MIN_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_min_length_fb,
+                tcx_cfg.tcx_mdct_window_minimum_fb,
+            ),
+            HALF_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_half_length_fb,
+                tcx_cfg.tcx_mdct_window_half_fb,
+            ),
+            RECTANGULAR_OVERLAP => (0, none),
+            FULL_OVERLAP => (
+                tcx_cfg.tcx_mdct_window_delay_fb,
+                &tcx_cfg.tcx_aldo_window_2_fb[..],
+            ),
+            _ => (0, none),
+        };
+    }
+    TcxWindows {
+        left_overlap,
+        left_win,
+        right_overlap,
+        right_win,
+    }
+}
+
+/// `tcx_windowing_analysis`: window `signal[0..l_frame + (left + right) / 2]` into `output`: the
+/// left overlap slope, the flat part, the right overlap slope.
+fn tcx_windowing_analysis(
+    signal: &[i16],
+    l_frame: i16,
+    left_overlap: i16,
+    left_win: &[PWord16],
+    right_overlap: i16,
+    right_win: &[PWord16],
+    output: &mut [i16],
+) {
+    let mut at = 0usize;
+
+    // Left overlap
+    let n = shr(left_overlap, 1).max(0) as usize;
+    for window in &left_win[..n] {
+        output[at] = mult_r(signal[at], window.v.im);
+        at += 1;
+    }
+    for w in 0..n {
+        output[at] = mult_r(signal[at], left_win[n - 1 - w].v.re);
+        at += 1;
+    }
+
+    // Non overlapping region
+    let n = sub(l_frame, shr(add(left_overlap, right_overlap), 1)).max(0) as usize;
+    for _ in 0..n {
+        output[at] = signal[at];
+        at += 1;
+    }
+
+    // Right overlap
+    let n = shr(right_overlap, 1).max(0) as usize;
+    for window in &right_win[..n] {
+        output[at] = mult_r(signal[at], window.v.re);
+        at += 1;
+    }
+    for w in 0..n {
+        output[at] = mult_r(signal[at], right_win[n - 1 - w].v.im);
+        at += 1;
+    }
+}
+
+/// `WindowSignal`: window the TCX frame that starts `offset` samples after `in_[in_at]` (the left
+/// folding point) with the overlap modes given; after ACELP (`TRANSITION_OVERLAP`) the frame grows
+/// by 5 ms and starts half the transition window earlier. A full left overlap is faded at its
+/// start (the truncated ALDO window would otherwise leave a discontinuity). `*l_frame` is updated;
+/// the overlap lengths used are returned in `left_overlap_length` / `right_overlap_length`.
+///
+/// `in_` is the signal buffer with its history: the window starts `left_overlap / 2 - offset`
+/// samples before `in_at`, which the reference's callers keep inside the buffer.
+pub fn window_signal(
+    tcx_cfg: &TcxConfig,
+    offset: i16,
+    left_overlap_mode: i16,
+    right_overlap_mode: i16,
+    left_overlap_length: &mut i16,
+    right_overlap_length: &mut i16,
+    in_: &[i16],
+    in_at: usize,
+    l_frame: &mut i16,
+    out: &mut [i16],
+    fullband: i8,
+) {
+    let mut offset = offset;
+
+    // Init
+    let windows = tcx_get_windows(tcx_cfg, left_overlap_mode, right_overlap_mode, fullband);
+    let (l, r) = (windows.left_overlap, windows.right_overlap);
+
+    // Init lengths
+
+    // if past frame is ACELP
+    if sub(left_overlap_mode, TRANSITION_OVERLAP) == 0 {
+        // Increase frame size for 5ms
+        if fullband == 0 {
+            *l_frame = add(*l_frame, tcx_cfg.tcx5_size);
+            offset = negate(shr(tcx_cfg.tcx_mdct_window_trans_length, 1));
+        } else {
+            *l_frame = add(*l_frame, tcx_cfg.tcx5_size_fb);
+            offset = negate(shr(tcx_cfg.tcx_mdct_window_trans_length_fb, 1));
+        }
+    }
+
+    // Windowing
+    let start = in_at
+        .checked_add_signed(isize::from(offset) - isize::from(shr(l, 1)))
+        .unwrap_or(0);
+    tcx_windowing_analysis(
+        &in_[start..],
+        *l_frame,
+        l,
+        windows.left_win,
+        r,
+        windows.right_win,
+        out,
+    );
+
+    if sub(left_overlap_mode, FULL_OVERLAP) == 0 {
+        // fade truncated ALDO window to avoid discontinuities
+        let mut p = tcx_cfg.tcx_mdct_window_minimum;
+        let mut tmp = shr(tcx_cfg.tcx_mdct_window_min_length, 1);
+        if fullband != 0 {
+            p = tcx_cfg.tcx_mdct_window_minimum_fb;
+            tmp = shr(tcx_cfg.tcx_mdct_window_min_length_fb, 1);
+        }
+
+        let tmp = tmp.max(0) as usize;
+        for i in 0..tmp {
+            out[i] = mult_r(out[i], p[i].v.im);
+        }
+        for i in 0..tmp {
+            out[i + tmp] = mult_r(out[i + tmp], p[tmp - 1 - i].v.re);
+        }
+    }
+
+    *left_overlap_length = l;
+    *right_overlap_length = r;
+}
+
+/// `SetTnsConfig`: select `tnsConfig[isTCX20][isAfterACELP]` as the current TNS configuration
+/// (both flags are 0 or 1, the results of comparisons at every call site).
+pub fn set_tns_config(tcx_cfg: &mut TcxConfig, is_tcx20: i8, is_after_acelp: i8) {
+    tcx_cfg.p_current_tns_config =
+        Some((usize::from(is_tcx20 != 0), usize::from(is_after_acelp != 0)));
 }
 
 /// `tcx_windowing_synthesis_current_frame`: window the left part of a decoded TCX frame `signal`
@@ -506,6 +753,51 @@ pub fn tcx_windowing_synthesis_past_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_tns_config_selects_the_configuration_by_frame_kind() {
+        let mut config = TcxConfig::zeroed();
+        set_tns_config(&mut config, 1, 0);
+        assert_eq!(config.p_current_tns_config, Some((1, 0)));
+        set_tns_config(&mut config, 0, 1);
+        assert_eq!(config.p_current_tns_config, Some((0, 1)));
+    }
+
+    static TRANSITION_SLOPE: [PWord16; 16] = [PWord16 {
+        v: crate::evs::rom::types::PWord16V {
+            re: 32767,
+            im: 32767,
+        },
+    }; 16];
+
+    #[test]
+    fn window_signal_after_acelp_grows_the_frame_by_five_milliseconds() {
+        let mut config = TcxConfig::zeroed();
+        config.tcx5_size_fb = 64;
+        config.tcx_mdct_window_trans_length_fb = 32;
+        config.tcx_mdct_window_trans_fb = &TRANSITION_SLOPE;
+        let signal = [1000i16; 600];
+        let mut out = [0i16; 600];
+        let (mut left, mut right) = (-1, -1);
+        let mut l_frame = 256;
+        window_signal(
+            &config,
+            0,
+            TRANSITION_OVERLAP,
+            RECTANGULAR_OVERLAP,
+            &mut left,
+            &mut right,
+            &signal,
+            100,
+            &mut l_frame,
+            &mut out,
+            1,
+        );
+        assert_eq!((l_frame, left, right), (320, 32, 0));
+        // the flat part (and the 16-sample slope at gain ~1) is the input
+        assert!(out[32..320 - 16].iter().all(|&v| v == 1000));
+        assert!(out[..32].iter().all(|&v| (999..=1000).contains(&v)));
+    }
 
     #[test]
     fn the_inverse_frame_length_is_q21() {

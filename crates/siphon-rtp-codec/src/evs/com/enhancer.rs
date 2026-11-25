@@ -1,19 +1,20 @@
 //! Excitation enhancer: phase dispersion and noise enhancement of the fixed-codebook contribution
 //! (TS 26.442 `lib_com/enhancer_fx.c`; TS 26.445 §6.1.1.3).
 //!
-//! Only the MODE1 / AMR-WB IO path (`enhancer_fx`) is ported; `E_UTIL_enhancer` is MODE2's.
+//! `enhancer_fx` is the MODE1 / AMR-WB IO path, `E_UTIL_enhancer` MODE2's.
 
-use crate::evs::basop::{madd_32_16, mult_32_16};
-use crate::evs::cnst::L_SUBFR;
+use crate::evs::basop::{madd_32_16, mpy_32_16_1, mpy_32_32, mult_32_16};
+use crate::evs::cnst::{L_FRAME16K, L_SUBFR, UNVOICED, VOICED};
 use crate::evs::com::fft_rel::r_fft_fx_lc;
 use crate::evs::com::math_op::isqrt;
+use crate::evs::com::phase_dispersion::phase_dispersion as e_util_phase_dispersion;
 use crate::evs::dec::state::DispMem;
 use crate::evs::rom::{LOW_H_PHASEDISP, MID_H_PHASEDISP, PHS_TBL_DEC};
 use crate::itu::basic_ops::{
-    add, div_s, extract_h, l_deposit_h, l_mac, l_msu, l_mult, l_shl, l_shr, l_sub, mult, mult_r,
-    norm_l, round_word, shl, shr, sub,
+    add, div_s, extract_h, l_add, l_deposit_h, l_mac, l_msu, l_mult, l_shl, l_shr, l_sub, mult,
+    mult_r, norm_l, round_word, shl, shr, sub,
 };
-use crate::itu::stl2009::{l_mac0, l_mult0, mac_r, msu_r};
+use crate::itu::stl2009::{l_mac0, l_msu0, l_mult0, mac_r, msu_r};
 
 const SUBFR: usize = L_SUBFR as usize;
 
@@ -240,5 +241,175 @@ fn agc2(sig_in: &[i16], sig_out: &mut [i16], l_trm: i16) {
     }
     for i in 0..l_trm {
         sig_out[i] = round_word(l_shl(l_mac(-8192, sig_out[i], g0), 2));
+    }
+}
+
+/// `E_UTIL_enhancer`: MODE2's enhancement of the excitation before synthesis. Phase dispersion of
+/// the innovation `code` (Q9, exponent returned), the noise enhancer that moves its gain 1.5 dB
+/// toward the threshold `gc_threshold` when the signal is noisy and the LP filter stable, and the
+/// pitch enhancer (a smooth HP filtering of the code) added into `exc2`. Returns the exponent of
+/// `code`. `prev_gain_code`, `prev_gain_pit` (6 values) and `prev_state` are the phase-dispersion
+/// memory.
+pub fn e_util_enhancer(
+    voice_fac: i16,
+    stab_fac: i16,
+    gain_code: i32,
+    gain_inov: i16,
+    gc_threshold: &mut i32,
+    code: &mut [i16],
+    exc2: &mut [i16],
+    gain_pit: i16,
+    prev_gain_code: &mut i32,
+    prev_gain_pit: &mut [i16],
+    prev_state: &mut i16,
+    coder_type: i16,
+    cdk_index: i16,
+    l_subfr: i16,
+    l_frame: i16,
+    q_new: i16,
+) -> i16 {
+    let mut code_exp: i16 = 15 - 9;
+    let exc2_exp: i16 = 15 - q_new;
+    let gain_inov = shr(gain_inov, 1);
+
+    // Phase dispersion to enhance noise at low bit rates
+    let mut max_cdk_index_uv: i16 = 10;
+    if sub(l_frame, L_FRAME16K) == 0 {
+        max_cdk_index_uv = 14;
+    }
+    let mut disp_mode: i16 = 2; // any=off
+    if (sub(coder_type, VOICED) != 0 && sub(cdk_index, 2) <= 0)
+        || (sub(coder_type, UNVOICED) == 0 && sub(cdk_index, max_cdk_index_uv) <= 0)
+    {
+        disp_mode = 0; // high
+    } else if sub(coder_type, VOICED) != 0 && sub(cdk_index, 7) <= 0 {
+        disp_mode = 1; // low
+    }
+
+    e_util_phase_dispersion(
+        gain_code,
+        gain_pit,
+        code,
+        &mut code_exp,
+        disp_mode,
+        prev_gain_code,
+        prev_gain_pit,
+        prev_state,
+        l_subfr,
+    );
+
+    // noise enhancer: enhance excitation on noise (modify gain of code). If signal is noisy and
+    // LPC filter is stable, move gain of code 1.5 dB toward gain of code threshold. This
+    // decrease by 3 dB noise energy variation.
+    let mut tmp = msu_r(1_073_741_824, 16384, voice_fac); // 1=unvoiced, 0=voiced
+    let fac = mult_r(stab_fac, tmp); // fac in Q15
+
+    let mut l_tmp = l_add(0, gain_code); // L_tmp in 15Q16
+
+    if l_sub(l_tmp, *gc_threshold) < 0 {
+        l_tmp = l_shl(mpy_32_32(l_tmp, 1_277_752_832), 1);
+        l_tmp = l_tmp.min(*gc_threshold);
+    } else {
+        l_tmp = mpy_32_32(l_tmp, 1_804_608_000);
+        l_tmp = l_tmp.max(*gc_threshold);
+    }
+    *gc_threshold = l_tmp; // in 15Q16
+
+    // gain = ( (fac * L_tmp) + (gain_code - fac*gain_code) ) * gain_inov
+    // exponent of L_tmp: 31-16 + 15-11
+    l_tmp = mpy_32_16_1(
+        l_add(
+            mpy_32_16_1(l_tmp, fac),
+            l_sub(gain_code, mpy_32_16_1(gain_code, fac)),
+        ),
+        gain_inov,
+    );
+
+    // exponent gain: 31-16 + 15-11 - tmp
+    tmp = norm_l(l_tmp);
+
+    // exponent of code: 31-16 + 15-11 - tmp + code_exp
+    code_exp = sub(add(31 - 16 + 15 - 11, code_exp), tmp);
+
+    l_tmp = l_shl(l_tmp, tmp);
+    let mut gain = round_word(l_tmp);
+
+    for value in code.iter_mut().take(l_subfr.max(0) as usize) {
+        *value = mult_r(*value, gain);
+    }
+
+    // pitch enhancer: enhance excitation on voice (HP filtering of code). On voiced signal,
+    // filtering of code by a smooth fir HP filter to decrease energy of code in low frequency.
+
+    // exponent difference of code and exc2. +1 accounts for headroom required below.
+    gain = add(sub(code_exp, exc2_exp), 1);
+
+    tmp = mac_r(268_435_456, 4096, voice_fac); // 0.25=voiced, 0=unvoiced
+    if sub(l_frame, L_FRAME16K) == 0 {
+        tmp = mac_r(322_122_560, 4915, voice_fac); // 0.30=voiced, 0=unvoiced
+    }
+
+    // exc2[0] = exc2[0] + code[0] - tmp*code[1];
+    l_tmp = l_mult(code[0], 16384);
+    l_tmp = l_msu0(l_tmp, tmp, code[1]);
+    if gain != 0 {
+        l_tmp = l_shl(l_tmp, gain);
+    }
+    exc2[0] = msu_r(l_tmp, -32768, exc2[0]);
+
+    let last = (l_subfr.max(1) - 1) as usize;
+    for i in 1..last {
+        // exc2[i] = exc2[i] + code[i] - tmp*(code[i+1]+code[i-1]);
+        l_tmp = l_mult(code[i], 16384);
+        l_tmp = l_msu0(l_tmp, tmp, code[i - 1]);
+        l_tmp = l_msu0(l_tmp, tmp, code[i + 1]);
+        if gain != 0 {
+            l_tmp = l_shl(l_tmp, gain);
+        }
+        exc2[i] = msu_r(l_tmp, -32768, exc2[i]);
+    }
+    // exc2[L_subfr-1] = exc2[L_subfr-1] + code[L_subfr-1] - tmp*code[L_subfr-2];
+    l_tmp = l_mult(code[last], 16384);
+    l_tmp = l_msu0(l_tmp, tmp, code[last - 1]);
+    if gain != 0 {
+        l_tmp = l_shl(l_tmp, gain);
+    }
+    exc2[last] = msu_r(l_tmp, -32768, exc2[last]);
+
+    code_exp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_code_leaves_the_excitation_and_reports_a_finite_exponent() {
+        let mut code = [0i16; 64];
+        let mut exc2 = [100i16; 64];
+        let mut gc_threshold = 0;
+        let mut prev_gain_code = 0;
+        let mut prev_gain_pit = [0i16; 6];
+        let mut prev_state = 0;
+        let code_exp = e_util_enhancer(
+            0,
+            0,
+            0,
+            2048,
+            &mut gc_threshold,
+            &mut code,
+            &mut exc2,
+            0,
+            &mut prev_gain_code,
+            &mut prev_gain_pit,
+            &mut prev_state,
+            VOICED,
+            9,
+            64,
+            256,
+            5,
+        );
+        assert!(exc2.iter().all(|&value| value == 100));
+        assert!(code_exp > -64 && code_exp < 64);
     }
 }

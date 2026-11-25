@@ -11,14 +11,16 @@ use crate::evs::cnst::{
     PIT_FR1_DEXT8B_MINUS_PIT_MIN_DEXT_X2, PIT_FR1_EXT8B_MINUS_PIT_MIN_EXT_X2,
     PIT_FR1_EXT9B_MINUS_PIT_FR2_EXT9B_X2, PIT_FR1_EXTEND_8B, PIT_FR2_9B,
     PIT_FR2_9B_MINUS_PIT_MIN_X4, PIT_FR2_DEXT9B_MINUS_PIT_MIN_DEXT_X4, PIT_FR2_DOUBLEEXTEND_9B,
-    PIT_FR2_EXT9B_MINUS_PIT_MIN_EXT_X4, PIT_FR2_EXTEND_9B, PIT_MAX, PIT_MIN, PIT_MIN_DOUBLEEXTEND,
-    PIT_MIN_EXTEND, VOICED,
+    PIT_FR2_EXT9B_MINUS_PIT_MIN_EXT_X4, PIT_FR2_EXTEND_9B, PIT_MAX, PIT_MIN, PIT_MIN_16K,
+    PIT_MIN_DOUBLEEXTEND, PIT_MIN_EXTEND, VOICED,
 };
 use crate::evs::com::bitstream::{bit_alloc_idx, bit_alloc_idx_16khz, get_next_indice};
 use crate::evs::com::limit_t0::limit_t0;
+use crate::evs::com::limit_t0::limit_t0_voiced;
 use crate::evs::dec::state::DecoderState;
-use crate::evs::rom::{ACB_BITS_16KHZ_TBL, ACB_BITS_TBL};
-use crate::itu::basic_ops::{add, shl, shr, sub};
+use crate::evs::rom::{ACB_BITS_16KHZ_TBL, ACB_BITS_TBL, INVINTTABLE};
+use crate::itu::basic_ops::{add, l_deposit_h, l_mac, mult, shl, shr, sub};
+use crate::itu::stl2009::i_mult;
 
 /// `ACB_bits_tbl[index]` / `ACB_bits_16kHz_tbl[index]`. The index comes from the bit rate and the
 /// bitstream's coder type; a combination the codec never signals (a corrupted coder type) can lie
@@ -427,6 +429,316 @@ pub fn abs_pit_dec(
             *t0_frac = 0;
         }
     }
+}
+
+/// `inv_T0_res[res]` (`InvIntTable`): `1/res` in Q15. `res` is a pitch resolution (at most 6); one
+/// past the table (a corrupted frame) reads as 0.
+fn inv_t0_res(res: i16) -> i16 {
+    usize::try_from(res)
+        .ok()
+        .and_then(|index| INVINTTABLE.get(index))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// `*(*pt_indice)++`: the next quantisation index of `pt_indice`, which is advanced past it. An
+/// exhausted list reads 0 (the reference would run past the end of the parameter array).
+fn next_pitch_index(pt_indice: &mut &[i16]) -> i16 {
+    let index = pt_indice.first().copied().unwrap_or(0);
+    *pt_indice = pt_indice.get(1..).unwrap_or(&[]);
+    index
+}
+
+/// The relative-pitch step every MODE2 coding model shares: `limit_T0_voiced` around
+/// `(t0_in, t0_frac_in, t0_res_in)` with `nbits` / `res`, then the resolution becomes `res` and
+/// `Mode2_delta_pit_dec` reads the index.
+fn mode2_relative_pit(
+    nbits: i16,
+    res: i16,
+    around: (i16, i16, i16),
+    limits: (i16, i16),
+    outputs: (&mut i16, &mut i16, &mut i16),
+    window: (&mut i16, &mut i16, &mut i16, &mut i16),
+    pt_indice: &mut &[i16],
+) {
+    let (t0_in, t0_frac_in, t0_res_in) = around;
+    let (pit_min, pit_max) = limits;
+    let (t0, t0_frac, t0_res) = outputs;
+    let (t0_min, t0_min_frac, t0_max, t0_max_frac) = window;
+
+    (*t0_min, *t0_min_frac, *t0_max, *t0_max_frac) =
+        limit_t0_voiced(nbits, res, t0_in, t0_frac_in, t0_res_in, pit_min, pit_max);
+    *t0_res = res;
+    mode2_delta_pit_dec(t0, t0_frac, *t0_res, *t0_min, *t0_min_frac, pt_indice);
+}
+
+/// `Mode2_pit_decode`: decode the pitch lag of one MODE2 ACELP subframe from `pt_indice` (the
+/// remaining indices, advanced past what is read). Absolute decoding on the first subframe(s) of
+/// each coding model, relative decoding in the window `[T0_min, T0_max]` after that; returns the
+/// pitch `T0 + T0_frac/T0_res` (`T0` in the upper half of the `Word32`).
+pub fn mode2_pit_decode(
+    coder_type: i16,
+    i_subfr: i16,
+    l_subfr: i16,
+    pt_indice: &mut &[i16],
+    t0: &mut i16,
+    t0_frac: &mut i16,
+    t0_res: &mut i16,
+    t0_min: &mut i16,
+    t0_min_frac: &mut i16,
+    t0_max: &mut i16,
+    t0_max_frac: &mut i16,
+    pit_min: i16,
+    pit_fr1: i16,
+    pit_fr1b: i16,
+    pit_fr2: i16,
+    pit_max: i16,
+    pit_res_max: i16,
+) -> i32 {
+    let around = (*t0, *t0_frac, *t0_res);
+    if coder_type == 0 {
+        *t0 = l_subfr;
+        *t0_frac = 0;
+        *t0_res = 1;
+    } else if sub(coder_type, 1) == 0 {
+        // 8/4/4/4 (EVS)
+        if i_subfr == 0 {
+            mode2_abs_pit_dec(
+                t0,
+                t0_frac,
+                t0_res,
+                pt_indice,
+                pit_min,
+                pit_fr1b,
+                pit_min,
+                pit_res_max,
+            );
+        } else {
+            let res = shr(pit_res_max, 1);
+            mode2_relative_pit(
+                4,
+                res,
+                around,
+                (pit_min, pit_max),
+                (t0, t0_frac, t0_res),
+                (t0_min, t0_min_frac, t0_max, t0_max_frac),
+                pt_indice,
+            );
+        }
+    } else if sub(coder_type, 2) == 0 {
+        // 8/5/8/5 (EVS)
+        if i_subfr == 0 || sub(i_subfr, shl(l_subfr, 1)) == 0 {
+            mode2_abs_pit_dec(
+                t0,
+                t0_frac,
+                t0_res,
+                pt_indice,
+                pit_min,
+                pit_fr1b,
+                pit_min,
+                pit_res_max,
+            );
+        } else {
+            let res = shr(pit_res_max, 1);
+            mode2_relative_pit(
+                5,
+                res,
+                around,
+                (pit_min, pit_max),
+                (t0, t0_frac, t0_res),
+                (t0_min, t0_min_frac, t0_max, t0_max_frac),
+                pt_indice,
+            );
+        }
+    } else if sub(coder_type, 3) == 0 {
+        // 9/6/6/6 (HRs- VC)
+        let mut pit_res_max2 = pit_res_max;
+        if sub(pit_min, PIT_MIN_16K) == 0 {
+            pit_res_max2 = shr(pit_res_max, 1);
+        }
+
+        if i_subfr == 0 {
+            mode2_abs_pit_dec(
+                t0,
+                t0_frac,
+                t0_res,
+                pt_indice,
+                pit_min,
+                pit_fr1,
+                pit_fr2,
+                pit_res_max,
+            );
+        } else {
+            mode2_relative_pit(
+                6,
+                pit_res_max2,
+                (*t0, 0, 1),
+                (pit_min, pit_max),
+                (t0, t0_frac, t0_res),
+                (t0_min, t0_min_frac, t0_max, t0_max_frac),
+                pt_indice,
+            );
+        }
+    } else if sub(coder_type, 4) == 0 {
+        // 9/6/9/6 (AMRWB)
+        let mut pit_res_max2 = pit_res_max;
+        if sub(pit_min, PIT_MIN_16K) == 0 {
+            pit_res_max2 = shr(pit_res_max, 1);
+        }
+        if i_subfr == 0 || sub(i_subfr, shl(l_subfr, 1)) == 0 {
+            mode2_abs_pit_dec(
+                t0,
+                t0_frac,
+                t0_res,
+                pt_indice,
+                pit_min,
+                pit_fr1,
+                pit_fr2,
+                pit_res_max,
+            );
+        } else {
+            mode2_relative_pit(
+                6,
+                pit_res_max2,
+                (*t0, 0, 1),
+                (pit_min, pit_max),
+                (t0, t0_frac, t0_res),
+                (t0_min, t0_min_frac, t0_max, t0_max_frac),
+                pt_indice,
+            );
+        }
+    } else if sub(coder_type, 8) == 0 {
+        // 8/5/5/5 (RF all pred mode)
+        if i_subfr == 0 {
+            mode2_abs_pit_dec(
+                t0,
+                t0_frac,
+                t0_res,
+                pt_indice,
+                pit_min,
+                pit_fr1b,
+                pit_min,
+                pit_res_max,
+            );
+        } else {
+            let res = shr(pit_res_max, 1);
+            mode2_relative_pit(
+                5,
+                res,
+                around,
+                (pit_min, pit_max),
+                (t0, t0_frac, t0_res),
+                (t0_min, t0_min_frac, t0_max, t0_max_frac),
+                pt_indice,
+            );
+        }
+    } else if sub(coder_type, 9) == 0 {
+        // 8/0/8/0 (RF gen pred mode)
+        if i_subfr == 0 {
+            mode2_abs_pit_dec(
+                t0,
+                t0_frac,
+                t0_res,
+                pt_indice,
+                pit_min,
+                pit_fr1b,
+                pit_min,
+                pit_res_max,
+            );
+        } else {
+            let res = shr(pit_res_max, 1);
+            mode2_relative_pit(
+                4,
+                res,
+                around,
+                (pit_min, pit_max),
+                (t0, t0_frac, t0_res),
+                (t0_min, t0_min_frac, t0_max, t0_max_frac),
+                pt_indice,
+            );
+        }
+    }
+    // The reference asserts on any other coding model ("LTP mode not supported"); the decoder
+    // only signals the ones above, so a corrupted value leaves the lag as it was.
+
+    // Compute floating pitch output
+    // pitch = (float)(*T0) + (float)(*T0_frac)/(float)(*T0_res);
+    l_mac(l_deposit_h(*t0), *t0_frac, inv_t0_res(*t0_res))
+}
+
+/// `Mode2_abs_pit_dec`: decode an absolute pitch index into `T0`, `T0_frac` and the resolution
+/// `T0_res`, in three regions: resolution `pit_res_max` below `pit_fr2`, half of it up to
+/// `pit_fr1`, integer lags above.
+pub fn mode2_abs_pit_dec(
+    t0: &mut i16,
+    t0_frac: &mut i16,
+    t0_res: &mut i16,
+    pt_indice: &mut &[i16],
+    pit_min: i16,
+    pit_fr1: i16,
+    pit_fr2: i16,
+    pit_res_max: i16,
+) {
+    let mut index = next_pitch_index(pt_indice);
+    let pit_res_max_half = shr(pit_res_max, 1);
+
+    let tmp1 = i_mult(sub(pit_fr2, pit_min), pit_res_max);
+    let tmp2 = i_mult(sub(pit_fr1, pit_fr2), pit_res_max_half);
+    if sub(index, tmp1) < 0 {
+        // the reference asserts 1 < pit_res_max <= 6
+        let mut res = pit_res_max;
+        if sub(pit_res_max, 6) == 0 {
+            res = shr(res, 1);
+        }
+
+        *t0 = mult(index, inv_t0_res(res));
+        if sub(pit_res_max, 6) == 0 {
+            *t0 = shr(*t0, 1);
+        }
+
+        *t0 = add(pit_min, *t0);
+
+        *t0_frac = sub(index, i_mult(sub(*t0, pit_min), pit_res_max));
+        *t0_res = pit_res_max;
+    } else if index < add(tmp1, tmp2) {
+        index = sub(index, tmp1);
+        *t0 = add(pit_fr2, mult(index, inv_t0_res(pit_res_max_half)));
+        *t0_frac = sub(index, i_mult(sub(*t0, pit_fr2), pit_res_max_half));
+        *t0_res = pit_res_max_half;
+    } else {
+        *t0 = add(index, sub(pit_fr1, add(tmp1, tmp2)));
+        *t0_frac = 0;
+        *t0_res = 1;
+    }
+}
+
+/// `Mode2_delta_pit_dec`: decode a relative pitch index against the window start
+/// (`t0_min`, `t0_min_frac`) at resolution `t0_res` (2..=6). The reference takes `T0_min` and
+/// `T0_min_frac` by pointer but only reads them.
+pub fn mode2_delta_pit_dec(
+    t0: &mut i16,
+    t0_frac: &mut i16,
+    t0_res: i16,
+    t0_min: i16,
+    t0_min_frac: i16,
+    pt_indice: &mut &[i16],
+) {
+    // the reference asserts 1 < T0_res <= 6
+    let mut res = t0_res;
+    if sub(t0_res, 6) == 0 {
+        res = shr(res, 1);
+    }
+
+    let index = next_pitch_index(pt_indice);
+
+    *t0 = mult(add(index, t0_min_frac), inv_t0_res(res));
+    if sub(t0_res, 6) == 0 {
+        *t0 = shr(*t0, 1);
+    }
+
+    *t0 = add(t0_min, *t0);
+
+    *t0_frac = add(index, sub(t0_min_frac, i_mult(sub(*t0, t0_min), t0_res)));
 }
 
 /// `delta_pit_dec_fx`: pitch decoding relative to `T0_min` at fractional resolution `fr_steps`

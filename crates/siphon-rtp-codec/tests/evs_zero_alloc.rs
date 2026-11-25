@@ -4,7 +4,7 @@
 //!
 //! There is no EVS encoder yet to make input, so the decoder is fed every TS 26.444 decoder
 //! sequence upstream's `Readme_EVS_dec.txt` lists, at the output rate it names, up to the first
-//! frame that needs a part of the decoder not ported yet ([`EvsError::Unsupported`]): every path the
+//! frame that needs a part of the decoder not ported yet (the AMR-WB IO frames) ([`EvsError::Unsupported`]): every path the
 //! decoder can take today is measured, whatever bit rate, bandwidth or output rate reaches it. Like
 //! `evs_conformance`, it skips when the sequences are absent and `SIPHON_RTP_REQUIRE_VECTORS=1`
 //! turns that skip into a failure.
@@ -142,7 +142,7 @@ fn evs_decode_makes_no_heap_allocation_on_any_decodable_frame() {
     );
     // At least every sequence `evs_conformance` gates as byte-identical runs to its end.
     assert!(
-        whole_sequences >= 186 || all.is_empty() && !required(),
-        "expected at least 186 whole sequences, ran {whole_sequences}"
+        whole_sequences >= 889 || all.is_empty() && !required(),
+        "expected at least 889 whole sequences, ran {whole_sequences}"
     );
 }

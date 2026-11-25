@@ -5,13 +5,14 @@
 //! look-ahead.
 
 use crate::evs::basop::{l_extract_lc, mpy_32_16_1};
+use crate::evs::cnst::{PIT_MAX_MAX, PIT_MIN_SHORTER};
 use crate::evs::com::basop_util::{idiv1616_u, imult1616};
 use crate::evs::com::lpc_tools::e_lpc_lev_dur;
 use crate::evs::com::syn_filt::e_util_synthesis;
 use crate::evs::rom::types::TcxLtpFilter;
 use crate::evs::rom::TCXLTPFILTERS;
 use crate::itu::basic_ops::{
-    add, div_s, l_mac, l_shl, l_shr, l_sub, mult_r, norm_l, norm_s, round_word, shl, sub,
+    add, div_s, l_mac, l_shl, l_shr, l_sub, mult_r, norm_l, norm_s, round_word, shl, shr, sub,
 };
 use crate::itu::stl2009::{l_mac0, l_mult0, lshl};
 
@@ -548,4 +549,110 @@ pub fn tcx_ltp_post(
     *filt_idx_past = filt_idx;
     *pitres_past = pitres;
     mem_out[..lf].copy_from_slice(&buf_out[sig_out..sig_out + lf]);
+}
+
+/// `tcx_ltp_decode_params`: decode the TCX LTP pitch (`pitch_int` / `pitch_fr`, a resolution of
+/// `pitres` fractions below `pitfr2`, half of it up to `pitfr1`, whole samples above) and gain
+/// (`gain`, Q15) from the three LTP parameters `ltp_param` (active flag, pitch index, gain index).
+/// Without an active LTP the pitch is the maximum and the gain 0. Returns 1 when the decoded pitch
+/// lies outside `PIT_MIN_SHORTER..=PIT_MAX_MAX` (a bit error; the pitch is then clamped to the
+/// limit it crossed), else 0.
+pub fn tcx_ltp_decode_params(
+    ltp_param: Option<&[i16]>,
+    pitch_int: &mut i16,
+    pitch_fr: &mut i16,
+    gain: &mut i16,
+    pitmin: i16,
+    pitfr1: i16,
+    pitfr2: i16,
+    pitmax: i16,
+    pitres: i16,
+) -> i16 {
+    let mut pitres = pitres;
+
+    // Decode Pitch and Gain
+    if let Some(ltp_param) = ltp_param.filter(|param| param[0] != 0) {
+        let tmp = imult1616(sub(pitfr2, pitmin), pitres);
+
+        if sub(ltp_param[1], tmp) < 0 {
+            let tmp2 = idiv1616_u(ltp_param[1], pitres);
+
+            *pitch_int = add(pitmin, tmp2);
+            *pitch_fr = sub(ltp_param[1], imult1616(tmp2, pitres));
+        } else {
+            pitres = shr(pitres, 1);
+            let mut tmp2 = imult1616(sub(pitfr1, pitfr2), pitres);
+
+            if sub(ltp_param[1], add(tmp, tmp2)) < 0 {
+                tmp2 = idiv1616_u(sub(ltp_param[1], tmp), pitres);
+
+                *pitch_int = add(pitfr2, tmp2);
+                *pitch_fr = shl(sub(sub(ltp_param[1], tmp), imult1616(tmp2, pitres)), 1);
+            } else {
+                *pitch_int = sub(add(ltp_param[1], pitfr1), add(tmp, tmp2));
+                *pitch_fr = 0;
+            }
+        }
+
+        *gain = imult1616(add(ltp_param[2], 1), 0x1400);
+
+        if sub(*pitch_int, PIT_MIN_SHORTER) < 0 {
+            // pitch out of range due to bit error
+            *pitch_int = PIT_MIN_SHORTER;
+            return 1;
+        }
+
+        if sub(*pitch_int, PIT_MAX_MAX) > 0 {
+            // pitch out of range due to bit error
+            *pitch_int = PIT_MAX_MAX;
+            return 1;
+        }
+    } else {
+        *pitch_int = pitmax;
+        *pitch_fr = 0;
+        *gain = 0;
+    }
+
+    0
+}
+
+#[cfg(test)]
+mod decode_params_tests {
+    use super::*;
+
+    #[test]
+    fn an_inactive_ltp_decodes_to_the_maximum_pitch_and_no_gain() {
+        let (mut pitch_int, mut pitch_fr, mut gain) = (1, 1, 1);
+        let status = tcx_ltp_decode_params(
+            Some(&[0, 5, 5]),
+            &mut pitch_int,
+            &mut pitch_fr,
+            &mut gain,
+            34,
+            162,
+            98,
+            228,
+            4,
+        );
+        assert_eq!((status, pitch_int, pitch_fr, gain), (0, 228, 0, 0));
+    }
+
+    #[test]
+    fn a_pitch_below_the_limit_is_clamped_and_flagged() {
+        let (mut pitch_int, mut pitch_fr, mut gain) = (0, 0, 0);
+        // pitmin 10 puts the first decoded pitch (10 + 0) under PIT_MIN_SHORTER
+        let status = tcx_ltp_decode_params(
+            Some(&[1, 0, 2]),
+            &mut pitch_int,
+            &mut pitch_fr,
+            &mut gain,
+            10,
+            162,
+            98,
+            228,
+            4,
+        );
+        assert_eq!((status, pitch_int), (1, PIT_MIN_SHORTER));
+        assert_eq!(gain, 3 * 0x1400);
+    }
 }

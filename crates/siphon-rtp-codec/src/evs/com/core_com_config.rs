@@ -1,10 +1,11 @@
 //! Core configuration helpers shared by encoder and decoder (TS 26.442 `lib_com/core_com_config_fx.c`).
 
 use crate::evs::cnst::{
-    FB, FSCALE_DENOM, HQ_16K40, LPC_SHAPED_ARI_MAX_RATE, NB, PIT_FR1_12K8, PIT_FR1_16K,
-    PIT_FR1_25K6, PIT_FR1_32K, PIT_FR1_8B_12K8, PIT_FR1_8B_16K, PIT_FR1_8B_25K6, PIT_FR1_8B_32K,
-    PIT_FR2_12K8, PIT_FR2_16K, PIT_FR2_25K6, PIT_FR2_32K, PIT_MAX_12K8, PIT_MAX_16K, PIT_MAX_25K6,
-    PIT_MAX_32K, PIT_MIN_12K8, PIT_MIN_16K, PIT_MIN_25K6, PIT_MIN_32K, SWB, WB,
+    ACELP_13K20, ACELP_16K40, ACELP_9K60, FB, FSCALE_DENOM, HQ_16K40, HQ_64K,
+    LPC_SHAPED_ARI_MAX_RATE, NB, PIT_FR1_12K8, PIT_FR1_16K, PIT_FR1_25K6, PIT_FR1_32K,
+    PIT_FR1_8B_12K8, PIT_FR1_8B_16K, PIT_FR1_8B_25K6, PIT_FR1_8B_32K, PIT_FR2_12K8, PIT_FR2_16K,
+    PIT_FR2_25K6, PIT_FR2_32K, PIT_MAX_12K8, PIT_MAX_16K, PIT_MAX_25K6, PIT_MAX_32K, PIT_MIN_12K8,
+    PIT_MIN_16K, PIT_MIN_25K6, PIT_MIN_32K, SWB, WB,
 };
 
 /// `HQ_32k`.
@@ -153,6 +154,50 @@ pub fn get_num_tcx_coded_lines(bwidth: i16) -> i16 {
     }
 }
 
+/// `getIgfPresent`: whether Intelligent Gap Filling runs at a bit rate and bandwidth (`rf_mode` the
+/// channel-aware flag).
+#[must_use]
+pub fn get_igf_present(bitrate: i32, bandwidth: i16, rf_mode: i16) -> i8 {
+    let mut igf_present = 0;
+
+    if bandwidth == SWB && bitrate >= i32::from(ACELP_9K60) && bitrate < HQ_64K {
+        igf_present = 1;
+    }
+
+    if bandwidth == FB && bitrate >= i32::from(ACELP_16K40) {
+        igf_present = 1;
+    }
+
+    if bandwidth == WB && bitrate == i32::from(ACELP_9K60) {
+        igf_present = 1;
+    }
+
+    if (bandwidth == WB || bandwidth == SWB) && rf_mode == 1 && bitrate == i32::from(ACELP_13K20) {
+        igf_present = 1;
+    }
+
+    igf_present
+}
+
+/// `getCnaPresent`: whether comfort noise addition runs at a bit rate and bandwidth.
+#[must_use]
+pub fn get_cna_present(bitrate: i32, bandwidth: i16) -> i8 {
+    let mut flag_cna = 0;
+    if bandwidth == NB && bitrate <= i32::from(ACELP_13K20) {
+        flag_cna = 1;
+    }
+
+    if bandwidth == WB && bitrate <= i32::from(ACELP_13K20) {
+        flag_cna = 1;
+    }
+
+    if bandwidth == SWB && bitrate <= i32::from(ACELP_13K20) {
+        flag_cna = 1;
+    }
+
+    flag_cna
+}
+
 /// `getTcxLpcShapedAri`: whether TCX uses the LPC-shaped arithmetic coder. `bwidth` is unused by
 /// the reference too.
 #[must_use]
@@ -174,5 +219,18 @@ mod tests {
         assert_eq!(sr2fscale(16000), 640);
         assert_eq!(sr2fscale(44100), 0);
         assert_eq!(init_pitch_lag_parameters(16000).pit_res_max, 6);
+    }
+
+    #[test]
+    fn igf_and_cna_follow_the_bit_rate_and_bandwidth() {
+        assert_eq!(get_igf_present(9600, SWB, 0), 1);
+        assert_eq!(get_igf_present(64000, SWB, 0), 0);
+        assert_eq!(get_igf_present(16400, FB, 0), 1);
+        assert_eq!(get_igf_present(13200, WB, 0), 0);
+        assert_eq!(get_igf_present(13200, WB, 1), 1);
+        assert_eq!(get_igf_present(9600, WB, 0), 1);
+        assert_eq!(get_cna_present(13200, NB), 1);
+        assert_eq!(get_cna_present(16400, WB), 0);
+        assert_eq!(get_cna_present(9600, FB), 0);
     }
 }

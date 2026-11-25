@@ -1139,3 +1139,8 @@ pub fn qlsf_arsn_tcvq_dec_16k(y: &mut [i16], indice: &[i16], n_bits: i16) -> i16
 
 mod lpc_conv;
 pub use lpc_conv::{a2rc, compute_poly_product, lsp2lpc, lsp_convolve, poscos, space_lsfs};
+mod isp_conv;
+pub use isp_conv::{
+    e_lpc_a_isp_conversion, e_lpc_isp_isf_conversion, isf2lsf, isp2lsp, lsf2isf, lsf_update_memory,
+    lsp2isp, msvq_dec, tcxlpc_get_cdk,
+};

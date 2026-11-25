@@ -194,3 +194,95 @@ pub fn rescale_mem(
     scale_sig(&mut pf_stat.mem_stp, L_SUBFR, exp_scale); // NB post_filter mem
     scale_sig(slice::from_mut(mem_agc), 1, exp_scale); // NB post_filter mem
 }
+
+/// `rescale_mem` (lower case, `scale_mem_fx.c`; not [`rescale_mem`], the reference's `Rescale_mem`):
+/// MODE2's rescaling of the synthesis memory `mem_syn2[0..mem_len]` and, when given, the
+/// synthesis `syn[0..i_subfr]` to a new synthesis Q. The new Q follows the excitation Q
+/// (`q_exc - 3`, at least -1) but never leaves less than the memories' own headroom; the Q a
+/// frame later cannot rise above the previous one (`prev_q_syn`). Returns the shift applied.
+pub fn rescale_mem_syn(
+    q_exc: i16,
+    prev_q_syn: &mut i16,
+    q_syn: &mut i16,
+    mem_syn2: &mut [i16],
+    syn: Option<&mut [i16]>,
+    mem_len: i16,
+    i_subfr: i16,
+) -> i16 {
+    let mut max16: i16 = 0;
+    for &value in &mem_syn2[..mem_len.max(0) as usize] {
+        max16 = max16.max(abs_s(value));
+    }
+    if let Some(syn) = syn.as_deref() {
+        for &value in &syn[..i_subfr.max(0) as usize] {
+            max16 = max16.max(abs_s(value));
+        }
+    }
+    let mut max_scale: i16 = 15;
+    if max16 > 0 {
+        max_scale = add(norm_s(max16), -3);
+    }
+
+    // find scaling of synthesis (based on min of current frame and last frame); scaling factor
+    // of synthesis (-1..6)
+    let mut new_q = sub(q_exc, 3);
+    new_q = new_q.max(-1);
+
+    let mut tmp = add(max_scale, *q_syn);
+    if sub(new_q.min(*prev_q_syn), tmp) > 0 {
+        new_q = tmp.max(-1);
+    }
+
+    tmp = new_q.min(*prev_q_syn);
+    *prev_q_syn = new_q;
+
+    let exp_scale = sub(tmp, *q_syn);
+    *q_syn = tmp;
+    // rescale synthesis memory (mem_syn2)
+    scale_sig(mem_syn2, mem_len, exp_scale);
+    if let Some(syn) = syn {
+        scale_sig(syn, i_subfr, exp_scale);
+    }
+
+    exp_scale
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rescale_mem_syn_lowers_the_q_when_the_memory_has_no_headroom() {
+        // q_exc 4 asks for Q 1, but a memory peaking at 20000 has no headroom (max_scale -3), so
+        // the Q drops to the floor of -1 and everything is halved (-3 rounds to -1)
+        let mut prev_q_syn = 1;
+        let mut q_syn = 0;
+        let mut mem = [20000_i16, -3, 7, 0];
+        let mut syn = [100_i16, -200, 300];
+        let shift = rescale_mem_syn(
+            4,
+            &mut prev_q_syn,
+            &mut q_syn,
+            &mut mem,
+            Some(&mut syn),
+            4,
+            3,
+        );
+        assert_eq!(shift, -1);
+        assert_eq!(q_syn, -1);
+        assert_eq!(prev_q_syn, -1);
+        assert_eq!(mem, [10000, -1, 4, 0]);
+        assert_eq!(syn, [50, -100, 150]);
+    }
+
+    #[test]
+    fn rescale_mem_syn_without_syn_scales_only_the_memory() {
+        let mut prev_q_syn = 5;
+        let mut q_syn = 2;
+        let mut mem = [10_i16; 4];
+        let shift = rescale_mem_syn(9, &mut prev_q_syn, &mut q_syn, &mut mem, None, 4, 0);
+        assert_eq!(q_syn, 5);
+        assert_eq!(shift, 3);
+        assert_eq!(mem, [80; 4]);
+    }
+}

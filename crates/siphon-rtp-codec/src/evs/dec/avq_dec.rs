@@ -1,10 +1,10 @@
 //! Algebraic vector quantiser demultiplexing and decoding (TS 26.442 `lib_dec/avq_dec_fx.c`;
-//! TS 26.445 §6.1.4.2.1). Only `AVQ_demuxdec_fx` is ported; `AVQ_dec_lpc` is MODE2's LPC path.
+//! TS 26.445 §6.1.4.2.1): `AVQ_demuxdec_fx` and, for MODE2's LPC path, `AVQ_dec_lpc`.
 
 use crate::evs::com::bitstream::{get_next_indice, get_next_indice_1};
 use crate::evs::dec::re8_dec::re8_dec;
 use crate::evs::dec::state::DecoderState;
-use crate::itu::basic_ops::{add, extract_l, shl, shr, sub};
+use crate::itu::basic_ops::{add, extract_l, l_add, l_deposit_l, l_shl, shl, shr, sub};
 use crate::itu::stl2009::l_mac0;
 
 /// The reference's `I[]` / `nq[]` scratch length, an upper bound on `Nsv`.
@@ -108,4 +108,88 @@ pub fn avq_demuxdec(
     // write the remaining bits and the codebook numbers
     *nb_bits = bits;
     nq_out[..nsv_count].copy_from_slice(&nq[..nsv_count]);
+}
+
+/// `AVQ_dec_lpc`: decode `nsv` split-algebraic-VQ sub-vectors of 8 from the 4-bit words `indx`
+/// into `nvecq` (`8·nsv` values), the codebook numbers first (`indx[0..nsv]`) and the base and
+/// Voronoi indices read backwards from the end of the words. A position the words do not cover (a
+/// corrupt codebook number) reads as 0, where the reference reads outside the parameter array.
+pub fn avq_dec_lpc(indx: &[i16], nvecq: &mut [i16], nsv: i16) {
+    let mut kv = [0_i16; 8];
+    let mut c = [0_i16; 8];
+
+    // read `indx[pos--]`: 0 outside the words
+    let word = |pos: i16| -> i16 {
+        usize::try_from(pos)
+            .ok()
+            .and_then(|pos| indx.get(pos))
+            .copied()
+            .unwrap_or(0)
+    };
+
+    // last index word
+    let mut pos = sub(nsv, 1);
+
+    for &count in indx.iter().take(nsv.max(0) as usize) {
+        pos = add(pos, count);
+    }
+
+    // decode all subvectors
+    for l in (0..nsv.max(0) as usize).rev() {
+        let nq = indx[l]; // quantizer number (0,2,3..n)
+
+        let mut nk: i16 = 0;
+        let mut n = nq;
+
+        if sub(nq, 4) > 0 {
+            nk = shr(sub(nq, 3), 1);
+            n = sub(nq, shl(nk, 1));
+        }
+
+        // read n groups of 4-bit for Voronoi index (k[])
+        kv.fill(0);
+
+        while nk > 0 {
+            let mut ival = word(pos) & 0x0F;
+            pos = pos.wrapping_sub(1);
+            ival = shl(ival, 4);
+            ival = add(ival, word(pos) & 0x0F);
+            pos = pos.wrapping_sub(1);
+
+            for i in (0..8).rev() {
+                kv[i] = shl(kv[i], 1);
+                kv[i] = add(kv[i], ival & 0x01);
+                ival = shr(ival, 1);
+            }
+            nk -= 1;
+        }
+
+        // read n groups of 4-bit for base codebook index (I)
+        let mut big_i = l_deposit_l(0);
+        while n > 0 {
+            big_i = l_shl(big_i, 4);
+            big_i = l_add(big_i, i32::from(word(pos) & 0x0F));
+            pos = pos.wrapping_sub(1);
+            n -= 1;
+        }
+
+        // multi-rate RE8 decoder
+        let i16_index = extract_l(big_i) as u16;
+        re8_dec(nq, i16_index, &kv, &mut c);
+
+        // write decoded RE8 vector
+        nvecq[l * 8..l * 8 + 8].copy_from_slice(&c);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_codebook_numbers_decode_to_the_zero_vector() {
+        let mut nvecq = [7_i16; 16];
+        avq_dec_lpc(&[0, 0], &mut nvecq, 2);
+        assert_eq!(nvecq, [0; 16]);
+    }
 }

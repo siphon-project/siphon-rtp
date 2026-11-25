@@ -8,13 +8,18 @@
 
 use crate::evs::basop::{l_extract_lc, mult_32_16, mult_32_32};
 use crate::evs::cnst::{
-    ACELP_8K00, ALLPASSSECTIONS_STEEP, HILBERT_MEM_SIZE, INTERP_3_1_MEM_LEN, LONG_H_ST,
-    LPC_SHB_ORDER, L_FRAME, L_FRAME16K, L_SHB_LAHEAD, L_SUBFR, MAX_16, VF_0TH_PARAM_FX,
-    VF_1ST_PARAM_FX, VF_2ND_PARAM_FX, VOICED,
+    ACELP_13K20, ACELP_16K40, ACELP_24K40, ACELP_32K, ACELP_8K00, ACELP_9K60,
+    ALLPASSSECTIONS_STEEP, BITS_TEC, BITS_TFA, FB, HILBERT_MEM_SIZE, INTERP_3_1_MEM_LEN, LONG_H_ST,
+    LPC_SHB_ORDER, L_FRAME, L_FRAME16K, L_SHB_LAHEAD, L_SUBFR, MAX_16, MIRROR_POINT_BITS,
+    NB_SUBFR16K, NUM_BITS_LBR_WB_LSF, NUM_BITS_SHB_ENER_SF, NUM_BITS_SHB_FRAMEGAIN,
+    NUM_BITS_SHB_FRAMEGAIN_LBR_WB, NUM_BITS_SHB_RES_GS, NUM_BITS_SHB_SUBGAINS, NUM_BITS_SHB_VF,
+    NUM_LSF_GRID_BITS, NUM_Q_LSF, SWB, VF_0TH_PARAM_FX, VF_1ST_PARAM_FX, VF_2ND_PARAM_FX, VOICED,
+    WB,
 };
 use crate::evs::com::log2::log2_norm_lc;
 use crate::evs::com::math_op::pow2;
 use crate::evs::com::tools::{set16, set32};
+use crate::evs::rom::LSF_Q_NUM_BITS;
 use crate::itu::basic_ops::{
     abs_s, add, div_s, extract_h, extract_l, l_add, l_deposit_h, l_mac, l_mult, l_negate, l_shl,
     l_shr, l_sub, mult_r, negate, norm_l, norm_s, round_word, shl, shr, sub,
@@ -494,6 +499,64 @@ pub fn wb_tbe_extras_reset(
         0,
         2 * ALLPASSSECTIONS_STEEP + 1,
     );
+}
+
+/// `get_tbe_bits_fx`: the number of bits the TBE bandwidth extension takes of a frame at `bitrate`
+/// and `bandwidth` (0 for none); `rf_mode` selects the channel-aware primary-frame layout.
+// indices mirror the reference's loops
+#[allow(clippy::needless_range_loop)]
+#[must_use]
+pub fn get_tbe_bits(bitrate: i32, bandwidth: i16, rf_mode: i16) -> i16 {
+    let mut bits: i16 = 0;
+
+    if sub(rf_mode, 1) == 0 {
+        // TBE bits for core, primary frame
+        if sub(bandwidth, WB) == 0 && l_sub(bitrate, i32::from(ACELP_13K20)) == 0 {
+            // Gain frame: 4, Gain shapes: 0, and LSFs: 2
+            bits = NUM_BITS_SHB_FRAMEGAIN_LBR_WB + NUM_BITS_LBR_WB_LSF;
+        } else if sub(bandwidth, SWB) == 0 && l_sub(bitrate, i32::from(ACELP_13K20)) == 0 {
+            // Gain frame: 5, Gain shapes: 5, and lowrate LSFs: 8
+            bits = NUM_BITS_SHB_FRAMEGAIN + NUM_BITS_SHB_SUBGAINS + 8;
+        }
+    } else if sub(bandwidth, WB) == 0 && l_sub(bitrate, i32::from(ACELP_9K60)) == 0 {
+        bits = NUM_BITS_LBR_WB_LSF + NUM_BITS_SHB_FRAMEGAIN_LBR_WB;
+    } else if sub(bandwidth, SWB) == 0 || sub(bandwidth, FB) == 0 {
+        if l_sub(bitrate, i32::from(ACELP_9K60)) == 0 {
+            bits = NUM_BITS_SHB_FRAMEGAIN + NUM_BITS_SHB_SUBGAINS + 8;
+        } else if l_sub(bitrate, i32::from(ACELP_13K20)) >= 0
+            && l_sub(bitrate, i32::from(ACELP_32K)) <= 0
+        {
+            bits = NUM_BITS_SHB_SUBGAINS
+                + NUM_BITS_SHB_FRAMEGAIN
+                + NUM_LSF_GRID_BITS
+                + MIRROR_POINT_BITS;
+
+            for i in 0..NUM_Q_LSF as usize {
+                bits = add(bits, LSF_Q_NUM_BITS[i]);
+            }
+        }
+
+        if l_sub(bitrate, i32::from(ACELP_24K40)) >= 0 {
+            bits = add(
+                bits,
+                NUM_BITS_SHB_ENER_SF + NUM_BITS_SHB_VF + NUM_BITS_SHB_RES_GS * NB_SUBFR16K,
+            );
+        }
+
+        if sub(bandwidth, SWB) == 0
+            && (l_sub(bitrate, i32::from(ACELP_16K40)) == 0
+                || l_sub(bitrate, i32::from(ACELP_24K40)) == 0)
+        {
+            bits = add(bits, BITS_TEC + BITS_TFA);
+        }
+
+        if sub(bandwidth, FB) == 0 {
+            // full band slope
+            bits = add(bits, 4);
+        }
+    }
+
+    bits
 }
 
 #[cfg(test)]

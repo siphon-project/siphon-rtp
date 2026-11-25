@@ -1,8 +1,12 @@
 //! The per-frame decoder dispatcher (TS 26.442 `lib_dec/evs_dec_fx.c`): decision matrix, ACELP or
 //! HQ core, core and bandwidth switching, bandwidth extension, delay alignment of the
 //! extension layers, high-pass filtering, output conversion and the end-of-frame updates, for the
-//! MODE1 (ACELP / HQ) frames. A MODE2 (TCX) frame is refused with [`EvsError::Unsupported`] at the
-//! point the reference enters its MODE2 part (`dec_acelp_tcx_frame`); it never produces audio.
+//! MODE1 (ACELP / HQ) frames, and for MODE2 (TCX / LPD) frames the `ELSE /* MODE2 PART */` block
+//! (`mode2`: the LPD core, IGF / TBE interface and the CLDFB post-processing) followed by the
+//! same tail. A frame that needs AMR-WB IO is refused with [`EvsError::Unsupported`]; it never
+//! produces audio.
+
+mod mode2;
 
 use crate::evs::basop::mpy_32_16_1;
 use crate::evs::cnst::{
@@ -11,8 +15,8 @@ use crate::evs::cnst::{
     HQ_48K, HQ_CORE, HQ_DELAY_COMP, HQ_DELTA_MAX, INACTIVE, LG10, LP_CNG, L_FRAME, L_FRAME16K,
     L_FRAME32K, L_FRAME48K, MAX_DELAY_TBE_NS, MIN_ACT_CNG_UPD, MODE1, MODE2, NB, NB_SUBFR,
     NB_SUBFR16K, NL_BUFF_OFFSET, N_ZERO_MDCT_NS, PH_ECU_LOOKAHEAD_NS, PH_ECU_MEM_NS,
-    POST_HQ_DELAY_NS, RF_NO_DATA, SID_2K40, SWB_BWE, SWB_BWE_HIGHRATE, SWB_CNG, SWB_TBE,
-    TCXLTP_DELAY_NS, TCX_10_CORE, TCX_20_CORE, TCX_NONTONAL, WB_BWE, WB_TBE,
+    POST_HQ_DELAY_NS, RF_NO_DATA, RF_TCXFD, RF_TCXTD2, SID_2K40, SWB_BWE, SWB_BWE_HIGHRATE,
+    SWB_CNG, SWB_TBE, TCXLTP_DELAY_NS, TCX_10_CORE, TCX_20_CORE, TCX_NONTONAL, WB_BWE, WB_TBE,
 };
 use crate::evs::com::basop_util::idiv1616;
 use crate::evs::com::bitstream::{get_partial_copy_info, FRAMEMODE_MISSING};
@@ -27,6 +31,7 @@ use crate::evs::dec::core_switching_dec::{
     bandwidth_switching_detect, bw_switching_pre_proc, core_switching_post_dec,
     core_switching_pre_dec,
 };
+use crate::evs::dec::dec_acelp_tcx_main::DEC_CONCEALMENT_EXT;
 use crate::evs::dec::decision_matrix_dec::decision_matrix_dec;
 use crate::evs::dec::hq_core_dec::hq_core_dec;
 use crate::evs::dec::state::DecoderState;
@@ -35,15 +40,19 @@ use crate::evs::dec::swb_bwe_dec_hr::swb_bwe_dec_hr;
 use crate::evs::dec::swb_tbe_dec::{fb_tbe_dec, swb_tbe_dec, wb_tbe_dec};
 use crate::evs::dec::syn_outp::syn_output;
 use crate::evs::dec::updt_dec::{updt_bw_switching, updt_dec_common};
+use crate::evs::dec::waveadjust_fec_dec::{concealment_update2_x, waveform_adj2_fix};
 use crate::evs::error::{EvsError, UnsupportedMode};
 use crate::evs::macros::ns2sa_fx2;
 use crate::evs::rom::SIN_TABLE256_FX;
 use crate::itu::basic_ops::{
-    add, l_add, l_deposit_l, l_mac, l_mult, l_shl, mult_r, negate, norm_l, round_word, shl, shr,
-    sub,
+    add, extract_l, l_add, l_deposit_l, l_mac, l_mult, l_shl, l_shr_r, mult, mult_r, negate,
+    norm_l, round_word, shl, shr, sub,
 };
 use crate::itu::oper_32b::mpy_32_16;
 use crate::itu::stl2009::{i_mult, l_mult0};
+
+/// `RF_NELP` = `ACELP_MODE_MAX + 3`.
+const RF_NELP: i16 = crate::evs::cnst::ACELP_MODE_MAX + 3;
 
 /// `Qpostd`-independent size of `synth_fx`: `L_FRAME48k + HQ_DELTA_MAX*HQ_DELAY_COMP`.
 const SYNTH_LEN: usize = L_FRAME48K as usize + (HQ_DELTA_MAX * HQ_DELAY_COMP) as usize;
@@ -72,6 +81,33 @@ struct FrameWork {
     output_frame: i16,
 }
 
+impl FrameWork {
+    /// The locals of `evs_dec_fx` at the start of a frame.
+    fn new() -> Self {
+        Self {
+            bwe_exc_extended: [0; L_FRAME32K as usize + NL_BUFF_OFFSET as usize],
+            voice_factors: [0; NB_SUBFR16K as usize],
+            hb_synth: [0; L_FRAME48K as usize],
+            hb_synth_exp: 0,
+            tmp_buffer: [0; L_FRAME48K as usize],
+            synth: [0; SYNTH_LEN],
+            pitch_buf: [0; NB_SUBFR16K as usize],
+            old_syn_12k8_16k: [0; L_FRAME16K as usize],
+            sid_bw: -1,
+            unbits: 0,
+            fb_exc: [0; L_FRAME16K as usize],
+            q_fb_exc: 0,
+            coder_type: INACTIVE,
+            sharp_flag: 0,
+            hq_core_type: -1,
+            core_switching_flag: 0,
+            qpostd: 0,
+            qpostd_prev: 0,
+            output_frame: 0,
+        }
+    }
+}
+
 /// `sin_table256_fx[index]`; the index is a multiple of the interpolation step below 256.
 fn sin_table256(index: i16) -> i16 {
     SIN_TABLE256_FX
@@ -85,34 +121,14 @@ fn sin_table256(index: i16) -> i16 {
 /// `frame_mode` is `FRAMEMODE_NORMAL` or `FRAMEMODE_MISSING`.
 ///
 /// # Errors
-/// [`EvsError::Unsupported`] for a frame that needs MODE2 (TCX) or AMR-WB IO, which this port
-/// does not run yet; the state is then mid-frame and the decoder must not be used further.
+/// [`EvsError::Unsupported`] for a frame that needs AMR-WB IO, which this port does not run yet;
+/// the state is then mid-frame and the decoder must not be used further.
 pub fn evs_dec(
     st: &mut DecoderState,
     output_sp: &mut [i16],
     frame_mode: i16,
 ) -> Result<(), EvsError> {
-    let mut w = FrameWork {
-        bwe_exc_extended: [0; L_FRAME32K as usize + NL_BUFF_OFFSET as usize],
-        voice_factors: [0; NB_SUBFR16K as usize],
-        hb_synth: [0; L_FRAME48K as usize],
-        hb_synth_exp: 0,
-        tmp_buffer: [0; L_FRAME48K as usize],
-        synth: [0; SYNTH_LEN],
-        pitch_buf: [0; NB_SUBFR16K as usize],
-        old_syn_12k8_16k: [0; L_FRAME16K as usize],
-        sid_bw: -1,
-        unbits: 0,
-        fb_exc: [0; L_FRAME16K as usize],
-        q_fb_exc: 0,
-        coder_type: INACTIVE,
-        sharp_flag: 0,
-        hq_core_type: -1,
-        core_switching_flag: 0,
-        qpostd: 0,
-        qpostd_prev: 0,
-        output_frame: 0,
-    };
+    let mut w = FrameWork::new();
 
     if st.bfi == 0 {
         st.extl = -1;
@@ -127,16 +143,14 @@ pub fn evs_dec(
         w.coder_type = st.last_coder_type;
     }
 
-    // PLC: [TCX: Fade-out-recovery]: the first good frame after a TCX concealment
+    // PLC: [TCX: Fade-out-recovery]: the first good frame after a TCX concealment; the
+    // overlapping part needs to be attenuated
     if st.bfi == 0
         && st.prev_bfi != 0
         && sub(st.last_codec_mode, MODE2) == 0
         && (sub(st.last_core_bfi, TCX_20_CORE) == 0 || sub(st.last_core_bfi, TCX_10_CORE) == 0)
     {
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Mode2,
-            reference_call: "TCX fade-out recovery of evs_dec_fx",
-        });
+        evs_dec_fade_out_recovery(st);
     }
 
     st.rate_switching_reset = 0;
@@ -161,11 +175,9 @@ pub fn evs_dec(
     evs_dec_partial_copy(st, &mut frame_mode);
 
     if sub(st.codec_mode, MODE1) != 0 {
-        // the reference enters its MODE2 part here
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Mode2,
-            reference_call: "dec_acelp_tcx_frame",
-        });
+        // MODE2 PART
+        let conceal_whole_frame = mode2::evs_dec_mode2(st, &mut w, output_sp, &mut frame_mode)?;
+        return evs_dec_finish(st, &mut w, output_sp, frame_mode, conceal_whole_frame);
     }
 
     // Decision matrix (selection of technologies)
@@ -186,10 +198,38 @@ pub fn evs_dec(
 
     evs_dec_core(st, &mut w)?;
     evs_dec_extension(st, &mut w)?;
-    evs_dec_delay_alignment(st, &mut w)?;
+    evs_dec_delay_alignment(st, &mut w);
     evs_dec_add_extension(st, &mut w)?;
     evs_dec_postfilter(st, &mut w);
-    evs_dec_finish(st, &mut w, output_sp)
+    evs_dec_finish(st, &mut w, output_sp, frame_mode, false)
+}
+
+/// The first good frame after a TCX concealment: the overlap and the PLC memories are faded by
+/// the recovery gain, and, if no ALDO window is used, the overlap buffers by the concealment
+/// end-of-frame gain.
+fn evs_dec_fade_out_recovery(st: &mut DecoderState) {
+    let recovery_gain = st.plc_info.recovery_gain;
+    for sample in &mut st.old_out[..st.l_frame_tcx.max(0) as usize] {
+        *sample = shl(mult_r(*sample, recovery_gain), 1);
+    }
+    for sample in &mut st.old_out_lb[..st.l_frame.max(0) as usize] {
+        *sample = shl(mult_r(*sample, recovery_gain), 1);
+    }
+    // attenuate PLC buffers, if no aldo window is used and if no sid or zero frame is received
+    if st.tcx_cfg.last_aldo == 0 {
+        // Q14
+        let f = l_deposit_l(st.conceal_eof_gain);
+        let mut s = sub(16, norm_l(f));
+        let mut factor = extract_l(l_shr_r(f, s));
+        for sample in &mut st.syn_overl_fb[..st.tcx_cfg.tcx_mdct_window_length_fb.max(0) as usize] {
+            *sample = shl(mult(factor, *sample), add(s, 1));
+        }
+        s = sub(16, norm_l(f));
+        factor = extract_l(l_shr_r(f, s));
+        for sample in &mut st.syn_overl[..st.tcx_cfg.tcx_mdct_window_length.max(0) as usize] {
+            *sample = shl(mult(factor, *sample), s);
+        }
+    }
 }
 
 /// The partial-copy (channel-aware) preamble of `evs_dec_fx`: a partial copy that cannot be used
@@ -272,7 +312,7 @@ fn evs_dec_core(st: &mut DecoderState, w: &mut FrameWork) -> Result<(), EvsError
             w.output_frame,
             w.hq_core_type,
             w.core_switching_flag,
-        )?;
+        );
         w.qpostd = q_synth;
     }
 
@@ -410,7 +450,7 @@ fn evs_dec_extension(st: &mut DecoderState, w: &mut FrameWork) -> Result<(), Evs
 
 /// Delay the ACELP core synthesis to be synchronised with the components of the bandwidth
 /// extension layers.
-fn evs_dec_delay_alignment(st: &mut DecoderState, w: &mut FrameWork) -> Result<(), EvsError> {
+fn evs_dec_delay_alignment(st: &mut DecoderState, w: &mut FrameWork) {
     let output = w.output_frame as usize;
     if sub(w.output_frame, L_FRAME16K) >= 0 {
         let tmps = ns2sa_fx2(st.output_fs, DELAY_BWE_TOTAL_NS - DELAY_CLDFB_NS);
@@ -446,12 +486,29 @@ fn evs_dec_delay_alignment(st: &mut DecoderState, w: &mut FrameWork) -> Result<(
         && st.plc_info.concealment_method == TCX_NONTONAL
         && st.plc_info.nb_lost_cmpt < 4
     {
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Mode2,
-            reference_call: "waveform_adj2_fix",
-        });
+        let tmps = if sub(w.output_frame, L_FRAME16K) >= 0 {
+            ns2sa_fx2(st.output_fs, DELAY_BWE_TOTAL_NS)
+        } else {
+            0
+        };
+        let overlap_at = st.tonal_mdc_tconceal.second_last_pcm_out.unwrap_or(0);
+        waveform_adj2_fix(
+            &mut st.tonal_mdc_tconceal.time_data_buffer[overlap_at..],
+            &mut w.synth[tmps.max(0) as usize..],
+            &mut st.plc_info.data_noise,
+            &mut st.plc_info.outx_new_n1,
+            &mut st.plc_info.nsapp_gain,
+            &mut st.plc_info.nsapp_gain_n,
+            &mut st.plc_info.recovery_gain,
+            st.plc_info.step_concealgain,
+            st.plc_info.pitch,
+            st.plc_info.frame_size,
+            tmps,
+            add(extract_l(st.plc_info.nb_lost_cmpt), 1),
+            st.bfi,
+        );
+        st.plc_info.pitch = 0;
     }
-    Ok(())
 }
 
 /// Addition of the bandwidth-extension components to the ACELP core synthesis: delay and
@@ -717,6 +774,8 @@ fn evs_dec_finish(
     st: &mut DecoderState,
     w: &mut FrameWork,
     output_sp: &mut [i16],
+    frame_mode: i16,
+    conceal_whole_frame: bool,
 ) -> Result<(), EvsError> {
     let output = w.output_frame;
     let frame = output as usize;
@@ -724,7 +783,9 @@ fn evs_dec_finish(
     output_sp[..frame].copy_from_slice(&w.synth[..frame]);
 
     // Save synthesis for HQ FEC
-    evs_dec_save_synthesis(st, w);
+    if sub(st.codec_mode, MODE1) == 0 {
+        evs_dec_save_synthesis(st, w);
+    }
 
     // HP filtering
     st.qprev_synth_buffer = w.qpostd;
@@ -738,10 +799,37 @@ fn evs_dec_finish(
     );
 
     // Synthesis output
-    syn_output(st.codec_mode, &w.synth, output, output_sp, w.qpostd);
+    if sub(st.codec_mode, MODE1) == 0 {
+        // final output of synthesis signal
+        syn_output(st.codec_mode, &w.synth, output, output_sp, w.qpostd);
+    } else {
+        output_sp[..frame].copy_from_slice(&w.synth[..frame]);
+    }
 
     // Updates
-    updt_dec_common(st, w.hq_core_type, output_sp);
+    if st.last_is_cng == 0 && sub(st.codec_mode, MODE2) == 0 {
+        st.bfi = 0;
+        if st.use_partial_copy != 0
+            && sub(st.rf_frame_type, RF_TCXFD) >= 0
+            && sub(st.rf_frame_type, RF_TCXTD2) <= 0
+        {
+            if sub(frame_mode, FRAMEMODE_MISSING) == 0 {
+                st.bfi = 1;
+            }
+        } else if sub(st.m_decode_mode, DEC_CONCEALMENT_EXT) == 0 {
+            st.bfi = 1;
+        }
+        updt_dec_common(st, -1, output_sp);
+    } else {
+        if sub(st.codec_mode, MODE2) == 0 {
+            st.bfi = 0;
+        }
+        updt_dec_common(st, w.hq_core_type, output_sp);
+    }
+    if sub(st.codec_mode, MODE2) == 0 {
+        st.last_nelp_mode_dec =
+            i16::from(sub(st.use_partial_copy, 1) == 0 && sub(st.rf_frame_type, RF_NELP) == 0);
+    }
 
     st.prev_use_partial_copy = st.use_partial_copy;
     st.prev_tilt_code_dec = 0;
@@ -777,7 +865,11 @@ fn evs_dec_finish(
     }
 
     // update bandwidth switching parameters
-    updt_bw_switching(st, &w.synth, w.qpostd);
+    if sub(st.codec_mode, MODE1) == 0 {
+        updt_bw_switching(st, &w.synth, w.qpostd);
+    } else {
+        st.last_bwidth = st.bwidth;
+    }
 
     // synchronisation of CNG seeds
     if st.bfi != 0
@@ -787,13 +879,9 @@ fn evs_dec_finish(
         random(&mut st.cng_ener_seed);
     }
 
-    // the waveform adjustment memory update (concealment_update2_x) only runs with
-    // enablePlcWaveadjust, which the MODE1 branch clears and only the MODE2 decoder sets
-    if st.enable_plc_waveadjust != 0 {
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Mode2,
-            reference_call: "concealment_update2_x",
-        });
+    if st.enable_plc_waveadjust != 0 && !conceal_whole_frame {
+        // update the parameters used in waveform adjustment
+        concealment_update2_x(output_sp, &mut st.plc_info, st.l_frame_tcx);
     }
 
     st.last_total_brate_ber = st.total_brate;

@@ -8,7 +8,7 @@
 //! overlapping buffers (it picks the copy direction from the pointer order, i.e. a `memmove`).
 
 use crate::evs::basop::{l_extract_lc, madd_32_16, msub_32_16, mult_32_16};
-use crate::evs::cnst::{L_FILT_MAX, L_FRAME32K, L_SUBFR};
+use crate::evs::cnst::{L_FILT_MAX, L_FRAME16K, L_FRAME32K, L_SUBFR};
 use crate::evs::com::math_op::isqrt_lc;
 use crate::evs::rom::{A_HP400_FX, B_HP400_FX};
 use crate::itu::basic_ops::{
@@ -987,6 +987,84 @@ pub fn usquant(x: i16, xq: &mut i16, qlow: i16, delta: i16, cbsize: i16) -> i16 
     l_tmp = l_mac(l_tmp, idx, delta);
     *xq = round_word(l_shl(l_tmp, 16));
     idx
+}
+
+/// `Exp32Array`: the headroom (`norm_l` of the largest magnitude, 31 if all zero) of `sx[0..n]`.
+#[must_use]
+pub fn exp32_array(n: i16, sx: &[i32]) -> i16 {
+    let mut l_max = l_abs(sx[0]);
+    for &value in sx.iter().take(n.max(0) as usize).skip(1) {
+        l_max = l_max.max(l_abs(value));
+    }
+    let mut exp = norm_l(l_max);
+    if l_max == 0 {
+        exp = 31;
+    }
+    exp
+}
+
+/// `Invert16`: `1/val` for `val >= 1` as a Q15 mantissa with the exponent `*exp` updated
+/// (it is both input and output): the result is Q(15 + `*exp`).
+pub fn invert16(val: i16, exp: &mut i16) -> i16 {
+    // prevent 0 input
+    let mut val = val.max(1);
+    // Normalize Value
+    let temp = norm_s(val);
+    val = shl(val, temp);
+
+    // -1 because of 0x4000 is 1.0 in Q14 (and not Q15)
+    *exp = sub(sub(15 - 1, *exp), temp);
+
+    div_s(0x4000, val)
+}
+
+/// `dot_prod_satcontr`: `Σ x[i]·y[i]` (inputs Q`qx`, Q`qy`) as a 16-bit mantissa, rescaling both
+/// inputs by 2 bits (and the result's exponent by 4) until the 32-bit accumulation, started at a
+/// rounding offset, no longer saturates; `qo` receives the Q format of the result.
+///
+/// The reference loops on the STL `Overflow` flag, reset at the top of each pass and raised by the
+/// operators `L_shl` (the offset) and `L_mac0` (each product). Each is checked here against the
+/// same arithmetic in 64 bits, which is exactly when the reference operator saturates.
+pub fn dot_prod_satcontr(x: &[i16], y: &[i16], qx: i16, qy: i16, qo: &mut i16, len: i16) -> i16 {
+    let mut tmp_tab_x = [0i16; L_FRAME16K as usize];
+    let mut tmp_tab_y = [0i16; L_FRAME16K as usize];
+    let count = (len.max(0) as usize).min(L_FRAME16K as usize);
+
+    tmp_tab_x[..count].copy_from_slice(&x[..count]);
+    tmp_tab_y[..count].copy_from_slice(&y[..count]);
+    let mut shift: i16 = 0;
+    let mut l_tmp;
+    loop {
+        // Overflow = 0
+        let mut overflow = false;
+        let offset_shift = sub(add(add(qx, qy), 7), shift).max(0);
+        l_tmp = l_shl(1, offset_shift);
+        if offset_shift >= 31 {
+            overflow = true; // 1 << 31 saturates
+        }
+        for i in 0..count {
+            let exact = i64::from(l_tmp) + i64::from(l_mult0(tmp_tab_x[i], tmp_tab_y[i]));
+            l_tmp = l_mac0(l_tmp, tmp_tab_x[i], tmp_tab_y[i]); // Q(qx+qy-shift)
+            if exact != i64::from(l_tmp) {
+                overflow = true;
+            }
+        }
+
+        if !overflow {
+            break;
+        }
+        scale_sig(&mut tmp_tab_x, len, -2);
+        scale_sig(&mut tmp_tab_y, len, -2);
+        shift = add(shift, 4);
+    }
+
+    let mut q = norm_l(l_tmp);
+    l_tmp = l_shl(l_tmp, q); // Q(qx+qy-shift+q)
+    let ener = extract_h(l_tmp); // Q(qx+qy-shift+q-16)
+    q = add(q, add(qx, qy));
+    *qo = sub(q, add(shift, 16));
+
+    ener
 }
 
 #[cfg(test)]
