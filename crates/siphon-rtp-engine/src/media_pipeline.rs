@@ -59,6 +59,7 @@ mod secure_hold;
 mod split;
 mod surrender;
 mod x3_single_leg;
+mod x3_split;
 use ingress_clock::IngressClock;
 pub use relay_tap::CarriedAttachments;
 use relay_tap::TapDecode;
@@ -759,6 +760,9 @@ pub struct Direction {
     /// Lawful-interception tap on what this direction **sends** toward the party, set only on the
     /// one direction of a single-leg call that faces its caller (media_pipeline/x3_single_leg.rs).
     x3_egress: X3Taps,
+    /// The taps of this direction's ingress that carry what the target hears, re-stamped for this
+    /// direction's own egress, which delivers them while the call is split (media_pipeline/x3_split.rs).
+    x3_toward: X3Taps,
     /// Plaintext-RTP taps of a tee or decoded recording moved over from a crypto bridge flow while
     /// the call is held here (media_pipeline/secure_hold.rs). Empty otherwise.
     plain_taps: PlainTaps,
@@ -1602,6 +1606,7 @@ impl Direction {
             raw_tee: Vec::new(),
             x3: X3Taps::default(),
             x3_egress: X3Taps::default(),
+            x3_toward: X3Taps::default(),
             plain_taps: PlainTaps::default(),
             rtcp_out: None,
             decoder: config.decoder,
@@ -1690,6 +1695,7 @@ impl Direction {
             raw_tee: Vec::new(),
             x3: X3Taps::default(),
             x3_egress: X3Taps::default(),
+            x3_toward: X3Taps::default(),
             plain_taps: PlainTaps::default(),
             rtcp_out: None,
             decoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
@@ -2229,9 +2235,7 @@ impl Direction {
         // It is also before the `relay_only` early return below, so an intercepted plain relay is
         // covered without being forced into a transcode. RTCP is filtered inside the tap (a PDU
         // declares payload format 8, "RTP packet").
-        if !self.x3.is_empty() {
-            self.x3.deliver(source, data);
-        }
+        self.deliver_x3_ingress(source, data);
         // A tee's or a recording's copy, taken off the bridge while this call is held (RTCP is not audio).
         if !self.plain_taps.is_empty() && !(64..=95).contains(&(data[1] & 0x7f)) {
             self.plain_taps.offer(data);
@@ -2695,6 +2699,7 @@ impl Direction {
         if !self.x3_egress.is_empty() {
             self.x3_egress.deliver_egress(self.egress_dst, plaintext);
         }
+        self.deliver_x3_toward(plaintext);
         let (endpoint, dst) = match self.rtcp_out {
             Some(rtcp) if (64..=95).contains(&(plaintext[1] & 0x7f)) => rtcp,
             _ => (self.egress_endpoint, self.egress_dst),
@@ -3628,6 +3633,7 @@ impl MediaCall {
         let (leg_a, leg_b) = taps;
         self.a_to_b.x3 = leg_a;
         self.b_to_a.x3 = leg_b;
+        self.derive_x3_toward();
     }
 
     /// Stop lawful-interception content delivery (`Command::DetachX3`): drop both taps so the
@@ -3637,6 +3643,7 @@ impl MediaCall {
         self.a_to_b.x3 = X3Taps::default();
         self.b_to_a.x3 = X3Taps::default();
         self.a_to_b.x3_egress = X3Taps::default();
+        self.derive_x3_toward();
     }
 
     /// Whether this call is under lawful-interception content delivery (test/observability helper).

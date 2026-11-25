@@ -95,6 +95,7 @@ mod ws_takeover_order;
 mod x3_hand_over;
 mod x3_rebuilt_pipeline;
 mod x3_single_leg_ice;
+mod x3_split;
 
 /// A connectivity check that nominates its pair (USE-CANDIDATE, RFC 8445 §7.1.1): the only kind an
 /// ice-lite leg selects a media path from (§7.3.1.5). Plain `binding_request` checks are answered

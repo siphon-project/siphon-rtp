@@ -164,6 +164,7 @@ impl MediaCall {
         self.a_to_b.continue_egress(&resume.toward_b, now);
         self.a_to_b.adopt_taps(resume.taps_a);
         self.b_to_a.adopt_taps(resume.taps_b);
+        self.derive_x3_toward();
         if resume.ungate {
             self.a_to_b.secure_pending = false;
             self.b_to_a.secure_pending = false;
@@ -172,7 +173,9 @@ impl MediaCall {
 
     /// What goes back to a bridge: A's side (the `a_to_b` direction) and B's (the `b_to_a`).
     pub fn held_back(&mut self) -> [HeldBack; 2] {
-        [self.a_to_b.held_back(), self.b_to_a.held_back()]
+        let held = [self.a_to_b.held_back(), self.b_to_a.held_back()];
+        self.derive_x3_toward();
+        held
     }
 }
 

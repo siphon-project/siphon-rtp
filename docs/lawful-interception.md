@@ -311,6 +311,29 @@ deliveries end loudly with `transport_error` and an `error!` on `siphon_rtp::li`
 recording, SIPREC subscription, WebSocket tee or DTMF block is attached, as before. `node_info` lists
 `x3_ws_takeover` on a node provisioned for X3.
 
+### Split calls
+
+A call split with `attach_ws_split` is intercepted like any other, with the warrant before or after the
+split, and X3 carries what is on each wire (§5.3). On an ordinary two-party call what the target hears
+*is* the other party's ingress, which is why two ingress taps are enough. A split ends that identity: the
+parties are isolated and the target hears what the bot plays its leg. So while the split lasts, per delivery:
+
+| Direction | Source while split | Source otherwise |
+|---|---|---|
+| `from_target` (3) | the target's own ingress, as always | the same |
+| `to_target` (2) | the **egress** of the target's leg: the plaintext RTP sent to it, the bot's audio or the silence the playout clock sends when the bot is quiet or gone, in the leg's own codec | the other party's ingress |
+
+The other party's original voice is not delivered as audio the target heard; it is still on the
+recordings, the tee and SIPREC, which carry the parties' own voices. The two sources are chosen by the one
+state that isolates the direction, in the same step, so a detach switches `to_target` back to the other
+party's ingress with no packet delivered twice and none skipped, and an isolation that outlives the bot
+(the call is silent until a `detach_ws_split`) delivers the silence the wire carries. Each warrant takes
+its own side: a second warrant on the other party gets the other leg's egress. The delivery's PDU sequence
+runs on unbroken, the interception follows a re-offer like any other, and a restored split call is
+intercepted again by attaching the warrant on it (a checkpoint carries the isolation, not a delivery
+connection). A packet is delivered only after the engine sent it: nothing is delivered toward a leg that
+is unkeyed, awaiting ICE or not receiving.
+
 ### Events
 
 | Event | Meaning |
@@ -328,6 +351,7 @@ recording, SIPREC subscription, WebSocket tee or DTMF block is attached, as befo
 | WebSocket takeover (`ws_uri`, `attach_ws_bridge`) | Delivered (ingress in the bridge's dispatch, egress in its drain), see [WebSocket takeover calls](#websocket-takeover-calls) |
 | Echo test | **Refused** — no second party, and the echo path bypasses the tap |
 | Conference seat (`conference_seat`, or joined with `conference_join`) | Delivered (room tap), see [Conference rooms](#conference-rooms) |
+| Split call (`attach_ws_split`) | Delivered: `to_target` is what the target's leg is sent while split, see [Split calls](#split-calls) |
 | Engine-answered call (`answer_local`), also while `offer_far` grows it | Delivered (ingress and egress taps, the caller is the target), see [Engine-answered calls](#engine-answered-calls) |
 
 Each unsupported shape is refused at the command with a reason, never accepted silently.

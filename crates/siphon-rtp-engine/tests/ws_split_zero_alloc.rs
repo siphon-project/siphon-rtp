@@ -25,6 +25,7 @@ use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::Encoder;
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::media_pipeline::{DirectionConfig, MediaCall, SplitAttach};
+use siphon_rtp_engine::x3::{ingress_directions, x3_channel, X3Taps};
 use siphon_rtp_media::bridge::protocol::{Encoding, Endianness, MediaFormat};
 use siphon_rtp_media::bridge::split::playout;
 use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
@@ -33,6 +34,7 @@ use siphon_rtp_media::rtp::{write_packet, RtpHeader};
 struct CountingAllocator;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
@@ -125,9 +127,39 @@ fn stereo_frame(samples: usize) -> Vec<u8> {
     bytes
 }
 
-#[test]
-fn a_split_tick_allocates_only_the_datagrams_it_sends() {
+/// Allocations over the measured ticks of a split call under `deliveries` interceptions, the packets
+/// the call sent and the packets the interceptions were given. Half the interceptions target the
+/// offerer and half the answerer, so both directions' split egress taps are in the loop.
+fn split_ticks(deliveries: usize) -> (usize, usize, usize) {
+    // The counter is global and the tests run on threads of one process: one measures at a time.
+    let _turn = MEASURING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut call = ulaw_call();
+    let channels: Vec<_> = (0..deliveries).map(|_| x3_channel(4096)).collect();
+    if deliveries > 0 {
+        let taps = |address: SocketAddr, caller_is_target: bool| {
+            X3Taps::new(
+                channels
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (factory, _))| {
+                        let (direction_a, direction_b) = ingress_directions(index % 2 == 0);
+                        let direction = if caller_is_target {
+                            direction_a
+                        } else {
+                            direction_b
+                        };
+                        factory.tap(address, direction)
+                    })
+                    .collect(),
+            )
+        };
+        call.start_x3((
+            taps(addr("198.51.100.1:20000"), true),
+            taps(addr("198.51.100.1:20002"), false),
+        ));
+    }
     let wire = MediaFormat {
         encoding: Encoding::L16,
         sample_rate: 16_000,
@@ -177,6 +209,7 @@ fn a_split_tick_allocates_only_the_datagrams_it_sends() {
         })
         .collect();
     let (mut out, mut events) = (Vec::new(), Vec::new());
+    let delivered = Cell::new(0usize);
     let mut step = |call: &mut MediaCall, a: &RxPacket, b: &RxPacket| -> usize {
         out.clear();
         events.clear();
@@ -188,6 +221,13 @@ fn a_split_tick_allocates_only_the_datagrams_it_sends() {
         while let Ok(wire) = uplink.frames.try_recv() {
             let _ = uplink.recycle.send(wire);
         }
+        // The delivery task: hand every tapped packet's buffer back to the taps.
+        for (_, delivery) in &channels {
+            while let Ok(packet) = delivery.packets.try_recv() {
+                delivered.set(delivered.get() + 1);
+                let _ = delivery.recycle.try_send(packet.payload);
+            }
+        }
         std::hint::black_box(&out);
         out.len()
     };
@@ -196,6 +236,7 @@ fn a_split_tick_allocates_only_the_datagrams_it_sends() {
         step(&mut call, a, b);
     }
     ARMED.with(|armed| armed.set(true));
+    delivered.set(0);
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     let mut sent = 0usize;
     for (a, b) in packets.iter().skip(200) {
@@ -203,10 +244,35 @@ fn a_split_tick_allocates_only_the_datagrams_it_sends() {
     }
     let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
     ARMED.with(|armed| armed.set(false));
+    (allocated, sent, delivered.get())
+}
 
+#[test]
+fn a_split_tick_allocates_only_the_datagrams_it_sends() {
+    let (allocated, sent, delivered) = split_ticks(0);
     assert!(sent >= 700, "the tick sends to both parties: {sent}");
+    assert_eq!(delivered, 0, "nothing is delivered with no tap");
     assert_eq!(
         allocated, sent,
         "{allocated} allocations for {sent} packets: one is the datagram each carries, anything more is the split's"
     );
+}
+
+/// The interception of a split call, taking what the target hears from its egress, adds no allocation
+/// to the tick: the tapped packet's buffer comes back from the delivery task, as on every other tap.
+#[test]
+fn an_intercepted_split_tick_allocates_nothing_beyond_the_datagrams_it_sends() {
+    for deliveries in [1usize, 2, 3] {
+        let (allocated, sent, delivered) = split_ticks(deliveries);
+        assert!(sent >= 700, "the tick sends to both parties: {sent}");
+        // Per delivery: the target's own ingress and what its wire carries, one packet per tick each.
+        assert!(
+            delivered >= deliveries * 2 * 390,
+            "{deliveries} deliveries were given both directions ({delivered} packets)"
+        );
+        assert_eq!(
+            allocated, sent,
+            "{deliveries} deliveries: {allocated} allocations for {sent} packets, the interception allocates nothing"
+        );
+    }
 }
