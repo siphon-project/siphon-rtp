@@ -1,18 +1,21 @@
 //! Gaussian-codebook decoding of unvoiced subframes (TS 26.442 `lib_dec/gaus_dec_fx.c`;
-//! TS 26.445 §6.1.1.2.7). `gaus_L2_dec` (MODE2) is not ported here: it needs `cb_shape_fx`.
+//! TS 26.445 §6.1.1.2.7), MODE1's `gaus_dec_fx` and MODE2's `gaus_L2_dec`.
 
-use crate::evs::cnst::{L_FRAME, L_SUBFR, UNVOICED};
+use crate::evs::cnst::{FORMANT_SHARPENING_G2, L_FRAME, L_SUBFR, UNVOICED};
 use crate::evs::com::bitstream::{bit_alloc_idx, get_next_indice};
+use crate::evs::com::cb_shape::cb_shape;
 use crate::evs::com::math_op::{dot_product12, i_mult2, isqrt_lc};
 use crate::evs::com::scale_mem::rescale_exc;
+use crate::evs::com::tools::own_random2;
 use crate::evs::dec::gain_dec::{gain_dec_gaus, lp_gain_updt};
 use crate::evs::dec::state::DecoderState;
 use crate::evs::rom::{FCB_BITS_TBL, GAIN_BITS_TBL, GAUS_DICO_FX};
+use crate::itu::basic_ops::l_mac;
 use crate::itu::basic_ops::{
     add, div_s, extract_h, l_deposit_h, l_mult, l_shl, mult, mult_r, negate, round_word, shl, shr,
     sub,
 };
-use crate::itu::stl2009::{mac_r, msu_r};
+use crate::itu::stl2009::{mac_r, msu_r, StlFlags};
 
 /// Size of the Gaussian codebook `gaus_dico_fx`.
 const GAUS_DICO_LEN: usize = 190;
@@ -184,4 +187,71 @@ fn dec_2pos(index: i16, log2_n: i16) -> (i16, i16, i16, i16) {
         sign2 = negate(sign1);
     }
     (ind1, ind2, sign1, sign2)
+}
+
+/// `gaus_L2_dec`: MODE2's Gaussian codebook for unvoiced subframes as layer 2, one Gaussian
+/// vector: `L_SUBFR` samples of white noise (the sum of three `own_random2` draws, Q9), shaped
+/// by `cb_shape_fx` with the tilt `tilt_code` (Q15), the LPCs `a` (Q12) and the formant
+/// enhancement factor `formant_enh` (Q15). `seed_acelp` is the random seed, advanced.
+pub fn gaus_l2_dec(
+    code: &mut [i16],
+    tilt_code: i16,
+    a: &[i16],
+    formant_enh: i16,
+    seed_acelp: &mut i16,
+) {
+    // Generate white gaussian noise using central limit theorem method (N only 4 as
+    // E_util_random is not purely uniform)
+    let mut seed = *seed_acelp;
+    for value in code.iter_mut().take(L_SUBFR as usize) {
+        seed = own_random2(seed);
+        let mut tmp32 = l_mac(0, seed, 1 << 9);
+
+        seed = own_random2(seed);
+        tmp32 = l_mac(tmp32, seed, 1 << 9);
+
+        seed = own_random2(seed);
+        *value = mac_r(tmp32, seed, 1 << 9);
+    }
+    *seed_acelp = seed;
+
+    // Shape the gaussian excitation. The pre-emphasis, pitch sharpening and formant filters used
+    // here never reach the carry operators (only the formant-tilt branch does, switched off), so
+    // `Carry` is not shared with the caller.
+    let mut flags = StlFlags::default();
+    cb_shape(
+        1,
+        0,
+        0,
+        1,
+        0,
+        formant_enh,
+        FORMANT_SHARPENING_G2,
+        a,
+        code,
+        tilt_code,
+        0,
+        1,
+        &mut flags,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gaus_l2_dec_advances_the_seed_by_three_draws_per_sample() {
+        let mut code = [0i16; L_SUBFR as usize];
+        let mut a = [0i16; 17];
+        a[0] = 4096;
+        let mut seed = 0;
+        gaus_l2_dec(&mut code, 0, &a, 0, &mut seed);
+        let mut expected = 0;
+        for _ in 0..3 * L_SUBFR {
+            expected = own_random2(expected);
+        }
+        assert_eq!(seed, expected);
+        assert!(code.iter().any(|&value| value != 0));
+    }
 }

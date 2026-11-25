@@ -6,20 +6,14 @@ use crate::CodecError;
 /// with [`EvsError::Unsupported`]: it never produces audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedMode {
-    /// MODE2 (TCX / MDCT-based LPD core and its concealment; `dec_acelp_tcx_frame`).
-    Mode2,
     /// AMR-WB interoperable mode (`amr_wb_dec_fx`) and the switch from it (`updt_IO_switch_dec_fx`).
     AmrWbIo,
-    /// The channel-aware (RF) partial copy.
-    ChannelAware,
 }
 
 impl core::fmt::Display for UnsupportedMode {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str(match self {
-            Self::Mode2 => "MODE2 (TCX core)",
             Self::AmrWbIo => "AMR-WB IO",
-            Self::ChannelAware => "channel-aware partial copy",
         })
     }
 }
@@ -68,12 +62,12 @@ mod tests {
     #[test]
     fn unsupported_names_the_mode_and_the_reference_call() {
         let error = EvsError::Unsupported {
-            mode: UnsupportedMode::Mode2,
-            reference_call: "dec_acelp_tcx_frame",
+            mode: UnsupportedMode::AmrWbIo,
+            reference_call: "amr_wb_dec_fx",
         };
         assert_eq!(
             error.to_string(),
-            "EVS MODE2 (TCX core) is not supported yet (reference call dec_acelp_tcx_frame)"
+            "EVS AMR-WB IO is not supported yet (reference call amr_wb_dec_fx)"
         );
     }
 

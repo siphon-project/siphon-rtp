@@ -1,7 +1,8 @@
 //! LP filter weighting, `ap[i] = a[i] · gamma^i` (TS 26.442 `lib_com/weight_a_fx.c`; TS 26.445
 //! §5.1.10 uses it for the perceptual weighting filter and the postfilter).
 
-use crate::itu::basic_ops::{l_abs, l_mult, l_shl, mult_r, norm_l, round_word, shl, sub};
+use crate::evs::cnst::GAMMA16K_INV;
+use crate::itu::basic_ops::{add, l_abs, l_mult, l_shl, mult_r, norm_l, round_word, shl, sub};
 use crate::itu::stl2009::l_mult0;
 
 /// `weight_a_fx`: weight `a[0..=m]` by successive powers of `gamma` into `ap[0..=m]`, normalising
@@ -42,6 +43,51 @@ pub fn weight_a_lc(a: &[i16], ap: &mut [i16], gammatbl: &[i16], m: i16) {
         ap[index] = round_word(l_shl(l_mult0(a[index], gammatbl[index - 1]), shift));
     }
     ap[order] = round_word(l_shl(l_mult0(a[order], gammatbl[order - 1]), shift));
+}
+
+/// `inv_gamma_tab_12k8` of `E_LPC_a_weight_inv`: the first eight Q14, the last eight Q13.
+const INV_GAMMA_TAB_12K8: [i16; 16] = [
+    17809, 19357, 21041, 22870, 24859, 27020, 29370, 31924, 17350, 18859, 20499, 22281, 24219,
+    26325, 28614, 31102,
+];
+/// `inv_gamma_tab_16k` of `E_LPC_a_weight_inv`: the first eight Q14, the last eight Q13.
+const INV_GAMMA_TAB_16K: [i16; 16] = [
+    17430, 18542, 19726, 20985, 22324, 23749, 25265, 26878, 14297, 15209, 16180, 17213, 18312,
+    19480, 20724, 22047,
+];
+
+/// `E_LPC_a_weight_inv`: `ap[i] = a[i] · inv_gamma^i` (`inv_gamma` Q14, one of `GAMMA1_INV`,
+/// `GAMMA16k_INV`, or 16384 for a plain copy), normalised to the headroom of the largest
+/// coefficient. The reference asserts `m == 16` for the weighted case.
+pub fn e_lpc_a_weight_inv(a: &[i16], ap: &mut [i16], inv_gamma: i16, m: i16) {
+    if inv_gamma == 16384 {
+        ap[..=m as usize].copy_from_slice(&a[..=m as usize]);
+        return;
+    }
+
+    let mut inv_gamma_tab = &INV_GAMMA_TAB_12K8;
+    if sub(inv_gamma, GAMMA16K_INV) == 0 {
+        inv_gamma_tab = &INV_GAMMA_TAB_16K;
+    }
+
+    let mut a_max = l_mult(16384, a[0]);
+    for i in 1..9 {
+        a_max = a_max.max(l_abs(l_mult(a[i], inv_gamma_tab[i - 1])));
+    }
+    for i in 9..17 {
+        a_max = a_max.max(l_abs(l_shl(l_mult(a[i], inv_gamma_tab[i - 1]), 1)));
+    }
+    let mut shift = norm_l(a_max);
+    ap[0] = shl(a[0], sub(shift, 1));
+    for i in 1..9 {
+        let l_tmp = l_mult(a[i], inv_gamma_tab[i - 1]);
+        ap[i] = round_word(l_shl(l_tmp, shift));
+    }
+    shift = add(shift, 1);
+    for i in 9..17 {
+        let l_tmp = l_mult(a[i], inv_gamma_tab[i - 1]);
+        ap[i] = round_word(l_shl(l_tmp, shift));
+    }
 }
 
 #[cfg(test)]

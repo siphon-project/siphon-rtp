@@ -1,22 +1,30 @@
 //! End-of-frame decoder state updates (TS 26.442 `lib_dec/updt_dec_fx.c`; TS 26.445 §6.9).
 //!
-//! `updt_IO_switch_dec_fx` (EVS primary ↔ AMR-WB IO switching) and `update_decoder_LPD_cng`
-//! (MODE2 CNG) live in the same reference file and are not ported here: the MODE1 7.2 / 8.0 kbit/s
-//! decoder does not reach them.
+//! `updt_IO_switch_dec_fx` (EVS primary ↔ AMR-WB IO switching) lives in the same reference file
+//! and is not ported here (AMR-WB IO is out of scope).
 
 use crate::evs::cnst::{
-    ACELP_24K40, ACELP_CORE, ACELP_LOOK_NS, ACTIVE_FRAME, AUDIO, DELAY_BWE_TOTAL_NS, FD_CNG,
-    FRAME_NO_DATA, FRAME_SIZE_NS, GENERIC, HARMONIC, HQ_16K40, HQ_CORE, HQ_HARMONIC, HQ_HVQ,
-    INACTIVE, L_EXC_MEM_DEC, L_FRAME, L_FRAME16K, L_FRAME32K, L_SUBFR, M, MAX_UPD_CNT, MBANDS_GN,
-    MODE1, MODE2, NB_SUBFR, NB_SUBFR16K, NOISE_LEVEL_SP3, N_WS2N_FRAMES, PIT16K_MAX, RF_TCXFD,
-    RF_TCXTD2, SID_1K75, SID_2K40, SWB, TRANSITION, UNVOICED, UNVOICED_TRANSITION, WB,
+    ACELP_24K40, ACELP_CORE, ACELP_LOOK_NS, ACTIVE_FRAME, ALDO_WINDOW, AUDIO, DELAY_BWE_TOTAL_NS,
+    FD_CNG, FRAME_NO_DATA, FRAME_SIZE_NS, GENERIC, HARMONIC, HQ_16K40, HQ_CORE, HQ_HARMONIC,
+    HQ_HVQ, INACTIVE, INT_FS_16K_FX, L_EXC_MEM_DEC, L_FRAME, L_FRAME16K, L_FRAME32K, L_FRAME_MAX,
+    L_SUBFR, L_SYN_MEM, M, MAX_UPD_CNT, MBANDS_GN, MODE1, MODE2, NB_SUBFR, NB_SUBFR16K,
+    NOISE_LEVEL_SP3, N_WS2N_FRAMES, OLD_SYNTH_SIZE_DEC, PIT16K_MAX, RF_TCXFD, RF_TCXTD2, SID_1K75,
+    SID_2K40, SWB, TILT_CODE, TRANSITION, UNVOICED, UNVOICED_TRANSITION, WB,
 };
+use crate::evs::com::basop_util::buffer_copy_fx;
+use crate::evs::com::lsf_tools::{e_lpc_a_lsp_conversion, e_lpc_lsp_lsf_conversion, lsp2lsf};
+use crate::evs::com::preemph::e_util_f_preemph3;
+use crate::evs::com::residu::residu3;
 use crate::evs::com::swb_bwe_com::calc_tilt_bwe;
-use crate::evs::com::tools::{copy_scale_sig, random};
+use crate::evs::com::tools::{copy_scale_sig, random, scale_sig, set16};
+use crate::evs::dec::fec_clas_estim::fec_clas_estim;
+use crate::evs::dec::post_dec::post_decoder;
 use crate::evs::dec::state::DecoderState;
 use crate::evs::macros::ns2sa_fx2;
 use crate::evs::rom::{GEWB2_AVE_FX, GEWB_AVE_FX, INNER_FRAME_TBL};
-use crate::itu::basic_ops::{add, l_shl, l_sub, round_word, shr, shr_r, sub};
+use crate::itu::basic_ops::{
+    add, l_deposit_l, l_shl, l_sub, mult_r, round_word, shl, shr, shr_r, sub,
+};
 use crate::itu::stl2009::l_mult0;
 
 /// `updt_dec_fx`: the common updates after an ACELP frame (all frame types): excitation and
@@ -283,6 +291,199 @@ pub fn updt_dec_common(st: &mut DecoderState, hq_core_type_fx: i16, synth: &[i16
             st.mem_ar.copy_from_slice(&GEWB_AVE_FX);
         }
     }
+}
+
+/// `update_decoder_LPD_cng`: the MODE2 decoder's end-of-frame update after a CNG (SID / no-data)
+/// frame synthesised in the time domain: LP analysis of the synthesis `time_domain_buffer` with
+/// `a` (`M + 1` coefficients), the synthesis, excitation and LPC memories, the ACELP / TCX state
+/// reset to "ACELP after CNG", the concealment memories, the class estimate and finally the
+/// post-filter (`post_decoder`), whose output replaces `time_domain_buffer`.
+///
+/// `time_domain_buffer` holds the `L_frame` synthesised samples; `bpf_noise_buf` receives the bass
+/// post-filter's signal (`L_frame` samples).
+// indices mirror the reference's pointer walks
+#[allow(clippy::needless_range_loop, clippy::too_many_lines)]
+pub fn update_decoder_lpd_cng(
+    st: &mut DecoderState,
+    coder_type: i16,
+    time_domain_buffer: &mut [i16],
+    a: &[i16],
+    bpf_noise_buf: &mut [i16],
+) {
+    let m = M as usize;
+    let l_frame = st.l_frame;
+    let frame = l_frame.max(0) as usize;
+    let old_synth_len = st.old_synth_len.max(0) as usize;
+    let mut lsp = [0i16; M as usize];
+    let mut lsf = [0i16; M as usize];
+    let mut synth_buf = [0i16; M as usize + 1 + L_FRAME_MAX as usize + L_FRAME_MAX as usize / 2];
+    let mut buf_synth = [0i16; OLD_SYNTH_SIZE_DEC as usize + L_FRAME_MAX as usize + M as usize];
+    let mut pf_pitch = [0i16; NB_SUBFR16K as usize];
+    let mut pf_gain = [0i16; NB_SUBFR16K as usize];
+    let mut pitch = [0i16; NB_SUBFR16K as usize];
+    // `synth` is `synth_buf[SYNTH_AT..]`
+    let synth_at = m + 1;
+
+    // LPC -> LSP
+    let lsp_old = st.lsp_old;
+    e_lpc_a_lsp_conversion(a, &mut lsp, &lsp_old, M);
+
+    // LSP -> LSF
+    if sub(l_frame, L_FRAME16K) == 0 {
+        lsp2lsf(&lsp, &mut lsf, M, i32::from(INT_FS_16K_FX));
+    } else {
+        e_lpc_lsp_lsf_conversion(&lsp, &mut lsf, M);
+    }
+
+    buf_synth[..old_synth_len].copy_from_slice(&st.old_synth[..old_synth_len]);
+    buf_synth[old_synth_len..old_synth_len + frame].copy_from_slice(&time_domain_buffer[..frame]);
+
+    // Update synth memory
+    synth_buf[..m + 1].copy_from_slice(&st.syn);
+    synth_buf[synth_at..synth_at + frame].copy_from_slice(&time_domain_buffer[..frame]);
+    st.syn
+        .copy_from_slice(&synth_buf[synth_at + frame - (m + 1)..synth_at + frame]);
+    st.old_synth.copy_within(frame..old_synth_len, 0);
+    st.old_synth[old_synth_len - frame..old_synth_len]
+        .copy_from_slice(&synth_buf[synth_at..synth_at + frame]);
+    buffer_copy_fx(
+        &synth_buf[synth_at + frame - frame / 2..],
+        &mut st.old_syn_overl,
+        l_frame / 2,
+        0,
+        -1,
+        0,
+        0,
+    );
+
+    st.tcxltp_last_gain_unmodified = 0;
+
+    // Update pe-synth memory
+    let mut tmp = synth_buf[synth_at - (1 + m)];
+
+    st.q_syn = e_util_f_preemph3(
+        &mut synth_buf[synth_at - m..],
+        st.preemph_fac,
+        add(M, l_frame),
+        &mut tmp,
+        1,
+    );
+    // plain C `st->Q_syn - 1`
+    st.q_syn = st.q_syn.wrapping_sub(1);
+    st.prev_q_syn = st.q_syn;
+    st.mem_syn2
+        .copy_from_slice(&synth_buf[synth_at + frame - m..synth_at + frame]);
+    let mem_len = L_SYN_MEM as usize;
+    st.mem_syn_r
+        .copy_from_slice(&synth_buf[synth_at + frame - mem_len..synth_at + frame]);
+
+    // Update excitation memory
+    if sub(add(st.q_syn, 1), st.q_exc) != 0 {
+        scale_sig(
+            &mut st.old_exc,
+            L_EXC_MEM_DEC,
+            sub(add(st.q_syn, 1), st.q_exc),
+        );
+    }
+    st.q_exc = st.q_syn.wrapping_add(1);
+    let exc_len = L_EXC_MEM_DEC as usize;
+    st.old_exc.copy_within(frame..exc_len, 0);
+    residu3(
+        a,
+        &synth_buf,
+        synth_at,
+        &mut st.old_exc[exc_len - frame..],
+        l_frame,
+        1,
+    );
+
+    // Update LPC-related memories
+    st.lsp_old = lsp;
+    st.lsf_old = lsf;
+    st.lspold_uw = lsp;
+    st.lsfold_uw = lsf;
+    st.env_weighted = 0;
+    st.old_aq_12_8.copy_from_slice(&a[..m + 1]);
+    st.old_es_pred = 0;
+
+    // Reset acelp memories
+    st.dm.prev_gain_code = l_deposit_l(0);
+    set16(&mut st.dm.prev_gain_pit, 0, 6);
+    st.dm.prev_state = 0;
+
+    st.tilt_code = TILT_CODE;
+    st.gc_threshold = 0;
+
+    // Update ace/tcx mode
+    st.core = ACELP_CORE;
+    st.last_is_cng = 1;
+
+    // Reset TCX overlap
+    st.tcx_cfg.tcx_curr_overlap_mode = ALDO_WINDOW;
+    st.tcx_cfg.tcx_last_overlap_mode = ALDO_WINDOW;
+
+    // For BBWE and Postfilter
+    for subframe in 0..4 {
+        st.mem_aq[subframe * (m + 1)..(subframe + 1) * (m + 1)].copy_from_slice(&a[..m + 1]);
+    }
+    if sub(l_frame, L_FRAME16K) == 0 {
+        st.mem_aq[4 * (m + 1)..5 * (m + 1)].copy_from_slice(&a[..m + 1]);
+    }
+
+    // Update for concealment
+    st.nb_lost_cmpt = 0;
+    st.prev_old_bfi = 0;
+
+    for i in 0..m {
+        // 1.0f/3.0f Q15
+        st.lsf_adaptive_mean[i] = add(
+            mult_r(st.lsfoldbfi1[i], 10923),
+            add(mult_r(st.lsfoldbfi0[i], 10923), mult_r(lsf[i], 10923)),
+        );
+        st.lsfoldbfi1[i] = st.lsfoldbfi0[i];
+        st.lsfoldbfi0[i] = lsf[i];
+    }
+
+    set16(&mut pitch, shl(L_SUBFR, 6), NB_SUBFR16K);
+
+    let (q_syn, last_core_brate) = (st.q_syn, st.last_core_brate);
+    fec_clas_estim(
+        st,
+        0,
+        l_frame,
+        coder_type,
+        &pitch,
+        &synth_buf,
+        synth_at,
+        None,
+        None,
+        // bitrate: not used by the ACELP classifier
+        0,
+        q_syn,
+        None,
+        // -1.f Q15
+        -32768,
+        // CLASSIFIER_ACELP
+        0,
+        // bfi
+        0,
+        last_core_brate,
+    );
+
+    // Postfiltering
+    pf_pitch.fill(L_SUBFR);
+    pf_gain.fill(0);
+    st.bpf_gain_param = 0;
+
+    post_decoder(
+        st,
+        coder_type,
+        &mut buf_synth,
+        &pf_gain,
+        &pf_pitch,
+        time_domain_buffer,
+        bpf_noise_buf,
+    );
 }
 
 #[cfg(test)]

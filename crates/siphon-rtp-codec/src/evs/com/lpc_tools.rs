@@ -1,10 +1,17 @@
-//! Autocorrelation and Levinson-Durbin recursion (TS 26.442 `lib_com/lpc_tools_fx.c`). Only
-//! `autocorr_fx`, `E_LPC_lev_dur` / `E_LPC_lev_dur_stab` and what they need are ported.
+//! Autocorrelation, Levinson-Durbin and Schur recursions and the LPC / LSP helpers of the TCX
+//! path (TS 26.442 `lib_com/lpc_tools_fx.c`). Ported: `autocorr_fx`, `E_LPC_lev_dur` /
+//! `E_LPC_lev_dur_stab`, `E_LPC_schur`, `E_LPC_a_add_tilt`, `E_LPC_int_lpc_tcx`,
+//! `E_LPC_lsp_unweight` and what they need.
 
 use crate::evs::basop::{l_extract_lc, mpy_32_16_1, mpy_32_32, msu_32_16};
+use crate::evs::cnst::{GAMMA16K_INV, GAMMA1_INV, M};
+use crate::evs::com::basop_util::{divide3232, get_scale_factor32};
+use crate::evs::com::lsf_tools::{e_lpc_f_lsp_a_conversion, xsf_to_xsp, xsp_to_xsf};
+use crate::evs::com::tools::scale_sig32;
+use crate::evs::rom::{P16_GAMMA0_92TO1, P16_GAMMA0_94TO1};
 use crate::itu::basic_ops::{
     abs_s, add, div_s, extract_h, l_abs, l_add, l_deposit_h, l_deposit_l, l_mac, l_msu, l_mult,
-    l_negate, l_shl, l_shr, l_sub, mult, mult_r, norm_l, round_word, shl, shr, sub,
+    l_negate, l_shl, l_shr, l_sub, mult, mult_r, negate, norm_l, round_word, shl, shr, shr_r, sub,
 };
 use crate::itu::oper_32b::{l_comp, l_extract, mpy_32};
 use crate::itu::oper_32b::{mac_32, sqr_32};
@@ -267,4 +274,238 @@ pub fn e_lpc_lev_dur_stab(
         }
     }
     flag
+}
+
+/// `E_LPC_a_add_tilt`: `Ap(z) = A(z) · (1 - gamma · z^-1)`, the LP filter `a[0..=m]` (Q12) with a
+/// first-order pre-emphasis added, normalised to the headroom of its largest coefficient into
+/// `ap[0..=m + 1]`.
+pub fn e_lpc_a_add_tilt(a: &[i16], ap: &mut [i16], gamma: i16, m: i16) {
+    let m = m as usize;
+    let mut atmp = [0i32; M as usize + 2];
+
+    let mut a_max = l_mult(16384, a[0]);
+    for i in 1..=m {
+        atmp[i] = l_sub(l_mult(16384, a[i]), l_mult0(gamma, a[i - 1]));
+        a_max = a_max.max(l_abs(atmp[i]));
+    }
+    atmp[m + 1] = l_negate(l_mult0(gamma, a[m]));
+    a_max = a_max.max(l_abs(atmp[m + 1]));
+    let shift = norm_l(a_max);
+    ap[0] = shl(a[0], sub(shift, 1));
+    for i in 1..=m {
+        ap[i] = round_word(l_shl(atmp[i], shift));
+    }
+    ap[m + 1] = round_word(l_shl(atmp[m + 1], shift));
+}
+
+/// `E_LPC_int_lpc_tcx`: the LP coefficients `a` (Q12) of a TCX frame from the LSPs of the past
+/// frame (weight 1/8) and the present frame (weight 7/8).
+pub fn e_lpc_int_lpc_tcx(lsp_old: &[i16], lsp_new: &[i16], a: &mut [i16]) {
+    let mut lsp = [0i16; M as usize];
+
+    for i in 0..M as usize {
+        // lsp[i] = lsp_old[i]*0.125f + lsp_new[i]*0.875f;
+        lsp[i] = round_word(l_mac(l_mult(lsp_old[i], 4096), lsp_new[i], 28672));
+    }
+    e_lpc_f_lsp_a_conversion(&lsp, a, M);
+}
+
+/// `lsp_reorder`: enforce an ascending LSP order with a minimum distance `min_dist` (Q13 · 1.2732)
+/// in the `acos()` domain, forwards and then, where the last one is too high, backwards.
+fn lsp_reorder(lsp: &mut [i16], min_dist: i16, lpcorder: i16) {
+    // Verify the LSF ordering and minimum GAP
+    let mut lsp_min = min_dist;
+    for value in &mut lsp[..lpcorder as usize] {
+        *value = (*value).max(lsp_min);
+        lsp_min = add(*value, min_dist);
+    }
+
+    // Reverify the LSF ordering and minimum GAP in the reverse order (security)
+    let mut lsp_max = sub(32767, min_dist);
+
+    // If danger of unstable filter in case of resonance in HF
+    let last = sub(lpcorder, 1);
+    if sub(lsp[last as usize], lsp_max) > 0 {
+        // Reverify the minimum LSF gap in the reverse sense
+        for i in (0..=last as usize).rev() {
+            lsp[i] = lsp[i].min(lsp_max);
+            lsp_max = sub(lsp[i], min_dist);
+        }
+    }
+}
+
+/// `E_LPC_lsp_unweight`: approximate removal of the perceptual weighting `inv_gamma` (Q14, one of
+/// `GAMMA1_INV`, `GAMMA16k_INV`) from the weighted LSPs `lsp_w` (Q15) by a 3-tap FIR on their
+/// `acos()` (mean removed); returns the unweighted LSPs `lsp_uw` (Q15) and LSFs `lsf_uw`
+/// (Q1 · 1.28). The reference supports `lpcorder == 16` only (asserted); an `inv_gamma` other than
+/// the two weightings leaves the outputs untouched (the reference dereferences `NULL`).
+pub fn e_lpc_lsp_unweight(
+    lsp_w: &[i16],
+    lsp_uw: &mut [i16],
+    lsf_uw: &mut [i16],
+    inv_gamma: i16,
+    lpcorder: i16,
+) -> i16 {
+    let mut lsp_w_orig = [0i16; M as usize];
+    let mut lsp_w_diff = [0i16; M as usize];
+
+    // Table selection
+    let unw_coeffs: &[[i16; 3]; 16] = if sub(inv_gamma, GAMMA16K_INV) == 0 {
+        &P16_GAMMA0_94TO1
+    } else if sub(inv_gamma, GAMMA1_INV) == 0 {
+        &P16_GAMMA0_92TO1
+    } else {
+        return 0;
+    };
+    let order = lpcorder as usize;
+
+    // step = M_PI/(float)(lpcorder+1);
+    let step: i16 = 1927;
+    let mut mean: i16 = 0;
+
+    // Apply acos() and get mean removed version
+    for i in 0..order {
+        mean = add(mean, step);
+        lsp_w_orig[i] = shl(xsp_to_xsf(lsp_w[i]), 1);
+        lsp_w_diff[i] = sub(lsp_w_orig[i], mean);
+    }
+
+    // Approximate unweighting by 3-tap FIR
+    lsp_uw[0] = add(
+        lsp_w_orig[0],
+        round_word(l_shl(
+            l_mac0(
+                l_mult0(unw_coeffs[0][1], lsp_w_diff[0]),
+                unw_coeffs[0][2],
+                lsp_w_diff[1],
+            ),
+            2,
+        )),
+    );
+    for i in 1..order - 1 {
+        lsp_uw[i] = add(
+            lsp_w_orig[i],
+            round_word(l_shl(
+                l_mac0(
+                    l_mac0(
+                        l_mult0(unw_coeffs[i][0], lsp_w_diff[i - 1]),
+                        unw_coeffs[i][1],
+                        lsp_w_diff[i],
+                    ),
+                    unw_coeffs[i][2],
+                    lsp_w_diff[i + 1],
+                ),
+                2,
+            )),
+        );
+    }
+    let i = order - 1;
+    lsp_uw[i] = add(
+        lsp_w_orig[i],
+        round_word(l_shl(
+            l_mac0(
+                l_mult0(unw_coeffs[i][0], lsp_w_diff[i - 1]),
+                unw_coeffs[i][1],
+                lsp_w_diff[i],
+            ),
+            2,
+        )),
+    );
+
+    // Reorder
+    lsp_reorder(lsp_uw, 256, lpcorder);
+
+    // Convert to LSF, apply cos()
+    for i in 0..order {
+        lsf_uw[i] = shr_r(lsp_uw[i], 1);
+        lsp_uw[i] = xsf_to_xsp(lsf_uw[i]);
+    }
+
+    0
+}
+
+/// `E_LPC_schur`: the Schur recursion on the autocorrelations `r[0..=m]` (scaled in place to full
+/// range): the reflection coefficients `refl_coeff[0..m]` (Q15) and the prediction errors
+/// `eps_p[0..=m]`. Returns the final `g1[0]` (the zero-lag energy after the recursion).
+pub fn e_lpc_schur(r: &mut [i32], refl_coeff: &mut [i16], eps_p: &mut [i32], m: i16) -> i32 {
+    let min_eps_p: i32 = 1; // > 0.01f*2^27/2^30
+    let mut g0 = [0i32; M as usize];
+    let order = m as usize;
+
+    let m_m1 = sub(m, 1);
+
+    let s = get_scale_factor32(r, add(m, 1));
+    if s != 0 {
+        scale_sig32(r, add(m, 1), s); // scale in-place
+    }
+
+    // g1 is r
+    g0[..order].copy_from_slice(&r[1..=order]);
+
+    // compute g0[0]/g1[0], where g0[0] < g1[0]
+    let mut temp16 = negate(divide3232(g0[0], r[0]));
+    refl_coeff[0] = temp16;
+    eps_p[0] = r[0];
+
+    let mut i = 0usize;
+    while (i as i16) < m_m1 {
+        // g1[0] = g0[0]*temp16 + g1[0];
+        let tmp32 = mpy_32_16_1(g0[0], temp16);
+        r[0] = l_add(r[0], tmp32);
+
+        let m_mi = sub(m, i as i16) as usize;
+        for j in 1..m_mi {
+            // g0[j-1] = g0[j]        + g1[j]*temp16;
+            // g1[j]   = g0[j]*temp16 + g1[j];
+            g0[j - 1] = l_add(g0[j], mpy_32_16_1(r[j], temp16));
+            r[j] = l_add(r[j], mpy_32_16_1(g0[j], temp16));
+        }
+        temp16 = negate(divide3232(g0[0], r[0]));
+        refl_coeff[i + 1] = temp16;
+
+        // Prediction errors
+        let mut tmp_eps_p = l_shr(r[0], s);
+        if tmp_eps_p <= 0 {
+            tmp_eps_p = l_add(0, min_eps_p);
+        }
+        eps_p[i + 1] = tmp_eps_p;
+        i += 1;
+    }
+
+    // epsP[i+1] = g0[0]*temp16 + g1[0];
+    let mut tmp_eps_p = l_add(r[0], mpy_32_16_1(g0[0], temp16));
+    tmp_eps_p = l_shr(tmp_eps_p, s);
+    if tmp_eps_p <= 0 {
+        tmp_eps_p = l_add(min_eps_p, 0);
+    }
+    eps_p[i + 1] = tmp_eps_p;
+
+    // prediction gain = divide3232(L_shr(epsP[0], PRED_GAIN_E), g1[0]);
+    r[0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tilt_filter_of_a_unit_filter_is_one_minus_gamma() {
+        let mut a = [0i16; 17];
+        a[0] = 4096;
+        let mut ap = [0i16; 18];
+        e_lpc_a_add_tilt(&a, &mut ap, 16384, 16);
+        // (1 - 0.5 z^-1) normalised by the headroom of the largest coefficient (a gain of 4)
+        assert_eq!(ap[0], 16384);
+        assert_eq!(ap[1], -8192);
+    }
+
+    #[test]
+    fn the_schur_recursion_of_white_noise_has_no_reflection() {
+        let mut r = [0i32; 17];
+        r[0] = 1 << 28;
+        let mut refl = [1i16; 16];
+        let mut eps = [0i32; 17];
+        e_lpc_schur(&mut r, &mut refl, &mut eps, 16);
+        assert!(refl.iter().all(|&k| k == 0));
+    }
 }

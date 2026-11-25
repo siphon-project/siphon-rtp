@@ -6,19 +6,20 @@
 //! changes nothing for an input the reference accepts.
 
 use crate::evs::basop::{mpy_32_16_1, mpy_32_32, mult_32_16};
-use crate::evs::cnst::LD_DATA_SCALE;
+use crate::evs::cnst::{LD_DATA_SCALE, WORD16_BITS};
 use crate::evs::com::math_op::isqrt_lc;
 use crate::evs::rom::{
-    BASOP_UTIL_NORMRECIPROCAL, EXP2W_TAB_LONG, EXP2X_TAB_LONG, EXP2_TAB_LONG, INVDIFFTABLE,
-    INVTABLE, ISQRTDIFFTABLE, ISQRTTABLE, LDCOEFF, SINETABLE512, SQRTDIFFTABLE, SQRTTABLE,
+    BASOP_UTIL_NORMRECIPROCAL, EXP2W_TAB_LONG, EXP2X_TAB_LONG, EXP2_TAB_LONG, F_ATAN_EXPAND_RANGE,
+    INVDIFFTABLE, INVTABLE, ISQRTDIFFTABLE, ISQRTTABLE, LDCOEFF, SINETABLE512, SQRTDIFFTABLE,
+    SQRTTABLE,
 };
 use crate::itu::basic_ops::{
-    abs_s, add, div_s, extract_h, extract_l, l_abs, l_add, l_deposit_l, l_mac, l_msu, l_mult,
-    l_shl, l_shr, l_sub, mult, mult_r, negate, norm_l, norm_s, round_word, shl, shr, sub,
+    abs_s, add, div_s, extract_h, extract_l, l_abs, l_add, l_deposit_h, l_deposit_l, l_mac, l_msu,
+    l_mult, l_shl, l_shr, l_sub, mult, mult_r, negate, norm_l, norm_s, round_word, shl, shr, sub,
 };
 use crate::itu::stl2009::{
-    div_l, l_add_c, l_lshl, l_lshr, l_mac0, l_mac_ns, l_msu0, l_msu_ns, l_mult0, mac_r, msu_r,
-    StlFlags,
+    div_l, l_add_c, l_lshl, l_lshr, l_mac0, l_mac_ns, l_msu0, l_msu_ns, l_mult0, lshr, mac_r,
+    mpy_32_16_ss, msu_r, StlFlags,
 };
 
 /// `LD`: log2 of the sine table's quarter-wave length (`SINETAB` = `SineTable512`).
@@ -218,6 +219,17 @@ pub fn sqrt16(mantissa: i16, exponent: &mut i16) -> i16 {
 
     // e = (e + 1) >> 1
     *exponent = mult_r(e, 1 << 14);
+    mantissa
+}
+
+/// `Sqrt16norm`: [`sqrt16`] for an already normalised `mantissa` (`>= 2^14` or zero), with the
+/// result's exponent written back to `exponent`.
+pub fn sqrt16norm(mantissa: i16, exponent: &mut i16) -> i16 {
+    // calc mantissa
+    let mantissa = sqrt16_common(mantissa, *exponent);
+
+    // e = (e + 1) >> 1
+    *exponent = mult_r(*exponent, 1 << 14);
     mantissa
 }
 
@@ -793,6 +805,135 @@ pub fn get_sqrt_word32(val: i32) -> i16 {
     temp
 }
 
+/// `ISqrt16_common`: the 16-bit inverse square-root mantissa of a normalised `m` (`m >= 2^14`)
+/// with exponent `e`, by table interpolation; an even exponent multiplies by `sqrt(1/2)`.
+fn isqrt16_common(m: i16, e: i16) -> i16 {
+    // get table index (upper 6 bits minus 32): index = (m >> 9) - 32
+    let index = mac_r(-32768 - (32 << 16), m, 1 << 6);
+
+    // get fractional part for interpolation (lower 9 bits)
+    let frac = m & 0x1FF; // Q9
+
+    // interpolate (the reference asserts m >= 0x4000, which keeps the index in the table)
+    let index = index.clamp(0, 31) as usize;
+    let mut m = msu_r(ISQRTTABLE[index], ISQRTDIFFTABLE[index], frac);
+
+    // handle even exponents
+    if e & 1 == 0 {
+        m = mult_r(m, 0x5a82);
+    }
+    m
+}
+
+/// `ISqrt16`: `1 / sqrt(mantissa · 2^exponent)` for `mantissa > 0`; the result's exponent is
+/// written back to `exponent`.
+pub fn isqrt16(mantissa: i16, exponent: &mut i16) -> i16 {
+    // normalize
+    let pre_shift = norm_s(mantissa);
+    let e = sub(*exponent, pre_shift);
+    let mantissa = shl(mantissa, pre_shift);
+
+    // calc mantissa
+    let mantissa = isqrt16_common(mantissa, e);
+
+    // e = (2 - e) >> 1
+    *exponent = msu_r(1 << 15, e, 1 << 14);
+    mantissa
+}
+
+/// `BASOP_Util_Sqrt_InvSqrt_MantExp`: `sqrt` and `1 / sqrt` of `mantissa · 2^exponent` in one
+/// pass (`mantissa > 0`, asserted by the reference), each with its own exponent.
+pub fn basop_util_sqrt_inv_sqrt_mant_exp(
+    mantissa: i16,
+    exponent: i16,
+    sqrt_mant: &mut i16,
+    sqrt_exp: &mut i16,
+    isqrt_mant: &mut i16,
+    isqrt_exp: &mut i16,
+) {
+    // normalize
+    let pre_shift = norm_s(mantissa);
+
+    let exponent = sub(exponent, pre_shift);
+    let mantissa = shl(mantissa, pre_shift);
+
+    // get table index (upper 6 bits minus 32): index = (m >> 9) - 32
+    let index = mac_r(-32768 - (32 << 16), mantissa, 1 << 6);
+
+    // get fractional part for interpolation (lower 9 bits)
+    let frac = mantissa & 0x1FF; // Q9
+
+    // interpolate (the reference asserts mantissa > 0, which keeps the index in the table)
+    let index = index.clamp(0, 31) as usize;
+    let mut m = mac_r(SQRTTABLE[index], SQRTDIFFTABLE[index], frac);
+    let mut mi = msu_r(ISQRTTABLE[index], ISQRTDIFFTABLE[index], frac);
+
+    // handle even/odd exponents
+    let e_odd = exponent & 1;
+    if e_odd != 0 {
+        m = mult_r(m, 0x5a82);
+    }
+    if e_odd == 0 {
+        mi = mult_r(mi, 0x5a82);
+    }
+
+    // e = (e + 1) >> 1
+    *sqrt_exp = mult_r(exponent, 1 << 14);
+
+    // e = (2 - e) >> 1
+    *isqrt_exp = msu_r(1 << 15, exponent, 1 << 14);
+
+    // Write result
+    *sqrt_mant = m;
+    *isqrt_mant = mi;
+}
+
+/// `Norm32Norm`: the sum of squares of `x[0..length]` after a left shift by `headroom` (reduced
+/// by one whenever the running sum reaches `0x40000000`), as a Q-normalised mantissa; the result's
+/// exponent `1 - 2 · shift` is written to `result_e`.
+pub fn norm32_norm(x: &[i32], headroom: i16, length: i16, result_e: &mut i16) -> i32 {
+    let mut shift = headroom;
+    let mut l_tmp: i32 = 0;
+
+    for &value in &x[..length.max(0) as usize] {
+        let l_tmp2 = l_sub(l_tmp, 0x40000000);
+        if l_tmp2 >= 0 {
+            shift = sub(shift, 1);
+        }
+        if l_tmp2 >= 0 {
+            l_tmp = l_shr(l_tmp, 2);
+        }
+
+        let tmp = round_word(l_shl(value, shift));
+        l_tmp = l_mac0(l_tmp, tmp, tmp); // exponent = (1-shift*2), Q(30+shift*2)
+    }
+
+    *result_e = sub(1, shl(shift, 1));
+    l_tmp
+}
+
+/// `compMantExp16Unorm`: the sign of `m1 · 2^e1 - m2 · 2^e2` for two normalised mantissas
+/// (`>= 0x4000`, asserted by the reference), as a number that is negative, zero or positive.
+#[must_use]
+pub fn comp_mant_exp16_unorm(m1: i16, e1: i16, m2: i16, e2: i16) -> i16 {
+    let mut tmp = sub(e1, e2);
+    if tmp == 0 {
+        tmp = sub(m1, m2);
+    }
+    tmp
+}
+
+/// `getCosWord16`: `cos(theta)` for `theta` in Q(15-2) radians, result Q15.
+#[must_use]
+pub fn get_cos_word16(theta: i16) -> i16 {
+    let (mut sine, mut cosine) = (0, 0);
+    let residual = fixp_sin_cos_residual_16(theta, 2, &mut sine, &mut cosine, 0);
+    // This negation prevents the subsequent addition from overflow
+    // The negation cannot overflow, sine is in range [0x0..0x7FFF]
+    sine = negate(sine);
+    mac_r(l_mult0(sine, residual), cosine, 16384)
+}
+
 /// `ISqrt32_common`: the inverse square-root mantissa of a normalised `m` (`m >= 2^30`) with
 /// exponent `e`, by table interpolation; an even exponent multiplies by `sqrt(1/2)`.
 fn isqrt32_common(m: i32, e: i16) -> i32 {
@@ -895,6 +1036,309 @@ pub fn basop_util_pow2(exp_m: i32, exp_e: i16, result_e: &mut i16) -> i32 {
 
     *result_e = int_part;
     result_m
+}
+
+/// `Sqrt32norm`: as [`sqrt32`] for an already normalised mantissa (`>= 0x40000000` or zero).
+pub fn sqrt32norm(mantissa: i32, exponent: &mut i16) -> i32 {
+    // calc mantissa
+    let mantissa = sqrt32_common(mantissa, *exponent);
+
+    // e = (e + 1) >> 1
+    *exponent = mult_r(*exponent, 1 << 14);
+    mantissa
+}
+
+/// `ISqrt32norm`: as [`isqrt32`] for an already normalised mantissa (`>= 0x40000000`).
+pub fn isqrt32norm(mantissa: i32, exponent: &mut i16) -> i32 {
+    // calc mantissa
+    let mantissa = isqrt32_common(mantissa, *exponent);
+
+    // e = (2 - e) >> 1
+    *exponent = msu_r(1 << 15, *exponent, 1 << 14);
+    mantissa
+}
+
+/// `imult3216`: `x · y` as an integer, from the 48-bit fractional product of `Mpy_32_16_ss`.
+#[must_use]
+pub fn imult3216(x: i32, y: i16) -> i32 {
+    let (mut mh, ml) = mpy_32_16_ss(x, y);
+
+    mh = l_shl(mh, 15);
+    // `ml` is a UWord16 handed to `lshr(Word16, Word16)` and stored back as a UWord16
+    let ml = lshr(ml as i16, 1) as u16;
+
+    mh | l_deposit_l(ml as i16)
+}
+
+/// `getNormReciprocalWord16Scale`: `1/x` as `BASOP_util_normReciprocal[x]` shifted left by `s`
+/// and rounded to 16 bits.
+#[must_use]
+pub fn get_norm_reciprocal_word16_scale(x: i16, s: i16) -> i16 {
+    // The reference asserts x is a table index.
+    let index = (x.max(0) as usize).min(BASOP_UTIL_NORMRECIPROCAL.len() - 1);
+    round_word(l_shl(BASOP_UTIL_NORMRECIPROCAL[index], s))
+}
+
+/// `BASOP_Util_fPow`: `base ^ exp` for mantissa/exponent pairs, as a mantissa with the exponent
+/// written to `result_e`; 0 for a zero base with a non-zero exponent.
+pub fn basop_util_f_pow(
+    base_m: i32,
+    base_e: i16,
+    exp_m: i32,
+    exp_e: i16,
+    result_e: &mut i16,
+) -> i32 {
+    if base_m == 0 && exp_m != 0 {
+        *result_e = 0;
+        return 0;
+    }
+    // Calc log2 of base
+    let mut shift = norm_l(base_m);
+    let base_m = l_shl(base_m, shift);
+    let base_e = sub(base_e, shift);
+    let base_lg2_m = basop_util_log2(base_m);
+
+    // shift: max left shift such that neither base_e or base_lg2_m saturate.
+    shift = sub(norm_s(base_e).min(WORD16_BITS - 1 - LD_DATA_SCALE), 1);
+    // Compensate shift into exponent of result.
+    let base_lg2_e = sub(WORD16_BITS - 1, shift);
+    let base_lg2_m = l_add(
+        l_shr(base_lg2_m, sub(WORD16_BITS - 1 - LD_DATA_SCALE, shift)),
+        l_deposit_h(shl(base_e, shift)),
+    );
+
+    // Prepare exp
+    shift = norm_l(exp_m);
+    let exp_m = l_shl(exp_m, shift);
+    let exp_e = sub(exp_e, shift);
+
+    // Calc base pow exp
+    let ans_lg2_m = mpy_32_32(base_lg2_m, exp_m);
+    let ans_lg2_e = add(exp_e, base_lg2_e);
+
+    // Calc antilog
+    basop_util_pow2(ans_lg2_m, ans_lg2_e, result_e)
+}
+
+/// `Dot_product12_offs`: `L_off + Σ x[i]·y[i]` over 12-bit data, normalised to Q31 with the
+/// exponent (0..30) written to `exp`. Without `exp` the sum is returned unnormalised.
+pub fn dot_product12_offs(x: &[i16], y: &[i16], lg: i16, exp: Option<&mut i16>, l_off: i32) -> i32 {
+    let mut l_sum = l_mac0(l_off, x[0], y[0]);
+    for i in 1..lg.max(1) as usize {
+        l_sum = l_mac0(l_sum, x[i], y[i]);
+    }
+    // Normalize acc in Q31
+    let mut sft = norm_l(l_sum);
+    if exp.is_some() {
+        l_sum = l_shl(l_sum, sft);
+    }
+
+    // exponent = 0..30, when L_sum != 0
+    if l_sum != 0 {
+        sft = sub(31, sft);
+    }
+
+    if let Some(exp) = exp {
+        *exp = sft;
+    }
+    l_sum
+}
+
+/// `Dot_product15_offs`: `L_off + Σ x[i]·y[i]` over 15-bit data (with headroom for `lg`
+/// accumulations), normalised to Q31 with the exponent written to `exp`.
+pub fn dot_product15_offs(x: &[i16], y: &[i16], lg: i16, exp: &mut i16, l_off: i32) -> i32 {
+    let ld = sub(14, norm_s(lg));
+    let fac = shr(-32768, ld);
+    let mut l_sum = l_shr(l_off, ld);
+
+    for i in 0..lg.max(0) as usize {
+        l_sum = l_add(l_sum, mpy_32_16_1(l_msu(0, y[i], fac), x[i]));
+    }
+
+    // Avoid returning 0
+    if l_sum == 0 {
+        l_sum = l_add(l_sum, 1);
+    }
+
+    // Normalize acc in Q31
+    let mut sft = norm_l(l_sum);
+    l_sum = l_shl(l_sum, sft);
+
+    // exponent = 0..30, when L_sum != 0
+    if l_sum != 0 {
+        sft = add(ld, sub(30, sft));
+    }
+
+    *exp = sft;
+    l_sum
+}
+
+/// `bufferCopyFx`: copy `src[0..length]` to `dest`, re-scaling from the format `(Qf_src, Q_src)`
+/// to `(Qf_dest, Q_dest)`: a right shift is a rounding multiplication, a left shift a plain shift.
+pub fn buffer_copy_fx(
+    src: &[i16],
+    dest: &mut [i16],
+    length: i16,
+    qf_src: i16,
+    qf_dest: i16,
+    q_src: i16,
+    q_dest: i16,
+) {
+    let len = length.max(0) as usize;
+    let mut tmp_16 = sub(sub(qf_src, qf_dest), sub(q_src, q_dest));
+    if tmp_16 > 0 {
+        // if value will be shifted right, do a multiplication with rounding: preserves more
+        // accuracy
+        tmp_16 = shl(1, sub(15, tmp_16));
+        for i in 0..len {
+            dest[i] = mult_r(src[i], tmp_16);
+        }
+    } else if tmp_16 < 0 {
+        // leftshift - no accuracy preservation needed
+        for i in 0..len {
+            dest[i] = shr(src[i], tmp_16);
+        }
+    } else {
+        // no shift, simply copy
+        dest[..len].copy_from_slice(&src[..len]);
+    }
+}
+
+/// `Q_ATANINP`: `BASOP_util_atan` input Q format.
+const Q_ATANINP: i16 = 25;
+/// `Q_ATANOUT`: `BASOP_util_atan` output Q format.
+const Q_ATANOUT: i16 = 14;
+/// `ATI_SF`: input scale level of `BASOP_util_atan` (`(32-1) - Q_ATANINP`).
+const ATI_SF: i16 = (32 - 1) - Q_ATANINP;
+/// `ATO_SF`: output scale level of `BASOP_util_atan` (`(16-1) - Q_ATANOUT`).
+const ATO_SF: i16 = (16 - 1) - Q_ATANOUT;
+/// `Q_ATAN2OUT`: `BASOP_util_atan2` output Q format.
+const Q_ATAN2OUT: i16 = 13;
+/// `AT2O_SF`: output scale level of `BASOP_util_atan2` (`(16-1) - Q_ATAN2OUT`).
+const AT2O_SF: i16 = (16 - 1) - Q_ATAN2OUT;
+/// `MAXSFTAB` (rom_basop_util.h): the last scale level `f_atan_expand_range` covers.
+const MAXSFTAB: i16 = 25;
+
+/// `BASOP_util_atan2`: `atan2(y, x)` in `[-pi, pi]` as Q13, for mantissas `y`, `x` whose
+/// exponents differ by `e` (`exp_y - exp_x`).
+#[must_use]
+pub fn basop_util_atan2(y: i32, x: i32, e: i16) -> i16 {
+    if (y | x) == 0 {
+        return 0;
+    }
+
+    if x == 0 {
+        let ret: i16 = 12868; // +EVS_PI/2 Q13
+        return if y < 0 { negate(ret) } else { ret };
+    }
+
+    // division
+    let l_sign = (x ^ y) & i32::MIN;
+
+    let mut sf: i16 = 0;
+    let mut q = basop_util_divide3232_uu_1616_scale(l_abs(y), l_abs(x), &mut sf);
+
+    if l_sign < 0 {
+        q = negate(q);
+    }
+
+    let mut sfo = add(sf, e);
+
+    // atan()
+    if sub(sfo, ATI_SF) > 0 {
+        // could not calc fixp_atan() here because of input data out of range: give back boundary
+        // values
+        sfo = sfo.min(MAXSFTAB);
+
+        let boundary = F_ATAN_EXPAND_RANGE[(sub(sfo, ATI_SF) - 1) as usize];
+        if q > 0 {
+            q = boundary;
+        }
+        if q < 0 {
+            q = -boundary;
+        }
+    } else {
+        // calc of fixp_atan() is possible; input data within range: set q on fixed scale level
+        // as desired from fixp_atan()
+        let stf = sub(sfo, ATI_SF);
+
+        let mut at = l_deposit_h(q);
+        if stf < 0 {
+            at = l_shl(at, stf);
+        }
+
+        q = basop_util_atan(at); // ATO_SF
+    }
+
+    // atan2()
+    let mut ret = shr(q, AT2O_SF - ATO_SF); // now AT2O_SF for atan2
+    if x < 0 {
+        if y >= 0 {
+            ret = add(ret, 25736); // EVS_PI Q13
+        }
+        if y < 0 {
+            ret = sub(ret, 25736); // EVS_PI Q13
+        }
+    }
+    ret
+}
+
+/// `BASOP_util_atan`: `atan(x)` in `]-pi/2, pi/2[` as Q14 for `x` in `(-64, 64)` as Q25, by a
+/// piecewise approximation (56 dB SNR).
+#[must_use]
+pub fn basop_util_atan(x: i32) -> i16 {
+    const P281: i32 = 0x0002_6000; // 0.281 in q19
+    const ONEP571: i16 = 0x6487; // 1.571 in q14
+
+    let sign = x < 0;
+    let x = l_abs(x);
+
+    // calc of arctan
+    let mut result: i16;
+    if l_sub(x, 1_509_950) < 0 {
+        // 0.045/64.0 Q31
+        result = round_word(l_shl(x, 5)); // Q14
+    } else if l_sub(x, (1_i32 << Q_ATANINP) - 8_482_560) < 0 {
+        let mut xx = round_word(l_shl(x, 6));
+        let mut tmp = mult_r(xx, xx); // q15 * q15 - (16-1) = q15
+        tmp = mult_r(tmp, 0x1340); // 15 * (ONEBY3P56) q14 - (16-1) = q14
+        tmp = add(tmp, 0x4000); // L_shl(1,14) = 524288 : q14 + q14 = q14
+        let mut res_e = Q_ATANOUT - 15 + 14 - 16 + 1;
+        if sub(xx, tmp) > 0 {
+            res_e = add(res_e, 1);
+        }
+        if sub(xx, tmp) > 0 {
+            xx = shr(xx, 1);
+        }
+        result = div_s(xx, tmp);
+        result = msu_r(0, result, shl(-32768, res_e));
+    } else if l_sub(x, 42_949_673) < 0 {
+        // 1.28/64.0 Q31
+        let pi_by_4: i32 = 1_686_629_684 / 2; // pi/4 in q30
+
+        let delta_fix = round_word(l_shl(l_sub(x, 33_554_432), 5)); // 1.0/64.0 Q31 -> q30
+        result = round_word(l_sub(
+            l_add(pi_by_4, l_msu(0, delta_fix, -16384)),
+            l_mult0(delta_fix, delta_fix),
+        ));
+    } else {
+        let exp = sub(norm_l(x), 1);
+        let xx = round_word(l_shl(x, exp));
+        // q25+exp * q25+exp - (16-1) = q19+2*exp
+        let tmp = mac_r(l_shl(P281, shl(exp, 1)), xx, xx); // q19+2*exp + q19+2*exp = q19+2*exp
+        let res_e = norm_s(tmp);
+        result = div_s(xx, shl(tmp, res_e));
+        result = shl(
+            result,
+            add(add(Q_ATANOUT - Q_ATANINP + 19 - 16 + 1, res_e), exp),
+        );
+        result = sub(ONEP571, result); // q14 + q14 = q14
+    }
+
+    if sign {
+        result = negate(result);
+    }
+    result
 }
 
 #[cfg(test)]

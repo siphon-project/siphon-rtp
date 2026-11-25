@@ -4,7 +4,9 @@ use crate::evs::cnst::{
     L_FRAME, L_INTERPOL, PIT16K_MAX, PIT16K_MIN, PIT16K_MIN_EXTEND, PIT_MAX, PIT_MIN,
     PIT_MIN_DOUBLEEXTEND, PIT_MIN_EXTEND,
 };
-use crate::itu::basic_ops::{add, shl, sub};
+use crate::evs::rom::INVINTTABLE;
+use crate::itu::basic_ops::{add, mult, shl, shr, sub};
+use crate::itu::stl2009::i_mult;
 
 /// Delta interval to extend pitch coding in relative Q (`LIMIT_PIT_REL_LOWER`).
 const LIMIT_PIT_REL_LOWER: i16 = 2;
@@ -82,6 +84,88 @@ pub fn limit_t0(
         }
     }
     (t0_min, t0_max)
+}
+
+/// `inv_T0_res[res]` (`InvIntTable`): `1/res` in Q15. `res` is a pitch resolution (at most 6); one
+/// past the table (a corrupted frame) reads as 0.
+fn inv_t0_res(res: i16) -> i16 {
+    usize::try_from(res)
+        .ok()
+        .and_then(|index| INVINTTABLE.get(index))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The lag limits `limit_T0_voiced` writes, as `(T0_min, T0_min_frac, T0_max, T0_max_frac)`.
+pub type VoicedLimits = (i16, i16, i16, i16);
+
+/// `limit_T0_voiced`: the closed-loop search interval of `2^nbits` lag steps of resolution `res`
+/// (2..=6) centred on `t0` + `t0_frac`/`t0_res`, clamped to `[pit_min, pit_max]`; returns
+/// `(T0_min, T0_min_frac, T0_max, T0_max_frac)`.
+#[must_use]
+pub fn limit_t0_voiced(
+    nbits: i16,
+    res: i16,
+    t0: i16,
+    t0_frac: i16,
+    t0_res: i16,
+    pit_min: i16,
+    pit_max: i16,
+) -> VoicedLimits {
+    let mut res2 = res;
+    if sub(res, 6) == 0 {
+        res2 = shr(res2, 1);
+    }
+
+    // Mid-point
+    let mut t1 = t0;
+    if sub(t0_res, 1) > 0 && sub(t0_frac, shr(t0_res, 1)) >= 0 {
+        t1 = add(t1, 1);
+    }
+
+    // Lower-bound
+    let mut temp1 = sub(i_mult(t1, res), shl(1, sub(nbits, 1)));
+
+    let mut temp2 = mult(temp1, inv_t0_res(res2));
+    if sub(res, 6) == 0 {
+        temp2 = shr(temp2, 1);
+    }
+
+    let mut t0_min = temp2;
+    let mut t0_min_frac = sub(temp1, i_mult(temp2, res));
+
+    if sub(t0_min, pit_min) < 0 {
+        t0_min = pit_min;
+        t0_min_frac = 0;
+    }
+
+    // Higher-bound
+    temp1 = add(i_mult(t0_min, res), add(t0_min_frac, sub(shl(1, nbits), 1)));
+
+    temp2 = mult(temp1, inv_t0_res(res2));
+    if sub(res, 6) == 0 {
+        temp2 = shr(temp2, 1);
+    }
+
+    let mut t0_max = temp2;
+    let mut t0_max_frac = sub(temp1, i_mult(temp2, res));
+
+    if sub(t0_max, pit_max) > 0 {
+        t0_max = pit_max;
+        t0_max_frac = sub(res, 1);
+
+        temp1 = add(i_mult(t0_max, res), sub(t0_max_frac, sub(shl(1, nbits), 1)));
+
+        temp2 = mult(temp1, inv_t0_res(res2));
+        if sub(res, 6) == 0 {
+            temp2 = shr(temp2, 1);
+        }
+        t0_min = temp2;
+
+        t0_min_frac = sub(temp1, i_mult(temp2, res));
+    }
+
+    (t0_min, t0_min_frac, t0_max, t0_max_frac)
 }
 
 #[cfg(test)]

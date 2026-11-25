@@ -1,6 +1,6 @@
 //! Pitch prediction for a lost frame by a weighted linear fit over the past subframe lags (TS
-//! 26.442 `lib_dec/pitch_extr.c`; TS 26.447 §5.4.2.2). Only `pitch_pred_linear_fit` is ported
-//! here; `get_subframe_pitch` (MODE2) is not yet called by anything ported.
+//! 26.442 `lib_dec/pitch_extr.c`; TS 26.447 §5.4.2.2), and the per-subframe lags between two
+//! pitch values (`get_subframe_pitch`, MODE2).
 
 use crate::evs::basop::mpy_32_16_1;
 use crate::evs::cnst::{NB_SUBFR, NB_SUBFR16K, ONSET, UNVOICED_TRANSITION};
@@ -378,4 +378,47 @@ fn pitch_pred_linear_fit_b(pg: &[i16; 8], ml: &[i32; 8], sum0: i16) -> (i16, i16
     let mut tmpb = 0i16;
     let quotient = basop_util_divide3216_scale(b, sum0, &mut tmpb);
     (quotient, tmpb, b_e)
+}
+
+/// `get_subframe_pitch`: the pitch lag (15Q16) of each of the `n_subframes` subframes of a
+/// concealed frame, interpolated linearly from `pitch_start` (subframe -1) to `pitch_end`
+/// (subframe `n_subframes - 1`). The reference asserts `n_subframes > 0`, `pitch_start >= 0` and
+/// `pitch_end > 0`.
+pub fn get_subframe_pitch(
+    n_subframes: i16,
+    pitch_start: i32,
+    pitch_end: i32,
+    pitch_buf: &mut [i32],
+) {
+    let mut s: i16 = 0;
+    // pitchDelta = (pitchEnd - pitchStart)/nSubframes
+    let pitch_delta = l_deposit_l(basop_util_divide3216_scale(
+        l_sub(pitch_end, pitch_start),
+        n_subframes,
+        &mut s,
+    )); // Q15
+    let pitch_delta = l_shl(pitch_delta, add(s, 1)); // Q16
+    pitch_buf[0] = l_add(pitch_start, pitch_delta);
+    for i in 1..n_subframes.max(1) as usize {
+        pitch_buf[i] = l_add(pitch_buf[i - 1], pitch_delta);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_subframe_pitch_interpolates_linearly() {
+        let mut buf = [0i32; 4];
+        get_subframe_pitch(4, 100 << 16, 108 << 16, &mut buf);
+        assert_eq!(buf, [102 << 16, 104 << 16, 106 << 16, 108 << 16]);
+    }
+
+    #[test]
+    fn get_subframe_pitch_keeps_a_constant_pitch() {
+        let mut buf = [0i32; 5];
+        get_subframe_pitch(5, 77 << 16, 77 << 16, &mut buf);
+        assert_eq!(buf, [77 << 16; 5]);
+    }
 }

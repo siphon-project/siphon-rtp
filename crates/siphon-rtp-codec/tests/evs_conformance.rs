@@ -124,19 +124,48 @@ fn every_decoder_sequence_is_well_formed_g192_and_one_output_frame_per_input_fra
 /// Exact counts rather than a floor, so a case that moves from identical to refused is caught too.
 /// A later phase raises the counts it unlocks.
 const DECODER_IDENTICAL: &[((u32, usize), usize)] = &[
+    ((0, 8), 18),
+    ((0, 32), 20),
+    ((0, 48), 18),
+    ((1280, 8), 19),
+    ((1280, 16), 38),
+    ((1280, 32), 54),
+    ((1280, 48), 37),
     ((5900, 8), 9),
     ((5900, 16), 9),
     ((7200, 8), 18),
     ((7200, 16), 18),
     ((8000, 8), 18),
     ((8000, 16), 18),
-    ((13200, 8), 12),
-    ((13200, 16), 6),
-    ((13200, 32), 6),
+    ((9600, 8), 18),
+    ((9600, 16), 18),
+    ((9600, 32), 18),
+    ((13200, 8), 18),
+    ((13200, 16), 54),
+    ((13200, 32), 54),
+    ((16400, 8), 18),
+    ((16400, 16), 18),
+    ((16400, 32), 18),
+    ((16400, 48), 18),
+    ((24400, 8), 18),
+    ((24400, 16), 19),
+    ((24400, 32), 18),
+    ((24400, 48), 18),
     ((32000, 16), 18),
+    ((32000, 32), 18),
+    ((32000, 48), 18),
+    ((48000, 16), 18),
+    ((48000, 32), 18),
+    ((48000, 48), 18),
     ((64000, 16), 18),
     ((64000, 32), 18),
     ((64000, 48), 18),
+    ((96000, 16), 18),
+    ((96000, 32), 18),
+    ((96000, 48), 18),
+    ((128000, 16), 18),
+    ((128000, 32), 18),
+    ((128000, 48), 18),
 ];
 
 /// The (bit rate, output kHz) bucket of `case` in [`DECODER_IDENTICAL`]: the first `_<digits>_`
@@ -305,7 +334,7 @@ fn every_decoder_sequence_decodes_byte_identical_or_is_refused_at_a_named_bounda
 }
 
 #[test]
-fn a_mode2_sequence_is_refused_not_decoded() {
+fn an_amr_wb_io_sequence_is_refused_not_decoded() {
     use siphon_rtp_codec::evs::error::UnsupportedMode;
     let Some(root) = vectors_dir() else {
         assert!(
@@ -314,20 +343,38 @@ fn a_mode2_sequence_is_refused_not_decoded() {
         );
         return;
     };
-    // 9.6 kbit/s wideband is a TCX (MODE2) stream
-    let bytes = std::fs::read(root.join("testv/bitstreams/wb/stv16c_9600_16kHz.COD"))
-        .unwrap_or_else(|error| panic!("{error}"));
-    let mut decoder = EvsDecoder::new(16000).unwrap_or_else(|error| panic!("{error}"));
+    // the switch from EVS to AMR-WB IO frames ends in the (phase 4) AMR-WB IO decoder
+    let bytes =
+        std::fs::read(root.join("testv/bitstreams/swb/stv32c_bw_59_1280_evs_amrwb_32kHz.COD"))
+            .unwrap_or_else(|error| panic!("{error}"));
+    let mut decoder = EvsDecoder::new(32000).unwrap_or_else(|error| panic!("{error}"));
     let mut out = vec![0i16; decoder.frame_samples()];
-    let frame = G192Reader::new(&bytes)
-        .next()
-        .and_then(Result::ok)
-        .unwrap_or_else(|| panic!("no frame"));
+    let refused = G192Reader::new(&bytes)
+        .filter_map(Result::ok)
+        .find_map(|frame| decoder.decode_frame(&frame, &mut out).err());
     assert!(matches!(
-        decoder.decode_frame(&frame, &mut out),
-        Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Mode2,
+        refused,
+        Some(EvsError::Unsupported {
+            mode: UnsupportedMode::AmrWbIo,
             ..
         })
     ));
+}
+
+#[test]
+fn a_mode2_sequence_decodes_to_the_reference_output() {
+    let Some(root) = vectors_dir() else {
+        assert!(
+            !required(),
+            "SIPHON_RTP_REQUIRE_VECTORS=1 but reference/evs/testvec is absent"
+        );
+        return;
+    };
+    // 9.6 kbit/s wideband is a TCX (MODE2) stream
+    let case = Case {
+        output_khz: 16,
+        bitstream: root.join("testv/bitstreams/wb/stv16c_9600_16kHz.COD"),
+        reference: root.join("testv/decoded/wb/stv16c_9600_16kHz.OUT"),
+    };
+    assert!(matches!(decode_case(&case), Ok(None)));
 }

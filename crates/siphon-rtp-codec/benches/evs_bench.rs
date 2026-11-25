@@ -39,6 +39,20 @@ const SEQUENCES: &[(&str, &str, u32)] = &[
         "fb/stv48c_64000_48kHz.COD",
         48000,
     ),
+    // MODE2 (LPD) at 9.6 kbit/s WB: ACELP and TCX
+    ("evs_decode_lpd_9k6_wb", "wb/stv16c_9600_16kHz.COD", 16000),
+    // MODE2 TCX with IGF, SWB
+    (
+        "evs_decode_tcx_24k4_swb_igf",
+        "swb/stv32c_24400_32kHz.COD",
+        32000,
+    ),
+    // MODE2 TCX at 128 kbit/s FB
+    (
+        "evs_decode_tcx_128k_fb",
+        "fb/stv48c_128000_48kHz.COD",
+        48000,
+    ),
 ];
 
 #[cfg(feature = "evs")]

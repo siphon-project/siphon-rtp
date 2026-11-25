@@ -22,11 +22,11 @@ use crate::evs::dec::hq_conf_fec::hq_configure_bfi;
 use crate::evs::dec::hq_hr_dec::hq_hr_dec;
 use crate::evs::dec::hq_lr_dec::hq_lr_dec;
 use crate::evs::dec::state::DecoderState;
-use crate::evs::error::{EvsError, UnsupportedMode};
+use crate::evs::dec::waveadjust_fec_dec::waveform_adj2_fix;
 use crate::evs::macros::ns2sa_fx2;
 use crate::evs::rom::{HQ_NOMINAL_SCALING_INV, INNER_FRAME_TBL, INNER_FRAME_TBL_FX};
 use crate::itu::basic_ops::{
-    add, div_s, extract_l, l_add, l_shl, l_shr, l_sub, mult, mult_r, negate, sub,
+    add, div_s, extract_l, l_add, l_shl, l_shr, l_sub, mult, mult_r, negate, shl, sub,
 };
 use crate::itu::stl2009::{i_mult, lshr, mpy_32_16_ss};
 
@@ -57,10 +57,6 @@ struct HqWork {
 /// `hq_core_dec_fx`: decode one HQ core frame into `synth` (`output_frame` samples, Q`*q_synth`).
 /// `hq_core_type` is the low- or high-rate core, `core_switching_flag` marks an ACELP -> HQ
 /// switching frame.
-///
-/// # Errors
-/// [`EvsError::Unsupported`] when the frame follows a MODE2 (TCX) concealment, whose recovery
-/// (`waveform_adj2_fix`) belongs to the MODE2 decoder.
 pub fn hq_core_dec(
     st: &mut DecoderState,
     synth: &mut [i16],
@@ -68,7 +64,7 @@ pub fn hq_core_dec(
     output_frame: i16,
     hq_core_type: i16,
     core_switching_flag: i16,
-) -> Result<(), EvsError> {
+) {
     let mut w = HqWork {
         t_audio_q: [0; L_FRAME48K as usize],
         wtda_audio: [0; 2 * L_FRAME48K as usize],
@@ -97,9 +93,8 @@ pub fn hq_core_dec(
     }
     hq_core_dec_bandwidth_switching(st, &mut w);
     hq_core_dec_synthesis(st, &mut w, synth, q_synth, output_frame);
-    hq_core_dec_recovery(st, synth, *q_synth)?;
+    hq_core_dec_recovery(st, synth, *q_synth);
     hq_core_dec_update(st, &w, synth, *q_synth, output_frame);
-    Ok(())
 }
 
 /// Initialisations and the bit budget of `hq_core_dec_fx`.
@@ -490,9 +485,9 @@ fn hq_core_dec_preecho(
     }
 }
 
-/// Recovery from a MODE2 (TCX) concealment: `waveform_adj2_fix` of the reference. A MODE1 decoder
-/// never has MODE2 as its last codec mode, so this refuses only a stream the port cannot decode.
-fn hq_core_dec_recovery(st: &DecoderState, _synth: &[i16], _q_synth: i16) -> Result<(), EvsError> {
+/// Recovery from a MODE2 (TCX) concealment: the waveform adjustment (`waveform_adj2_fix`) of the
+/// first good frame, from the periodic extension of the last concealed one.
+fn hq_core_dec_recovery(st: &mut DecoderState, synth: &mut [i16], q_synth: i16) {
     if st.bfi == 0
         && st.prev_bfi != 0
         && l_sub(st.last_total_brate, HQ_48K) >= 0
@@ -501,12 +496,24 @@ fn hq_core_dec_recovery(st: &DecoderState, _synth: &[i16], _q_synth: i16) -> Res
         && st.plc_info.concealment_method == TCX_NONTONAL
         && st.plc_info.nb_lost_cmpt < 4
     {
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::Mode2,
-            reference_call: "waveform_adj2_fix",
-        });
+        st.plc_info.recovery_gain = shl(st.plc_info.recovery_gain, q_synth);
+        let overlap_at = st.tonal_mdc_tconceal.second_last_pcm_out.unwrap_or(0);
+        waveform_adj2_fix(
+            &mut st.tonal_mdc_tconceal.time_data_buffer[overlap_at..],
+            synth,
+            &mut st.plc_info.data_noise,
+            &mut st.plc_info.outx_new_n1,
+            &mut st.plc_info.nsapp_gain,
+            &mut st.plc_info.nsapp_gain_n,
+            &mut st.plc_info.recovery_gain,
+            st.plc_info.step_concealgain,
+            st.plc_info.pitch,
+            st.plc_info.frame_size,
+            0,
+            add(extract_l(st.plc_info.nb_lost_cmpt), 1),
+            st.bfi,
+        );
     }
-    Ok(())
 }
 
 /// The HQ voicing memory, the 8 kHz history buffers and the pitch memories at the end of

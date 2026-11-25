@@ -140,6 +140,82 @@ pub fn edct_in_place(xy: &mut [i32], length: i16, q: &mut i16) {
     edct_transform(xy, edct_table, length, q, &mut re2, &mut im2);
 }
 
+/// The twiddle and pre-rotation of `edst_fx`: `x` into `re2` / `im2`, `Q(q+1)`.
+fn edst_pre_rotate(
+    x: &[i32],
+    edct_table: &[i16],
+    length: usize,
+    re2: &mut [i32; EDCT_HALF_MAX],
+    im2: &mut [i32; EDCT_HALF_MAX],
+) {
+    let len1 = length / 2;
+    for i in 0..len1 {
+        let l_tmp = mult_32_16(x[length - 1 - 2 * i], edct_table[i]);
+        re2[i] = madd_32_16(l_tmp, x[2 * i], edct_table[len1 - 1 - i]);
+
+        let l_tmp = mult_32_16(x[2 * i], edct_table[i]);
+        im2[i] = msub_32_16(l_tmp, x[length - 1 - 2 * i], edct_table[len1 - 1 - i]);
+    }
+}
+
+/// The FFT and post-rotation of `edst_fx`, writing `y`.
+fn edst_transform(
+    y: &mut [i32],
+    edct_table: &[i16],
+    length: i16,
+    q: &mut i16,
+    re2: &mut [i32; EDCT_HALF_MAX],
+    im2: &mut [i32; EDCT_HALF_MAX],
+) {
+    let len1 = shr(length, 1);
+    // The reference lends the FFT the output `y` as its work buffer; nothing in it is read back.
+    let mut work = [0i32; BASOP_CFFT_WORK_LENGTH];
+
+    *q = sub(15, *q);
+    basop_cfft(&mut Split { re: re2, im: im2 }, len1, 1, q, &mut work);
+
+    let mut tmp = div_s(1, length); // Q15
+    tmp = round_word(l_shl(l_mult(tmp, 19302), 2)); // Q15
+    let (len1, length) = (len1 as usize, length as usize);
+    for i in 0..len1 {
+        let re = msub_32_16(re2[i], im2[i], tmp);
+        let im = madd_32_16(im2[i], re2[i], tmp);
+        y[2 * i] = l_add(
+            mult_32_16(re, edct_table[i]),
+            mult_32_16(im, edct_table[len1 - 1 - i]),
+        );
+        y[length - 1 - 2 * i] = l_sub(
+            mult_32_16(im, edct_table[i]),
+            mult_32_16(re, edct_table[len1 - 1 - i]),
+        ); // Q(q)
+    }
+
+    *q = sub(15 + 2, *q);
+}
+
+/// `edst_fx`: the `length`-point DST-IV of `x` (Q`*q`) into `y`, updating `*q`. A length without
+/// a table leaves `y` untouched (the reference would dereference `NULL`).
+pub fn edst(x: &[i32], y: &mut [i32], length: i16, q: &mut i16) {
+    let Some(edct_table) = get_edct_table(length, q) else {
+        return;
+    };
+    let mut re2 = [0i32; EDCT_HALF_MAX];
+    let mut im2 = [0i32; EDCT_HALF_MAX];
+    edst_pre_rotate(x, edct_table, length as usize, &mut re2, &mut im2);
+    edst_transform(y, edct_table, length, q, &mut re2, &mut im2);
+}
+
+/// [`edst`] with `x` and `y` the same buffer (`edst_fx(y, y, ...)`, as `TCX_MDST` calls it).
+pub fn edst_in_place(xy: &mut [i32], length: i16, q: &mut i16) {
+    let Some(edct_table) = get_edct_table(length, q) else {
+        return;
+    };
+    let mut re2 = [0i32; EDCT_HALF_MAX];
+    let mut im2 = [0i32; EDCT_HALF_MAX];
+    edst_pre_rotate(xy, edct_table, length as usize, &mut re2, &mut im2);
+    edst_transform(xy, edct_table, length, q, &mut re2, &mut im2);
+}
+
 /// The table of an `edct_16fx` length: `L_FRAME32k`, `L_FRAME` or `L_FRAME16k`. Any other length
 /// has none (the reference would dereference `NULL`) and leaves the output untouched.
 fn edct_16fx_table(length: i16) -> Option<&'static [i16]> {
