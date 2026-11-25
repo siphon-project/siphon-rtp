@@ -53,6 +53,18 @@ const SEQUENCES: &[(&str, &str, u32)] = &[
         "fb/stv48c_128000_48kHz.COD",
         48000,
     ),
+    // AMR-WB IO at 12.65 kbit/s with the 6 - 8 kHz band extension
+    (
+        "evs_decode_amr_wb_io_12k65",
+        "amrwb/T03_12650_16kHz.COD",
+        16000,
+    ),
+    // AMR-WB IO at 23.85 kbit/s (the HF gain index of that rate), DTX
+    (
+        "evs_decode_amr_wb_io_23k85_dtx",
+        "amrwb/T03_dtx_23850_16kHz.COD",
+        16000,
+    ),
 ];
 
 #[cfg(feature = "evs")]

@@ -2,7 +2,14 @@
 //! TS 26.445 §6.1.4.2).
 //!
 //! Ported: the 12.8 kHz core's 6-7 kHz noise synthesis (`hf_synth_fx`) with its filters and
-//! initialisations. The AMR-WB IO high band (`hf_synth_amr_wb_fx`) is not ported yet.
+//! initialisations, and the AMR-WB IO high band (`hf_synth_amr_wb_fx` with `envelope_fx`,
+//! `AdaptiveStartBand_fx`; in the submodules `amr_wb` and `amr_wb_envelope`).
+
+mod amr_wb;
+mod amr_wb_envelope;
+
+pub use amr_wb::{hf_synth_amr_wb, hf_synth_amr_wb_reset, HfSynthAmrWbState};
+pub use amr_wb_envelope::{adaptive_start_band, envelope};
 
 use crate::evs::cnst::{
     ALLPASSSECTIONS_STEEP, DELAY_CLDFB_NS, FRAME_NO_DATA, L_FILT16K, L_FIR, L_FRAME, L_FRAME16K,

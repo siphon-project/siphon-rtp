@@ -7,9 +7,9 @@
 //!
 //! Two checks. Every bitstream those scripts name is a well-formed G.192 stream of legal EVS frames,
 //! and every reference output is exactly one 20 ms frame at the requested rate per input frame.
-//! And the decoder gate: every decoder sequence either decodes byte for byte to the reference
-//! `.OUT` or stops at a named [`EvsError::Unsupported`] boundary of the port, and the number that
-//! decode identically matches [`DECODER_IDENTICAL`], which each later phase raises.
+//! And the decoder gate: every decoder sequence of both scripts, EVS and AMR-WB IO alike, decodes
+//! byte for byte to the reference `.OUT`, and the number that do matches [`DECODER_IDENTICAL`] and
+//! [`AMR_WB_IO_IDENTICAL`].
 //!
 //! The sequences are copyrighted and gitignored, so this skips when they are absent (a fresh
 //! checkout stays green) and `SIPHON_RTP_REQUIRE_VECTORS=1` turns that skip into a failure, and also
@@ -24,7 +24,6 @@ mod evs_cases;
 
 use evs_cases::{cases, required, vectors_dir, Case};
 use siphon_rtp_codec::evs::decoder::EvsDecoder;
-use siphon_rtp_codec::evs::error::EvsError;
 use siphon_rtp_codec::evs::frame::FrameKind;
 use siphon_rtp_codec::evs::g192::G192Reader;
 
@@ -119,18 +118,17 @@ fn every_decoder_sequence_is_well_formed_g192_and_one_output_frame_per_input_fra
 /// How many sequences of `Readme_EVS_dec.txt` decode byte-identical, per (bit rate, output kHz).
 /// The bit rate is the one a `..._<rate>_<kHz>kHz` sequence name carries (`stv16c_dtx_13200_16kHz`);
 /// the switching, network-simulation and channel-aware families name no single rate and count as
-/// `0`. Every other sequence must stop at a named [`EvsError::Unsupported`] boundary: a decoder
-/// that emits audio which differs from the reference, or fails any other way, fails the gate.
-/// Exact counts rather than a floor, so a case that moves from identical to refused is caught too.
-/// A later phase raises the counts it unlocks.
+/// `0`. Every one of the 979 sequences must decode byte for byte: a decoder that emits audio which
+/// differs from the reference, or fails any other way, fails the gate. Exact counts rather than a
+/// floor, so a case the script gains, loses or moves between buckets is caught too.
 const DECODER_IDENTICAL: &[((u32, usize), usize)] = &[
     ((0, 8), 18),
     ((0, 32), 20),
     ((0, 48), 18),
-    ((1280, 8), 19),
-    ((1280, 16), 38),
-    ((1280, 32), 54),
-    ((1280, 48), 37),
+    ((1280, 8), 37),
+    ((1280, 16), 56),
+    ((1280, 32), 90),
+    ((1280, 48), 55),
     ((5900, 8), 9),
     ((5900, 16), 9),
     ((7200, 8), 18),
@@ -168,6 +166,22 @@ const DECODER_IDENTICAL: &[((u32, usize), usize)] = &[
     ((128000, 48), 18),
 ];
 
+/// The same for the 1590 sequences of `Readme_AMRWB_IO_dec.txt` (the AMR-WB interoperable mode,
+/// all at 16 kHz): per AMR-WB bit rate 159 sequences (clean, 10 % and 6 % frame erasure, with and
+/// without DTX, over the test items), and 318 switching streams (AMR-WB IO to and from the EVS
+/// primary modes) that name no single rate. Every one must decode byte for byte.
+const AMR_WB_IO_IDENTICAL: &[((u32, usize), usize)] = &[
+    ((0, 16), 318),
+    ((6600, 16), 159),
+    ((8850, 16), 159),
+    ((12650, 16), 159),
+    ((14250, 16), 159),
+    ((15850, 16), 159),
+    ((19850, 16), 159),
+    ((23050, 16), 159),
+    ((23850, 16), 159),
+];
+
 /// The (bit rate, output kHz) bucket of `case` in [`DECODER_IDENTICAL`]: the first `_<digits>_`
 /// field of four or more digits in the sequence name, or `0` when it has none.
 fn rate_bucket(case: &Case) -> (u32, usize) {
@@ -185,41 +199,20 @@ fn rate_bucket(case: &Case) -> (u32, usize) {
     (rate, case.output_khz)
 }
 
-/// What decoding one sequence came to.
-enum Outcome {
-    Identical,
-    /// Stopped at a boundary of the port that is not built yet.
-    Refused(String),
-    /// Audio that differs from the reference, or any other failure.
-    Failed(String),
-}
-
-fn outcome(case: &Case) -> Outcome {
+/// What decoding one sequence came to: `None` when it is byte-identical to the reference, the
+/// reason otherwise.
+fn outcome(case: &Case) -> Option<String> {
     match decode_case(case) {
-        Ok(None) => Outcome::Identical,
+        Ok(None) => None,
         Ok(Some((frame, offset))) => {
-            Outcome::Failed(format!("first difference in frame {frame} sample {offset}"))
+            Some(format!("first difference in frame {frame} sample {offset}"))
         }
-        Err(DecodeFailure::Unsupported(reason)) => Outcome::Refused(reason),
-        Err(DecodeFailure::Other(reason)) => Outcome::Failed(reason),
-    }
-}
-
-/// Why [`decode_case`] did not produce a comparable output.
-enum DecodeFailure {
-    /// [`EvsError::Unsupported`]: a frame needs a part of the decoder not ported yet.
-    Unsupported(String),
-    Other(String),
-}
-
-impl From<String> for DecodeFailure {
-    fn from(reason: String) -> Self {
-        Self::Other(reason)
+        Err(reason) => Some(reason),
     }
 }
 
 /// Decode `case` and return the first differing sample (frame, offset) or `None` when identical.
-fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, DecodeFailure> {
+fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, String> {
     let bitstream = std::fs::read(&case.bitstream).map_err(|error| error.to_string())?;
     let reference = std::fs::read(&case.reference).map_err(|error| error.to_string())?;
     let mut decoder =
@@ -231,12 +224,7 @@ fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, DecodeFailure> {
         let frame = frame.map_err(|error| error.to_string())?;
         let written = decoder
             .decode_frame(&frame, &mut out)
-            .map_err(|error| match error {
-                EvsError::Unsupported { .. } => {
-                    DecodeFailure::Unsupported(format!("frame {index}: {error}"))
-                }
-                other => DecodeFailure::Other(format!("frame {index}: {other}")),
-            })?;
+            .map_err(|error| format!("frame {index}: {error}"))?;
         for sample in &out[..written] {
             pcm.extend_from_slice(&sample.to_le_bytes());
         }
@@ -246,11 +234,11 @@ fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, DecodeFailure> {
         pcm.extend_from_slice(&sample.to_le_bytes());
     }
     if pcm.len() != reference.len() {
-        return Err(DecodeFailure::Other(format!(
+        return Err(format!(
             "{} bytes, reference {}",
             pcm.len(),
             reference.len()
-        )));
+        ));
     }
     Ok(pcm
         .iter()
@@ -262,18 +250,13 @@ fn decode_case(case: &Case) -> Result<Option<(usize, usize)>, DecodeFailure> {
         }))
 }
 
-#[test]
-fn every_decoder_sequence_decodes_byte_identical_or_is_refused_at_a_named_boundary() {
-    let Some(root) = vectors_dir() else {
-        assert!(
-            !required(),
-            "SIPHON_RTP_REQUIRE_VECTORS=1 but reference/evs/testvec is absent"
-        );
-        eprintln!("skipping: EVS conformance sequences not installed (sh reference/evs/fetch.sh)");
-        return;
-    };
-    let all = cases(&root, "Readme_EVS_dec.txt");
-    // One sequence per worker at a time: each holds a decoder and two whole files.
+/// Decode every case of `script` (a sequence per worker at a time: each holds a decoder and two
+/// whole files) and return how many were byte-identical per bucket, and the failures.
+fn decode_script(
+    root: &std::path::Path,
+    script: &str,
+) -> (BTreeMap<(u32, usize), usize>, Vec<String>) {
+    let all = cases(root, script);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(Vec::new());
     let workers = std::thread::available_parallelism().map_or(4, |count| count.get().min(16));
@@ -299,43 +282,54 @@ fn every_decoder_sequence_decodes_byte_identical_or_is_refused_at_a_named_bounda
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let mut identical: BTreeMap<(u32, usize), usize> = BTreeMap::new();
-    let (mut refused, mut failures) = (BTreeMap::<String, usize>::new(), Vec::new());
-    for (bucket, name, result) in results {
-        match result {
-            Outcome::Identical => *identical.entry(bucket).or_default() += 1,
-            Outcome::Refused(reason) => {
-                // `frame N: <what is not supported>`: count by the boundary, not the frame
-                let boundary = reason
-                    .split_once(": ")
-                    .map_or(reason.as_str(), |(_, boundary)| boundary);
-                *refused.entry(boundary.to_owned()).or_default() += 1;
-            }
-            Outcome::Failed(reason) => failures.push(format!("{name}: {reason}")),
+    let mut failures = Vec::new();
+    for (bucket, name, failure) in results {
+        match failure {
+            None => *identical.entry(bucket).or_default() += 1,
+            Some(reason) => failures.push(format!("{name}: {reason}")),
         }
     }
-    eprintln!(
-        "{} sequences byte-identical, {} refused at a boundary, {} failed",
-        identical.values().sum::<usize>(),
-        refused.values().sum::<usize>(),
-        failures.len()
-    );
-    for (boundary, count) in &refused {
-        eprintln!("  {count} refused: {boundary}");
-    }
-    for failure in &failures {
-        eprintln!("FAIL {failure}");
-    }
-    assert!(failures.is_empty(), "{} sequences failed", failures.len());
-    let expected: BTreeMap<(u32, usize), usize> = DECODER_IDENTICAL.iter().copied().collect();
-    assert_eq!(
-        identical, expected,
-        "byte-identical sequences per (bit rate, output kHz) changed"
-    );
+    (identical, failures)
 }
 
 #[test]
-fn an_amr_wb_io_sequence_is_refused_not_decoded() {
-    use siphon_rtp_codec::evs::error::UnsupportedMode;
+fn every_decoder_sequence_decodes_byte_identical() {
+    let Some(root) = vectors_dir() else {
+        assert!(
+            !required(),
+            "SIPHON_RTP_REQUIRE_VECTORS=1 but reference/evs/testvec is absent"
+        );
+        eprintln!("skipping: EVS conformance sequences not installed (sh reference/evs/fetch.sh)");
+        return;
+    };
+    for (script, table) in [
+        ("Readme_EVS_dec.txt", DECODER_IDENTICAL),
+        ("Readme_AMRWB_IO_dec.txt", AMR_WB_IO_IDENTICAL),
+    ] {
+        let (identical, failures) = decode_script(&root, script);
+        eprintln!(
+            "{script}: {} sequences byte-identical, {} failed",
+            identical.values().sum::<usize>(),
+            failures.len()
+        );
+        for failure in &failures {
+            eprintln!("FAIL {failure}");
+        }
+        assert!(
+            failures.is_empty(),
+            "{script}: {} sequences failed",
+            failures.len()
+        );
+        let expected: BTreeMap<(u32, usize), usize> = table.iter().copied().collect();
+        assert_eq!(
+            identical, expected,
+            "{script}: byte-identical sequences per (bit rate, output kHz) changed"
+        );
+    }
+}
+
+#[test]
+fn an_evs_to_amr_wb_io_switching_sequence_decodes_to_the_reference_output() {
     let Some(root) = vectors_dir() else {
         assert!(
             !required(),
@@ -343,22 +337,18 @@ fn an_amr_wb_io_sequence_is_refused_not_decoded() {
         );
         return;
     };
-    // the switch from EVS to AMR-WB IO frames ends in the (phase 4) AMR-WB IO decoder
-    let bytes =
-        std::fs::read(root.join("testv/bitstreams/swb/stv32c_bw_59_1280_evs_amrwb_32kHz.COD"))
-            .unwrap_or_else(|error| panic!("{error}"));
-    let mut decoder = EvsDecoder::new(32000).unwrap_or_else(|error| panic!("{error}"));
-    let mut out = vec![0i16; decoder.frame_samples()];
-    let refused = G192Reader::new(&bytes)
+    // the stream switches from EVS frames to AMR-WB IO frames and back
+    let case = Case {
+        output_khz: 32,
+        bitstream: root.join("testv/bitstreams/swb/stv32c_bw_59_1280_evs_amrwb_32kHz.COD"),
+        reference: root.join("testv/decoded/swb/stv32c_bw_59_1280_evs_amrwb_32kHz.OUT"),
+    };
+    assert!(matches!(decode_case(&case), Ok(None)));
+    // and it does carry AMR-WB IO frames
+    let bytes = std::fs::read(&case.bitstream).unwrap_or_else(|error| panic!("{error}"));
+    assert!(G192Reader::new(&bytes)
         .filter_map(Result::ok)
-        .find_map(|frame| decoder.decode_frame(&frame, &mut out).err());
-    assert!(matches!(
-        refused,
-        Some(EvsError::Unsupported {
-            mode: UnsupportedMode::AmrWbIo,
-            ..
-        })
-    ));
+        .any(|frame| matches!(frame.kind, FrameKind::AmrWbIo(_) | FrameKind::AmrWbIoSid)));
 }
 
 #[test]

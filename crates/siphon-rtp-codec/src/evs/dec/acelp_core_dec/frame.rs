@@ -41,7 +41,9 @@ use crate::evs::dec::lsf_dec::lsf_dec;
 use crate::evs::dec::stat_noise_uv_dec::stat_noise_uv_dec;
 use crate::evs::dec::state::DecoderState;
 use crate::evs::dec::transition_dec::tc_classif;
-use crate::itu::basic_ops::{add, l_mac, l_shl, l_sub, mult, mult_r, round_word, shr, shr_r, sub};
+use crate::itu::basic_ops::{
+    add, l_deposit_h, l_mac, l_shl, l_sub, mult, mult_r, round_word, shr, shr_r, sub,
+};
 
 /// `acelp_core_dec_fx`'s `GOOD frame` branch.
 pub(super) fn good_frame(
@@ -214,7 +216,7 @@ fn good_frame_cng(
     );
 
     // update the past excitation signals for the LD music post-filter
-    update_dct_post_old_exc(st, &w.old_exc2);
+    update_dct_post_old_exc(st, &w.old_exc2[EXC2_AT..]);
 
     // synthesis at the 12.8 kHz sampling rate
     syn_12k8(
@@ -250,7 +252,7 @@ fn good_frame_cng(
         .copy_from_slice(&w.syn1_fx_tmp[from..from + L_SYN_MEM_CLAS_ESTIM as usize]);
 
     // Update the music post-processing values: filter energies update
-    update_filt_lfe(st);
+    update_filt_lfe(st, 1228);
 
     // save and delay the synthesis to be used by the SWB BWE
     copy_scale_sig(
@@ -272,18 +274,18 @@ fn good_frame_cng(
 /// `Copy( dct_post_old_exc + L_FRAME, dct_post_old_exc, DCT_L_POST - L_FRAME - OFFSET2 )` and
 /// `Copy( exc2_fx, dct_post_old_exc + (DCT_L_POST - L_FRAME - OFFSET2), L_FRAME )`: slide the
 /// past excitation of the LD music post-filter by one frame and append `exc2`.
-pub(super) fn update_dct_post_old_exc(st: &mut DecoderState, old_exc2: &[i16]) {
+pub(crate) fn update_dct_post_old_exc(st: &mut DecoderState, exc2: &[i16]) {
     let keep = (DCT_L_POST - L_FRAME - OFFSET2) as usize;
     st.dct_post_old_exc
         .copy_within(L_FRAME as usize..L_FRAME as usize + keep, 0);
-    st.dct_post_old_exc[keep..keep + L_FRAME as usize]
-        .copy_from_slice(&old_exc2[EXC2_AT..EXC2_AT + L_FRAME as usize]);
+    st.dct_post_old_exc[keep..keep + L_FRAME as usize].copy_from_slice(&exc2[..L_FRAME as usize]);
 }
 
-/// `filt_lfE[i] = 0.3 + 0.7 * filt_lfE[i]` for the `DCT_L_POST` bins.
-pub(super) fn update_filt_lfe(st: &mut DecoderState) {
+/// `filt_lfE[i] = 0.3 + 0.7 * filt_lfE[i]` for the `DCT_L_POST` bins; `offset` is the 0.3 in Q12 as
+/// the caller writes it: `1228` in `acelp_core_dec_fx`, `1229` in `amr_wb_dec_fx`.
+pub(crate) fn update_filt_lfe(st: &mut DecoderState, offset: i16) {
     for value in st.filt_lf_e.iter_mut().take(DCT_L_POST as usize) {
-        *value = round_word(l_mac(1228 << 16, 22938, *value));
+        *value = round_word(l_mac(l_deposit_h(offset), 22938, *value));
     }
 }
 
@@ -426,7 +428,7 @@ fn good_frame_active(
     // Save the filter memory in case the synthesis is redone after scaling; synthesis at the
     // 12.8 kHz sampling rate.
     // update the past excitation signals for the LD music post-filter
-    update_dct_post_old_exc(st, &w.old_exc2);
+    update_dct_post_old_exc(st, &w.old_exc2[EXC2_AT..]);
 
     good_frame_synthesis(st, w, coder_type, pitch_buf);
 }
@@ -775,7 +777,7 @@ fn good_frame_synthesis(
             st.q_syn,
         );
 
-        update_filt_lfe(st);
+        update_filt_lfe(st, 1228);
     }
 
     // FEC - estimate the classification information
@@ -842,7 +844,7 @@ fn good_frame_synthesis(
 }
 
 /// `pitch_buf_tmp[k] = mult_r(pitch_buf[k], 512)` for each 64-sample subframe: the pitch in Q0.
-pub(super) fn pitch_buf_for_scaling(pitch_buf: &[i16], l_frame: i16, pitch_buf_tmp: &mut [i16]) {
+pub(crate) fn pitch_buf_for_scaling(pitch_buf: &[i16], l_frame: i16, pitch_buf_tmp: &mut [i16]) {
     let mut k = 0;
     let mut i = 0;
     while i < l_frame {
@@ -1060,7 +1062,7 @@ pub(super) fn bad_frame(
     );
 
     // update the past excitation signals for the LD music post-filter
-    update_dct_post_old_exc(st, &w.old_exc2);
+    update_dct_post_old_exc(st, &w.old_exc2[EXC2_AT..]);
 
     // synthesis at the 12.8 kHz sampling rate; add extra headroom in case a CNA addition is
     // likely
@@ -1115,7 +1117,7 @@ pub(super) fn bad_frame(
         .copy_from_slice(&w.syn_fx_tmp[clas_from..clas_from + L_SYN_MEM_CLAS_ESTIM as usize]);
 
     // Update the music post-processing values: filter energies update
-    update_filt_lfe(st);
+    update_filt_lfe(st, 1228);
     // Update the circular buffer, keep the last energy difference unchanged
     for i in 1..MAX_LT as usize {
         st.l_dm_lt_diff_etot[i - 1] = st.l_dm_lt_diff_etot[i];

@@ -115,7 +115,7 @@ fn corre_at(old_synth: &[i16], pos: i16, t0: i16) -> i16 {
 /// `decision_hyst`, `UV_cnt`, `LT_UV_cnt`, `Last_ener`, `lt_diff_etot`, `mem_syn_clas_estim` and
 /// `Q_mem_syn` (or NULL where the function does not touch them), so they are read and written
 /// here as `st.clas_dec`, `st.lp_ener_fer`, `st.decision_hyst`, `st.uv_cnt`, `st.lt_uv_cnt`,
-/// `st.last_ener`, `st.lt_diff_etot`, `st.mem_syn_clas_estim` and `st.classifier_q_mem_syn`.
+/// `st.Last_ener` (the reference's `Last_ener_fx`, not the GSC's `last_ener_fx`), `st.lt_diff_etot`, `st.mem_syn_clas_estim` and `st.classifier_q_mem_syn`.
 /// `locattack`, `amr_io_class` (AMR-WB IO only) and `class_para` (MODE1 only) are the callers'
 /// locals; `None` stands for the reference's NULL, which no caller passes where it is written.
 pub fn fec_clas_estim(
@@ -634,8 +634,8 @@ fn fec_clas_estim_amr_wb_io(
     //   classification is overwritten to AUDIO
     // IF energy difference > 6.0dB
     //   consider an attack
-    let diff_ener = sub(ener, st.last_ener);
-    st.last_ener = ener;
+    let diff_ener = sub(ener, st.Last_ener);
+    st.Last_ener = ener;
     *amr_io_class = st.clas_dec;
     if sub(st.lt_uv_cnt, LT_UV_THR_FX) > 0 && sub(diff_ener, 12 * 256 /* Q8 */) < 0 {
         *amr_io_class = AUDIO_CLAS;
