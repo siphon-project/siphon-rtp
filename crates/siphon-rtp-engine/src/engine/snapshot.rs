@@ -78,6 +78,10 @@ pub(super) fn codec_snapshot(codec: &CodecSpec) -> crate::ha::CodecSnapshot {
             use_inband_fec: params.use_inband_fec,
             use_dtx: params.use_dtx,
         }),
+        evs: codec.evs.map(|params| crate::ha::EvsSnapshot {
+            fmtp: params.to_fmtp(),
+            malformed: params.malformed,
+        }),
     }
 }
 
@@ -122,6 +126,14 @@ pub(super) fn restore_codec(snapshot: &crate::ha::CodecSnapshot) -> CodecSpec {
                 use_dtx: params.use_dtx,
             }),
     )
+    .with_evs_params(snapshot.evs.as_ref().map(|snapshot| {
+        // the text was written by `to_fmtp`, so it parses; a snapshot from elsewhere that does not
+        // is a list the registration does not permit, which is what `malformed` says
+        let mut params = siphon_rtp_codec::factory::EvsParams::parse(&snapshot.fmtp)
+            .unwrap_or_else(|_| siphon_rtp_codec::factory::EvsParams::default());
+        params.malformed |= snapshot.malformed;
+        params
+    }))
 }
 
 /// Map an SDES [`CryptoAttribute`] to its snapshot (suite name + hex key material).

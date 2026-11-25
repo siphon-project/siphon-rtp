@@ -54,6 +54,7 @@ pub mod g729;
 // as `amr`: the feature gates TRANSCODING only, and passthrough of EVS never reaches this crate.
 #[cfg(feature = "evs")]
 pub mod evs;
+pub mod evs_fmtp;
 pub mod l16;
 pub mod mode_request;
 pub mod opus;

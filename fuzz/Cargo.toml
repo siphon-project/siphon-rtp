@@ -15,7 +15,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 # Every crate with a parser that eats untrusted bytes off the network gets a fuzz target. The codec
-# crate is included with the `amr` feature so the AMR-NB/WB RFC 4867 payload decoders (a hostile
+# crate is included with the `amr` and `evs` features so the AMR-NB/WB RFC 4867 and the EVS payload decoders (a hostile
 # codec bitstream off the wire) are fuzzed too, alongside the Opus packet framing and CELT decode.
 siphon-rtp-media = { path = "../crates/siphon-rtp-media" }
 siphon-rtp-engine = { package = "siphon-rtp", path = "../crates/siphon-rtp-engine" }
@@ -23,7 +23,7 @@ siphon-rtp-ngcompat = { path = "../crates/siphon-rtp-ngcompat" }
 siphon-rtp-proto = { path = "../crates/siphon-rtp-proto" }
 siphon-rtp-stun = { path = "../crates/siphon-rtp-stun" }
 siphon-rtp-ice = { path = "../crates/siphon-rtp-ice" }
-siphon-rtp-codec = { path = "../crates/siphon-rtp-codec", features = ["amr"] }
+siphon-rtp-codec = { path = "../crates/siphon-rtp-codec", features = ["amr", "evs"] }
 siphon-rtp-li = { path = "../crates/siphon-rtp-li" }
 # The MCPTT floor data channel target drives a peer SCTP host against the engine channel driver.
 siphon-rtp-dtls = { path = "../crates/siphon-rtp-dtls" }
@@ -97,6 +97,24 @@ bench = false
 [[bin]]
 name = "amr_wb_decode_fuzz"
 path = "fuzz_targets/amr_wb_decode_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# 3GPP TS 26.445 Annex A — EVS RTP payload parse (compact and header-full, CMR, ToC) and the a=fmtp
+# parameter list.
+[[bin]]
+name = "evs_payload_fuzz"
+path = "fuzz_targets/evs_payload_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# 3GPP TS 26.445 Annex A / TS 26.442 — EVS RTP payload parse + decode with state kept across payloads
+# (hostile codec bitstream).
+[[bin]]
+name = "evs_decode_fuzz"
+path = "fuzz_targets/evs_decode_fuzz.rs"
 test = false
 doc = false
 bench = false

@@ -38,12 +38,16 @@ AMR-NB / AMR-WB transcoding is behind the `amr` Cargo feature, off by default fo
 cargo install siphon-rtp --features amr
 ```
 
+EVS decoding is behind the `evs` feature on the same terms. There is no EVS encoder, so it lets the
+engine record, stream and fork EVS legs decoded; it never makes EVS a transcode target
+([EVS](codecs.md#evs)).
+
 From source:
 
 ```sh
 git clone https://github.com/siphon-project/siphon-rtp
 cd siphon-rtp
-cargo build --release -p siphon-rtp          # add --features amr for AMR transcoding
+cargo build --release -p siphon-rtp          # add --features amr for AMR transcoding, evs to decode EVS
 ./target/release/siphon-rtp --control 127.0.0.1:8080
 ```
 

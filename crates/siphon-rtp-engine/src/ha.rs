@@ -448,6 +448,25 @@ pub struct CodecSnapshot {
     /// for a non-Opus codec, and for an Opus leg whose peer declared nothing (the RFC defaults apply).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opus: Option<OpusSnapshot>,
+    /// The negotiated `audio/EVS` `a=fmtp` parameters (3GPP TS 26.445 A.3), preserved so a restored
+    /// leg keeps reading its payloads in the format the peer negotiated (`hf-only`) and decoding at
+    /// the bandwidth it sends. `None` for a non-EVS codec, and for an EVS leg whose peer declared
+    /// nothing (the registration's defaults apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evs: Option<EvsSnapshot>,
+}
+
+/// The `audio/EVS` `a=fmtp` parameters of a leg (mirror of `siphon_rtp_codec::factory::EvsParams`,
+/// which is serde-free): the parameter list in the registration's own syntax, which is the one form
+/// every parameter has, plus the mark for a list the registration does not permit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvsSnapshot {
+    /// The parameters as an `a=fmtp` body (`hf-only=1;bw=nb-swb`).
+    pub fmtp: String,
+    /// A parameter had a value the registration does not permit: the leg is relayed and never
+    /// decoded, and that is still so after a restore.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub malformed: bool,
 }
 
 /// The RFC 7587 §6.1 Opus `a=fmtp` parameters (mirror of `siphon_rtp_codec::factory::OpusParams`,
@@ -822,6 +841,7 @@ mod tests {
                 allowed_modes: Vec::new(),
                 amr: None,
                 opus: None,
+                evs: None,
             }),
             far_codec: None,
             near_telephone_event: Some(101),

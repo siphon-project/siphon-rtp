@@ -14,7 +14,7 @@ use super::*;
 
 /// Offer `offer_media` from A, answer `answer_media` from B, and return the engine plus each
 /// phone with the engine address it sends to. Both media sections are complete `m=` blocks.
-async fn relay_on(
+pub(super) async fn relay_on(
     call_id: &str,
     offer_media: impl Fn(SocketAddr) -> String,
     answer_media: impl Fn(SocketAddr) -> String,
@@ -68,7 +68,7 @@ async fn relay_on(
 }
 
 /// An RTP packet carrying `payload` under PT `payload_type`.
-fn rtp_packet(
+pub(super) fn rtp_packet(
     payload_type: u8,
     sequence: u16,
     timestamp: u32,
@@ -85,7 +85,7 @@ fn rtp_packet(
 
 /// Attach a caller-only tee at the caller's own rate: one wire frame per decoded packet, so the
 /// counts on its end event are exact.
-async fn attach_caller_tee(
+pub(super) async fn attach_caller_tee(
     engine: &Engine<UdpLoopbackDatapath>,
     call_id: &str,
 ) -> flume::Receiver<tokio_tungstenite::tungstenite::Message> {
@@ -113,7 +113,7 @@ async fn attach_caller_tee(
 }
 
 /// Send every packet from A and assert B receives each one byte for byte, in order.
-async fn assert_relayed_verbatim(
+pub(super) async fn assert_relayed_verbatim(
     (phone_a, near_addr): (&UdpSocket, SocketAddr),
     phone_b: &UdpSocket,
     packets: &[Vec<u8>],
@@ -129,7 +129,7 @@ async fn assert_relayed_verbatim(
 }
 
 /// Detach the tee and return its `(frames_sent, frames_dropped)`.
-async fn detach_and_count(
+pub(super) async fn detach_and_count(
     engine: &Engine<UdpLoopbackDatapath>,
     events: &flume::Receiver<Event>,
     call_id: &str,

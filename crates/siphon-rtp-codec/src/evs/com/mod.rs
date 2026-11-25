@@ -10,6 +10,7 @@ pub mod bitalloc;
 pub mod bitallocsum;
 pub mod bits_alloc;
 pub mod bitstream;
+pub mod bitstream_rtp;
 pub mod cb_shape;
 pub mod cldfb;
 pub mod cng_exc;

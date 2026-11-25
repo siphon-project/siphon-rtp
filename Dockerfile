@@ -6,6 +6,7 @@
 #
 #   docker build -t siphon-rtp .                      # UDP-backend image (any kernel)
 #   docker build --build-arg CARGO_FEATURES=amr .     # + AMR-NB/WB transcode (patent-gated)
+#   docker build --build-arg CARGO_FEATURES=evs .     # + EVS decode (patent-gated; no EVS encoder)
 #
 # See docker-compose.yml for the dev (veth + SKB XDP) and prod (host-net + native XDP) profiles.
 
@@ -28,7 +29,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Builder: cook deps (cached until Cargo.lock changes), then build the engine ──────────
 FROM chef AS builder
-# Opt-in Cargo features (only `amr` today: AMR-NB/WB transcode, patent-gated — see
+# Opt-in Cargo features (`amr`: AMR-NB/WB transcode, `g729`, `evs`: EVS decode, all patent-gated — see
 # docs/codec-licensing.md). Empty by default. The XDP datapath is a separate excluded workspace
 # (crates/siphon-rtp-xdp), not a Cargo feature; the default binary runs the UDP backend.
 ARG CARGO_FEATURES=""

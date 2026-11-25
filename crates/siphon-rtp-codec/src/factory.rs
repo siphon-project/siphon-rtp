@@ -7,6 +7,9 @@
 #[cfg(feature = "amr")]
 use crate::amr::{AmrNb, AmrWb, PayloadFormat, RtpConfig};
 use crate::cn::Cn;
+#[cfg(feature = "evs")]
+use crate::evs::codec::EvsRtpDecoder;
+pub use crate::evs_fmtp::EvsParams;
 use crate::g711::{Variant, G711};
 use crate::g722::G722;
 use crate::g726::{Rate, G726};
@@ -32,6 +35,13 @@ fn g726_rate(encoding_name: &str) -> Option<Rate> {
 /// The SDP encoding name of Opus (RFC 7587 §6.1 registers the media subtype `opus`), uppercased to
 /// match [`CodecSpec::encoding_name`]'s normalisation.
 pub const OPUS_ENCODING_NAME: &str = "OPUS";
+
+/// The SDP encoding name of EVS (3GPP TS 26.445 A.3 registers the media subtype `EVS`).
+pub const EVS_ENCODING_NAME: &str = "EVS";
+
+/// The one RTP clock rate EVS signals, in Hz (`a=rtpmap:<pt> EVS/16000`, TS 26.445 A.3). The codec's
+/// own output rate is 8, 16, 32 or 48 kHz by bandwidth; the RTP clock is independent of it.
+pub const EVS_CLOCK_RATE_HZ: u32 = 16_000;
 
 /// The one RTP clock rate Opus signals, in Hz. RFC 7587 §4.1: "the RTP timestamp is incremented with
 /// a 48000 Hz clock rate for all modes of Opus and all sampling rates", and §7.1 repeats it for SDP —
@@ -247,6 +257,10 @@ pub struct CodecSpec {
     /// declared nothing — a consumer reads [`OpusParams::default`] then, which *is* the RFC default
     /// set. Ignored by every non-Opus codec.
     pub opus: Option<OpusParams>,
+    /// The peer's `audio/EVS` `a=fmtp` parameters (3GPP TS 26.445 A.3), when this spec names EVS and
+    /// the peer sent an `a=fmtp`. `None` reads as every registration default: both payload formats,
+    /// every bandwidth. Ignored by every other codec.
+    pub evs: Option<EvsParams>,
     /// Whether G.729 Annex B (VAD / DTX / comfort noise) is in force on this stream — the SDP
     /// `a=fmtp:18 annexb=` parameter, RFC 3555 §4.1.13.
     ///
@@ -293,6 +307,7 @@ impl CodecSpec {
             allowed_modes: Vec::new(),
             amr: None,
             opus: None,
+            evs: None,
             // RFC 3555 §4.1.13: absent means yes.
             annex_b: true,
         }
@@ -367,6 +382,39 @@ impl CodecSpec {
     pub fn with_allowed_modes(mut self, modes: Vec<u8>) -> Self {
         self.allowed_modes = modes;
         self
+    }
+
+    /// Whether this spec names EVS (3GPP TS 26.445).
+    #[must_use]
+    pub fn is_evs(&self) -> bool {
+        self.encoding_name == EVS_ENCODING_NAME
+    }
+
+    /// Attach the peer's `audio/EVS` `a=fmtp` parameters. A spec for any other codec is left
+    /// untouched.
+    #[must_use]
+    pub fn with_evs_params(mut self, params: Option<EvsParams>) -> Self {
+        if self.is_evs() {
+            self.evs = params;
+        }
+        self
+    }
+
+    /// Why the engine cannot carry this EVS configuration, or `None` when it can (and for every
+    /// other codec): a parameter with a value the registration does not permit, a clock rate
+    /// other than the 16000 Hz `EVS/16000` names, or more than one channel.
+    #[must_use]
+    pub fn evs_unsupported(&self) -> Option<&'static str> {
+        if !self.is_evs() {
+            return None;
+        }
+        if self.clock_rate_hz != EVS_CLOCK_RATE_HZ {
+            return Some("EVS is signalled at a 16000 Hz RTP clock (EVS/16000)");
+        }
+        if self.channels > 1 {
+            return Some("multi-channel EVS is not implemented");
+        }
+        self.evs.and_then(|params| params.unsupported())
     }
 
     /// Whether this spec names AMR or AMR-WB, the two codecs of the RFC 4867 payload format.
@@ -532,6 +580,22 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
             spec.decode_channels(),
             spec.ptime_ms,
         )?)),
+        // EVS **decode** is bit-exact for every TS 26.444 decoder sequence (primary modes 1 and 2
+        // and the AMR-WB interoperable mode, clean, frame-erased, DTX, channel-aware and switching)
+        // and reads both RTP payload formats of TS 26.445 Annex A. There is no EVS encoder, so
+        // `encoder_for` refuses it and the engine never offers EVS as a transcode target: what is
+        // built here serves the consumers that only need the audio (a decoded recording, a WS tee,
+        // a SIPREC fork, an interception). Behind the `evs` feature like AMR, for the same reason.
+        #[cfg(feature = "evs")]
+        EVS_ENCODING_NAME => {
+            if let Some(reason) = spec.evs_unsupported() {
+                return Err(CodecError::Unsupported(reason));
+            }
+            Ok(Box::new(EvsRtpDecoder::negotiated(
+                &spec.evs.unwrap_or_default(),
+                spec.ptime_ms,
+            )?))
+        }
         _ => Err(CodecError::Unsupported(unsupported_name(
             &spec.encoding_name,
         ))),
@@ -667,7 +731,7 @@ impl KnownCodec {
 /// a capability advertisement is [`available_codecs`], which asks the factory about each entry, so
 /// a codec the factory serves cannot be missing from it and one it refuses cannot be in it. A test
 /// holds this list to the arms of the two functions, so a codec added to them is added here.
-pub const KNOWN_CODECS: [KnownCodec; 11] = [
+pub const KNOWN_CODECS: [KnownCodec; 12] = [
     KnownCodec::new("PCMU", "PCMU", 8000),
     KnownCodec::new("PCMA", "PCMA", 8000),
     KnownCodec::new("G722", "G722", 8000),
@@ -682,6 +746,9 @@ pub const KNOWN_CODECS: [KnownCodec; 11] = [
     KnownCodec::new("L16", "L16", 16000),
     KnownCodec::new("AMR-WB", "AMR-WB", 16000),
     KnownCodec::new("AMR", "AMR", 8000),
+    // Decodes with the `evs` feature and has no encoder, so `is_available` is false for it and it is
+    // not advertised as something the engine can transcode.
+    KnownCodec::new("EVS", EVS_ENCODING_NAME, EVS_CLOCK_RATE_HZ),
     KnownCodec {
         channels: OPUS_RTPMAP_CHANNELS,
         ..KnownCodec::new("opus", OPUS_ENCODING_NAME, OPUS_CLOCK_RATE_HZ)
@@ -746,9 +813,17 @@ fn unsupported_name(encoding_name: &str) -> &'static str {
              patent-licensed — see docs/codec-licensing.md); G.723.1 passthrough/relay is always \
              available"
         }
+        // With the `evs` feature the decoder is built, so what reaches here is `encoder_for`.
+        #[cfg(not(feature = "evs"))]
         "EVS" => {
-            "EVS transcoding is not implemented (planned behind the `evs` build feature, \
-             patent-licensed — see docs/codec-licensing.md); EVS passthrough/relay is always available"
+            "EVS transcoding requires the `evs` build feature (patent-licensed — see \
+             docs/codec-licensing.md); EVS passthrough/relay is always available"
+        }
+        #[cfg(feature = "evs")]
+        "EVS" => {
+            "there is no EVS encoder: the `evs` build feature decodes EVS only (to record, stream or \
+             fork it), so EVS cannot be sent as a transcode target; EVS passthrough/relay is always \
+             available"
         }
         "ILBC" | "SPEEX" => {
             "this codec is royalty-free but has no implementation in the engine; passthrough/relay is \
@@ -1381,10 +1456,8 @@ mod tests {
         // decides whether a call had to fail at all (docs/codec-licensing.md).
         // G.729 has its own pair of tests below, because whether it is implemented depends on the
         // build and the message has to say which.
-        for (name, expected) in [
-            ("G723", "G.723.1 transcoding is not implemented"),
-            ("EVS", "EVS transcoding is not implemented"),
-        ] {
+        {
+            let (name, expected) = ("G723", "G.723.1 transcoding is not implemented");
             let spec = CodecSpec::new(18, name, 8000, 1, 20);
             let Err(CodecError::Unsupported(message)) = decoder_for(&spec) else {
                 panic!("{name} has no decoder in this build");
@@ -1398,6 +1471,24 @@ mod tests {
                 panic!("{name} has no encoder in this build");
             };
             assert!(message.contains(expected), "{name}: {message}");
+        }
+    }
+
+    #[cfg(not(feature = "evs"))]
+    #[test]
+    fn evs_transcoding_is_unsupported_without_the_evs_feature() {
+        // Default build: EVS decoding is gated off (patent-licensed). Both directions name the
+        // feature and say relaying is unaffected.
+        let spec = CodecSpec::new(96, "EVS", 16_000, 1, 20);
+        for result in [decoder_for(&spec).err(), encoder_for(&spec).err()] {
+            let Some(CodecError::Unsupported(message)) = result else {
+                panic!("EVS has neither half without the feature");
+            };
+            assert!(message.contains("`evs` build feature"), "{message}");
+            assert!(
+                message.contains("passthrough/relay is always available"),
+                "{message}"
+            );
         }
     }
 
@@ -1677,7 +1768,7 @@ mod tests {
             }
         }
         // The two arms that are not string literals.
-        for name in [OPUS_ENCODING_NAME, "G726-32"] {
+        for name in [OPUS_ENCODING_NAME, EVS_ENCODING_NAME, "G726-32"] {
             assert!(KNOWN_CODECS.iter().any(|codec| codec.encoding_name == name));
         }
         // And the other way: an entry names something the factory at least recognises, which a

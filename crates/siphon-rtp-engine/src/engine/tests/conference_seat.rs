@@ -207,7 +207,7 @@ async fn a_masked_codec_is_not_seated() {
 }
 
 /// Without the `amr` feature the same offer is refused, and the reason says, codec by codec, that
-/// EVS is not implemented and that AMR needs the `amr` build feature.
+/// EVS cannot be encoded (or, without the `evs` feature, decoded either) and that AMR needs the `amr` build feature.
 #[cfg(not(feature = "amr"))]
 #[tokio::test]
 async fn a_terminal_offer_is_refused_naming_the_missing_amr_feature() {
@@ -223,7 +223,12 @@ async fn a_terminal_offer_is_refused_naming_the_missing_amr_feature() {
     .await;
     let reason = refusal(&refused);
     assert!(
-        reason.starts_with("conference_join: no offered codec can be seated: EVS/16000 payload type 110: no decoder: unsupported: EVS transcoding is not implemented"),
+        reason.starts_with(if cfg!(feature = "evs") {
+            // a room mixes: it decodes each seat and encodes the mix back, and EVS has no encoder
+            "conference_join: no offered codec can be seated: EVS/16000 payload type 110: no encoder: unsupported: there is no EVS encoder"
+        } else {
+            "conference_join: no offered codec can be seated: EVS/16000 payload type 110: no decoder: unsupported: EVS transcoding requires the `evs` build feature"
+        }),
         "{reason}"
     );
     for payload_type in [104, 106] {

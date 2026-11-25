@@ -21,7 +21,7 @@ default = []
 # jurisdiction. See docs/codec-licensing.md.
 amr = [] # AMR-NB / AMR-WB (3GPP TS 26.071 / 26.171) — the VoLTE codecs.
 g729 = [] # G.729 (ITU-T G.729) — 8 kbit/s CS-ACELP. Annex B (VAD/DTX/CNG) is not implemented.
-evs = [] # EVS (3GPP TS 26.441 family) — the VoLTE successor to AMR-WB. In progress: no factory arm yet.
+evs = [] # EVS (3GPP TS 26.441 family) — the VoLTE successor to AMR-WB. Decode only (both RTP payload formats): the factory builds a decoder and refuses an encoder.
 
 [dependencies]
 thiserror = { workspace = true }

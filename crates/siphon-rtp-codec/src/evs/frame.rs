@@ -81,6 +81,16 @@ impl AmrWbIoMode {
     /// Speech bits per frame for modes 0..=8 (the AMR-WB frame sizes, TS 26.201).
     const BITS: [u16; 9] = [132, 177, 253, 285, 317, 365, 397, 461, 477];
 
+    /// The mode with number `index`, or `None` above 8.
+    #[must_use]
+    pub const fn from_index(index: u8) -> Option<Self> {
+        if index <= 8 {
+            Some(Self(index))
+        } else {
+            None
+        }
+    }
+
     /// The mode number, 0..=8.
     #[must_use]
     pub const fn index(self) -> u8 {

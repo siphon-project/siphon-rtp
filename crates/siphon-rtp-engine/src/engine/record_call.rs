@@ -18,7 +18,7 @@ use siphon_rtp_media::bridge::wire_rate::wire_resampler;
 use siphon_rtp_proto::RecordingEndReason;
 
 use super::record::{pcm_rate_of, StandUp};
-use super::{Engine, PromoteMode, PromotionReason};
+use super::{Engine, PipelineKind, PromoteMode, PromotionReason};
 
 /// A recording's frame assembler, held strongly across a re-answer — see
 /// [`Engine::pin_call_recordings`].
@@ -64,7 +64,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         else {
             return;
         };
-        if !self.media.is_media_call(call_id) {
+        // The pipeline call has its media actor up. A plain relay has none until a recording holds it
+        // in userspace, which `stand_up_recording` does, relay-only: this is the call that records a
+        // codec the engine decodes and does not encode (see `resolve_pipeline_kind`), and any other
+        // plain relay is not one that asked for the pipeline, so nothing is recorded for it.
+        let relay_records = self
+            .owned_call_internal(call_id, |call| call.pipeline == PipelineKind::Passthrough)
+            .unwrap_or(false);
+        if !self.media.is_media_call(call_id) && !relay_records {
             return;
         }
         let Some((near_codec, far_codec, from_tag, to_tag, owner)) =

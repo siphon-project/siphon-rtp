@@ -32,7 +32,9 @@ from the offer/answer, once, at `answer`:
   never saw.
 - **Something else needs the audio** — recording at answer (`record-call`), noise suppression, echo
   cancellation or record-tone detection put the call on the media path even when both legs share a
-  codec, and that path decodes.
+  codec, and that path decodes. (A codec that only decodes, EVS, cannot take that path, which
+  re-encodes: `record-call` on it keeps the call a relay and decodes a copy for the files, and the
+  others are refused.)
 
 Only the last three need the codec compiled in. On a call that transcodes, A is held on the first
 codec of its offer this build can transcode, in A's order, so an offer led by a codec the engine
@@ -56,7 +58,7 @@ relay a stream the far side cannot decode.
 | AMR-NB | `AMR` (dynamic) | all 8 modes | all 8 modes | 3GPP TS 26.074 vectors | `amr` |
 | Opus | `opus` (dynamic, `opus/48000/2`) | yes — SILK, CELT and Hybrid, mono and stereo, all bandwidths and frame durations, PLC and in-band FEC | yes — SILK, CELT and Hybrid, mono and stereo, VBR / constrained VBR / CBR, LBRR/FEC and DTX | all 12 official RFC 6716 vectors (mono + stereo), plus exact per-packet `final_range`; the encoder against libopus' own decoder over the full configuration matrix | none (royalty-free) |
 | G.729 (+ Annex B) | `G729` (18) | yes | yes | ITU-T G.729 Release 3 sequences — all nine decode byte-exact, all six with an input encode byte-exact; Annex B all six decode and all four encode byte-exact | `g729` |
-| EVS | | no | no | | absent |
+| EVS | `EVS` (dynamic, `EVS/16000`) | yes — EVS primary modes 1 and 2 and AMR-WB IO, both RTP payload formats | **no** | all 979 TS 26.444 EVS and all 1590 AMR-WB IO decoder sequences, byte for byte; the RTP path against the reference's own storage-format decoder | `evs` |
 
 **G.729 Annex B** — voice-activity detection, discontinuous transmission and comfort-noise
 generation — is implemented in both directions. An inactive frame becomes either a two-octet silence
@@ -91,7 +93,8 @@ Relaying is unaffected by any of this — the engine never executes a codec on t
 **What `node_info` lists.** The `codecs` list of `node_info` is derived from the codec factory, not
 kept beside it: a codec is listed exactly when this build both decodes and encodes it, so `G729`,
 `AMR` and `AMR-WB` appear on a build with their feature and on no other. `CN` is listed although it
-has no encoder (it is a generator), and `telephone-event` although it is not a codec.
+has no encoder (it is a generator), and `telephone-event` although it is not a codec. `EVS` is never
+listed: it decodes and has no encoder, and the list has no per-direction field.
 
 The engine resolves a codec from the `a=rtpmap` encoding name (case-insensitive, RFC
 4566 §6), falling back to the RFC 3551 §6 static payload-type table (`PCMU` 0, `GSM` 3,
@@ -315,8 +318,55 @@ signals mono or stereo through the `stereo` / `sprop-stereo` fmtp parameters), s
 Going genuinely multi-channel end to end (a stereo mixer, a two-channel resampler, a stereo
 WAV) is a separate change; nothing in the codec work depends on it.
 
-**EVS.** Not implemented, and gated by an active patent pool besides; see
-[Codec licensing](codec-licensing.md). EVS passthrough relays fine.
+<a id="evs"></a>
+**EVS.** Decode only, behind the `evs` feature (an active patent pool; see
+[Codec licensing](codec-licensing.md)). There is no EVS encoder.
+
+*What works with `evs` built in.*
+
+- The decoder reproduces every TS 26.444 decoder sequence byte for byte: the EVS primary modes (the
+  ACELP, HQ and TCX cores with every bandwidth extension, 2.8 to 128 kbit/s, NB to FB), the AMR-WB
+  interoperable (IO) mode, SID and NO_DATA comfort noise, frame-erasure concealment, channel-aware
+  partial copies and the switches between the modes.
+- Both RTP payload formats of TS 26.445 Annex A are read: the **compact** one (one frame, its size
+  names it; an AMR-WB IO frame with its 3-bit CMR) and the **header-full** one (optional CMR octet,
+  a table of contents, any number of frames up to 12 per packet, the `Q` bit, SPEECH_LOST, NO_DATA,
+  an AMR-WB IO SID with its STI bit). With `hf-only=1` every payload is header-full. Without it a
+  payload is compact exactly when its size in bits is one of the 22 compact sizes, except 56 bits
+  with the first bit set, which is an AMR-WB IO SID behind a CMR octet (A.2.1.3).
+- `a=fmtp` is read per the registration: `hf-only`, `evs-mode-switch`, `dtx`, `dtx-recv`, `br`,
+  `br-send`, `br-recv`, `bw`, `bw-send`, `bw-recv`, `cmr`, `ch-aw-recv`, `mode-set` and `max-red`.
+  An unknown parameter is ignored; a known one with a value the registration does not permit (or
+  written twice) marks the payload type malformed: it is relayed as ever and never decoded on a guess.
+  The decoder's output rate is that of the widest bandwidth the peer may send (`bw-send`, else `bw`,
+  else fullband): 8, 16, 32 or 48 kHz. The RTP clock stays 16000 whatever the output rate.
+- A lost packet is concealed by the decoder; in a silence period it keeps producing comfort noise.
+  The codec mode request (CMR) of every payload is parsed, and acted on by nothing, because it
+  is addressed to an encoder.
+
+*What the engine does with an EVS leg.*
+
+| | with `evs` | without |
+|---|---|---|
+| Relay EVS to EVS | forwarded as it arrived, no codec | the same |
+| Decoded recording (`start_recording`, `record_call`), WS tee, SIPREC decoded forks | decoded off the relay beside the verbatim forward (`record_call` keeps the call a relay; nothing is decoded and re-encoded) | refused: no decoder |
+| A call that transcodes to or from EVS, noise suppression, echo cancellation, beep detection, a WebSocket takeover, a conference seat, a forwarding-room seat in another codec | refused, naming the EVS encoder that is missing | refused, naming the `evs` feature |
+| `codec-transcode-EVS` | not offered (an unknown target) | the same |
+| `node_info` `codecs` | not listed: the list means the build decodes **and** encodes it | the same |
+
+*What does not work.* EVS cannot be sent by the engine in any form: there is no encoder, no EVS
+transcode target, no EVS conference seat.
+
+**How the RTP path is validated.** The depacketizer is held to three references that do not share
+its code: the reference encoder's own storage-format output for every EVS rate and AMR-WB IO mode
+(each frame, with its G.192 twin, must read back to exactly the G.192 bits, which settles the bit
+order, the AMR-WB IO sorting and the STI bit); Wireshark's EVS dissector (every payload size, every
+CMR octet, table-of-contents fields); and the reference decoder run on the storage format
+(`EVS_dec -mime`), against which all 2569 TS 26.444 decoder sequences, wrapped into both payload
+formats, decode byte for byte. 108 of them (DTX combined with frame erasure) differ from the
+`.OUT` files the reference's G.192 decoder wrote, because an RTP frame says what it is (SPEECH_LOST,
+NO_DATA, the STI bit) where a G.192 file leaves the decoder to infer it; for those the reference's
+storage-format decoder gives the engine's output exactly.
 
 ## The `amr` feature
 
