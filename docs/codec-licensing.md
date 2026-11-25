@@ -34,7 +34,7 @@ default binary.
 |---|---|---|
 | `amr` | AMR-NB (TS 26.071), AMR-WB / G.722.2 (TS 26.171) | implemented, bit-exact (AMR-WB decode + encode, all 9 modes; AMR-NB decode + encode, all 8 speech modes) |
 | `g729` | G.729, G.729A, G.729B | decoder **and** encoder implemented, bit-exact against the ITU-T Release 3 sequences in both directions, Annex B (VAD/DTX/CNG) included |
-| `evs` | EVS (TS 26.441…) | **in progress, not usable yet**: the port of the TS 26.442 fixed-point reference has begun (operators, G.192 reader, conformance harness), but there is no decoder or encoder, so the factory still reports EVS as unsupported with or without the feature |
+| `evs` | EVS (TS 26.441…) | **decoder only**, bit-exact against every TS 26.444 decoder sequence (EVS primary modes 1 and 2 and the AMR-WB interoperable mode; clean, frame-erased, DTX, channel-aware and switching), reading both RTP payload formats of TS 26.445 Annex A. There is no encoder: the factory builds an EVS decoder and refuses an encoder, so EVS is recorded, streamed and forked decoded but never a transcode target |
 
 **Enabling any feature above is an explicit statement that you, the operator, hold the necessary
 patent licence(s) for that codec in your jurisdiction.** Build with e.g. `--features amr`.
@@ -62,7 +62,7 @@ status on the right (passthrough of every codec is always available, per the rul
 |---|---|
 | AMR-NB / AMR-WB | 3GPP patent pool. Core patents have largely expired (NB ~2019, WB ~2022) but there is **no explicit royalty-free grant** — treat as licence-required. *Mandatory for VoLTE*, so implemented (behind `amr`); the operator carries the licence. |
 | G.729 / G.723.1 | Core patents expired (~2015–2017) but, again, **no explicit grant** — a counsel-grade call. Gated behind `g729`; the operator enabling it carries that call. G.723.1 is not implemented. |
-| EVS | **Actively encumbered** — large pool (Fraunhofer/Qualcomm/Nokia/…), filed ~2012–14, **no expiry until ~2032+**. Always gated; only ever compiled in by an explicitly-licensed operator. |
+| EVS | **Actively encumbered** — large pool (Fraunhofer/Qualcomm/Nokia/…), filed ~2012–14, **no expiry until ~2032+**. Always gated (behind `evs`, which builds the decoder: decoding is running the codec, so a decoded recording or a WS tee of EVS needs the licence as much as a transcode would); only ever compiled in by an explicitly-licensed operator. |
 
 ## Excluded outright
 

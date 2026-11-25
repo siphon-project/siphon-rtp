@@ -91,7 +91,7 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **Recording (runtime raw-RTP pcap)** | — | Implemented |
 | **Clustering + warm-standby HA (checkpoint / restore)** | — | Implemented — plain / SDES-SRTP / transcode / secure-transcode restore (WS restore pending) |
 | **Opus** | RFC 6716 / RFC 7587 | Implemented and wired **both ways** — SILK / CELT / Hybrid, mono + stereo, PLC + in-band FEC, VBR/CVBR/CBR and DTX, with every RFC 7587 `a=fmtp` parameter honoured; decode gated on all 12 official vectors plus exact per-packet `final_range`, encode against libopus' own decoder |
-| **EVS** | 3GPP TS 26.441 | Planned |
+| **EVS** | 3GPP TS 26.441 / TS 26.445 | Decode only (`evs` feature) — every TS 26.444 decoder sequence byte-exact (EVS primary modes and AMR-WB IO), both RTP payload formats; no encoder, so EVS relays, records and streams but is never a transcode target ([docs](docs/codecs.md#evs)) |
 
 ## Performance
 
@@ -318,7 +318,7 @@ WebSocket-bridge paths), SIPREC forking, the N-party conferencing MCU, the RTP�
 runtime pcap recording, and cluster load / drain with warm-standby checkpoint/restore.
 
 On the forward track: the OpenAI-Realtime / gRPC / direct-WebRTC voice-AI adapters, and the EVS
-codec. See the [docs](https://rtp.siphon-sip.org/) for the full picture.
+encoder (the decoder is in, behind the `evs` feature). See the [docs](https://rtp.siphon-sip.org/) for the full picture.
 
 ## License
 

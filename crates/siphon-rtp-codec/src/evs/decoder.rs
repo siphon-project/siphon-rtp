@@ -11,6 +11,7 @@ use crate::evs::cnst::{DEC, L_FRAME48K, MAX_FRAME_COUNTER};
 use crate::evs::com::bitstream::{
     read_indices_frame, reset_indices_dec, FRAMEMODE_MISSING, FRAMEMODE_NORMAL,
 };
+use crate::evs::com::bitstream_rtp::{read_indices_received, ReceivedFrame};
 use crate::evs::com::delay_comp::get_delay;
 use crate::evs::dec::amr_wb_dec::amr_wb_dec;
 use crate::evs::dec::evs_dec::evs_dec;
@@ -64,6 +65,28 @@ impl EvsDecoder {
         })
     }
 
+    /// A decoder for a live stream: as [`Self::new`], but every frame decodes to a whole 20 ms of
+    /// PCM. The reference's delay compensation drops the first part of the first frame so the
+    /// output lines up with the encoder's input, which suits a file comparison and not a stream:
+    /// a packet decoder must return as many samples as it was given frames, and the decoder's
+    /// own delay (a few ms) is not the caller's to remove.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    pub fn new_streaming(output_rate_hz: u32) -> Result<Self, EvsError> {
+        let mut decoder = Self::new(output_rate_hz)?;
+        decoder.dec_delay = 0;
+        decoder.zero_pad = 0;
+        Ok(decoder)
+    }
+
+    /// Whether the last frame received was in the AMR-WB interoperable mode, which is what a lost
+    /// frame is concealed in.
+    #[must_use]
+    pub fn is_amr_wb_io(&self) -> bool {
+        self.st.opt_amr_wb != 0
+    }
+
     /// Samples one input frame decodes to before the start-of-stream delay is removed.
     #[must_use]
     pub fn frame_samples(&self) -> usize {
@@ -89,7 +112,34 @@ impl EvsDecoder {
             });
         }
         read_indices_frame(&mut self.st, frame)?;
+        self.decode_read_frame(out)
+    }
 
+    /// Decode one frame received in an RTP payload (TS 26.445 Annex A) into `out`, as
+    /// [`Self::decode_frame`] does for a G.192 frame: a whole frame, or fewer while the decoder
+    /// delay is being dropped (never, for a [`Self::new_streaming`] decoder).
+    ///
+    /// A lost frame is a [`ReceivedFrame`] with `speech_lost` set and no bits, and conceals.
+    ///
+    /// # Errors
+    /// As [`Self::decode_frame`].
+    pub fn decode_received(
+        &mut self,
+        frame: &ReceivedFrame<'_>,
+        out: &mut [i16],
+    ) -> Result<usize, EvsError> {
+        if out.len() < self.output_frame {
+            return Err(EvsError::OutputTooSmall {
+                needed: self.output_frame,
+                have: out.len(),
+            });
+        }
+        read_indices_received(&mut self.st, frame)?;
+        self.decode_read_frame(out)
+    }
+
+    /// Decode the frame the bitstream reader has just taken in.
+    fn decode_read_frame(&mut self, out: &mut [i16]) -> Result<usize, EvsError> {
         let mut output = [0i16; L_FRAME48K as usize];
         let st = &mut *self.st;
         // run the main decoding routine

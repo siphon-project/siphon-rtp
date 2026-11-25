@@ -2,8 +2,9 @@
 //! with its RX DTX handler, the bit readers every decoding stage calls, the MODE1/MODE2 codec
 //! selection, and the channel-aware (RF) signalling readers.
 //!
-//! The encoder half of the file (`push_indice_fx`, `write_indices_fx`, ...) and the MIME / RTP /
-//! jitter-buffer readers are not ported: the decoder here is driven by G.192 frames only.
+//! The encoder half of the file (`push_indice_fx`, `write_indices_fx`, ...) and the jitter-buffer
+//! reader are not ported. The G.192 reader is here; the RTP / storage-format reader (the
+//! `read_indices_mime` family) is [`super::bitstream_rtp`].
 
 use crate::evs::cnst::{
     ACELP_13K20, ACELP_16K40, ACELP_24K40, ACELP_64K, ACELP_CORE, ACELP_MODE_MAX, ACTIVE_FRAME,

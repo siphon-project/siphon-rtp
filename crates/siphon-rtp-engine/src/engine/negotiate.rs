@@ -1095,10 +1095,16 @@ pub(super) fn resolve_pipeline_kind(
     near_dtls: bool,
 ) -> PipelineKind {
     // Transcode when the two legs' primary codecs differ in encoding or clock rate.
-    let transcode = match (near_codec, info.primary_codec()) {
-        (Some(near), Some(far)) => !same_codec(near, &far),
+    let far_codec = info.primary_codec();
+    let transcode = match (near_codec, far_codec.as_ref()) {
+        (Some(near), Some(far)) => !same_codec(near, far),
         _ => false,
     };
+    // `record_call` on a codec that only decodes is served by the relay, not the pipeline. Only the
+    // plain arm below does that: a secure leg keeps resolving to its decoding twin (and so to the
+    // codec factory's refusal), because a crypto bridge has no decoded audio to record.
+    let record_call_on_relay =
+        record_call_decodes_on_the_relay(transcode, profile, near_codec, far_codec.as_ref());
     // Everything that cannot be done to a payload the engine only forwards. **Every** arm below
     // tests exactly this, and that is the point: each used to spell the list out for itself, and one
     // of them — the secure far leg — spelled a shorter one, checking only `transcode ||
@@ -1175,13 +1181,46 @@ pub(super) fn resolve_pipeline_kind(
             PipelineKind::Srtp
         };
     }
-    if decodes_for_the_whole_call {
+    if decodes_for_the_whole_call && !record_call_on_relay {
         // Recording, noise suppression, echo cancellation, record-tone (beep) detection, or a codec
         // mismatch all need the decoded audio, so force the userspace media slow path instead of the
         // in-kernel passthrough. A tee alone does not: it promotes the relay itself (see above).
         PipelineKind::Media
     } else {
         PipelineKind::Passthrough
+    }
+}
+
+/// Whether `record_call` is the **only** reason to decode a plain call whose two legs carry a codec
+/// the engine decodes and cannot encode (EVS).
+///
+/// The media pipeline decodes and re-encodes every packet, and a codec with no encoder cannot be
+/// re-encoded, so it would refuse the answer for something a recording does not need. A decoded
+/// recording only wants the audio, which a relay decodes a copy of beside the verbatim forward
+/// (`start_record_call_streams`). So the call stays a relay, which is also what keeps the recorded
+/// codec off a lossy decode and re-encode. Anything else that needs the pipeline (a codec mismatch,
+/// noise suppression, echo cancellation, beep detection) still resolves to it and is refused there
+/// with the codec factory's reason.
+fn record_call_decodes_on_the_relay(
+    transcode: bool,
+    profile: &ProfileFlags,
+    near_codec: Option<&CodecSpec>,
+    far_codec: Option<&CodecSpec>,
+) -> bool {
+    if !profile.record_call
+        || transcode
+        || profile.noise_suppression
+        || profile.echo_cancellation
+        || profile.beep_detection
+    {
+        return false;
+    }
+    let decodes_only = |codec: &CodecSpec| {
+        factory::decoder_for(codec).is_ok() && factory::encoder_for(codec).is_err()
+    };
+    match (near_codec, far_codec) {
+        (Some(near), Some(far)) => decodes_only(near) && decodes_only(far),
+        _ => false,
     }
 }
 
@@ -1222,6 +1261,142 @@ mod tests {
             far_dtls,
             near_dtls,
         )
+    }
+
+    fn evs_answer() -> sdp::MediaInfo {
+        sdp::parse(concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.0.2.20\r\n",
+            "s=-\r\n",
+            "c=IN IP4 192.0.2.20\r\n",
+            "t=0 0\r\n",
+            "m=audio 40000 RTP/AVP 110\r\n",
+            "a=rtpmap:110 EVS/16000\r\n",
+            "a=fmtp:110 br=5.9-24.4;bw=nb-wb\r\n",
+        ))
+        .expect("a well-formed EVS answer")
+    }
+
+    /// `record_call` is the one reason to decode that a codec with a decoder and no encoder can meet,
+    /// because a recording needs the audio and not the call decoded and re-encoded. It stays a relay
+    /// (which `start_record_call_streams` then decodes a copy of). Everything else that needs the
+    /// pipeline still resolves to it, and so to the codec factory's refusal, and a secure leg keeps
+    /// its decoding twin rather than a bridge that would record nothing.
+    #[cfg(feature = "evs")]
+    #[test]
+    fn record_call_on_a_decode_only_codec_is_a_relay_and_nothing_else_is() {
+        let info = evs_answer();
+        let near = info.primary_codec();
+        let resolve_evs = |profile: &ProfileFlags, near_sdes: bool, far_sdes: bool, dtls: bool| {
+            resolve_pipeline_kind(
+                near.as_ref(),
+                &info,
+                profile,
+                far_sdes.then(key),
+                near_sdes.then(key),
+                dtls,
+                false,
+            )
+        };
+        let recorded = ProfileFlags {
+            record_call: true,
+            ..ProfileFlags::default()
+        };
+        assert_eq!(
+            resolve_evs(&ProfileFlags::default(), false, false, false),
+            PipelineKind::Passthrough
+        );
+        assert_eq!(
+            resolve_evs(&recorded, false, false, false),
+            PipelineKind::Passthrough,
+            "a recording decodes a copy beside the relay"
+        );
+        for (name, profile) in [
+            (
+                "noise suppression",
+                ProfileFlags {
+                    noise_suppression: true,
+                    ..recorded.clone()
+                },
+            ),
+            (
+                "echo cancellation",
+                ProfileFlags {
+                    echo_cancellation: true,
+                    ..recorded.clone()
+                },
+            ),
+            (
+                "beep detection",
+                ProfileFlags {
+                    beep_detection: true,
+                    ..recorded.clone()
+                },
+            ),
+        ] {
+            assert_eq!(
+                resolve_evs(&profile, false, false, false),
+                PipelineKind::Media,
+                "{name} puts the audio back, which needs the pipeline (and is refused there)"
+            );
+        }
+        assert_eq!(
+            resolve_evs(&recorded, false, true, false),
+            PipelineKind::SrtpMedia,
+            "a secure leg has no relay to decode a copy beside: it keeps its decoding twin"
+        );
+        assert_eq!(
+            resolve_evs(&recorded, true, true, false),
+            PipelineKind::SrtpTranscryptMedia
+        );
+        assert_eq!(
+            resolve_evs(&recorded, false, false, true),
+            PipelineKind::DtlsMedia
+        );
+        // a codec mismatch is a transcode whatever else is asked
+        let pcmu = pcmu_answer().primary_codec();
+        assert_eq!(
+            resolve_pipeline_kind(pcmu.as_ref(), &info, &recorded, None, None, false, false),
+            PipelineKind::Media
+        );
+        // and a codec with both halves is recorded the way it always was
+        let pcmu_info = pcmu_answer();
+        assert_eq!(
+            resolve_pipeline_kind(
+                pcmu.as_ref(),
+                &pcmu_info,
+                &recorded,
+                None,
+                None,
+                false,
+                false
+            ),
+            PipelineKind::Media
+        );
+    }
+
+    /// Without the `evs` feature EVS has no decoder either, so `record_call` on it is the pipeline's
+    /// to refuse, as for any codec the engine cannot decode.
+    #[cfg(not(feature = "evs"))]
+    #[test]
+    fn record_call_on_an_undecodable_codec_resolves_to_the_pipeline_which_refuses_it() {
+        let info = evs_answer();
+        let recorded = ProfileFlags {
+            record_call: true,
+            ..ProfileFlags::default()
+        };
+        assert_eq!(
+            resolve_pipeline_kind(
+                info.primary_codec().as_ref(),
+                &info,
+                &recorded,
+                None,
+                None,
+                false,
+                false
+            ),
+            PipelineKind::Media
+        );
     }
 
     /// A tee streams the *decoded* audio, so it is a reason to decode exactly like a recording.

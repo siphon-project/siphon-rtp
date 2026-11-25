@@ -59,3 +59,11 @@ pub fn cases(root: &Path, script: &str) -> Vec<Case> {
     }
     cases
 }
+
+// Only the RTP tests wrap frames into payloads.
+#[allow(dead_code)]
+pub mod packetize;
+
+// The reference's own decoders, built out of tree (`sh reference/evs/oracle/build.sh`).
+#[allow(dead_code)]
+pub mod oracle;

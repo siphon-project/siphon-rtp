@@ -19,8 +19,16 @@
 //! SID and no-data comfort noise, frame-erasure concealment, and the switches to and from the
 //! primary modes). Every TS 26.444 decoder sequence, EVS and AMR-WB IO alike, decodes byte for
 //! byte to the reference output (clean, frame-erased, DTX, channel-aware and switching);
-//! `tests/evs_conformance.rs` runs every sequence and pins how many. The codec factory does not
-//! offer EVS yet: it also needs the RTP payload format.
+//! `tests/evs_conformance.rs` runs every sequence and pins how many.
+//!
+//! **The RTP path.** [`rtp`] reads the two payload formats of TS 26.445 Annex A (compact and
+//! header-full, with the AMR-WB IO bit sorting and the CMR), [`com::bitstream_rtp`] takes a
+//! frame so received into the decoder with the RTP side's DTX handling, and [`codec::EvsRtpDecoder`]
+//! is the engine's [`crate::Decoder`] over them, built by [`crate::factory::decoder_for`] from the
+//! peer's `a=fmtp` ([`crate::evs_fmtp`]). **Decode only**: there is no encoder, so
+//! [`crate::factory::encoder_for`] refuses EVS and the engine never offers it as a transcode
+//! target. `tests/evs_rtp_conformance.rs` holds the path to the same sequences, wrapped into both
+//! formats.
 //!
 //! Gated behind the off-by-default `evs` Cargo feature, which gates **transcoding** only: relaying
 //! EVS never executes a codec and never reaches this module. EVS is covered by an active patent
@@ -32,6 +40,7 @@
 
 pub mod basop;
 pub mod cnst;
+pub mod codec;
 pub mod com;
 pub mod dec;
 pub mod decoder;
@@ -40,3 +49,4 @@ pub mod frame;
 pub mod g192;
 pub mod macros;
 pub mod rom;
+pub mod rtp;

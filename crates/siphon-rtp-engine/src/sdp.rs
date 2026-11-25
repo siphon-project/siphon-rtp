@@ -13,7 +13,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use siphon_rtp_codec::factory::{CodecSpec, OpusParams, OPUS_MAX_PTIME_MS};
+use siphon_rtp_codec::factory::{CodecSpec, EvsParams, OpusParams, OPUS_MAX_PTIME_MS};
 use siphon_rtp_ice::{Candidate, IceOptions, END_OF_CANDIDATES_ATTRIBUTE, ICE_MISMATCH_ATTRIBUTE};
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
@@ -21,6 +21,7 @@ mod amr;
 mod data_channel;
 mod decline;
 mod direction;
+mod evs;
 pub(crate) mod floor;
 mod key_mgmt;
 mod offer;
@@ -144,6 +145,8 @@ pub struct MediaInfo {
     /// resolves to Opus; an Opus stream that declared no fmtp is absent here and reads the RFC
     /// defaults ([`OpusParams::default`]).
     pub opus_params: Vec<(u8, OpusParams)>,
+    /// `a=fmtp` `audio/EVS` parameters per payload type (3GPP TS 26.445 A.3), read by the private `evs` submodule.
+    pub evs_params: Vec<(u8, EvsParams)>,
     /// `a=fmtp` `annexb=` declarations (payload type → whether G.729 Annex B is wanted), RFC 3555
     /// §4.1.13. A payload type that declared nothing is **absent here and defaults to `true`**,
     /// which is the RFC's default and not a convenient one: a peer that sends no `annexb=` is asking
@@ -511,6 +514,9 @@ impl MediaInfo {
                 }
                 return Some(spec);
             }
+            if spec.is_evs() {
+                return Some(evs::negotiated(spec, &self.evs_params, payload_type));
+            }
             // Carry the peer's RFC 7587 §6.1 Opus parameters onto the spec: `sprop-stereo` decides
             // the ingress channel layout the decoder is built for, `maxptime` caps the egress ptime,
             // and the rest are the rate-control/FEC/DTX limits the Opus encoder honours. An `a=maxptime`
@@ -604,6 +610,8 @@ struct AudioScan {
     fmtp_amr: Vec<(u8, AmrFmtp)>,
     /// `a=fmtp` RFC 7587 Opus parameters in the audio section (payload type → parameter set).
     fmtp_opus: Vec<(u8, OpusParams)>,
+    /// `a=fmtp` `audio/EVS` parameters in the audio section (payload type → parameter set).
+    fmtp_evs: Vec<(u8, EvsParams)>,
     /// `a=fmtp` `annexb=` declarations in the audio section (payload type → wanted).
     fmtp_annex_b: Vec<(u8, bool)>,
     /// The audio stream's `a=ptime`, if present.
@@ -840,6 +848,7 @@ fn scan(sdp: &str) -> AudioScan {
         fmtp_amr: Vec::new(),
         fmtp_annex_b: Vec::new(),
         fmtp_opus: Vec::new(),
+        fmtp_evs: Vec::new(),
         ptime_ms: None,
         maxptime_ms: None,
         crypto: Vec::new(),
@@ -1069,6 +1078,9 @@ fn scan(sdp: &str) -> AudioScan {
                         if let Some(opus) = parse_fmtp_opus(value) {
                             scan.fmtp_opus.push(opus);
                         }
+                        if let Some(declared) = evs::parse_fmtp(value) {
+                            scan.fmtp_evs.push(declared);
+                        }
                         if let Some(annex_b) = parse_fmtp_annex_b(value) {
                             scan.fmtp_annex_b.push(annex_b);
                         }
@@ -1135,6 +1147,7 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         amr_fmtp: scan.fmtp_amr.clone(),
         annex_b: scan.fmtp_annex_b.clone(),
         opus_params: scan.fmtp_opus.clone(),
+        evs_params: scan.fmtp_evs.clone(),
         ptime_ms: scan.ptime_ms.unwrap_or(DEFAULT_PTIME_MS),
         maxptime_ms: scan.maxptime_ms,
         text: text_media_info(scan),
@@ -2686,6 +2699,72 @@ mod tests {
             !info.ice_options.has("ice2"),
             "the media-level list replaces the session-level one"
         );
+    }
+
+    fn evs_offer(fmtp: Option<&str>) -> String {
+        let fmtp = fmtp.map_or_else(String::new, |body| format!("a=fmtp:110 {body}\r\n"));
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 198.51.100.7\r\ns=-\r\nc=IN IP4 198.51.100.7\r\nt=0 0\r\n\
+             m=audio 40000 RTP/AVP 110 8\r\na=rtpmap:110 EVS/16000\r\n{fmtp}a=rtpmap:8 PCMA/8000\r\n"
+        )
+    }
+
+    #[test]
+    fn the_evs_fmtp_parameters_reach_the_codec_spec() {
+        let info = parse(&evs_offer(Some(
+            "hf-only=1;br=5.9-24.4;bw=nb-swb;max-red=220",
+        )))
+        .expect("parse");
+        let spec = info
+            .audio_codecs()
+            .into_iter()
+            .find(|spec| spec.is_evs())
+            .expect("EVS");
+        let params = spec.evs.expect("the peer's parameters");
+        assert!(params.header_full_only());
+        assert_eq!(
+            params.send_bandwidth_ceiling(),
+            siphon_rtp_codec::evs_fmtp::EvsBandwidth::SuperWideband
+        );
+        assert!(!params.malformed);
+        assert_eq!(spec.evs_unsupported(), None);
+        // only EVS carries them: the PCMA entry of the same offer has none
+        let pcma = info
+            .audio_codecs()
+            .into_iter()
+            .find(|spec| spec.encoding_name == "PCMA")
+            .expect("PCMA");
+        assert_eq!(pcma.evs, None);
+    }
+
+    #[test]
+    fn an_evs_payload_type_that_declared_nothing_reads_the_registration_defaults() {
+        let info = parse(&evs_offer(None)).expect("parse");
+        assert!(info.evs_params.is_empty());
+        let spec = info
+            .audio_codecs()
+            .into_iter()
+            .find(|spec| spec.is_evs())
+            .expect("EVS");
+        assert_eq!(spec.evs, None);
+        // an fmtp of parameters this engine does not read is not a declaration either
+        let info = parse(&evs_offer(Some("some-future-parameter=1"))).expect("parse");
+        assert!(info.evs_params.is_empty());
+    }
+
+    #[test]
+    fn a_parameter_the_registration_does_not_permit_marks_the_payload_type_malformed_not_defaulted()
+    {
+        for body in ["hf-only=2", "bw=ultra", "br=6.6", "cmr=7", "bw=wb;bw=fb"] {
+            let info = parse(&evs_offer(Some(body))).expect("the SDP itself parses");
+            let spec = info
+                .audio_codecs()
+                .into_iter()
+                .find(|spec| spec.is_evs())
+                .expect("EVS");
+            assert!(spec.evs.expect("recorded").malformed, "{body}");
+            assert!(spec.evs_unsupported().is_some(), "{body}");
+        }
     }
 
     /// A G.729 offer (static payload type 18), with an optional `a=fmtp:18` body appended.

@@ -508,10 +508,14 @@ async fn an_offer_with_nothing_to_transcode_is_refused_naming_both_codecs() {
         reason.contains("EVS/16000") && reason.contains("PCMA/8000"),
         "the refusal names the offered and the answered codec: {reason}"
     );
-    assert!(
-        reason.contains("EVS transcoding is not implemented"),
-        "and keeps the reason the codec gave: {reason}"
-    );
+    // and keeps the reason the codec gave: without the `evs` feature EVS has no codec at all, and
+    // with it EVS decodes and cannot be encoded toward the gateway
+    let given = if cfg!(feature = "evs") {
+        "there is no EVS encoder"
+    } else {
+        "EVS transcoding requires the `evs` build feature"
+    };
+    assert!(reason.contains(given), "the codec's own reason: {reason}");
 }
 
 /// EVS alone toward a far side that answers EVS is a relay: no codec is run, so none is needed.

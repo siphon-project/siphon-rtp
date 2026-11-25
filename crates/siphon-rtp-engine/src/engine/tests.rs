@@ -57,6 +57,7 @@ mod conference_dtmf;
 mod conference_received_from;
 mod conference_seat;
 mod conference_seat_call;
+mod evs_decode_only;
 mod floor_call_rtcp;
 mod floor_checkpoint;
 mod floor_security_refusals;
@@ -271,6 +272,38 @@ fn codec_snapshot_round_trips_the_opus_fmtp_parameters() {
     // …and the derived behaviour survives with it.
     assert_eq!(restored.decode_channels(), 2);
     assert_eq!(restored.ptime_ms, 40);
+}
+
+#[test]
+fn codec_snapshot_round_trips_the_evs_parameters() {
+    // `hf-only` decides how every payload of the leg is read and `bw` the decoder's output rate, so
+    // a restored leg that lost them would decode its peer's payloads as the wrong format.
+    let params = siphon_rtp_codec::factory::EvsParams::parse(
+        "hf-only=1;br=5.9-24.4;bw=nb-swb;mode-set=0,2,8",
+    )
+    .expect("fmtp");
+    let original = CodecSpec::new(110, "EVS", 16_000, 1, 20).with_evs_params(Some(params));
+    let json = serde_json::to_string(&codec_snapshot(&original)).expect("serialize");
+    let decoded: crate::ha::CodecSnapshot = serde_json::from_str(&json).expect("deserialize");
+    let restored = restore_codec(&decoded);
+    assert_eq!(restored, original);
+    assert!(restored.evs.expect("params").header_full_only());
+
+    // a list the registration does not permit stays one, and an EVS leg that declared nothing
+    // snapshots no parameters
+    let malformed = siphon_rtp_codec::factory::EvsParams {
+        malformed: true,
+        ..Default::default()
+    };
+    let original = CodecSpec::new(110, "EVS", 16_000, 1, 20).with_evs_params(Some(malformed));
+    let json = serde_json::to_string(&codec_snapshot(&original)).expect("serialize");
+    let decoded: crate::ha::CodecSnapshot = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(restore_codec(&decoded), original);
+    let plain = codec_snapshot(&CodecSpec::new(110, "EVS", 16_000, 1, 20));
+    assert_eq!(plain.evs, None);
+    assert!(!serde_json::to_string(&plain)
+        .expect("serialize")
+        .contains("evs"));
 }
 
 #[test]

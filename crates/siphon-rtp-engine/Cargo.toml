@@ -23,6 +23,11 @@ amr = ["siphon-rtp-codec/amr"]
 # Build the patent-licensed G.729 codec into the engine (transcode). Off by default; passthrough of
 # G.729 is always available and never executes a codec. See docs/codec-licensing.md.
 g729 = ["siphon-rtp-codec/g729"]
+# Build the patent-licensed EVS decoder into the engine. Decode only (both RTP payload formats of
+# 3GPP TS 26.445 Annex A): EVS is then recorded, streamed to a WebSocket and forked decoded, and is
+# never a transcode target, because there is no EVS encoder. Off by default; passthrough of EVS is
+# always available and never executes a codec. See docs/codec-licensing.md.
+evs = ["siphon-rtp-codec/evs"]
 
 [[bin]]
 name = "siphon-rtp"

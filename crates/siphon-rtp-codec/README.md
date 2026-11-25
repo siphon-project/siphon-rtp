@@ -7,7 +7,7 @@ pure-Rust, kernel-accelerated media engine for SIPhon.
 reference vectors (ITU-T G.191 STL; 3GPP TS 26.074 / 26.174), with criterion benches on every
 encode/decode hot path.
 
-Implemented: G.711 (A-law / µ-law, with PLC), L16 (linear PCM), G.722, G.726 (16/24/32/40 kbit/s), GSM-FR, RFC 3389 comfort noise, and Opus (full RFC 6716, encode + decode). AMR-NB and AMR-WB (encode + decode, bit-exact against the 3GPP vectors) are gated behind the off-by-default `amr` feature (patent-encumbered transcoding; passthrough/relay is always available).
+Implemented: G.711 (A-law / µ-law, with PLC), L16 (linear PCM), G.722, G.726 (16/24/32/40 kbit/s), GSM-FR, RFC 3389 comfort noise, and Opus (full RFC 6716, encode + decode). AMR-NB and AMR-WB (encode + decode, bit-exact against the 3GPP vectors) are gated behind the off-by-default `amr` feature (patent-encumbered transcoding; passthrough/relay is always available). EVS is decode-only behind the off-by-default `evs` feature (both RTP payload formats of TS 26.445 Annex A; no encoder).
 
 ```toml
 [dependencies]
