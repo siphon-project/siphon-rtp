@@ -16,6 +16,8 @@ mod frame;
 mod post;
 mod resample;
 
+pub(crate) use frame::{pitch_buf_for_scaling, update_dct_post_old_exc, update_filt_lfe};
+
 use crate::evs::basop::mpy_32_16_1;
 use crate::evs::cnst::{
     CLDFB_NO_COL_MAX, DEC, GAMMA1, GAMMA16K, HQ_CORE, INT_FS_16K, INT_FS_FX, L_EXC_DEC, L_EXC_MEM,
@@ -314,7 +316,7 @@ fn acelp_core_dec_rate_switch(st: &mut DecoderState, w: &mut CoreWork) {
 }
 
 /// The conversion of the old subframe pitch values to the new internal sampling rate.
-fn acelp_core_dec_pitch_memory_switch(st: &mut DecoderState) {
+pub(crate) fn acelp_core_dec_pitch_memory_switch(st: &mut DecoderState) {
     if sub(st.l_frame, L_FRAME) == 0 {
         let k: i16 = if sub(st.last_l_frame, L_FRAME32K) == 0 {
             13107 // 12800 / 32000
@@ -357,7 +359,7 @@ fn acelp_core_dec_pitch_memory_switch(st: &mut DecoderState) {
 }
 
 /// The conversion of the concealment pitch `bfi_pitch` to the frame length of this frame.
-fn acelp_core_dec_bfi_pitch_switch(st: &mut DecoderState) {
+pub(crate) fn acelp_core_dec_bfi_pitch_switch(st: &mut DecoderState) {
     if sub(st.l_frame, L_FRAME) == 0 {
         let k: i16 = if sub(st.bfi_pitch_frame, L_FRAME32K) == 0 {
             13107 // 12800 / 32000

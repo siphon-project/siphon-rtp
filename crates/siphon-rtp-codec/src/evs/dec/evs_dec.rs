@@ -3,8 +3,8 @@
 //! extension layers, high-pass filtering, output conversion and the end-of-frame updates, for the
 //! MODE1 (ACELP / HQ) frames, and for MODE2 (TCX / LPD) frames the `ELSE /* MODE2 PART */` block
 //! (`mode2`: the LPD core, IGF / TBE interface and the CLDFB post-processing) followed by the
-//! same tail. A frame that needs AMR-WB IO is refused with [`EvsError::Unsupported`]; it never
-//! produces audio.
+//! same tail. The AMR-WB IO frames are decoded by [`crate::evs::dec::amr_wb_dec::amr_wb_dec`];
+//! the first frame after them runs `updt_IO_switch_dec_fx` here.
 
 mod mode2;
 
@@ -39,9 +39,9 @@ use crate::evs::dec::swb_bwe_dec::{swb_bwe_dec, wb_bwe_dec};
 use crate::evs::dec::swb_bwe_dec_hr::swb_bwe_dec_hr;
 use crate::evs::dec::swb_tbe_dec::{fb_tbe_dec, swb_tbe_dec, wb_tbe_dec};
 use crate::evs::dec::syn_outp::syn_output;
-use crate::evs::dec::updt_dec::{updt_bw_switching, updt_dec_common};
+use crate::evs::dec::updt_dec::{updt_bw_switching, updt_dec_common, updt_io_switch_dec};
 use crate::evs::dec::waveadjust_fec_dec::{concealment_update2_x, waveform_adj2_fix};
-use crate::evs::error::{EvsError, UnsupportedMode};
+use crate::evs::error::EvsError;
 use crate::evs::macros::ns2sa_fx2;
 use crate::evs::rom::SIN_TABLE256_FX;
 use crate::itu::basic_ops::{
@@ -121,8 +121,8 @@ fn sin_table256(index: i16) -> i16 {
 /// `frame_mode` is `FRAMEMODE_NORMAL` or `FRAMEMODE_MISSING`.
 ///
 /// # Errors
-/// [`EvsError::Unsupported`] for a frame that needs AMR-WB IO, which this port does not run yet;
-/// the state is then mid-frame and the decoder must not be used further.
+/// Only the errors of the bandwidth extension and concealment stages (a frame the reference
+/// rejects as malformed).
 pub fn evs_dec(
     st: &mut DecoderState,
     output_sp: &mut [i16],
@@ -160,10 +160,7 @@ pub fn evs_dec(
 
     // Updates in case of AMR-WB IO mode -> EVS primary switching
     if sub(st.last_core, AMR_WB_CORE) == 0 {
-        return Err(EvsError::Unsupported {
-            mode: UnsupportedMode::AmrWbIo,
-            reference_call: "updt_IO_switch_dec_fx",
-        });
+        updt_io_switch_dec(w.output_frame, st);
     }
 
     let mut frame_mode = frame_mode;

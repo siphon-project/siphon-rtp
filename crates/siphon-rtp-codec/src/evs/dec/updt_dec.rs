@@ -1,27 +1,37 @@
 //! End-of-frame decoder state updates (TS 26.442 `lib_dec/updt_dec_fx.c`; TS 26.445 §6.9).
 //!
-//! `updt_IO_switch_dec_fx` (EVS primary ↔ AMR-WB IO switching) lives in the same reference file
-//! and is not ported here (AMR-WB IO is out of scope).
+//! `updt_IO_switch_dec_fx` (EVS primary ↔ AMR-WB IO switching) lives in the same reference file.
 
 use crate::evs::cnst::{
-    ACELP_24K40, ACELP_CORE, ACELP_LOOK_NS, ACTIVE_FRAME, ALDO_WINDOW, AUDIO, DELAY_BWE_TOTAL_NS,
-    FD_CNG, FRAME_NO_DATA, FRAME_SIZE_NS, GENERIC, HARMONIC, HQ_16K40, HQ_CORE, HQ_HARMONIC,
-    HQ_HVQ, INACTIVE, INT_FS_16K_FX, L_EXC_MEM_DEC, L_FRAME, L_FRAME16K, L_FRAME32K, L_FRAME_MAX,
+    ACELP_24K40, ACELP_CORE, ACELP_LOOK_NS, ACTIVE_FRAME, ALDO_WINDOW, AMR_WB_CORE, AUDIO,
+    DELAY_BWE_TOTAL_NS, FD_CNG, FRAME_NO_DATA, FRAME_SIZE_NS, GAIN_PRED_ORDER, GENERIC, HARMONIC,
+    HQ_16K40, HQ_CORE, HQ_DELAY_COMP, HQ_DELTA_MAX, HQ_HARMONIC, HQ_HVQ, INACTIVE, INT_FS_16K_FX,
+    LPC_SHB_ORDER, L_EXC_MEM_DEC, L_FRAME, L_FRAME16K, L_FRAME32K, L_FRAME48K, L_FRAME_MAX,
     L_SUBFR, L_SYN_MEM, M, MAX_UPD_CNT, MBANDS_GN, MODE1, MODE2, NB_SUBFR, NB_SUBFR16K,
-    NOISE_LEVEL_SP3, N_WS2N_FRAMES, OLD_SYNTH_SIZE_DEC, PIT16K_MAX, RF_TCXFD, RF_TCXTD2, SID_1K75,
-    SID_2K40, SWB, TILT_CODE, TRANSITION, UNVOICED, UNVOICED_TRANSITION, WB,
+    NL_BUFF_OFFSET, NOISE_LEVEL_SP3, NORMAL, NUM_SHB_SUBFR, N_WS2N_FRAMES, OLD_SYNTH_SIZE_DEC,
+    PIT16K_MAX, RF_TCXFD, RF_TCXTD2, SID_1K75, SID_2K40, SWB, TILT_CODE, TRANSITION, UNVOICED,
+    UNVOICED_TRANSITION, WB,
 };
 use crate::evs::com::basop_util::buffer_copy_fx;
-use crate::evs::com::lsf_tools::{e_lpc_a_lsp_conversion, e_lpc_lsp_lsf_conversion, lsp2lsf};
+use crate::evs::com::lsf_tools::{
+    e_lpc_a_lsp_conversion, e_lpc_lsp_lsf_conversion, isf2lsf, isp2lsp, lsf2isf, lsp2isp, lsp2lsf,
+};
 use crate::evs::com::preemph::e_util_f_preemph3;
 use crate::evs::com::residu::residu3;
 use crate::evs::com::swb_bwe_com::calc_tilt_bwe;
+use crate::evs::com::swb_tbe_com::{
+    fb_tbe_reset_synth, swb_tbe_reset, swb_tbe_reset_synth, wb_tbe_extras_reset,
+    wb_tbe_extras_reset_synth,
+};
 use crate::evs::com::tools::{copy_scale_sig, random, scale_sig, set16};
 use crate::evs::dec::fec_clas_estim::fec_clas_estim;
+use crate::evs::dec::hf_synth::{hf_synth_amr_wb_reset, HfSynthAmrWbState};
 use crate::evs::dec::post_dec::post_decoder;
 use crate::evs::dec::state::DecoderState;
 use crate::evs::macros::ns2sa_fx2;
-use crate::evs::rom::{GEWB2_AVE_FX, GEWB_AVE_FX, INNER_FRAME_TBL};
+use crate::evs::rom::{
+    GEWB2_AVE_FX, GEWB_AVE_FX, INNER_FRAME_TBL, STABLE_ISP_FX, STABLE_LSP_FX, UVWB_AVE_FX,
+};
 use crate::itu::basic_ops::{
     add, l_deposit_l, l_shl, l_sub, mult_r, round_word, shl, shr, shr_r, sub,
 };
@@ -484,6 +494,163 @@ pub fn update_decoder_lpd_cng(
         time_domain_buffer,
         bpf_noise_buf,
     );
+}
+
+/// `updt_IO_switch_dec_fx`: the common updates of the switching between the AMR-WB IO mode and
+/// the EVS primary modes (`st.last_core == AMR_WB_CORE` selects the switch to the EVS primary
+/// mode, anything else the switch to AMR-WB IO). The ISF / ISP of AMR-WB IO and the LSF / LSP
+/// of EVS primary are converted, the memories of the mode switched to are reset.
+pub fn updt_io_switch_dec(output_frame: i16, st: &mut DecoderState) {
+    if sub(st.last_core, AMR_WB_CORE) == 0 {
+        // switching to the EVS primary mode: AMR-WB IO mode uses ISF(ISP), but the EVS primary
+        // mode LSF(LSP)
+        let mut xsp_tmp = STABLE_LSP_FX;
+        let isf = st.lsf_old;
+        isf2lsf(&isf, &mut st.lsf_old, &mut xsp_tmp);
+        let mut xsp_tmp = STABLE_LSP_FX;
+        let isp = st.lsp_old;
+        isp2lsp(&isp, &mut st.lsp_old, &mut xsp_tmp, M);
+
+        // AMR-WB IO mode uses ISF(ISP), but the EVS primary mode uses LSF(LSP)
+        let mut xsp_tmp = STABLE_LSP_FX;
+        let isp = st.lsp_cng;
+        isp2lsp(&isp, &mut st.lsp_cng, &mut xsp_tmp, M);
+
+        st.old_enr_index = shl(st.old_enr_index, 1).min(127);
+
+        // reset the TD BWE buffers
+        set16(&mut st.old_bwe_exc, 0, PIT16K_MAX * 2);
+        set16(&mut st.old_bwe_exc_extended, 0, NL_BUFF_OFFSET);
+        st.bwe_non_lin_prev_scale = 0;
+        st.last_voice_factor = 0;
+
+        wb_tbe_extras_reset(
+            &mut st.mem_gen_sh_bexc_filt_down_wb2,
+            &mut st.mem_gen_sh_bexc_filt_down_wb3,
+        );
+        wb_tbe_extras_reset_synth(
+            &mut st.state_lsyn_filt_shb,
+            &mut st.state_lsyn_filt_dwn_shb,
+            &mut st.state_32and48k_wb_upsample,
+            &mut st.mem_resamp_hb,
+        );
+
+        if sub(output_frame, L_FRAME32K) >= 0 {
+            swb_tbe_reset(
+                &mut st.mem_csfilt,
+                &mut st.mem_gen_sh_bexc_filt_down_shb,
+                &mut st.state_lpc_syn,
+                &mut st.syn_overlap,
+                &mut st.state_syn_shbexc,
+                &mut st.tbe_demph,
+                &mut st.tbe_premph,
+                &mut st.mem_stp_swb,
+                &mut st.gain_prec_swb,
+            );
+            set16(&mut st.gain_shape_delay, 0, NUM_SHB_SUBFR / 2);
+            swb_tbe_reset_synth(
+                &mut st.gen_sh_bsynth_hilbert_mem,
+                &mut st.gen_sh_bsynth_state_lsyn_filt_shb_local,
+            );
+        }
+
+        if sub(output_frame, L_FRAME48K) == 0 {
+            st.prev_fb_ener_adjust = 0;
+            set16(&mut st.fb_state_lpc_syn, 0, LPC_SHB_ORDER);
+            st.fb_tbe_demph = 0;
+            fb_tbe_reset_synth(
+                &mut st.fbbwe_hpf_mem,
+                &mut st.fbbwe_hpf_mem_fx_q,
+                &mut st.prev_fbbwe_ratio,
+            );
+        }
+        st.prev_energy_wb = l_deposit_l(0);
+        st.prev_weight = 6554;
+
+        // reset the FD BWE buffers
+        st.prev_mode = NORMAL;
+        st.prev_energy = 0;
+        st.prev_l_swb_norm = 8;
+        st.prev_frica_flag = 0;
+        set16(&mut st.mem_imdct, 0, L_FRAME48K);
+        st.prev_td_energy = 0;
+        set16(&mut st.l_old_wtda_swb, 0, L_FRAME48K);
+        // HQ core buffers
+        set16(&mut st.delay_buf_out, 0, HQ_DELTA_MAX * HQ_DELAY_COMP);
+
+        // reset the unvoiced/audio signal improvement memories
+        st.seed_tcx = 15687;
+        st.uv_cnt = 30;
+        st.lt_uv_cnt = 60 << 6;
+
+        st.use_acelp_preq = 0;
+        if sub(st.last_flag_filter_nb, 1) == 0 {
+            if let Some(syn) = st.cldfb_syn.as_mut() {
+                syn.bands_to_zero = 0;
+            }
+        }
+        st.last_active_bands_to_zero_bwdec = 0;
+        st.flag_nb_bwddec = 0;
+        st.perc_bwddec = 0;
+        st.last_flag_filter_nb = 0;
+        st.active_frame_cnt_bwddec = 0;
+        set16(&mut st.flag_buffer, 0, 20);
+    } else {
+        // switching to the AMR-WB IO mode: the ISF Q memories
+        set16(&mut st.mem_ma, 0, M);
+
+        // AMR-WB IO mode uses ISF(ISP), but the EVS primary mode LSF(LSP)
+        let mut xsp_tmp = STABLE_ISP_FX;
+        let lsf = st.lsf_old;
+        lsf2isf(&lsf, &mut st.lsf_old, &mut xsp_tmp, M);
+        let mut xsp_tmp = STABLE_ISP_FX;
+        let lsp = st.lsp_old;
+        lsp2isp(&lsp, &mut st.lsp_old, &mut xsp_tmp, M);
+
+        // AMR-WB IO mode uses ISF(ISP), but the EVS primary mode LSF(LSP)
+        let mut xsp_tmp = STABLE_ISP_FX;
+        let lsp = st.lsp_cng;
+        lsp2isp(&lsp, &mut st.lsp_cng, &mut xsp_tmp, M);
+
+        st.old_enr_index = shr(st.old_enr_index, 1).clamp(0, 63);
+
+        // gain quantization memory
+        set16(&mut st.past_qua_en, -14 * 1024, GAIN_PRED_ORDER);
+
+        // HF synthesis memories
+        st.ng_ener_st = -51 * 256; // Q8
+
+        {
+            let (seed2, mut state) = HfSynthAmrWbState::of(st);
+            hf_synth_amr_wb_reset(seed2, &mut state);
+        }
+
+        // reset the unvoiced/audio signal improvement memories
+        st.seed_tcx = 15687;
+        st.uv_cnt = 30;
+        st.lt_uv_cnt = 60 << 6;
+        st.Last_ener = 0;
+        st.lt_voice_fac = 0;
+
+        st.psf_lp_noise = round_word(l_shl(st.lp_noise, 1));
+
+        // reset the VBR signalling
+        st.last_ppp_mode_dec = 0;
+        st.last_nelp_mode_dec = 0;
+        st.ppp_mode_dec = 0;
+        st.nelp_mode_dec = 0;
+    }
+
+    // CNG - reset
+    st.ho_hist_size = 0;
+
+    // LSF Q memories
+    st.mem_ar = UVWB_AVE_FX;
+
+    // FEC - update the adaptive LSF mean vector
+    st.lsfoldbfi0 = st.lsf_old;
+    st.lsfoldbfi1 = st.lsf_old;
+    st.lsf_adaptive_mean = st.lsf_old;
 }
 
 #[cfg(test)]

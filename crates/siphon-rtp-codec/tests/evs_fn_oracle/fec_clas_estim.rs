@@ -31,7 +31,7 @@ fn fec_clas_estim_matches_the_reference() {
         st.decision_hyst = case.i16("decision_hyst");
         st.uv_cnt = case.i16("uv_cnt");
         st.lt_uv_cnt = case.i16("lt_uv_cnt");
-        st.last_ener = case.i16("last_ener");
+        st.Last_ener = case.i16("last_ener");
         st.lt_diff_etot.copy_from_slice(&case.i16s("lt_diff_etot"));
         st.mem_syn_clas_estim.copy_from_slice(&case.i16s("mem"));
         st.classifier_q_mem_syn = case.i16("q_mem_syn");
@@ -64,7 +64,7 @@ fn fec_clas_estim_matches_the_reference() {
         check(case, "decision_hyst", &[st.decision_hyst]);
         check(case, "uv_cnt", &[st.uv_cnt]);
         check(case, "lt_uv_cnt", &[st.lt_uv_cnt]);
-        check(case, "last_ener", &[st.last_ener]);
+        check(case, "last_ener", &[st.Last_ener]);
         check(case, "lt_diff_etot", &st.lt_diff_etot);
         check(case, "mem", &st.mem_syn_clas_estim);
         check(case, "q_mem_syn", &[st.classifier_q_mem_syn]);

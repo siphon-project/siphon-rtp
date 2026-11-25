@@ -3,9 +3,9 @@
 //! `cargo test -p siphon-rtp-codec --features evs --test evs_zero_alloc`
 //!
 //! There is no EVS encoder yet to make input, so the decoder is fed every TS 26.444 decoder
-//! sequence upstream's `Readme_EVS_dec.txt` lists, at the output rate it names, up to the first
-//! frame that needs a part of the decoder not ported yet (the AMR-WB IO frames) ([`EvsError::Unsupported`]): every path the
-//! decoder can take today is measured, whatever bit rate, bandwidth or output rate reaches it. Like
+//! sequence upstream's `Readme_EVS_dec.txt` and `Readme_AMRWB_IO_dec.txt` list, at the output rate
+//! each names, to the end: every path the decoder can take is measured, whatever bit rate,
+//! bandwidth, output rate or mode (MODE1, MODE2, AMR-WB IO) reaches it. Like
 //! `evs_conformance`, it skips when the sequences are absent and `SIPHON_RTP_REQUIRE_VECTORS=1`
 //! turns that skip into a failure.
 //!
@@ -24,7 +24,6 @@ mod evs_cases;
 
 use evs_cases::{cases, required, vectors_dir};
 use siphon_rtp_codec::evs::decoder::EvsDecoder;
-use siphon_rtp_codec::evs::error::EvsError;
 use siphon_rtp_codec::evs::g192::G192Reader;
 
 /// A pass-through allocator that counts allocations, so a test can assert a hot loop made none.
@@ -77,11 +76,11 @@ fn evs_decode_makes_no_heap_allocation_on_any_decodable_frame() {
         return;
     };
 
-    let all = cases(&root, "Readme_EVS_dec.txt");
-    let mut frames_decoded = 0usize;
-    let mut whole_sequences = 0usize;
+    let evs = cases(&root, "Readme_EVS_dec.txt");
+    let amr_wb_io = cases(&root, "Readme_AMRWB_IO_dec.txt");
+    let (mut frames_decoded, mut whole_sequences) = (0usize, 0usize);
     let mut offenders = Vec::new();
-    for case in &all {
+    for case in evs.iter().chain(&amr_wb_io) {
         let name = case.bitstream.display().to_string();
         let bytes = std::fs::read(&case.bitstream).expect("read bitstream");
         let frames: Vec<_> = G192Reader::new(&bytes)
@@ -95,36 +94,26 @@ fn evs_decode_makes_no_heap_allocation_on_any_decodable_frame() {
         // Counted per frame, so a failure names where the first allocation happened.
         let mut allocations = 0usize;
         let mut first: Option<String> = None;
-        let mut refused = false;
         for (index, frame) in frames.iter().enumerate() {
             let mut result = Ok(0);
             let made = count_allocations(|| result = decoder.decode_frame(frame, &mut out));
-            match result {
-                Ok(_) => frames_decoded += 1,
-                // the rest of this sequence needs a part of the port that is not built yet
-                Err(EvsError::Unsupported { .. }) => {
-                    refused = true;
-                }
-                Err(error) => panic!("{name} frame {index}: {error}"),
+            if let Err(error) = result {
+                panic!("{name} frame {index}: {error}");
             }
+            frames_decoded += 1;
             if made != 0 && first.is_none() {
                 first = Some(format!("frame {index}"));
             }
             allocations += made;
-            if refused {
-                break;
-            }
         }
-        if !refused {
-            let made = count_allocations(|| {
-                decoder.flush(&mut out).expect("flush");
-            });
-            if made != 0 && first.is_none() {
-                first = Some("flush".to_owned());
-            }
-            allocations += made;
-            whole_sequences += 1;
+        let made = count_allocations(|| {
+            decoder.flush(&mut out).expect("flush");
+        });
+        if made != 0 && first.is_none() {
+            first = Some("flush".to_owned());
         }
+        allocations += made;
+        whole_sequences += 1;
         if let Some(first) = first {
             offenders.push(format!(
                 "{name}: {allocations} allocations, the first in {first}"
@@ -134,15 +123,16 @@ fn evs_decode_makes_no_heap_allocation_on_any_decodable_frame() {
 
     eprintln!(
         "{} sequences, {whole_sequences} decoded to the end, {frames_decoded} frames decoded",
-        all.len()
+        evs.len() + amr_wb_io.len()
     );
     assert!(
         offenders.is_empty(),
         "EVS decode allocated on the hot path: {offenders:?}"
     );
-    // At least every sequence `evs_conformance` gates as byte-identical runs to its end.
+    // Every sequence of both scripts runs to its end (`evs_conformance` gates each as
+    // byte-identical): 979 EVS and 1590 AMR-WB IO.
     assert!(
-        whole_sequences >= 889 || all.is_empty() && !required(),
-        "expected at least 889 whole sequences, ran {whole_sequences}"
+        whole_sequences == 979 + 1590 || evs.is_empty() && !required(),
+        "expected 979 + 1590 whole sequences, ran {whole_sequences}"
     );
 }

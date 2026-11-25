@@ -2,9 +2,9 @@
 //! library type. One [`G192Frame`] in, one 20 ms frame of 16-bit PCM out, with the decoder's
 //! algorithmic delay removed from the start of the stream exactly as the reference does.
 //!
-//! MODE1 (ACELP / HQ) and MODE2 (TCX / LPD) frames decode; a frame that needs AMR-WB IO is
-//! refused with [`EvsError::Unsupported`] and never produces audio (see
-//! [`crate::evs::dec::evs_dec::evs_dec`]).
+//! MODE1 (ACELP / HQ), MODE2 (TCX / LPD) and AMR-WB IO frames decode: an AMR-WB IO frame goes to
+//! [`crate::evs::dec::amr_wb_dec::amr_wb_dec`], every other frame to
+//! [`crate::evs::dec::evs_dec::evs_dec`].
 
 use crate::evs::basop::mult_32_16;
 use crate::evs::cnst::{DEC, L_FRAME48K, MAX_FRAME_COUNTER};
@@ -12,11 +12,12 @@ use crate::evs::com::bitstream::{
     read_indices_frame, reset_indices_dec, FRAMEMODE_MISSING, FRAMEMODE_NORMAL,
 };
 use crate::evs::com::delay_comp::get_delay;
+use crate::evs::dec::amr_wb_dec::amr_wb_dec;
 use crate::evs::dec::evs_dec::evs_dec;
 use crate::evs::dec::init_dec::init_decoder;
 use crate::evs::dec::io_dec::configure_decoder;
 use crate::evs::dec::state::DecoderState;
-use crate::evs::error::{EvsError, UnsupportedMode};
+use crate::evs::error::EvsError;
 use crate::evs::g192::G192Frame;
 use crate::evs::macros::ns2sa_fx2;
 use crate::itu::basic_ops::{add, extract_l, sub};
@@ -75,8 +76,7 @@ impl EvsDecoder {
     ///
     /// # Errors
     /// [`EvsError::OutputTooSmall`] for a short `out`; [`EvsError::Malformed`] for a frame the
-    /// reference rejects; [`EvsError::Unsupported`] for a frame that needs a part of the reference
-    /// decoder this port does not run yet. After an error the decoder must be discarded.
+    /// reference rejects. After an error the decoder must be discarded.
     pub fn decode_frame(
         &mut self,
         frame: &G192Frame<'_>,
@@ -95,12 +95,10 @@ impl EvsDecoder {
         // run the main decoding routine
         if sub(st.codec_mode, MODE1) == 0 {
             if st.opt_amr_wb != 0 {
-                return Err(EvsError::Unsupported {
-                    mode: UnsupportedMode::AmrWbIo,
-                    reference_call: "amr_wb_dec_fx",
-                });
+                amr_wb_dec(st, &mut output);
+            } else {
+                evs_dec(st, &mut output, FRAMEMODE_NORMAL)?;
             }
-            evs_dec(st, &mut output, FRAMEMODE_NORMAL)?;
         } else if st.bfi == 0 {
             evs_dec(st, &mut output, FRAMEMODE_NORMAL)?;
         } else {

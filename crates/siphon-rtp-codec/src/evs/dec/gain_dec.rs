@@ -1,12 +1,11 @@
 //! Decoding of the ACELP pitch and codebook gains for the MODE1 core (TS 26.442
-//! `lib_dec/gain_dec_fx.c`; TS 26.445 §6.1.1.2.3). `gain_dec_amr_wb_fx` (AMR-WB IO) is not
-//! ported here.
+//! `lib_dec/gain_dec_fx.c`; TS 26.445 §6.1.1.2.3), including `gain_dec_amr_wb_fx` (AMR-WB IO).
 
 use crate::evs::basop::{l_extract_lc, mult_32_16};
 use crate::evs::cnst::{
-    G_CODE_MAX_TC192_Q0, G_CODE_MAX_TC_Q0, G_CODE_MIN_TC192_Q15, G_CODE_MIN_TC_Q15,
-    G_PITCH_MAX_MINUS_MIN_TC192_Q13, G_PITCH_MIN_TC192_Q14, INACTIVE, L_FRAME, L_FRAME16K, L_SUBFR,
-    TRANSITION,
+    ACELP_12K65, GAIN_PRED_ORDER, G_CODE_MAX_TC192_Q0, G_CODE_MAX_TC_Q0, G_CODE_MIN_TC192_Q15,
+    G_CODE_MIN_TC_Q15, G_PITCH_MAX_MINUS_MIN_TC192_Q13, G_PITCH_MIN_TC192_Q14, INACTIVE, L_FRAME,
+    L_FRAME16K, L_SUBFR, MEAN_ENER, TRANSITION,
 };
 use crate::evs::com::bitstream::{bit_alloc_idx, bit_alloc_idx_16khz, get_next_indice};
 use crate::evs::com::log2::log2_norm_lc;
@@ -19,13 +18,13 @@ use crate::evs::rom::{
     ES_PRED_QUA_5B_FX, GAIN_BITS_16KHZ_TBL, GAIN_BITS_TBL, GAIN_QUA_MLESS_5B_FX,
     GAIN_QUA_MLESS_6B_FX, GAIN_QUA_MLESS_7B_FX, GP_GAMMA_1SFR_6B_FX, GP_GAMMA_1SFR_7B_FX,
     GP_GAMMA_1SFR_8B_FX, GP_GAMMA_2SFR_6B_FX, GP_GAMMA_2SFR_7B_FX, GP_GAMMA_3SFR_6B_FX,
-    GP_GAMMA_4SFR_6B_FX, TBL_GAIN_CODE_TC_FX,
+    GP_GAMMA_4SFR_6B_FX, PRED_GAIN_FX, TBL_GAIN_CODE_TC_FX, T_QUA_GAIN6B_FX, T_QUA_GAIN7B_FX,
 };
 use crate::itu::basic_ops::{
-    add, div_s, extract_h, extract_l, l_add, l_deposit_h, l_mult, l_shl, l_shr, l_sub, mult,
+    add, div_s, extract_h, extract_l, l_add, l_deposit_h, l_mac, l_mult, l_shl, l_shr, l_sub, mult,
     mult_r, norm_l, norm_s, round_word, shl, shr, sub,
 };
-use crate::itu::oper_32b::mpy_32_16;
+use crate::itu::oper_32b::{l_extract, mpy_32_16};
 use crate::itu::stl2009::mac_r;
 
 /// `table[index]` for an index the bitstream (or a bit-allocation row it selects) determines;
@@ -306,6 +305,82 @@ pub fn gain_dec_sq(
     let l_tmp = l_mult(tmp16, gcode0); // Q0*Q0 -> Q1
     *gain_code = l_shl(l_tmp, add(add(expg, exp_gcode0), 15)); // Q16
 
+    *norm_gain_code = normalised_gain_code(*gain_code, *gain_inov);
+}
+
+/// `gain_dec_amr_wb_fx`: the joint pitch and codebook gain decoder of AMR-WB IO (6 bits below
+/// 12.65 kbit/s, 7 bits from there up), with the gain predicted from the energy of the previous
+/// quantised gains. The reference's `past_qua_en` argument is always the decoder's own
+/// `past_qua_en_fx`, so it is read and updated as `st.past_qua_en`.
+pub fn gain_dec_amr_wb(
+    st: &mut DecoderState,
+    core_brate: i32,
+    gain_pit: &mut i16,
+    gain_code: &mut i32,
+    gain_inov: &mut i16,
+    code: &[i16],
+    norm_gain_code: &mut i32,
+) {
+    let (inov, _, _) = innovation_gain(code);
+    *gain_inov = inov;
+
+    // select the gain quantization table
+    let mut nbits: i16 = 7;
+    let mut t_qua_gain: &[i16] = &T_QUA_GAIN7B_FX;
+    if l_sub(core_brate, i32::from(ACELP_12K65)) < 0 {
+        nbits = 6;
+        t_qua_gain = &T_QUA_GAIN6B_FX;
+    }
+
+    // predicted code gain: start with predicting the code energy in dB
+    let mut l_tmp = l_deposit_h(MEAN_ENER); // MEAN_ENER in Q16
+    l_tmp = l_shl(l_tmp, 9); // From Q16 to Q25
+    for i in 0..GAIN_PRED_ORDER as usize {
+        // pred_code += pred[i]*past_qua_en[i]
+        l_tmp = l_mac(l_tmp, PRED_GAIN_FX[i], st.past_qua_en[i]); // Q14*Q10 -> Q25
+    }
+
+    // predicted codebook gain
+    let gcode0 = extract_h(l_tmp); // From Q25 to Q9
+
+    // gcode0 = pow(10.0, gcode0/20) = pow(2, 0.166096*gcode0)
+    l_tmp = l_mult(gcode0, 21771); // *0.166096 in Q17 -> Q27
+    l_tmp = l_shr(l_tmp, 9 + 2); // From Q27 to Q16
+    let (exp_gcode0, fracg) = l_extract(l_tmp); // Extract exponent of gcode0
+    let gcode0 = extract_l(pow2(14, fracg)); // Put 14 as exponent so that the output of Pow2()
+                                             // is 16384 < Pow2() <= 32767
+    let exp_gcode0 = sub(exp_gcode0, 14);
+
+    // decode the pitch gain
+    let index = get_next_indice(st, nbits) as i16;
+    let index2 = shl(index, 1);
+    *gain_pit = at(t_qua_gain, i32::from(index2));
+
+    // decode the code gain
+    let mut qua_en = at(t_qua_gain, i32::from(add(index2, 1)));
+
+    // *gain_code = t_qua_gain[indice*2+1] * gcode0
+    l_tmp = l_mult(qua_en, gcode0); // Q11*Q0 -> Q12
+    *gain_code = l_shl(l_tmp, add(exp_gcode0, 4)); // Q12 -> Q16
+
+    // adjust the gain according to the energy of the code
+    l_tmp = mult_32_16(*gain_code, *gain_inov);
+    *gain_code = l_shl(l_tmp, 3); // gcode_inov in Q12
+
+    // update the table of past quantized energies
+    for i in (1..GAIN_PRED_ORDER as usize).rev() {
+        st.past_qua_en[i] = st.past_qua_en[i - 1];
+    }
+    // past_qua_en[0] = 20*log10(t_qua_gain[indice*2+1]) = 6.0206*(log2(t_qua_gain[indice*2+1]Q11) - 11)
+    let tmp = norm_l(i32::from(qua_en));
+    let fracg = log2_norm_lc(l_shl(i32::from(qua_en), tmp));
+    let mut expg = sub(30, tmp);
+    expg = sub(expg, 11);
+    l_tmp = mpy_32_16(expg, fracg, 24660); // x 6.0206 in Q12
+    qua_en = extract_h(l_shl(l_tmp, 13)); // result in Q10
+    st.past_qua_en[0] = qua_en; // in Q10
+
+    // normalized code gain: *norm_gain_code = *gain_code / *gain_inov
     *norm_gain_code = normalised_gain_code(*gain_code, *gain_inov);
 }
 
