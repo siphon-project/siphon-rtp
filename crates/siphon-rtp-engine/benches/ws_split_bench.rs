@@ -9,6 +9,10 @@
 //!   bot's stereo frame into the two playout queues, and plays each party a chunk, 16 kHz down to the
 //!   legs' 8 kHz.
 //!
+//! - `split_x3` is `split` under one lawful interception (ETSI TS 103 221-2 X3) of the offerer, so the
+//!   offerer's own voice is delivered from its ingress and what the offerer hears from its egress; the
+//!   delivery task is stood in for by draining the tapped packets and handing their buffers back.
+//!
 //! The uplink frame is drained and its buffer handed back, as the transport does, so no point
 //! measures a queue filling up.
 
@@ -26,6 +30,7 @@ use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::Encoder;
 use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::media_pipeline::{DirectionConfig, MediaCall, SplitAttach};
+use siphon_rtp_engine::x3::{ingress_directions, x3_channel, X3Delivery, X3Taps};
 use siphon_rtp_media::bridge::protocol::{Encoding, Endianness, MediaFormat};
 use siphon_rtp_media::bridge::split::{playout, PlayoutWriter};
 use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeePlan, WsTeeSink};
@@ -180,6 +185,33 @@ fn bench(criterion: &mut Criterion) {
             split.tick(&mut out, &mut events);
             while let Ok(wire) = uplink.frames.try_recv() {
                 let _ = uplink.recycle.send(wire);
+            }
+            std::hint::black_box(&out);
+        });
+    });
+
+    let (mut intercepted, uplink, mut downlink) = split_call();
+    let (factory, delivery): (_, X3Delivery) = x3_channel(4096);
+    let (direction_a, direction_b) = ingress_directions(true);
+    intercepted.start_x3((
+        X3Taps::single(factory.tap(addr("198.51.100.1:20000"), direction_a)),
+        X3Taps::single(factory.tap(addr("198.51.100.1:20002"), direction_b)),
+    ));
+    let mut cursor = 0usize;
+    group.bench_function("split_x3", |bencher| {
+        bencher.iter(|| {
+            let (a, b) = &packets[cursor % packets.len()];
+            cursor += 1;
+            out.clear();
+            downlink.push_wire(&stereo);
+            intercepted.process(a, &mut out, &mut events);
+            intercepted.process(b, &mut out, &mut events);
+            intercepted.tick(&mut out, &mut events);
+            while let Ok(wire) = uplink.frames.try_recv() {
+                let _ = uplink.recycle.send(wire);
+            }
+            while let Ok(packet) = delivery.packets.try_recv() {
+                let _ = delivery.recycle.try_send(packet.payload);
             }
             std::hint::black_box(&out);
         });

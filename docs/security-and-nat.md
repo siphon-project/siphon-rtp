@@ -1135,6 +1135,13 @@ closed:
   a split call isolated and silent, before it takes a packet, and the split's queues are attached
   afterwards. There is no interval in which one party's audio reaches the other because the
   actor that carried the isolation was replaced.
+- **Interception follows the wires.** The target's own voice is still the ingress tap (taken after
+  the gate and the SRTP authentication, so a refused packet is never delivered). What the target
+  *hears* is no longer the other party's ingress, which is isolated, so the `to_target` stream comes
+  from the egress of the direction facing the target, on the plaintext just sent and only once the
+  datagram is really going out. The switch rides the same per-direction state as the isolation, read
+  by one actor at both tap sites, so a packet reaches the interception from exactly one of the two
+  and the other party's original voice is never delivered as what the target heard.
 - **The gate does not move.** The bot is not a media source: it has no flow, no endpoint and no
   address on the datapath, only a WebSocket the engine dialled. A stranger is refused by the same
   gate and latch as on a held call (layers 1 to 3; no RTPbleed: a split never latches to whatever

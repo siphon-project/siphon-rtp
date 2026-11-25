@@ -394,12 +394,17 @@ impl Direction {
             let silence = self.egress_sample_rate as usize / 1000 * 20;
             pcm.resize(silence.min(MAX_FRAME_SAMPLES), 0);
         }
+        // The isolation is back in place before the frame is sent, so the egress it is sent on knows
+        // the call is split: that is what delivers the frame to an interception as what the party
+        // hears (media_pipeline/x3_split.rs).
+        self.split = Some(split);
         // What the bot sends is not what an egress tap records (see `feed_split_taps`).
         let taps = std::mem::take(&mut self.egress_taps);
         self.repacketize(&pcm, false, out);
         self.egress_taps = taps;
-        split.pcm = pcm;
-        self.split = Some(split);
+        if let Some(split) = self.split.as_mut() {
+            split.pcm = pcm;
+        }
     }
 }
 

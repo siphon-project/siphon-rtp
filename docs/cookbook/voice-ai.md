@@ -751,6 +751,14 @@ SIPREC keep the parties' *own* voices, not the bot's; a `both` recording's secon
 other party as it would have been heard, so a transcript made from it is the conversation, not the
 translation.
 
+**Lawful interception sees the wires, not the originals.** An X3 interception (`attach_x3`) is not
+refused on a split call and keeps delivering through attach, detach, a re-offer and the bot going
+away. While split it carries, for the target, its own voice (`from_target`) and what the target's
+leg is actually sent (`to_target`): the bot's translation, or the silence the playout clock sends
+when the bot is quiet or gone. The other party's original voice, which the target no longer hears, is
+not delivered as audio the target heard. After a detach `to_target` is the other party again. See
+[Lawful interception](../lawful-interception.md#split-calls).
+
 **What it works on.** An answered two-party call: a plain relay, a transcoding call, SDES-SRTP on
 either leg or both, and DTLS-SRTP with or without ICE on either leg (a browser caller to a plain
 carrier, or the carrier calling a browser). Each leg's SRTP contexts and DTLS association are used

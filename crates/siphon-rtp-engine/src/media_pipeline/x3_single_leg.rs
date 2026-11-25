@@ -29,6 +29,8 @@ impl MediaCall {
         self.b_to_a.x3 = X3Taps::default();
         self.a_to_b.x3 = ingress;
         self.a_to_b.x3_egress = egress;
+        self.a_to_b.x3_toward = X3Taps::default();
+        self.b_to_a.x3_toward = X3Taps::default();
     }
 }
 

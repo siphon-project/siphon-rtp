@@ -282,6 +282,34 @@ impl X3Tap {
     pub fn counters(&self) -> &Arc<X3Counters> {
         &self.counters
     }
+
+    /// The target-relative direction this tap carries.
+    #[must_use]
+    pub fn direction(&self) -> PayloadDirection {
+        self.direction
+    }
+
+    /// The engine-local address this tap stamps as its own end of a packet.
+    #[must_use]
+    pub fn destination(&self) -> SocketAddr {
+        self.destination
+    }
+
+    /// Whether `other` feeds the same delivery channel: the two taps are one interception's.
+    #[must_use]
+    pub fn same_delivery(&self, other: &Self) -> bool {
+        self.packets.same_channel(&other.packets)
+    }
+
+    /// This tap stamped with another engine-local address. The same delivery, direction and counters,
+    /// so a packet it delivers continues the interception's one PDU sequence.
+    #[must_use]
+    pub fn with_destination(&self, destination: SocketAddr) -> Self {
+        Self {
+            destination,
+            ..self.clone()
+        }
+    }
 }
 
 /// Every tap one media-path position carries: one [`X3Tap`] per delivery on the call (a call can be
@@ -331,6 +359,44 @@ impl X3Taps {
         for tap in self.0.iter() {
             tap.deliver_egress(destination, data);
         }
+    }
+
+    /// Deliver one accepted, decrypted packet to the deliveries whose tap here says it is the
+    /// target's own (`from_target`), and to no other: the taps that carry what the target hears are
+    /// left to the egress tap of a split call (media_pipeline/x3_split.rs).
+    pub fn deliver_from_target(&self, source: SocketAddr, data: &[u8]) {
+        for tap in self.0.iter() {
+            if tap.direction == PayloadDirection::FromTarget {
+                tap.deliver(source, data);
+            }
+        }
+    }
+
+    /// The taps of this set that carry what the target hears (`to_target`), re-stamped for the egress
+    /// that really sends it: `counterpart` is the other direction's set, and the same delivery's tap
+    /// there holds the engine-local address that egress leaves from. A tap with no counterpart keeps
+    /// its own address, which is the only one it has.
+    #[must_use]
+    pub fn toward_target_egress(&self, counterpart: &Self) -> Self {
+        Self::new(
+            self.0
+                .iter()
+                .filter(|tap| tap.direction == PayloadDirection::ToTarget)
+                .map(
+                    |tap| match counterpart.0.iter().find(|other| other.same_delivery(tap)) {
+                        Some(other) => tap.with_destination(other.destination),
+                        None => {
+                            tracing::error!(
+                                target: "siphon_rtp::li",
+                                "a lawful-interception tap has no counterpart on the other leg; \
+                                 its split egress copy keeps the address of its own leg"
+                            );
+                            tap.clone()
+                        }
+                    },
+                )
+                .collect(),
+        )
     }
 }
 

@@ -31,13 +31,23 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   encoded in its leg's own codec on the stream it was already receiving. Works on a plain relay, a
   transcoding call and every crypto bridge (SDES, SDES to SDES, DTLS-SRTP with or without ICE, either
   leg), with no re-INVITE and the same SSRC and contiguous sequence numbers across attach and detach.
-  Recordings, a tee, SIPREC and interception keep the parties' own voices. A re-offer is followed; a
+  Recordings, a tee and SIPREC keep the parties' own voices; interception delivers what is on each
+  wire (below). A re-offer is followed; a
   DTLS re-handshake is refused while split. `ws_split_started` / `ws_split_ended` (once, with a
   reason); once isolated, a call's parties hear each other again only after a `detach_ws_split` the
   controller sent has succeeded: not after the bot goes, a re-offer, a failure, a failover (a checkpoint
   carries the isolation, `restored`) or a delete.
   Refused with `ws-split-secondary-source`, `ws-split-sample-rate` and `ws-split-profile` besides the
   tokens above. `node_info` features gain `ws_split`.
+- **X3 interception of a split call delivers what is on each wire.** The interception is not refused
+  and keeps delivering through attach, detach, a re-offer, the bot going away, a restore (the
+  warrant is attached again on the restored call) and a delete. While the call is split, `from_target`
+  stays the target's own voice and `to_target` is what the target's leg is actually sent (the bot's
+  audio, or the silence the playout clock sends when the bot is quiet or gone), taken from that leg's
+  egress as sent; the other party's own voice, which the target no longer hears, is not delivered as
+  audio the target heard. On detach `to_target` goes back to the other party's ingress, switched in
+  the same step as the isolation, so no packet is delivered twice or skipped. Several warrants, on
+  either party, each get their own side; the delivery connection's PDU sequence runs on unbroken.
 
 ## [0.28.1] — 2026-11-24
 

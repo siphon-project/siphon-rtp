@@ -24,28 +24,28 @@ use std::sync::Mutex as StdMutex;
 use tokio_tungstenite::tungstenite::Message;
 
 /// What each party says on the phone, in Hz.
-const A_TONE: f32 = 600.0;
-const B_TONE: f32 = 1_400.0;
+pub(super) const A_TONE: f32 = 600.0;
+pub(super) const B_TONE: f32 = 1_400.0;
 /// What the bot says to each party, in Hz (channel 0 to the offerer, channel 1 to the answerer).
-const TO_A_TONE: f32 = 1_000.0;
-const TO_B_TONE: f32 = 2_000.0;
-const WIRE_RATE: u32 = 16_000;
+pub(super) const TO_A_TONE: f32 = 1_000.0;
+pub(super) const TO_B_TONE: f32 = 2_000.0;
+pub(super) const WIRE_RATE: u32 = 16_000;
 
 // ---- the bot ------------------------------------------------------------------------------------
 
 #[derive(Default)]
-struct BotSeen {
-    start: Option<serde_json::Value>,
+pub(super) struct BotSeen {
+    pub(super) start: Option<serde_json::Value>,
     /// What the bot received on each channel, at the wire rate.
     uplink: [Vec<i16>; 2],
 }
 
 #[derive(Default)]
-struct BotControl {
+pub(super) struct BotControl {
     /// What the bot says on each channel (`None` is a channel it leaves silent: it sends zeros).
     tones: [Option<f32>; 2],
     /// Close the socket.
-    close: bool,
+    pub(super) close: bool,
     /// Send nothing downlink at all.
     mute: bool,
     /// The wire rate the bot speaks at (0 is [`WIRE_RATE`]).
@@ -54,22 +54,22 @@ struct BotControl {
     burst: usize,
 }
 
-struct Bot {
-    uri: String,
-    seen: Arc<StdMutex<BotSeen>>,
-    control: Arc<StdMutex<BotControl>>,
+pub(super) struct Bot {
+    pub(super) uri: String,
+    pub(super) seen: Arc<StdMutex<BotSeen>>,
+    pub(super) control: Arc<StdMutex<BotControl>>,
 }
 
 impl Bot {
-    fn set_tones(&self, tones: [Option<f32>; 2]) {
+    pub(super) fn set_tones(&self, tones: [Option<f32>; 2]) {
         self.control.lock().expect("control").tones = tones;
     }
 
-    fn uplink(&self, channel: usize) -> Vec<i16> {
+    pub(super) fn uplink(&self, channel: usize) -> Vec<i16> {
         self.seen.lock().expect("seen").uplink[channel].clone()
     }
 
-    fn take_uplink(&self) {
+    pub(super) fn take_uplink(&self) {
         let mut seen = self.seen.lock().expect("seen");
         seen.uplink = [Vec::new(), Vec::new()];
     }
@@ -77,7 +77,7 @@ impl Bot {
 
 /// A bot on a loopback socket: it records `start` and the uplink per channel, and sends a stereo
 /// downlink at the wire rate in real time, one 20 ms frame per 20 ms.
-async fn bot() -> Bot {
+pub(super) async fn bot() -> Bot {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind bot");
@@ -188,7 +188,7 @@ async fn send_tone(phone: &mut Phone, frequency: f32, frame: usize) {
 }
 
 /// Goertzel power of `frequency` in `samples` at `rate`, per sample squared.
-fn power(samples: &[i16], rate: f32, frequency: f32) -> f64 {
+pub(super) fn power(samples: &[i16], rate: f32, frequency: f32) -> f64 {
     let coefficient = 2.0 * (std::f32::consts::TAU * frequency / rate).cos();
     let (mut previous, mut before) = (0.0f64, 0.0f64);
     for &sample in samples {
@@ -200,7 +200,7 @@ fn power(samples: &[i16], rate: f32, frequency: f32) -> f64 {
     power / (samples.len().max(1) as f64).powi(2)
 }
 
-fn decode(heard: &Heard) -> Vec<i16> {
+pub(super) fn decode(heard: &Heard) -> Vec<i16> {
     let mut decoder = siphon_rtp_codec::g711::G711::ulaw();
     let mut pcm = Vec::new();
     let mut frame = [0i16; 1024];
@@ -211,11 +211,11 @@ fn decode(heard: &Heard) -> Vec<i16> {
     pcm
 }
 
-const TONES: [f32; 4] = [A_TONE, TO_A_TONE, B_TONE, TO_B_TONE];
+pub(super) const TONES: [f32; 4] = [A_TONE, TO_A_TONE, B_TONE, TO_B_TONE];
 
 /// `samples` carry `wanted` and none of the other tones.
 #[track_caller]
-fn assert_hears(samples: &[i16], rate: f32, wanted: f32, who: &str) {
+pub(super) fn assert_hears(samples: &[i16], rate: f32, wanted: f32, who: &str) {
     assert!(
         samples.len() >= 1_600,
         "{who}: heard {} samples",
@@ -237,7 +237,7 @@ fn assert_hears(samples: &[i16], rate: f32, wanted: f32, who: &str) {
 
 /// `samples` carry none of the tones, and there are enough of them to say so.
 #[track_caller]
-fn assert_silent_audio(samples: &[i16], rate: f32, who: &str) {
+pub(super) fn assert_silent_audio(samples: &[i16], rate: f32, who: &str) {
     assert!(
         samples.len() >= 1_600,
         "{who}: heard {} samples",
@@ -256,7 +256,7 @@ fn assert_silent_audio(samples: &[i16], rate: f32, who: &str) {
 
 /// `frames` of both parties speaking their tone, listening as it goes. `frame` counts the tone's
 /// phase across calls so it stays continuous.
-async fn talk(
+pub(super) async fn talk(
     rig: &mut Rig,
     frame: &mut usize,
     frames: usize,
@@ -276,7 +276,7 @@ async fn talk(
     (at_a, at_b)
 }
 
-fn attach_command(rig: &Rig, bot: &Bot, sample_rate: Option<u32>) -> Command {
+pub(super) fn attach_command(rig: &Rig, bot: &Bot, sample_rate: Option<u32>) -> Command {
     Command::AttachWsSplit(WsSplitAttach {
         call_id: rig.call_id.into(),
         from_tag: "a".into(),
@@ -287,7 +287,7 @@ fn attach_command(rig: &Rig, bot: &Bot, sample_rate: Option<u32>) -> Command {
     })
 }
 
-fn detach_command(rig: &Rig) -> Command {
+pub(super) fn detach_command(rig: &Rig) -> Command {
     Command::DetachWsSplit(WsSplitDetach {
         call_id: rig.call_id.into(),
         from_tag: "a".into(),
@@ -295,14 +295,14 @@ fn detach_command(rig: &Rig) -> Command {
 }
 
 /// The split events seen so far, in order.
-fn split_events(events: &flume::Receiver<Event>) -> Vec<Event> {
+pub(super) fn split_events(events: &flume::Receiver<Event>) -> Vec<Event> {
     events
         .try_iter()
         .filter(|event| matches!(event, Event::WsSplitStarted(_) | Event::WsSplitEnded(_)))
         .collect()
 }
 
-async fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
+pub(super) async fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
     for _ in 0..200 {
         if condition() {
             return;
