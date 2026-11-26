@@ -31,7 +31,9 @@ pub const WS_SPLIT_DEFAULT_SAMPLE_RATE: u32 = 16_000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WsSplitAttach {
     pub call_id: String,
-    /// The offerer's tag, as on every call verb.
+    /// The offerer's tag, as on every call verb. The call is found by `call_id` alone, so this does
+    /// not choose a party: channel 0 is always the offerer's leg and channel 1 the answerer's, and the
+    /// events carry the call's own offerer tag.
     pub from_tag: String,
     /// `ws://` or `wss://` URI of the bot the engine dials as a client.
     pub ws_uri: String,
@@ -72,7 +74,9 @@ pub struct WsSplitStarted {
 }
 
 /// [`Event::WsSplitEnded`](crate::Event::WsSplitEnded): the split stopped. Emitted exactly once per
-/// started split, and only after its [`WsSplitStarted`].
+/// started split, and after its [`WsSplitStarted`] on the connection that attached it. One
+/// exception: `restored` goes to the connection that sent the restore, on a standby that never
+/// started the split, so it arrives there with no `ws_split_started` before it.
 ///
 /// **After any `ws_split_ended` but `detached` and `call_deleted`, the call is still isolated and
 /// silent** in both directions, whatever the reason. A split's isolation is lifted by a
@@ -112,6 +116,10 @@ pub enum WsSplitEndReason {
     /// socket did not move: the call is isolated and silent until you detach it (direct audio) or
     /// detach and attach again (a new bot).
     Restored,
+    /// A reason this build does not know: what a newer engine's reason decodes to here, so the event
+    /// still arrives and still means "the split ended". This engine never sends it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a requested split wire rate is refused.

@@ -7,6 +7,19 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An end reason a consumer does not know no longer loses the whole event.** Every reason enum an
+  event carries (`ws_split_ended`, `ws_tee_ended`, `ws_bridge_ended`, `play_finished`,
+  `media_timeout`, `x3_ended`, `recording_finished`) gains an `Unknown` variant that an unrecognised
+  reason string decodes to (`#[serde(other)]`). Before, a controller built against an older proto
+  failed to decode the event, so a split left isolated or a bridge gone one-way was never reported.
+  `#[non_exhaustive]` only ever covered a Rust `match`, never the wire. The engine never sends
+  `unknown`.
+- The `ws_split_ended` docs now say that `restored` arrives on the connection that sent the restore,
+  with no `ws_split_started` before it, and that `attach_ws_split`'s `from_tag` does not choose a
+  party (channel 0 is always the offerer).
+
 ## [0.29.0] — 2026-11-26
 
 ### Added

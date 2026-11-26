@@ -1261,6 +1261,10 @@ pub enum WsTeeEndReason {
     CallEnded,
     /// A WebSocket/transport error ended the stream.
     TransportError,
+    /// A reason this build does not know: what a newer engine's reason decodes to here, so the event
+    /// still arrives and still means "the stream ended". This engine never sends it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a WebSocket **takeover** bridge ended, carried by [`Event::WsBridgeEnded`].
@@ -1286,6 +1290,10 @@ pub enum WsBridgeEndReason {
     CallEnded,
     /// A WebSocket/transport error ended it.
     TransportError,
+    /// A reason this build does not know: what a newer engine's reason decodes to here, so the event
+    /// still arrives and still means "the bridge ended". This engine never sends it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A participant's role in a conference — the audio routing matrix (call-centre / PBX). Tagged on
@@ -2275,6 +2283,10 @@ pub enum PlayEndReason {
     Superseded,
     /// Playback aborted — a decode / source error, or the leg was torn down mid-play.
     Error,
+    /// A reason this build does not know: what a newer engine's reason decodes to here, so the event
+    /// still arrives and still means "not completed". This engine never sends it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Which idle rule tore a call down ([`Event::MediaTimeout`]).
@@ -2304,6 +2316,10 @@ pub enum MediaTimeoutReason {
     /// definition and its silence is not a fault. A controller should treat this as a call that never
     /// connected — the same class as its own ring timeout — not as a dead path on a live call.
     SetupTimeout,
+    /// A reason this build does not know: what a newer engine's reason decodes to here, so the event
+    /// still arrives and still means "the call is gone". This engine never sends it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// An asynchronous event pushed from the engine to SIPhon (no request correlation).
@@ -2742,6 +2758,10 @@ pub enum X3EndReason {
     MediationClosed,
     /// The delivery connection failed and could not be re-established.
     TransportError,
+    /// A reason this build does not know: what a newer engine's reason decodes to here, so the event
+    /// still arrives and still means "delivery stopped". This engine never sends it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Errors from the framing helpers.
@@ -2840,6 +2860,9 @@ pub use ws_split::{
     resolve_ws_split_sample_rate, WsSplitAttach, WsSplitDetach, WsSplitEndReason, WsSplitEnded,
     WsSplitRateError, WsSplitStarted, WS_SPLIT_DEFAULT_SAMPLE_RATE, WS_SPLIT_SAMPLE_RATES,
 };
+
+#[cfg(test)]
+mod forward_compat_tests;
 
 #[cfg(test)]
 mod tests {

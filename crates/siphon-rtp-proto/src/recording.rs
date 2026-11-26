@@ -109,6 +109,10 @@ pub enum RecordingEndReason {
     /// is 0. Reported by a `record_call` stream (one per party), so a consumer waiting on every
     /// party's file can tell "this one will never come" from "still being written".
     NoAudio,
+    /// A reason this build does not know: what a newer engine's reason decodes to here, so the event
+    /// still arrives and still means "the recording ended". This engine never sends it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The most calls one recording or tee can be fed by ([`crate::Command::StartRecording`] and
