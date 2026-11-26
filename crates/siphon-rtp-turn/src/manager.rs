@@ -18,6 +18,7 @@ use siphon_rtp_stun::{self as stun, turn, StunMessage};
 
 use crate::credentials::{AuthResult, CredentialVerifier, NonceFactory};
 use crate::fastpath::{ChannelRoute, TurnFastPath};
+use crate::metrics::{RefusalReason, RelayDirection, TurnMetrics};
 use crate::{ClientTransport, FiveTuple, TransportProtocol, TurnConfig, UnixClock};
 
 /// A message into the allocation actor.
@@ -110,6 +111,7 @@ pub struct AllocationManager<D> {
     quota: HashMap<String, usize>,
     indication_counter: u64,
     fast_path: Box<dyn TurnFastPath>,
+    metrics: Arc<TurnMetrics>,
 }
 
 impl<D: Datapath> AllocationManager<D> {
@@ -135,7 +137,14 @@ impl<D: Datapath> AllocationManager<D> {
             quota: HashMap::new(),
             indication_counter: 0,
             fast_path,
+            metrics: Arc::new(TurnMetrics::default()),
         }
+    }
+
+    /// The counters this manager feeds (shared with [`crate::Turn::metrics`]).
+    #[must_use]
+    pub fn metrics(&self) -> Arc<TurnMetrics> {
+        self.metrics.clone()
     }
 
     /// Run the actor until the mailbox closes or a [`Message::Shutdown`] arrives.
@@ -158,6 +167,12 @@ impl<D: Datapath> AllocationManager<D> {
                 }
                 Message::Shutdown => break,
             }
+        }
+        // The actor is stopping (shutdown, or every handle dropped): free what is left through the
+        // one removal path, so the gauge, the quota and the relay endpoints do not outlive it.
+        let remaining: Vec<FiveTuple> = self.allocations.keys().copied().collect();
+        for five_tuple in remaining {
+            self.delete_allocation(&five_tuple).await;
         }
     }
 
@@ -308,6 +323,7 @@ impl<D: Datapath> AllocationManager<D> {
         }
         // Per-credential allocation quota → 486 (docs/security-and-nat.md §11, R4).
         if self.quota.get(&username).copied().unwrap_or(0) >= self.config.max_allocations_per_user {
+            self.metrics.refused(RefusalReason::Quota);
             self.send_error(
                 method,
                 &txid,
@@ -385,6 +401,7 @@ impl<D: Datapath> AllocationManager<D> {
         self.relay_index.insert(relay.id, five_tuple);
         self.allocations.insert(five_tuple, allocation);
         *self.quota.entry(username).or_insert(0) += 1;
+        self.metrics.allocation_opened(five_tuple.transport);
         tracing::debug!(client = %five_tuple.client, relay = %relay_addr, "TURN allocation created");
         transport.send(&response).await;
     }
@@ -487,6 +504,7 @@ impl<D: Datapath> AllocationManager<D> {
             .iter()
             .any(|peer| self.peer_access(peer.ip()) == PeerAccess::Forbidden)
         {
+            self.metrics.refused(RefusalReason::PeerDenied);
             self.send_error(
                 method,
                 &txid,
@@ -580,6 +598,7 @@ impl<D: Datapath> AllocationManager<D> {
         }
         let access = self.peer_access(peer.ip());
         if access == PeerAccess::Forbidden {
+            self.metrics.refused(RefusalReason::PeerDenied);
             self.send_error(
                 method,
                 &txid,
@@ -703,6 +722,8 @@ impl<D: Datapath> AllocationManager<D> {
         if let Some(allocation) = self.allocations.get_mut(five_tuple) {
             allocation.bytes_relayed += data.len() as u64;
         }
+        self.metrics
+            .relayed(RelayDirection::ClientToPeer, data.len());
     }
 
     /// Handle a peer's datagram arriving on a relay endpoint (RFC 5766 §8/§10): permission-gate it,
@@ -759,9 +780,14 @@ impl<D: Datapath> AllocationManager<D> {
             Frame::Channel(channel) => turn::encode_channel_data(channel, data, pad),
             Frame::Indication => self.data_indication(peer, data),
         };
-        transport.send(&message).await;
-        if let Some(allocation) = self.allocations.get_mut(&five_tuple) {
-            allocation.bytes_relayed += data.len() as u64;
+        // Counted only when the message reached the client's transport: a closed connection relays
+        // nothing, and the budget and the metric must not say it did.
+        if transport.send(&message).await {
+            if let Some(allocation) = self.allocations.get_mut(&five_tuple) {
+                allocation.bytes_relayed += data.len() as u64;
+            }
+            self.metrics
+                .relayed(RelayDirection::PeerToClient, data.len());
         }
     }
 
@@ -809,6 +835,7 @@ impl<D: Datapath> AllocationManager<D> {
                 .as_ref()
                 .is_some_and(|own| own.is_live_media_endpoint(peer));
         if !live {
+            self.metrics.refused(RefusalReason::PeerDenied);
             tracing::debug!(%peer, "TURN dropped a relayed packet: not a permitted peer, not a live own media endpoint");
         }
         live
@@ -832,6 +859,7 @@ impl<D: Datapath> AllocationManager<D> {
         {
             AuthResult::Ok { username, key } => Some((username, key)),
             AuthResult::Unauthorized => {
+                self.metrics.refused(RefusalReason::Unauthorized);
                 self.send_challenge(
                     method,
                     txid,
@@ -844,6 +872,7 @@ impl<D: Datapath> AllocationManager<D> {
                 None
             }
             AuthResult::StaleNonce => {
+                self.metrics.refused(RefusalReason::StaleNonce);
                 self.send_challenge(
                     method,
                     txid,
@@ -963,6 +992,7 @@ impl<D: Datapath> AllocationManager<D> {
         if let Some(allocation) = self.allocations.swap_remove(five_tuple) {
             self.relay_index.remove(&allocation.relay.id);
             self.datapath.remove_endpoint(allocation.relay.id).await;
+            self.metrics.allocation_closed(five_tuple.transport);
             // Withdraw every fast-path channel route this allocation installed.
             if five_tuple.transport == TransportProtocol::Udp {
                 for (channel, binding) in &allocation.channels {

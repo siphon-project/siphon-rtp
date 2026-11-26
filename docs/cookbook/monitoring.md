@@ -42,6 +42,9 @@ The full series set:
 | `siphon_rtp_load_permille` | gauge | normalized node load 0..=1000, max of session utilization and CPU |
 | `siphon_rtp_cpu_permille` | gauge | host CPU 0..=1000 (absent until first `/proc/stat` sample) |
 | `siphon_rtp_draining` | gauge | 1 while draining, 0 while serving |
+| `siphon_rtp_turn_allocations{transport}` | gauge | live built-in TURN allocations by the transport the client reached the server over (`udp`, `tcp`, `tls`); back to 0 when they are deleted or expire |
+| `siphon_rtp_turn_relayed_bytes_total{direction}` | counter | payload bytes the built-in TURN server relayed (`client_to_peer`, `peer_to_client`) |
+| `siphon_rtp_turn_refused_total{reason}` | counter | TURN requests refused and relayed packets dropped: `unauthorized` (401, including the one that opens every long-term-credential exchange), `stale_nonce` (438), `quota` (486), `peer_denied` (403 for a peer the denylist refuses, and every relayed packet dropped for the same reason, RFC 8656 §21) |
 
 Worth alerting on:
 

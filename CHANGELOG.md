@@ -22,6 +22,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **The built-in TURN server exports metrics.** `siphon_rtp_turn_allocations{transport="udp|tcp|tls"}`
+  (live allocations by the client's transport, back to 0 on delete or expiry),
+  `siphon_rtp_turn_relayed_bytes_total{direction="client_to_peer|peer_to_client"}` and
+  `siphon_rtp_turn_refused_total{reason="unauthorized|stale_nonce|quota|peer_denied"}` (401, 438, 486,
+  and 403 plus every relayed packet dropped for a denied peer), on `/metrics` beside the engine's own
+  series. The counters are atomics in `siphon-rtp-turn` (`Turn::metrics`), read at scrape time.
 - **A TURN-only client can reach the engine's own media endpoints, and nothing else private.** The
   built-in TURN server used to refuse every loopback and private peer, so on a LAN deployment (or an
   RFC 1918 engine address behind 1:1 NAT) a relayed candidate could not reach the engine's media

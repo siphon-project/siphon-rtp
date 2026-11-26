@@ -36,6 +36,20 @@ struct Rig {
     turn_address: SocketAddr,
 }
 
+/// The value of the sample line starting `series` in the engine's exposition.
+fn sample(engine: &Engine<UdpLoopbackDatapath>, series: &str) -> u64 {
+    let body = engine.metrics().render(Default::default(), 0);
+    let line = body
+        .lines()
+        .find(|line| line.starts_with(series))
+        .unwrap_or_else(|| panic!("no {series} in:\n{body}"));
+    line.rsplit(' ')
+        .next()
+        .expect("value")
+        .parse()
+        .expect("number")
+}
+
 /// An engine and a TURN server with the **default** denylist over one datapath.
 async fn rig() -> Rig {
     let datapath = UdpLoopbackDatapath::new();
@@ -48,6 +62,7 @@ async fn rig() -> Rig {
         Arc::new(FixedUnixClock::new(1_000)),
     )
     .expect("spawn turn");
+    engine.metrics().attach_turn(turn.metrics());
     let socket = UdpSocket::bind(("127.0.0.1", 0)).await.expect("listener");
     let turn_address = socket.local_addr().expect("address");
     tokio::spawn(async move {
@@ -396,4 +411,94 @@ async fn a_torn_down_calls_port_is_dropped_even_when_something_else_binds_it() {
         browser.send(near_leg, &rtp(4)).await;
         assert!(silent(&squatter).await);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_engine_exposition_follows_the_relay_and_the_refusals() {
+    let rig = rig().await;
+    let engine = &rig.engine;
+    assert_eq!(
+        sample(engine, "siphon_rtp_turn_allocations{transport=\"udp\"}"),
+        0
+    );
+
+    let mut browser = Browser::allocate(rig.turn_address).await;
+    assert_eq!(
+        sample(engine, "siphon_rtp_turn_allocations{transport=\"udp\"}"),
+        1
+    );
+    assert_eq!(
+        sample(engine, "siphon_rtp_turn_allocations{transport=\"tcp\"}"),
+        0
+    );
+    // The 401 that opened the exchange.
+    assert_eq!(
+        sample(
+            engine,
+            "siphon_rtp_turn_refused_total{reason=\"unauthorized\"}"
+        ),
+        1
+    );
+
+    let (far_phone, far_address) = udp().await;
+    let (near_leg, far_leg) = call(&rig, "turn-metrics", browser.relay, far_address).await;
+    assert_eq!(
+        turn::class_of(browser.permit(near_leg).await.message_type),
+        turn::CLASS_SUCCESS
+    );
+    browser.send(near_leg, &rtp(5)).await;
+    received(&far_phone).await;
+    far_phone.send_to(&rtp(6), far_leg).await.expect("send");
+    browser.next_data().await;
+    let bytes = rtp(5).len() as u64;
+    assert_eq!(
+        sample(
+            engine,
+            "siphon_rtp_turn_relayed_bytes_total{direction=\"client_to_peer\"}"
+        ),
+        bytes
+    );
+    assert_eq!(
+        sample(
+            engine,
+            "siphon_rtp_turn_relayed_bytes_total{direction=\"peer_to_client\"}"
+        ),
+        bytes
+    );
+
+    // A forbidden peer and a packet to a port that is not an engine endpoint are both peer_denied.
+    let elsewhere: SocketAddr = "127.0.0.2:30000".parse().expect("address");
+    assert!(is_forbidden(&browser.permit(elsewhere).await));
+    let (_bystander, bystander_address) = udp().await;
+    browser.send(bystander_address, &rtp(7)).await;
+    for _ in 0..100 {
+        if sample(
+            engine,
+            "siphon_rtp_turn_refused_total{reason=\"peer_denied\"}",
+        ) == 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sample(
+            engine,
+            "siphon_rtp_turn_refused_total{reason=\"peer_denied\"}"
+        ),
+        2
+    );
+
+    // Deleting the allocation takes the gauge back to zero.
+    let response = browser
+        .request(
+            turn::METHOD_REFRESH,
+            &[(turn::ATTR_LIFETIME, turn::lifetime_value(0).to_vec())],
+        )
+        .await;
+    assert_eq!(turn::class_of(response.message_type), turn::CLASS_SUCCESS);
+    assert_eq!(
+        sample(engine, "siphon_rtp_turn_allocations{transport=\"udp\"}"),
+        0
+    );
 }

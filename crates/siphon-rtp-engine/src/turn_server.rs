@@ -252,6 +252,7 @@ where
         Box::new(NoFastPath),
         relay_rx,
     )?;
+    engine.metrics().attach_turn(turn.metrics());
     tracing::info!(realm, "TURN server enabled (coturn replacement)");
 
     if let Some(addr) = settings.turn_udp {

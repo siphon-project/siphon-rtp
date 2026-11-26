@@ -1721,6 +1721,80 @@ mod tests {
         assert!(from_flag.turn_permit_private_peers);
     }
 
+    #[tokio::test]
+    async fn spawn_turn_feeds_the_turn_counters_into_the_engine_metrics() {
+        use crate::turn_server::{spawn_turn, TurnCredentials};
+        use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
+        use siphon_rtp_stun::{self as stun, turn};
+
+        let datapath = UdpLoopbackDatapath::new();
+        let engine = crate::Engine::new(datapath.clone());
+        let config = resolve_from(&["siphon-rtp"], FileConfig::default());
+
+        // Without credentials TURN stays off and nothing is attached.
+        let (off, _) = spawn_turn(
+            std::sync::Arc::new(datapath.clone()),
+            &config,
+            None,
+            &engine,
+        )
+        .await
+        .expect("spawn");
+        assert!(off.is_none());
+
+        let credentials = TurnCredentials {
+            realm: "turn.example.com".into(),
+            secret: b"secret".to_vec(),
+        };
+        let (turn_server, _) = spawn_turn(
+            std::sync::Arc::new(datapath),
+            &config,
+            Some(credentials),
+            &engine,
+        )
+        .await
+        .expect("spawn");
+        let turn_server = turn_server.expect("enabled");
+        let listener = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = turn_server.serve_udp(listener).await;
+        });
+
+        // An Allocate without credentials is answered 401, which the server counts as refused.
+        let client = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind client");
+        let request = stun::MessageBuilder::new(
+            turn::message_type(turn::METHOD_ALLOCATE, turn::CLASS_REQUEST),
+            &[7u8; 12],
+        )
+        .attribute(
+            turn::ATTR_REQUESTED_TRANSPORT,
+            &turn::requested_transport_value(turn::TRANSPORT_UDP),
+        )
+        .finish(None, true);
+        client.send_to(&request, address).await.expect("send");
+        let mut buffer = [0u8; 2048];
+        let (length, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buffer),
+        )
+        .await
+        .expect("response in time")
+        .expect("recv");
+        let response = stun::parse(&buffer[..length]).expect("parse");
+        assert_eq!(turn::error_code(&response), Some(turn::ERROR_UNAUTHORIZED));
+
+        let body = engine.metrics().render(Default::default(), 0);
+        assert!(
+            body.contains("siphon_rtp_turn_refused_total{reason=\"unauthorized\"} 1\n"),
+            "{body}"
+        );
+    }
+
     #[test]
     fn the_turn_realm_and_secret_file_resolve_flag_over_config_file() {
         let file = FileConfig {

@@ -12,6 +12,11 @@
 //! dependency).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use siphon_rtp_turn::{
+    RefusalReason, RelayDirection, TransportProtocol, TurnMetrics, TurnMetricsSnapshot,
+};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -81,6 +86,8 @@ pub struct Metrics {
     /// Packets and bytes anchored video streams carried, by direction, added as each call ends.
     video_packets_total: [AtomicU64; 2],
     video_bytes_total: [AtomicU64; 2],
+    /// The built-in TURN server's counters, once one is running ([`Metrics::attach_turn`]).
+    turn: OnceLock<Arc<TurnMetrics>>,
 }
 
 /// Why a WebSocket dial failed, as counted in the metrics and named in the log line.
@@ -210,6 +217,12 @@ impl Metrics {
     /// A plain relaxed load of each atomic; the four values are sampled independently (no global
     /// barrier), which is correct for read-only telemetry — `statistics` is a census, not a
     /// transaction.
+    /// Export the built-in TURN server's counters from now on (`siphon_rtp_turn_*`). Called once,
+    /// when the server starts; a second call is ignored. Without it the series render as zero.
+    pub fn attach_turn(&self, turn: Arc<TurnMetrics>) {
+        let _ = self.turn.set(turn);
+    }
+
     /// Add one ended call's anchored video counters.
     pub fn record_video(&self, video: &siphon_rtp_proto::VideoStats) {
         self.video_packets_total[0].fetch_add(video.packets_in, Ordering::Relaxed);
@@ -234,7 +247,7 @@ impl Metrics {
     /// (live heap).
     ///
     /// The body is valid `text/plain; version=0.0.4`: each series carries a `# HELP` and `# TYPE`
-    /// line, then the sample. Numbers only (no labels) keeps the surface trivially scrapeable.
+    /// line, then the sample. Series are unlabelled except the TURN ones, which carry one label each.
     #[must_use]
     pub fn render(&self, live: LiveGauges, jemalloc_allocated_bytes: u64) -> String {
         let offers = self.offers_total.load(Ordering::Relaxed);
@@ -539,7 +552,68 @@ impl Metrics {
             "counter",
             delay_estimation.rewidens_total,
         );
+        let turn = self
+            .turn
+            .get()
+            .map(|turn| turn.snapshot())
+            .unwrap_or_default();
+        render_turn(&mut output, &turn);
         output
+    }
+}
+
+/// Append the built-in TURN server's series: the live allocations per client transport, the relayed
+/// payload bytes per direction, and the refusals per reason. Every label value is always present
+/// (zero when TURN is off or has not seen one), so a dashboard or alert never has to cope with a
+/// series that appears only after its first event.
+fn render_turn(output: &mut String, turn: &TurnMetricsSnapshot) {
+    labeled_series(
+        output,
+        (
+            "siphon_rtp_turn_allocations",
+            "Live TURN allocations, by the transport the client reached the server over.",
+            "gauge",
+        ),
+        "transport",
+        TransportProtocol::ALL.map(|transport| (transport.label(), turn.allocations(transport))),
+    );
+    labeled_series(
+        output,
+        (
+            "siphon_rtp_turn_relayed_bytes_total",
+            "Payload bytes the TURN server has relayed, by direction.",
+            "counter",
+        ),
+        "direction",
+        RelayDirection::ALL.map(|direction| (direction.label(), turn.relayed_bytes(direction))),
+    );
+    labeled_series(
+        output,
+        (
+            "siphon_rtp_turn_refused_total",
+            "TURN requests refused and relayed packets dropped, by reason (the 401 that opens every \
+             long-term-credential exchange counts as unauthorized).",
+            "counter",
+        ),
+        "reason",
+        RefusalReason::ALL.map(|reason| (reason.label(), turn.refused(reason))),
+    );
+}
+
+/// Append one labelled series: `# HELP` and `# TYPE` from `(name, help, kind)`, then one
+/// `name{label="value"} sample` line per `(value, sample)`. Label values are fixed identifiers (the
+/// `label` functions of the TURN metric types), so none needs escaping.
+fn labeled_series<const N: usize>(
+    output: &mut String,
+    (name, help, kind): (&str, &str, &str),
+    label: &str,
+    samples: [(&str, u64); N],
+) {
+    use std::fmt::Write as _;
+    let _ = writeln!(output, "# HELP {name} {help}");
+    let _ = writeln!(output, "# TYPE {name} {kind}");
+    for (value, sample) in samples {
+        let _ = writeln!(output, "{name}{{{label}=\"{value}\"}} {sample}");
     }
 }
 
@@ -880,9 +954,9 @@ mod tests {
         }
         assert!(body.contains("# TYPE siphon_rtp_scoped_offers_total counter\n"));
         assert!(body.contains("siphon_rtp_scoped_offers_total 0\n"));
-        // Every series carries a HELP + TYPE line (37 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 37);
-        assert_eq!(body.matches("# TYPE ").count(), 37);
+        // Every series carries a HELP + TYPE line (40 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 40);
+        assert_eq!(body.matches("# TYPE ").count(), 40);
     }
 
     #[test]
@@ -904,8 +978,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (36 vs 37).
-        assert_eq!(body.matches("# TYPE ").count(), 36);
+        // One fewer series than the CPU-present case (39 vs 40).
+        assert_eq!(body.matches("# TYPE ").count(), 39);
     }
 
     #[test]
@@ -922,6 +996,40 @@ mod tests {
         assert!(body.contains("siphon_rtp_video_packets_total{direction=\"out\"} 5\n"));
         assert!(body.contains("siphon_rtp_video_bytes_total{direction=\"in\"} 700\n"));
         assert!(body.contains("siphon_rtp_video_bytes_total{direction=\"out\"} 500\n"));
+    }
+
+    #[test]
+    fn the_turn_series_render_with_one_label_each_and_are_zero_without_a_server() {
+        let body = Metrics::new().render(LiveGauges::default(), 0);
+        for expected in [
+            "# HELP siphon_rtp_turn_allocations ",
+            "# TYPE siphon_rtp_turn_allocations gauge\n",
+            "siphon_rtp_turn_allocations{transport=\"udp\"} 0\n",
+            "siphon_rtp_turn_allocations{transport=\"tcp\"} 0\n",
+            "siphon_rtp_turn_allocations{transport=\"tls\"} 0\n",
+            "# HELP siphon_rtp_turn_relayed_bytes_total ",
+            "# TYPE siphon_rtp_turn_relayed_bytes_total counter\n",
+            "siphon_rtp_turn_relayed_bytes_total{direction=\"client_to_peer\"} 0\n",
+            "siphon_rtp_turn_relayed_bytes_total{direction=\"peer_to_client\"} 0\n",
+            "# HELP siphon_rtp_turn_refused_total ",
+            "# TYPE siphon_rtp_turn_refused_total counter\n",
+            "siphon_rtp_turn_refused_total{reason=\"unauthorized\"} 0\n",
+            "siphon_rtp_turn_refused_total{reason=\"stale_nonce\"} 0\n",
+            "siphon_rtp_turn_refused_total{reason=\"quota\"} 0\n",
+            "siphon_rtp_turn_refused_total{reason=\"peer_denied\"} 0\n",
+        ] {
+            assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
+        }
+    }
+
+    #[test]
+    fn an_attached_turn_server_is_read_live_at_every_render() {
+        let metrics = Metrics::new();
+        let turn = Arc::new(TurnMetrics::default());
+        metrics.attach_turn(turn.clone());
+        // A second attach is ignored: the first server stays the source.
+        metrics.attach_turn(Arc::new(TurnMetrics::default()));
+        assert!(Arc::ptr_eq(metrics.turn.get().expect("attached"), &turn));
     }
 
     #[test]

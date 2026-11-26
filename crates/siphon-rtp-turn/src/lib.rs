@@ -36,12 +36,14 @@ use tokio_rustls::TlsAcceptor;
 mod credentials;
 mod fastpath;
 mod manager;
+mod metrics;
 mod server;
 pub mod tls;
 
 pub use credentials::{CredentialVerifier, NonceFactory};
 pub use fastpath::{ChannelRoute, NoFastPath, TurnFastPath};
 pub use manager::AllocationManager;
+pub use metrics::{RefusalReason, RelayDirection, TurnMetrics, TurnMetricsSnapshot};
 
 use manager::Message;
 
@@ -97,22 +99,26 @@ impl ClientTransport {
 
     /// Write one already-framed message back to the client. Best-effort: a failed UDP send or a
     /// closed stream writer is logged, not propagated (the reaper / connection teardown handles a
-    /// dead client).
-    pub(crate) async fn send(&self, message: &[u8]) {
+    /// dead client). Returns whether the message was handed to the transport, so a caller counts
+    /// only what was delivered.
+    pub(crate) async fn send(&self, message: &[u8]) -> bool {
         match self {
-            ClientTransport::Udp { socket, peer } => {
-                if let Err(error) = socket.send_to(message, *peer).await {
+            ClientTransport::Udp { socket, peer } => match socket.send_to(message, *peer).await {
+                Ok(_) => true,
+                Err(error) => {
                     tracing::debug!(%peer, %error, "TURN UDP reply failed");
+                    false
                 }
-            }
+            },
             ClientTransport::Stream { writer } => {
-                if writer
+                let queued = writer
                     .send_async(Bytes::copy_from_slice(message))
                     .await
-                    .is_err()
-                {
+                    .is_ok();
+                if !queued {
                     tracing::debug!("TURN stream writer closed");
                 }
+                queued
             }
         }
     }
@@ -371,6 +377,7 @@ pub enum TurnError {
 #[derive(Clone)]
 pub struct Turn {
     pub(crate) client_tx: flume::Sender<Message>,
+    metrics: Arc<TurnMetrics>,
 }
 
 impl Turn {
@@ -431,6 +438,7 @@ impl Turn {
         let (client_tx, client_rx) = flume::bounded::<Message>(2048);
         let manager =
             AllocationManager::new(datapath.clone(), config, unix_clock, nonce, fast_path);
+        let metrics = manager.metrics();
         tokio::spawn(manager.run(client_rx));
 
         // Drain redirected peer datagrams into the allocation actor. Drop-newest on a full mailbox —
@@ -449,7 +457,7 @@ impl Turn {
             }
         });
 
-        Ok(Self { client_tx })
+        Ok(Self { client_tx, metrics })
     }
 
     /// Serve TURN over UDP on `socket` (the `turn:` UDP front door) until the socket errors. All UDP
@@ -471,6 +479,13 @@ impl Turn {
         acceptor: TlsAcceptor,
     ) -> std::io::Result<()> {
         server::serve_tls(self.client_tx.clone(), listener, acceptor).await
+    }
+
+    /// The server's live counters (allocations per client transport, relayed bytes, refusals), for
+    /// the host's metrics exposition. Cheap to read from any task.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<TurnMetrics> {
+        self.metrics.clone()
     }
 
     /// Tick the allocation actor's reaper (frees expired allocations/permissions/channels against the
