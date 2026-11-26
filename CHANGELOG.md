@@ -20,6 +20,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   with no `ws_split_started` before it, and that `attach_ws_split`'s `from_tag` does not choose a
   party (channel 0 is always the offerer).
 
+### Added
+
+- **The built-in TURN server reads its secret from a file.** `--turn-secret-file` (env
+  `SIPHON_RTP_TURN_SECRET_FILE`, config key `turn_secret_file`) and `--turn-realm` (config key
+  `turn_realm`; `SIPHON_RTP_TURN_REALM` keeps working) enable TURN on a deployment that keeps its
+  secrets as files on a volume and cannot wrap the entrypoint in a shell. The file is trimmed and an
+  empty or unreadable one is refused; a file together with `SIPHON_RTP_TURN_SECRET` is refused
+  rather than preferring one. A realm without a secret, or a secret without a realm, now fails the
+  start instead of silently leaving TURN off.
+
 ## [0.29.0] — 2026-11-26
 
 ### Added

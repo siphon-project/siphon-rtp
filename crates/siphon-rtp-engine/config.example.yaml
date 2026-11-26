@@ -301,8 +301,18 @@ control: "127.0.0.1:8080"
 
 # --- TURN server (coturn replacement) -----------------------------------------------------------
 #
-# TURN is enabled when SIPHON_RTP_TURN_REALM and SIPHON_RTP_TURN_SECRET are set in the environment;
-# at least one turn_* listener must then be configured (here or via --turn-*).
+# TURN is enabled when a realm and a secret are both set; one without the other is a fatal startup
+# error. At least one turn_* listener must then be configured (here or via --turn-*).
+# The secret is never a config value: SIPHON_RTP_TURN_SECRET in the environment, or a file (below).
+# Giving both is a fatal startup error.
+
+# Realm of the TURN server (CLI: --turn-realm; env SIPHON_RTP_TURN_REALM is the fallback).
+# turn_realm: "turn.example.com"
+
+# File holding the TURN static-auth-secret, for a deployment that keeps secrets as files on a volume
+# (CLI: --turn-secret-file; env SIPHON_RTP_TURN_SECRET_FILE is the fallback). A trailing newline is
+# trimmed; an empty file is refused.
+# turn_secret_file: "/run/secrets/siphon-rtp-turn"
 
 # TURN UDP listen address, `turn:` (CLI: --turn-udp).
 # turn_udp: "0.0.0.0:3478"
