@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-11-27
+
 ### Added
 
 - **`offer_local`: the engine makes its own offer for an INVITE that carries no SDP.** A carrier
