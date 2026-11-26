@@ -96,6 +96,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             controllers: DashMap::new(),
             controller_ids: DashMap::new(),
             endpoint_calls: DashMap::new(),
+            media_endpoints: Arc::new(crate::media_endpoints::MediaEndpointRegistry::new()),
             call_floor_channels: DashMap::new(),
             awaiting_media: DashMap::new(),
             bridge,
@@ -324,6 +325,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Borrow the underlying datapath (used by tests and, later, the media pipeline).
     pub fn datapath(&self) -> &D {
         &self.datapath
+    }
+
+    /// The engine's live media endpoints, for the built-in TURN server to check per packet before it
+    /// relays to a loopback or private peer (`TurnConfig::own_media_endpoints`, RFC 8656 §21).
+    pub fn own_media_endpoints(&self) -> Arc<dyn siphon_rtp_turn::OwnMediaEndpoints> {
+        self.media_endpoints.clone()
     }
 
     /// The shared SRTP bridge — handed to the redirect dispatcher so it can route bridge-owned

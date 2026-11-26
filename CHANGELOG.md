@@ -22,6 +22,15 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **A TURN-only client can reach the engine's own media endpoints, and nothing else private.** The
+  built-in TURN server used to refuse every loopback and private peer, so on a LAN deployment (or an
+  RFC 1918 engine address behind 1:1 NAT) a relayed candidate could not reach the engine's media
+  port. A peer IP the denylist refuses only as loopback or private is now accepted at CreatePermission
+  and ChannelBind when the engine has a live media endpoint on it, and every relayed packet toward or
+  from it is checked against the engine's live endpoints per `(IP, port)`: any other port, a relay
+  socket, or a port a finished call released is dropped. Other private IPs, link-local, multicast and
+  explicit denials stay 403 (RFC 8656 §21). `siphon-rtp-turn` takes the view as
+  `TurnConfig::own_media_endpoints` (`OwnMediaEndpoints`); without it nothing changes.
 - **The built-in TURN server reads its secret from a file.** `--turn-secret-file` (env
   `SIPHON_RTP_TURN_SECRET_FILE`, config key `turn_secret_file`) and `--turn-realm` (config key
   `turn_realm`; `SIPHON_RTP_TURN_REALM` keeps working) enable TURN on a deployment that keeps its

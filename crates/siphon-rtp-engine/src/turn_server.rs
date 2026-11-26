@@ -9,10 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use siphon_rtp_datapath::{Datapath, RxPacket};
-use siphon_rtp_turn::{tls, NoFastPath, PeerIpPolicy, SystemUnixClock, Turn, TurnConfig};
+use siphon_rtp_turn::{
+    tls, NoFastPath, OwnMediaEndpoints, PeerIpPolicy, SystemUnixClock, Turn, TurnConfig,
+};
 use tokio::net::{TcpListener, UdpSocket};
 
 use crate::daemon::RunConfig;
+use crate::Engine;
 
 /// Environment variable carrying the TURN realm (`--turn-realm`, config key `turn_realm`).
 pub(crate) const TURN_REALM_ENV: &str = "SIPHON_RTP_TURN_REALM";
@@ -190,9 +193,17 @@ fn read_secret_file(path: &Path) -> Result<String, TurnServerSettingsError> {
 ///
 /// The denylist is the secure default (loopback, private, link-local and multicast peers refused,
 /// RFC 8656 §21) unless `--turn-permit-private-peers` is set, which lifts only the loopback and
-/// private-range denials; link-local and multicast stay refused.
-pub(crate) fn turn_config(realm: String, secret: Vec<u8>, settings: &RunConfig) -> TurnConfig {
+/// private-range denials; link-local and multicast stay refused. Independently of that flag,
+/// `own_media` lets a client reach the engine's own live media endpoints (and only those) through
+/// a relayed candidate, per packet (docs/security-and-nat.md §11 R3).
+pub(crate) fn turn_config(
+    realm: String,
+    secret: Vec<u8>,
+    settings: &RunConfig,
+    own_media: Arc<dyn OwnMediaEndpoints>,
+) -> TurnConfig {
     let mut config = TurnConfig::new(realm, secret);
+    config.own_media_endpoints = Some(own_media);
     config.relay_address = settings.turn_relay_ip;
     if settings.turn_permit_private_peers {
         config.denied_peers = PeerIpPolicy {
@@ -216,15 +227,21 @@ pub(crate) async fn spawn_turn<D>(
     datapath: Arc<D>,
     settings: &RunConfig,
     credentials: Option<TurnCredentials>,
+    engine: &Engine<D>,
 ) -> Result<(Option<Turn>, Option<flume::Sender<RxPacket>>), Box<dyn std::error::Error>>
 where
-    D: Datapath + 'static,
+    D: Datapath + Clone + Send + 'static,
 {
     let Some(TurnCredentials { realm, secret }) = credentials else {
         return Ok((None, None));
     };
 
-    let config = turn_config(realm.clone(), secret, settings);
+    let config = turn_config(
+        realm.clone(),
+        secret,
+        settings,
+        engine.own_media_endpoints(),
+    );
     // TURN's relay packets are fed by the redirect dispatcher (it shares datapath.rx() with the SRTP
     // bridge), not drained by TURN directly. Drop-newest on a full mailbox — late media is worthless.
     let (relay_tx, relay_rx) = flume::bounded(2048);

@@ -146,6 +146,11 @@ harness = false
 name = "dtls_bridge_bench"
 harness = false
 
+# The per-packet cost of the TURN own-media-endpoint check: one sharded-map read against a busy node.
+[[bench]]
+name = "media_endpoints_bench"
+harness = false
+
 # The forwarding room's fan-out cost per inbound packet at 10 to 1000 seats, with no sockets.
 [[bench]]
 name = "forward_fanout_bench"

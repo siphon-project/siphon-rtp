@@ -1190,7 +1190,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .alloc_endpoint_on_port_at(addr.ip(), addr.port())
                 .await
             {
-                Ok(endpoint) => bound.push((role, endpoint)),
+                Ok(endpoint) => {
+                    self.media_endpoints.register(endpoint);
+                    bound.push((role, endpoint));
+                }
                 Err(error) => {
                     self.free_bound(&bound).await;
                     return Err(Box::new(error_result(
