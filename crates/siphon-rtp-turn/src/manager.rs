@@ -8,7 +8,7 @@
 //! injected logical clock so the reaper is deterministic.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -46,6 +46,28 @@ pub(crate) enum Message {
     Count(tokio::sync::oneshot::Sender<usize>),
     /// Stop the actor.
     Shutdown,
+}
+
+/// A peer address in its canonical form: an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) becomes the
+/// IPv4 address it wraps. Every peer address the client names or the datapath reports passes through
+/// this before the denylist, the permission and channel tables, the own-endpoint lookup and the
+/// fast-path offer, so one peer has one spelling everywhere and the mapped form cannot dodge a check
+/// made on the plain one (RFC 8656 §21). It also keeps the relay socket sending: an IPv4 socket
+/// cannot address a mapped IPv6 destination.
+fn canonical(peer: SocketAddr) -> SocketAddr {
+    SocketAddr::new(peer.ip().to_canonical(), peer.port())
+}
+
+/// How the peer denylist treats one peer IP (see `AllocationManager::peer_access`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerAccess {
+    /// The policy permits it: every port.
+    Open,
+    /// Denied as loopback or private, but the host has live media endpoints on it: only those
+    /// `(IP, port)` pairs, checked per packet.
+    OwnEndpointsOnly,
+    /// Refused.
+    Forbidden,
 }
 
 /// One channel binding (RFC 5766 §11): the peer it targets and when it expires.
@@ -442,7 +464,10 @@ impl<D: Datapath> AllocationManager<D> {
             .await;
             return;
         }
-        let peers = turn::xor_peer_addresses(message);
+        let peers: Vec<SocketAddr> = turn::xor_peer_addresses(message)
+            .into_iter()
+            .map(canonical)
+            .collect();
         if peers.is_empty() {
             self.send_error(
                 method,
@@ -455,10 +480,12 @@ impl<D: Datapath> AllocationManager<D> {
             .await;
             return;
         }
-        // Any denied peer rejects the whole request (anti-SSRF, R3) — install nothing.
+        // Any denied peer rejects the whole request (anti-SSRF, R3) — install nothing. A host IP of
+        // the engine's own media endpoints passes (RFC 8656 §21 exemption, `peer_access`); only its
+        // live ports get packets.
         if peers
             .iter()
-            .any(|peer| !self.config.denied_peers.permits(peer.ip()))
+            .any(|peer| self.peer_access(peer.ip()) == PeerAccess::Forbidden)
         {
             self.send_error(
                 method,
@@ -513,7 +540,7 @@ impl<D: Datapath> AllocationManager<D> {
         }
         let (Some(channel), Some(peer)) = (
             turn::channel_number(message),
-            turn::xor_peer_address(message),
+            turn::xor_peer_address(message).map(canonical),
         ) else {
             self.send_error(
                 method,
@@ -551,7 +578,8 @@ impl<D: Datapath> AllocationManager<D> {
             .await;
             return;
         }
-        if !self.config.denied_peers.permits(peer.ip()) {
+        let access = self.peer_access(peer.ip());
+        if access == PeerAccess::Forbidden {
             self.send_error(
                 method,
                 &txid,
@@ -581,8 +609,12 @@ impl<D: Datapath> AllocationManager<D> {
             relay_addr = Some(allocation.relay.local_addr);
         }
         // Offer the bound channel to the kernel fast path — UDP client legs only, since the kernel
-        // rewrite is UDP-to-UDP (M-T8). The default NoFastPath ignores it.
-        if let (TransportProtocol::Udp, Some(relay)) = (five_tuple.transport, relay_addr) {
+        // rewrite is UDP-to-UDP (M-T8). The default NoFastPath ignores it. Never for a peer that is
+        // exempt as an own media endpoint: the kernel rewrite is fixed at bind time and cannot check
+        // that the endpoint is still live on each packet.
+        if let (TransportProtocol::Udp, Some(relay), PeerAccess::Open) =
+            (five_tuple.transport, relay_addr, access)
+        {
             self.fast_path.install_channel(ChannelRoute {
                 channel,
                 client: five_tuple.client,
@@ -599,11 +631,13 @@ impl<D: Datapath> AllocationManager<D> {
 
     /// Handle a Send indication (RFC 5766 §10): client → peer, no auth, no response.
     async fn handle_send_indication(&mut self, five_tuple: FiveTuple, message: &StunMessage) {
-        let (Some(peer), Some(data)) = (turn::xor_peer_address(message), turn::data(message))
-        else {
+        let (Some(peer), Some(data)) = (
+            turn::xor_peer_address(message).map(canonical),
+            turn::data(message),
+        ) else {
             return;
         };
-        if !self.config.denied_peers.permits(peer.ip()) {
+        if !self.relay_peer_allowed(peer) {
             return;
         }
         let now_tick = self.datapath.now_ticks();
@@ -644,7 +678,7 @@ impl<D: Datapath> AllocationManager<D> {
         let Some((relay_id, peer)) = target else {
             return;
         };
-        if !self.config.denied_peers.permits(peer.ip()) {
+        if !self.relay_peer_allowed(peer) {
             return;
         }
         self.relay_to_peer(&five_tuple, relay_id, peer, channel_data.data)
@@ -674,6 +708,7 @@ impl<D: Datapath> AllocationManager<D> {
     /// Handle a peer's datagram arriving on a relay endpoint (RFC 5766 §8/§10): permission-gate it,
     /// then deliver to the client as ChannelData (if a channel is bound) or a Data indication.
     async fn handle_relay_inbound(&mut self, endpoint: EndpointId, peer: SocketAddr, data: &[u8]) {
+        let peer = canonical(peer);
         let Some(&five_tuple) = self.relay_index.get(&endpoint) else {
             return;
         };
@@ -695,7 +730,7 @@ impl<D: Datapath> AllocationManager<D> {
             {
                 return;
             }
-            if !self.config.denied_peers.permits(peer.ip()) {
+            if !self.relay_peer_allowed(peer) {
                 return;
             }
             if !self.within_budget(&five_tuple, data.len()) {
@@ -728,6 +763,55 @@ impl<D: Datapath> AllocationManager<D> {
         if let Some(allocation) = self.allocations.get_mut(&five_tuple) {
             allocation.bytes_relayed += data.len() as u64;
         }
+    }
+
+    /// How the denylist treats `ip` at CreatePermission / ChannelBind (RFC 8656 §9, §11, §21).
+    ///
+    /// An IP the policy permits is [`PeerAccess::Open`]. One it denies only as loopback or private
+    /// is [`PeerAccess::OwnEndpointsOnly`] when the host reports live media endpoints on it, and
+    /// [`PeerAccess::Forbidden`] otherwise, as is anything the policy denies for another reason
+    /// (explicit entry, link-local, multicast, unspecified).
+    fn peer_access(&self, ip: IpAddr) -> PeerAccess {
+        let policy = &self.config.denied_peers;
+        if policy.permits(ip) {
+            return PeerAccess::Open;
+        }
+        let hosted = policy.denied_only_by_range(ip)
+            && self
+                .config
+                .own_media_endpoints
+                .as_ref()
+                .is_some_and(|own| own.hosts_media_on(ip));
+        if hosted {
+            PeerAccess::OwnEndpointsOnly
+        } else {
+            PeerAccess::Forbidden
+        }
+    }
+
+    /// Whether a relayed packet to or from `peer` may pass, checked on **every** packet (RFC 8656 §21).
+    ///
+    /// A permitted peer always passes. A peer in the denied loopback or private range passes only
+    /// while it is a live media endpoint of the host, so the permission (IP-only, RFC 8656 §9) a
+    /// client holds on the engine's address opens exactly the ports the engine has bound for calls
+    /// right now, and none of its other ports, nor a port a finished call has released. Allocation-free:
+    /// a policy check and, for a denied-range peer, one sharded-map read (a shard read lock, held for
+    /// the lookup alone, never across an `.await`).
+    fn relay_peer_allowed(&self, peer: SocketAddr) -> bool {
+        let policy = &self.config.denied_peers;
+        if policy.permits(peer.ip()) {
+            return true;
+        }
+        let live = policy.denied_only_by_range(peer.ip())
+            && self
+                .config
+                .own_media_endpoints
+                .as_ref()
+                .is_some_and(|own| own.is_live_media_endpoint(peer));
+        if !live {
+            tracing::debug!(%peer, "TURN dropped a relayed packet: not a permitted peer, not a live own media endpoint");
+        }
+        live
     }
 
     /// Authenticate a request; on failure, send the 401/438 challenge and return `None`.

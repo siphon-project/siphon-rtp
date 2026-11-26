@@ -210,7 +210,26 @@ impl PeerIpPolicy {
     /// Whether the relay may exchange traffic with `peer` (RFC 5766 §8/§9 permission target).
     #[must_use]
     pub fn permits(&self, peer: IpAddr) -> bool {
-        if self.denied.contains(&peer) {
+        self.permits_with(peer, self.deny_loopback, self.deny_private)
+    }
+
+    /// Whether `peer` is denied **only** for being a loopback or private address, so that a host
+    /// which knows `peer` is one of its own live media endpoints may still accept it
+    /// ([`OwnMediaEndpoints`]). An explicitly [`denied`](Self::denied) address, the unspecified
+    /// address, and link-local or multicast addresses (where those are denied) stay refused: RFC 8656
+    /// §21 has no reason to relay to them, own endpoint or not.
+    #[must_use]
+    pub fn denied_only_by_range(&self, peer: IpAddr) -> bool {
+        !self.permits(peer) && self.permits_with(peer, false, false)
+    }
+
+    /// [`permits`](Self::permits) with the loopback and private denials set explicitly.
+    fn permits_with(&self, peer: IpAddr, deny_loopback: bool, deny_private: bool) -> bool {
+        // An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is the IPv4 address it wraps for every
+        // range and list check, or `::ffff:127.0.0.1` would pass the IPv6 branch as a public address
+        // (RFC 8656 §21).
+        let peer = peer.to_canonical();
+        if self.denied.iter().any(|entry| entry.to_canonical() == peer) {
             return false;
         }
         // The unspecified address (0.0.0.0 / ::) is never a valid relay peer.
@@ -219,10 +238,10 @@ impl PeerIpPolicy {
         }
         match peer {
             IpAddr::V4(ip) => {
-                if self.deny_loopback && ip.is_loopback() {
+                if deny_loopback && ip.is_loopback() {
                     return false;
                 }
-                if self.deny_private && ip.is_private() {
+                if deny_private && ip.is_private() {
                     return false;
                 }
                 if self.deny_link_local && ip.is_link_local() {
@@ -234,12 +253,12 @@ impl PeerIpPolicy {
                 true
             }
             IpAddr::V6(ip) => {
-                if self.deny_loopback && ip.is_loopback() {
+                if deny_loopback && ip.is_loopback() {
                     return false;
                 }
                 // Unique-local fc00::/7 and link-local fe80::/10 by prefix (no stable std helpers).
                 let first = ip.octets()[0];
-                if self.deny_private && (first & 0xfe) == 0xfc {
+                if deny_private && (first & 0xfe) == 0xfc {
                     return false;
                 }
                 let segs = ip.segments();
@@ -253,6 +272,26 @@ impl PeerIpPolicy {
             }
         }
     }
+}
+
+/// The host's view of its own live media endpoints, handed to the TURN server so a client can reach
+/// the engine's media ports through a relayed candidate without lifting the peer denylist for every
+/// loopback or private peer (RFC 8656 §21, docs/security-and-nat.md §11 R3).
+///
+/// A TURN permission names an IP only (RFC 8656 §9), so the denylist exemption is two-part. An IP the
+/// default policy denies for being loopback or private is accepted at CreatePermission and
+/// ChannelBind only when [`hosts_media_on`](Self::hosts_media_on) says the host has media endpoints
+/// there; and every relayed packet to or from such a peer, in both directions, is then checked
+/// against [`is_live_media_endpoint`](Self::is_live_media_endpoint) at that moment, so a permitted
+/// host IP never opens its other ports and a torn-down call's port stops being reachable at once.
+///
+/// `is_live_media_endpoint` runs on every packet toward a denylisted-range peer and must not block or
+/// allocate: a sharded-map read. Peers the policy already permits never reach this trait.
+pub trait OwnMediaEndpoints: Send + Sync {
+    /// Whether at least one live media endpoint of the host is bound to `ip`.
+    fn hosts_media_on(&self, ip: IpAddr) -> bool;
+    /// Whether `endpoint` is a live media endpoint of the host right now.
+    fn is_live_media_endpoint(&self, endpoint: SocketAddr) -> bool;
 }
 
 /// Static configuration for the TURN server. Lifetimes are in seconds (the logical clock advances
@@ -286,6 +325,9 @@ pub struct TurnConfig {
     pub max_bytes_per_allocation: Option<u64>,
     /// The peer-address denylist (anti-SSRF).
     pub denied_peers: PeerIpPolicy,
+    /// The host's own live media endpoints, the one exemption to [`denied_peers`](Self::denied_peers)
+    /// (see [`OwnMediaEndpoints`]). `None` keeps the denylist exactly as configured.
+    pub own_media_endpoints: Option<Arc<dyn OwnMediaEndpoints>>,
     /// Whether to append FINGERPRINT to responses (harmless; some clients expect it).
     pub include_fingerprint: bool,
 }
@@ -307,6 +349,7 @@ impl TurnConfig {
             max_allocations_per_user: 16,
             max_bytes_per_allocation: None,
             denied_peers: PeerIpPolicy::default(),
+            own_media_endpoints: None,
             include_fingerprint: true,
         }
     }
@@ -455,5 +498,92 @@ impl Turn {
             return 0;
         }
         response.await.unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PeerIpPolicy;
+    use std::net::IpAddr;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().expect("ip")
+    }
+
+    #[test]
+    fn only_loopback_and_private_are_denied_by_range() {
+        let policy = PeerIpPolicy::default();
+        for denied_by_range in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.9",
+            "172.16.0.1",
+            "::1",
+            "fd00::7",
+        ] {
+            assert!(
+                policy.denied_only_by_range(ip(denied_by_range)),
+                "{denied_by_range}"
+            );
+        }
+        for refused_for_good in [
+            "169.254.1.1",
+            "fe80::1",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(
+                !policy.denied_only_by_range(ip(refused_for_good)),
+                "{refused_for_good}"
+            );
+        }
+        // A public address is permitted, not "denied by range".
+        assert!(!policy.denied_only_by_range(ip("203.0.113.9")));
+    }
+
+    #[test]
+    fn an_explicit_entry_is_never_denied_only_by_range() {
+        let policy = PeerIpPolicy {
+            denied: vec![ip("127.0.0.1")],
+            ..PeerIpPolicy::default()
+        };
+        assert!(!policy.denied_only_by_range(ip("127.0.0.1")));
+        assert!(policy.denied_only_by_range(ip("127.0.0.2")));
+    }
+
+    #[test]
+    fn an_ipv4_mapped_address_is_judged_as_the_ipv4_address_it_wraps() {
+        let policy = PeerIpPolicy {
+            denied: vec![ip("203.0.113.9")],
+            ..PeerIpPolicy::default()
+        };
+        for mapped in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.1.2.3",
+            "::ffff:169.254.1.1",
+            "::ffff:224.0.0.1",
+        ] {
+            assert!(!policy.permits(ip(mapped)), "{mapped}");
+        }
+        assert!(policy.denied_only_by_range(ip("::ffff:127.0.0.1")));
+        assert!(policy.denied_only_by_range(ip("::ffff:10.1.2.3")));
+        assert!(!policy.denied_only_by_range(ip("::ffff:169.254.1.1")));
+        // An explicit entry matches in either spelling.
+        assert!(!policy.permits(ip("::ffff:203.0.113.9")));
+        let mapped_entry = PeerIpPolicy {
+            denied: vec![ip("::ffff:203.0.113.9")],
+            ..PeerIpPolicy::default()
+        };
+        assert!(!mapped_entry.permits(ip("203.0.113.9")));
+        // A mapped public address stays permitted.
+        assert!(policy.permits(ip("::ffff:203.0.113.77")));
+    }
+
+    #[test]
+    fn a_permissive_policy_denies_nothing_by_range() {
+        assert!(!PeerIpPolicy::permissive().denied_only_by_range(ip("127.0.0.1")));
     }
 }

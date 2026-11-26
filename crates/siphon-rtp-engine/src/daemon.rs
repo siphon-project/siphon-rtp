@@ -1011,7 +1011,7 @@ where
     // a node that runs without the telemetry it was configured to send.
     let hep = crate::hep_export::HepSettings::from_env()?;
     // Likewise TURN's realm and secret: half of the pair refuses the start (see `turn_server`).
-    let turn_credentials = turn_credentials_for(&config)?;
+    let credentials = turn_credentials_for(&config)?;
 
     // Cluster state for the `load` / `node_info` / `drain` control commands. The node id falls back to
     // the host's `HOSTNAME` (else `siphon-rtp`); the advertised media addresses are the interfaces'
@@ -1146,7 +1146,7 @@ where
     // The built-in TURN server (coturn replacement), if configured. It no longer drains the
     // datapath's Redirect stream itself — the unified dispatcher below feeds it its relay packets.
     let (turn, turn_relay) =
-        spawn_turn(Arc::new(datapath.clone()), &config, turn_credentials).await?;
+        spawn_turn(Arc::new(datapath.clone()), &config, credentials, &engine).await?;
 
     // The single redirect dispatcher: own `datapath.rx()` and route each redirected datagram by
     // EndpointId to the SRTP bridge or (when running) the TURN relay — the sole consumer of the
@@ -1762,6 +1762,7 @@ mod tests {
             "realm".into(),
             b"secret".to_vec(),
             &resolve_from(&["siphon-rtp"], FileConfig::default()),
+            std::sync::Arc::new(crate::media_endpoints::MediaEndpointRegistry::new()),
         );
         for peer in [loopback, private, unique_local] {
             assert!(
@@ -1776,6 +1777,11 @@ mod tests {
                 &["siphon-rtp", "--turn-permit-private-peers"],
                 FileConfig::default(),
             ),
+            std::sync::Arc::new(crate::media_endpoints::MediaEndpointRegistry::new()),
+        );
+        assert!(
+            secure.own_media_endpoints.is_some(),
+            "the daemon hands TURN the engine's live media endpoints"
         );
         for peer in [loopback, private, unique_local] {
             assert!(

@@ -1128,6 +1128,10 @@ pub struct Engine<D: Datapath> {
     controller_ids: DashMap<ClientId, Arc<str>>,
     /// Reverse index endpoint → call-id, correlating observed RTCP back to its call (HEP telemetry).
     endpoint_calls: DashMap<EndpointId, String>,
+    /// Every live media endpoint by bound address, the view the built-in TURN server checks per
+    /// packet before it relays to a loopback or private peer. Entered by `alloc_endpoints` (and a
+    /// snapshot restore), left through `release_endpoint`.
+    media_endpoints: Arc<crate::media_endpoints::MediaEndpointRegistry>,
     /// The WebRTC data channel that carries the MCPTT floor of a two-party call's DTLS leg
     /// (`(call key, leg tag)`), where `send_rtcp_app` finds it. Drained with the call.
     call_floor_channels: DashMap<(String, String), floor::CallFloorChannel>,
@@ -1350,6 +1354,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     return Err(format!("alloc endpoint: {error}"));
                 }
             }
+        }
+        // Only a whole allocation is live: the rollback above never reached the registry.
+        for endpoint in &endpoints {
+            self.media_endpoints.register(*endpoint);
         }
         Ok(endpoints)
     }

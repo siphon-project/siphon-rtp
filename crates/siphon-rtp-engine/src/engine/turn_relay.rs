@@ -217,6 +217,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// endpoint itself. The single funnel every endpoint release goes through, so no teardown path
     /// can leave an allocation refreshing for a leg that no longer exists.
     pub(super) async fn release_endpoint(&self, endpoint: EndpointId) {
+        // Not live from here on: the TURN server stops relaying to its address before the socket
+        // goes, so a port the OS hands to something else next is never reachable through it.
+        self.media_endpoints.release(endpoint);
         self.release_turn_allocation(endpoint).await;
         self.datapath.remove_endpoint(endpoint).await;
     }
