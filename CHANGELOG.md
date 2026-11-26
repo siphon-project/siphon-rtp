@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-11-26
+
 ### Added
 
 - **A call on a crypto bridge can be held in the decoding actor and released back, with no re-INVITE.**
