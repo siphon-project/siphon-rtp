@@ -256,8 +256,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ) -> Result<(), String> {
         let config = self.validate_x3_request(delivery, xid, correlation_id)?;
 
-        let Some((pipeline, echo, has_far_leg, answered, seated, single_leg)) = self
-            .owned_call_internal(call_id, |call| {
+        let Some((pipeline, echo, has_far_leg, answered, seated, single_leg, awaiting_answer)) =
+            self.owned_call_internal(call_id, |call| {
                 (
                     call.pipeline,
                     call.promotion_reasons.contains(&PromotionReason::Echo),
@@ -267,6 +267,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         .is_some_and(|far| far.remote_rtp.is_some()),
                     call.seat.as_ref().is_some_and(|seat| seat.seated),
                     call.is_single_leg_answer(),
+                    call.local_offer_pending(),
                 )
             })
         else {
@@ -301,7 +302,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // leg that is offered but not answered yet is a warrant that can match at the INVITE, and
         // content (early media included) flows from the first answer on. What is left without any
         // far leg is not a call the engine answered, so there is nothing to tap.
-        if !has_far_leg && !in_room && !single_leg && !ws_call {
+        if !has_far_leg && !in_room && !single_leg && !ws_call && !awaiting_answer {
             return Err("the call has no second leg to intercept".to_string());
         }
 

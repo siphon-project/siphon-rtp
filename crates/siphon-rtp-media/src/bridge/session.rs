@@ -80,6 +80,11 @@ pub struct BridgeSession {
     /// Decoded recordings tapping this call — see [`crate::bridge::taps`]. Empty unless a
     /// recording is running, and an empty set costs the tick two empty loops.
     recording_taps: RecordingTaps,
+    /// The negotiated RFC 4733 telephone-event payload type and its clock rate, when the leg has one:
+    /// packets on it are events, never audio.
+    telephone_event: Option<(u8, u32)>,
+    /// Collapses the redundant packets of one press into one event.
+    dtmf: crate::dtmf::DtmfDetector,
 }
 
 /// The longest frame at `rate_hz` the ptime ceiling allows, in samples.
@@ -120,7 +125,21 @@ impl BridgeSession {
             uplink_converted: Vec::new(),
             downlink_converted: Vec::new(),
             recording_taps: RecordingTaps::default(),
+            telephone_event: None,
+            dtmf: crate::dtmf::DtmfDetector::new(),
         }
+    }
+
+    /// Tell the session which payload type carries RFC 4733 telephone-events, and that stream's clock
+    /// rate, which times the durations it reports (not necessarily the audio codec's).
+    /// Packets on it are demultiplexed before the audio path: an event payload is four bytes of
+    /// digit, volume and duration, and decoding it as audio turns a digit into bogus PCM. Each press
+    /// is reported to the server once, as a `dtmf` control message.
+    #[must_use]
+    pub fn with_telephone_event(mut self, event: Option<(u8, u32)>) -> Self {
+        self.telephone_event =
+            event.map(|(payload_type, clock_rate_hz)| (payload_type, clock_rate_hz.max(1)));
+        self
     }
 
     /// Attach a decoded recording's sink to one party of this call — see [`TapSide`].
@@ -281,8 +300,44 @@ impl BridgeSession {
 
     /// Feed an inbound RTP packet from the call (uplink ingress).
     pub fn on_rtp(&mut self, packet: &[u8]) {
+        if let Some((event_payload_type, _)) = self.telephone_event {
+            if let Ok(parsed) = crate::rtp::RtpPacket::parse(packet) {
+                if parsed.payload_type == event_payload_type {
+                    // The event is not audio: it is accounted, its sequence number is stepped over
+                    // (no concealment for it), and the press goes to the server.
+                    self.leg.consume_non_audio_rtp(&parsed);
+                    if let Ok(presses) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
+                        self.report_presses(presses);
+                    }
+                    return;
+                }
+                // Audio after an event that never ended: that End was lost (RFC 4733 §2.5.1.4).
+                let presses = self.dtmf.audio_resumed();
+                self.report_presses(presses);
+            }
+        }
         if let Err(error) = self.leg.ingest_rtp(packet) {
             tracing::debug!(%error, "bridge dropped malformed ingress RTP");
+        }
+    }
+
+    /// Let an event with no update for a while end (RFC 4733 §2.5.1.4); out of line so the per-tick
+    /// path stays as small as it was.
+    #[inline(never)]
+    fn time_out_event(&mut self) {
+        let presses = self.dtmf.tick(self.core.ptime_ms());
+        self.report_presses(presses);
+    }
+
+    /// Send the presses the detector completed to the server.
+    fn report_presses(&mut self, presses: crate::dtmf::DtmfPresses) {
+        let Some((_, clock_rate_hz)) = self.telephone_event else {
+            return;
+        };
+        for press in presses {
+            // RFC 4733 §2.5: duration is in timestamp units of the event's own clock.
+            let duration_ms = u32::from(press.duration) * 1000 / clock_rate_hz;
+            self.core.queue_dtmf(press.digit, duration_ms);
         }
     }
 
@@ -307,6 +362,13 @@ impl BridgeSession {
     /// leaves a call that looks healthy from every angle — the socket is up, the ticker runs, RTP
     /// arrives — while the server hears nothing at all.
     pub fn tick(&mut self, uplink_out: &mut [u8], downlink_rtp_out: &mut [u8]) -> TickResult {
+        // An event with no update for a while is over, its End lost (RFC 4733 §2.5.1.4): the session's
+        // own tick is the clock, so this is as deterministic as the audio it drives.
+        // Only a leg that negotiated telephone-events has an event to time out: the common path pays
+        // one branch.
+        if self.telephone_event.is_some() {
+            self.time_out_event();
+        }
         // Uplink: decode one PCM frame off the leg's jitter buffer straight into the core's staging
         // slot — no intermediate frame buffer, so the split costs the per-tick path nothing.
         //
@@ -916,6 +978,148 @@ mod tests {
         assert_eq!(result.uplink_bytes, 320, "8k/20ms L16 = 320 bytes");
         // Decoded silence → all-zero L16.
         assert!(uplink[..320].iter().all(|&byte| byte == 0));
+    }
+
+    fn event_packet(payload_type: u8, sequence: u16, timestamp: u32, end: bool) -> Vec<u8> {
+        let header = RtpHeader {
+            marker: false,
+            payload_type,
+            sequence,
+            timestamp,
+            ssrc: 1,
+        };
+        // RFC 4733 §2.3: event 5, volume 10, duration 800 timestamp units; the E bit ends the press.
+        let payload = [5u8, if end { 0x8A } else { 0x0A }, 0x03, 0x20];
+        let mut buffer = vec![0u8; 12 + payload.len()];
+        let written = write_packet(&header, &payload, &mut buffer).expect("write");
+        buffer.truncate(written);
+        buffer
+    }
+
+    #[test]
+    fn a_telephone_event_is_a_dtmf_message_and_never_audio() {
+        let mut session = ulaw_session().with_telephone_event(Some((101, 8000)));
+        // A press: a few packets of one event, the last with the End bit (RFC 4733 §2.5.1.4).
+        for (sequence, end) in [(0u16, false), (1, false), (2, true), (3, true)] {
+            session.on_rtp(&event_packet(101, sequence, 1600, end));
+        }
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        let result = session.tick(&mut uplink, &mut downlink);
+        // Not decoded: the four-byte event payload would otherwise be a 4-sample audio frame that
+        // the leg turns into PCM.
+        assert_eq!(
+            result.uplink_bytes, 0,
+            "no audio frame comes from an event payload"
+        );
+        // The press is reported once, to the server.
+        let mut digits = Vec::new();
+        while let Some(control) = session.next_control() {
+            match control {
+                ControlMessage::Dtmf(dtmf) => digits.push((dtmf.digit, dtmf.duration_ms)),
+                other => panic!("unexpected control message {other:?}"),
+            }
+        }
+        assert_eq!(
+            digits,
+            [("5".to_string(), 100)],
+            "one press, 800 units at 8 kHz"
+        );
+        // Audio on its own payload type still decodes.
+        session.on_rtp(&ulaw_packet(5, 0xFF));
+        assert_eq!(session.tick(&mut uplink, &mut downlink).uplink_bytes, 320);
+    }
+
+    #[test]
+    fn events_between_audio_cost_no_concealment_and_no_latency() {
+        // Audio, ten events (their sequence numbers are in the audio's space), audio: the jitter
+        // buffer must not read the ten as lost packets (about 200 ms of concealment).
+        let mut session = ulaw_session().with_telephone_event(Some((101, 8000)));
+        session.on_rtp(&ulaw_packet(0, 0xFF));
+        for sequence in 1..=10u16 {
+            session.on_rtp(&event_packet(101, sequence, 1600, sequence == 10));
+        }
+        session.on_rtp(&ulaw_packet(11, 0xFF));
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        assert_eq!(
+            session.tick(&mut uplink, &mut downlink).uplink_bytes,
+            320,
+            "audio 0"
+        );
+        assert_eq!(
+            session.tick(&mut uplink, &mut downlink).uplink_bytes,
+            320,
+            "audio 11 is the very next frame, not ten concealed ones later"
+        );
+        assert_eq!(
+            session.leg.jitter_stats().losses,
+            0,
+            "nothing was read as lost"
+        );
+    }
+
+    #[test]
+    fn the_event_clock_is_the_events_own_not_the_codecs() {
+        // 800 timestamp units are 100 ms at telephone-event/8000, whatever the audio codec runs at.
+        let mut session = ulaw_session().with_telephone_event(Some((101, 8000)));
+        session.on_rtp(&event_packet(101, 0, 1600, true));
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        let _ = session.tick(&mut uplink, &mut downlink);
+        match session.next_control() {
+            Some(ControlMessage::Dtmf(dtmf)) => assert_eq!(dtmf.duration_ms, 100),
+            other => panic!("expected dtmf, got {other:?}"),
+        }
+        let mut wide = ulaw_session().with_telephone_event(Some((101, 48_000)));
+        wide.on_rtp(&event_packet(101, 0, 1600, true));
+        let _ = wide.tick(&mut uplink, &mut downlink);
+        match wide.next_control() {
+            Some(ControlMessage::Dtmf(dtmf)) => assert_eq!(dtmf.duration_ms, 16, "800/48000"),
+            other => panic!("expected dtmf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_press_whose_end_never_arrives_is_still_reported() {
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        // The ticks of the session are the clock: 25 ticks of 20 ms with no update.
+        let mut session = ulaw_session().with_telephone_event(Some((101, 8000)));
+        session.on_rtp(&event_packet(101, 0, 1600, false));
+        for _ in 0..30 {
+            let _ = session.tick(&mut uplink, &mut downlink);
+        }
+        assert!(matches!(
+            session.next_control(),
+            Some(ControlMessage::Dtmf(_))
+        ));
+        // Audio resuming completes it too.
+        let mut session = ulaw_session().with_telephone_event(Some((101, 8000)));
+        session.on_rtp(&event_packet(101, 0, 1600, false));
+        session.on_rtp(&ulaw_packet(1, 0xFF));
+        assert!(matches!(
+            session.next_control(),
+            Some(ControlMessage::Dtmf(_))
+        ));
+        // And so does the next event starting.
+        let mut session = ulaw_session().with_telephone_event(Some((101, 8000)));
+        session.on_rtp(&event_packet(101, 0, 1600, false));
+        session.on_rtp(&event_packet(101, 1, 3200, false));
+        assert!(matches!(
+            session.next_control(),
+            Some(ControlMessage::Dtmf(_))
+        ));
+    }
+
+    #[test]
+    fn without_a_negotiated_event_type_every_packet_is_audio_as_before() {
+        let mut session = ulaw_session();
+        session.on_rtp(&event_packet(101, 0, 1600, true));
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        assert!(session.tick(&mut uplink, &mut downlink).uplink_bytes > 0);
+        assert!(session.next_control().is_none());
     }
 
     fn ulaw_packet_pcm(sequence: u16, pcm: &[i16]) -> Vec<u8> {

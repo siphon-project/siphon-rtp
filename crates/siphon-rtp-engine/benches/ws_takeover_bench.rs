@@ -127,6 +127,7 @@ fn registry_with_egress(
     let egress = Arc::new(WsEgress::new(addr(PEER), ice_managed));
     let (rtp_in, rtp_in_rx) = flume::bounded::<Bytes>(1024);
     registry.register(WsCallPlan {
+        ingress_payload_type: None,
         call_id: "bench".to_string(),
         endpoint_a: endpoint,
         accepted_source: SourceFilter::Exact(addr(PEER).ip()),

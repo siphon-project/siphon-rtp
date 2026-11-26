@@ -89,6 +89,7 @@ fn leg(
     let registry = WsRegistry::default();
     let (rtp_in, rtp_in_rx) = flume::bounded::<Bytes>(1024);
     registry.register(WsCallPlan {
+        ingress_payload_type: None,
         call_id: "zero-alloc".to_string(),
         endpoint_a: endpoint,
         accepted_source: SourceFilter::Exact(peer(0).ip()),

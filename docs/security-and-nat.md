@@ -220,6 +220,29 @@ Only **accept** (and only latch from) media whose source matches the address lea
 - **Effect on A1:** with `SignalledOnly`, a blind attacker must *also* spoof the signalled source IP
   to land a packet — collapses the off-path attack for non-NAT and full-cone-NAT peers.
 
+- **An engine offer has no signalled source until its answer (`offer_local`).** The engine binds the
+  leg and writes the offer (RFC 3264 §5) before the caller has said where it sends from, so there is
+  nothing to gate on. Until the answer the call is *pending* and holds its endpoints and nothing
+  else: the endpoints carry the `Drop` flow, and no pipeline, bridge, DTLS driver or ICE agent is
+  registered. A datagram from anywhere is dropped (never forwarded into the void, never latched),
+  and nothing is sent. Gathering against a STUN server leaves the datapath's ICE-lite responder on
+  the endpoint, which would latch the source of an authenticated nominating check and stamp the call
+  alive; the engine therefore clears the endpoint's datapath ICE state as soon as gathering ends, so
+  a holder of the offered credentials can neither latch before the answer nor keep the call out of
+  the setup reap. The full agent is armed from the answer's credentials, and an answer without ICE
+  (RFC 8839 §5.1) leaves no ICE state behind to gate the legitimate caller. The answer is validated
+  against the offer first (the RFC 3264 §6.1 codec, the offered transport, the SDES line by tag and suite, the DTLS fingerprint and `a=setup`
+  role, ICE credentials with candidates) and a refused answer leaves the call pending, so a spoofed
+  or malformed answer cannot open a path, and an answer consumes only the exact offer it was
+  validated against (`offer-local-superseded` otherwise), so a call-id deleted and offered again
+  meanwhile is never completed with the old validation. Only then is the gate drawn: on the address the answer
+  signalled, with the same `received-from`, `subnet-source` and `symmetric` postures as every other
+  leg, or on the pair ICE selects (Layer 4) with DTLS or SDES keying the path (Layer 5). The
+  answering source is the controller's, so the engine trusts it as it trusts an `answer_local`
+  offer. A repeated answer is refused (`offer-local-already-answered`), so a second SDP cannot move
+  the gate of a live call; only a re-answer through `answer_local`, which replaces the call on fresh
+  ports, can.
+
 ### Layer 3 — Sticky, SSRC-consistent latch (the NAT-rebind vs hijack reconciliation)
 Replace the permanent `or_insert` with a lifecycle that follows a real rebind but resists a spray.
 

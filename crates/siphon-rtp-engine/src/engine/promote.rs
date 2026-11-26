@@ -142,6 +142,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             comfort_noise_pt,
             near_secure,
             caller_source_posture,
+            local_ingress,
         )) = self.owned_call_internal(call_id, |call| {
             (
                 call.owner,
@@ -167,6 +168,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // case — see the `with_near_secure_pending` call below.
                 call.near_secure,
                 call.caller_source_posture,
+                // What an answered `offer_local` call receives on, in the numbering of its offer
+                // (the answer renumbers what the engine sends).
+                call.local_ingress(),
             )
         })
         else {
@@ -259,6 +263,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // same here as on every two-leg path. An exact gate on a NATed UA's private `c=` would
                 // refuse every packet it sends.
                 let accepted_source = caller_source_posture.gate(caller);
+                // The caller sends events on the offer's number and the engine on the answer's.
+                let near_te_in =
+                    local_ingress.map_or(near_te, |ingress| ingress.event_payload_type);
                 let a_to_b = build_direction(
                     caller_facing_endpoint,
                     accepted_source,
@@ -266,7 +273,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     caller,
                     &near_codec,
                     &near_codec,
-                    near_te,
+                    near_te_in,
                     near_te,
                     false,                                         // noise_suppression
                     crate::media_pipeline::EchoProfile::default(), // echo (a reflect path wants the echo)
@@ -280,7 +287,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     caller,
                     &near_codec,
                     &near_codec,
-                    near_te,
+                    near_te_in,
                     near_te,
                     false,                                         // noise_suppression
                     crate::media_pipeline::EchoProfile::default(), // echo (a reflect path wants the echo)
@@ -341,6 +348,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // §5.2): an intercepted caller (a bot handing the leg back to the engine) on its own, an
         // intercepted two-party call on both of its legs.
         if offer_only_restore.is_some() {
+            // One decoder: audio on another payload type than the one offered is refused (RFC 3264
+            // §6.1 lets an answer list several formats the caller may then send).
+            if let Some(ingress) = local_ingress {
+                call.set_ingress_audio_payload_type(Some(ingress.audio_payload_type));
+            }
             // A caller that only sends (`sendonly`, `inactive`) is sent nothing (RFC 3264 §6.1). The
             // actor's first playout tick fires the moment it is registered, so a control message sent
             // after the promotion can lose the race and let one comfort-noise frame out: the actor

@@ -96,11 +96,100 @@ pub struct DtmfEvent {
     pub volume: u8,
 }
 
+/// How many recently completed events the detector remembers, so a late retransmission of an
+/// earlier event's End packet is not mistaken for a new press (RFC 4733 §2.5.1.3 sends it three
+/// times, and the packets can reorder).
+const COMPLETED_RING: usize = 4;
+
+/// How far back, in RTP timestamp units, a packet may be from the newest event and still be a late
+/// packet of an earlier one: about 21 s at 48 kHz and 131 s at 8 kHz, far longer than reordering or
+/// the End redundancy can delay a packet. A timestamp further back than that is a sender whose
+/// timeline restarted (RFC 3550 §5.1 starts it at a random value, and a sender may be reset or
+/// replaced mid-call), so it is a new event and the old timeline is forgotten.
+const LATE_PACKET_WINDOW: i32 = 1 << 20;
+
+/// How long an event may go without an update before it is taken as over, in milliseconds: ten
+/// missed updates of the 50 ms cadence (RFC 4733 §2.5.1.2). A receiver must cope with a lost End
+/// (§2.5.1.4), so the press is completed with the duration of the last update.
+pub const LOST_END_TIMEOUT_MS: u32 = 500;
+
+/// The presses one call to a [`DtmfDetector`] completed: none, one, or the lost-End press of an
+/// earlier event together with the one that completed it. A value, not a queue: the detector keeps
+/// nothing for a caller to forget to collect, and the type is `#[must_use]`.
+#[derive(Debug, Clone, Copy, Default)]
+#[must_use = "the presses a packet completed are reported here and nowhere else"]
+pub struct DtmfPresses {
+    presses: [Option<DtmfEvent>; 3],
+    next: usize,
+}
+
+impl DtmfPresses {
+    fn push(&mut self, press: DtmfEvent) {
+        if let Some(slot) = self.presses.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(press);
+        }
+    }
+}
+
+impl Iterator for DtmfPresses {
+    type Item = DtmfEvent;
+
+    fn next(&mut self) -> Option<DtmfEvent> {
+        let press = self.presses.get(self.next).copied().flatten()?;
+        self.next += 1;
+        Some(press)
+    }
+}
+
+/// The event being tracked.
+#[derive(Debug, Clone, Copy)]
+struct Tracked {
+    timestamp: u32,
+    event: u8,
+    volume: u8,
+    /// The longest duration any packet of the event has reported.
+    duration: u16,
+    /// Whether the press has been completed (by its End, or by one of the lost-End triggers).
+    completed: bool,
+}
+
+impl Tracked {
+    fn press(&self) -> Option<DtmfEvent> {
+        Some(DtmfEvent {
+            digit: event_code_to_digit(self.event)?,
+            event_code: self.event,
+            duration: self.duration,
+            volume: self.volume,
+        })
+    }
+}
+
+/// How `timestamp` stands to `newest`, in RTP serial-number arithmetic (RFC 3550 §5.1, RFC 1982):
+/// positive when it is later, zero when equal, negative when earlier.
+fn serial_distance(timestamp: u32, newest: u32) -> i32 {
+    timestamp.wrapping_sub(newest) as i32
+}
+
 /// Collapses a redundant RFC 4733 telephone-event stream into one [`DtmfEvent`] per press.
+///
+/// A press is completed by its End bit, de-duplicated across the three End packets (RFC 4733
+/// §2.5.1.3) and across a reordered retransmission of an earlier press. Timestamps are compared in
+/// serial arithmetic: only a **newer** start completes the open event, and an older packet is a late
+/// packet that is deduplicated or completed on its own and never touches the open event. A lost End
+/// does not lose the press (§2.5.1.4): it is completed when a newer event starts
+/// ([`Self::on_packet`]), when audio resumes ([`Self::audio_resumed`]), or when no update has come
+/// for [`LOST_END_TIMEOUT_MS`] ([`Self::tick`]), reporting the duration of the last update. All of it
+/// runs on packet timestamps and a caller-supplied elapsed time, never a wall clock, and without
+/// allocating. Every call returns the presses it completed.
 #[derive(Debug, Default)]
 pub struct DtmfDetector {
-    /// The start timestamp of the event currently being tracked, and whether it was emitted.
-    current: Option<(u32, bool)>,
+    current: Option<Tracked>,
+    /// The newest event timestamp seen, started or completed.
+    newest: Option<u32>,
+    completed: [Option<u32>; COMPLETED_RING],
+    completed_next: usize,
+    /// Milliseconds since the last packet of an unfinished event.
+    idle_ms: u32,
 }
 
 impl DtmfDetector {
@@ -110,36 +199,144 @@ impl DtmfDetector {
         Self::default()
     }
 
-    /// Feed one telephone-event RTP packet (its timestamp and payload). Returns the press exactly
-    /// once, when the event's End bit is observed.
+    /// Feed one telephone-event RTP packet (its timestamp and payload): the presses it completed.
     pub fn on_packet(
         &mut self,
         rtp_timestamp: u32,
         payload: &[u8],
-    ) -> Result<Option<DtmfEvent>, DtmfError> {
+    ) -> Result<DtmfPresses, DtmfError> {
         let event = TelephoneEvent::parse(payload)?;
-
-        let is_new = !matches!(self.current, Some((timestamp, _)) if timestamp == rtp_timestamp);
-        if is_new {
-            self.current = Some((rtp_timestamp, false));
+        let mut presses = DtmfPresses::default();
+        self.idle_ms = 0;
+        let distance = self
+            .newest
+            .map(|newest| serial_distance(rtp_timestamp, newest));
+        match distance {
+            // Exactly half the timestamp range away is neither later nor earlier in serial order
+            // (RFC 1982 leaves it undefined), and not a restart either: it must neither complete the
+            // open event nor clear history. Treated as a late packet and dropped.
+            Some(i32::MIN) => return Ok(presses),
+            // The event in progress (or the newest, already complete: a redundant End).
+            Some(0) => {}
+            // Earlier than the newest event, within reach of a reordered packet: a late packet of
+            // an event that is not the open one. Never touches the open event.
+            Some(distance) if (-LATE_PACKET_WINDOW..0).contains(&distance) => {
+                self.late_packet(rtp_timestamp, &event, &mut presses);
+                return Ok(presses);
+            }
+            // Further back than a late packet can be: the sender's timeline restarted. Forget the
+            // old one; what follows is a new event.
+            Some(distance) if distance < 0 => {
+                self.complete_current(&mut presses);
+                self.current = None;
+                self.completed = [None; COMPLETED_RING];
+                self.newest = Some(rtp_timestamp);
+            }
+            // Newer than everything seen: a new event, even if it reuses a remembered timestamp.
+            // The open event never ended (that End was lost).
+            Some(_) => {
+                self.complete_current(&mut presses);
+                self.current = None;
+                self.newest = Some(rtp_timestamp);
+            }
+            None => self.newest = Some(rtp_timestamp),
         }
-
+        // A packet at the newest timestamp that is not the open event is a retransmission of an
+        // event already completed.
+        if self.current.is_none() && distance == Some(0) {
+            return Ok(presses);
+        }
+        let tracked = self.current.get_or_insert(Tracked {
+            timestamp: rtp_timestamp,
+            event: event.event,
+            volume: event.volume,
+            duration: 0,
+            completed: false,
+        });
+        tracked.event = event.event;
+        tracked.volume = event.volume;
+        tracked.duration = tracked.duration.max(event.duration);
         if event.end {
-            if let Some((timestamp, emitted)) = self.current {
-                if timestamp == rtp_timestamp && !emitted {
-                    self.current = Some((timestamp, true));
-                    if let Some(digit) = event.digit() {
-                        return Ok(Some(DtmfEvent {
-                            digit,
-                            event_code: event.event,
-                            duration: event.duration,
-                            volume: event.volume,
-                        }));
-                    }
+            self.complete_current(&mut presses);
+        }
+        Ok(presses)
+    }
+
+    /// A packet older than the newest event: dropped when its event is known to be complete, and
+    /// reported on its own when it is an End of an event this detector never saw (its other packets
+    /// were lost), so the digit is not.
+    fn late_packet(&mut self, timestamp: u32, event: &TelephoneEvent, presses: &mut DtmfPresses) {
+        if self.completed.contains(&Some(timestamp)) || !event.end {
+            return;
+        }
+        // Older than everything still remembered: the End of an event long since completed whose
+        // record has been evicted, almost certainly a delayed retransmission (RFC 4733 §2.5.1.3).
+        // A lone End is reported only when it falls among the remembered completions (or none is
+        // remembered) and none of them matches.
+        let oldest = self
+            .completed
+            .iter()
+            .flatten()
+            .copied()
+            .reduce(|oldest, next| {
+                if serial_distance(next, oldest) < 0 {
+                    next
+                } else {
+                    oldest
                 }
+            });
+        if oldest.is_some_and(|oldest| serial_distance(timestamp, oldest) < 0) {
+            return;
+        }
+        self.remember_completed(timestamp);
+        let Some(digit) = event.digit() else {
+            return;
+        };
+        presses.push(DtmfEvent {
+            digit,
+            event_code: event.event,
+            duration: event.duration,
+            volume: event.volume,
+        });
+    }
+
+    /// Audio is flowing again on the stream the events share: an event still unfinished is over.
+    pub fn audio_resumed(&mut self) -> DtmfPresses {
+        let mut presses = DtmfPresses::default();
+        self.complete_current(&mut presses);
+        presses
+    }
+
+    /// Advance the idle clock by `elapsed_ms` (a tick of the caller's own clock): an unfinished event
+    /// with no update for [`LOST_END_TIMEOUT_MS`] is over.
+    pub fn tick(&mut self, elapsed_ms: u32) -> DtmfPresses {
+        let mut presses = DtmfPresses::default();
+        if self.current.is_some_and(|tracked| !tracked.completed) {
+            self.idle_ms = self.idle_ms.saturating_add(elapsed_ms);
+            if self.idle_ms >= LOST_END_TIMEOUT_MS {
+                self.complete_current(&mut presses);
             }
         }
-        Ok(None)
+        presses
+    }
+
+    fn remember_completed(&mut self, timestamp: u32) {
+        self.completed[self.completed_next] = Some(timestamp);
+        self.completed_next = (self.completed_next + 1) % COMPLETED_RING;
+    }
+
+    /// Complete the tracked event once: remember its timestamp, and report the press when it is a
+    /// digit.
+    fn complete_current(&mut self, presses: &mut DtmfPresses) {
+        let Some(tracked) = self.current.as_mut().filter(|tracked| !tracked.completed) else {
+            return;
+        };
+        tracked.completed = true;
+        let tracked = *tracked;
+        self.remember_completed(tracked.timestamp);
+        if let Some(press) = tracked.press() {
+            presses.push(press);
+        }
     }
 }
 
@@ -472,25 +669,207 @@ impl DtmfSequence {
 mod tests {
     use super::*;
 
+    fn event_payload(event: u8, end: bool, duration: u16) -> [u8; 4] {
+        let [high, low] = duration.to_be_bytes();
+        [event, if end { 0x8A } else { 0x0A }, high, low]
+    }
+
+    /// Feed one packet and collect the presses it completed as (digit, duration).
+    fn feed(
+        detector: &mut DtmfDetector,
+        timestamp: u32,
+        event: u8,
+        end: bool,
+        duration: u16,
+    ) -> Vec<(char, u16)> {
+        detector
+            .on_packet(timestamp, &event_payload(event, end, duration))
+            .expect("packet")
+            .map(|press| (press.digit, press.duration))
+            .collect()
+    }
+
+    fn collect(presses: DtmfPresses) -> Vec<(char, u16)> {
+        presses.map(|press| (press.digit, press.duration)).collect()
+    }
+
     #[test]
-    fn event_durations_are_rescaled_per_block_and_saturate() {
-        let mut out = Vec::new();
-        // Two blocks: event 5 for 800 ticks, event 6 for 60 000 ticks, both at 8 kHz.
-        let payload = [5, 10, 0x03, 0x20, 6, 10, 0xEA, 0x60];
-        rescale_event(&payload, 8000, 48_000, &mut out);
-        assert_eq!(&out[..4], &[5, 10, 0x12, 0xC0]);
-        assert_eq!(&out[4..], &[6, 10, 0xFF, 0xFF], "saturates at 16 bits");
-        rescale_event(&payload, 8000, 8000, &mut out);
-        assert_eq!(out, payload, "the same clock copies the payload");
-        rescale_event(&payload[..6], 8000, 16_000, &mut out);
+    fn a_late_end_of_an_earlier_event_is_not_a_second_press() {
+        // RFC 4733 §2.5.1.3: the End is sent three times and packets reorder. A ends, B starts, then
+        // A's End arrives again: one press for A, one for B.
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 1000, 1, true, 800), [('1', 800)]);
+        assert_eq!(feed(&mut detector, 2000, 2, false, 160), []);
         assert_eq!(
-            &out[4..],
-            &[6, 10],
-            "a trailing partial block is carried, not scaled"
+            feed(&mut detector, 1000, 1, true, 800),
+            [],
+            "A's End again is ignored"
+        );
+        assert_eq!(feed(&mut detector, 2000, 2, true, 800), [('2', 800)]);
+    }
+
+    #[test]
+    fn an_older_packet_never_completes_the_open_event() {
+        // B updates at 2000; A's late End (an event this detector never saw) arrives at 1000; B's End
+        // follows. B is reported once with 800, and A's digit is not lost either.
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 2000, 2, false, 160), []);
+        assert_eq!(
+            feed(&mut detector, 1000, 1, true, 800),
+            [('1', 800)],
+            "A on its own"
+        );
+        assert_eq!(
+            feed(&mut detector, 2000, 2, false, 480),
+            [],
+            "B is still open"
+        );
+        assert_eq!(
+            feed(&mut detector, 2000, 2, true, 800),
+            [('2', 800)],
+            "B once, with 800"
+        );
+        assert_eq!(feed(&mut detector, 2000, 2, true, 800), [], "and not again");
+        // The same when A was already reported: its retransmission is simply dropped.
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 1000, 1, true, 800), [('1', 800)]);
+        assert_eq!(feed(&mut detector, 2000, 2, false, 160), []);
+        assert_eq!(feed(&mut detector, 1000, 1, true, 800), []);
+        assert_eq!(feed(&mut detector, 2000, 2, true, 800), [('2', 800)]);
+    }
+
+    #[test]
+    fn timestamps_compare_across_the_32_bit_wrap() {
+        // 0xFFFF_FF00 then 0x0000_0100 is 512 units later, not 4 billion earlier.
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 0xFFFF_FF00, 1, false, 160), []);
+        assert_eq!(
+            feed(&mut detector, 0x0000_0100, 2, false, 160),
+            [('1', 160)],
+            "the later event completes the one whose End was lost"
+        );
+        assert_eq!(feed(&mut detector, 0x0000_0100, 2, true, 800), [('2', 800)]);
+        // And an older packet across the wrap is late, not new.
+        assert_eq!(feed(&mut detector, 0xFFFF_FF00, 1, true, 800), []);
+    }
+
+    #[test]
+    fn a_delayed_end_older_than_everything_remembered_is_a_retransmission() {
+        // A updates, then B, C, D and E complete and evict A from the ring; A's delayed End arrives.
+        // It is reported once (the first time A was completed), never as a lone press afterwards.
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 1000, 1, false, 160), []);
+        assert_eq!(
+            feed(&mut detector, 2000, 2, true, 800),
+            [('1', 160), ('2', 800)]
+        );
+        assert_eq!(feed(&mut detector, 3000, 3, true, 800), [('3', 800)]);
+        assert_eq!(feed(&mut detector, 4000, 4, true, 800), [('4', 800)]);
+        assert_eq!(feed(&mut detector, 5000, 5, true, 800), [('5', 800)]);
+        assert_eq!(
+            feed(&mut detector, 1000, 1, true, 800),
+            [],
+            "A is not reported twice"
+        );
+        // An End between remembered completions that none matches is still a lone End.
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 1000, 1, true, 800), [('1', 800)]);
+        assert_eq!(feed(&mut detector, 3000, 3, true, 800), [('3', 800)]);
+        assert_eq!(
+            feed(&mut detector, 2000, 2, true, 800),
+            [('2', 800)],
+            "between 1000 and 3000"
         );
     }
 
-    /// Build a telephone-event payload.
+    #[test]
+    fn timestamps_half_the_range_apart_never_clear_history_or_complete_the_open_event() {
+        // 0 and 0x8000_0000 are neither earlier nor later than each other.
+        let mut detector = DtmfDetector::new();
+        let mut reported = Vec::new();
+        for _ in 0..4 {
+            reported.extend(feed(&mut detector, 0, 1, true, 800));
+            reported.extend(feed(&mut detector, 0x8000_0000, 2, true, 800));
+        }
+        assert_eq!(reported, [('1', 800)], "each digit at most once");
+        // And an open event is left alone by a packet half the range away.
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 0, 1, false, 160), []);
+        assert_eq!(feed(&mut detector, 0x8000_0000, 2, true, 800), []);
+        assert_eq!(feed(&mut detector, 0, 1, true, 800), [('1', 800)]);
+    }
+
+    #[test]
+    fn a_sender_reset_is_a_new_event_even_on_a_remembered_timestamp() {
+        // The timeline restarts far behind (RFC 3550 §5.1: the sender picked a new origin): C reuses
+        // the timestamp A had, and is a press of its own.
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 1_000_000, 1, true, 800), [('1', 800)]);
+        assert_eq!(feed(&mut detector, 5_000_000, 2, true, 800), [('2', 800)]);
+        // 4 million units back is far past any late packet (see `LATE_PACKET_WINDOW`): a restart.
+        assert_eq!(feed(&mut detector, 1_000_000, 3, true, 800), [('3', 800)]);
+        // The restarted timeline is the live one: C's own End, again, is a retransmission.
+        assert_eq!(feed(&mut detector, 1_000_000, 3, true, 800), []);
+        // And a small step back to a remembered timestamp is a late packet, not a new press.
+        assert_eq!(feed(&mut detector, 1_000_500, 4, true, 800), [('4', 800)]);
+        assert_eq!(feed(&mut detector, 1_000_000, 3, true, 800), []);
+        // A reset while an event is open completes it, and nothing is double counted.
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 5_000_000, 4, false, 320), []);
+        assert_eq!(
+            feed(&mut detector, 100, 5, true, 800),
+            [('4', 320), ('5', 800)]
+        );
+    }
+
+    #[test]
+    fn a_lost_end_and_the_next_events_only_surviving_packet_are_both_reported() {
+        // A never ends; B's only surviving packet is its End. Both come out of that one call.
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 1000, 1, false, 160), []);
+        assert_eq!(feed(&mut detector, 1000, 1, false, 480), []);
+        assert_eq!(
+            feed(&mut detector, 2000, 2, true, 800),
+            [('1', 480), ('2', 800)]
+        );
+    }
+
+    #[test]
+    fn a_lost_end_is_completed_by_the_next_events_first_packet_with_the_last_duration() {
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 1000, 1, false, 160), []);
+        assert_eq!(feed(&mut detector, 1000, 1, false, 480), []);
+        // A's whole End burst is lost; B starts: A is completed with the last update's duration.
+        assert_eq!(feed(&mut detector, 2000, 2, false, 160), [('1', 480)]);
+        // A late End of A changes nothing, and B still completes normally, once.
+        assert_eq!(feed(&mut detector, 1000, 1, true, 800), []);
+        assert_eq!(feed(&mut detector, 2000, 2, true, 800), [('2', 800)]);
+    }
+
+    #[test]
+    fn a_lost_end_is_completed_when_audio_resumes() {
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 1000, 5, false, 320), []);
+        assert_eq!(collect(detector.audio_resumed()), [('5', 320)]);
+        assert_eq!(collect(detector.audio_resumed()), [], "once only");
+    }
+
+    #[test]
+    fn a_lost_end_is_completed_after_the_timeout_on_the_callers_clock() {
+        let mut detector = DtmfDetector::new();
+        assert_eq!(feed(&mut detector, 1000, 11, false, 400), []);
+        for _ in 0..24 {
+            assert_eq!(collect(detector.tick(20)), []);
+        }
+        assert_eq!(collect(detector.tick(20)), [('#', 400)], "500 ms: over");
+        // An idle detector never completes anything; updates keep an event alive.
+        assert_eq!(collect(detector.tick(10_000)), []);
+        assert_eq!(feed(&mut detector, 3000, 1, false, 160), []);
+        assert_eq!(collect(detector.tick(400)), []);
+        assert_eq!(feed(&mut detector, 3000, 1, false, 320), []);
+        assert_eq!(collect(detector.tick(400)), [], "updates keep it alive");
+    }
+
     fn payload(event: u8, end: bool, volume: u8, duration: u16) -> [u8; 4] {
         let end_volume = (u8::from(end) << 7) | (volume & 0x3F);
         let [duration_hi, duration_lo] = duration.to_be_bytes();
@@ -543,16 +922,21 @@ mod tests {
         assert_eq!(
             detector
                 .on_packet(1000, &payload(7, false, 8, 160))
-                .unwrap(),
+                .unwrap()
+                .next(),
             None
         );
         assert_eq!(
             detector
                 .on_packet(1000, &payload(7, false, 8, 320))
-                .unwrap(),
+                .unwrap()
+                .next(),
             None
         );
-        let emitted = detector.on_packet(1000, &payload(7, true, 8, 480)).unwrap();
+        let emitted = detector
+            .on_packet(1000, &payload(7, true, 8, 480))
+            .unwrap()
+            .next();
         assert_eq!(
             emitted,
             Some(DtmfEvent {
@@ -567,22 +951,24 @@ mod tests {
     #[test]
     fn dedupes_redundant_end_packets() {
         let mut detector = DtmfDetector::new();
-        detector
+        let _ = detector
             .on_packet(2000, &payload(3, false, 8, 160))
             .unwrap();
         assert!(detector
             .on_packet(2000, &payload(3, true, 8, 320))
             .unwrap()
+            .next()
             .is_some());
         // RFC 4733 sends the End packet up to three times; only the first emits.
-        assert_eq!(
-            detector.on_packet(2000, &payload(3, true, 8, 320)).unwrap(),
-            None
-        );
-        assert_eq!(
-            detector.on_packet(2000, &payload(3, true, 8, 320)).unwrap(),
-            None
-        );
+        for _ in 0..2 {
+            assert_eq!(
+                detector
+                    .on_packet(2000, &payload(3, true, 8, 320))
+                    .unwrap()
+                    .next(),
+                None
+            );
+        }
     }
 
     #[test]
@@ -592,9 +978,13 @@ mod tests {
         assert!(detector
             .on_packet(100, &payload(1, true, 8, 160))
             .unwrap()
+            .next()
             .is_some());
         // Press '2' at a new timestamp.
-        let second = detector.on_packet(260, &payload(2, true, 8, 160)).unwrap();
+        let second = detector
+            .on_packet(260, &payload(2, true, 8, 160))
+            .unwrap()
+            .next();
         assert_eq!(second.map(|event| event.digit), Some('2'));
     }
 
@@ -602,7 +992,10 @@ mod tests {
     fn rejects_short_payload() {
         assert_eq!(TelephoneEvent::parse(&[0u8; 3]), Err(DtmfError::TooShort));
         let mut detector = DtmfDetector::new();
-        assert_eq!(detector.on_packet(0, &[0u8; 2]), Err(DtmfError::TooShort));
+        assert!(matches!(
+            detector.on_packet(0, &[0u8; 2]),
+            Err(DtmfError::TooShort)
+        ));
     }
 
     #[test]
@@ -699,7 +1092,7 @@ mod tests {
         let event_timestamp = 5000u32; // constant for the whole event
         let mut emitted = Vec::new();
         while let Some(payload) = generator.next_payload() {
-            if let Some(event) = detector
+            for event in detector
                 .on_packet(event_timestamp, &payload.bytes)
                 .expect("detector")
             {
@@ -860,7 +1253,7 @@ mod tests {
                     timestamp_offset,
                 } => {
                     let timestamp = base_timestamp.wrapping_add(timestamp_offset);
-                    if let Some(event) = detector
+                    for event in detector
                         .on_packet(timestamp, &payload.bytes)
                         .expect("detector")
                     {
@@ -889,7 +1282,7 @@ mod tests {
                     payload,
                     timestamp_offset,
                 } => {
-                    if let Some(event) = detector
+                    for event in detector
                         .on_packet(base.wrapping_add(timestamp_offset), &payload.bytes)
                         .expect("detector")
                     {

@@ -44,19 +44,87 @@ struct SingleLegDtls<'a> {
     peer_setup: Option<sdp::Setup>,
 }
 
-struct LocalTakeover<'a> {
-    call_id: &'a str,
-    ws_uri: String,
-    chosen: CodecSpec,
-    offerer_security: &'a WsTakeoverSecurity,
-    near_local_crypto: Option<CryptoAttribute>,
-    ice_config: Option<IceConfig>,
-    info: &'a sdp::MediaInfo,
-    profile: &'a ProfileFlags,
-    near_rtp: siphon_rtp_datapath::Endpoint,
-    peer_ice: &'a Option<ice::IceCredentials>,
-    ice_candidates: &'a [siphon_rtp_ice::Candidate],
-    answer_sdp: String,
+/// What a single-leg local call is registered from.
+pub(super) struct LocalCallSpec<'a> {
+    pub(super) client: ClientId,
+    pub(super) call_id: &'a str,
+    pub(super) from_tag: String,
+    pub(super) near_rtp: siphon_rtp_datapath::Endpoint,
+    pub(super) near_rtcp: Option<siphon_rtp_datapath::Endpoint>,
+    pub(super) near_advertised: std::net::IpAddr,
+    pub(super) peer: LocalPeer,
+    pub(super) profile: &'a ProfileFlags,
+    /// Whether the call is made before the caller has answered, so its silence is judged against
+    /// the setup ceiling until the first packet arrives (see `Call::anchored_before_answer`).
+    pub(super) anchored_before_answer: bool,
+}
+
+/// What the call records of its one party's signalling: everything an `answer_local` reads off the
+/// caller's offer and an `offer_local` only learns from the caller's answer.
+pub(super) struct LocalPeer {
+    pub(super) remote_rtp: Option<std::net::SocketAddr>,
+    pub(super) remote_rtcp: Option<std::net::SocketAddr>,
+    pub(super) secure: bool,
+    pub(super) direction: sdp::MediaDirection,
+    pub(super) telephone_events: Vec<sdp::TelephoneEvent>,
+}
+
+impl LocalPeer {
+    /// The party as its SDP signalled it.
+    pub(super) fn signalled(info: &sdp::MediaInfo) -> Self {
+        Self {
+            remote_rtp: Some(info.remote_rtp),
+            remote_rtcp: Some(info.remote_rtcp),
+            secure: info.secure,
+            direction: info.direction,
+            telephone_events: info.telephone_events(),
+        }
+    }
+
+    /// A party that has signalled nothing yet (an engine offer awaiting its answer).
+    pub(super) fn unsignalled() -> Self {
+        Self {
+            remote_rtp: None,
+            remote_rtcp: None,
+            secure: false,
+            direction: sdp::MediaDirection::default(),
+            telephone_events: Vec::new(),
+        }
+    }
+}
+
+/// What arms the RFC 8445 agent of a single-leg call.
+pub(super) struct IceArming<'a> {
+    /// The engine's own credentials.
+    pub(super) config: IceConfig,
+    /// The peer's credentials; without them no agent can run.
+    pub(super) peer: Option<&'a ice::IceCredentials>,
+    /// The peer's candidates.
+    pub(super) remote_candidates: &'a [siphon_rtp_ice::Candidate],
+    /// The candidates the engine advertised.
+    pub(super) local_candidates: &'a [siphon_rtp_ice::Candidate],
+    /// The engine's ICE role. RFC 8445 §6.1.1: the offerer controls, and so does a full agent facing
+    /// a lite one.
+    pub(super) controlling: bool,
+}
+
+pub(super) struct LocalTakeover<'a> {
+    pub(super) call_id: &'a str,
+    pub(super) ws_uri: String,
+    pub(super) chosen: CodecSpec,
+    pub(super) offerer_security: &'a WsTakeoverSecurity,
+    pub(super) near_local_crypto: Option<CryptoAttribute>,
+    pub(super) ice_config: Option<IceConfig>,
+    pub(super) info: &'a sdp::MediaInfo,
+    pub(super) profile: &'a ProfileFlags,
+    pub(super) near_rtp: siphon_rtp_datapath::Endpoint,
+    pub(super) peer_ice: &'a Option<ice::IceCredentials>,
+    pub(super) ice_candidates: &'a [siphon_rtp_ice::Candidate],
+    pub(super) answer_sdp: String,
+    /// The engine's ICE role on the takeover leg (RFC 8445 §6.1.1).
+    pub(super) controlling: bool,
+    /// The creation of the call this takeover was begun on ([`Call::instance`]).
+    pub(super) instance: u64,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -149,7 +217,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// The candidates and agent configuration of a single-leg answer that runs ICE, none without
     /// credentials. Neither a single-leg local answer nor a conference seat relays text or fax.
-    async fn gather_local_ice(
+    pub(super) async fn gather_local_ice(
         &self,
         credentials: Option<&ice::IceCredentials>,
         (near_rtp, near_rtcp, near_advertised): (
@@ -220,125 +288,130 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Record the half-built call before selecting the codec, so the reject path exercises the same
     /// teardown as a live call (frees the ports + releases the client quota). `to_tag: None` — there
     /// is no far leg. `near_codec` is set to the chosen codec below, right before promotion.
-    #[allow(clippy::too_many_arguments)]
-    fn register_local_call(
-        &self,
-        client: ClientId,
-        call_id: &str,
-        from_tag: String,
-        near_rtp: siphon_rtp_datapath::Endpoint,
-        near_rtcp: Option<siphon_rtp_datapath::Endpoint>,
-        near_advertised: std::net::IpAddr,
-        info: &sdp::MediaInfo,
-        profile: &ProfileFlags,
-    ) {
-        self.calls.insert(
-            call_id.to_string(),
-            Call {
-                owner: client,
-                created_tick: self.datapath.now_ticks(),
-                // This command *is* the answer: the caller is already in a live dialog and starts
-                // sending one round trip later, so there is no setup phase to spare it from the
-                // dead-path ceiling.
-                anchored_before_answer: false,
-                started_at_unix_ms: super::unix_time_ms(),
-                near_media_started_at_unix_ms: None,
-                far_media_started_at_unix_ms: None,
-                ice: None,
-                // A single-leg local answer mints no ICE of its own, so there is no pair to keep
-                // consent on either side.
-                near_remote_ice: None,
-                far_remote_ice: None,
-                near_remote_candidates: Vec::new(),
-                near_peer_is_lite: false,
-                far_local_candidates: Vec::new(),
-                near_local_candidates: Vec::new(),
-                // No far leg to take ICE off.
-                far_ice_removed: false,
-                from_tag,
-                to_tag: None,
-                near: Leg {
-                    rtp: near_rtp,
-                    rtcp: near_rtcp,
-                    remote_rtp: Some(info.remote_rtp),
-                    remote_rtcp: Some(info.remote_rtcp),
-                    advertised_ip: near_advertised,
-                    // A single-leg local answer relays no text stream.
-                    text: None,
-                    text_remote_rtp: None,
-                    // Neither a single-leg local answer nor a conference seat relays fax.
-                    image: None,
-                    image_remote: None,
-                    floor: None,
-                    floor_remote: None,
-                    floor_format: siphon_rtp_proto::ControlFormat::Mcptt,
-                    video: None,
-                },
-                // No B-facing leg, and never will be: this verb *is* the answer (see the allocation
-                // comment above). `answer` refuses to run on such a call rather than inventing one.
-                far: None,
-                caller_media_leg: CallerMediaLeg::Near,
-                far_local_crypto: None,
-                far_remote_crypto: None,
-                far_dtls: false,
-                far_dtls_role: None,
-                far_downgraded_to_plain: false,
-                far_rtcp_fallback: false,
-                // Recorded for symmetry; a single-leg call never reaches `answer`.
-                near_secure: info.secure,
-                // A single-leg call's keying lives on the takeover leg, not on the two-party pair.
-                near_local_crypto: None,
-                near_remote_crypto: None,
-                near_dtls: None,
-                near_codec: None,
-                // A single-leg local answer never reaches `answer`, so the offered set is unused.
-                near_offered_codecs: Vec::new(),
-                near_codec_withheld: false,
-                far_codec: None,
-                // The caller's own direction. A single-leg call has no second party, so the far default
-                // never contributes — `legs_expected_to_send` only walks a far leg that exists.
-                near_direction: info.direction,
-                far_direction: sdp::MediaDirection::default(),
-                // Settled with the codec below, like `near_codec`.
-                near_telephone_event: None,
-                near_offered_telephone_events: info.telephone_events(),
-                far_telephone_event: None,
-                pipeline: PipelineKind::Passthrough,
-                // Refused above: a locally answered call synthesizes its own audio, so it can never
-                // be a fax relay.
-                fax_passthrough: false,
-                near_sip_call_id: profile.sip_call_id.clone(),
-                far_sip_call_id: None,
-                caller_source_posture: super::negotiate::SourcePosture::from_profile(profile),
-                near_secure_key: None,
-                relay_flows: Vec::new(),
-                promotion_reasons: HashSet::new(),
-                offer_received_from: profile.received_from,
-                // No far party, so no far hint and no re-offer from one.
-                far_received_from: None,
-                pending_far_reoffer: None,
-                // Set below once the answered codec is known (a single-leg local answer negotiates CN
-                // at the chosen codec's clock rate); left `None` for the reject path.
-                comfort_noise_payload_type: None,
-                text_t140_payload_type: None,
-                text_red_payload_type: None,
-                // A single-leg local answer negotiates no text stream.
-                text_relay_flows: Vec::new(),
-                text_promotion_reasons: HashSet::new(),
-                text_events: false,
-                text_secure: false,
-                near_text_remote_crypto: None,
-                far_text_local_crypto: None,
-                near_text_local_crypto: None,
-                // Set once the local answer is complete (see the end of `answer_local`).
-                video: super::call_video::CallVideo::default(),
-                local_answer: None,
-                seat: None,
-                seating: false,
-                secure_hold: None,
-            },
-        );
+    fn register_local_call(&self, spec: LocalCallSpec<'_>) {
+        let (client, call_id) = (spec.client, spec.call_id);
+        let call = self.new_local_call(spec);
+        self.calls.insert(call_id.to_string(), call);
         self.index_new_call(call_id, client);
+    }
+
+    /// The [`Call`] of a single-leg local call: the one leg the caller reaches, no far leg and no
+    /// pipeline yet. Shared by `answer_local`, which knows the caller's media address, and
+    /// `offer_local`, which does not until the answer arrives.
+    pub(super) fn new_local_call(&self, spec: LocalCallSpec<'_>) -> Call {
+        let LocalCallSpec {
+            client,
+            call_id: _,
+            from_tag,
+            near_rtp,
+            near_rtcp,
+            near_advertised,
+            peer,
+            profile,
+            anchored_before_answer,
+        } = spec;
+        Call {
+            owner: client,
+            created_tick: self.datapath.now_ticks(),
+            anchored_before_answer,
+            started_at_unix_ms: super::unix_time_ms(),
+            near_media_started_at_unix_ms: None,
+            far_media_started_at_unix_ms: None,
+            ice: None,
+            // A single-leg local answer mints no ICE of its own, so there is no pair to keep
+            // consent on either side.
+            near_remote_ice: None,
+            far_remote_ice: None,
+            near_remote_candidates: Vec::new(),
+            near_peer_is_lite: false,
+            far_local_candidates: Vec::new(),
+            near_local_candidates: Vec::new(),
+            // No far leg to take ICE off.
+            far_ice_removed: false,
+            from_tag,
+            to_tag: None,
+            near: Leg {
+                rtp: near_rtp,
+                rtcp: near_rtcp,
+                remote_rtp: peer.remote_rtp,
+                remote_rtcp: peer.remote_rtcp,
+                advertised_ip: near_advertised,
+                // A single-leg local answer relays no text stream.
+                text: None,
+                text_remote_rtp: None,
+                // Neither a single-leg local answer nor a conference seat relays fax.
+                image: None,
+                image_remote: None,
+                floor: None,
+                floor_remote: None,
+                floor_format: siphon_rtp_proto::ControlFormat::Mcptt,
+                video: None,
+            },
+            // No B-facing leg, and never will be: this verb *is* the answer (see the allocation
+            // comment above). `answer` refuses to run on such a call rather than inventing one.
+            far: None,
+            caller_media_leg: CallerMediaLeg::Near,
+            far_local_crypto: None,
+            far_remote_crypto: None,
+            far_dtls: false,
+            far_dtls_role: None,
+            far_downgraded_to_plain: false,
+            far_rtcp_fallback: false,
+            // Recorded for symmetry; a single-leg call never reaches `answer`.
+            near_secure: peer.secure,
+            // A single-leg call's keying lives on the takeover leg, not on the two-party pair.
+            near_local_crypto: None,
+            near_remote_crypto: None,
+            near_dtls: None,
+            near_codec: None,
+            // A single-leg local answer never reaches `answer`, so the offered set is unused.
+            near_offered_codecs: Vec::new(),
+            near_codec_withheld: false,
+            far_codec: None,
+            // The caller's own direction. A single-leg call has no second party, so the far default
+            // never contributes — `legs_expected_to_send` only walks a far leg that exists.
+            near_direction: peer.direction,
+            far_direction: sdp::MediaDirection::default(),
+            // Settled with the codec below, like `near_codec`.
+            near_telephone_event: None,
+            near_offered_telephone_events: peer.telephone_events,
+            far_telephone_event: None,
+            pipeline: PipelineKind::Passthrough,
+            // Refused above: a locally answered call synthesizes its own audio, so it can never
+            // be a fax relay.
+            fax_passthrough: false,
+            near_sip_call_id: profile.sip_call_id.clone(),
+            far_sip_call_id: None,
+            caller_source_posture: super::negotiate::SourcePosture::from_profile(profile),
+            near_secure_key: None,
+            relay_flows: Vec::new(),
+            promotion_reasons: HashSet::new(),
+            offer_received_from: profile.received_from,
+            // No far party, so no far hint and no re-offer from one.
+            far_received_from: None,
+            pending_far_reoffer: None,
+            // Set below once the answered codec is known (a single-leg local answer negotiates CN
+            // at the chosen codec's clock rate); left `None` for the reject path.
+            comfort_noise_payload_type: None,
+            text_t140_payload_type: None,
+            text_red_payload_type: None,
+            // A single-leg local answer negotiates no text stream.
+            text_relay_flows: Vec::new(),
+            text_promotion_reasons: HashSet::new(),
+            text_events: false,
+            text_secure: false,
+            near_text_remote_crypto: None,
+            far_text_local_crypto: None,
+            near_text_local_crypto: None,
+            // Set once the local answer is complete (see the end of `answer_local`).
+            video: super::call_video::CallVideo::default(),
+            local_answer: None,
+            seat: None,
+            seating: false,
+            secure_hold: None,
+            local_offer: None,
+            instance: super::next_call_instance(),
+        }
     }
 
     /// WebSocket bridge (mod_audio_stream / voice-AI) on a single-leg answer — the same
@@ -356,7 +429,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// A dial failure fails the command: returning `ok` while the requested bridge is not up would
     /// connect a caller to nothing and give the controller no way to notice, so it is torn down and
     /// reported exactly like `no-encodable-codec` (the controller renders a real SIP failure).
-    async fn answer_local_takeover(&self, takeover: LocalTakeover<'_>) -> CmdResult {
+    pub(super) async fn answer_local_takeover(&self, takeover: LocalTakeover<'_>) -> CmdResult {
         let LocalTakeover {
             call_id,
             ws_uri,
@@ -370,12 +443,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             peer_ice,
             ice_candidates,
             answer_sdp,
+            controlling,
+            instance,
         } = takeover;
         // Record the negotiated ingress codec + the takeover pipeline before the bridge is built.
         // `far_codec` stays `None`: the WS server is the far side and it speaks L16, not an RTP
         // codec — a `far_codec` here would claim a far RTP party that does not exist (`offer`'s WS
         // arm records the same shape).
-        if let Some(mut call) = self.calls.get_mut(call_id) {
+        if let Some(mut call) = self
+            .calls
+            .get_mut(call_id)
+            .filter(|call| call.instance == instance)
+        {
             call.near_codec = Some(chosen.clone());
             call.pipeline = PipelineKind::Ws;
         }
@@ -390,7 +469,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // Key direction (RFC 4568 / `SecureLeg::new`): encrypt egress with the key this
                 // answer advertised, decrypt ingress with the key the offer carried.
                 let Some(local) = near_local_crypto else {
-                    self.teardown_call(call_id).await;
+                    self.teardown_call_instance(call_id, Some(instance)).await;
                     return error_result(
                         "ws bridge",
                         &"ws-takeover-unkeyable: no engine SDES key was minted (internal)",
@@ -417,6 +496,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             bridge_source_filter(profile, a_media)
         };
+        // The dial is the one long await of the setup, and the call-id can be deleted and created
+        // again meanwhile. Dialled here, ahead of the setup, so that what comes back from it is
+        // checked against the creation of the call this takeover began on: a failed dial then ends
+        // only that call, and a successful one for a call that is gone is dropped unused.
+        let socket = match self.dial_ws(call_id, &ws_uri).await {
+            Ok(socket) => socket,
+            Err(reason) => {
+                self.teardown_call_instance(call_id, Some(instance)).await;
+                return error_result("ws bridge", &reason);
+            }
+        };
+        if !self
+            .calls
+            .get(call_id)
+            .is_some_and(|call| call.instance == instance)
+        {
+            return error_result("ws bridge", &super::takeover::SUPERSEDED_DIAL);
+        }
         if let Err(reason) = self
             .setup_ws_bridge(WsBridgeSetup {
                 call_id,
@@ -432,11 +529,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // yet) — so there is nothing for a detach to put back either.
                 egress: None,
                 takeover: None,
-                socket: None,
+                socket: Some(socket),
             })
             .await
         {
-            self.teardown_call(call_id).await;
+            self.teardown_call_instance(call_id, Some(instance)).await;
             return error_result("ws bridge", &reason);
         }
         // Arm the full RFC 8445 agent on the takeover endpoint. `ForwardOnly`: the agent owns
@@ -447,12 +544,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             if !self.arm_single_leg_ice(
                 call_id,
                 near_rtp,
-                config,
-                peer_ice.as_ref(),
-                info,
-                ice_candidates,
+                IceArming {
+                    config,
+                    peer: peer_ice.as_ref(),
+                    remote_candidates: &info.candidates,
+                    local_candidates: ice_candidates,
+                    controlling,
+                },
             ) {
-                self.teardown_call(call_id).await;
+                self.teardown_call_instance(call_id, Some(instance)).await;
                 return error_result(
                     "ws bridge",
                     &"ws-takeover-ice-unsupported: no ICE agent available (internal)",
@@ -482,7 +582,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 peer_setup: *peer_setup,
             };
             if !self.register_single_leg_dtls(dtls, target) {
-                self.teardown_call(call_id).await;
+                self.teardown_call_instance(call_id, Some(instance)).await;
                 return error_result(
                     "ws bridge",
                     &"ws-takeover-unkeyable: engine has no DTLS certificate",
@@ -522,11 +622,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self,
         call_id: &str,
         near_rtp: siphon_rtp_datapath::Endpoint,
-        config: IceConfig,
-        peer: Option<&ice::IceCredentials>,
-        info: &sdp::MediaInfo,
-        candidates: &[siphon_rtp_ice::Candidate],
+        arming: IceArming<'_>,
     ) -> bool {
+        let IceArming {
+            config,
+            peer,
+            remote_candidates,
+            controlling,
+            local_candidates,
+        } = arming;
         let (Some(agents), Some(peer)) = (self.ice_agents.clone(), peer) else {
             return false;
         };
@@ -536,13 +640,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 config.local_pwd.clone(),
             ),
             siphon_rtp_ice::agent::Credentials::new(peer.ufrag.clone(), peer.pwd.clone()),
-            // RFC 8445 §6.1.1: the offerer controls — unless it is a lite agent, which never can.
-            info.ice_lite,
+            controlling,
             ice_tie_breaker(),
         )
         .with_candidates(
-            filter_component(candidates, 1),
-            filter_component(&info.candidates, 1),
+            filter_component(local_candidates, 1),
+            filter_component(remote_candidates, 1),
         );
         self.datapath.set_ice_agent(
             near_rtp.id,
@@ -962,16 +1065,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return *refusal;
         }
         let floor_channel_tag = from_tag.clone();
-        self.register_local_call(
+        self.register_local_call(LocalCallSpec {
             client,
             call_id,
             from_tag,
             near_rtp,
             near_rtcp,
             near_advertised,
-            &info,
+            peer: LocalPeer::signalled(&info),
             profile,
-        );
+            // This command *is* the answer: the caller is already in a live dialog and starts
+            // sending one round trip later, so there is no setup phase to spare it from the
+            // dead-path ceiling.
+            anchored_before_answer: false,
+        });
         // The re-answer of an intercepted dialog: the interception is the replacement's now, and is
         // tapped onto its pipeline once that is up. A withdrawal that arrived while the old call was
         // going away ends it here. Anything that fails after this ends the call, and with it the
@@ -1051,6 +1158,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     peer_ice: &peer_ice,
                     ice_candidates: &ice_candidates,
                     answer_sdp,
+                    // RFC 8445 §6.1.1: the answerer controls only a lite offerer.
+                    controlling: info.ice_lite,
+                    instance: self.calls.get(call_id).map_or(0, |call| call.instance),
                 })
                 .await;
             if matches!(result, CmdResult::Ok { .. }) {
@@ -1073,60 +1183,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Err(refusal) => return *refusal,
         };
 
-        // Engage the transcoder now (single-leg, no far side). After this answer the offerer sends the
-        // chosen codec, so set `near_codec = chosen` *before* promoting: `promote_to_processing`'s
-        // single-leg branch (far_codec == None) uses `near_codec` for both decode and encode, yielding
-        // a processing pipeline that decodes the caller's chosen codec and re-encodes prompt/echo PCM
-        // back into it. The negotiated CN payload type rides along so the promote wires comfort-idle.
-        if let Some(mut call) = self.calls.get_mut(call_id) {
-            call.near_codec = Some(chosen.clone());
-            call.comfort_noise_payload_type = comfort_noise_payload_type;
-            if ice_config.is_some() {
-                call.caller_source_posture = super::negotiate::SourcePosture::Ice;
-            }
-        }
-        if let Err(reason) = self
-            .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
-            .await
-        {
-            self.teardown_call(call_id).await;
-            return error_result("answer_local: engage transcoder", &reason);
-        }
-        // Record the chosen egress codec + the promoted pipeline for observability. Promotion already
-        // set `pipeline = Media`; `far_codec` mirrors `near_codec` for a single-leg IVR (encode == the
-        // codec the caller will send).
-        if let Some(mut call) = self.calls.get_mut(call_id) {
-            call.far_codec = Some(chosen);
-            call.pipeline = PipelineKind::Media;
-            // Kept so `offer_far` can grow the call into a relay behind this very answer.
-            call.keep_local_answer(sdp, &answer_sdp);
-        }
-        self.withhold_egress_unless_received(call_id, info.direction);
-
-        let ice_running = ice_config.is_some();
-        if let Some(config) = ice_config {
-            if !self.arm_single_leg_ice(
-                call_id,
-                near_rtp,
-                config,
-                peer_ice.as_ref(),
-                &info,
-                &ice_candidates,
-            ) {
-                self.teardown_call(call_id).await;
-                return error_result("answer_local", &"ice-unsupported: no ICE agent (internal)");
-            }
-        }
         if let Some(refusal) = self
-            .key_local_pipeline(
+            .engage_local_pipeline(
                 call_id,
-                &offerer_security,
-                near_local_crypto,
-                LocalLeg {
-                    near_rtp,
+                LocalEngage {
+                    chosen,
+                    comfort_noise_payload_type,
+                    offerer_security: &offerer_security,
+                    near_local_crypto,
+                    ice: ice_config.map(|config| IceArming {
+                        config,
+                        peer: peer_ice.as_ref(),
+                        remote_candidates: &info.candidates,
+                        local_candidates: &ice_candidates,
+                        // RFC 8445 §6.1.1: the answerer controls only a lite offerer.
+                        controlling: info.ice_lite,
+                    }),
                     info: &info,
                     profile,
-                    ice_running,
+                    near_rtp,
+                    kept_offer: sdp,
+                    kept_answer: &answer_sdp,
                 },
             )
             .await
@@ -1137,6 +1214,102 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The pipeline is up and keyed: put a carried interception's taps on it.
         self.carry_x3_across_answer(call_id).await;
         super::call_video::with_video_declined(ok_sdp(answer_sdp, None), video_declined)
+    }
+}
+
+/// What [`Engine::engage_local_pipeline`] puts a single-leg call on the engine's own media pipeline
+/// from.
+pub(super) struct LocalEngage<'a> {
+    pub(super) chosen: CodecSpec,
+    pub(super) comfort_noise_payload_type: Option<u8>,
+    pub(super) offerer_security: &'a WsTakeoverSecurity,
+    pub(super) near_local_crypto: Option<CryptoAttribute>,
+    /// The agent to arm, when the leg runs ICE.
+    pub(super) ice: Option<IceArming<'a>>,
+    pub(super) info: &'a sdp::MediaInfo,
+    pub(super) profile: &'a ProfileFlags,
+    pub(super) near_rtp: siphon_rtp_datapath::Endpoint,
+    /// The caller's SDP and the engine's, kept for `offer_far` to grow the call from.
+    pub(super) kept_offer: &'a str,
+    pub(super) kept_answer: &'a str,
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Put a registered single-leg call, whose codec is settled and whose keying and ICE are known,
+    /// on the engine's own pipeline: the transcoder, the ICE agent and the SRTP or DTLS keying of the
+    /// caller. Shared by `answer_local` (the answer it just wrote) and `offer_local` (the caller's
+    /// answer to the engine's offer), so the two end in the same call. `Some` is the refusal, and the
+    /// call has been torn down.
+    pub(super) async fn engage_local_pipeline(
+        &self,
+        call_id: &str,
+        engage: LocalEngage<'_>,
+    ) -> Option<CmdResult> {
+        let LocalEngage {
+            chosen,
+            comfort_noise_payload_type,
+            offerer_security,
+            near_local_crypto,
+            ice,
+            info,
+            profile,
+            near_rtp,
+            kept_offer,
+            kept_answer,
+        } = engage;
+        let ice_running = ice.is_some();
+        // Engage the transcoder now (single-leg, no far side). After this answer the offerer sends the
+        // chosen codec, so set `near_codec = chosen` *before* promoting: `promote_to_processing`'s
+        // single-leg branch (far_codec == None) uses `near_codec` for both decode and encode, yielding
+        // a processing pipeline that decodes the caller's chosen codec and re-encodes prompt/echo PCM
+        // back into it. The negotiated CN payload type rides along so the promote wires comfort-idle.
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.near_codec = Some(chosen.clone());
+            call.comfort_noise_payload_type = comfort_noise_payload_type;
+            if ice_running {
+                call.caller_source_posture = super::negotiate::SourcePosture::Ice;
+            }
+        }
+        if let Err(reason) = self
+            .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
+            .await
+        {
+            self.teardown_call(call_id).await;
+            return Some(error_result("answer_local: engage transcoder", &reason));
+        }
+        // Record the chosen egress codec + the promoted pipeline for observability. Promotion already
+        // set `pipeline = Media`; `far_codec` mirrors `near_codec` for a single-leg IVR (encode == the
+        // codec the caller will send).
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.far_codec = Some(chosen);
+            call.pipeline = PipelineKind::Media;
+            // Kept so `offer_far` can grow the call into a relay behind this very answer.
+            call.keep_local_answer(kept_offer, kept_answer);
+        }
+        self.withhold_egress_unless_received(call_id, info.direction);
+
+        let ice_config_present = ice.is_some();
+        if let Some(arming) = ice {
+            if !self.arm_single_leg_ice(call_id, near_rtp, arming) {
+                self.teardown_call(call_id).await;
+                return Some(error_result(
+                    "answer_local",
+                    &"ice-unsupported: no ICE agent (internal)",
+                ));
+            }
+        }
+        self.key_local_pipeline(
+            call_id,
+            offerer_security,
+            near_local_crypto,
+            LocalLeg {
+                near_rtp,
+                info,
+                profile,
+                ice_running: ice_config_present,
+            },
+        )
+        .await
     }
 }
 

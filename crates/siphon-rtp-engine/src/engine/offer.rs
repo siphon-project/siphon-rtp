@@ -1009,6 +1009,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 seat: None,
                 seating: false,
                 secure_hold: None,
+                local_offer: None,
+                instance: super::next_call_instance(),
             },
         );
         self.index_new_call(&call_id, client);
@@ -1016,6 +1018,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Stand the WS bridge up now that the call is recorded (so a dispatch can find its route). On
         // any failure (no codec, redirect install, or dial), tear the half-built call back down.
         if let Some(ws_uri) = ws_uri {
+            // The creation of the call this takeover began on: the dial is a long await, after which
+            // the call-id may name a replacement that must not be torn down for this one's failure.
+            let instance = self.call_instance(&call_id);
             // Aim the downlink at leg A's `received-from` public IP when the offer supplied one, and
             // gate its ingress on the same address — one value for both, see the helper.
             let a_media = ws_takeover_media_address(info.remote_rtp, profile.received_from);
@@ -1040,7 +1045,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 })
                 .await
             {
-                self.teardown_call(&call_id).await;
+                // `None`: the call is already gone, and whatever holds the id now is not this one's.
+                if instance.is_some() {
+                    self.teardown_call_instance(&call_id, instance).await;
+                }
                 return error_result("ws bridge", &reason);
             }
         }

@@ -165,6 +165,15 @@ impl MediaLeg {
             .push(parsed.sequence, Bytes::copy_from_slice(parsed.payload)))
     }
 
+    /// Account a packet that carries no audio (an RFC 4733 telephone-event) without playing it: it
+    /// counts in the receiver statistics, which share its sequence space, and the jitter buffer's
+    /// cursor steps over its sequence number rather than reading it as a lost audio packet.
+    pub fn consume_non_audio_rtp(&mut self, packet: &RtpPacket<'_>) {
+        self.ingress
+            .on_rtp(packet.ssrc, packet.sequence, packet.timestamp);
+        self.jitter.skip(packet.sequence);
+    }
+
     /// SSRC of this leg's inbound stream (RFC 3550 §5.1), or `None` before the first packet — the
     /// source the RTCP reception report describes.
     #[must_use]

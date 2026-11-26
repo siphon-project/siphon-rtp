@@ -159,6 +159,15 @@ pub(super) fn answered_codec(
     let Some(answered) = info.audio_codecs().into_iter().next() else {
         return Err("the answer has no audio codec".to_string());
     };
+    answered_format(answered, offered)
+}
+
+/// Whether `answered` is one of the `offered` formats: the payload type the offer listed, under the
+/// same encoding, clock rate and (for AMR) payload format (RFC 3264 §6.1, RFC 4867 §8.3.1).
+pub(super) fn answered_format(
+    answered: CodecSpec,
+    offered: &[CodecSpec],
+) -> Result<CodecSpec, String> {
     let Some(offered) = offered
         .iter()
         .find(|offered| offered.payload_type == answered.payload_type)

@@ -188,6 +188,9 @@ fn build_features() -> Vec<String> {
         // `conference_seat`: a live call's leg seated in a room in place. A controller gates the
         // verb on this entry, so it is advertised only where the verb is served.
         "conference_seat".to_string(),
+        // `offer_local`: the engine makes its own offer for a one-legged call whose INVITE carried no
+        // SDP, and the caller's answer (`answer`) completes it as an `answer_local` call.
+        "offer_local".to_string(),
         // Forwarding rooms for push-to-talk group calls: `forward_join`, `forward_leave` and
         // `forward_set_source`. A controller gates the verbs on this entry, so it is advertised only
         // where they are served.

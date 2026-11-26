@@ -230,6 +230,9 @@ pub struct WsEgress {
     /// is only a candidate then, and media MUST follow the selected pair (RFC 8445 §12), so the
     /// downlink has nowhere it may go yet.
     destination: tokio::sync::watch::Sender<Option<SocketAddr>>,
+    /// Whether the peer receives media at all (RFC 3264 §6.1: a `sendonly` or `inactive` party is
+    /// sent nothing). The drain task sends no downlink while this is false, comfort idle included.
+    receives: Arc<std::sync::atomic::AtomicBool>,
     /// The SSRC-consistent symmetric-RTP latch (docs/security-and-nat.md §4 layer 3; RFC 3550 §8),
     /// shared with [`crate::media_pipeline`] so the two userspace `Redirect` paths cannot drift on
     /// what counts as a genuine NAT rebind and what counts as a hijack spray.
@@ -253,10 +256,24 @@ impl WsEgress {
     pub fn new(destination: SocketAddr, ice_managed: bool) -> Self {
         Self {
             destination: tokio::sync::watch::Sender::new((!ice_managed).then_some(destination)),
+            receives: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             latch: Mutex::new(SymmetricLatch::default()),
             ice_managed,
             taps: crate::ws_x3::WsTaps::default(),
         }
+    }
+
+    /// Whether the peer receives media (`false` for a `sendonly` or `inactive` party).
+    pub fn set_peer_receives(&self, receives: bool) {
+        self.receives
+            .store(receives, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The live "peer receives" flag, for the drain task: one relaxed atomic load per downlink
+    /// packet, no lock.
+    #[must_use]
+    pub fn peer_receives_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.receives.clone()
     }
 
     /// The leg's lawful-interception taps: delivered from [`WsRegistry::dispatch`] (what the leg
@@ -339,6 +356,17 @@ impl WsEgress {
     }
 }
 
+/// The payload types the bridge's decoder takes, when the peer may legally send others (RFC 3264
+/// §6.1): the one audio payload type, and the telephone-event payload type its events arrive on
+/// (RFC 4733), which is not audio and is not refused with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngressPayloadTypes {
+    /// The one audio payload type the decoder takes.
+    pub audio: u8,
+    /// The telephone-event payload type, when one was negotiated.
+    pub event: Option<u8>,
+}
+
 /// One WS-bridged call's datapath route: the bridge's RTP-in mailbox plus the source gate to apply
 /// before feeding it (the `Redirect` path skips the datapath's gate — RTPBleed defence).
 struct WsRoute {
@@ -350,6 +378,9 @@ struct WsRoute {
     /// the agent decides — at which point [`WsRegistry::ice_selected`] narrows the gate to the
     /// selected pair and clears this.
     ice_pending: bool,
+    /// The one payload type the bridge's decoder takes. A packet on another one (RFC 3264 §6.1 lets
+    /// the peer send any answered format) is refused, never fed to the wrong decoder. `None`: any.
+    ingress_payload_type: Option<IngressPayloadTypes>,
     /// Leg A's RTP, forwarded (decrypted, on a secure leg) into the bridge for decode → WS uplink.
     rtp_in: flume::Sender<Bytes>,
     /// SRTP crypto for a secure takeover leg; `None` on a plaintext one.
@@ -417,6 +448,8 @@ pub struct WsCallPlan {
     pub activity: Arc<dyn MediaActivity>,
     /// The bridge's RTP-in mailbox.
     pub rtp_in: flume::Sender<Bytes>,
+    /// The only audio payload type the bridge decodes: a packet on another is refused, since the peer may legally send any answered format (RFC 3264 §6.1). `None` takes any.
+    pub ingress_payload_type: Option<IngressPayloadTypes>,
     /// The bridge task (`run_bridge` over the dialed WS connection).
     pub bridge_task: tokio::task::JoinHandle<()>,
     /// The drain task pumping the bridge's `rtp_out` to the datapath toward A.
@@ -460,6 +493,7 @@ impl WsRegistry {
             WsRoute {
                 accepted_source: plan.accepted_source,
                 ice_pending: plan.ice_pending,
+                ingress_payload_type: plan.ingress_payload_type,
                 rtp_in: plan.rtp_in,
                 secure: plan.secure,
                 egress: plan.egress,
@@ -614,6 +648,31 @@ impl WsRegistry {
                 }
             },
         };
+        // The bridge decodes one codec. RFC 3264 §6.1 lets the peer send any format it answered, so a
+        // packet on another payload type is refused here (and counted), never fed to the decoder of
+        // the wrong codec. Before the latch and the liveness stamp: a refused packet moves neither.
+        if let Some(IngressPayloadTypes {
+            audio: expected,
+            event,
+        }) = route.ingress_payload_type
+        {
+            // A telephone-event (RFC 4733) is not audio: the negotiated event payload type passes,
+            // and is stamped, delivered to the interception and forwarded like any accepted packet.
+            if !is_rtcp(&payload)
+                && payload
+                    .get(1)
+                    .is_some_and(|byte| byte & 0x7F != expected && Some(byte & 0x7F) != event)
+            {
+                tracing::debug!(
+                    target: "siphon_rtp::media",
+                    call_id = %route.call_id,
+                    expected,
+                    "ws-bridge refused an RTP packet on a payload type its decoder does not take"
+                );
+                route.activity.dropped(packet.endpoint);
+                return;
+            }
+        }
         // Symmetric-RTP latch (docs/security-and-nat.md §4 layer 3): aim the downlink at the source
         // this leg's media actually arrives from. Offered after the gate above and after SRTP auth,
         // so only an authentic packet from an accepted source can move it, and skipped entirely on an
@@ -804,6 +863,7 @@ mod tests {
             egress: Arc::new(WsEgress::new(address("127.0.0.2:5000"), false)),
             activity: Arc::new(CountingActivity::default()),
             rtp_in,
+            ingress_payload_type: None,
             bridge_task,
             drain_task,
             rtcp_tap: None,
@@ -967,6 +1027,7 @@ mod tests {
             egress: egress.clone(),
             activity: Arc::new(CountingActivity::default()),
             rtp_in: rtp_in_tx,
+            ingress_payload_type: None,
             bridge_task,
             drain_task,
             rtcp_tap: None,

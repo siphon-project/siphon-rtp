@@ -1,7 +1,7 @@
 //! The control entry point: client registration, event delivery, and routing commands to verbs.
 
 use siphon_rtp_datapath::Datapath;
-use siphon_rtp_proto::{CmdResult, Command, Event};
+use siphon_rtp_proto::{CmdResult, Command, Event, ProfileFlags};
 use std::sync::Arc;
 
 use super::play::PlayOptions;
@@ -308,6 +308,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Some(CmdResult::Error { reason })
     }
 
+    /// [`Command::Reoffer`]: a far leg `offer_far` offered has no party behind it yet, and the caller
+    /// already holds the answer the local pipeline gave it, so there is nothing to renegotiate toward.
+    async fn reoffer_command(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+        sdp: &str,
+        profile: &ProfileFlags,
+    ) -> CmdResult {
+        if self.owned_call(client, call_id, super::Call::far_offer_pending) == Some(true) {
+            return CmdResult::Error {
+                reason: "reoffer: far-offer-pending: the far leg offer_far offered is not \
+                         answered yet; answer it or delete it first"
+                    .to_string(),
+            };
+        }
+        let result = self.reoffer(client, call_id, from_tag, sdp, profile).await;
+        self.sync_ws_peer_receives(call_id);
+        result
+    }
+
     /// Push an asynchronous event to whichever client owns `call_id` (a no-op for an unknown call).
     pub(super) fn emit_call_event(&self, call_id: &str, event: Event) {
         if let Some(owner) = self.owned_call_internal(call_id, |call| call.owner) {
@@ -363,7 +385,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // arrival before its completion line; the INFO story is the single `handled` line below.
         tracing::debug!(target: "siphon_rtp::control", verb, call_id = call_id_field, scope, client = client.0, "control command received");
 
-        let anchors = matches!(command, Command::Offer { .. } | Command::AnswerLocal { .. });
+        let anchors = matches!(
+            command,
+            Command::Offer { .. } | Command::AnswerLocal { .. } | Command::OfferLocal { .. }
+        );
         let started = std::time::Instant::now();
         // From here on the command names its call by key (see [`super::scope`]).
         let result = match key_command(scope, &mut command) {
@@ -401,6 +426,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 command,
                 Command::Offer { .. }
                     | Command::AnswerLocal { .. }
+                    | Command::OfferLocal { .. }
                     | Command::ConferenceJoin { .. }
                     | Command::ForwardJoin { .. }
                     | Command::ForwardOffer { .. }
@@ -415,7 +441,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         // A call whose leg sits in a room answers only the verbs that mean something for a seat. The
         // rest would rebuild a media path the room owns now, so each is refused naming the room.
-        if let Some(refusal) = self.seated_call_refusal(client, &command) {
+        // An `offer_local` call still waiting for its answer has no pipeline to act on either.
+        if let Some(refusal) = self
+            .seated_call_refusal(client, &command)
+            .or_else(|| self.pending_offer_refusal(client, &command))
+        {
             return refusal;
         }
         if let Some(refusal) = super::call_video::video_relay_refusal(&command) {
@@ -439,16 +469,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sdp,
                 profile,
             } => {
-                // A far leg `offer_far` offered has no party behind it yet, and the caller already
-                // holds the answer the local pipeline gave it; there is nothing to renegotiate toward.
-                if self.owned_call(client, &call_id, super::Call::far_offer_pending) == Some(true) {
-                    return CmdResult::Error {
-                        reason: "reoffer: far-offer-pending: the far leg offer_far offered is not \
-                                 answered yet; answer it or delete it first"
-                            .to_string(),
-                    };
-                }
-                self.reoffer(client, &call_id, &from_tag, &sdp, &profile)
+                self.reoffer_command(client, &call_id, &from_tag, &sdp, &profile)
                     .await
             }
             Command::IceCandidate {
@@ -496,10 +517,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sdp,
                 profile,
             } => {
-                let result = self
-                    .answer_or_complete_far(client, &call_id, &from_tag, to_tag, &sdp, &profile)
-                    .await;
-                self.apply_profile_ws_tee(&call_id, &profile, result).await
+                self.answer_command(client, &call_id, &from_tag, to_tag, &sdp, &profile)
+                    .await
             }
             Command::AnswerLocal {
                 call_id,
@@ -517,6 +536,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag,
                 profile,
             } => self.offer_far(client, &call_id, &from_tag, &profile).await,
+            Command::OfferLocal {
+                call_id,
+                from_tag,
+                profile,
+            } => self.offer_local(client, &call_id, from_tag, &profile).await,
             Command::Delete {
                 call_id,
                 to_tag: Some(to_tag),
@@ -1035,6 +1059,7 @@ pub(super) fn command_name(command: &Command) -> &'static str {
         Command::Answer { .. } => "answer",
         Command::AnswerLocal { .. } => "answer_local",
         Command::OfferFar { .. } => "offer_far",
+        Command::OfferLocal { .. } => "offer_local",
         Command::Delete { .. } => "delete",
         Command::Query { .. } => "query",
         Command::Ping => "ping",
@@ -1114,6 +1139,7 @@ pub(super) fn command_call_id(command: &Command) -> Option<&str> {
         | Command::Answer { call_id, .. }
         | Command::AnswerLocal { call_id, .. }
         | Command::OfferFar { call_id, .. }
+        | Command::OfferLocal { call_id, .. }
         | Command::Delete { call_id, .. }
         | Command::Query { call_id, .. }
         | Command::Checkpoint { call_id, .. }

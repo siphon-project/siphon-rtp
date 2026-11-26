@@ -52,6 +52,7 @@ mod multi_source;
 mod near_dtls;
 mod offer;
 mod offer_far;
+mod offer_local;
 mod play;
 mod promote;
 mod record;
@@ -704,6 +705,19 @@ struct Call {
     /// Set while a crypto-bridged call is held in the decoding media actor (see
     /// [`promote::secure_hold`]); `None` on every other call.
     secure_hold: Option<promote::secure_hold::SecureHold>,
+    /// The engine's own offer of an [`Engine::offer_local`] call that its answer has not yet
+    /// completed (see [`offer_local`]); `None` on every other call, and again once the answer lands.
+    local_offer: Option<offer_local::LocalOfferState>,
+    /// Which creation of this call-id this is. A call-id can be deleted and created again while a
+    /// command that began on the first is still awaiting (a WebSocket dial), so that command must
+    /// know whether the call it comes back to is still the one it started on.
+    instance: u64,
+}
+
+/// A process-unique [`Call::instance`].
+fn next_call_instance() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A runtime reason a plain passthrough relay is held in the userspace media pipeline (promoted off

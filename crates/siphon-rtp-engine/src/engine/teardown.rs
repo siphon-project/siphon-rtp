@@ -15,7 +15,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Tear down a call's datapath + slow-path state without an ownership check (an internal cleanup
     /// for a half-built call). Frees the sockets and drops any bridge / media / WS registration.
     pub(super) async fn teardown_call(&self, call_id: &str) {
-        if let Some((_, call)) = self.calls.remove(call_id) {
+        self.teardown_call_instance(call_id, None).await;
+    }
+
+    /// [`Self::teardown_call`] of one creation of the call-id: with `Some(instance)` it removes the
+    /// call only while it is still that one, so a command that comes back from an await after the
+    /// call-id was deleted and created again cannot take the replacement down with it.
+    pub(super) async fn teardown_call_instance(&self, call_id: &str, instance: Option<u64>) {
+        if let Some((_, call)) = self.calls.remove_if(call_id, |_, call| {
+            instance.is_none_or(|wanted| call.instance == wanted)
+        }) {
             // A seated leg leaves its room with the call.
             self.release_seat_of(&call).await;
             let endpoints: Vec<EndpointId> = call.all_endpoint_ids().collect();
