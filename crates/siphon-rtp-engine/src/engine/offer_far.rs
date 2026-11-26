@@ -101,6 +101,36 @@ fn far_offer_refusal(call: &Call) -> Option<&'static str> {
              be grown into a relay",
         );
     }
+    // An `offer_local` call whose answer renumbered a format (RFC 3264 §5.1, §6.1): the caller sends
+    // on the payload types of the engine's offer and receives on those of its own answer. A plain
+    // relay forwards the payload type unchanged, so the far party would be sent numbers it never
+    // negotiated, and the two-party install has no separate ingress mapping to honour. Refused,
+    // rather than relayed wrong. The same for an answer that listed several formats, of which the
+    // caller may send any (the far offer lists only the one the call runs on).
+    if let Some(ingress) = call.local_ingress() {
+        let audio_renumbered = call
+            .near_codec
+            .as_ref()
+            .is_some_and(|codec| codec.payload_type != ingress.audio_payload_type);
+        let event_renumbered = matches!(
+            (ingress.event_payload_type, call.near_telephone_event),
+            (Some(offered), Some(answered)) if offered != answered.payload_type
+        );
+        if audio_renumbered || event_renumbered {
+            return Some(
+                "offer_far: renumbered-payload-types: the caller answered the engine's offer with \
+                 other payload numbers (audio or telephone-event) than the ones offered, and a \
+                 relay to a far party cannot carry that mapping; answer with the offered numbers",
+            );
+        }
+        if ingress.other_formats_answered {
+            return Some(
+                "offer_far: several-formats-answered: the caller's answer listed more formats than \
+                 the one the call runs on, and a relay would forward the others unchanged; answer \
+                 with one format",
+            );
+        }
+    }
     if call.caller_source_posture == SourcePosture::Ice {
         return Some(
             "offer_far: near-leg-not-plain: the caller runs ICE, and only a plain RTP caller can be \

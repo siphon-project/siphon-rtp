@@ -131,6 +131,7 @@ async fn ingress_allocations(deliveries: usize) -> (usize, usize) {
     let egress = Arc::new(WsEgress::new(addr(PEER), false));
     let (rtp_in, mailbox) = flume::bounded::<Bytes>(1024);
     registry.register(WsCallPlan {
+        ingress_payload_type: None,
         call_id: "ws-x3".to_string(),
         endpoint_a: endpoint,
         accepted_source: SourceFilter::Exact(addr(PEER).ip()),

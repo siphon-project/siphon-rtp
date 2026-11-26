@@ -59,6 +59,21 @@ pub fn conference_seat_offer(
 /// The audio section's format attributes, shared by the plain and the WebRTC offer: `a=rtpmap` /
 /// `a=fmtp` per codec, the telephone-events, the packetization and `a=sendrecv` / `a=rtcp-mux`.
 fn write_audio_attributes(sdp: &mut String, codecs: &[CodecSpec], events: &[TelephoneEvent]) {
+    write_format_attributes(sdp, codecs, events);
+    let _ = write!(
+        sdp,
+        "a=ptime:20{CRLF}a=maxptime:{OPUS_MAX_PTIME_MS}{CRLF}a=sendrecv{CRLF}a=rtcp-mux{CRLF}"
+    );
+}
+
+/// The per-format attributes of an audio section: `a=rtpmap` / `a=fmtp` per codec and the
+/// telephone-events with their event range (RFC 4733 §2.1, §2.4). Shared by every offer the engine
+/// writes whole.
+pub(super) fn write_format_attributes(
+    sdp: &mut String,
+    codecs: &[CodecSpec],
+    events: &[TelephoneEvent],
+) {
     for codec in codecs {
         let _ = write!(sdp, "{}{CRLF}", rtpmap_line(codec));
         if let Some(fmtp) = egress_fmtp_line(codec) {
@@ -73,10 +88,6 @@ fn write_audio_attributes(sdp: &mut String, codecs: &[CodecSpec], events: &[Tele
             event.payload_type
         );
     }
-    let _ = write!(
-        sdp,
-        "a=ptime:20{CRLF}a=maxptime:{OPUS_MAX_PTIME_MS}{CRLF}a=sendrecv{CRLF}a=rtcp-mux{CRLF}"
-    );
 }
 
 /// What turns a seat's offer into a WebRTC one (RFC 8829 / RFC 8839 / RFC 5763): the ICE identity the

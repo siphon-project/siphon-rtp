@@ -75,6 +75,7 @@ mod joined_seat_owner;
 mod multi_source_recording;
 mod multi_source_tee;
 mod offer_far;
+mod offer_local;
 mod ogg_opus_recording;
 mod record_call_streams;
 mod record_handover;

@@ -898,32 +898,34 @@ impl Conference {
         // detect the key press and surface it on the control channel instead.
         if participant.telephone_event.map(|event| event.payload_type) == Some(parsed.payload_type)
         {
-            if let Ok(Some(event)) = participant.dtmf.on_packet(parsed.timestamp, parsed.payload) {
-                // RFC 4733 §2.3.5: the duration counts in the clock of the seat's event stream,
-                // which is not 8 kHz for a wideband or full-band seat.
-                let clock = u64::from(
-                    participant
-                        .telephone_event
-                        .map_or(crate::sdp::TelephoneEvent::DEFAULT_CLOCK_RATE_HZ, |event| {
-                            event.clock_rate_hz
-                        })
-                        .max(1),
-                );
-                let duration_ms =
-                    u32::try_from(u64::from(event.duration) * 1000 / clock).unwrap_or(u32::MAX);
-                // A seated call leg's digit names its call (the controller's correlation key), with
-                // the room beside it; a joined seat's names the room, as it always has.
-                let digit = Event::Dtmf {
-                    call_id: participant.call_seat.event_call_id(conference_id),
-                    from_tag: participant.tag.clone(),
-                    to_tag: None,
-                    conference_id: Some(conference_id.to_string()),
-                    digit: event.digit.to_string(),
-                    duration_ms,
-                    volume: -i32::from(event.volume),
-                    source: None,
-                };
-                participant.call_seat.route(&mut self.pending_events, digit);
+            if let Ok(presses) = participant.dtmf.on_packet(parsed.timestamp, parsed.payload) {
+                for event in presses {
+                    // RFC 4733 §2.3.5: the duration counts in the clock of the seat's event stream,
+                    // which is not 8 kHz for a wideband or full-band seat.
+                    let clock = u64::from(
+                        participant
+                            .telephone_event
+                            .map_or(crate::sdp::TelephoneEvent::DEFAULT_CLOCK_RATE_HZ, |event| {
+                                event.clock_rate_hz
+                            })
+                            .max(1),
+                    );
+                    let duration_ms =
+                        u32::try_from(u64::from(event.duration) * 1000 / clock).unwrap_or(u32::MAX);
+                    // A seated call leg's digit names its call (the controller's correlation key), with
+                    // the room beside it; a joined seat's names the room, as it always has.
+                    let digit = Event::Dtmf {
+                        call_id: participant.call_seat.event_call_id(conference_id),
+                        from_tag: participant.tag.clone(),
+                        to_tag: None,
+                        conference_id: Some(conference_id.to_string()),
+                        digit: event.digit.to_string(),
+                        duration_ms,
+                        volume: -i32::from(event.volume),
+                        source: None,
+                    };
+                    participant.call_seat.route(&mut self.pending_events, digit);
+                }
             }
             if participant.dtmf_mode == ConferenceDtmf::Forward {
                 let timestamp = parsed.timestamp;

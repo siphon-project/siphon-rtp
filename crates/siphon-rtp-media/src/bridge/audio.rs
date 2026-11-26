@@ -399,6 +399,24 @@ impl BridgeCore {
         self.echo_canceller.is_some()
     }
 
+    /// The packetization time of the session in milliseconds, which is what one [`Self::tick`] advances.
+    #[must_use]
+    pub fn ptime_ms(&self) -> u32 {
+        u32::from(self.format.ptime.max(1))
+    }
+
+    /// Queue a detected telephone-event press (RFC 4733) for the server as a `dtmf` control message,
+    /// sent after the next tick like the turn signals.
+    pub fn queue_dtmf(&mut self, digit: char, duration_ms: u32) {
+        self.pending_control
+            .push(ControlMessage::Dtmf(crate::bridge::protocol::DtmfData {
+                stream_id: self.stream_id.clone(),
+                digit: digit.to_string(),
+                track: "inbound".to_string(),
+                duration_ms,
+            }));
+    }
+
     /// Take the next tick-originated control message to send to the server (turn signals), or `None`.
     /// Drained FIFO by the transport after each [`BridgeCore::tick`]; returns `None` with no work
     /// (and no allocation) on the steady-state path.

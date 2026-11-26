@@ -93,6 +93,27 @@ The callee is offered the caller's codec first, so an answer on it is a plain re
 picks a codec the offer did not list is refused (`codec-not-offered`) and left for the controller to
 release with a 488.
 
+## An INVITE without SDP
+
+A carrier that sends the INVITE with no SDP (a delayed offer, RFC 3261 §13.2.1) expects the
+answerer to offer first, so the engine makes the offer and the caller's answer arrives in the ACK:
+
+1. `offer_local` on the call; put the SDP it returns in the 2xx. The `profile` picks the codecs and
+   the security (`transport_protocol`, `ice`, `ws_uri` for a bot), as for `answer_local`.
+2. The ACK carries the caller's answer: send it with `answer`, `from_tag` the caller's and `to_tag`
+   the one the 2xx carried. The call is an `answer_local` one from here on: `play_media`, `echo`,
+   recording, the `ws_uri` takeover, `delete`. The result is the engine's offer again, unchanged.
+3. An answer the engine cannot use (a codec it did not offer, a declined stream, keying that does
+   not match) is an error with a token such as `codec-not-offered`, and leaves the call allocated:
+   an ACK cannot be answered with a 488, so `delete` the call and end the dialog yourself.
+
+```json
+{"id": 30, "command": "offer_local", "call_id": "7f9a2b1c@198.51.100.20", "from_tag": "a7c31f"}
+```
+
+Nothing is sent to the caller, and nothing it sends is accepted, until the answer names where it
+sends from. The offer is one audio stream; video is not offered.
+
 ## Ringback while a leg rings
 
 The case the overlay mode exists for. Party A is connected and B has not answered, so there

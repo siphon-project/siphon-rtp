@@ -134,6 +134,49 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
 use super::ws_dial::WsClientSocket;
 
+/// The refusal of a takeover whose call was deleted or created again while its WebSocket was dialled.
+pub(super) const SUPERSEDED_DIAL: &str = "call-superseded: the call was deleted or created again \
+    while the WebSocket was being dialled";
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Which creation of the call-id is registered now ([`Call::instance`]), `None` when there is none.
+    pub(super) fn call_instance(&self, call_id: &str) -> Option<u64> {
+        self.calls.get(call_id).map(|call| call.instance)
+    }
+
+    /// The telephone-event payload type the caller of `call_id` sends events on and the clock rate of
+    /// that stream. For an `offer_local` call it is the offer's number (the caller sends on the
+    /// engine's numbering); otherwise the negotiated one. The rate is the event stream's own, which
+    /// need not be the audio codec's (RFC 4733 §2.5: a duration counts in the event's clock).
+    fn telephone_event_of(&self, call_id: &str) -> Option<(u8, u32)> {
+        self.owned_call_internal(call_id, |call| {
+            call.local_ingress()
+                .and_then(|ingress| ingress.event_payload_type.zip(ingress.event_clock_rate_hz))
+                .or(call
+                    .near_telephone_event
+                    .map(|event| (event.payload_type, event.clock_rate_hz)))
+        })
+        .flatten()
+    }
+
+    /// Whether the caller of `call_id` receives media: false for a party that declared `sendonly` or
+    /// `inactive` (RFC 3264 §6.1).
+    fn peer_receives(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .is_none_or(|call| call.near_direction.receives())
+    }
+
+    /// Bring a live takeover bridge's downlink in line with the caller's current direction, after a
+    /// re-offer or the answer to one changed it (a hold stops the downlink, a resume restarts it).
+    /// A no-op for a call with no bridge. Never called with a call registry guard held.
+    pub(super) fn sync_ws_peer_receives(&self, call_id: &str) {
+        if let Some(egress) = self.ws.egress_of(call_id) {
+            egress.set_peer_receives(self.peer_receives(call_id));
+        }
+    }
+}
+
 /// Switching a live two-party relay onto a WebSocket takeover, and back again.
 ///
 /// The two halves are recorded together because they are one decision: `displace` is applied with
@@ -262,9 +305,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // The lifecycle events are addressed to the call's owner and carry its offerer tag, and both
         // have to be captured now: teardown emits the end event after `delete` has removed the call.
-        let Some((from_tag, owner)) =
-            self.owned_call_internal(call_id, |call| (call.from_tag.clone(), call.owner))
-        else {
+        let Some((from_tag, owner, instance)) = self.owned_call_internal(call_id, |call| {
+            (call.from_tag.clone(), call.owner, call.instance)
+        }) else {
             return Err("call no longer exists".to_string());
         };
 
@@ -300,7 +343,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // call's datapath untouched, which for a runtime attach means still relaying.
         let socket = match dialled {
             Some(socket) => socket,
-            None => self.dial_ws(call_id, ws_uri).await?,
+            None => {
+                let socket = self.dial_ws(call_id, ws_uri).await?;
+                // The dial is a long await, and the call-id may have been deleted and created again
+                // meanwhile: what comes back belongs to the call this setup began on, or to nothing.
+                if self.call_instance(call_id) != Some(instance) {
+                    return Err(SUPERSEDED_DIAL.to_string());
+                }
+                socket
+            }
         };
 
         // Which endpoint a relay actor keeps (it is stopped only once the bridge is live; see
@@ -350,6 +401,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // bot is speaking, which reads to the caller as dead air, lets the NAT pinhole toward them
         // expire, and leaves the egress clock stopped between turns.
         .with_comfort_idle(true)
+        // RFC 4733 telephone-events are demultiplexed before the audio path, whose decoder would turn
+        // a digit into bogus PCM; each press goes to the server as a `dtmf` message. The number the
+        // caller sends events on is the offer's, for an `offer_local` call, else the negotiated one.
+        .with_telephone_event(self.telephone_event_of(call_id))
         // Clean leg A's uplink audio toward the voice-AI server when requested (rate-gated inside).
         .with_noise_suppression(noise_suppression)
         // Cancel leg A's uplink echo toward the voice-AI server, referenced against the downlink the
@@ -420,6 +475,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if !egress_carried {
             self.tap_new_bridge_leg(call_id, endpoint_a, &egress);
         }
+        // RFC 3264 §6.1: a party that declared `sendonly` or `inactive` is sent no media at all, not
+        // the bot's audio and not comfort idle. Set before either task runs, so not one frame leaves
+        // first. The direction is the leg's, so a carried egress takes the call's current one too: a
+        // re-point must not keep a flag a hold or a resume has made stale.
+        egress.set_peer_receives(self.peer_receives(call_id));
         // The bridge: pump A's RTP (rtp_in) ↔ WS, render WS downlink to RTP (rtp_out). Whichever way
         // it ends, say so once — a detach that beat it to the latch has already reported `Detached`.
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -463,12 +523,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let drain_endpoint = endpoint_a;
         let drain_secure = secure.clone();
         let drain_egress = egress.subscribe();
+        let drain_receives = egress.peer_receives_flag();
         let drain_taps = egress.taps().subscribe();
         let drain_task = tokio::spawn(async move {
             let mut sealed = Vec::new();
             while let Ok(packet) = rtp_out_rx.recv_async().await {
                 // Copy the destination out of the watch before any `.await` — never hold its guard
                 // across a yield point.
+                if !drain_receives.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
                 let Some(destination) = *drain_egress.borrow() else {
                     // An ICE leg before its agent selects: nowhere it may send (RFC 8445 §12).
                     continue;
@@ -503,6 +567,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // carries the datapath itself and stamps on each accepted packet.
             activity: Arc::new(self.datapath.clone()),
             rtp_in: rtp_in_tx,
+            // An `offer_local` call decodes the one payload type its offer numbered; the route
+            // reads it off the call, so a re-point and a detach carry it without being told.
+            ingress_payload_type: self
+                .owned_call_internal(call_id, |call| call.local_ingress())
+                .flatten()
+                .map(|ingress| crate::ws_bridge::IngressPayloadTypes {
+                    audio: ingress.audio_payload_type,
+                    event: ingress.event_payload_type,
+                }),
             bridge_task,
             drain_task,
             // The leg's own engine address is the capture's destination: a takeover leg
@@ -738,12 +811,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // Dial first, while the outgoing bridge still owns the leg: a re-point that cannot reach
             // the new consumer must be a clean refusal on a call that is still up, not a call left
             // redirected into nothing with its relay-restore plan already dropped.
+            let instance = self.call_instance(call_id);
             let socket = self.dial_ws(call_id, ws_uri).await?;
+            // The bridge about to be stopped and replaced is the call's own only while the call-id
+            // still names the call the re-point began on.
+            if instance.is_none() || self.call_instance(call_id) != instance {
+                return Err(SUPERSEDED_DIAL.to_string());
+            }
             // A recording follows the leg to the new consumer, as it follows it onto a bot from the
             // anchor: off the outgoing bridge before it stops, onto the new one once it is up.
             let recordings = self.take_bridge_recordings(call_id).await;
+            // Re-checked after that await and before the bridge is stopped: a call-id deleted and
+            // created again meanwhile names a bridge that is not the one this re-point began on, and
+            // stopping it would end the replacement's. The recordings taken belong to the call that
+            // is gone, and end with it. (The take is itself an await on the bridge's reply, so this
+            // cannot be made atomic with it; the check follows it immediately and precedes every
+            // mutation below.)
+            if self.call_instance(call_id) != instance {
+                drop(recordings);
+                return Err(SUPERSEDED_DIAL.to_string());
+            }
             self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
                 .await;
+            // And again after the stop's own await, before the replacement bridge is set up on the id.
+            if self.call_instance(call_id) != instance {
+                drop(recordings);
+                return Err(SUPERSEDED_DIAL.to_string());
+            }
             let result = self
                 .setup_ws_bridge(WsBridgeSetup {
                     call_id,

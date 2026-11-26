@@ -240,6 +240,9 @@ pub enum Command {
     /// On a call grown by [`Command::OfferFar`] it answers the far leg: the local pipeline stops, the
     /// caller and the far party are relayed (transcoded when they use different codecs), and the SDP
     /// returned is the caller's original `answer_local` answer, unchanged.
+    ///
+    /// On a call made by [`Command::OfferLocal`] it carries the caller's answer: the SDP returned is
+    /// the engine's own offer, unchanged, and the call then runs as an `answer_local` one.
     Answer {
         call_id: String,
         from_tag: String,
@@ -280,6 +283,21 @@ pub enum Command {
     /// RTP `answer_local` call (a WebSocket takeover, or a caller on SRTP or ICE), and on one that
     /// already has a far leg.
     OfferFar {
+        call_id: String,
+        from_tag: String,
+        #[serde(default)]
+        profile: ProfileFlags,
+    },
+    /// Single-leg UAS **offer**: the engine makes its own SDP offer for a call whose INVITE carried no
+    /// SDP (a delayed offer, RFC 3261 §13.2.1), to be answered by the controller itself (a voice bot,
+    /// a prompt, a menu, voicemail, a recording). Allocates the one leg toward the caller and returns
+    /// the engine's **offer** on [`CmdResult::Ok`], to go in the 2xx. The caller's answer comes back
+    /// in the ACK and is completed with [`Command::Answer`] (`from_tag` is the caller's tag, `to_tag`
+    /// the one the controller put in its 2xx), after which the call behaves exactly like an
+    /// [`Command::AnswerLocal`] call. One audio stream (no video); security, ICE and the codec policy
+    /// come from `profile`. Until the answer arrives nothing is sent and nothing received is
+    /// forwarded.
+    OfferLocal {
         call_id: String,
         from_tag: String,
         #[serde(default)]
@@ -4056,6 +4074,11 @@ mod tests {
                 sdp: "v=0".into(),
                 profile: ProfileFlags::default(),
             },
+            Command::OfferLocal {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                profile: ProfileFlags::default(),
+            },
             Command::Delete {
                 call_id: "c".into(),
                 from_tag: "f".into(),
@@ -4902,6 +4925,46 @@ mod tests {
         assert_eq!(value["profile"]["flags"][0], "codec-transcode-PCMA");
         assert!(value.get("sdp").is_none(), "offer_far carries no sdp");
         assert!(value.get("to_tag").is_none(), "offer_far carries no to_tag");
+    }
+
+    #[test]
+    fn offer_local_wire_shape_carries_no_sdp_and_no_to_tag() {
+        let json = r#"{"command":"offer_local","call_id":"c","from_tag":"f"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::OfferLocal {
+                call_id,
+                from_tag,
+                profile,
+            } => {
+                assert_eq!(call_id, "c");
+                assert_eq!(from_tag, "f");
+                assert_eq!(profile, ProfileFlags::default());
+            }
+            other => panic!("expected offer_local, got {other:?}"),
+        }
+
+        let request = Request {
+            id: 13,
+            command: Command::OfferLocal {
+                call_id: "abc@host".into(),
+                from_tag: "ft".into(),
+                profile: ProfileFlags {
+                    transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                    ice: Some("force".into()),
+                    ws_uri: Some("wss://bot.example.net/stream".into()),
+                    ..Default::default()
+                },
+            },
+        };
+        roundtrip(&request);
+        let value = serde_json::to_value(&request).expect("to_value");
+        assert_eq!(value["command"], "offer_local");
+        assert_eq!(value["profile"]["transport_protocol"], "UDP/TLS/RTP/SAVPF");
+        assert!(value.get("sdp").is_none(), "offer_local carries no sdp");
+        assert!(
+            value.get("to_tag").is_none(),
+            "offer_local carries no to_tag"
+        );
     }
 
     #[test]

@@ -23,8 +23,10 @@ mod decline;
 mod direction;
 pub(crate) mod floor;
 mod key_mgmt;
+mod local_offer;
 mod offer;
 mod stream_identity;
+pub use local_offer::{local_audio_offer, LocalOffer, LocalOfferIce, LocalOfferKeying};
 pub use offer::{
     conference_seat_offer, webrtc_seat_offer, WebrtcOffer, WebrtcVideoOffer, WEBRTC_AUDIO_MID,
     WEBRTC_DATA_CHANNEL_MID, WEBRTC_VIDEO_MID,

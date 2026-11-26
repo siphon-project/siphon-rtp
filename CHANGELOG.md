@@ -7,8 +7,48 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **`offer_local`: the engine makes its own offer for an INVITE that carries no SDP.** A carrier
+  that sends a delayed offer (RFC 3261 §13.2.1) is answered anchored: `offer_local` binds the one leg
+  toward the caller and returns the engine's SDP offer for the 2xx, and `answer` with the caller's
+  answer from the ACK completes it, after which the call is an `answer_local` one (`play_media`,
+  recording, a `ws_uri` takeover dialled at the answer, X3 single-leg taps, a re-answer, `offer_far`
+  on a plain caller, `delete`). The offer is one audio stream: the codecs this build runs both ways,
+  ordered by the codec flags, then telephone-event, as plain RTP, SDES-SRTP, DTLS-SRTP (`a=setup:actpass`)
+  or ICE (full agent, the engine controlling), alone or DTLS over ICE. The answer must pick from the
+  offered formats; a refused one (`codec-not-offered`, `answer-rejected`, `security-mismatch`,
+  `sdes-no-acceptable-crypto`, `dtls-fingerprint-missing`, `dtls-setup-invalid`, `ice-no-candidates`,
+  `rtcp-mux-not-accepted`, and more) is an error that leaves the call pending for the controller to
+  delete. Until the answer nothing is sent and nothing received is forwarded or latched. An X3
+  interception attached at the offer delivers from the answer on. Video is not offered. `checkpoint`
+  is refused on a pending call. `node_info` lists `offer_local`.
+
 ### Fixed
 
+- **A WebSocket takeover now honours the caller's direction.** `answer_local` with `ws_uri` (and
+  `offer`, and `attach_ws_bridge`) answered a `sendonly` or `inactive` caller with the bot's audio and
+  comfort idle all the same; the downlink is withheld now, as the local pipeline already did
+  (RFC 3264 §6.1), and follows the caller's direction across a later hold or resume (`reoffer`, the
+  answer to one, a re-pointed bridge). The same holds for the answer of an `offer_local` takeover.
+- **A digit on a WebSocket takeover is no longer decoded as audio.** `answer_local` with `ws_uri` (and
+  `offer`, `attach_ws_bridge`) fed RFC 4733 telephone-event packets to the codec's decoder, so a
+  digit became a burst of bogus PCM for the server. Events are now demultiplexed before the audio
+  path, their sequence numbers stepped over by the jitter buffer (a digit no longer costs about
+  200 ms of concealment), and each press is reported to the server once as a `dtmf` control message,
+  timed by the event stream's own clock. The shared RFC 4733 detector also stops counting a
+  reordered End retransmission as a second press, and completes a press whose End was lost (when
+  the next event starts, when audio resumes, or after 500 ms without an update), for every path
+  that uses it; timestamps compare in serial arithmetic, so a reordered older packet never completes
+  the open event and a sender whose timeline restarted is a new press. `DtmfDetector::on_packet`
+  now returns every press the packet completed (the lost-End press of the previous event as well as
+  its own), which the media pipeline and the conference report together.
+- **A failed WebSocket dial no longer ends a replacement call, and a dial that returns for a call
+  that is gone no longer takes over its replacement.** `answer_local` and `offer` with `ws_uri` tore
+  the call down by its call-id after a failed dial, and a runtime attach or re-point of a bridge
+  carried on after its dial without checking the call was still the one it began on, so a call-id
+  deleted and created again meanwhile lost or was taken over by the stale command. The teardown and
+  the setup that follows the dial now apply only to the call the command began on.
 - **An end reason a consumer does not know no longer loses the whole event.** Every reason enum an
   event carries (`ws_split_ended`, `ws_tee_ended`, `ws_bridge_ended`, `play_finished`,
   `media_timeout`, `x3_ended`, `recording_finished`) gains an `Unknown` variant that an unrecognised

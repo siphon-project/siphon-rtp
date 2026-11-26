@@ -853,6 +853,13 @@ pub struct Direction {
     telephone_event_in: Option<u8>,
     /// Egress RFC 4733 telephone-event payload type (what the receiving party expects).
     telephone_event_out: Option<u8>,
+    /// The one audio payload type this direction's decoder takes, when the peer may legally send
+    /// others (RFC 3264 §6.1: any format it answered). A packet on another payload type is refused
+    /// and counted in `ingress_payload_refused`, never fed to the decoder of the wrong codec. `None`
+    /// (the default) decodes whatever arrives.
+    ingress_audio_payload_type: Option<u8>,
+    /// How many ingress packets `ingress_audio_payload_type` refused.
+    ingress_payload_refused: u64,
     dtmf: DtmfDetector,
     /// Fork sinks fed the decoded ingress audio (post-decode, pre-encode): SIPREC / monitor
     /// subscribers, each re-encoding for a send-only Session Recording Server (RFC 7866 §6), and the
@@ -1645,6 +1652,8 @@ impl Direction {
             pending_marker: false,
             telephone_event_in: config.telephone_event_in,
             telephone_event_out: config.telephone_event_out,
+            ingress_audio_payload_type: None,
+            ingress_payload_refused: 0,
             dtmf: DtmfDetector::new(),
             forks: Vec::new(),
             egress_taps: Vec::new(),
@@ -1733,6 +1742,8 @@ impl Direction {
             // leg never repacketizes; it drops or forwards the packet whole.
             telephone_event_in: config.telephone_event,
             telephone_event_out: None,
+            ingress_audio_payload_type: None,
+            ingress_payload_refused: 0,
             dtmf: DtmfDetector::new(),
             forks: Vec::new(),
             egress_taps: Vec::new(),
@@ -2282,19 +2293,19 @@ impl Direction {
                     // then drop the packet — the peer never hears the tone. A malformed telephone-event
                     // still drops (never forward a blocked DTMF PT).
                     if let Ok(parsed) = RtpPacket::parse(data) {
-                        if let Ok(Some(event)) =
-                            self.dtmf.on_packet(parsed.timestamp, parsed.payload)
-                        {
-                            events.push(Event::Dtmf {
-                                call_id: leg_meta.call_id.to_string(),
-                                from_tag: leg_meta.from_tag.to_string(),
-                                to_tag: leg_meta.to_tag.map(str::to_string),
-                                conference_id: None,
-                                digit: event.digit.to_string(),
-                                duration_ms: u32::from(event.duration) / 8,
-                                volume: -i32::from(event.volume),
-                                source: None,
-                            });
+                        if let Ok(presses) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
+                            for event in presses {
+                                events.push(Event::Dtmf {
+                                    call_id: leg_meta.call_id.to_string(),
+                                    from_tag: leg_meta.from_tag.to_string(),
+                                    to_tag: leg_meta.to_tag.map(str::to_string),
+                                    conference_id: None,
+                                    digit: event.digit.to_string(),
+                                    duration_ms: u32::from(event.duration) / 8,
+                                    volume: -i32::from(event.volume),
+                                    source: None,
+                                });
+                            }
                         }
                     }
                     return Ok(admitted);
@@ -2364,18 +2375,20 @@ impl Direction {
 
         // RFC 4733 telephone-event: extract a DTMF event and repacketize onto the egress stream.
         if Some(parsed.payload_type) == self.telephone_event_in {
-            if let Ok(Some(event)) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
-                events.push(Event::Dtmf {
-                    call_id: leg_meta.call_id.to_string(),
-                    from_tag: leg_meta.from_tag.to_string(),
-                    to_tag: leg_meta.to_tag.map(str::to_string),
-                    conference_id: None,
-                    digit: event.digit.to_string(),
-                    // RTP timestamp units are samples at the 8 kHz telephone-event clock (RFC 4733).
-                    duration_ms: u32::from(event.duration) / 8,
-                    volume: -i32::from(event.volume),
-                    source: None,
-                });
+            if let Ok(presses) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
+                for event in presses {
+                    events.push(Event::Dtmf {
+                        call_id: leg_meta.call_id.to_string(),
+                        from_tag: leg_meta.from_tag.to_string(),
+                        to_tag: leg_meta.to_tag.map(str::to_string),
+                        conference_id: None,
+                        digit: event.digit.to_string(),
+                        // RTP timestamp units are samples at the 8 kHz telephone-event clock (RFC 4733).
+                        duration_ms: u32::from(event.duration) / 8,
+                        volume: -i32::from(event.volume),
+                        source: None,
+                    });
+                }
             }
             // `block DTMF`: still detect + emit the event above (the controller sees the digit), but
             // do not relay it to the peer — the far side never hears the tone. v1 = drop mode.
@@ -2388,6 +2401,9 @@ impl Direction {
             return Ok(admitted);
         }
 
+        if self.refuses_payload_type(parsed.payload_type) {
+            return Ok(admitted);
+        }
         if self.blocked {
             return Ok(admitted);
         }
@@ -2819,18 +2835,23 @@ impl Direction {
         let stream_ssrc = parsed.ssrc;
         // Detect DTMF so the caller can end the echo test on a digit; do not echo the tone itself.
         if Some(parsed.payload_type) == self.telephone_event_in {
-            if let Ok(Some(event)) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
-                events.push(Event::Dtmf {
-                    call_id: leg_meta.call_id.to_string(),
-                    from_tag: leg_meta.from_tag.to_string(),
-                    to_tag: leg_meta.to_tag.map(str::to_string),
-                    conference_id: None,
-                    digit: event.digit.to_string(),
-                    duration_ms: u32::from(event.duration) / 8,
-                    volume: -i32::from(event.volume),
-                    source: None,
-                });
+            if let Ok(presses) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
+                for event in presses {
+                    events.push(Event::Dtmf {
+                        call_id: leg_meta.call_id.to_string(),
+                        from_tag: leg_meta.from_tag.to_string(),
+                        to_tag: leg_meta.to_tag.map(str::to_string),
+                        conference_id: None,
+                        digit: event.digit.to_string(),
+                        duration_ms: u32::from(event.duration) / 8,
+                        volume: -i32::from(event.volume),
+                        source: None,
+                    });
+                }
             }
+            return admitted;
+        }
+        if self.refuses_payload_type(parsed.payload_type) {
             return admitted;
         }
         // The same preallocated decode scratch `handle` uses (`egress` is a different `Direction`, so no
@@ -2875,6 +2896,18 @@ impl Direction {
         egress.emit_pcm(&decoded[..samples], parsed.marker, out);
         std::mem::swap(&mut self.decode_scratch, &mut decoded);
         admitted
+    }
+
+    /// Whether `payload_type` is an audio payload type this direction's decoder does not take
+    /// (`ingress_audio_payload_type`), counting the refusal.
+    fn refuses_payload_type(&mut self, payload_type: u8) -> bool {
+        match self.ingress_audio_payload_type {
+            Some(expected) if expected != payload_type => {
+                self.ingress_payload_refused += 1;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Repacketize a telephone-event onto the egress stream: keep the event's RTP timestamp (RFC 4733
@@ -3577,6 +3610,22 @@ impl MediaCall {
     pub fn set_silenced(&mut self, silenced: bool) {
         self.a_to_b.silenced = silenced;
         self.b_to_a.silenced = silenced;
+    }
+
+    /// Hold the decoders to the one audio payload type the call's offer numbered: the pipeline has a
+    /// single decoder per direction, and RFC 3264 §6.1 lets the peer send any format it answered.
+    /// A packet on another payload type is refused and counted rather than decoded as the wrong
+    /// codec, which is a stated limitation of a call answered with several formats.
+    pub fn set_ingress_audio_payload_type(&mut self, payload_type: Option<u8>) {
+        self.a_to_b.ingress_audio_payload_type = payload_type;
+        self.b_to_a.ingress_audio_payload_type = payload_type;
+    }
+
+    /// How many ingress packets the audio payload type filter
+    /// ([`Self::set_ingress_audio_payload_type`]) has refused, across both directions.
+    #[must_use]
+    pub fn ingress_payload_refusals(&self) -> u64 {
+        self.a_to_b.ingress_payload_refused + self.b_to_a.ingress_payload_refused
     }
 
     /// Whether the party faced by both egress directions will receive media at all; when not, every
@@ -5587,6 +5636,83 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(call.a_to_b.decode_errors, 2);
+    }
+
+    #[test]
+    fn a_lost_end_and_the_next_events_only_end_packet_are_both_reported_to_the_controller() {
+        // A's End is lost; B's only surviving packet is its End. The controller must get both digits
+        // from that one packet: nothing may be left waiting for an event packet that never comes.
+        let mut call = ulaw_alaw_call();
+        let event = |sequence: u16, timestamp: u32, code: u8, end: bool, duration: u16| {
+            let header = RtpHeader {
+                marker: false,
+                payload_type: 101,
+                sequence,
+                timestamp,
+                ssrc: 0x1234_5678,
+            };
+            let [high, low] = duration.to_be_bytes();
+            let payload = [code, if end { 0x8A } else { 0x0A }, high, low];
+            let mut buffer = vec![0u8; 12 + payload.len()];
+            let len = write_packet(&header, &payload, &mut buffer).expect("write");
+            buffer.truncate(len);
+            buffer
+        };
+        let (mut out, mut events) = (Vec::new(), Vec::new());
+        call.process(
+            &rx(1, A_ADDR, event(1, 1000, 1, false, 160)),
+            &mut out,
+            &mut events,
+        );
+        call.process(
+            &rx(1, A_ADDR, event(2, 1000, 1, false, 480)),
+            &mut out,
+            &mut events,
+        );
+        call.process(
+            &rx(1, A_ADDR, event(3, 2000, 2, true, 800)),
+            &mut out,
+            &mut events,
+        );
+        let digits: Vec<(String, u32)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dtmf {
+                    digit, duration_ms, ..
+                } => Some((digit.clone(), *duration_ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(digits, [("1".to_string(), 60), ("2".to_string(), 100)]);
+    }
+
+    #[test]
+    fn audio_on_a_payload_type_the_decoder_does_not_take_is_refused_and_counted() {
+        // RFC 3264 §6.1 lets a peer send any format it answered, and the pipeline holds one decoder:
+        // a packet on another payload type must never reach it.
+        let mut call = ulaw_alaw_call();
+        call.set_ingress_audio_payload_type(Some(0));
+        let on = |payload_type: u8, sequence: u16| {
+            let header = RtpHeader {
+                marker: false,
+                payload_type,
+                sequence,
+                timestamp: u32::from(sequence) * 160,
+                ssrc: 0x1234_5678,
+            };
+            let mut buffer = vec![0u8; 12 + 160];
+            let len = write_packet(&header, &[0x55; 160], &mut buffer).expect("write");
+            buffer.truncate(len);
+            buffer
+        };
+        let (mut out, mut events) = (Vec::new(), Vec::new());
+        call.process(&rx(1, A_ADDR, on(8, 1)), &mut out, &mut events);
+        call.process(&rx(1, A_ADDR, on(8, 2)), &mut out, &mut events);
+        assert!(out.is_empty(), "a PCMA packet is not decoded as PCMU");
+        assert_eq!(call.ingress_payload_refusals(), 2);
+        call.process(&rx(1, A_ADDR, on(0, 3)), &mut out, &mut events);
+        assert_eq!(out.len(), 1, "the selected payload type still transcodes");
+        assert_eq!(call.ingress_payload_refusals(), 2);
     }
 
     /// A µ-law RTP packet with a caller-chosen SSRC (RFC 3550 §5.1) — drives the SSRC-consistent

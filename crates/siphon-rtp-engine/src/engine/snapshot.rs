@@ -857,6 +857,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 seat: None,
                 seating: false,
                 secure_hold: None,
+                local_offer: None,
+                instance: super::next_call_instance(),
             },
         );
         // Register the reconstructed call under the requesting (standby) client.

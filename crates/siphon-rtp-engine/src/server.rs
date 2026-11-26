@@ -512,7 +512,9 @@ where
         command: Command,
         lane: &str,
     ) -> Option<CmdResult> {
-        if !Engine::<D>::command_runs_off_loop(&command) {
+        if !Engine::<D>::command_runs_off_loop(&command)
+            && !self.engine.command_completes_a_dial(lane, &command)
+        {
             return Some(self.handle(scope.as_deref(), command).await);
         }
         self.held.entry(lane.to_owned()).or_default();
