@@ -8,7 +8,7 @@ the native control channel's `call_quality` events (per-leg jitter / loss / MOS,
 
 Enabled with `--metrics-addr <ip:port>`. A hand-rolled HTTP/1.1 server (no hyper/axum), one request
 per connection, never blocking the engine. Routes: `GET /metrics`, `GET /healthz`, `GET /readyz`.
-`/metrics` is `text/plain; version=0.0.4` — numbers only, no labels, trivially scrapeable.
+`/metrics` is `text/plain; version=0.0.4` — numbers only, at most one label per series, trivially scrapeable.
 
 | series | type | meaning |
 |---|---|---|
@@ -43,6 +43,9 @@ per connection, never blocking the engine. Routes: `GET /metrics`, `GET /healthz
 | `siphon_rtp_aec_delay_never_locked_total` | counter | echo cancellers that consumed ~10 s of audio without ever having enough usable audio to evaluate a peak |
 | `siphon_rtp_aec_delay_rewidens_total` | counter | narrowed delay scans that widened back because the echo left the re-lock margin |
 | `siphon_rtp_jemalloc_allocated_bytes` | gauge | live heap (jemalloc `stats.allocated`) |
+| `siphon_rtp_turn_allocations{transport}` | gauge | live built-in TURN allocations by the transport the client reached the server over (`udp`, `tcp`, `tls`); back to 0 when they are deleted or expire |
+| `siphon_rtp_turn_relayed_bytes_total{direction}` | counter | payload bytes the built-in TURN server relayed (`client_to_peer`, `peer_to_client`) |
+| `siphon_rtp_turn_refused_total{reason}` | counter | TURN requests refused and relayed packets dropped: `unauthorized` (401, including the one that opens every long-term-credential exchange), `stale_nonce` (438), `quota` (486), `peer_denied` (403 for a peer the denylist refuses, and every relayed packet dropped for the same reason, RFC 8656 §21) |
 
 Gauges are read on demand at scrape time from the live registries (`Metrics::render` takes a
 [`LiveGauges`]); counters are monotonic and incremented on the control path. The jemalloc gauge is

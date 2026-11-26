@@ -16,7 +16,9 @@ use std::time::Duration;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_stun::{self as stun, turn};
-use siphon_rtp_turn::{FixedUnixClock, PeerIpPolicy, Turn, TurnConfig};
+use siphon_rtp_turn::{
+    FixedUnixClock, PeerIpPolicy, RelayDirection, TransportProtocol, Turn, TurnConfig,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -41,7 +43,7 @@ fn rest_key() -> [u8; 16] {
 /// Hold the server pieces alive for the test's lifetime.
 struct Server {
     _datapath: UdpLoopbackDatapath,
-    _turn: Turn,
+    turn: Turn,
 }
 
 async fn start(transport: Listener) -> (Server, SocketAddr) {
@@ -66,7 +68,7 @@ async fn start(transport: Listener) -> (Server, SocketAddr) {
     (
         Server {
             _datapath: datapath,
-            _turn: turn,
+            turn,
         },
         addr,
     )
@@ -234,22 +236,36 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_over_tcp_relays_both_ways() {
-    let (_server, addr) = start(Listener::Tcp).await;
+    let (server, addr) = start(Listener::Tcp).await;
     let (peer, peer_addr) = udp_peer().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect tcp");
     drive_session(&mut stream, &peer, peer_addr).await;
+    assert_allocation_counted_under(&server, TransportProtocol::Tcp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_over_tls_relays_both_ways() {
     let (acceptor, connector) = tls_pair();
-    let (_server, addr) = start(Listener::Tls(acceptor)).await;
+    let (server, addr) = start(Listener::Tls(acceptor)).await;
     let (peer, peer_addr) = udp_peer().await;
 
     let tcp = TcpStream::connect(addr).await.expect("connect tcp");
     let domain = ServerName::try_from("localhost").expect("server name");
     let mut stream = connector.connect(domain, tcp).await.expect("tls handshake");
     drive_session(&mut stream, &peer, peer_addr).await;
+    assert_allocation_counted_under(&server, TransportProtocol::Tls);
+}
+
+/// The one allocation of `drive_session` is on the gauge of the transport its client used, and of
+/// no other, and its two 14-byte payloads are on the byte counters.
+fn assert_allocation_counted_under(server: &Server, transport: TransportProtocol) {
+    let snapshot = server.turn.metrics().snapshot();
+    for candidate in TransportProtocol::ALL {
+        let expected = u64::from(candidate == transport);
+        assert_eq!(snapshot.allocations(candidate), expected, "{candidate:?}");
+    }
+    assert_eq!(snapshot.relayed_bytes(RelayDirection::ClientToPeer), 14);
+    assert_eq!(snapshot.relayed_bytes(RelayDirection::PeerToClient), 14);
 }
 
 /// A rustls acceptor + connector pair sharing a fresh self-signed `localhost` certificate.
