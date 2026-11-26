@@ -235,6 +235,10 @@ pub struct FileConfig {
     pub consent_interval_secs: Option<u64>,
     /// Seconds without a consent response before the pair is dead (`--consent-timeout-secs`).
     pub consent_timeout_secs: Option<u64>,
+    /// Realm of the built-in TURN server (`--turn-realm`).
+    pub turn_realm: Option<String>,
+    /// File holding the built-in TURN server's static-auth-secret (`--turn-secret-file`).
+    pub turn_secret_file: Option<PathBuf>,
     /// TURN UDP listen address (`--turn-udp`).
     pub turn_udp: Option<SocketAddr>,
     /// TURN TCP listen address (`--turn-tcp`).
@@ -491,6 +495,28 @@ mod tests {
         assert_eq!(config.max_sessions, Some(4000));
         assert_eq!(config.xdp_interface.as_deref(), Some("eth0"));
         assert_eq!(config.xdp_queue, Some(2));
+    }
+
+    /// The TURN server realm and secret-file keys parse in both formats.
+    #[test]
+    fn deserializes_the_turn_server_realm_and_secret_file_keys() {
+        let from_toml = FileConfig::parse_toml(concat!(
+            "turn_realm = \"turn.example.com\"\n",
+            "turn_secret_file = \"/run/secrets/siphon-rtp-turn\"\n",
+        ))
+        .expect("valid TOML deserializes");
+        let from_yaml = FileConfig::parse_yaml(concat!(
+            "turn_realm: turn.example.com\n",
+            "turn_secret_file: /run/secrets/siphon-rtp-turn\n",
+        ))
+        .expect("valid YAML deserializes");
+        assert_eq!(from_toml, from_yaml);
+        assert_eq!(from_toml.turn_realm.as_deref(), Some("turn.example.com"));
+        assert_eq!(
+            from_toml.turn_secret_file,
+            Some(PathBuf::from("/run/secrets/siphon-rtp-turn")),
+            "the config file names the secret's *path*, never the secret"
+        );
     }
 
     /// The TURN client keys parse, including the repeatable server list.

@@ -23,8 +23,7 @@ use std::time::Duration;
 use clap::parser::ValueSource;
 use clap::ArgMatches;
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
-use siphon_rtp_datapath::{Datapath, Dscp, RxPacket};
-use siphon_rtp_turn::{tls, NoFastPath, PeerIpPolicy, SystemUnixClock, Turn, TurnConfig};
+use siphon_rtp_datapath::{Datapath, Dscp};
 use tokio::net::{TcpListener, UdpSocket};
 use tracing_subscriber::EnvFilter;
 
@@ -32,6 +31,7 @@ use crate::config::{resolve_defaulted, resolve_optional, FileConfig, InterfaceCo
 use crate::interface::{InterfaceEntry, InterfaceTable};
 use crate::media_fetch::{self, MediaFetchLimits};
 use crate::srtp_bridge::run_redirect_dispatcher_with_text;
+use crate::turn_server::{spawn_turn, turn_credentials_for};
 use crate::{cluster, metrics, server, shutdown, ClientId, Engine};
 
 /// The engine's shared CLI surface, common to every datapath binary. Kept a **flattenable**
@@ -56,8 +56,19 @@ pub struct EngineArgs {
     #[arg(long)]
     pub ng: Option<SocketAddr>,
 
-    /// TURN UDP listen address (`turn:`). TURN is enabled when `SIPHON_RTP_TURN_REALM` and
-    /// `SIPHON_RTP_TURN_SECRET` are set; at least one `--turn-*` listener must then be given.
+    /// Realm of the built-in TURN server (RFC 8656 §7.2). TURN is enabled when a realm and a secret
+    /// (`SIPHON_RTP_TURN_SECRET` or `--turn-secret-file`) are both set; one without the other is a
+    /// fatal startup error. `SIPHON_RTP_TURN_REALM` is the environment form.
+    #[arg(long)]
+    pub turn_realm: Option<String>,
+    /// File holding the built-in TURN server's `static-auth-secret` (coturn `use-auth-secret`), for
+    /// a deployment that keeps secrets as files on a volume (also `SIPHON_RTP_TURN_SECRET_FILE`).
+    /// One trailing newline is trimmed; an empty file, or this together with
+    /// `SIPHON_RTP_TURN_SECRET`, is a fatal startup error.
+    #[arg(long, value_name = "PATH")]
+    pub turn_secret_file: Option<PathBuf>,
+    /// TURN UDP listen address (`turn:`). At least one `--turn-*` listener must be given once TURN
+    /// is enabled (see `--turn-realm`).
     #[arg(long)]
     pub turn_udp: Option<SocketAddr>,
     /// TURN TCP listen address (`turn:` over TCP, RFC 6062).
@@ -459,6 +470,10 @@ pub struct RunConfig {
     pub consent_interval_secs: u64,
     /// Seconds without a correlated consent response before the pair is declared dead.
     pub consent_timeout_secs: u64,
+    /// Realm of the built-in TURN server (`--turn-realm`); `None` falls back to the environment.
+    pub turn_realm: Option<String>,
+    /// File holding the TURN static-auth-secret (`--turn-secret-file`).
+    pub turn_secret_file: Option<PathBuf>,
     /// TURN UDP listen address (`turn:`); `None` = off.
     pub turn_udp: Option<SocketAddr>,
     /// TURN TCP listen address (`turn:` over TCP); `None` = off.
@@ -640,6 +655,8 @@ impl RunConfig {
                 file.consent_timeout_secs,
                 DEFAULT_CONSENT_TIMEOUT_SECS,
             ),
+            turn_realm: resolve_optional(args.turn_realm, file.turn_realm),
+            turn_secret_file: resolve_optional(args.turn_secret_file, file.turn_secret_file),
             turn_udp: resolve_optional(args.turn_udp, file.turn_udp),
             turn_tcp: resolve_optional(args.turn_tcp, file.turn_tcp),
             turn_tls: resolve_optional(args.turn_tls, file.turn_tls),
@@ -993,6 +1010,8 @@ where
     // Read before anything is bound, so a malformed collector fails the start instead of leaving
     // a node that runs without the telemetry it was configured to send.
     let hep = crate::hep_export::HepSettings::from_env()?;
+    // Likewise TURN's realm and secret: half of the pair refuses the start (see `turn_server`).
+    let turn_credentials = turn_credentials_for(&config)?;
 
     // Cluster state for the `load` / `node_info` / `drain` control commands. The node id falls back to
     // the host's `HOSTNAME` (else `siphon-rtp`); the advertised media addresses are the interfaces'
@@ -1126,7 +1145,8 @@ where
 
     // The built-in TURN server (coturn replacement), if configured. It no longer drains the
     // datapath's Redirect stream itself — the unified dispatcher below feeds it its relay packets.
-    let (turn, turn_relay) = spawn_turn(Arc::new(datapath.clone()), &config).await?;
+    let (turn, turn_relay) =
+        spawn_turn(Arc::new(datapath.clone()), &config, turn_credentials).await?;
 
     // The single redirect dispatcher: own `datapath.rx()` and route each redirected datagram by
     // EndpointId to the SRTP bridge or (when running) the TURN relay — the sole consumer of the
@@ -1403,98 +1423,6 @@ where
             return;
         }
     }
-}
-
-/// The built-in TURN server's configuration for `settings`: the realm and secret, the advertised
-/// relay address, and the peer denylist.
-///
-/// The denylist is the secure default (loopback, private, link-local and multicast peers refused,
-/// RFC 8656 §21) unless `--turn-permit-private-peers` is set, which lifts only the loopback and
-/// private-range denials; link-local and multicast stay refused.
-fn turn_config(realm: String, secret: Vec<u8>, settings: &RunConfig) -> TurnConfig {
-    let mut config = TurnConfig::new(realm, secret);
-    config.relay_address = settings.turn_relay_ip;
-    if settings.turn_permit_private_peers {
-        config.denied_peers = PeerIpPolicy {
-            deny_loopback: false,
-            deny_private: false,
-            ..PeerIpPolicy::default()
-        };
-        tracing::warn!(
-            "--turn-permit-private-peers: the TURN server will relay to loopback and private \
-             peers, which weakens the anti-SSRF default (RFC 8656 §21, security-and-nat.md §11 \
-             R3). Never enable it on a server reachable by untrusted clients."
-        );
-    }
-    config
-}
-
-/// Build and start the TURN server when `SIPHON_RTP_TURN_REALM` + `SIPHON_RTP_TURN_SECRET` are set,
-/// spawning whichever of the UDP/TCP/TLS listeners are configured. Returns `None` when TURN is off.
-/// Generic over the datapath backend so TURN shares whichever one the daemon selected.
-async fn spawn_turn<D>(
-    datapath: Arc<D>,
-    settings: &RunConfig,
-) -> Result<(Option<Turn>, Option<flume::Sender<RxPacket>>), Box<dyn std::error::Error>>
-where
-    D: Datapath + 'static,
-{
-    let (Some(realm), Some(secret)) = (
-        std::env::var("SIPHON_RTP_TURN_REALM").ok(),
-        std::env::var("SIPHON_RTP_TURN_SECRET").ok(),
-    ) else {
-        return Ok((None, None));
-    };
-
-    let config = turn_config(realm.clone(), secret.into_bytes(), settings);
-    // TURN's relay packets are fed by the redirect dispatcher (it shares datapath.rx() with the SRTP
-    // bridge), not drained by TURN directly. Drop-newest on a full mailbox — late media is worthless.
-    let (relay_tx, relay_rx) = flume::bounded(2048);
-    let turn = Turn::spawn_with_relay_source(
-        datapath,
-        config,
-        Arc::new(SystemUnixClock),
-        Box::new(NoFastPath),
-        relay_rx,
-    )?;
-    tracing::info!(realm, "TURN server enabled (coturn replacement)");
-
-    if let Some(addr) = settings.turn_udp {
-        let socket = UdpSocket::bind(addr).await?;
-        tracing::info!(turn_udp = %addr, "TURN UDP listening");
-        let turn = turn.clone();
-        tokio::spawn(async move {
-            let _ = turn.serve_udp(socket).await;
-        });
-    }
-    if let Some(addr) = settings.turn_tcp {
-        let tcp = TcpListener::bind(addr).await?;
-        tracing::info!(turn_tcp = %addr, "TURN TCP listening");
-        let turn = turn.clone();
-        tokio::spawn(async move {
-            let _ = turn.serve_tcp(tcp).await;
-        });
-    }
-    if let Some(addr) = settings.turn_tls {
-        let (Some(cert), Some(key)) = (&settings.turn_tls_cert, &settings.turn_tls_key) else {
-            return Err("turns: (--turn-tls) requires --turn-tls-cert and --turn-tls-key".into());
-        };
-        tls::install_crypto_provider();
-        let acceptor = tls::acceptor_from_pem(cert, key)?;
-        let tls_listener = TcpListener::bind(addr).await?;
-        tracing::info!(turn_tls = %addr, "TURN TLS listening");
-        let turn = turn.clone();
-        tokio::spawn(async move {
-            let _ = turn.serve_tls(tls_listener, acceptor).await;
-        });
-    }
-
-    if settings.turn_udp.is_none() && settings.turn_tcp.is_none() && settings.turn_tls.is_none() {
-        tracing::warn!(
-            "TURN is configured but no --turn-udp/--turn-tcp/--turn-tls listener was given"
-        );
-    }
-    Ok((Some(turn), Some(relay_tx)))
 }
 
 #[cfg(test)]
@@ -1794,13 +1722,43 @@ mod tests {
     }
 
     #[test]
+    fn the_turn_realm_and_secret_file_resolve_flag_over_config_file() {
+        let file = FileConfig {
+            turn_realm: Some("from-file".into()),
+            turn_secret_file: Some(PathBuf::from("/run/secrets/file")),
+            ..FileConfig::default()
+        };
+        let from_file = resolve_from(&["siphon-rtp"], file.clone());
+        assert_eq!(from_file.turn_realm.as_deref(), Some("from-file"));
+        assert_eq!(
+            from_file.turn_secret_file,
+            Some(PathBuf::from("/run/secrets/file"))
+        );
+        let from_flag = resolve_from(
+            &[
+                "siphon-rtp",
+                "--turn-realm",
+                "from-flag",
+                "--turn-secret-file",
+                "/run/secrets/flag",
+            ],
+            file,
+        );
+        assert_eq!(from_flag.turn_realm.as_deref(), Some("from-flag"));
+        assert_eq!(
+            from_flag.turn_secret_file,
+            Some(PathBuf::from("/run/secrets/flag"))
+        );
+    }
+
+    #[test]
     fn the_built_in_turn_server_denies_private_peers_by_default_and_permits_them_with_the_flag() {
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let private = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7));
         let unique_local = IpAddr::V6("fd00::7".parse().expect("ula"));
         let link_local = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1));
         let multicast = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1));
-        let secure = super::turn_config(
+        let secure = crate::turn_server::turn_config(
             "realm".into(),
             b"secret".to_vec(),
             &resolve_from(&["siphon-rtp"], FileConfig::default()),
@@ -1811,7 +1769,7 @@ mod tests {
                 "{peer} denied by default"
             );
         }
-        let lab = super::turn_config(
+        let lab = crate::turn_server::turn_config(
             "realm".into(),
             b"secret".to_vec(),
             &resolve_from(
@@ -2072,6 +2030,8 @@ mod tests {
             amr: crate::sdp::AmrPolicy::default(),
             amr_wb: crate::sdp::AmrPolicy::default(),
             control_secret_file: None,
+            turn_realm: None,
+            turn_secret_file: None,
             media_timeout_secs: 30,
             held_media_timeout_secs: super::DEFAULT_HELD_MEDIA_TIMEOUT_SECS,
             setup_timeout_secs: super::DEFAULT_SETUP_TIMEOUT_SECS,
