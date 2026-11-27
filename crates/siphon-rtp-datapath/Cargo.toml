@@ -29,6 +29,10 @@ tracing = { workspace = true }
 # exposes no setsockopt surface for these, and socket2 borrows the fd rather than taking it, so the
 # option is set on the already-bound tokio socket without a conversion round trip.
 socket2 = { workspace = true }
+# `epoll_create1` / `epoll_ctl` / `epoll_wait` for the relay reactor's level-triggered wait
+# (`src/udp/epoll.rs`); std and socket2 bind none of them. Already in the tree through Tokio, socket2
+# and the XDP backend.
+libc = "0.2"
 
 [features]
 # The backend-agnostic security conformance checks (`conformance` module): the RTPBleed source gate,

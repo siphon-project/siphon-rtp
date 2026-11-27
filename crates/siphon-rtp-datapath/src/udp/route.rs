@@ -15,9 +15,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
-use tokio::net::UdpSocket;
-
-use super::{Inner, StatsAtomic};
+use super::{Inner, MediaSocket, StatsAtomic};
 use crate::{EndpointId, FlowAction, SourceLatch};
 
 /// What a forwarded packet needs from the leg it leaves through.
@@ -25,7 +23,7 @@ pub(super) struct OutLeg {
     /// The out leg's socket, held weakly: `remove_endpoint` promises the OS socket is closed when it
     /// returns, so a route cached on another leg must never keep it open. Upgraded per packet; only
     /// this receive task upgrades it, so the count it touches is not shared with other workers.
-    pub(super) socket: Weak<UdpSocket>,
+    pub(super) socket: Weak<MediaSocket>,
     pub(super) stats: Arc<StatsAtomic>,
     /// The out leg's generation when this was resolved.
     generation: u64,

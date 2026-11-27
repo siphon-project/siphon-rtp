@@ -7,8 +7,8 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use tokio::net::UdpSocket;
 
+use crate::udp::MediaSocket;
 use crate::TurnRelay;
 
 /// What the TURN de-encapsulation decided about one inbound datagram.
@@ -115,21 +115,22 @@ pub(crate) fn relay_egress(relay: &TurnRelay, dst: SocketAddr, payload: &[u8]) -
     }
 }
 
-/// Put framed `egress` on the wire: queue it on the allocation's stream, or send it from `socket`.
-/// A full or closed stream queue sheds the packet (`WouldBlock`), because late media is worthless.
-pub(crate) async fn emit(
-    socket: &UdpSocket,
+/// Put framed `egress` on the wire now: queue it on the allocation's stream, or send it from
+/// `socket`, which is non-blocking. A full send buffer or a full or closed stream queue sheds the
+/// packet (`WouldBlock`), because late media is worthless; this is the relay path's send.
+pub(crate) fn emit_now(
+    socket: &std::net::UdpSocket,
     egress: RelayEgress,
     dst: SocketAddr,
     payload: &[u8],
 ) -> std::io::Result<usize> {
     match egress {
-        RelayEgress::Direct => socket.send_to(payload, dst).await,
+        RelayEgress::Direct => socket.send_to(payload, dst),
         RelayEgress::Wrapped {
             wire,
             stream: None,
             server,
-        } => socket.send_to(&wire, server).await,
+        } => socket.send_to(&wire, server),
         RelayEgress::Wrapped {
             wire,
             stream: Some(stream),
@@ -144,6 +145,37 @@ pub(crate) async fn emit(
         RelayEgress::Unavailable => Err(std::io::Error::other(
             "no randomness for a TURN Send indication",
         )),
+    }
+}
+
+/// [`emit_now`], except that a datagram meeting a full send buffer waits for room instead of being
+/// shed: the send the engine itself asks for (`Datapath::send`), which used to await the socket. A
+/// stream queue still sheds, as it always has.
+pub(crate) async fn emit(
+    socket: &MediaSocket,
+    egress: RelayEgress,
+    dst: SocketAddr,
+    payload: &[u8],
+) -> std::io::Result<usize> {
+    let (bytes, target): (&[u8], SocketAddr) = match &egress {
+        RelayEgress::Direct => (payload, dst),
+        RelayEgress::Wrapped {
+            wire,
+            stream: None,
+            server,
+        } => (wire.as_slice(), *server),
+        _ => return emit_now(socket.get_ref(), egress, dst, payload),
+    };
+    match socket.get_ref().send_to(bytes, target) {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        sent => return sent,
+    }
+    loop {
+        let mut ready = socket.writable().await?;
+        match ready.try_io(|socket| socket.get_ref().send_to(bytes, target)) {
+            Ok(sent) => return sent,
+            Err(_would_block) => continue,
+        }
     }
 }
 

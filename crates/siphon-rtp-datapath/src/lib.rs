@@ -13,7 +13,9 @@
 //! - [`FlowAction::Redirect`] pushes the datagram onto the [`RxPacket`] stream for a userspace
 //!   actor (the SRTP/decode/WS slow path).
 //! - [`FlowAction::Drop`] discards it (e.g. a blocked or held leg).
-#![forbid(unsafe_code)]
+// Denied, not forbidden: the relay reactor's level-triggered epoll (`udp/epoll.rs`) has no safe
+// binding, and that one module opts back in with every unsafe call carrying its SAFETY argument.
+#![deny(unsafe_code)]
 
 use std::net::{IpAddr, SocketAddr};
 

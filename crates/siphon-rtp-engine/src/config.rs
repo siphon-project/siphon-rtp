@@ -175,6 +175,9 @@ pub struct FileConfig {
     pub port_min: Option<u16>,
     /// Highest media port the datapath may bind (`--port-max`). Set together with `port_min`.
     pub port_max: Option<u16>,
+    /// Userspace relay threads (`--relay-threads`); unset = one per CPU this process may run on.
+    /// Zero is refused: a relay with no threads relays nothing.
+    pub relay_threads: Option<std::num::NonZeroUsize>,
     /// DiffServ code point stamped on outbound media (`--media-dscp`). A name (`EF`, `CS3`, `AF41`,
     /// `VA`, `BE`, …) or a raw `0`-`63`; defaults to `EF`. `BE`/`0` disables marking.
     #[serde(default, deserialize_with = "deserialize_media_dscp")]
@@ -687,6 +690,20 @@ mod tests {
     }
 
     /// An unknown/mistyped key is rejected (`deny_unknown_fields`) so a config typo is loud.
+    #[test]
+    fn zero_relay_threads_is_refused_in_the_file() {
+        assert_eq!(
+            FileConfig::parse_yaml("relay_threads: 4\n")
+                .expect("four")
+                .relay_threads,
+            std::num::NonZeroUsize::new(4)
+        );
+        assert!(
+            FileConfig::parse_yaml("relay_threads: 0\n").is_err(),
+            "a relay with no threads relays nothing"
+        );
+    }
+
     #[test]
     fn unknown_key_is_rejected() {
         let result = FileConfig::parse_toml("relay_bind_up = \"127.0.0.1\"\n");
