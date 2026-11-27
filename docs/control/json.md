@@ -69,7 +69,9 @@ authenticated; run that posture only on a trusted, private control network.
 
 Two more per-connection guards apply regardless of auth:
 
-- A token-bucket rate cap (`--max-control-rps`, default 200 requests/second, 0 disables).
+- A token-bucket rate cap (`--max-control-rps`, default 5000 requests/second, 0 disables), per
+  connection. A controller drives every call over one connection, so size it for the node's whole
+  call rate (three requests per basic anchored call).
   A breach is answered `{"result": "error", "reason": "rate limit exceeded"}` before any
   work is done.
 - Ownership: a call is private to the client that created it — the connection, unless it

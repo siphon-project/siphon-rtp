@@ -82,7 +82,7 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 | `--media-dscp <DSCP>` | `EF` | DiffServ marking (RFC 2474) on outbound media. A name (`EF`, `CS3`, `AF41`, `VA`, `BE`, …) or a raw `0`–`63`. `EF` is TOS byte 184 — Asterisk's `tos_audio`, rtpengine's `--tos`. `BE`/`0` disables marking and leaves the TOS byte untouched. Applies to every egress path (UDP sockets, AF_XDP TX, in-kernel XDP_TX); never to the control, metrics, HEP or WS sockets. |
 | `--metrics-addr <ADDR>` | off | Prometheus + health HTTP: `GET /metrics`, `GET /healthz`, `GET /readyz`. |
 | `--healthcheck <ADDR>` | off | Probe instead of serve: ask `GET /healthz` on a running engine's `--metrics-addr`, exit `0` on a `200` and `1` otherwise, and start nothing. See [Health probes](#health-probes). |
-| `--max-control-rps <N>` | `200` | Per-connection control request cap (requests/second). `0` disables the limit. |
+| `--max-control-rps <N>` | `5000` | Per-connection control request cap (requests/second). `0` disables the limit. |
 | `--amr-max-mode <0-7>` / `--amr-wb-max-mode <0-8>` | unset | Highest AMR / AMR-WB mode the node sends. Unset: the highest mode of each stream's negotiated `mode-set` (12.2 and 23.85 kbit/s with none). `--amr-wb-max-mode 2` holds wideband legs at 12.65 kbit/s. Only on `amr` builds; see [AMR on RTP](codecs.md#amr-on-rtp). |
 | `--amr-mode-request <0-7>` / `--amr-wb-mode-request <0-8>` | unset | Codec mode request the node puts in every AMR / AMR-WB payload it sends, asking the peer for no mode above it. Unset: 15, no request. |
 | `--ws-connect-timeout-ms <N>` | `3000` | Bound on a WebSocket dial the engine makes on a controller's word (`attach_ws_tee`, `attach_ws_bridge`, a `ws_uri` or `ws_tee` profile): name resolution, TCP connect, TLS and the upgrade together. The command that asked fails when it runs out; no other command waits for it. |
@@ -368,10 +368,14 @@ exists.
 ### Control-plane protection
 
 - **Rate limiting.** Each control connection gets a token bucket of `--max-control-rps`
-  requests/second (default 200, `0` disables). A breaching request is answered
-  `Error { "rate limit exceeded" }` before any work is done, and counted in
-  `siphon_rtp_control_rate_limited_total`. A legitimate SIPhon controller never gets near the
-  default; a flood cannot drive engine work or probe authentication.
+  requests/second (default 5000, `0` disables). A breaching request is answered
+  `Error { "rate limit exceeded" }` before any work is done, counted in
+  `siphon_rtp_control_rate_limited_total`, and logged as one warning per connection per second.
+  SIPhon drives an engine over a single connection and spends three requests on a basic anchored
+  call (`offer`, `answer`, `delete`), more with re-INVITEs, hold or playback, so the cap bounds a
+  whole node's call rate: the default carries ~1600 basic anchored calls a second. A node that
+  needs more raises it; a flood held at the cap costs under one core of control work and cannot
+  probe authentication.
 - **Authentication.** With `SIPHON_RTP_CONTROL_SECRET` set, a JSON-over-TCP connection must send
   the `authenticate` verb with the matching token before anything else is honoured (the comparison
   is constant-time). The NG/bencode front-end has no authentication, matching rtpengine, so treat

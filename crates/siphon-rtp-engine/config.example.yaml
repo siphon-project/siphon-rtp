@@ -35,6 +35,8 @@ control: "127.0.0.1:8080"
 # ng: "0.0.0.0:22222"
 
 # Per-connection control request cap, requests/second; 0 disables the limit (CLI: --max-control-rps).
+# Default 5000: a controller drives every call over one connection, three requests per basic
+# anchored call, so this is ~1600 anchored calls a second.
 # max_control_rps: 5000
 
 # --- Media / relay ------------------------------------------------------------------------------

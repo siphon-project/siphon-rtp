@@ -7,6 +7,22 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Changed
+
+- **`--max-control-rps` now defaults to 5000 requests a second, up from 200.** The cap is per
+  connection, and SIPhon drives an engine over a single connection at three requests per basic
+  anchored call (`offer`, `answer`, `delete`), so the old default refused a node's calls past about
+  66 a second. 5000 carries about 1600 anchored calls a second; a flood held at the cap costs under
+  one core of control work. Set `--max-control-rps` (or `max_control_rps:`) explicitly to keep a
+  lower cap.
+
+### Fixed
+
+- **A connection over its control rate cap is now logged.** Refused requests were only counted in
+  `siphon_rtp_control_rate_limited_total`, so a controller hitting the cap saw calls fail with
+  nothing in the engine log. The first refusal in each one-second window now logs one warning per
+  connection, naming the cap; a flood does not become a log flood.
+
 ## [0.30.0] — 2026-11-27
 
 ### Added

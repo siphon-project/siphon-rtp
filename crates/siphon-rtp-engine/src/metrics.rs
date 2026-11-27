@@ -800,6 +800,10 @@ where
 pub struct RateLimiter {
     capacity: u64,
     tokens: u64,
+    /// A request was refused since the last refill.
+    refused_in_window: bool,
+    /// That refusal was already handed out by [`take_refusal_report`](Self::take_refusal_report).
+    reported_in_window: bool,
 }
 
 impl RateLimiter {
@@ -812,6 +816,8 @@ impl RateLimiter {
         Self {
             capacity,
             tokens: capacity,
+            refused_in_window: false,
+            reported_in_window: false,
         }
     }
 
@@ -828,10 +834,23 @@ impl RateLimiter {
             return true;
         }
         if self.tokens == 0 {
+            self.refused_in_window = true;
             return false;
         }
         self.tokens -= 1;
         true
+    }
+
+    /// Whether a refusal in the current refill window is still to be reported: `true` once, for the
+    /// first refusal since the last [`refill`](Self::refill), and `false` after that until the
+    /// next window. Lets the server log a refusing connection once a second instead of once per
+    /// refused request, so a flood cannot turn into a log flood.
+    pub fn take_refusal_report(&mut self) -> bool {
+        if self.refused_in_window && !self.reported_in_window {
+            self.reported_in_window = true;
+            return true;
+        }
+        false
     }
 
     /// Refill the bucket for `elapsed_seconds` of wall time, capped at `capacity`. Deterministic:
@@ -842,6 +861,8 @@ impl RateLimiter {
         }
         let added = self.capacity.saturating_mul(elapsed_seconds);
         self.tokens = self.tokens.saturating_add(added).min(self.capacity);
+        self.refused_in_window = false;
+        self.reported_in_window = false;
     }
 }
 
@@ -1165,6 +1186,51 @@ mod tests {
         assert!(limiter.try_acquire());
         assert!(limiter.try_acquire());
         assert!(!limiter.try_acquire());
+    }
+
+    #[test]
+    fn rate_limiter_reports_the_first_refusal_in_a_window_once() {
+        let mut limiter = RateLimiter::new(1);
+        assert!(limiter.try_acquire());
+        assert!(!limiter.take_refusal_report(), "nothing refused yet");
+        assert!(!limiter.try_acquire());
+        assert!(
+            limiter.take_refusal_report(),
+            "the first refusal is reported"
+        );
+        assert!(!limiter.try_acquire());
+        assert!(
+            !limiter.take_refusal_report(),
+            "later refusals in the same window are not reported again"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_refill_rearms_the_refusal_report() {
+        let mut limiter = RateLimiter::new(1);
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
+        assert!(limiter.take_refusal_report());
+        limiter.refill(1);
+        assert!(
+            !limiter.take_refusal_report(),
+            "a fresh window starts clean"
+        );
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
+        assert!(
+            limiter.take_refusal_report(),
+            "a refusal in the next window is reported again"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_unlimited_never_reports_a_refusal() {
+        let mut limiter = RateLimiter::new(0);
+        for _ in 0..1000 {
+            assert!(limiter.try_acquire());
+        }
+        assert!(!limiter.take_refusal_report());
     }
 
     #[test]
