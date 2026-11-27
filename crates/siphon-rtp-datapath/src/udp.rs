@@ -27,7 +27,7 @@ use crate::{
     SourceLatchVerdict,
 };
 pub(crate) use reactor::MediaSocket;
-pub use reactor::RELAY_THREAD_PREFIX;
+pub use reactor::{DEFAULT_RELAY_BATCH_WINDOW, RELAY_THREAD_PREFIX};
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
 /// leaves headroom without paying for jumbo frames the media plane never sees.
@@ -655,6 +655,22 @@ impl UdpLoopbackDatapath {
             );
         }
         self
+    }
+
+    /// Set the relay's batching window ([`DEFAULT_RELAY_BATCH_WINDOW`] by default): how long a relay
+    /// thread whose last pass found little work sleeps before looking again, so a loaded thread
+    /// serves many sockets per wake-up. It caps one socket at one datagram per window, so keep it
+    /// well under the fastest stream's packet interval. `Duration::ZERO` turns it off.
+    #[must_use]
+    pub fn with_relay_batch_window(self, window: std::time::Duration) -> Self {
+        self.inner.reactor.set_batch_window(window);
+        self
+    }
+
+    /// The relay's batching window.
+    #[must_use]
+    pub fn relay_batch_window(&self) -> std::time::Duration {
+        self.inner.reactor.batch_window()
     }
 
     /// How many relay threads endpoints are spread over.
@@ -4804,5 +4820,170 @@ mod tests {
             );
         }
         assert_eq!(datapath.stats(near.id).expect("stats").packets_in, 32);
+    }
+
+    // --- The relay's batching window ---------------------------------------------------------------
+
+    /// `count` near legs on a one-thread relay, each forwarding to `callee` through `far`.
+    async fn fan_in(
+        datapath: &UdpLoopbackDatapath,
+        count: usize,
+        callee: SocketAddr,
+    ) -> Vec<Endpoint> {
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let mut nears = Vec::new();
+        for _ in 0..count {
+            let near = datapath.alloc_endpoint().await.expect("alloc near");
+            datapath
+                .install_flow(near.id, FlowAction::Forward(open_rule(far.id, callee)))
+                .expect("flow");
+            nears.push(near);
+        }
+        nears
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_window_serves_several_sockets_per_wake_up() {
+        let datapath = UdpLoopbackDatapath::new()
+            .with_relay_threads(std::num::NonZeroUsize::MIN)
+            .with_relay_batch_window(Duration::from_millis(5));
+        let (caller, _) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        let nears = fan_in(&datapath, 20, callee_addr).await;
+        let before = datapath.inner.reactor.counters();
+
+        // Twenty legs, one packet each, a quarter of a millisecond apart: five milliseconds of
+        // arrivals, which a 5 ms window gathers into a handful of passes instead of twenty.
+        for (sequence, near) in nears.iter().enumerate() {
+            caller
+                .send_to(&rtp(1, sequence as u16), near.local_addr)
+                .await
+                .expect("send");
+            tokio::time::sleep(Duration::from_micros(250)).await;
+        }
+        for _ in 0..nears.len() {
+            recv(&callee).await;
+        }
+        let (waits, datagrams) = datapath.inner.reactor.counters();
+        let (waits, datagrams) = (waits - before.0, datagrams - before.1);
+        assert_eq!(datagrams, 20, "every datagram was read");
+        assert!(
+            waits <= 10,
+            "{waits} waits for {datagrams} datagrams: not batched"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn without_a_window_an_idle_relay_takes_one_wake_up_per_packet() {
+        let datapath = UdpLoopbackDatapath::new()
+            .with_relay_threads(std::num::NonZeroUsize::MIN)
+            .with_relay_batch_window(Duration::ZERO);
+        assert_eq!(datapath.relay_batch_window(), Duration::ZERO);
+        let (caller, _) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        let nears = fan_in(&datapath, 5, callee_addr).await;
+        let before = datapath.inner.reactor.counters();
+        for (sequence, near) in nears.iter().enumerate() {
+            caller
+                .send_to(&rtp(1, sequence as u16), near.local_addr)
+                .await
+                .expect("send");
+            recv(&callee).await;
+        }
+        let (waits, datagrams) = datapath.inner.reactor.counters();
+        assert_eq!(datagrams - before.1, 5);
+        assert!(waits - before.0 >= 5, "one blocking wait per spaced packet");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batching_relay_delays_a_packet_by_at_most_the_window_and_loses_none() {
+        let window = Duration::from_millis(2);
+        let datapath = UdpLoopbackDatapath::new()
+            .with_relay_threads(std::num::NonZeroUsize::MIN)
+            .with_relay_batch_window(window);
+        let (caller, _) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        let nears = fan_in(&datapath, 3, callee_addr).await;
+        // 3 streams at 500 pps each: busy enough to keep the thread batching, under the one
+        // datagram per socket per window the window allows.
+        let mut worst = Duration::ZERO;
+        for sequence in 0..60u16 {
+            for near in &nears {
+                let sent = std::time::Instant::now();
+                caller
+                    .send_to(&rtp(1, sequence), near.local_addr)
+                    .await
+                    .expect("send");
+                recv(&callee).await;
+                worst = worst.max(sent.elapsed());
+            }
+        }
+        assert_eq!(
+            datapath.stats(nears[0].id).expect("stats").packets_in,
+            60,
+            "none lost"
+        );
+        // The window plus scheduling slack on a loaded CI runner.
+        assert!(
+            worst < window + Duration::from_millis(50),
+            "worst delay {worst:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removal_is_acknowledged_while_the_relay_batches() {
+        let datapath = UdpLoopbackDatapath::new()
+            .with_relay_threads(std::num::NonZeroUsize::MIN)
+            .with_relay_batch_window(Duration::from_millis(20));
+        let (caller, _) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        let nears = fan_in(&datapath, 2, callee_addr).await;
+        caller
+            .send_to(&rtp(1, 1), nears[0].local_addr)
+            .await
+            .expect("send");
+        recv(&callee).await;
+        timeout(SHORT, datapath.remove_endpoint(nears[1].id))
+            .await
+            .expect("removed within a window, not stuck behind the sleep");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backlog_is_drained_without_waiting_out_the_window_again() {
+        // The window is for a thread whose wake-ups are not amortised. One that finds a full pass
+        // of work is already batching, and sleeping then would only shrink its capacity while the
+        // backlog grows: that feedback overflowed socket buffers under load.
+        let window = Duration::from_millis(200);
+        let datapath = UdpLoopbackDatapath::new()
+            .with_relay_threads(std::num::NonZeroUsize::MIN)
+            .with_relay_batch_window(window);
+        let (caller, _) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        // More ready sockets than one wait returns.
+        let nears = fan_in(&datapath, 300, callee_addr).await;
+        let started = std::time::Instant::now();
+        // One datagram: a small pass, so the thread sleeps the window...
+        caller
+            .send_to(&rtp(1, 0), nears[0].local_addr)
+            .await
+            .expect("send");
+        recv(&callee).await;
+        // ...while a backlog bigger than a pass builds up behind it.
+        for near in &nears {
+            caller
+                .send_to(&rtp(1, 1), near.local_addr)
+                .await
+                .expect("send");
+        }
+        for _ in 0..nears.len() {
+            recv(&callee).await;
+        }
+        // One window, then the backlog at full speed: two full passes with no sleep between.
+        // Sleeping after each pass, as a full pass must not, takes three windows.
+        assert!(
+            started.elapsed() < window * 3 / 2,
+            "the backlog took {:?}: the thread slept between full passes",
+            started.elapsed()
+        );
     }
 }

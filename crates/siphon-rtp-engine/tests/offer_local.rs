@@ -18,7 +18,7 @@ use common::x3_mdf::{
     CORRELATION_ID, SHORT,
 };
 use futures_util::StreamExt;
-use siphon_rtp_datapath::Datapath as _;
+use siphon_rtp_datapath::{Datapath as _, EndpointId};
 use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher;
 use siphon_rtp_engine::{ClientId, Engine};
 use siphon_rtp_proto::{
@@ -281,6 +281,24 @@ async fn an_interception_attached_at_the_offer_delivers_from_the_answer_on() {
             .send(&rtp_from(CALLER_SSRC, sequence), toward_engine)
             .await;
     }
+    // Answer only once the relay has read them. Nothing orders the media path against the control
+    // connection: a relay thread may hold an arrival for up to its batching window, and a datagram
+    // read after the answer is handled as arriving after it. This rig's datapath carries only this
+    // call, so its endpoints' receive counts are this call's.
+    timeout(SHORT, async {
+        loop {
+            let received: u64 = (0..64)
+                .filter_map(|id| rig.engine.datapath().stats(EndpointId(id)))
+                .map(|stats| stats.packets_in)
+                .sum();
+            if received >= 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the relay read what the caller sent before the answer");
     let completed = answer(&rig.engine, "tap", caller_answer(caller.address)).await;
     assert!(matches!(completed, CmdResult::Ok { .. }), "{completed:?}");
     assert!(matches!(

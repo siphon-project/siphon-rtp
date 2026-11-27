@@ -23,8 +23,9 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io;
 use std::os::unix::net::UnixDatagram;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::epoll::{Epoll, Events};
 use super::route::Route;
@@ -45,6 +46,19 @@ pub const RELAY_THREAD_PREFIX: &str = "rtp-relay-";
 /// The token of a shard's own wake socket; endpoint ids are allocated upward from zero.
 const WAKE: u64 = u64::MAX;
 
+/// How long a relay thread whose last pass found little work waits before looking again, by
+/// default. See [`UdpLoopbackDatapath::with_relay_batch_window`](super::UdpLoopbackDatapath::with_relay_batch_window). 100 us: on a six-CPU relay carrying ~3,000 G.711
+/// calls it cut engine CPU per relayed packet by 4.5% against no window and left the CPU the
+/// signalling shares the relay with free enough that call setup stopped failing, where 250 and
+/// 500 us gained no more and cap a single socket lower (one datagram per window).
+pub const DEFAULT_RELAY_BATCH_WINDOW: Duration = Duration::from_micros(100);
+
+/// A pass that read at least this many datagrams has amortised its wake-up already, so the thread
+/// goes straight on instead of sleeping the batching window. Sleeping after a full pass would only
+/// cut the thread's capacity while its backlog grows: under load that feedback overflowed socket
+/// buffers.
+const BATCH_TARGET: u64 = 32;
+
 /// Ready sockets one `epoll_wait` can return. More stay ready and come back on the next wait.
 const EVENTS_PER_WAIT: usize = 256;
 
@@ -56,6 +70,8 @@ pub(super) struct Reactor {
     shards: Mutex<Vec<Option<Arc<Shard>>>>,
     /// The started shard threads, joined on shutdown.
     joins: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The batching window in microseconds, read by every shard on every pass (`0` = off).
+    batch_window_micros: Arc<AtomicU64>,
 }
 
 /// One relay thread's handle, shared by the thread and the control path.
@@ -63,6 +79,10 @@ pub(super) struct Shard {
     epoll: Epoll,
     commands: flume::Sender<Command>,
     wake: UnixDatagram,
+    batch_window_micros: Arc<AtomicU64>,
+    /// `epoll_wait` calls this shard made, and datagrams it read: their ratio is the batch size.
+    waits: AtomicU64,
+    datagrams: AtomicU64,
 }
 
 enum Command {
@@ -89,6 +109,7 @@ impl Reactor {
             threads: AtomicUsize::new(threads.max(1)),
             shards: Mutex::new(Vec::new()),
             joins: Mutex::new(Vec::new()),
+            batch_window_micros: Arc::new(AtomicU64::new(micros(DEFAULT_RELAY_BATCH_WINDOW))),
         }
     }
 
@@ -112,6 +133,38 @@ impl Reactor {
 
     pub(super) fn threads(&self) -> usize {
         self.threads.load(Ordering::Relaxed)
+    }
+
+    /// Set the batching window: how long a relay thread whose last pass found a little work (fewer
+    /// than [`BATCH_TARGET`] datagrams) sleeps before looking for more, so one wake-up serves many
+    /// sockets instead of one. A thread that finds nothing blocks as before, so an idle relay adds
+    /// no latency, and one that finds a full pass looks again at once, so a backlog drains at full
+    /// speed; in between it adds up to the window. Because a thread reads one datagram per socket per pass, the window also caps one
+    /// socket at one datagram per window (10 000 per second at 100 us), so keep it well under the
+    /// packet interval of the fastest stream. Takes effect on each thread's next pass.
+    pub(super) fn set_batch_window(&self, window: Duration) {
+        self.batch_window_micros
+            .store(micros(window), Ordering::Relaxed);
+    }
+
+    pub(super) fn batch_window(&self) -> Duration {
+        Duration::from_micros(self.batch_window_micros.load(Ordering::Relaxed))
+    }
+
+    /// `epoll_wait` calls and datagrams read, summed over the started shards.
+    #[cfg(test)]
+    pub(super) fn counters(&self) -> (u64, u64) {
+        self.shards.lock().map_or((0, 0), |shards| {
+            shards
+                .iter()
+                .flatten()
+                .fold((0, 0), |(waits, datagrams), shard| {
+                    (
+                        waits + shard.waits.load(Ordering::Relaxed),
+                        datagrams + shard.datagrams.load(Ordering::Relaxed),
+                    )
+                })
+        })
     }
 
     /// How many shard threads have started.
@@ -162,7 +215,7 @@ impl Reactor {
         if let Some(shard) = &shards[index] {
             return Ok(shard.clone());
         }
-        let (shard, join) = Shard::start(inner.clone(), index)?;
+        let (shard, join) = Shard::start(inner.clone(), index, self.batch_window_micros.clone())?;
         if let Ok(mut joins) = self.joins.lock() {
             joins.push(join);
         }
@@ -200,6 +253,7 @@ impl Shard {
     fn start(
         inner: Arc<Inner>,
         index: usize,
+        batch_window_micros: Arc<AtomicU64>,
     ) -> io::Result<(Arc<Self>, std::thread::JoinHandle<()>)> {
         let epoll = Epoll::new()?;
         let (wake, wake_receiver) = UnixDatagram::pair()?;
@@ -211,6 +265,9 @@ impl Shard {
             epoll,
             commands,
             wake,
+            batch_window_micros,
+            waits: AtomicU64::new(0),
+            datagrams: AtomicU64::new(0),
         });
         let thread_shard = shard.clone();
         let join = std::thread::Builder::new()
@@ -258,11 +315,15 @@ fn run(
     let mut slots: HashMap<u64, Slot, BuildHasherDefault<TokenHasher>> = HashMap::default();
     let mut events = Events::with_capacity(EVENTS_PER_WAIT);
     let mut buffer = vec![0u8; MAX_DATAGRAM];
+    // Block only when the last pass found nothing; after one that found work, sleep the batching
+    // window and then look without blocking (see `Reactor::set_batch_window`).
+    let mut block = true;
     loop {
-        if let Err(error) = shard.epoll.wait(&mut events, -1) {
+        if let Err(error) = shard.epoll.wait(&mut events, if block { -1 } else { 0 }) {
             tracing::error!(%error, "relay shard epoll_wait failed; its endpoints stop receiving");
             return;
         }
+        shard.waits.fetch_add(1, Ordering::Relaxed);
         // The wake-up first, the queue second. A command is queued before its wake-up is sent, so
         // anything queued after this drain has a wake-up still pending and the next wait returns at
         // once. The other order loses a wake-up: a command queued between the queue drain and the
@@ -285,6 +346,7 @@ fn run(
                 Command::Shutdown => return,
             }
         }
+        let mut received = 0u64;
         for token in events.tokens() {
             if token == WAKE {
                 continue;
@@ -292,19 +354,33 @@ fn run(
             let Some(slot) = slots.get_mut(&token) else {
                 continue; // removed after this event was harvested
             };
-            if let Err(error) = receive_one(inner, slot, &mut buffer) {
-                // Level-triggered: a socket left watched in a failed state would be reported (and
-                // fail) on every wait, so stop receiving on it, as the per-socket task used to end.
-                tracing::debug!(endpoint = ?slot.endpoint, %error, "endpoint receive loop ending");
-                let _ = shard.epoll.delete(slot.socket.get_ref());
-                slots.remove(&token);
+            match receive_one(inner, slot, &mut buffer) {
+                Ok(true) => received += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    // Level-triggered: a socket left watched in a failed state would be reported (and
+                    // fail) on every wait, so stop receiving on it, as the per-socket task used to end.
+                    tracing::debug!(endpoint = ?slot.endpoint, %error, "endpoint receive loop ending");
+                    let _ = shard.epoll.delete(slot.socket.get_ref());
+                    slots.remove(&token);
+                }
             }
+        }
+        shard.datagrams.fetch_add(received, Ordering::Relaxed);
+        // Nothing found: block until something arrives. A small pass: let more arrive before the
+        // next look (a command queued meanwhile waits at most the window; its wake-up stays
+        // pending, so the next, non-blocking, wait reports it). A full pass: look again at once.
+        block = received == 0;
+        let window = shard.batch_window_micros.load(Ordering::Relaxed);
+        if !block && window != 0 && received < BATCH_TARGET {
+            std::thread::sleep(Duration::from_micros(window));
         }
     }
 }
 
-/// Read one datagram from a ready socket and hand it to [`Inner::receive`].
-fn receive_one(inner: &Inner, slot: &mut Slot, buffer: &mut [u8]) -> io::Result<()> {
+/// Read one datagram from a ready socket and hand it to [`Inner::receive`]. `Ok(false)` when the
+/// socket had nothing after all.
+fn receive_one(inner: &Inner, slot: &mut Slot, buffer: &mut [u8]) -> io::Result<bool> {
     let (len, source) = match slot.socket.get_ref().recv_from(buffer) {
         Ok(received) => received,
         Err(error)
@@ -313,7 +389,7 @@ fn receive_one(inner: &Inner, slot: &mut Slot, buffer: &mut [u8]) -> io::Result<
                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
             ) =>
         {
-            return Ok(());
+            return Ok(false);
         }
         Err(error) => return Err(error),
     };
@@ -328,7 +404,7 @@ fn receive_one(inner: &Inner, slot: &mut Slot, buffer: &mut [u8]) -> io::Result<
         buffer,
         len,
     );
-    Ok(())
+    Ok(true)
 }
 
 /// The shard `endpoint` is relayed on.
@@ -367,6 +443,11 @@ impl Hasher for TokenHasher {
     fn write_u64(&mut self, value: u64) {
         self.0 = value.wrapping_mul(FIBONACCI);
     }
+}
+
+/// A duration in whole microseconds, saturating.
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

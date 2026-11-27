@@ -151,6 +151,14 @@ pub struct EngineArgs {
     #[arg(long, value_name = "N")]
     pub relay_threads: Option<std::num::NonZeroUsize>,
 
+    /// Microseconds a relay thread that just found work waits before looking for more, so a busy
+    /// thread serves many sockets per wake-up instead of being woken for every packet. Idle threads
+    /// still block, so this adds latency only under load, at most the window. A thread reads one
+    /// datagram per socket per pass, so the window also caps one socket at one datagram per window
+    /// (10 000 per second at 100). `0` turns batching off.
+    #[arg(long, value_name = "MICROSECONDS", default_value_t = default_relay_batch_window_us())]
+    pub relay_batch_window_us: u64,
+
     /// DiffServ code point (RFC 2474) stamped on outbound media — the QoS marking a network polices
     /// voice on. Accepts a name (`EF`, `CS3`, `AF41`, `VA`, `BE`, …) or a raw `0`–`63`.
     ///
@@ -426,6 +434,8 @@ pub struct RunConfig {
     pub port_max: Option<u16>,
     /// Userspace relay threads; `None` = one per CPU this process may run on.
     pub relay_threads: Option<std::num::NonZeroUsize>,
+    /// The relay threads' batching window in microseconds; `0` = off.
+    pub relay_batch_window_us: u64,
     /// DiffServ code point (RFC 2474) stamped on outbound media on every egress path. Defaults to
     /// [`Dscp::EF`]; [`Dscp::BE`] disables marking.
     pub media_dscp: Dscp,
@@ -541,6 +551,12 @@ impl RunConfig {
             port_min: resolve_optional(args.port_min, file.port_min),
             port_max: resolve_optional(args.port_max, file.port_max),
             relay_threads: resolve_optional(args.relay_threads, file.relay_threads),
+            relay_batch_window_us: resolve_defaulted(
+                args.relay_batch_window_us,
+                explicit("relay_batch_window_us"),
+                file.relay_batch_window_us,
+                default_relay_batch_window_us(),
+            ),
             media_dscp: resolve_defaulted(
                 args.media_dscp,
                 explicit("media_dscp"),
@@ -831,6 +847,11 @@ pub fn resolve_port_range(
 /// routable IP instead of loopback; neither set falls back to OS-ephemeral loopback ports (the
 /// NIC-free default). This is the engine's default backend and the `siphon-rtp-xdp-daemon`'s
 /// graceful fallback when the kernel fast path is unavailable.
+/// The relay batching window's default, in the microseconds the flag and the file take.
+pub(crate) fn default_relay_batch_window_us() -> u64 {
+    u64::try_from(siphon_rtp_datapath::udp::DEFAULT_RELAY_BATCH_WINDOW.as_micros()).unwrap_or(0)
+}
+
 #[must_use]
 pub fn build_udp_datapath(
     config: &RunConfig,
@@ -848,7 +869,11 @@ pub fn build_udp_datapath(
     };
     // The DSCP marking (RFC 2474) every media socket this backend binds carries — see
     // `RunConfig::media_dscp`.
-    let datapath = datapath.with_dscp(config.media_dscp);
+    let datapath = datapath
+        .with_dscp(config.media_dscp)
+        .with_relay_batch_window(std::time::Duration::from_micros(
+            config.relay_batch_window_us,
+        ));
     // The relay's parallelism — see `RunConfig::relay_threads`. Set before any endpoint exists.
     match config.relay_threads {
         Some(threads) => datapath.with_relay_threads(threads),
@@ -1944,6 +1969,37 @@ mod tests {
     }
 
     #[test]
+    fn the_relay_batch_window_comes_from_the_file_and_the_flag_overrides_it() {
+        assert_eq!(
+            resolve_from(&["siphon-rtp"], FileConfig::default()).relay_batch_window_us,
+            crate::daemon::default_relay_batch_window_us()
+        );
+        let file = FileConfig {
+            relay_batch_window_us: Some(250),
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            resolve_from(&["siphon-rtp"], file.clone()).relay_batch_window_us,
+            250
+        );
+        assert_eq!(
+            resolve_from(&["siphon-rtp", "--relay-batch-window-us", "0"], file)
+                .relay_batch_window_us,
+            0
+        );
+    }
+
+    #[test]
+    fn the_built_datapath_batches_over_the_configured_window() {
+        let mut config = bare_run_config();
+        config.relay_batch_window_us = 175;
+        assert_eq!(
+            crate::daemon::build_udp_datapath(&config, None).relay_batch_window(),
+            std::time::Duration::from_micros(175)
+        );
+    }
+
+    #[test]
     fn zero_relay_threads_is_refused_at_the_command_line() {
         let parsed = <TestCommandLine as clap::CommandFactory>::command().try_get_matches_from([
             "siphon-rtp",
@@ -2165,6 +2221,7 @@ mod tests {
             port_min: None,
             port_max: None,
             relay_threads: None,
+            relay_batch_window_us: crate::daemon::default_relay_batch_window_us(),
             media_dscp: Dscp::DEFAULT,
             metrics_addr: None,
             max_control_rps: 0,
