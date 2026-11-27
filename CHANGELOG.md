@@ -7,8 +7,21 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **`--relay-threads` (`relay_threads`): how many threads receive and relay media on the userspace
+  datapath.** One per CPU the process may run on by default, so `taskset` or a cgroup cpuset narrows
+  it. Zero is refused.
+
 ### Changed
 
+- **The userspace relay receives on its own threads instead of a Tokio task per socket.** Each relay
+  thread waits on a level-triggered epoll over its share of the media sockets, reads one datagram per
+  readiness report and relays it before waiting again. A relayed packet no longer pays a task wake
+  and reschedule, nor the empty `recvfrom` a read-until-`EAGAIN` loop needs, so it takes two kernel
+  crossings instead of three, and a busy Tokio runtime no longer delays media. A forwarded packet
+  that meets a full socket send buffer is dropped and counted rather than waited for: by the time
+  there is room it is late. Sends the engine makes itself still wait. Tokio 1.54 is now the minimum.
 - **A relayed packet no longer looks its endpoint up in shared maps.** The userspace relay keeps,
   per endpoint, what its flow needs (the flow, the ICE and TURN state, both latches, the out leg)
   and reads it again only after a control write changes either leg, where every packet used to take

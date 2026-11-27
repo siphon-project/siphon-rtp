@@ -16,7 +16,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
+use siphon_rtp_datapath::udp::{self, UdpLoopbackDatapath};
 use siphon_rtp_engine::{sdp, ClientId, Engine};
 use siphon_rtp_proto::{CmdResult, Command};
 use tokio::net::UdpSocket;
@@ -756,7 +756,9 @@ pub fn run(plan: &RunPlan) -> Result<RunOutcome, LoadgenError> {
         measured,
         delivery,
         latency,
-        engine_cpu: cpu_delta.bucket_starting_with(ENGINE_THREAD_PREFIX),
+        // The relay threads do the per-packet receive and send; the runtime does everything else.
+        engine_cpu: cpu_delta
+            .bucket_starting_with_any(&[ENGINE_THREAD_PREFIX, udp::RELAY_THREAD_PREFIX]),
         generator_cpu: cpu_delta.bucket_starting_with(LOADGEN_THREAD_PREFIX),
         total_cpu: cpu_delta.total(),
         engine_sessions,

@@ -48,7 +48,7 @@ expect_used = "warn"
 # Shared dependency pins — kept in lockstep with siphon-sip's house versions.
 [workspace.dependencies]
 # Async runtime + channels
-tokio = { version = "1.50", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 flume = "0.12"
 # Buffers / ordered maps / concurrency
 bytes = "1.11"

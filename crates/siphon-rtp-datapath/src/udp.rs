@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
-use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
+use std::net::UdpSocket;
 
 use crate::dscp::Dscp;
+use crate::udp::reactor::{Reactor, Shard};
 use crate::udp::route::Route;
 use crate::udp_relay::{
-    emit, is_data_indication, relay_egress, relay_unwrap, RelayEgress, RelayIngress,
+    emit, emit_now, is_data_indication, relay_egress, relay_unwrap, RelayEgress, RelayIngress,
 };
 use crate::{
     classify, rtp_media_ssrc, signalled_peer_moved, source_latch_verdict, AddressFamily, Datapath,
@@ -26,6 +26,8 @@ use crate::{
     IceConfig, IceDatapathEvent, LatchPolicy, ObservedRtcp, PacketClass, RxPacket, SourceLatch,
     SourceLatchVerdict,
 };
+pub(crate) use reactor::MediaSocket;
+pub use reactor::RELAY_THREAD_PREFIX;
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
 /// leaves headroom without paying for jumbo frames the media plane never sees.
@@ -38,6 +40,8 @@ const MAX_DATAGRAM: usize = 2048;
 /// absolute tick, only differences), so making it one costs nothing and keeps the sentinel exact.
 const FIRST_TICK: u64 = 1;
 
+mod epoll;
+mod reactor;
 mod route;
 
 /// Lock-free per-endpoint counters, mutated from the endpoint's single receive task and snapshotted
@@ -95,11 +99,11 @@ impl StatsAtomic {
     }
 }
 
-/// One allocated endpoint: its socket, counters, and receive task.
+/// One allocated endpoint: its socket, counters, and the relay shard receiving on it.
 struct EndpointEntry {
-    socket: Arc<UdpSocket>,
+    socket: Arc<MediaSocket>,
     stats: Arc<StatsAtomic>,
-    task: JoinHandle<()>,
+    shard: Arc<Shard>,
 }
 
 /// A deterministic media-port allocator over a closed `[min, max]` range.
@@ -250,12 +254,13 @@ struct Inner {
     observe_enabled: AtomicBool,
     observe_tx: flume::Sender<ObservedRtcp>,
     observe_rx: flume::Receiver<ObservedRtcp>,
+    /// The threads receiving on every endpoint socket.
+    reactor: Reactor,
 }
 
 impl Inner {
-    /// Apply the installed flow to one received datagram, as `route` resolved it. Holds no map guard
-    /// across an `.await`.
-    async fn dispatch(
+    /// Apply the installed flow to one received datagram, as `route` resolved it.
+    fn dispatch(
         &self,
         endpoint: EndpointId,
         source: SocketAddr,
@@ -373,7 +378,7 @@ impl Inner {
                 } else {
                     RelayEgress::Direct
                 };
-                match emit(&socket, egress, destination, payload).await {
+                match emit_now(socket.get_ref(), egress, destination, payload) {
                     Ok(sent) => {
                         out.stats.packets_out.fetch_add(1, Ordering::Relaxed);
                         out.stats
@@ -381,8 +386,9 @@ impl Inner {
                             .fetch_add(sent as u64, Ordering::Relaxed);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        // A stalled TURN stream sheds media instead of queueing it.
-                        tracing::debug!(?endpoint, "forward dropped: TURN stream queue full");
+                        // A full send buffer or a stalled TURN stream sheds media instead of queueing
+                        // it: by the time there is room the packet is late, and late media is loss.
+                        tracing::debug!(?endpoint, "forward dropped: out leg cannot take it now");
                         in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(error) => {
@@ -552,16 +558,15 @@ fn ice_gate(route: &Route, source: SocketAddr) -> IceGate {
     }
 }
 
-/// Ends every receive task when the last [`UdpLoopbackDatapath`] handle is dropped. The tasks hold
-/// the backend strongly (see [`recv_loop`]) and are parked on `recv_from` with no way to notice
-/// teardown, so aborting them is what lets the backend, its sockets and its maps go.
+/// Stops the relay reactor when the last [`UdpLoopbackDatapath`] handle is dropped. Its threads hold
+/// the backend strongly (a per-packet `Weak::upgrade` would be a read-modify-write on the one count
+/// every thread shares) and sit in `epoll_wait` with no way to notice teardown, so shutting them down
+/// is what lets the backend, its sockets and its maps go.
 struct Teardown(Arc<Inner>);
 
 impl Drop for Teardown {
     fn drop(&mut self) {
-        for entry in self.0.endpoints.iter() {
-            entry.value().task.abort();
-        }
+        self.0.reactor.shutdown();
     }
 }
 
@@ -634,6 +639,30 @@ impl UdpLoopbackDatapath {
         self
     }
 
+    /// Set how many relay threads receive on the endpoint sockets (one per CPU this process may run
+    /// on, by default). Endpoints are spread over them by id; each thread waits on its own
+    /// level-triggered epoll and relays synchronously, so this is the relay's parallelism.
+    ///
+    /// Applies only before the first endpoint is allocated (the threads start with it), which for
+    /// the daemon is always the case.
+    #[must_use]
+    pub fn with_relay_threads(self, threads: std::num::NonZeroUsize) -> Self {
+        if !self.inner.reactor.set_threads(threads.get()) {
+            tracing::warn!(
+                threads,
+                "relay thread count set after the relay started; keeping {}",
+                self.inner.reactor.threads()
+            );
+        }
+        self
+    }
+
+    /// How many relay threads endpoints are spread over.
+    #[must_use]
+    pub fn relay_threads(&self) -> usize {
+        self.inner.reactor.threads()
+    }
+
     /// The DSCP currently applied to newly bound media sockets.
     #[must_use]
     pub fn dscp(&self) -> Dscp {
@@ -667,6 +696,7 @@ impl UdpLoopbackDatapath {
             observe_enabled: AtomicBool::new(false),
             observe_tx,
             observe_rx,
+            reactor: Reactor::new(Reactor::default_threads()),
         });
         Self {
             _teardown: Arc::new(Teardown(inner.clone())),
@@ -731,14 +761,21 @@ impl UdpLoopbackDatapath {
             Some(pool) => Self::bind_in_range(bind_ip, pool, dscp).await,
             None => Self::bind_ephemeral(bind_ip, 0, dscp).await,
         };
-        let (socket, local_addr) = match bound {
-            Ok(pair) => pair,
-            Err(error) => {
-                self.inner.live.fetch_sub(1, Ordering::AcqRel);
-                return Err(error);
-            }
-        };
-        Ok(self.register_socket(socket, local_addr))
+        let registered = bound.and_then(|(socket, local_addr)| {
+            self.register_socket(socket, local_addr)
+                .inspect_err(|_| self.release_port(local_addr))
+        });
+        if registered.is_err() {
+            self.inner.live.fetch_sub(1, Ordering::AcqRel);
+        }
+        registered
+    }
+
+    /// Return a range port to the pool after a failed allocation (no-op without a range).
+    fn release_port(&self, local_addr: SocketAddr) {
+        if let Some(pool) = &self.inner.ports {
+            pool.release(local_addr.port());
+        }
     }
 
     /// Allocate an endpoint bound to a **specific** port — the HA-restore primitive: a standby
@@ -779,8 +816,9 @@ impl UdpLoopbackDatapath {
                 return Err(DatapathError::PortUnavailable { port });
             }
         }
-        match Self::bind_ephemeral(bind_ip, port, self.dscp()).await {
-            Ok((socket, local_addr)) => Ok(self.register_socket(socket, local_addr)),
+        let bound = Self::bind_ephemeral(bind_ip, port, self.dscp()).await;
+        match bound.and_then(|(socket, local_addr)| self.register_socket(socket, local_addr)) {
+            Ok(endpoint) => Ok(endpoint),
             Err(error) => {
                 if let Some(pool) = &self.inner.ports {
                     pool.release(port);
@@ -797,12 +835,13 @@ impl UdpLoopbackDatapath {
         bind_ip: IpAddr,
         port: u16,
         dscp: Dscp,
-    ) -> Result<(UdpSocket, SocketAddr), DatapathError> {
-        let socket = UdpSocket::bind((bind_ip, port))
-            .await
-            .map_err(DatapathError::Bind)?;
+    ) -> Result<(MediaSocket, SocketAddr), DatapathError> {
+        let socket = UdpSocket::bind((bind_ip, port)).map_err(DatapathError::Bind)?;
+        socket.set_nonblocking(true).map_err(DatapathError::Bind)?;
         let local_addr = socket.local_addr().map_err(DatapathError::Bind)?;
         apply_dscp(&socket, local_addr, dscp);
+        // Writability only: the relay reactor does every read (see `MediaSocket`).
+        let socket = epoll::register_writable(socket).map_err(DatapathError::Bind)?;
         Ok((socket, local_addr))
     }
 
@@ -822,7 +861,7 @@ impl UdpLoopbackDatapath {
         bind_ip: IpAddr,
         pool: &PortAllocator,
         dscp: Dscp,
-    ) -> Result<(UdpSocket, SocketAddr), DatapathError> {
+    ) -> Result<(MediaSocket, SocketAddr), DatapathError> {
         for _ in 0..pool.span() {
             let Some(port) = pool.reserve_next() else {
                 return Err(DatapathError::PoolExhausted { limit: pool.span() });
@@ -841,25 +880,30 @@ impl UdpLoopbackDatapath {
     }
 
     /// Register a freshly bound socket: assign an id, start its receive loop, and record it.
-    fn register_socket(&self, socket: UdpSocket, local_addr: SocketAddr) -> Endpoint {
+    /// A packet arriving before the entry is in the table finds no flow (none can be installed
+    /// before this returns) and is dropped, as it would be on an endpoint with no flow.
+    fn register_socket(
+        &self,
+        socket: MediaSocket,
+        local_addr: SocketAddr,
+    ) -> Result<Endpoint, DatapathError> {
         let socket = Arc::new(socket);
         let id = EndpointId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let stats = Arc::new(StatsAtomic::default());
-        let task = tokio::spawn(recv_loop(
-            self.inner.clone(),
-            id,
-            socket.clone(),
-            stats.clone(),
-        ));
+        let shard = self
+            .inner
+            .reactor
+            .register(&self.inner, id, socket.clone(), stats.clone())
+            .map_err(DatapathError::Bind)?;
         self.inner.endpoints.insert(
             id,
             EndpointEntry {
                 socket,
                 stats,
-                task,
+                shard,
             },
         );
-        Endpoint { id, local_addr }
+        Ok(Endpoint { id, local_addr })
     }
 }
 
@@ -930,7 +974,7 @@ fn is_rtcp(payload: &[u8]) -> bool {
 /// Answer a STUN connectivity check on an ICE-enabled endpoint: validate the request against our
 /// local credentials, adopt the validated source as the media path, and reply with a Binding
 /// success response (RFC 8445 §7.3 / RFC 5389). Invalid checks are dropped silently.
-async fn handle_stun(
+fn handle_stun(
     socket: &UdpSocket,
     endpoint: EndpointId,
     source: SocketAddr,
@@ -987,7 +1031,8 @@ async fn handle_stun(
         Some(relay) => relay_egress(&relay, source, &response),
         None => RelayEgress::Direct,
     };
-    match emit(socket, egress, source, &response).await {
+    // Shed on a full send buffer, like media: the peer retransmits an unanswered check.
+    match emit_now(socket, egress, source, &response) {
         Ok(sent) => {
             stats.packets_out.fetch_add(1, Ordering::Relaxed);
             stats.bytes_out.fetch_add(sent as u64, Ordering::Relaxed);
@@ -1006,11 +1051,12 @@ impl Inner {
     /// same ICE gate, source gate, latch, stats and flows as one that arrived on the socket.
     ///
     /// `route` is the caller's cached [`Route`] for `endpoint`, refreshed here when stale.
+    /// Synchronous: it runs on a relay shard thread, which has no executor to yield to.
     #[allow(
         clippy::too_many_arguments,
         reason = "one datagram's context, passed by reference rather than bundled per packet"
     )]
-    async fn receive(
+    fn receive(
         &self,
         endpoint: EndpointId,
         socket: &UdpSocket,
@@ -1083,7 +1129,7 @@ impl Inner {
                 return;
             }
             if let Some(ice) = self.ice.get(&endpoint).map(|config| config.clone()) {
-                handle_stun(socket, endpoint, source, &buffer[..len], &ice, self, stats).await;
+                handle_stun(socket, endpoint, source, &buffer[..len], &ice, self, stats);
                 return;
             }
             // No ICE credentials: do *not* drop here — fall through to the installed flow. A TURN
@@ -1092,47 +1138,7 @@ impl Inner {
             // media `Forward` endpoint still drops non-RTP inside `dispatch` (the layer-1 demux), so
             // this never lets STUN reach the media latch.
         }
-        self.dispatch(endpoint, source, &buffer[..len], stats, route)
-            .await;
-    }
-}
-
-/// Per-endpoint receive loop: drain the socket and apply the installed flow (which gates the source
-/// and latches it per policy — see [`Inner::dispatch`]).
-///
-/// Holds the backend strongly: a per-packet `Weak::upgrade` is a read-modify-write on the one
-/// reference count every receive task shares. [`Teardown`] aborts the task when the last handle
-/// goes, which is what releases the backend.
-async fn recv_loop(
-    inner: Arc<Inner>,
-    endpoint: EndpointId,
-    socket: Arc<UdpSocket>,
-    stats: Arc<StatsAtomic>,
-) {
-    let mut buffer = vec![0u8; MAX_DATAGRAM];
-    let mut route = None;
-    loop {
-        let (len, source) = match socket.recv_from(&mut buffer).await {
-            Ok(received) => received,
-            Err(error) => {
-                tracing::debug!(?endpoint, %error, "endpoint receive loop ending");
-                return;
-            }
-        };
-        stats.packets_in.fetch_add(1, Ordering::Relaxed);
-        stats.bytes_in.fetch_add(len as u64, Ordering::Relaxed);
-
-        inner
-            .receive(
-                endpoint,
-                &socket,
-                &stats,
-                &mut route,
-                source,
-                &mut buffer,
-                len,
-            )
-            .await;
+        self.dispatch(endpoint, source, &buffer[..len], stats, route);
     }
 }
 
@@ -1193,16 +1199,16 @@ impl Datapath for UdpLoopbackDatapath {
             // Release the range port back to the pool (if a range is configured), reading the bound
             // port off the socket before it is dropped, so the port can be re-allocated.
             if let Some(pool) = &self.inner.ports {
-                if let Ok(local) = entry.socket.local_addr() {
+                if let Ok(local) = entry.socket.get_ref().local_addr() {
                     pool.release(local.port());
                 }
             }
-            // Stop the receive task and wait for it to drop its socket clone, then drop ours, so the
-            // OS socket is fully closed before we return. A range port is then immediately
-            // re-bindable — needed for a same-port HA restore and for tight port-churn.
-            let EndpointEntry { socket, task, .. } = entry;
-            task.abort();
-            let _ = task.await;
+            // Stop the relay shard receiving on it and wait for the shard to drop its socket clone,
+            // then drop ours, so the OS socket is fully closed before we return. A range port is
+            // then immediately re-bindable — needed for a same-port HA restore and for tight
+            // port-churn. (A peer's cached route holds the socket only weakly.)
+            let EndpointEntry { socket, shard, .. } = entry;
+            shard.unregister(endpoint, &socket).await;
             drop(socket);
             // Release the pool slot only when an endpoint was actually removed (idempotent).
             self.inner.live.fetch_sub(1, Ordering::AcqRel);
@@ -1312,19 +1318,17 @@ impl Datapath for UdpLoopbackDatapath {
             .bytes_in
             .fetch_add(frame.len() as u64, Ordering::Relaxed);
         let mut buffer = frame.to_vec();
-        // A stream frame is not on the receive task, so it resolves a route of its own.
+        // A stream frame does not arrive on a relay shard, so it resolves a route of its own.
         let mut route = None;
-        self.inner
-            .receive(
-                endpoint,
-                &socket,
-                &stats,
-                &mut route,
-                server,
-                &mut buffer,
-                frame.len(),
-            )
-            .await;
+        self.inner.receive(
+            endpoint,
+            socket.get_ref(),
+            &stats,
+            &mut route,
+            server,
+            &mut buffer,
+            frame.len(),
+        );
         true
     }
 
@@ -1487,10 +1491,18 @@ mod tests {
     use super::*;
     use crate::{ForwardRule, IceConfig, SourceFilter};
     use std::time::Duration;
+    // The test phones are ordinary async sockets; the endpoints under test are the reactor's.
+    use tokio::net::UdpSocket;
     use tokio::time::timeout;
 
     const SHORT: Duration = Duration::from_secs(1);
     const NEGATIVE: Duration = Duration::from_millis(150);
+
+    // Tests that bind a fixed port use 28000-29010, below Linux's ephemeral range (32768-60999 by
+    // default) and clear of the well-known services that sit there (Syncthing's 21027/22000), and
+    // each test its own window. A fixed port inside the ephemeral range can be taken
+    // at any moment by a `bind(:0)` in a test running in parallel, which fails the fixed bind with
+    // `EADDRINUSE` (or a one-port pool with `PoolExhausted`) for a reason that is not the code's.
 
     /// A test "phone": a loopback UDP socket standing in for a SIP endpoint.
     async fn phone() -> (UdpSocket, SocketAddr) {
@@ -1543,7 +1555,7 @@ mod tests {
     async fn a_port_range_endpoint_is_marked_too() {
         // The HA/firewallable bind path is a different branch from the ephemeral one; both mark.
         let datapath =
-            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 41000, 41010);
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 28000, 28010);
         let endpoint = datapath.alloc_endpoint().await.expect("alloc");
         assert_eq!(readback_tos(&datapath, endpoint.id), 184);
     }
@@ -1552,12 +1564,12 @@ mod tests {
     async fn a_restored_specific_port_endpoint_is_marked_too() {
         // `alloc_specific` is the HA-takeover bind; a standby's media must not lose its marking.
         let datapath =
-            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 41100, 41110);
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 28100, 28110);
         let endpoint = datapath
-            .alloc_specific(AddressFamily::V4, 41105)
+            .alloc_specific(AddressFamily::V4, 28105)
             .await
             .expect("alloc specific");
-        assert_eq!(endpoint.local_addr.port(), 41105);
+        assert_eq!(endpoint.local_addr.port(), 28105);
         assert_eq!(readback_tos(&datapath, endpoint.id), 184);
     }
 
@@ -2022,8 +2034,9 @@ mod tests {
         let framed = siphon_rtp_stun::turn::parse_channel_data(&wire).expect("ChannelData");
         assert_eq!(framed.channel, channel);
         assert_eq!(framed.data, &payload[..]);
-        let stats = datapath.stats(leg_b.id).expect("stats");
-        assert_eq!(stats.packets_out, 1);
+        // The relay thread counts a send once `send_to` has returned, which can be after the server
+        // already holds the datagram: wait for the count rather than read it once.
+        let stats = settled_stats(&datapath, leg_b.id, |stats| stats.packets_out == 1).await;
         assert_eq!(stats.bytes_out, wire.len() as u64, "counts the wire bytes");
     }
 
@@ -3101,7 +3114,7 @@ mod tests {
     async fn port_range_allocates_within_the_configured_window() {
         // Every media port comes from the operator-configured [min, max] window (rtpengine
         // port-min/port-max parity — firewallable), not an arbitrary OS-ephemeral port.
-        let (min, max) = (40_000u16, 40_009u16);
+        let (min, max) = (28_900u16, 28_909u16);
         let datapath =
             UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), min, max);
         for _ in 0..6 {
@@ -3119,11 +3132,11 @@ mod tests {
         // The documented reason `bind_in_range` retries at all: a port reservable in our range but
         // already bound on the host (another process, or another siphon-rtp instance sharing the
         // range) is released and skipped, and the allocation lands on the next one.
-        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 43_100))
+        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 28_200))
             .expect("hold the first port of the range");
 
         let datapath =
-            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 43_100, 43_101);
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 28_200, 28_201);
         let endpoint = datapath
             .alloc_endpoint()
             .await
@@ -3131,7 +3144,7 @@ mod tests {
 
         assert_eq!(
             endpoint.local_addr.port(),
-            43_101,
+            28_201,
             "the held port is skipped, not reported as a failure"
         );
         drop(held);
@@ -3146,8 +3159,8 @@ mod tests {
         // address (RFC 5737 §3) is the deterministic stand-in: unassigned on any conforming host.
         let datapath = UdpLoopbackDatapath::with_port_range(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            43_200,
-            43_209,
+            28_300,
+            28_309,
         );
 
         let error = datapath
@@ -3179,7 +3192,7 @@ mod tests {
     async fn port_range_exhaustion_is_clean() {
         // A two-port range admits exactly two endpoints; the third fails cleanly (no host-FD spray).
         let datapath =
-            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 41_000, 41_001);
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 28_400, 28_401);
         let _a = datapath.alloc_endpoint().await.expect("alloc a");
         let _b = datapath.alloc_endpoint().await.expect("alloc b");
         assert!(matches!(
@@ -3192,9 +3205,9 @@ mod tests {
     async fn port_range_releases_the_port_on_remove() {
         // A single-port range: the port is reusable once the endpoint that held it is removed.
         let datapath =
-            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_000, 42_000);
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 28_500, 28_500);
         let first = datapath.alloc_endpoint().await.expect("first alloc");
-        assert_eq!(first.local_addr.port(), 42_000);
+        assert_eq!(first.local_addr.port(), 28_500);
         assert!(
             matches!(
                 datapath.alloc_endpoint().await,
@@ -3204,30 +3217,30 @@ mod tests {
         );
         datapath.remove_endpoint(first.id).await;
         let reused = datapath.alloc_endpoint().await.expect("alloc after free");
-        assert_eq!(reused.local_addr.port(), 42_000, "the freed port is reused");
+        assert_eq!(reused.local_addr.port(), 28_500, "the freed port is reused");
     }
 
     #[tokio::test]
     async fn alloc_specific_binds_the_exact_port() {
         // The HA-restore primitive: a standby re-binds the exact port a primary advertised.
         let datapath =
-            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 43_000, 43_010);
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 28_600, 28_610);
         let endpoint = datapath
-            .alloc_specific(AddressFamily::V4, 43_005)
+            .alloc_specific(AddressFamily::V4, 28_605)
             .await
             .expect("bind the exact port");
-        assert_eq!(endpoint.local_addr.port(), 43_005);
+        assert_eq!(endpoint.local_addr.port(), 28_605);
         // The reserved port is now unavailable to the range allocator and to a second exact request.
         assert!(matches!(
-            datapath.alloc_specific(AddressFamily::V4, 43_005).await,
-            Err(DatapathError::PortUnavailable { port: 43_005 })
+            datapath.alloc_specific(AddressFamily::V4, 28_605).await,
+            Err(DatapathError::PortUnavailable { port: 28_605 })
         ));
     }
 
     #[tokio::test]
     async fn alloc_specific_rejects_out_of_range_ports() {
         let datapath =
-            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 44_000, 44_002);
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 28_700, 28_702);
         assert!(matches!(
             datapath.alloc_specific(AddressFamily::V4, 50_000).await,
             Err(DatapathError::PortUnavailable { port: 50_000 })
@@ -3236,12 +3249,10 @@ mod tests {
 
     #[tokio::test]
     async fn alloc_specific_without_a_range_binds_the_requested_port() {
-        // No configured range: the exact port is bound directly (any free OS port is accepted).
-        let scratch = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("scratch bind");
-        let free_port = scratch.local_addr().expect("addr").port();
-        drop(scratch);
+        // No configured range: the exact port is bound directly (any free port is accepted). A
+        // fixed one below the ephemeral range, not one a scratch bind found free and released: a
+        // parallel test's `bind(:0)` can take a released ephemeral port before it is bound again.
+        let free_port = 28_950;
         let datapath = UdpLoopbackDatapath::new();
         let endpoint = datapath
             .alloc_specific(AddressFamily::V4, free_port)
@@ -3382,7 +3393,7 @@ mod tests {
         );
 
         // The HA-restore path selects its bind IP the same way and must refuse the same way.
-        let restored = datapath.alloc_specific(AddressFamily::V6, 40_000).await;
+        let restored = datapath.alloc_specific(AddressFamily::V6, 28_800).await;
         assert!(
             matches!(
                 restored,
@@ -4408,6 +4419,24 @@ mod tests {
         }
     }
 
+    /// `endpoint`'s stats once `settled` holds for them (a relay thread counts after it acts).
+    async fn settled_stats(
+        datapath: &UdpLoopbackDatapath,
+        endpoint: EndpointId,
+        settled: impl Fn(&EndpointStats) -> bool,
+    ) -> EndpointStats {
+        timeout(SHORT, async {
+            loop {
+                if let Some(stats) = datapath.stats(endpoint).filter(|stats| settled(stats)) {
+                    return stats;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the counters settled")
+    }
+
     /// Wait until `endpoint` has counted `count` drops: a dropped packet leaves nothing to receive.
     async fn dropped_reaches(datapath: &UdpLoopbackDatapath, endpoint: EndpointId, count: u64) {
         timeout(SHORT, async {
@@ -4601,7 +4630,7 @@ mod tests {
         // `remove_endpoint` promises the OS socket is closed when it returns (a same-port HA restore
         // re-binds it straight away), so no other leg's cached route may keep it open.
         let datapath =
-            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 41300, 41310);
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 29000, 29010);
         let near = datapath.alloc_endpoint().await.expect("alloc near");
         let far = datapath.alloc_endpoint().await.expect("alloc far");
         let (caller, _) = phone().await;
@@ -4670,5 +4699,110 @@ mod tests {
             delivered(&callee).await.is_none(),
             "nothing relays after teardown"
         );
+    }
+
+    // --- The relay reactor (`udp/reactor.rs`) ----------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocating_and_removing_in_a_tight_loop_never_loses_a_removal() {
+        // Every removal waits for its shard to acknowledge. A wake-up consumed after the command
+        // queue was drained, but before the removal was queued, would leave the shard asleep and the
+        // removal waiting for ever. One shard, so every command meets the same thread.
+        let datapath = UdpLoopbackDatapath::new().with_relay_threads(std::num::NonZeroUsize::MIN);
+        timeout(Duration::from_secs(20), async {
+            for _ in 0..3000 {
+                let endpoint = datapath.alloc_endpoint().await.expect("alloc");
+                datapath.remove_endpoint(endpoint.id).await;
+            }
+        })
+        .await
+        .expect("every removal was acknowledged");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_relay_forwards_while_the_runtime_that_allocated_it_is_blocked() {
+        // The relay runs on its own threads, not on Tokio tasks: a runtime busy with something else
+        // (here, this test blocking its only thread) delays no media.
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let caller = std::net::UdpSocket::bind("127.0.0.1:0").expect("caller");
+        let callee = std::net::UdpSocket::bind("127.0.0.1:0").expect("callee");
+        let callee_addr = callee.local_addr().expect("callee addr");
+        datapath
+            .install_flow(near.id, FlowAction::Forward(open_rule(far.id, callee_addr)))
+            .expect("flow");
+
+        callee.set_read_timeout(Some(SHORT)).expect("timeout");
+        let mut buffer = [0u8; MAX_DATAGRAM];
+        for sequence in 1..=3 {
+            caller
+                .send_to(&rtp(1, sequence), near.local_addr)
+                .expect("send");
+            let (len, from) = callee
+                .recv_from(&mut buffer)
+                .expect("relayed with the runtime blocked");
+            assert_eq!(&buffer[..len], &rtp(1, sequence)[..]);
+            assert_eq!(from, far.local_addr);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoints_spread_over_the_configured_relay_threads() {
+        let threads = std::num::NonZeroUsize::new(2).expect("non-zero");
+        let datapath = UdpLoopbackDatapath::new().with_relay_threads(threads);
+        assert_eq!(datapath.relay_threads(), 2);
+        assert_eq!(
+            datapath.inner.reactor.started(),
+            0,
+            "nothing starts before an endpoint"
+        );
+        let first = datapath.alloc_endpoint().await.expect("alloc");
+        assert_eq!(
+            datapath.inner.reactor.started(),
+            1,
+            "a shard starts with its first endpoint"
+        );
+        for _ in 0..4 {
+            datapath.alloc_endpoint().await.expect("alloc");
+        }
+        assert_eq!(
+            datapath.inner.reactor.started(),
+            2,
+            "never more than configured"
+        );
+
+        // Too late to change once relaying: the count stays, so endpoints keep their shard.
+        let datapath = datapath.with_relay_threads(std::num::NonZeroUsize::MIN);
+        assert_eq!(datapath.relay_threads(), 2);
+        datapath.remove_endpoint(first.id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_datagram_waiting_on_a_socket_is_relayed_too() {
+        // Level-triggered: the reactor reads one datagram per readiness report and relies on the
+        // next wait to report the socket again while anything is left queued on it.
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (caller, _) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        datapath
+            .install_flow(near.id, FlowAction::Forward(open_rule(far.id, callee_addr)))
+            .expect("flow");
+        for sequence in 1..=32 {
+            caller
+                .send_to(&rtp(1, sequence), near.local_addr)
+                .await
+                .expect("send");
+        }
+        for sequence in 1..=32 {
+            assert_eq!(
+                recv(&callee).await.0,
+                rtp(1, sequence),
+                "in order, none lost"
+            );
+        }
+        assert_eq!(datapath.stats(near.id).expect("stats").packets_in, 32);
     }
 }

@@ -52,6 +52,10 @@ control: "127.0.0.1:8080"
 # port_min: 30000
 # port_max: 40000
 
+# Threads that receive and relay media on the userspace datapath (CLI: --relay-threads). Default: one
+# per CPU this process may run on, so a taskset or cgroup cpuset narrows it.
+# relay_threads: 8
+
 # DiffServ marking on outbound media (CLI: --media-dscp). A name (EF, CS3, AF41, VA, BE, ...) or a
 # raw 0-63. Default: EF (46, RFC 3246; RFC 4594 §4.1 Telephony) = TOS byte 184, the same value as
 # Asterisk's tos_audio and rtpengine's tos. BE (or 0) disables marking and leaves the TOS byte

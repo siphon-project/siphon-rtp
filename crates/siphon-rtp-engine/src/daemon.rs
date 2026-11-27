@@ -144,6 +144,13 @@ pub struct EngineArgs {
     #[arg(long)]
     pub port_max: Option<u16>,
 
+    /// Threads that receive and relay media on the userspace datapath. Endpoints are spread over
+    /// them; each waits on its own level-triggered epoll and relays what arrives synchronously, so
+    /// this is the relay's parallelism. Default: one per CPU this process may run on (its affinity
+    /// mask, so `taskset` or a cgroup cpuset narrows it).
+    #[arg(long, value_name = "N")]
+    pub relay_threads: Option<std::num::NonZeroUsize>,
+
     /// DiffServ code point (RFC 2474) stamped on outbound media — the QoS marking a network polices
     /// voice on. Accepts a name (`EF`, `CS3`, `AF41`, `VA`, `BE`, …) or a raw `0`–`63`.
     ///
@@ -417,6 +424,8 @@ pub struct RunConfig {
     pub port_min: Option<u16>,
     /// Highest media port the datapath may bind (paired with [`Self::port_min`]).
     pub port_max: Option<u16>,
+    /// Userspace relay threads; `None` = one per CPU this process may run on.
+    pub relay_threads: Option<std::num::NonZeroUsize>,
     /// DiffServ code point (RFC 2474) stamped on outbound media on every egress path. Defaults to
     /// [`Dscp::EF`]; [`Dscp::BE`] disables marking.
     pub media_dscp: Dscp,
@@ -531,6 +540,7 @@ impl RunConfig {
             default_interface: file.default_interface,
             port_min: resolve_optional(args.port_min, file.port_min),
             port_max: resolve_optional(args.port_max, file.port_max),
+            relay_threads: resolve_optional(args.relay_threads, file.relay_threads),
             media_dscp: resolve_defaulted(
                 args.media_dscp,
                 explicit("media_dscp"),
@@ -838,7 +848,12 @@ pub fn build_udp_datapath(
     };
     // The DSCP marking (RFC 2474) every media socket this backend binds carries — see
     // `RunConfig::media_dscp`.
-    datapath.with_dscp(config.media_dscp)
+    let datapath = datapath.with_dscp(config.media_dscp);
+    // The relay's parallelism — see `RunConfig::relay_threads`. Set before any endpoint exists.
+    match config.relay_threads {
+        Some(threads) => datapath.with_relay_threads(threads),
+        None => datapath,
+    }
 }
 
 /// Install the global `tracing` subscriber, applying the log-filter precedence: the process
@@ -1908,6 +1923,52 @@ mod tests {
     }
 
     #[test]
+    fn the_relay_threads_come_from_the_file_and_the_flag_overrides_it() {
+        assert_eq!(
+            resolve_from(&["siphon-rtp"], FileConfig::default()).relay_threads,
+            None,
+            "unset: one per CPU"
+        );
+        let file = FileConfig {
+            relay_threads: std::num::NonZeroUsize::new(3),
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            resolve_from(&["siphon-rtp"], file.clone()).relay_threads,
+            std::num::NonZeroUsize::new(3)
+        );
+        assert_eq!(
+            resolve_from(&["siphon-rtp", "--relay-threads", "5"], file).relay_threads,
+            std::num::NonZeroUsize::new(5)
+        );
+    }
+
+    #[test]
+    fn zero_relay_threads_is_refused_at_the_command_line() {
+        let parsed = <TestCommandLine as clap::CommandFactory>::command().try_get_matches_from([
+            "siphon-rtp",
+            "--relay-threads",
+            "0",
+        ]);
+        assert!(parsed.is_err(), "a relay with no threads relays nothing");
+    }
+
+    #[test]
+    fn the_built_datapath_runs_the_configured_relay_threads() {
+        let mut config = bare_run_config();
+        config.relay_threads = std::num::NonZeroUsize::new(3);
+        assert_eq!(
+            crate::daemon::build_udp_datapath(&config, None).relay_threads(),
+            3
+        );
+        config.relay_threads = None;
+        assert_eq!(
+            crate::daemon::build_udp_datapath(&config, None).relay_threads(),
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+        );
+    }
+
+    #[test]
     fn the_config_file_sets_the_media_dscp_and_the_flag_overrides_it() {
         let file = FileConfig {
             media_dscp: Some(Dscp::CS3),
@@ -2103,6 +2164,7 @@ mod tests {
             default_interface: None,
             port_min: None,
             port_max: None,
+            relay_threads: None,
             media_dscp: Dscp::DEFAULT,
             metrics_addr: None,
             max_control_rps: 0,
