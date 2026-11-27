@@ -111,14 +111,14 @@ streams one core sustains on that operation alone.
   frame in **~28 µs**, i.e. **~720 concurrent VoLTE decodes per core**. The hot kernels (LPC
   synthesis, pitch interpolation, 12.8→16 kHz oversampling) run on runtime-detected **AVX2 SIMD**
   (pure Rust, scalar fallback) — ~1.6× faster than the scalar port, staying byte-exact.
-- **The userspace relay costs ~7–9 µs of CPU per relayed packet**, end to end with sockets, of
-  which **about 70 % is kernel time** — one `recvmsg` plus one `sendmsg` per packet. Profiled at
-  100 000 pps, the engine's **own** relay logic (flow lookup, source gate, latch check, loss counter)
-  is **0.04 %** of that and Tokio is 0.15 %; the rest is the kernel's UDP path and its overheads, the
-  three largest being spinlocks, `epoll` readiness tracking, and `netfilter` connection tracking. The
-  packet handling really is free (parse ~1.9 ns; parse → re-originate SSRC/seq → write ~8 ns, zero
-  per-packet heap) — which is exactly why the syscalls, not the packet handling, are what a kernel
-  fast path buys back. Measured with the `siphon-rtp-loadgen` harness at 100–2 000 concurrent calls;
+- **The userspace relay costs ~8.4 µs of CPU per relayed packet** on a desktop part, end to end
+  with sockets, of which **close to 90 % is kernel time**: one `recvfrom` plus one `sendto` per
+  packet. Relay
+  threads with their own `epoll` and a per-socket flow cache took the engine's own share from about
+  29 % to about 11 % of a relayed packet; the rest is the kernel's UDP, IP, LSM and `netfilter` path.
+  The packet handling itself is cheap (parse ~1.9 ns; parse → re-originate SSRC/seq → write ~8 ns,
+  zero per-packet heap), which is why the syscalls, not the packet handling, are what a kernel fast
+  path buys back. Measured with the `siphon-rtp-loadgen` harness at 100–2 000 concurrent calls;
   see [Capacity & sizing](docs/capacity.md).
 - **A secure (SRTP) leg adds ~0.5 µs of crypto per packet round-trip** over a plaintext leg.
 
