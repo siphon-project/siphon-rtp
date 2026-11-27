@@ -16,9 +16,14 @@ use crate::engine::{ClientGeneration, ClientId, ControllerAttachError, Engine};
 use crate::metrics::RateLimiter;
 use crate::shutdown::Shutdown;
 
-/// Default per-connection control request cap (requests/second) when none is configured. Generous
-/// for a legitimate SIPhon controller; a hostile flood that exceeds it is rejected, not processed.
-pub const DEFAULT_MAX_CONTROL_RPS: u64 = 200;
+/// Default per-connection control request cap (requests/second) when none is configured.
+///
+/// Sized for a whole SIPhon node on one connection, which is how SIPhon drives an engine: one
+/// connection per engine instance, three requests (`offer`, `answer`, `delete`) per anchored call
+/// and more for re-INVITEs, hold or playback. 5000/s is ~1600 basic anchored calls a second, more
+/// than one node relays. A command costs ~0.15 ms to handle, so a flood held at the cap costs under
+/// one core of control work; anything past it is refused before any work is done.
+pub const DEFAULT_MAX_CONTROL_RPS: u64 = 5000;
 
 /// Accept loop with no control-plane authentication — suitable only for a trusted, private control
 /// network. Use [`serve_with_auth`] to require a shared secret.
@@ -230,6 +235,14 @@ where
                     // one runs off this loop and answers when its dial has, see [`Lanes`].
                     let result = if !rate_limiter.try_acquire() {
                         metrics.record_rate_limited();
+                        if rate_limiter.take_refusal_report() {
+                            tracing::warn!(
+                                cap = max_control_rps,
+                                "control connection over its request rate cap; refusing requests \
+                                 until the next one-second refill (raise --max-control-rps if \
+                                 this is a legitimate controller)"
+                            );
+                        }
                         Some(CmdResult::Error {
                             reason: "rate limit exceeded".to_string(),
                         })
@@ -854,6 +867,159 @@ mod tests {
             let deleted = control.response_to(deleted, bound).await;
             assert!(matches!(deleted, CmdResult::Ok { .. }), "{deleted:?}");
             assert_eq!(engine.session_count(), 1, "only the bystander is left");
+        }
+    }
+
+    /// The default per-connection cap, over the real control connection.
+    ///
+    /// A SIPhon node holds one connection per engine and spends three requests on every anchored
+    /// call (`offer`, `answer`, `delete`), so the default has to carry a whole node's call rate on
+    /// one connection, while still refusing a flood.
+    mod default_rate_cap {
+        use std::io::Write;
+        use std::net::Ipv4Addr;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
+        use siphon_rtp_proto::{frame, CmdResult, Command, Request, Response, Scoped};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::time::timeout;
+
+        use crate::server::{serve, DEFAULT_MAX_CONTROL_RPS};
+        use crate::Engine;
+
+        /// Requests one anchored call costs its controller: `offer`, `answer`, `delete`.
+        const REQUESTS_PER_CALL: u64 = 3;
+        /// Anchored calls per second one controller must be able to drive under the default.
+        const CALLS_PER_SECOND: u64 = 1_500;
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// Send `count` pings back to back on one default-configured connection and return how
+        /// many the rate cap refused. Any answer other than a pong or a rate refusal fails.
+        async fn refused_of(count: u64) -> u64 {
+            let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind control");
+            let addr = listener.local_addr().expect("control addr");
+            tokio::spawn(async move {
+                let _ = serve(engine, listener).await;
+            });
+            let stream = TcpStream::connect(addr).await.expect("connect control");
+            let (mut read_half, mut write_half) = stream.into_split();
+            // Written from its own task so neither side's socket buffer can fill and stall the
+            // other while the answers come back.
+            let writer = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                for id in 0..count {
+                    let request = Scoped::new(
+                        None,
+                        Request {
+                            id,
+                            command: Command::Ping,
+                        },
+                    );
+                    bytes.extend_from_slice(&frame::encode(&request).expect("encode"));
+                }
+                write_half.write_all(&bytes).await.expect("write pings");
+                write_half
+            });
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 65536];
+            let (mut answered, mut refused) = (0u64, 0u64);
+            while answered < count {
+                while let Some((value, consumed)) =
+                    frame::decode::<serde_json::Value>(&buffer).expect("decode frame")
+                {
+                    buffer.drain(..consumed);
+                    if value.get("event").is_some() {
+                        continue;
+                    }
+                    let response: Response = serde_json::from_value(value).expect("response");
+                    answered += 1;
+                    match response.result {
+                        CmdResult::Pong => {}
+                        CmdResult::Error { reason } if reason == "rate limit exceeded" => {
+                            refused += 1;
+                        }
+                        other => panic!("unexpected answer to a ping: {other:?}"),
+                    }
+                }
+                if answered == count {
+                    break;
+                }
+                let read = timeout(Duration::from_secs(10), read_half.read(&mut chunk))
+                    .await
+                    .expect("answers keep coming")
+                    .expect("read control");
+                assert_ne!(
+                    read, 0,
+                    "control connection closed after {answered} answers"
+                );
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            drop(writer.await.expect("writer"));
+            refused
+        }
+
+        #[tokio::test]
+        async fn one_controller_at_a_node_call_rate_is_not_refused_by_default() {
+            let requests = REQUESTS_PER_CALL * CALLS_PER_SECOND;
+            let refused = refused_of(requests).await;
+            assert_eq!(
+                refused, 0,
+                "{requests} requests in one second ({CALLS_PER_SECOND} anchored calls) must fit \
+                 the default cap of {DEFAULT_MAX_CONTROL_RPS}/s"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_flood_past_the_default_cap_is_refused_and_logged_once_not_per_request() {
+            let captured = Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            // Twice the cap plus a margin, in one burst: even if the one-second refill ticks once
+            // while the burst is in flight, at least the margin is refused.
+            let margin = 100;
+            let refused = refused_of(2 * DEFAULT_MAX_CONTROL_RPS + margin).await;
+            assert!(refused >= margin, "a flood is still refused: {refused}");
+
+            let output =
+                String::from_utf8(captured.0.lock().expect("capture").clone()).expect("utf8");
+            let warnings = output
+                .lines()
+                .filter(|line| line.contains("WARN") && line.contains("rate cap"))
+                .count();
+            assert!(
+                (1..=2).contains(&warnings),
+                "one warning per refill window, not one per refused request \
+                 ({refused} refused, {warnings} warnings):\n{output}"
+            );
         }
     }
 }

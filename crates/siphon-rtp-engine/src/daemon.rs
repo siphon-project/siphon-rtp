@@ -170,8 +170,9 @@ pub struct EngineArgs {
     #[arg(long, value_name = "ADDR")]
     pub healthcheck: Option<SocketAddr>,
 
-    /// Per-connection control request cap (requests/second). 0 disables the limit. The default is
-    /// generous for a legitimate SIPhon controller; floods beyond it are rejected, not processed.
+    /// Per-connection control request cap (requests/second). 0 disables the limit. A controller
+    /// drives every call over one connection at three requests per basic anchored call, so the
+    /// default carries ~1600 anchored calls a second; floods beyond it are refused, not processed.
     #[arg(long, default_value_t = server::DEFAULT_MAX_CONTROL_RPS)]
     pub max_control_rps: u64,
 
