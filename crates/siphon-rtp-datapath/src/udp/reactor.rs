@@ -1,11 +1,11 @@
 //! The relay reactor: the threads that receive on every endpoint socket.
 //!
-//! Endpoints are spread over a fixed set of shards (`endpoint id % shards`). Each shard is one OS
-//! thread blocked in a level-triggered [`Epoll`] over its sockets; a wait returns every socket that
-//! has a datagram, and the thread reads **one** datagram from each and runs it through
-//! [`Inner::receive`] synchronously before waiting again. Against a Tokio task per socket this
-//! removes, per packet, the task wake, the reschedule and the readiness bookkeeping, plus the empty
-//! `recvfrom` an edge-triggered loop needs to see `EAGAIN` (see [`super::epoll`]).
+//! Endpoints are spread over a fixed set of shards by a hash of their id (see [`shard_index`]).
+//! Each shard is one OS thread blocked in a level-triggered [`Epoll`] over its sockets; a wait
+//! returns every socket that has a datagram, and the thread reads **one** datagram from each and
+//! runs it through [`Inner::receive`] synchronously before waiting again. Against a Tokio task per
+//! socket this removes, per packet, the task wake, the reschedule and the readiness bookkeeping,
+//! plus the empty `recvfrom` an edge-triggered loop needs to see `EAGAIN` (see [`super::epoll`]).
 //!
 //! The thread owns its sockets' per-packet state (each [`Slot`] and its cached [`Route`]) outright,
 //! so nothing on the packet path is shared with another thread. Control reaches a shard through a
@@ -36,6 +36,11 @@ use crate::EndpointId;
 /// [`Datapath::send`](crate::Datapath::send) can wait out a full send buffer without the Tokio
 /// driver seeing a readiness event per received packet.
 pub(crate) type MediaSocket = tokio::io::unix::AsyncFd<std::net::UdpSocket>;
+
+/// What every relay thread's name starts with (`rtp-relay-0`, `rtp-relay-1`, ...), so a profiler or
+/// a CPU accountant can tell the relay's threads from the runtime's. Short enough that the index
+/// survives the kernel's 15-byte thread-name limit.
+pub const RELAY_THREAD_PREFIX: &str = "rtp-relay-";
 
 /// The token of a shard's own wake socket; endpoint ids are allocated upward from zero.
 const WAKE: u64 = u64::MAX;
@@ -146,7 +151,7 @@ impl Reactor {
 
     fn shard_for(&self, inner: &Arc<Inner>, endpoint: EndpointId) -> io::Result<Arc<Shard>> {
         let threads = self.threads();
-        let index = usize::try_from(endpoint.0 % threads as u64).unwrap_or(0);
+        let index = shard_index(endpoint, threads);
         let mut shards = self
             .shards
             .lock()
@@ -209,7 +214,7 @@ impl Shard {
         });
         let thread_shard = shard.clone();
         let join = std::thread::Builder::new()
-            .name(format!("siphon-rtp-relay-{index}"))
+            .name(format!("{RELAY_THREAD_PREFIX}{index}"))
             .spawn(move || run(&inner, &thread_shard, &command_receiver, &wake_receiver))?;
         Ok((shard, join))
     }
@@ -326,6 +331,22 @@ fn receive_one(inner: &Inner, slot: &mut Slot, buffer: &mut [u8]) -> io::Result<
     Ok(())
 }
 
+/// The shard `endpoint` is relayed on.
+///
+/// Hashed, not `id % threads`: endpoints are allocated in patterns (a leg's RTP endpoint, then its
+/// RTCP one; often both legs of a call back to back), so the ids that carry media form an arithmetic
+/// progression, and a modulus that shares a factor with its stride lands all of them on a subset of
+/// the shards. The Fibonacci multiply scatters any such progression over the high bits, and the
+/// multiply-shift maps those into `0..threads` without the bias a modulus of a hash keeps.
+fn shard_index(endpoint: EndpointId, threads: usize) -> usize {
+    let scattered = endpoint.0.wrapping_mul(FIBONACCI) >> 32;
+    let index = (scattered * threads as u64) >> 32;
+    usize::try_from(index).unwrap_or(0)
+}
+
+/// 2^64 / φ, odd: the multiplier of Fibonacci hashing.
+const FIBONACCI: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// Hashes a slot token (an endpoint id, allocated sequentially) with one multiply. Fibonacci
 /// hashing spreads sequential ids over the high bits the table's control bytes are taken from; the
 /// ids are the backend's own, so there is no attacker-chosen key to defend against.
@@ -339,12 +360,12 @@ impl Hasher for TokenHasher {
 
     fn write(&mut self, bytes: &[u8]) {
         for byte in bytes {
-            self.0 = (self.0.rotate_left(8) ^ u64::from(*byte)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            self.0 = (self.0.rotate_left(8) ^ u64::from(*byte)).wrapping_mul(FIBONACCI);
         }
     }
 
     fn write_u64(&mut self, value: u64) {
-        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = value.wrapping_mul(FIBONACCI);
     }
 }
 
@@ -352,6 +373,40 @@ impl Hasher for TokenHasher {
 mod tests {
     use super::*;
     use std::hash::BuildHasher;
+
+    /// How many of `ids` each of `threads` shards receives.
+    fn spread(ids: impl Iterator<Item = u64>, threads: usize) -> Vec<usize> {
+        let mut per_shard = vec![0; threads];
+        for id in ids {
+            per_shard[shard_index(EndpointId(id), threads)] += 1;
+        }
+        per_shard
+    }
+
+    #[test]
+    fn the_busy_half_of_paired_endpoints_reaches_every_shard() {
+        // A leg allocates its RTP endpoint and then its RTCP one, so media lives on every other id
+        // (and on every fourth when both legs of a call are allocated together). `id % threads`
+        // put all of it on the even shards and left the odd ones relaying RTCP: half the relay
+        // threads saturated, their sockets overflowed, the other half idled.
+        for threads in [2usize, 3, 4, 6, 8, 12, 24] {
+            for stride in [2u64, 4] {
+                let per_shard = spread((0..12_000u64).step_by(stride as usize), threads);
+                let mean = per_shard.iter().sum::<usize>() as f64 / threads as f64;
+                for (shard, count) in per_shard.iter().enumerate() {
+                    assert!(
+                        (*count as f64) > mean * 0.8 && (*count as f64) < mean * 1.2,
+                        "{threads} threads, stride {stride}: shard {shard} got {count} of mean {mean}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_thread_takes_every_endpoint() {
+        assert_eq!(spread(0..100, 1), vec![100]);
+    }
 
     #[test]
     fn sequential_tokens_hash_to_distinct_high_bits() {

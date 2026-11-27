@@ -63,6 +63,23 @@ pub struct CpuSample {
 }
 
 impl CpuSample {
+    /// CPU time for every thread whose name starts with any of `prefixes`, summed: the engine's
+    /// runtime plus the datapath's relay threads, which do the per-packet work.
+    #[must_use]
+    pub fn bucket_starting_with_any(&self, prefixes: &[&str]) -> CpuTime {
+        prefixes
+            .iter()
+            .map(|prefix| self.bucket_starting_with(prefix))
+            .fold(CpuTime::default(), |accumulated, time| CpuTime {
+                user_microseconds: accumulated
+                    .user_microseconds
+                    .saturating_add(time.user_microseconds),
+                system_microseconds: accumulated
+                    .system_microseconds
+                    .saturating_add(time.system_microseconds),
+            })
+    }
+
     /// CPU time for every thread whose name starts with `prefix`, summed.
     ///
     /// A prefix rather than an exact match because tokio may suffix worker threads, and because it
@@ -202,6 +219,28 @@ mod tests {
         assert!(parse_stat("1234 (short) R 1 2 3").is_none());
         // Non-numeric where a tick count belongs.
         assert!(parse_stat("1 (x) R 1 1 1 0 -1 0 0 0 0 0 abc def 0 0 20 0 1 0 0 0 0").is_none());
+    }
+
+    #[test]
+    fn sums_buckets_over_several_prefixes_without_counting_a_thread_twice() {
+        let mut buckets = BTreeMap::new();
+        for (name, user) in [
+            ("sr-engine", 100),
+            ("rtp-relay-0", 30),
+            ("rtp-relay-1", 20),
+            ("sr-loadgen", 7),
+        ] {
+            buckets.insert(
+                name.to_string(),
+                CpuTime {
+                    user_microseconds: user,
+                    system_microseconds: 0,
+                },
+            );
+        }
+        let sample = CpuSample { buckets };
+        let engine = sample.bucket_starting_with_any(&["sr-engine", "rtp-relay-"]);
+        assert_eq!(engine.user_microseconds, 150);
     }
 
     #[test]

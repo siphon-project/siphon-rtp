@@ -27,6 +27,7 @@ use crate::{
     SourceLatchVerdict,
 };
 pub(crate) use reactor::MediaSocket;
+pub use reactor::RELAY_THREAD_PREFIX;
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
 /// leaves headroom without paying for jumbo frames the media plane never sees.
