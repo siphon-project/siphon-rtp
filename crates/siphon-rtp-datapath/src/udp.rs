@@ -8,7 +8,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
@@ -16,6 +16,7 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
 use crate::dscp::Dscp;
+use crate::udp::route::Route;
 use crate::udp_relay::{
     emit, is_data_indication, relay_egress, relay_unwrap, RelayEgress, RelayIngress,
 };
@@ -37,6 +38,8 @@ const MAX_DATAGRAM: usize = 2048;
 /// absolute tick, only differences), so making it one costs nothing and keeps the sentinel exact.
 const FIRST_TICK: u64 = 1;
 
+mod route;
+
 /// Lock-free per-endpoint counters, mutated from the endpoint's single receive task and snapshotted
 /// by `stats`.
 struct StatsAtomic {
@@ -56,6 +59,9 @@ struct StatsAtomic {
     /// written only by the endpoint's single receive task (`recv_loop` awaits each `dispatch` before
     /// the next `recv_from`), so a plain `Relaxed` load/store carries no read-modify-write race.
     last_rtp_seq: AtomicU64,
+    /// Bumped by every control write that changes what a receive task's cached [`Route`] reads
+    /// about this endpoint (`Inner::touch`), so the route is resolved again on the next packet.
+    generation: AtomicU64,
 }
 
 impl Default for StatsAtomic {
@@ -71,6 +77,7 @@ impl Default for StatsAtomic {
             // No RTP sequence observed yet — the loss estimate establishes its baseline on the first
             // accepted media packet, not on a spurious 0 -> first-seq gap.
             last_rtp_seq: AtomicU64::new(siphon_rtp_ebpf_common::loss::RTP_SEQ_NONE),
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -246,20 +253,19 @@ struct Inner {
 }
 
 impl Inner {
-    /// Apply the installed flow to one received datagram. Holds no map guard across an `.await`.
+    /// Apply the installed flow to one received datagram, as `route` resolved it. Holds no map guard
+    /// across an `.await`.
     async fn dispatch(
         &self,
         endpoint: EndpointId,
         source: SocketAddr,
         payload: &[u8],
         in_stats: &StatsAtomic,
+        route: &Route,
     ) {
-        let action = match self.flows.get(&endpoint) {
-            Some(action) => *action,
-            None => {
-                in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+        let Some(action) = route.flow else {
+            in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
         };
         match action {
             FlowAction::Forward(rule) => {
@@ -272,7 +278,7 @@ impl Inner {
                 // Layer 4 — ICE supersedes blind latching (docs/security-and-nat.md §4 layer 4;
                 // RFC 8445 §7). On an ICE endpoint the signalled-source gate (layer 2) and the SSRC
                 // re-latch (layer 3) are subsumed by the authenticated connectivity check.
-                match self.ice_gate(endpoint, source) {
+                match ice_gate(route, source) {
                     IceGate::Reject => {
                         in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                         return;
@@ -291,8 +297,12 @@ impl Inner {
                         // carries the same RTP SSRC (a genuine NAT rebind), never a hijack spray.
                         // (docs/security-and-nat.md §4 layer 3; RFC 3550 §8.)
                         if rule.latch != LatchPolicy::Off
-                            && self.update_latch(endpoint, source, rtp_media_ssrc(payload))
-                                == LatchOutcome::Reject
+                            && self.update_latch(
+                                endpoint,
+                                route.latch,
+                                source,
+                                rtp_media_ssrc(payload),
+                            ) == LatchOutcome::Reject
                         {
                             in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                             return;
@@ -339,37 +349,36 @@ impl Inner {
 
                 // Forward toward the peer endpoint: prefer its latched source (symmetric RTP) over
                 // its configured destination; drop if neither resolves (never forward into the void).
-                let destination = self
-                    .latched
-                    .get(&rule.out_endpoint)
-                    .map(|latch| latch.source)
-                    .or(rule.out_dst);
-                let Some(destination) = destination else {
+                // A removed out leg (no entry, or its socket already closed) sends nothing.
+                let Some(out) = &route.out else {
                     in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
-                let out = match self.endpoints.get(&rule.out_endpoint) {
-                    Some(entry) => (entry.socket.clone(), entry.stats.clone()),
-                    None => {
-                        in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
+                let Some(destination) = out.latched.or(rule.out_dst) else {
+                    in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                let Some(socket) = out.socket.upgrade() else {
+                    in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
                 };
                 // RFC 8656 §11.1 / §12: a destination behind the out leg's allocation is reached
                 // through the TURN server, so it goes out framed and addressed to the server, the
                 // same framing `send` applies. Free when no allocation is installed.
-                let egress = if self.turn_relay_count.load(Ordering::Relaxed) == 0 {
-                    RelayEgress::Direct
-                } else {
+                let egress = if out.turn {
                     match self.turn_relay.get(&rule.out_endpoint) {
                         Some(relay) => relay_egress(&relay, destination, payload),
                         None => RelayEgress::Direct,
                     }
+                } else {
+                    RelayEgress::Direct
                 };
-                match emit(&out.0, egress, destination, payload).await {
+                match emit(&socket, egress, destination, payload).await {
                     Ok(sent) => {
-                        out.1.packets_out.fetch_add(1, Ordering::Relaxed);
-                        out.1.bytes_out.fetch_add(sent as u64, Ordering::Relaxed);
+                        out.stats.packets_out.fetch_add(1, Ordering::Relaxed);
+                        out.stats
+                            .bytes_out
+                            .fetch_add(sent as u64, Ordering::Relaxed);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         // A stalled TURN stream sheds media instead of queueing it.
@@ -409,7 +418,7 @@ impl Inner {
                 // and a TURN allocation's own STUN must reach its client (RFC 5766 §11). STUN never
                 // reaches this arm on an ICE endpoint: `recv_loop` hands it to the responder or the
                 // full agent first, which is what lets a check through and lets the latch form.
-                if self.ice_gate(endpoint, source) == IceGate::Reject {
+                if ice_gate(route, source) == IceGate::Reject {
                     in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -429,35 +438,6 @@ impl Inner {
             FlowAction::Drop => {
                 in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
             }
-        }
-    }
-
-    /// The layer-4 ICE verdict for one datagram arriving on `endpoint` from `source`
-    /// (docs/security-and-nat.md §4 layer 4; RFC 8445 §7).
-    ///
-    /// On an endpoint carrying ICE credentials the connectivity-check responder ([`handle_stun`]) —
-    /// or, for a full RFC 8445 agent, the engine through [`Datapath::adopt_source`] — is the **only**
-    /// thing that adopts a media source. Traffic is accepted only from that adopted source: nothing
-    /// before a check has validated one, and nothing from a different source afterwards, so an ICE
-    /// leg never blind-latches its first sender the way a plain relay's layer 3 may. The signalled
-    /// address is deliberately not consulted; a peer-reflexive candidate legitimately sends from a
-    /// transport the SDP never carried (RFC 8445 §7.3.1.3).
-    ///
-    /// One definition, consulted by both delivery paths — the in-kernel-style relay
-    /// ([`FlowAction::Forward`]) and the userspace slow path ([`FlowAction::Redirect`]) — so the two
-    /// cannot drift on what an ICE leg is allowed to receive.
-    fn ice_gate(&self, endpoint: EndpointId, source: SocketAddr) -> IceGate {
-        if !self.ice.contains_key(&endpoint) {
-            return IceGate::NotIce;
-        }
-        if self
-            .latched
-            .get(&endpoint)
-            .is_some_and(|latch| latch.source == source)
-        {
-            IceGate::Accept
-        } else {
-            IceGate::Reject
         }
     }
 
@@ -514,22 +494,32 @@ impl Inner {
         }
     }
 
+    /// Mark `endpoint` written, so every receive task's [`Route`] that reads it (its own, and the
+    /// peer leg's that forwards through it) is resolved again on its next packet. Called after the
+    /// write it announces, never before, so a route resolved past this bump sees the new state.
+    fn touch(&self, endpoint: EndpointId) {
+        if let Some(entry) = self.endpoints.get(&endpoint) {
+            entry.stats.generation.fetch_add(1, Ordering::Release);
+        }
+    }
+
     /// Apply the SSRC-consistent latch ([`source_latch_verdict`]) to a packet arriving on `endpoint`
     /// from `source`, storing what it learns. Returns [`LatchOutcome::Reject`] for a likely hijack (a
     /// new source that cannot prove it is the latched stream); the caller then drops it.
-    /// (docs/security-and-nat.md §4 layer 3.)
+    /// `current` is the latch the receive task's route holds. (docs/security-and-nat.md §4 layer 3.)
     fn update_latch(
         &self,
         endpoint: EndpointId,
+        current: Option<SourceLatch<SocketAddr>>,
         source: SocketAddr,
         ssrc: Option<u32>,
     ) -> LatchOutcome {
-        // Copy the current latch out and drop the read guard before any insert (no re-entrant lock).
-        let current = self.latched.get(&endpoint).map(|latch| *latch);
         match source_latch_verdict(current, source, ssrc) {
             SourceLatchVerdict::Keep => LatchOutcome::Accept,
             SourceLatchVerdict::Learn(latch) => {
                 self.latched.insert(endpoint, latch);
+                // Both legs' routes read this latch (the reply destination is the peer's latch).
+                self.touch(endpoint);
                 LatchOutcome::Accept
             }
             SourceLatchVerdict::Reject => LatchOutcome::Reject,
@@ -537,11 +527,39 @@ impl Inner {
     }
 }
 
-impl Drop for Inner {
+/// The layer-4 ICE verdict for one datagram arriving on `endpoint` from `source`
+/// (docs/security-and-nat.md §4 layer 4; RFC 8445 §7).
+///
+/// On an endpoint carrying ICE credentials the connectivity-check responder ([`handle_stun`]) —
+/// or, for a full RFC 8445 agent, the engine through [`Datapath::adopt_source`] — is the **only**
+/// thing that adopts a media source. Traffic is accepted only from that adopted source: nothing
+/// before a check has validated one, and nothing from a different source afterwards, so an ICE
+/// leg never blind-latches its first sender the way a plain relay's layer 3 may. The signalled
+/// address is deliberately not consulted; a peer-reflexive candidate legitimately sends from a
+/// transport the SDP never carried (RFC 8445 §7.3.1.3).
+///
+/// One definition, consulted by both delivery paths — the in-kernel-style relay
+/// ([`FlowAction::Forward`]) and the userspace slow path ([`FlowAction::Redirect`]) — so the two
+/// cannot drift on what an ICE leg is allowed to receive. Read from the receive task's [`Route`].
+fn ice_gate(route: &Route, source: SocketAddr) -> IceGate {
+    if !route.ice {
+        return IceGate::NotIce;
+    }
+    if route.latch.is_some_and(|latch| latch.source == source) {
+        IceGate::Accept
+    } else {
+        IceGate::Reject
+    }
+}
+
+/// Ends every receive task when the last [`UdpLoopbackDatapath`] handle is dropped. The tasks hold
+/// the backend strongly (see [`recv_loop`]) and are parked on `recv_from` with no way to notice
+/// teardown, so aborting them is what lets the backend, its sockets and its maps go.
+struct Teardown(Arc<Inner>);
+
+impl Drop for Teardown {
     fn drop(&mut self) {
-        // The receive tasks hold only a `Weak<Inner>`, so they are parked on `recv_from` with no
-        // way to notice teardown — abort them explicitly.
-        for entry in self.endpoints.iter() {
+        for entry in self.0.endpoints.iter() {
             entry.value().task.abort();
         }
     }
@@ -551,6 +569,8 @@ impl Drop for Inner {
 #[derive(Clone)]
 pub struct UdpLoopbackDatapath {
     inner: Arc<Inner>,
+    /// Shared by every clone of this handle; dropping the last one tears the backend down.
+    _teardown: Arc<Teardown>,
 }
 
 impl Default for UdpLoopbackDatapath {
@@ -624,31 +644,33 @@ impl UdpLoopbackDatapath {
     fn build(bind_ip: IpAddr, max_endpoints: usize, port_range: Option<(u16, u16)>) -> Self {
         let (redirect_tx, redirect_rx) = flume::unbounded();
         let (observe_tx, observe_rx) = flume::bounded(256);
+        let inner = Arc::new(Inner {
+            next_id: AtomicU64::new(0),
+            clock: AtomicU64::new(FIRST_TICK),
+            live: AtomicUsize::new(0),
+            max_endpoints,
+            bind_ip,
+            dscp: AtomicU8::new(Dscp::DEFAULT.value()),
+            ports: port_range.map(|(min, max)| PortAllocator::new(min, max)),
+            endpoints: DashMap::new(),
+            flows: DashMap::new(),
+            latched: DashMap::new(),
+            ice: DashMap::new(),
+            ice_nominated: DashMap::new(),
+            turn_relay: DashMap::new(),
+            turn_relay_count: AtomicUsize::new(0),
+            ice_events: DashMap::new(),
+            ice_forward_only: DashMap::new(),
+            ice_validated: DashMap::new(),
+            redirect_tx,
+            redirect_rx,
+            observe_enabled: AtomicBool::new(false),
+            observe_tx,
+            observe_rx,
+        });
         Self {
-            inner: Arc::new(Inner {
-                next_id: AtomicU64::new(0),
-                clock: AtomicU64::new(FIRST_TICK),
-                live: AtomicUsize::new(0),
-                max_endpoints,
-                bind_ip,
-                dscp: AtomicU8::new(Dscp::DEFAULT.value()),
-                ports: port_range.map(|(min, max)| PortAllocator::new(min, max)),
-                endpoints: DashMap::new(),
-                flows: DashMap::new(),
-                latched: DashMap::new(),
-                ice: DashMap::new(),
-                ice_nominated: DashMap::new(),
-                turn_relay: DashMap::new(),
-                turn_relay_count: AtomicUsize::new(0),
-                ice_events: DashMap::new(),
-                ice_forward_only: DashMap::new(),
-                ice_validated: DashMap::new(),
-                redirect_tx,
-                redirect_rx,
-                observe_enabled: AtomicBool::new(false),
-                observe_tx,
-                observe_rx,
-            }),
+            _teardown: Arc::new(Teardown(inner.clone())),
+            inner,
         }
     }
 
@@ -824,7 +846,7 @@ impl UdpLoopbackDatapath {
         let id = EndpointId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let stats = Arc::new(StatsAtomic::default());
         let task = tokio::spawn(recv_loop(
-            Arc::downgrade(&self.inner),
+            self.inner.clone(),
             id,
             socket.clone(),
             stats.clone(),
@@ -952,6 +974,7 @@ async fn handle_stun(
             inner
                 .latched
                 .insert(endpoint, SourceLatch { source, ssrc: None });
+            inner.touch(endpoint);
             inner.publish_ice_validated(endpoint);
         }
     }
@@ -981,15 +1004,23 @@ impl Inner {
     /// the ICE-lite responder, and the installed flow. Shared by the UDP receive loop and by
     /// [`Datapath::ingest_relayed`], so a datagram that reached us over a TURN stream passes the
     /// same ICE gate, source gate, latch, stats and flows as one that arrived on the socket.
+    ///
+    /// `route` is the caller's cached [`Route`] for `endpoint`, refreshed here when stale.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one datagram's context, passed by reference rather than bundled per packet"
+    )]
     async fn receive(
         &self,
         endpoint: EndpointId,
         socket: &UdpSocket,
         stats: &StatsAtomic,
+        route: &mut Option<Route>,
         source: SocketAddr,
         buffer: &mut [u8],
         len: usize,
     ) {
+        let route = Route::current(route, self, endpoint, stats);
         // RFC 5766 §11 de-encapsulation, **before every other layer**. On a leg relaying through a
         // TURN allocation the peer's traffic arrives from the TURN server wrapped in ChannelData, so
         // unwrapping here — and rewriting the source back to the peer the channel belongs to — is
@@ -999,7 +1030,11 @@ impl Inner {
         // Scoped to datagrams actually from the allocation's server: ChannelData-shaped bytes from
         // anywhere else are left alone, so this can never be used to spoof a peer address.
         let ingress = {
-            let relay = self.turn_relay.get(&endpoint);
+            let relay = if route.turn {
+                self.turn_relay.get(&endpoint)
+            } else {
+                None
+            };
             relay_unwrap(relay.as_deref(), source, &buffer[..len])
         };
         let (payload_range, source) = match ingress {
@@ -1057,19 +1092,25 @@ impl Inner {
             // media `Forward` endpoint still drops non-RTP inside `dispatch` (the layer-1 demux), so
             // this never lets STUN reach the media latch.
         }
-        self.dispatch(endpoint, source, &buffer[..len], stats).await;
+        self.dispatch(endpoint, source, &buffer[..len], stats, route)
+            .await;
     }
 }
 
 /// Per-endpoint receive loop: drain the socket and apply the installed flow (which gates the source
 /// and latches it per policy — see [`Inner::dispatch`]).
+///
+/// Holds the backend strongly: a per-packet `Weak::upgrade` is a read-modify-write on the one
+/// reference count every receive task shares. [`Teardown`] aborts the task when the last handle
+/// goes, which is what releases the backend.
 async fn recv_loop(
-    inner: Weak<Inner>,
+    inner: Arc<Inner>,
     endpoint: EndpointId,
     socket: Arc<UdpSocket>,
     stats: Arc<StatsAtomic>,
 ) {
     let mut buffer = vec![0u8; MAX_DATAGRAM];
+    let mut route = None;
     loop {
         let (len, source) = match socket.recv_from(&mut buffer).await {
             Ok(received) => received,
@@ -1081,12 +1122,16 @@ async fn recv_loop(
         stats.packets_in.fetch_add(1, Ordering::Relaxed);
         stats.bytes_in.fetch_add(len as u64, Ordering::Relaxed);
 
-        let Some(inner) = inner.upgrade() else {
-            return;
-        };
-
         inner
-            .receive(endpoint, &socket, &stats, source, &mut buffer, len)
+            .receive(
+                endpoint,
+                &socket,
+                &stats,
+                &mut route,
+                source,
+                &mut buffer,
+                len,
+            )
             .await;
     }
 }
@@ -1127,16 +1172,24 @@ impl Datapath for UdpLoopbackDatapath {
         let previous = self.inner.flows.insert(endpoint, action);
         if let FlowAction::Forward(rule) = action {
             self.inner.forget_stale_latches(endpoint, previous, &rule);
+            // `forget_stale_latches` may have dropped the peer's latch, which the peer's route reads.
+            self.inner.touch(rule.out_endpoint);
         }
+        self.inner.touch(endpoint);
         Ok(())
     }
 
     fn remove_flow(&self, endpoint: EndpointId) {
         self.inner.flows.remove(&endpoint);
+        self.inner.touch(endpoint);
     }
 
     async fn remove_endpoint(&self, endpoint: EndpointId) {
+        // The entry is gone from the map before the per-endpoint state below, so `touch` cannot find
+        // it: keep its counters to announce the removal to every route that forwards through it.
+        let mut removed_stats = None;
         if let Some((_, entry)) = self.inner.endpoints.remove(&endpoint) {
+            removed_stats = Some(entry.stats.clone());
             // Release the range port back to the pool (if a range is configured), reading the bound
             // port off the socket before it is dropped, so the port can be re-allocated.
             if let Some(pool) = &self.inner.ports {
@@ -1162,6 +1215,9 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner.ice_validated.remove(&endpoint);
         if self.inner.turn_relay.remove(&endpoint).is_some() {
             self.inner.turn_relay_count.fetch_sub(1, Ordering::Relaxed);
+        }
+        if let Some(stats) = removed_stats {
+            stats.generation.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -1256,8 +1312,18 @@ impl Datapath for UdpLoopbackDatapath {
             .bytes_in
             .fetch_add(frame.len() as u64, Ordering::Relaxed);
         let mut buffer = frame.to_vec();
+        // A stream frame is not on the receive task, so it resolves a route of its own.
+        let mut route = None;
         self.inner
-            .receive(endpoint, &socket, &stats, server, &mut buffer, frame.len())
+            .receive(
+                endpoint,
+                &socket,
+                &stats,
+                &mut route,
+                server,
+                &mut buffer,
+                frame.len(),
+            )
             .await;
         true
     }
@@ -1275,6 +1341,7 @@ impl Datapath for UdpLoopbackDatapath {
                 }
             }
         }
+        self.inner.touch(endpoint);
     }
 
     fn turn_relay(&self, endpoint: EndpointId) -> Option<crate::TurnRelay> {
@@ -1313,6 +1380,7 @@ impl Datapath for UdpLoopbackDatapath {
                 self.inner.ice_validated.remove(&endpoint);
             }
         }
+        self.inner.touch(endpoint);
     }
 
     fn set_ice_agent(
@@ -1335,6 +1403,7 @@ impl Datapath for UdpLoopbackDatapath {
                 self.inner.ice_forward_only.insert(endpoint, ());
             }
         }
+        self.inner.touch(endpoint);
     }
 
     fn adopt_source(&self, endpoint: EndpointId, source: SocketAddr) {
@@ -1343,6 +1412,7 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner
             .latched
             .insert(endpoint, SourceLatch { source, ssrc: None });
+        self.inner.touch(endpoint);
         self.inner.publish_ice_validated(endpoint);
     }
 
@@ -4310,5 +4380,295 @@ mod tests {
         datapath.remove_endpoint(endpoint.id).await;
         datapath.note_dropped(endpoint.id);
         assert!(datapath.stats(endpoint.id).is_none());
+    }
+
+    // --- The receive loop's cached route (`udp/route.rs`) ---------------------------------------
+    //
+    // Each receive task resolves what its endpoint's flow needs once and reuses it until a control
+    // write moves either endpoint. These tests change that state *after* media has flowed, so the
+    // route is already cached, and require the very next packet to see the change.
+
+    /// What `at` receives within [`NEGATIVE`], or `None` when nothing arrives.
+    async fn delivered(at: &UdpSocket) -> Option<(Vec<u8>, SocketAddr)> {
+        let mut buffer = [0u8; MAX_DATAGRAM];
+        match timeout(NEGATIVE, at.recv_from(&mut buffer)).await {
+            Ok(Ok((len, from))) => Some((buffer[..len].to_vec(), from)),
+            _ => None,
+        }
+    }
+
+    /// A rule with no gate and no latch, so only the flow, the ICE gate and the out leg decide.
+    fn open_rule(out_endpoint: EndpointId, out_dst: SocketAddr) -> ForwardRule {
+        ForwardRule {
+            out_endpoint,
+            out_dst: Some(out_dst),
+            accepted_source: SourceFilter::Any,
+            latch: LatchPolicy::Off,
+            rtcp_to_userspace: false,
+        }
+    }
+
+    /// Wait until `endpoint` has counted `count` drops: a dropped packet leaves nothing to receive.
+    async fn dropped_reaches(datapath: &UdpLoopbackDatapath, endpoint: EndpointId, count: u64) {
+        timeout(SHORT, async {
+            while datapath
+                .stats(endpoint)
+                .map_or(0, |stats| stats.packets_dropped)
+                < count
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the drop was counted");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flow_replaced_after_media_flowed_applies_to_the_next_packet() {
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let other = datapath.alloc_endpoint().await.expect("alloc other");
+        let (caller, _) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        let (third, third_addr) = phone().await;
+        datapath
+            .install_flow(near.id, FlowAction::Forward(open_rule(far.id, callee_addr)))
+            .expect("flow");
+        caller
+            .send_to(&rtp(1, 1), near.local_addr)
+            .await
+            .expect("send");
+        assert_eq!(recv(&callee).await.0, rtp(1, 1));
+
+        datapath
+            .install_flow(near.id, FlowAction::Drop)
+            .expect("drop");
+        caller
+            .send_to(&rtp(1, 2), near.local_addr)
+            .await
+            .expect("send");
+        dropped_reaches(&datapath, near.id, 1).await;
+        assert!(
+            delivered(&callee).await.is_none(),
+            "a Drop flow forwards nothing"
+        );
+
+        datapath
+            .install_flow(
+                near.id,
+                FlowAction::Forward(open_rule(other.id, third_addr)),
+            )
+            .expect("re-point");
+        caller
+            .send_to(&rtp(1, 3), near.local_addr)
+            .await
+            .expect("send");
+        let (data, from) = recv(&third).await;
+        assert_eq!(data, rtp(1, 3));
+        assert_eq!(from, other.local_addr, "leaves through the new out leg");
+        assert!(delivered(&callee).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_armed_after_media_flowed_gates_the_next_packet() {
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (caller, _) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        datapath
+            .install_flow(near.id, FlowAction::Forward(open_rule(far.id, callee_addr)))
+            .expect("flow");
+        caller
+            .send_to(&rtp(1, 1), near.local_addr)
+            .await
+            .expect("send");
+        assert_eq!(recv(&callee).await.0, rtp(1, 1));
+
+        // Credentials arrive (an ICE re-offer): from now on only a check-validated source passes,
+        // and the caller has validated nothing (docs/security-and-nat.md §4 layer 4).
+        datapath.set_ice(
+            near.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        caller
+            .send_to(&rtp(1, 2), near.local_addr)
+            .await
+            .expect("send");
+        dropped_reaches(&datapath, near.id, 1).await;
+        assert!(
+            delivered(&callee).await.is_none(),
+            "no validated source yet"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_peer_relatching_after_media_flowed_moves_the_reply_destination() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (phone_a, _) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(addr_b))),
+            )
+            .expect("flow a");
+        datapath
+            .install_flow(
+                leg_b.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_a.id, None)),
+            )
+            .expect("flow b");
+        phone_a
+            .send_to(&rtp(0xA, 1), leg_a.local_addr)
+            .await
+            .expect("a");
+        assert_eq!(recv(&phone_b).await.0, rtp(0xA, 1));
+        phone_b
+            .send_to(&rtp(0xB, 1), leg_b.local_addr)
+            .await
+            .expect("b");
+        assert_eq!(recv(&phone_a).await.0, rtp(0xB, 1));
+
+        // A's NAT rebinds: same SSRC from a new port, so leg A re-latches (RFC 3550 §8). leg B's
+        // receive task resolved its destination from A's old latch and must follow the move.
+        let (rebound, _) = phone().await;
+        rebound
+            .send_to(&rtp(0xA, 2), leg_a.local_addr)
+            .await
+            .expect("a");
+        assert_eq!(recv(&phone_b).await.0, rtp(0xA, 2));
+        phone_b
+            .send_to(&rtp(0xB, 2), leg_b.local_addr)
+            .await
+            .expect("b");
+        assert_eq!(
+            recv(&rebound).await.0,
+            rtp(0xB, 2),
+            "the reply follows the re-latch"
+        );
+        assert!(
+            delivered(&phone_a).await.is_none(),
+            "nothing to the old binding"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_relay_set_on_the_peer_after_media_flowed_wraps_the_next_packet() {
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (caller, _) = phone().await;
+        let (peer, peer_addr) = phone().await;
+        datapath
+            .install_flow(near.id, FlowAction::Forward(open_rule(far.id, peer_addr)))
+            .expect("flow");
+        caller
+            .send_to(&rtp(1, 1), near.local_addr)
+            .await
+            .expect("send");
+        assert_eq!(
+            recv(&peer).await.0,
+            rtp(1, 1),
+            "direct before the allocation"
+        );
+
+        // ICE selects a relayed candidate on the far leg (RFC 8656 §12).
+        let (server, relay, channel) = turn_relay_for(peer_addr).await;
+        datapath.set_turn_relay(far.id, Some(relay));
+        caller
+            .send_to(&rtp(1, 2), near.local_addr)
+            .await
+            .expect("send");
+        let (wire, _) = recv(&server).await;
+        let framed = siphon_rtp_stun::turn::parse_channel_data(&wire).expect("ChannelData");
+        assert_eq!(framed.channel, channel);
+        assert_eq!(framed.data, &rtp(1, 2)[..]);
+        assert!(
+            delivered(&peer).await.is_none(),
+            "never direct once relayed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_the_peer_after_media_flowed_drops_and_frees_its_port_at_once() {
+        // `remove_endpoint` promises the OS socket is closed when it returns (a same-port HA restore
+        // re-binds it straight away), so no other leg's cached route may keep it open.
+        let datapath =
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 41300, 41310);
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (caller, _) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        datapath
+            .install_flow(near.id, FlowAction::Forward(open_rule(far.id, callee_addr)))
+            .expect("flow");
+        caller
+            .send_to(&rtp(1, 1), near.local_addr)
+            .await
+            .expect("send");
+        assert_eq!(recv(&callee).await.0, rtp(1, 1));
+
+        datapath.remove_endpoint(far.id).await;
+        let restored = datapath
+            .alloc_specific(AddressFamily::V4, far.local_addr.port())
+            .await
+            .expect("the removed port re-binds immediately");
+        assert_eq!(restored.local_addr.port(), far.local_addr.port());
+
+        caller
+            .send_to(&rtp(1, 2), near.local_addr)
+            .await
+            .expect("send");
+        dropped_reaches(&datapath, near.id, 1).await;
+        assert!(
+            delivered(&callee).await.is_none(),
+            "the removed leg sends nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_last_handle_ends_every_receive_task_and_frees_the_backend() {
+        let datapath = UdpLoopbackDatapath::new();
+        let near = datapath.alloc_endpoint().await.expect("alloc near");
+        let far = datapath.alloc_endpoint().await.expect("alloc far");
+        let (caller, _) = phone().await;
+        let (callee, callee_addr) = phone().await;
+        datapath
+            .install_flow(near.id, FlowAction::Forward(open_rule(far.id, callee_addr)))
+            .expect("flow");
+        let backend = Arc::downgrade(&datapath.inner);
+
+        // A clone keeps the backend running: only the last handle tears it down.
+        let clone = datapath.clone();
+        drop(datapath);
+        caller
+            .send_to(&rtp(1, 1), near.local_addr)
+            .await
+            .expect("send");
+        assert_eq!(recv(&callee).await.0, rtp(1, 1), "still relaying");
+
+        drop(clone);
+        timeout(SHORT, async {
+            while backend.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("every receive task released the backend");
+        caller
+            .send_to(&rtp(1, 2), near.local_addr)
+            .await
+            .expect("send");
+        assert!(
+            delivered(&callee).await.is_none(),
+            "nothing relays after teardown"
+        );
     }
 }
