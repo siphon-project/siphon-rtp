@@ -178,6 +178,8 @@ pub struct FileConfig {
     /// Userspace relay threads (`--relay-threads`); unset = one per CPU this process may run on.
     /// Zero is refused: a relay with no threads relays nothing.
     pub relay_threads: Option<std::num::NonZeroUsize>,
+    /// Relay batching window in microseconds (`--relay-batch-window-us`); `0` turns it off.
+    pub relay_batch_window_us: Option<u64>,
     /// DiffServ code point stamped on outbound media (`--media-dscp`). A name (`EF`, `CS3`, `AF41`,
     /// `VA`, `BE`, …) or a raw `0`-`63`; defaults to `EF`. `BE`/`0` disables marking.
     #[serde(default, deserialize_with = "deserialize_media_dscp")]

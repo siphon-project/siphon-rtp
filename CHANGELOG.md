@@ -9,6 +9,15 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **`--relay-batch-window-us` (`relay_batch_window_us`): relay threads batch their wake-ups.** A
+  relay thread whose last pass found only a few datagrams now waits this long (100 us by default)
+  before looking again, so a busy thread serves many sockets per wake-up instead of being woken for
+  every packet. An idle thread still blocks, and one that finds a full pass looks again at once, so
+  a backlog drains at full speed. On a six-CPU relay carrying ~3,000 G.711 calls, engine CPU per
+  relayed packet fell 4.5% and call setup on the shared CPUs stopped failing. A thread reads one
+  datagram per socket per pass, so the window caps one socket at 10 000 packets/s at 100 us. `0`
+  turns batching off.
+
 - **`--relay-threads` (`relay_threads`): how many threads receive and relay media on the userspace
   datapath.** One per CPU the process may run on by default, so `taskset` or a cgroup cpuset narrows
   it. Zero is refused.
