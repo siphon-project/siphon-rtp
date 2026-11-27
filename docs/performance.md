@@ -5,10 +5,11 @@ to confirm it did something. For *how many calls fit on a box* — the measured 
 arithmetic — read [Capacity & sizing](capacity.md) first; this page assumes you have a box and want
 more out of it.
 
-One result shapes everything below. Profiled at 100 000 packets per second, **the engine's own relay
-logic is 0.04 % of the cost** and Tokio is 0.15 %: the flow lookup, signalled-source gate, latch check
-and loss counter together round to nothing. Every figure worth chasing on a relay node is in the
-kernel or in the host's configuration, not in this codebase.
+One result shapes everything below. Profiled at about 320 000 relayed packets per second, **close to
+90 % of a relayed packet's cost is kernel time** and the engine's own code is about 11 %. Most figures
+worth chasing on a relay node are in the kernel or in the host's configuration (connection tracking,
+the LSM, socket buffers), not in this codebase. See
+[Capacity & sizing](capacity.md#where-the-time-actually-goes).
 
 - [Before you turn anything](#before-you-turn-anything)
 - [Host: file descriptors](#host-file-descriptors)
@@ -205,7 +206,7 @@ busiest workers, and keep the engine off the cores handling ingress softirqs.
 ## Engine: the settings that matter
 
 **`rtcp-mux` (RFC 5761) is the one free win.** It halves both the descriptor count and the number of
-receive tasks per call. Worth treating as a capacity lever, not only an interop flag.
+sockets each relay thread watches per call. Worth treating as a capacity lever, not only an interop flag.
 
 **A bounded media port range** (`--port-min`/`--port-max`) costs nothing and buys a firewallable media
 plane plus the option of warm-standby restore. Size it for concurrency at up to 4 ports per call, 2
@@ -282,11 +283,12 @@ but that is work which has to happen somewhere rather than overhead waiting to b
 
 - Raise `nofile` before anything else, and verify it on the running process rather than in the config.
 - Exempt the media range from connection tracking, after checking all three pre-flight conditions.
-- Turn on `rtcp-mux` where the peers support it: half the sockets, half the tasks, no downside.
+- Turn on `rtcp-mux` where the peers support it: half the sockets, no downside.
 - Count the packet capture as a first-class consumer, or it will surprise you.
 - Measure on the hardware you deploy on. Syscall cost varies by nearly 3× across host classes, and
-  about 70 % of a relayed packet's cost is kernel time.
-- Do not tune the engine's own code. It is 0.04 % of the relay path; the headroom is not there.
+  close to 90 % of a relayed packet's cost is kernel time.
+- Tune the host before the engine. The engine's own code is about 11 % of a relayed packet; the
+  kernel path is the rest.
 
 ---
 

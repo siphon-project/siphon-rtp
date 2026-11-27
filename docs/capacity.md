@@ -42,44 +42,48 @@ process with the engine and performs comparable syscall work, so CPU is attribut
 saturated the box got, which is what makes it usable as a sizing input; "N calls ran cleanly" only
 says the box was not saturated, not where saturation is.
 
-Measured on one host: **AMD Ryzen AI 9 HX 370**, 12 cores / 24 threads, release build, engine
-confined to 4 worker threads. Endpoints and synthetic peers are on loopback.
+Measured on one host: **AMD Ryzen AI 9 HX 370**, 12 cores / 24 threads, release build, default
+relay threads (one per CPU) and the default 100 µs batching window. Endpoints and synthetic peers are
+on loopback.
 
 ## The numbers
 
 | Concurrent calls | Relayed | Loss | Engine CPU / packet | Engine cores | In kernel | Latency p50 |
 |---|--:|--:|--:|--:|--:|--:|
-| 100 | 10 000 pps | 0.13 % | 10.1 µs | 0.10 | 64.8 % | 0.5–1.3 ms |
-| 250 | 25 000 pps | 0.10 % | 8.4 µs | 0.21 | 68.9 % | 0.8–0.9 ms |
-| 500 | 50 000 pps | 0.03 % | 7.3 µs | 0.37 | 68.2 % | 1.2–1.3 ms |
-| 1 000 | 100 000 pps | 0.03 % | 7.5 µs | 0.75 | 69.8 % | 2.3–2.4 ms |
-| 2 000 | 200 000 pps | 0.00 % | 7.9 µs | 1.58 | 70.3 % | 4.2–5.7 ms |
+| 100 | 10 000 pps | 0.00 % | 13.6 µs | 0.14 | 85.3 % | 0.4 ms |
+| 250 | 25 000 pps | 0.03–0.07 % | 10.3 µs | 0.26 | 85.6 % | 0.7 ms |
+| 500 | 50 000 pps | 0.05–0.08 % | 8.8 µs | 0.44 | 86.1 % | 1.2 ms |
+| 1 000 | 100 000 pps | 0.05–0.09 % | 8.4 µs | 0.84 | 86.2 % | 1.8–2.0 ms |
+| 2 000 | 200 000 pps | 0.03–0.05 % | 8.4 µs | 1.69 | 87.7 % | 3.4–3.6 ms |
 
-Each row is the mean of repeated passes. Run-to-run spread on this host is about **±10 %**, which is
-large enough that a single run should not be read as a change; the second host below, which was
-quiet, agreed inside ±1 %. Quote a mean of several passes or do not quote a number.
+Each row is the mean of two passes, which agreed within 3 %. Run-to-run spread on a host with other
+work on it can reach **±10 %**, so a single run should not be read as a change. Quote a mean of
+several passes or do not quote a number.
 
-Three things are worth reading off that table.
+An earlier version of this table, measured when every socket had its own Tokio receive task, read
+7.3–10.1 µs. That build does not reproduce it: re-run on the same host it costs 10.8–11.5 µs per
+packet at 2 000 calls, so compare against that, not against the old table.
 
-**Per-packet cost is flat.** It stays inside 7–10 µs across a twentyfold range, so nothing in the
-one-socket-and-one-task-per-stream model degrades with scale — 2 000 calls is 4 000 sockets and
-4 000 receive tasks, and the cost per packet at that point is the same as at 100 calls. Capacity is
-therefore close to linear in cores, and the arithmetic below is sound rather than optimistic. The
-higher figure at 100 calls is fixed overhead amortising, not a small-run advantage.
+Three things are worth reading off the table.
 
-**About 70 % of it is kernel time, and the share grows with load.** That is the syscall bill:
-one `recvmsg` and one `sendmsg` per relayed packet. It is the single largest item in the relay's
+**Per-packet cost is flat above a few hundred calls.** It settles at about 8.4 µs from 1 000 calls
+on, so nothing in the relay degrades with scale: 2 000 calls is 8 000 sockets spread over the relay
+threads, and the cost per packet is the same as at 1 000. Capacity is therefore close to linear in
+cores. The higher figure at 100 calls is a quiet relay thread waking for nearly every packet; as
+load grows each wake-up serves more of them.
+
+**Close to 90 % of it is kernel time, and the share grows with load.** That is the syscall bill:
+one `recvfrom` and one `sendto` per relayed packet. It is the single largest item in the relay's
 cost and the reason a kernel-bypass datapath ([XDP](datapath.md)) is on the roadmap at all.
 
-**Latency is scheduling, not queueing.** The p50 climbs from under a millisecond to about 5 ms as
-the socket count grows, all of it well inside a 20 ms ptime. The p99 is not tabulated because on a
-host with other work on it the tail measures the host, not the engine — it moved between 2 ms and
-40 ms across passes at identical load.
+**Latency is scheduling and the batching window, not queueing.** The p50 climbs from under a
+millisecond to about 3.5 ms as the socket count grows, all of it well inside a 20 ms ptime. The p99
+is not tabulated because on a host with other work on it the tail measures the host, not the engine.
 
 ### The same measurement on a second host
 
 Because the cost is mostly syscall, it moves with the host by a factor that is worth seeing rather
-than assuming. The same harness, same build, same call counts, on a **2 vCPU Skylake-generation
+than assuming. The same harness, same build (the earlier, task-per-socket one), same call counts, on a **2 vCPU Skylake-generation
 virtualised instance with page-table isolation and IBRS both active** (against the 12-core desktop
 part above, which needs neither):
 
@@ -98,42 +102,56 @@ nearly three, in the direction that matters.
 
 ## Where the time actually goes
 
-Profiled with `perf` at 1000 concurrent calls (100 000 pps), sampling only the engine's threads, with
-kernel symbols resolved. Buckets are non-overlapping, first match wins, and sum to 100 %:
+Profiled with `perf` under a SIPp G.711 load through a siphon B2BUA at 320 calls per second (3 200
+concurrent calls, about 320 000 relayed packets per second), sampling only the engine's threads, with
+kernel and Rust symbols resolved. The host is an 11th-generation Intel desktop part in an LXC
+container, six relay threads, the generator and the SIP proxy on other cores. Buckets are
+non-overlapping, kernel buckets match only kernel symbols and userspace buckets only userspace ones,
+first match wins:
 
-| Bucket | Share |
-|---|--:|
-| spinlock acquire / contention | 16.1 % |
-| epoll / readiness tracking | 13.1 % |
-| **netfilter conntrack / NAT** | **10.6 %** |
-| UDP socket layer | 9.6 % |
-| long tail (no symbol above 1.2 %) | 8.6 % |
-| file-descriptor lookup + refcount | 7.3 % |
-| IP layer | 5.5 % |
-| generic socket layer | 5.1 % |
-| syscall entry / exit | 4.8 % |
-| route / dst lookup | 4.6 % |
-| netdev transmit | 4.0 % |
-| skb alloc / free | 3.9 % |
-| copy to/from user | 2.3 % |
-| RCU | 1.7 % |
-| hardened usercopy checks | 1.6 % |
-| scheduler / wakeup | 0.6 % |
-| AppArmor LSM | 0.5 % |
-| userspace: Tokio | 0.15 % |
-| **userspace: siphon-rtp itself** | **0.04 %** |
+| Bucket | Before the relay threads | Now |
+|---|--:|--:|
+| userspace: Tokio I/O and scheduler | 10.5 % | 0.0 % |
+| userspace: siphon-rtp relay logic | 9.9 % | 9.9 % |
+| userspace: per-packet map lookups and hashing | 8.2 % | 0.7 % |
+| generic socket layer | 8.5 % | 10.7 % |
+| UDP socket layer | 8.5 % | 9.5 % |
+| security (AppArmor LSM, hardened usercopy) | 6.7 % | 7.2 % |
+| **netfilter conntrack / NAT** | 5.5 % | **7.1 %** |
+| spinlock acquire / contention | 3.8 % | 6.0 % |
+| epoll / readiness tracking | 3.3 % | 5.5 % |
+| IP layer | 4.9 % | 5.1 % |
+| file-descriptor lookup and refcount | 3.6 % | 4.0 % |
+| skb alloc / free | 2.2 % | 3.1 % |
+| scheduler / wakeup / futex | 1.1 % | 2.7 % |
+| netdev transmit | 2.3 % | 2.4 % |
+| syscall entry / exit | 1.5 % | 2.4 % |
+| copy to/from user | 2.4 % | 2.0 % |
+| RCU, route lookup, timers, allocator | 1.6 % | 2.5 % |
+| long tail (no symbol above 1 %) | 15.6 % | 19.1 % |
 
-**The engine's own relay logic is four hundredths of one percent of the cost.** The flow lookup, the
-signalled-source gate, the latch check, the RFC 3550 §A.1 loss counter — all of it, together, rounds
-to nothing next to the two syscalls that carry the packet. There is no userspace optimisation
-available here, and a criterion bench of the packet handling, however fast it gets, cannot move a
-capacity number.
+"Before" is a Tokio task per socket reading until `EAGAIN` and looking its flow up in shared maps on
+every packet. "Now" is dedicated relay threads (`--relay-threads`, see [Deployment](deployment.md)): one
+level-triggered `epoll` per thread, one `recvfrom` per readiness report, and the flow cached per
+socket until a control write changes it. The kernel shares grew because the total shrank, not because the kernel
+does more: engine CPU per relayed packet on this host fell from 13.2 µs to 11.8 µs over the same
+change.
 
-Three things in that table are worth acting on.
+**Userspace went from about 29 % of the cost to about 11 %.** An earlier version of this page put the
+engine's own code at 0.04 %. That figure was wrong: the bucketing matched names such as `udp` against
+userspace symbols too, so the receive loop and Tokio's socket calls were counted as kernel time. Read
+the userspace row as small but real; what is left of it is the receive loop itself and the
+out-leg lookup.
 
-**`netfilter conntrack / NAT`, at 10.6 %, is the largest avoidable item.** Connection tracking is
+**The kernel is still close to 90 % of a relayed packet.** One receive and one send per packet,
+each through the full UDP, IP, LSM and netfilter path. That is the reason a kernel-bypass datapath
+([XDP](datapath.md)) is on the roadmap.
+
+Three items in that table are host configuration rather than relay work.
+
+**`netfilter conntrack / NAT`, at 7.1 %, is the largest avoidable item.** Connection tracking is
 loaded on any host running Docker (`xt_conntrack`, `nf_nat`, `nft_ct`, `xt_MASQUERADE` pull it in) and
-it then tracks every relayed media packet — for a media relay that is pure overhead, since the
+it then tracks every relayed media packet. For a media relay that is pure overhead, since the
 engine's own source gate is what decides whether a packet is accepted, not conntrack's state. Exempt
 the media port range in the `raw` table:
 
@@ -145,31 +163,34 @@ iptables -t raw -A OUTPUT     -p udp --sport 30000:40000 -j CT --notrack
 
 Check `iptables -t raw -L -n -v` first: if something already exempts the range, this is done. Note
 this removes the media flows from `conntrack` listings, which is the point, but worth knowing if you
-debug with them. The conntrack **table size** is generally not the constraint — at 4 entries per call
-a 2000-call node holds ~8000 against a typical `nf_conntrack_max` of 65536 — so this is about CPU,
+debug with them. The conntrack **table size** is generally not the constraint (at 4 entries per call
+a 2000-call node holds ~8000 against a typical `nf_conntrack_max` of 65536), so this is about CPU,
 not about exhaustion.
 
-**`epoll` plus file-descriptor handling is 20.3 % together**, and that is per-syscall readiness and
-lookup machinery, not data movement (`copy to/from user` is only 2.3 %). It is tempting to read that
-as the share a batched-submission datapath would reclaim. **We measured it, and that reading is
-wrong — or rather, it is true only on some hardware.** See
+**The security bucket is AppArmor checking every `sendmsg`** (`aa_inet_msg_perm` alone is the
+largest single kernel symbol, 3.9 %). It is there because the container runs under an AppArmor
+profile; a host without one does not pay it.
+
+**`epoll` plus file-descriptor handling is about 9.5 %**, and that is per-syscall readiness and
+lookup machinery, not data movement (`copy to/from user` is 2.0 %). It is tempting to read that as
+the share a batched-submission datapath would reclaim. **We measured it, and that reading is wrong,
+or rather true only on some hardware.** See
 [Does batching the syscalls help?](#does-batching-the-syscalls-help) below.
 
-**`route / dst lookup` at 4.6 % is smaller than it looks worth chasing.** A `connect()`ed UDP socket
-would let the kernel cache the destination and skip most of it, but `connect()` also filters the
-receive side, which would collide with the source gate and with latching — so it is not a free
-change, and 4.6 % does not justify touching that path.
+**`route / dst lookup` is under 1 %.** A `connect()`ed UDP socket would let the kernel cache the
+destination and skip it, but `connect()` also filters the receive side, which would collide with the
+source gate and with latching, so it is not worth touching that path.
 
-One caveat on the numbers: this profile is over loopback. On a physical interface the `netdev
-transmit` and `skb` shares grow with real driver work, so the other percentages shrink
-proportionally. The *shape* holds — overhead machinery dominates, data movement does not, and the
-engine's own code is invisible.
+One caveat on the numbers: the generator and the engine share a host, so the receive side is
+loopback-like. On a physical interface the `netdev transmit` and `skb` shares grow with real driver
+work and the other percentages shrink proportionally. The *shape* holds: per-packet kernel machinery
+dominates, data movement does not.
 
 ### Does batching the syscalls help?
 
 `io_uring` removes the syscall boundary: one `io_uring_enter` carries submissions and completions for
-many sockets, where `epoll` + `recvfrom`/`sendto` costs a kernel crossing per operation. Since ~70 %
-of the relay's CPU is kernel time, that looks like the obvious lever.
+many sockets, where `epoll` + `recvfrom`/`sendto` costs a kernel crossing per operation. Since close to
+90 % of the relay's CPU is kernel time, that looks like the obvious lever.
 
 It was measured, with a relay that does one receive and one send per packet exactly as the datapath
 does, against an `epoll` control arm, at 50 pps per socket — the production cadence. Both arms read
@@ -209,14 +230,14 @@ At a 20 ms ptime that gives, with zero headroom:
 
 | Per-packet cost | CPU per call | Calls per core |
 |---|--:|--:|
-| 7.5 µs (desktop part) | 0.75 ms/s | ~1 300 |
-| 21.5 µs (virtualised, mitigations active) | 2.15 ms/s | ~465 |
+| 8.4 µs (desktop part) | 0.84 ms/s | ~1 190 |
+| 21.5 µs (virtualised, mitigations active, earlier build) | 2.15 ms/s | ~465 |
 
 Size well below whichever applies: a node at its arithmetic ceiling has nothing left for a traffic
 spike, a re-INVITE storm, the control plane, or anything else sharing the box.
 
 !!! warning "Syscall cost is host-specific, and this workload is mostly syscall"
-    Around 70 % of the per-packet cost is kernel time, so the figure moves with anything that
+    Close to 90 % of the per-packet cost is kernel time, so the figure moves with anything that
     changes syscall cost — CPU generation, and especially speculative-execution mitigations. A host
     with page-table isolation and IBRS active pays materially more per syscall than one without, and
     a virtualised NIC adds driver cost that a loopback measurement does not capture. **Re-measure on
