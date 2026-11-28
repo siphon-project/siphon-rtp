@@ -73,7 +73,6 @@ async fn an_ice_answer_local_leg_is_intercepted_after_its_pair_is_selected() {
             ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             joined_endpoint: None,
             handing_over: Default::default(),
-            detach_requested: Default::default(),
         }],
     );
     engine.carry_x3_across_answer("ice-x3").await;

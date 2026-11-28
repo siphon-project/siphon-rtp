@@ -60,12 +60,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // call's processing pipeline already, so this promotes nothing.
         self.hold_in_userspace(call_id, PromotionReason::X3, PromoteMode::RelayOnly)
             .await?;
-        if !self.media.control(
-            call_id,
-            MediaControl::StartX3SingleLeg(Box::new((ingress, egress))),
-        ) {
+        if let Err(error) = self
+            .media
+            .control_confirmed(
+                call_id,
+                vec![MediaControl::StartX3SingleLeg(Box::new((ingress, egress)))],
+            )
+            .await
+        {
             self.release_x3_hold_if_unused(call_id).await;
-            return Err("media actor unavailable".to_string());
+            return Err(format!("media actor unavailable: {error}"));
         }
         Ok(())
     }
@@ -95,7 +99,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ///
     /// The sessions stay in the map for the whole hand-over, marked, so nothing can miss them: the
     /// old call's teardown leaves them alone ([`Self::stop_x3`]) and a `detach_x3` that lands meanwhile
-    /// is recorded per delivery and honoured by [`Self::settle_x3_hand_over`]. Returns whether any is
+    /// ends that delivery at once (see [`Self::detach_x3`]). Returns whether any is
     /// being handed over. Any other replacement is a new call, and the interceptions end with the
     /// old one.
     pub(super) fn begin_x3_hand_over(
@@ -118,8 +122,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         handing_over
     }
 
-    /// The replacement call is registered: the hand-over is over. A withdrawal that arrived meanwhile
-    /// ends that delivery now, `detached`, with exactly one `x3_ended`; the others carry on.
+    /// The replacement call is registered: the hand-over is over and the deliveries that remain
+    /// (a withdrawn one already ended in [`Self::detach_x3`]) carry on.
     pub(super) async fn settle_x3_hand_over(&self, call_id: &str) {
         let _changing = self.x3_sessions.lock.lock().await;
         if let Some(sessions) = self.x3_sessions.get(call_id) {
@@ -127,16 +131,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 session.handing_over.store(false, Ordering::SeqCst);
             }
         }
-        self.end_x3_where(
-            call_id,
-            |session| session.detach_requested.load(Ordering::SeqCst),
-            |_| X3EndReason::Detached,
-        )
-        .await;
     }
 
-    /// The re-answer failed with nothing to replace the call: the interceptions end with it, a
-    /// delivery whose withdrawal had arrived as `detached`, the rest as `call_ended`.
+    /// The re-answer failed with nothing to replace the call: the interceptions that are left end
+    /// with it, `call_ended` (a withdrawn one already ended `detached`).
     pub(super) async fn abandon_x3_hand_over(&self, call_id: &str) {
         let _changing = self.x3_sessions.lock.lock().await;
         if let Some(sessions) = self.x3_sessions.get(call_id) {
@@ -144,17 +142,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 session.handing_over.store(false, Ordering::SeqCst);
             }
         }
-        self.end_x3_where(
-            call_id,
-            |_| true,
-            |session| {
-                if session.detach_requested.load(Ordering::SeqCst) {
-                    X3EndReason::Detached
-                } else {
-                    X3EndReason::CallEnded
-                }
-            },
-        )
-        .await;
+        self.end_x3_where(call_id, |_| true, |_| X3EndReason::CallEnded)
+            .await;
     }
 }

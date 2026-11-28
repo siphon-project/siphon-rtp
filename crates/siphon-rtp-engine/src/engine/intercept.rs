@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::conference::SeatX3Source;
-use crate::media_pipeline::MediaControl;
+use crate::media_pipeline::{ConfirmError, MediaControl};
 use crate::x3::{
     build_tls_client_config, ingress_directions, run_x3_delivery, split_delivery_address,
     x3_channel, X3Config, X3Counters, X3Delivery, X3DeliveryEnd, X3DeliveryTask, X3Error,
@@ -59,10 +59,8 @@ pub(super) struct X3Session {
     pub(super) joined_endpoint: Option<EndpointId>,
     /// Set for the whole of a re-answer of the dialog (from the old call's teardown to the new
     /// call's registration): the session stays in the map, the old call's teardown leaves it alone,
-    /// and a `detach_x3` that lands meanwhile is recorded below instead of being lost.
+    /// and a `detach_x3` that lands meanwhile ends that delivery at once.
     pub(super) handing_over: std::sync::atomic::AtomicBool,
-    /// A `detach_x3` arrived during the hand-over; honoured the moment it ends.
-    pub(super) detach_requested: std::sync::atomic::AtomicBool,
 }
 
 /// Every live interception of the engine's calls, keyed by call: a call carries one session per
@@ -392,7 +390,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ended,
                 joined_endpoint: None,
                 handing_over: Default::default(),
-                detach_requested: Default::default(),
             });
         // Every session of the call names the endpoints the one install put taps on.
         if let Some(mut sessions) = self.x3_sessions.get_mut(call_id) {
@@ -597,7 +594,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     return Err("the call's crypto bridge is no longer installed".to_string());
                 }
                 // Not also in a pipeline actor, which would deliver everything twice.
-                self.media.control(call_id, MediaControl::StopX3);
+                self.stop_actor_x3(call_id).await;
                 Ok(vec![a_endpoint, b_endpoint])
             }
             // Everything else decodes (or at least relays) through the media pipeline, where the tap
@@ -614,12 +611,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             | PipelineKind::DtlsOffererTranscryptMedia => {
                 self.hold_in_userspace(call_id, PromotionReason::X3, PromoteMode::RelayOnly)
                     .await?;
-                if !self
+                // Applied, not merely queued: this is also how a detach of one warrant removes its
+                // taps from the actor, and the verb's reply must not precede that.
+                if let Err(error) = self
                     .media
-                    .control(call_id, MediaControl::StartX3(Box::new((taps_a, taps_b))))
+                    .control_confirmed(
+                        call_id,
+                        vec![MediaControl::StartX3(Box::new((taps_a, taps_b)))],
+                    )
+                    .await
                 {
                     self.release_x3_hold_if_unused(call_id).await;
-                    return Err("media actor unavailable".to_string());
+                    return Err(format!("media actor unavailable: {error}"));
                 }
                 Ok(Vec::new())
             }
@@ -680,13 +683,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// them in one install**: same delivery channels, same connections, same Correlation IDs,
     /// sequence counters unbroken.
     ///
-    /// A no-op on a call that is not intercepted. If the taps cannot be put back, every delivery of
+    /// On a call with no warrant left it takes whatever a pre-tap put on the new pipeline off again
+    /// (a no-op on one that was never intercepted). If the taps cannot be put back, every delivery of
     /// the call is ended loudly (`x3_ended` with `transport_error`, the nearest reason there is)
     /// rather than left attached and silent.
     pub(super) async fn carry_x3_across_answer(&self, call_id: &str) {
-        if !self.x3_sessions.contains_key(call_id) {
-            return;
-        }
         let _changing = self.x3_sessions.lock.lock().await;
         let (sources, previous) = match self.x3_sessions.get(call_id) {
             Some(sessions) => (
@@ -696,7 +697,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .flat_map(|session| session.bridged_endpoints.iter().copied())
                     .collect::<Vec<_>>(),
             ),
-            None => return,
+            // No warrant is left for the call: whatever the new pipeline was pre-tapped with came
+            // from a snapshot taken before a withdrawal landed, so it is taken off again (a
+            // call that was never intercepted has nothing on it and this is a no-op).
+            None => {
+                self.clear_x3_taps(call_id, &[]).await;
+                return;
+            }
         };
         match self.install_x3_taps(call_id, &sources).await {
             Ok(bridged) => {
@@ -734,17 +741,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         selector: X3Selector<'_>,
     ) -> CmdResult {
         let _changing = self.x3_sessions.lock.lock().await;
-        // A re-answer is replacing the call: the withdrawal is recorded, per delivery, and honoured
-        // the moment the replacement is registered, so delivery never outlives a withdrawn warrant.
-        if let Some(sessions) = self.x3_sessions.get(call_id) {
-            if sessions.iter().any(|session| {
+        // A re-answer is replacing the call: the old call is already gone from the table and its
+        // media actor is on its way out, so the survivors cannot be re-tapped here (that would end
+        // a warrant still in force). Only the withdrawn delivery ends, before the reply: its
+        // transport is aborted and awaited, which closes the delivery receiver, so nothing captured
+        // afterwards can reach the withdrawn warrant (ETSI TS 103 221-2: delivery stops with the
+        // warrant). The old actor's tap for it may keep writing into that closed channel until the
+        // actor dies, which is harmless: the send fails and nothing is delivered. The session
+        // leaves the table, so the replacement's taps (carried from the table) never include it.
+        // The survivors stay marked and are carried to the new pipeline as before.
+        let handing_over = self.x3_sessions.get(call_id).is_some_and(|sessions| {
+            sessions.iter().any(|session| {
                 session.owner == client && session.handing_over.load(Ordering::SeqCst)
-            }) {
-                for session in sessions.iter().filter(|session| selector.matches(session)) {
-                    session.detach_requested.store(true, Ordering::SeqCst);
+            })
+        });
+        if handing_over {
+            let mut withdrawn = Vec::new();
+            if let Some(mut sessions) = self.x3_sessions.get_mut(call_id) {
+                let all = std::mem::take(&mut *sessions);
+                for session in all {
+                    if selector.matches(&session) {
+                        withdrawn.push(session);
+                    } else {
+                        sessions.push(session);
+                    }
                 }
-                return ok_empty();
             }
+            self.x3_sessions
+                .remove_if(call_id, |_, sessions| sessions.is_empty());
+            for session in withdrawn {
+                self.finish_x3_session(call_id, session, X3EndReason::Detached)
+                    .await;
+            }
+            return ok_empty();
         }
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return self
@@ -852,6 +881,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.release_x3_hold_if_unused(call_id).await;
     }
 
+    /// Take the call's taps off its media actor and return once the actor has **applied** it, so
+    /// nothing it handles afterwards reaches a withdrawn warrant (or, on a hand-over to a bridge or a
+    /// room, a second time). A bare `try_send` could drop the stop on a full mailbox and leave the tap
+    /// live. `NoActor` or `Gone` means no pipeline is left holding a tap; a timeout is logged loudly.
+    pub(super) async fn stop_actor_x3(&self, call_id: &str) {
+        match self
+            .media
+            .control_confirmed(call_id, vec![MediaControl::StopX3])
+            .await
+        {
+            Ok(()) | Err(ConfirmError::NoActor | ConfirmError::Gone) => {}
+            Err(error) => tracing::error!(
+                target: "siphon_rtp::li",
+                call_id,
+                %error,
+                "the media actor did not confirm the removal of the lawful-interception taps"
+            ),
+        }
+    }
+
     /// Take every tap off whatever carries the call's media: the crypto bridge endpoints, the media
     /// actor and the conference room the call's leg is seated in. Dropping the taps closes the packet
     /// channels, which is what lets each delivery task finish sending what is still buffered
@@ -860,7 +909,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         for endpoint in bridged {
             self.bridge.clear_x3_tap(*endpoint);
         }
-        self.media.control(call_id, MediaControl::StopX3);
+        self.stop_actor_x3(call_id).await;
         if let Some(leg) = self.ws.egress_of(call_id) {
             leg.taps().clear();
         }

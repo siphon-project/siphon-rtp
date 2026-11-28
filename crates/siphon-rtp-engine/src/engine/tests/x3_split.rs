@@ -13,6 +13,7 @@
 use super::secure_hold::*;
 use super::ws_split::*;
 use super::*;
+use crate::media_pipeline::{MediaControl, MediaInput};
 use crate::x3::{X3Delivery, X3Packet};
 use siphon_rtp_li::PayloadDirection;
 use siphon_rtp_proto::{X3EndReason, Xid};
@@ -43,7 +44,6 @@ async fn intercept(rig: &Rig, xid_byte: u8, target_is_caller: bool) -> X3Deliver
             ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             joined_endpoint: None,
             handing_over: Default::default(),
-            detach_requested: Default::default(),
         });
     rig.engine.carry_x3_across_answer(rig.call_id).await;
     delivery
@@ -512,6 +512,69 @@ async fn assert_x3_attached_while_split(mut rig: Rig, target_is_caller: bool) {
         TO_B_TONE,
         "B still hears the bot",
     );
+}
+
+/// `detach_x3` answers only once the media actor has applied the removal of the withdrawn warrant's
+/// taps. The actor's mailbox is held by the test, so nothing reaches it until released: a reply that
+/// does not wait for the actor (the old behaviour) comes back while the actor still taps for the
+/// warrant, and everything the actor handles from then on is content captured after the withdrawal.
+async fn assert_detach_waits_for_the_actor(kept: Option<u8>) {
+    let mut rig = plain_rig().await;
+    rig.warm_up().await;
+    let _withdrawn = intercept(&rig, 3, true).await;
+    if let Some(byte) = kept {
+        let _kept = intercept(&rig, byte, true).await;
+    }
+    let (real, unread) = rig
+        .engine
+        .media
+        .wedge_mailbox_unbounded(rig.call_id)
+        .expect("an actor");
+    let detach = rig.engine.handle(
+        CLIENT,
+        Command::DetachX3 {
+            call_id: rig.call_id.into(),
+            from_tag: OWNER_TAG.into(),
+            xid: Some(Xid::from_bytes([3; 16])),
+            delivery: None,
+            correlation_id: None,
+        },
+    );
+    tokio::pin!(detach);
+    let early = tokio::time::timeout(Duration::from_millis(300), &mut detach).await;
+    assert!(
+        early.is_err(),
+        "detach_x3 answered while the actor had not applied the removal: {early:?}"
+    );
+    // What the handler sent the actor, in order, is released to it now.
+    let mut released = 0;
+    let mut removal_seen = false;
+    for input in unread.try_iter() {
+        if let MediaInput::Control(control) = &input {
+            removal_seen |= matches!(control, MediaControl::StartX3(_) | MediaControl::StopX3);
+        }
+        real.send_async(input).await.expect("the actor is alive");
+        released += 1;
+    }
+    assert!(
+        released > 0 && removal_seen,
+        "the removal reached the mailbox"
+    );
+    rig.engine.media.unwedge_mailbox(rig.call_id, real);
+    let detached = tokio::time::timeout(Duration::from_secs(5), &mut detach)
+        .await
+        .expect("answered once the actor applied it");
+    assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detaching_one_of_two_warrants_waits_for_the_actor_to_drop_its_taps() {
+    assert_detach_waits_for_the_actor(Some(4)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detaching_the_last_warrant_waits_for_the_actor_to_drop_its_taps() {
+    assert_detach_waits_for_the_actor(None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

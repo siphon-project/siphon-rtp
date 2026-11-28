@@ -254,7 +254,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // From here on nothing refuses: the room has the seat. Take the leg off its current owner.
         // The call-level taps stop with it: the room's own are on the seat already.
-        self.stop_x3_call_taps(call_id);
+        self.stop_x3_call_taps(call_id).await;
         let taken = self
             .take_over_leg(call_id, conference_id, from_tag, &plan)
             .await;
@@ -396,22 +396,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Take the call's own taps off the media path it is leaving (a crypto bridge's, or the media
     /// actor's), keeping the interception itself: its delivery connection, Correlation ID and
     /// sequence counter belong to the call and carry on from the room.
-    pub(super) fn stop_x3_call_taps(&self, call_id: &str) {
-        let Some(mut sessions) = self.x3_sessions.get_mut(call_id) else {
-            return;
+    pub(super) async fn stop_x3_call_taps(&self, call_id: &str) {
+        // The map guard is dropped before anything is awaited.
+        let mut endpoints: Vec<_> = {
+            let Some(mut sessions) = self.x3_sessions.get_mut(call_id) else {
+                return;
+            };
+            sessions
+                .iter_mut()
+                .flat_map(|session| std::mem::take(&mut session.bridged_endpoints))
+                .collect()
         };
         // Every delivery of the call names the same bridge endpoints, so each is cleared once.
-        let mut endpoints: Vec<_> = sessions
-            .iter_mut()
-            .flat_map(|session| std::mem::take(&mut session.bridged_endpoints))
-            .collect();
         endpoints.sort_unstable_by_key(|endpoint| endpoint.0);
         endpoints.dedup();
         for endpoint in endpoints {
             self.bridge.clear_x3_tap(endpoint);
         }
-        self.media
-            .control(call_id, crate::media_pipeline::MediaControl::StopX3);
+        self.stop_actor_x3(call_id).await;
     }
 
     /// A seat that failed after the call's media path was stopped leaves nothing to intercept. End
