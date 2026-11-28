@@ -9,6 +9,18 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **A DTLS-SRTP caller toward an SDES-SRTP callee is bridged.** A browser (`UDP/TLS/RTP/SAVPF`,
+  RFC 5764) calling a desk phone that must stay on `RTP/SAVP` (RFC 4568) was refused with
+  `secure-offerer-unsupported`; `transport_protocol: RTP/SAVP` on the offer now terminates the
+  caller's DTLS and keys the callee with the engine's own `a=crypto`. The DTLS bridge's plain side
+  carries the callee's SRTP leg (a second RFC 3711 transform per datagram, no allocation), or the
+  media actor holds it when the call needs the decoded audio (`PipelineKind::DtlsOffererTranscrypt`
+  and `DtlsOffererTranscryptMedia`). The callee's separate RTCP port is carried, the SDES leg keeps
+  its rollover across a re-offer, and a changed fingerprint runs a new handshake under it. A hold
+  or split and a conference seat are refused with `secure-transcrypt-hold-unsupported` and
+  `secure-transcrypt-seat-unsupported`, and bundled video is declined; an SDES caller toward a DTLS
+  callee stays refused.
+
 - **`--relay-batch-window-us` (`relay_batch_window_us`): relay threads batch their wake-ups.** A
   relay thread whose last pass found only a few datagrams now waits this long (100 us by default)
   before looking again, so a busy thread serves many sockets per wake-up instead of being woken for

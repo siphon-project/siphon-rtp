@@ -1034,6 +1034,18 @@ enum PipelineKind {
     /// endpoint; the [`MediaCall`] actor holds A's leg once the handshake delivers it, and both of its
     /// directions stay pending until then.
     DtlsOffererMedia,
+    /// A DTLS-SRTP **offerer** (A, a browser: RFC 5764) toward an **SDES-SRTP** callee (B, a desk
+    /// phone: RFC 4568), the engine keying each side under its own mechanism. The DTLS bridge
+    /// terminates A's association exactly as for [`PipelineKind::DtlsOfferer`]; B's plain side is
+    /// re-keyed with the engine's own SDES key, so A's media is DTLS-decrypted and SDES-encrypted on
+    /// its way to B and the reverse (RFC 3711 on both). Neither party's keying is ever shown to the
+    /// other, and the payload is never decoded.
+    DtlsOffererTranscrypt,
+    /// The transcode twin of [`PipelineKind::DtlsOffererTranscrypt`], for a call that needs the
+    /// decoded audio (a codec mismatch, a recording, a tee). The [`MediaCall`] actor holds B's SDES
+    /// [`SecureLeg`](siphon_rtp_srtp::leg::SecureLeg) from the start and A's once the handshake
+    /// delivers it, so A's directions stay pending until then.
+    DtlsOffererTranscryptMedia,
     /// The call's one remaining leg is a seat in a conference room (`conference_seat`): the room's
     /// actor owns its media, decrypting and mixing it like any participant's, and the call is kept so
     /// the controller's view of it — `delete`, the summary, the events, the timeout — survives the

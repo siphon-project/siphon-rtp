@@ -52,6 +52,10 @@ const INBOUND_CAPACITY: usize = 64;
 /// A shared secure leg that is `None` until the DTLS handshake installs it.
 pub(crate) type SharedSecureLeg = Arc<Mutex<Option<SecureLeg>>>;
 
+/// The SDES-SRTP leg of the plain peer on a transcrypted call (RFC 4568 keys it from the SDP, so it
+/// exists from the start, unlike the DTLS leg). Shared by every flow of the association.
+pub(crate) type SharedPlainLeg = Arc<Mutex<SecureLeg>>;
+
 /// Where a DTLS leg's encrypted traffic goes, published so it can change under the tasks reading it.
 ///
 /// `None` means **not yet decided**: on a full-ICE leg the destination is not known until ICE selects
@@ -122,6 +126,12 @@ struct Flow {
     secure_dst: Option<SecureDestination>,
     /// Shared with the call's other direction; `None` until the handshake completes.
     secure: SharedSecureLeg,
+    /// The plain peer's own SDES-SRTP leg, when that peer is keyed by SDES rather than plaintext (a
+    /// DTLS caller toward an SDES callee, `PipelineKind::DtlsOffererTranscrypt`). Set on the three
+    /// flows that face it: the secure flow re-keys what it decrypts for it (DTLS unprotect, then SDES
+    /// protect, RFC 3711) and the plain flows unprotect what it sends before the DTLS protect.
+    /// `None` on a plain peer, where the datagram is relayed as it is.
+    plain_leg: Option<SharedPlainLeg>,
     /// Lawful-interception content tap for this endpoint's ingress (ETSI TS 103 221-2 X3).
     ///
     /// Only the two *relaying* directions consult it. A [`Direction::Pipeline`] flow hands its
@@ -435,7 +445,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         rtcp: PlainRtcp,
         secure_endpoint: EndpointId,
         destination: SecureDestination,
-        secure: SharedSecureLeg,
+        (secure, plain_leg): (SharedSecureLeg, Option<SharedPlainLeg>),
     ) -> Flow {
         Flow {
             direction: Direction::Encrypt,
@@ -444,6 +454,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             out_dst: None,
             secure_dst: Some(destination),
             secure,
+            plain_leg,
             // X3 content is the call's media, tapped on the RTP endpoints; RTCP is not content.
             x3: X3Taps::default(),
             plain_taps: PlainTaps::default(),
@@ -463,7 +474,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         &self,
         plan: &DtlsCallPlan,
         previous: Option<EndpointId>,
-        secure: SharedSecureLeg,
+        legs: (SharedSecureLeg, Option<SharedPlainLeg>),
     ) {
         let current = plan.plain_rtcp.map(|rtcp| rtcp.endpoint);
         if let Some(previous) = previous.filter(|previous| Some(*previous) != current) {
@@ -485,7 +496,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         };
         self.flows.insert(
             rtcp.endpoint,
-            Self::plain_rtcp_flow(rtcp, plan.secure_endpoint, destination, secure),
+            Self::plain_rtcp_flow(rtcp, plan.secure_endpoint, destination, legs),
         );
     }
 
@@ -522,11 +533,11 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             if matches!(flow.direction, Direction::Decrypt { .. }) {
                 let previous = flow.rtcp_out.map(|(endpoint, _)| endpoint);
                 flow.rtcp_out = plan.plain_rtcp.map(|rtcp| (rtcp.endpoint, rtcp.dst));
-                relayed_rtcp = Some((previous, flow.secure.clone()));
+                relayed_rtcp = Some((previous, (flow.secure.clone(), flow.plain_leg.clone())));
             }
         }
-        if let Some((previous, secure)) = relayed_rtcp {
-            self.follow_plain_rtcp(plan, previous, secure);
+        if let Some((previous, legs)) = relayed_rtcp {
+            self.follow_plain_rtcp(plan, previous, legs);
         }
         // Where the DTLS peer is now. On an ICE leg the agent owns this and re-selects for itself, so
         // a signalled address must never clobber a selected pair (RFC 8445 §12).
@@ -631,6 +642,13 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 .map(|previous| (previous.x3.clone(), previous.plain_taps.clone()))
                 .unwrap_or_default()
         };
+        // The plain peer's SDES leg belongs to the call, not to one association (RFC 4568 keys it from
+        // the SDP): a new association keeps it, so no datagram of the rebuilt flows is ever relayed
+        // without the transform that keys the plain peer.
+        let carried_leg = self
+            .flows
+            .get(&plan.secure_endpoint)
+            .and_then(|previous| previous.plain_leg.clone());
         let (plain_side_x3, plain_side_taps) = carried_taps(plan.plain_endpoint);
         let (secure_side_x3, secure_side_taps) = carried_taps(plan.secure_endpoint);
         self.flows.insert(
@@ -643,6 +661,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: None,
                 secure_dst: Some(destination.clone()),
                 secure: secure.clone(),
+                plain_leg: carried_leg.clone(),
                 x3: plain_side_x3,
                 plain_taps: plain_side_taps,
                 rtcp_only: false,
@@ -661,7 +680,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                     rtcp,
                     plan.secure_endpoint,
                     destination.clone(),
-                    secure.clone(),
+                    (secure.clone(), carried_leg.clone()),
                 ),
             );
         }
@@ -675,6 +694,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: Some(plan.plain_dst),
                 secure_dst: None,
                 secure,
+                plain_leg: carried_leg,
                 x3: secure_side_x3,
                 plain_taps: secure_side_taps,
                 rtcp_only: false,
@@ -759,6 +779,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: None,
                 secure_dst: Some(destination.clone()),
                 secure: Arc::new(Mutex::new(None)),
+                plain_leg: None,
                 x3: X3Taps::default(),
                 plain_taps: PlainTaps::default(),
                 // The per-call actor relays RTCP itself (`plan.plain_rtcp` is not used here).
@@ -833,6 +854,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: None,
                 secure_dst: Some(destination),
                 secure,
+                plain_leg: None,
                 // X3 content is audio for now (docs/security-and-nat.md), and a tee or recording
                 // decodes audio: neither is offered the video.
                 x3: X3Taps::default(),
@@ -933,6 +955,46 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             matches!(&flow.direction, Direction::Pipeline { keyed, .. }
                 if keyed.load(std::sync::atomic::Ordering::Acquire))
         })
+    }
+
+    /// Key the plain peer of `secure_endpoint`'s association with its own SDES-SRTP leg (RFC 4568): a
+    /// DTLS-SRTP peer (RFC 5764) bridged to an SDES-SRTP one, which is
+    /// `PipelineKind::DtlsOffererTranscrypt`. From now on what the DTLS peer sends is unprotected
+    /// under the DTLS keys and protected under `leg` before it reaches the plain peer, and what the
+    /// plain peer sends is unprotected under `leg` before it is protected for the DTLS peer (RFC 3711
+    /// on both), so neither party's keying is ever shown to the other. The leg is shared by the
+    /// secure flow, the plain RTP flow and the plain peer's separate RTCP flow.
+    ///
+    /// Call it after [`Self::register`] and before the endpoints are redirected: a datagram handled
+    /// in between would be relayed without the transform. Returns `false`, changing nothing, when
+    /// `secure_endpoint` has no relaying association (none registered, or one whose media belongs to a
+    /// pipeline actor, which holds its own legs).
+    pub fn set_plain_leg(&self, secure_endpoint: EndpointId, leg: SharedPlainLeg) -> bool {
+        let relays = self
+            .flows
+            .get(&secure_endpoint)
+            .is_some_and(|flow| matches!(flow.direction, Direction::Decrypt { .. }));
+        if !relays {
+            return false;
+        }
+        for mut flow in self.flows.iter_mut() {
+            let faces_plain_peer = flow.out_endpoint == secure_endpoint
+                && matches!(flow.direction, Direction::Encrypt)
+                && flow.video.is_none();
+            if faces_plain_peer || *flow.key() == secure_endpoint {
+                flow.plain_leg = Some(leg.clone());
+            }
+        }
+        true
+    }
+
+    /// The plain peer's SDES leg on `secure_endpoint`'s association, when it has one, so a
+    /// renegotiation can re-key it in place and keep what it sent (RFC 3711 §3.3.1).
+    #[must_use]
+    pub fn plain_leg(&self, secure_endpoint: EndpointId) -> Option<SharedPlainLeg> {
+        self.flows
+            .get(&secure_endpoint)
+            .and_then(|flow| flow.plain_leg.clone())
     }
 
     /// Take back the leg retained for a media-pipeline owner of `endpoint` (see
@@ -1038,6 +1100,12 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         let Some(mut flow) = self.flows.get_mut(&endpoint) else {
             return Err("no DTLS flow on the endpoint");
         };
+        if flow.plain_leg.is_some() {
+            return Err(
+                "secure-transcrypt-seat-unsupported: a DTLS caller bridged to an SDES callee \
+                 cannot be seated in a conference yet",
+            );
+        }
         match &mut flow.direction {
             Direction::Pipeline {
                 target: current,

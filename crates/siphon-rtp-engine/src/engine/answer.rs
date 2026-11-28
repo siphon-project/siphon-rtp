@@ -153,6 +153,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         )));
                     }
                 };
+                // Each party stays on the codec it negotiated, and a switch of the media path the
+                // kept DTLS association cannot follow is refused, both before A's answer is written
+                // to the call (answer/steps.rs).
+                self.lead_far_reoffer(call_id, &answered, &mut far);
+                self.refuse_reversed_switch(call_id, &answered, &far, profile)?;
                 // A's answer is A's new state: record it on A's leg, exactly as a re-offer from A
                 // records A's offer. Its `received-from` is the address A's answer arrived from.
                 let Some(mut call) = self.calls.get_mut(call_id) else {
@@ -202,27 +207,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     if let Some(key) = text.crypto.first().filter(|_| text.secure) {
                         call.near_text_remote_crypto = Some(*key);
                     }
-                }
-                // Each party stays on the codec it negotiated. On a relay both share one, and it is
-                // the one A's answer selected from B's list (RFC 3264 §6.1); on a transcode A was shown
-                // only its own codec, so B's is the one B already had. Leading B's list with it lets
-                // the codec machinery below read it as B's primary, so the pipeline decision does not
-                // move on a renegotiation that changes no codec.
-                let transcoding = call.pipeline.is_transcode();
-                let far_codec = match answered.primary_codec() {
-                    Some(selected)
-                        if !transcoding
-                            && far
-                                .audio_codecs()
-                                .iter()
-                                .any(|offered| same_codec(offered, &selected)) =>
-                    {
-                        Some(selected)
-                    }
-                    _ => call.far_codec.clone(),
-                };
-                if let Some(far_codec) = far_codec.as_ref() {
-                    lead_with_codec(&mut far, far_codec);
                 }
                 let context = ReversedAnswer {
                     carries_text: answered.text.is_some(),

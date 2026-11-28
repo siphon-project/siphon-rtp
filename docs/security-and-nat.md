@@ -657,7 +657,7 @@ is wrong, and encryption defeats A2 eavesdrop.
 > any crypto, exactly as on the far-leg bridge, except that an ICE-gated caller's endpoint runs that
 > filter open and leaves the discrimination to the datapath's layer-4 gate (see the source gate below).
 > The handshake, and the records and SRTP toward the caller, go to the pair ICE selected (nominated) rather than
-> to the caller's `c=`. A secure far leg, a caller that does not multiplex
+> to the caller's `c=`. A DTLS far leg (a second association), a caller that does not multiplex
 > RTCP, and a call that needs the decoded audio are refused (`secure-offerer-unsupported`), and a
 > caller with no `a=fingerprint` is refused as unkeyable, rather than any of them being relayed in
 > the clear. A renegotiation from either party restates the caller's keying on `Call.near_dtls`: the
@@ -734,9 +734,40 @@ is wrong, and encryption defeats A2 eavesdrop.
 > reason the bridge does — seeding one and restarting the other leaves that party's ROC at 0 on every
 > re-INVITE, which its peer cannot verify (RFC 3711 §3.3.1).
 >
-> What is still refused is two keying *mechanisms* on one call (a DTLS party facing an SDES or DTLS
-> one), which needs a transcrypt between a handshake and a key; the refusal says that rather than
-> blaming the transcrypt.
+> **A DTLS-SRTP caller toward an SDES-SRTP callee is a transcrypt between a handshake and a key**
+> (`PipelineKind::DtlsOffererTranscrypt`, and `DtlsOffererTranscryptMedia` when the call needs the
+> decoded audio). A browser (RFC 5764, `UDP/TLS/RTP/SAVPF`) calling a desk phone that must stay on
+> `RTP/SAVP` (RFC 4568) is asked for with `transport_protocol: RTP/SAVP` on the offer. The engine is
+> the caller's DTLS peer exactly as for a plain callee, and the callee's SDES peer: it offers the
+> callee its **own** `a=crypto` (minted at the offer, never the caller's keying, which has none to
+> give) and answers the caller with its own fingerprint, so neither party's keying reaches the other.
+> The bridge's plain side carries the callee's `SecureLeg` (`DtlsBridge::set_plain_leg`, installed
+> after `register` and before the endpoints are redirected): what the caller sends is unprotected
+> under the handshake's keys and protected under the callee's key (RFC 3711 §3.1, §3.4), and the
+> reverse, both through the bridge's own scratch buffers, so the second transform allocates nothing.
+> The plaintext between the two transforms is the only plaintext the call has, and it is what an X3
+> tap, a tee or a recording reads. Every refusal the bridge makes on a plain peer holds here: nothing
+> crosses in either direction until the handshake has keyed the caller (never plaintext, and never
+> SDES-protected media toward an unkeyed caller), a callee packet that fails SRTP authentication or
+> replay (RFC 3711 §3.3.2) is dropped before the DTLS protect and counted as a failed unprotect, and
+> both endpoints re-enforce `bridge_source_filter` before any crypto. The callee's separate RTCP
+> port, when it declines `a=rtcp-mux`, rides the plain side as SRTCP under the callee's key
+> (RFC 5761 §5.1.1). A renegotiation keeps the DTLS association as before (RFC 8842 §5.5), and keeps
+> the callee's SDES leg across it: an answer that repeats the callee's keys keeps the live leg and its
+> send window, a changed key is replaced in place with the stream's rollover carried over (RFC 3711
+> §3.3.1, §9.1), and a changed fingerprint runs a new handshake under the same SDES leg. The transcode
+> twin holds the callee's leg in the media actor from the start and the caller's once the handshake
+> delivers it; both directions are pending until then, and the callee's separate RTCP port is relayed
+> by the actor (callee's SRTCP opened and sealed for the caller, caller's multiplexed RTCP sent to
+> the port). **Bundled video is declined** on such a call (audio only), a **hold or split** and a
+> **conference seat** are refused with `secure-transcrypt-hold-unsupported` and
+> `secure-transcrypt-seat-unsupported` until the bridge can move both keyings, and `checkpoint`
+> refuses it like every DTLS kind. A re-answer that would move a live call between the bridge and its
+> transcode twin (say, `noise_suppression` named on the answer) is refused before anything changes with
+> `secure-transcrypt-renegotiation-unsupported`: the kept association's flows and the callee's SDES leg
+> cannot yet move together. What is still refused is a DTLS caller toward a DTLS callee (two
+> associations) and an SDES caller toward a DTLS callee, which needs the mirror of this bridge; both
+> are `secure-offerer-unsupported`.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The
@@ -1018,7 +1049,8 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
 ### Layer 5d-ii — Holding a crypto-bridged call in the decoding actor, and releasing it
 
 > **Status (landed — `PromotionReason::WsSplit`, no control verb yet):** a call on a crypto bridge
-> (`Srtp`, `SrtpOfferer`, `SrtpTranscrypt`, `Dtls`, `DtlsOfferer`) can be moved at runtime into the
+> (`Srtp`, `SrtpOfferer`, `SrtpTranscrypt`, `Dtls`, `DtlsOfferer`; not yet `DtlsOffererTranscrypt`,
+> which is refused with `secure-transcrypt-hold-unsupported`) can be moved at runtime into the
 > decoding `MediaCall` actor and moved back, **with no re-INVITE and no rebuilt crypto state**. It is
 > the foundation a split bridge (both legs to one stereo stream) stands on; this change adds no wire
 > verb, only the engine's `hold_in_userspace(WsSplit, Processing)` and `release_userspace_hold`.

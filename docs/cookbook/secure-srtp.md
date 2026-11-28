@@ -76,10 +76,19 @@ callee — is wired in four places:
   each datagram from one to the other. See
   [Two secure parties](#two-secure-parties-the-transcrypt-bridge).
 
+A **DTLS caller toward an SDES callee** (a browser calling a desk phone that stays
+on `RTP/SAVP`) is carried: ask for `transport_protocol: "RTP/SAVP"` on the `offer`
+of the browser's `UDP/TLS/RTP/SAVPF` offer. The engine terminates the browser's
+DTLS and offers the phone its own `a=crypto`, so each datagram is decrypted under
+one keying and encrypted under the other, with a transcode twin when the call needs
+the decoded audio. Video, a hold or split and a conference seat are not carried on
+such a call yet (`secure-transcrypt-hold-unsupported`,
+`secure-transcrypt-seat-unsupported`).
+
 One shape is refused rather than half-carried, because the media path behind it
-is not built: **two keying mechanisms on one call**, an SDES caller toward a DTLS
-far leg or a DTLS caller toward a secure one. That needs a transcrypt between a
-handshake and a key, not between two keys. It is refused on the **`offer`**,
+is not built: an SDES caller toward a DTLS far leg, which needs the mirror of that
+transcrypt, and a DTLS caller toward a DTLS one, which would need two associations.
+It is refused on the **`offer`**,
 because the far leg's keying comes from the offer's own `transport_protocol`, so
 the engine knows before it hands back an SDP and declines there rather than after
 the callee has rung and answered. The reason carries the stable

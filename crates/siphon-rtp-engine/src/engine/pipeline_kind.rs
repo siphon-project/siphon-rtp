@@ -24,7 +24,12 @@ impl PipelineKind {
                 "a secure↔secure (transcrypt) call has two secure legs and the snapshot record \
                  carries one",
             ),
-            Self::Dtls | Self::DtlsMedia | Self::DtlsOfferer | Self::DtlsOffererMedia => Some(
+            Self::Dtls
+            | Self::DtlsMedia
+            | Self::DtlsOfferer
+            | Self::DtlsOffererMedia
+            | Self::DtlsOffererTranscrypt
+            | Self::DtlsOffererTranscryptMedia => Some(
                 "a DTLS-SRTP call's keys come from the handshake rather than the SDP, so an \
                  established association cannot move to a standby",
             ),
@@ -45,7 +50,12 @@ impl PipelineKind {
     pub(super) fn is_crypto_bridge(self) -> bool {
         matches!(
             self,
-            Self::Srtp | Self::SrtpOfferer | Self::SrtpTranscrypt | Self::Dtls | Self::DtlsOfferer
+            Self::Srtp
+                | Self::SrtpOfferer
+                | Self::SrtpTranscrypt
+                | Self::Dtls
+                | Self::DtlsOfferer
+                | Self::DtlsOffererTranscrypt
         )
     }
 
@@ -73,6 +83,7 @@ impl PipelineKind {
                 | Self::SrtpTranscryptMedia
                 | Self::SrtpOffererMedia
                 | Self::DtlsOffererMedia
+                | Self::DtlsOffererTranscryptMedia
         )
     }
 }

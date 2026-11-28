@@ -20,6 +20,12 @@ use crate::x3::X3Taps;
 
 use super::{Direction, DtlsBridge, Flow, PipelineTarget, PlainRtcp};
 
+/// Why a DTLS leg whose plain peer is keyed by SDES cannot be held in the decoding actor yet: the
+/// actor takes the DTLS leg alone, and the SDES leg the plain peer needs would have to move with it.
+pub(crate) const TRANSCRYPT_HOLD_REFUSAL: &str =
+    "secure-transcrypt-hold-unsupported: a DTLS caller bridged to an SDES callee cannot be held or \
+     split yet";
+
 /// What a DTLS leg looks like from outside, read without changing it.
 pub(crate) struct DtlsView {
     /// The gate on the DTLS-facing endpoint (open on an ICE leg, whose gate the datapath owns).
@@ -118,6 +124,9 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         if secure.video.is_some() {
             return Err("the DTLS leg carries bundled video");
         }
+        if secure.plain_leg.is_some() {
+            return Err(TRANSCRYPT_HOLD_REFUSAL);
+        }
         let keyed = secure.secure.lock().is_ok_and(|leg| leg.is_some());
         if !keyed {
             return Err("the DTLS handshake has not completed");
@@ -176,6 +185,9 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             };
             if flow.video.is_some() {
                 return Err("the DTLS leg carries bundled video");
+            }
+            if flow.plain_leg.is_some() {
+                return Err(TRANSCRYPT_HOLD_REFUSAL);
             }
             let dtls_in = dtls_in.clone();
             let leg = flow
@@ -255,6 +267,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: None,
                 secure_dst: Some(destination.clone()),
                 secure: shared.clone(),
+                plain_leg: None,
                 x3: X3Taps::default(),
                 plain_taps: crate::plain_tap::PlainTaps::default(),
                 rtcp_only: false,
@@ -271,7 +284,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         if let Some(rtcp) = plain_rtcp {
             self.flows.insert(
                 rtcp.endpoint,
-                Self::plain_rtcp_flow(rtcp, secure_endpoint, destination, shared),
+                Self::plain_rtcp_flow(rtcp, secure_endpoint, destination, (shared, None)),
             );
         }
         Ok(())
@@ -351,6 +364,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                         out_dst: None,
                         secure_dst: Some(destination.clone()),
                         secure: shared.clone(),
+                        plain_leg: None,
                         x3: give.plain_taps.x3,
                         plain_taps: give.plain_taps.plain,
                         rtcp_only: false,
@@ -370,7 +384,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             if !self.flows.contains_key(&rtcp.endpoint) {
                 self.flows.insert(
                     rtcp.endpoint,
-                    Self::plain_rtcp_flow(rtcp, secure_endpoint, destination, shared),
+                    Self::plain_rtcp_flow(rtcp, secure_endpoint, destination, (shared, None)),
                 );
             }
         }

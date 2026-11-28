@@ -259,20 +259,24 @@ pub(super) fn settle_secure_offerer(
         || (near_dtls.is_some()
             && !matches!(
                 pipeline,
-                super::PipelineKind::DtlsOfferer | super::PipelineKind::DtlsOffererMedia
+                super::PipelineKind::DtlsOfferer
+                    | super::PipelineKind::DtlsOffererMedia
+                    | super::PipelineKind::DtlsOffererTranscrypt
+                    | super::PipelineKind::DtlsOffererTranscryptMedia
             ))
     {
         // Naming the *actual* obstacle matters here, because neither "both parties are secure" nor
         // "the call needs the audio decoded" is one any more: an SDES↔SDES pair is carried by
         // `SrtpTranscrypt` or its transcode twin, and a secure caller toward a plain callee by an
         // offerer bridge or its transcode twin, whichever keying it used. What is left is two keying
-        // *mechanisms* on one call — a DTLS party facing an SDES or DTLS one — which needs a
-        // transcrypt between a handshake and a key, and nothing carries that.
-        let why = "both parties are secure and one is keyed by DTLS, which needs a transcrypt \
-                   between two keying mechanisms rather than between two keys";
+        // *mechanisms* on one call, and of those only two DTLS associations (a DTLS party facing a DTLS
+        // one) and an SDES caller facing a DTLS callee are still uncarried: a DTLS caller toward an
+        // SDES callee is `DtlsOffererTranscrypt` or its transcode twin.
+        let why = "both parties are secure and the pair needs a transcrypt this engine does not \
+                   run: two DTLS associations, or an SDES caller toward a DTLS callee";
         let supported = if far_secure {
-            "two SDES parties are bridged as a transcrypt, and transcoded as one where the call \
-             needs the decoded audio"
+            "two SDES parties, or a DTLS caller toward an SDES callee, are bridged as a transcrypt, \
+             and transcoded as one where the call needs the decoded audio"
         } else {
             "a secure caller toward a plain callee is bridged, or transcoded where the call needs \
              the decoded audio"
@@ -1128,6 +1132,19 @@ pub(super) fn resolve_pipeline_kind(
             PipelineKind::DtlsOfferer
         };
     }
+    // A terminated DTLS-SRTP **offerer** toward an **SDES-SRTP** callee (RFC 5764 toward RFC 4568): the
+    // engine is A's DTLS peer and B's SDES peer, under two unrelated keyings. It must be tested ahead
+    // of the secure-far-leg arm below, which assumes A is plaintext and would encrypt A's
+    // still-encrypted datagrams a second time under B's key. The bridge when nothing needs the decoded
+    // audio; the transcode twin, which holds B's leg from the start and A's once the handshake keys
+    // it, when something does.
+    if near_dtls && far_local_crypto.is_some() && !far_dtls {
+        return if needs_decoded_audio {
+            PipelineKind::DtlsOffererTranscryptMedia
+        } else {
+            PipelineKind::DtlsOffererTranscrypt
+        };
+    }
     if far_dtls {
         // DTLS-SRTP far leg. Route it through the media pipeline when something actually needs the
         // decoded audio, and through the plain crypto bridge otherwise, which stays cheaper (no
@@ -1280,6 +1297,59 @@ mod tests {
         assert_ne!(
             resolve(&teed, (false, false, true, false)),
             PipelineKind::DtlsOfferer
+        );
+    }
+
+    /// A DTLS caller toward an SDES callee is the terminated-DTLS-to-SDES transcrypt: the bridge when
+    /// nothing needs the decoded audio, its transcode twin when something does. It must be tested
+    /// ahead of the plain secure-far-leg arm, which would otherwise take the call for an `Srtp`
+    /// bridge and encrypt A's still-encrypted datagrams.
+    #[test]
+    fn a_dtls_caller_toward_an_sdes_callee_resolves_to_the_dtls_to_sdes_transcrypt() {
+        let dtls_to_sdes = (false, true, true, false);
+        assert_eq!(
+            resolve(&ProfileFlags::default(), dtls_to_sdes),
+            PipelineKind::DtlsOffererTranscrypt
+        );
+        let recorded = ProfileFlags {
+            record_call: true,
+            ..ProfileFlags::default()
+        };
+        let teed = ProfileFlags {
+            ws_tee: Some("ws://example.invalid/tee".to_string()),
+            ..ProfileFlags::default()
+        };
+        for profile in [&recorded, &teed] {
+            assert_eq!(
+                resolve(profile, dtls_to_sdes),
+                PipelineKind::DtlsOffererTranscryptMedia,
+                "anything that needs the audio takes the transcode twin"
+            );
+        }
+        // The neighbouring postures are unchanged: a DTLS caller toward a plain callee, an SDES
+        // callee behind a plain caller.
+        assert_eq!(
+            resolve(&ProfileFlags::default(), (false, false, true, false)),
+            PipelineKind::DtlsOfferer
+        );
+        assert_eq!(
+            resolve(&ProfileFlags::default(), (false, true, false, false)),
+            PipelineKind::Srtp
+        );
+        // A codec mismatch is a transcode too.
+        let info = pcmu_answer();
+        let pcma = CodecSpec::new(8, "PCMA", 8000, 1, 20);
+        assert_eq!(
+            resolve_pipeline_kind(
+                Some(&pcma),
+                &info,
+                &ProfileFlags::default(),
+                Some(key()),
+                None,
+                false,
+                true,
+            ),
+            PipelineKind::DtlsOffererTranscryptMedia
         );
     }
 

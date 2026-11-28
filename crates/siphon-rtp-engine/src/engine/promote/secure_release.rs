@@ -362,9 +362,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let (secure, changed) = match pipeline {
             PipelineKind::Dtls | PipelineKind::DtlsMedia => (far.rtp.id, fingerprints.0),
-            PipelineKind::DtlsOfferer | PipelineKind::DtlsOffererMedia => {
-                (near.rtp.id, fingerprints.1)
-            }
+            PipelineKind::DtlsOfferer
+            | PipelineKind::DtlsOffererMedia
+            | PipelineKind::DtlsOffererTranscrypt
+            | PipelineKind::DtlsOffererTranscryptMedia => (near.rtp.id, fingerprints.1),
             _ => return false,
         };
         changed.is_some_and(|fingerprint| {

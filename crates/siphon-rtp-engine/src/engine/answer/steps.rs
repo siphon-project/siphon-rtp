@@ -7,12 +7,14 @@ use siphon_rtp_proto::{CmdResult, ProfileFlags};
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
 use crate::engine::install::{AnswerText, AnswerWiring, AnsweredText};
-use crate::engine::negotiate::{resolve_pipeline, settle_secure_offerer, NearDtlsAnswer};
+use crate::engine::negotiate::{
+    resolve_pipeline, resolve_pipeline_kind, settle_secure_offerer, NearDtlsAnswer,
+};
 use crate::engine::promote::secure_release::HeldAnswer;
 use crate::engine::{Engine, Leg, PipelineKind};
 use crate::sdp;
 
-use super::{log_answer_applied, ReversedAnswer};
+use super::{lead_with_codec, log_answer_applied, negotiated_near_codec, ReversedAnswer};
 
 /// What an applied answer still needs to settle, log and present.
 pub(super) struct AnswerFinish<'a> {
@@ -114,6 +116,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ),
         near_dtls: Option<&crate::engine::NearDtls>,
     ) -> Result<(PipelineKind, Option<NearDtlsAnswer>), Box<CmdResult>> {
+        let resolved = resolve_pipeline_kind(
+            near_codec,
+            info,
+            profile,
+            far_local_crypto,
+            near_local_crypto,
+            far_dtls,
+            near_dtls.is_some(),
+        );
+        // Ahead of everything this answer would change: the reversed exchange refused already, before
+        // it wrote A's answer (`refuse_reversed_switch`).
+        if !reversed {
+            let current = self.calls.get(call_id).map(|call| call.pipeline);
+            refuse_transcrypt_switch(current, resolved)?;
+        }
         let pipeline = resolve_pipeline(
             near_codec,
             info,
@@ -158,5 +175,106 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             (reversed, profile, self.engine_fingerprint()),
         )?;
         Ok((pipeline, settled))
+    }
+}
+
+/// Refuse an answer that would move a live DTLS caller bridged to an SDES callee between its crypto
+/// bridge and its transcode twin (secure-transcrypt-renegotiation-unsupported). The kept
+/// association's flows either relay or feed an actor, and the callee's SDES leg lives in the bridge
+/// or in the actor accordingly; moving both together is not carried. A pure comparison of the live
+/// kind with the one the answer resolves to, so it can run ahead of every side effect of the answer
+/// (ICE, the call record) and leave the call as it was.
+fn refuse_transcrypt_switch(
+    current: Option<PipelineKind>,
+    resolved: PipelineKind,
+) -> Result<(), Box<CmdResult>> {
+    use PipelineKind::{DtlsOffererTranscrypt as Relay, DtlsOffererTranscryptMedia as Twin};
+    if matches!(
+        (current, resolved),
+        (Some(Relay), Twin) | (Some(Twin), Relay)
+    ) {
+        return Err(Box::new(CmdResult::Error {
+            reason: "answer: secure-transcrypt-renegotiation-unsupported: the answer would move a \
+                     live DTLS caller bridged to an SDES callee between the crypto bridge and the \
+                     media pipeline"
+                .to_string(),
+        }));
+    }
+    Ok(())
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// A re-offer from the far party being answered by A: each party stays on the codec it
+    /// negotiated. On a relay both share one, and it is the one A's answer selected from B's list
+    /// (RFC 3264 §6.1); on a transcode A was shown only its own codec, so B's is the one B already
+    /// had. Leading B's list with it lets the codec machinery read it as B's primary, so the pipeline
+    /// decision does not move on a renegotiation that changes no codec.
+    pub(super) fn lead_far_reoffer(
+        &self,
+        call_id: &str,
+        answered: &sdp::MediaInfo,
+        far: &mut sdp::MediaInfo,
+    ) {
+        let Some((transcoding, stored)) = self
+            .calls
+            .get(call_id)
+            .map(|call| (call.pipeline.is_transcode(), call.far_codec.clone()))
+        else {
+            return;
+        };
+        let far_codec = match answered.primary_codec() {
+            Some(selected)
+                if !transcoding
+                    && far.audio_codecs().iter().any(|offered| {
+                        crate::engine::negotiate::same_codec(offered, &selected)
+                    }) =>
+            {
+                Some(selected)
+            }
+            _ => stored,
+        };
+        if let Some(far_codec) = far_codec.as_ref() {
+            lead_with_codec(far, far_codec);
+        }
+    }
+
+    /// [`refuse_transcrypt_switch`] for A's answer to B's re-offer, predicted from what the answer
+    /// would settle (A's codec as `negotiated_near_codec` would pick it from A's answered list), before
+    /// that answer is written to the call.
+    pub(super) fn refuse_reversed_switch(
+        &self,
+        call_id: &str,
+        answered: &sdp::MediaInfo,
+        far: &sdp::MediaInfo,
+        profile: &ProfileFlags,
+    ) -> Result<(), Box<CmdResult>> {
+        let Some(call) = self.calls.get(call_id) else {
+            return Ok(());
+        };
+        let answered_codecs = answered.audio_codecs();
+        let offered = if answered_codecs.is_empty() {
+            call.near_offered_codecs.clone()
+        } else {
+            answered_codecs
+        };
+        // A codec the answer cannot settle is refused later, with its own reason.
+        let Ok(near_codec) = negotiated_near_codec(
+            &offered,
+            call.near_codec.clone(),
+            far.primary_codec().as_ref(),
+            call.near_codec_withheld,
+        ) else {
+            return Ok(());
+        };
+        let resolved = resolve_pipeline_kind(
+            near_codec.as_ref(),
+            far,
+            profile,
+            call.far_local_crypto,
+            call.near_local_crypto,
+            call.far_dtls,
+            call.near_dtls.is_some(),
+        );
+        refuse_transcrypt_switch(Some(call.pipeline), resolved)
     }
 }

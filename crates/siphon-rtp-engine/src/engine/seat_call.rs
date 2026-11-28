@@ -510,6 +510,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 )
             }
             PipelineKind::Seated => return refuse("the call's leg is already seated"),
+            // A DTLS caller bridged to an SDES callee has two keyings behind it, and a seat takes one
+            // leg's crypto: the room would be handed the DTLS leg while the peer's SDES leg is left
+            // with nothing to relay to.
+            PipelineKind::DtlsOffererTranscrypt | PipelineKind::DtlsOffererTranscryptMedia => {
+                return refuse(
+                    "secure-transcrypt-seat-unsupported: a DTLS caller bridged to an SDES callee \
+                     cannot be seated in a conference yet",
+                )
+            }
             _ => {}
         }
         if call.fax_passthrough {

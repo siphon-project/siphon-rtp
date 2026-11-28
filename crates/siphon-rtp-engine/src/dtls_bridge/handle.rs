@@ -18,7 +18,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             accepted_source,
             out_endpoint,
             out_dst,
-            secure,
+            (secure, plain_leg),
             x3,
             plain_taps,
             rtcp_only,
@@ -35,7 +35,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 // toward the plain peer it is the signalled address.
                 flow.out_dst
                     .or_else(|| flow.secure_dst.as_ref().and_then(|dst| *dst.borrow())),
-                flow.secure.clone(),
+                (flow.secure.clone(), flow.plain_leg.clone()),
                 flow.x3.clone(),
                 flow.plain_taps.clone(),
                 flow.rtcp_only,
@@ -126,14 +126,40 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         let mut scratch = self.scratch.take();
         let Scratch {
             decrypted: out,
+            sealed: resealed,
+            injected: opened,
             rewritten,
-            ..
         } = &mut *scratch;
+        // A plain peer keyed by SDES (RFC 4568) sends SRTP, which is opened under its own key before
+        // the DTLS protect, and only once the DTLS peer is keyed: an unkeyed association drops before
+        // any crypto, so a packet it could not relay never advances the SDES leg's replay window.
+        let plaintext_in: &[u8] = match (&plain_leg, &direction) {
+            (Some(leg), Direction::Encrypt) => {
+                let keyed = secure.lock().is_ok_and(|guard| guard.is_some());
+                if !keyed {
+                    self.datapath.note_dropped(packet.endpoint);
+                    return;
+                }
+                let Ok(mut leg) = leg.lock() else {
+                    tracing::error!("DTLS bridge SDES-leg mutex poisoned; dropping packet");
+                    return;
+                };
+                // RFC 3711 §3.3 / RFC 4568: a packet that does not authenticate is never relayed.
+                if let Err(error) = leg.unprotect(&packet.data, opened) {
+                    drop(leg);
+                    refusals.log_undecryptable(&error, &packet.data, "plain", context);
+                    self.datapath.note_dropped(packet.endpoint);
+                    return;
+                }
+                opened.as_slice()
+            }
+            _ => &packet.data,
+        };
         // The stream toward the DTLS peer, continued across a hold in the decoding actor.
         // The sender's own record of a stream, asked only for one the flow is not following.
         let sent = |ssrc| secure.lock().ok()?.as_ref()?.highest_sent(ssrc);
         let toward_peer: &[u8] = if matches!(direction, Direction::Encrypt) {
-            let Some(datagram) = continue_stream(&track, &packet.data, rewritten, sent) else {
+            let Some(datagram) = continue_stream(&track, plaintext_in, rewritten, sent) else {
                 self.datapath.note_dropped(packet.endpoint);
                 return;
             };
@@ -213,6 +239,28 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             _ => (out_endpoint, out_dst),
         };
 
+        // A plain peer keyed by SDES is sent what the DTLS peer sent, protected under the key the
+        // engine offered it (RFC 3711 §3.3 for RTP, §3.4 for RTCP). After the numbering was continued
+        // and the closed direction checked, so what is sealed is exactly what is relayed, and before
+        // the taps and liveness stamp, so a packet the SDES leg refuses (a reused index, RFC 3711
+        // §9.1) is neither delivered to an interception nor counted as carried.
+        let mut sealed_for_plain = false;
+        if let (Some(leg), Direction::Decrypt { .. }) = (&plain_leg, &direction) {
+            let sealed = {
+                let Ok(mut leg) = leg.lock() else {
+                    tracing::error!("DTLS bridge SDES-leg mutex poisoned; dropping packet");
+                    return;
+                };
+                (leg.protect(out.as_slice(), resealed), leg.reuse_refusals())
+            };
+            if let (Err(error), refused) = sealed {
+                crate::egress_track::log_protect_failure(&error, "dtls-bridge", refused);
+                self.datapath.note_dropped(packet.endpoint);
+                return;
+            }
+            sealed_for_plain = true;
+        }
+
         // Accepted: past the source gate, past the keyed check and past the crypto. Stamp liveness for
         // the idle sweep, exactly as the SDES bridge does and for the same reason — a `Redirect` leg
         // gets no `last_seen` from the datapath (docs/security-and-nat.md §4 layer 6). `Pipeline`-mode
@@ -224,7 +272,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         // source gate, after the leg is keyed, and after the crypto succeeded, so an unkeyed,
         // forged or replayed packet is never delivered.
         let plaintext = match direction {
-            Direction::Encrypt => packet.data.as_ref(),
+            Direction::Encrypt => plaintext_in,
             Direction::Decrypt { .. } | Direction::Pipeline { .. } => out.as_slice(),
         };
         // Audio only: interception, a tee and a recording take the call's audio, and a bundled
@@ -248,7 +296,12 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             );
         }
 
-        if let Err(error) = self.datapath.send(out_endpoint, out_dst, out).await {
+        let wire: &[u8] = if sealed_for_plain {
+            resealed.as_slice()
+        } else {
+            out.as_slice()
+        };
+        if let Err(error) = self.datapath.send(out_endpoint, out_dst, wire).await {
             tracing::debug!(%error, "DTLS bridge forward send failed");
         }
     }
