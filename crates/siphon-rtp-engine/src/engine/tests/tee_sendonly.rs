@@ -87,14 +87,23 @@ async fn a_tee_on_a_call_that_answered_a_sendonly_offer_streams_it_and_sends_not
     // not (RFC 5761 §4: RTCP packet types 200..=204 sit in the second byte).
     let mut buffer = [0u8; 2048];
     let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
-    while let Ok(Ok((len, _))) =
+    while let Ok(Ok((len, from))) =
         tokio::time::timeout_at(deadline, sender.recv_from(&mut buffer)).await
     {
+        // Only what this engine's own socket sends is the engine's doing. The suite binds hundreds
+        // of loopback sockets on ephemeral ports, so under load a port can be handed to this
+        // sender just after a neighbouring test's engine, whose comfort-noise actor outlives that
+        // test's phone socket by a runtime teardown, was still sending to it: a datagram from any
+        // other source says nothing about this call.
+        if from != engine_near {
+            continue;
+        }
         let is_rtcp = len >= 2 && (200..=204).contains(&buffer[1]);
         assert!(
             is_rtcp,
-            "the engine sent RTP toward a sendonly party ({len} bytes, PT byte {:#04x})",
-            buffer.get(1).copied().unwrap_or(0)
+            "the engine sent RTP toward a sendonly party ({len} bytes) from {from} (engine_near={engine_near} sender={:?}): {:02x?}",
+            sender.local_addr(),
+            &buffer[..len.min(24)]
         );
     }
 }
@@ -233,6 +242,14 @@ async fn a_recording_on_a_call_that_answered_a_sendonly_offer_records_it_and_sen
     while let Ok(Ok((len, from))) =
         tokio::time::timeout_at(quiet, sender.recv_from(&mut buffer)).await
     {
+        // Only what this engine's own socket sends is the engine's doing. The suite binds hundreds
+        // of loopback sockets on ephemeral ports, so under load a port can be handed to this
+        // sender just after a neighbouring test's engine, whose comfort-noise actor outlives that
+        // test's phone socket by a runtime teardown, was still sending to it: a datagram from any
+        // other source says nothing about this call.
+        if from != engine_near {
+            continue;
+        }
         let is_rtcp = len >= 2 && (200..=204).contains(&buffer[1]);
         assert!(
             is_rtcp,
@@ -254,6 +271,8 @@ async fn a_sendonly_callers_pipeline_starts_with_its_egress_already_withheld() {
         ("sendonly-start", "sendonly", true),
         ("inactive-start", "inactive", true),
         ("sendrecv-start", "sendrecv", false),
+        // The reverse: a party that only receives is answered `sendonly` and sent media at once.
+        ("recvonly-start", "recvonly", false),
     ] {
         let sdp = format!(
             "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
@@ -279,4 +298,40 @@ async fn a_sendonly_callers_pipeline_starts_with_its_egress_already_withheld() {
             "{direction}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_call_that_answered_a_recvonly_offer_is_sent_media_from_the_engines_own_socket() {
+    // The reverse of the withheld egress, and the proof the source filter above cannot hide a real
+    // send: the engine answers `recvonly` with `sendonly` and its idle stream reaches that party
+    // from the very address the answer advertised (RFC 3264 §6.1).
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (receiver, receiver_addr) = phone().await;
+    let sdp = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=recvonly\r\na=rtcp-mux\r\n",
+        ip = receiver_addr.ip(),
+        port = receiver_addr.port(),
+    );
+    let answered = engine
+        .handle(
+            CLIENT,
+            Command::AnswerLocal {
+                call_id: "recvonly-sent".into(),
+                from_tag: "tag-a".into(),
+                sdp,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&answered);
+    assert!(answer.contains("a=sendonly"), "{answer}");
+    let engine_near = sdp::parse(&answer).expect("answer sdp").remote_rtp;
+    let mut buffer = [0u8; 2048];
+    let (len, from) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buffer))
+        .await
+        .expect("a recvonly party is sent its idle stream")
+        .expect("recv");
+    assert_eq!(from, engine_near);
+    assert!(len >= 12, "{len} bytes");
 }
