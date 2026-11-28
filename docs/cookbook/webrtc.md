@@ -160,8 +160,14 @@ a=setup:active
   passes through to the callee untouched, for a callee that is itself a DTLS
   peer.
 
-Refused with `secure-offerer-unsupported`: a secure far leg (`RTP/SAVP`, or
-`UDP/TLS` without `dtls: off`), a caller without `a=rtcp-mux`, and an `answer`
+A callee that must stay on SDES-SRTP (`transport_protocol: "RTP/SAVP"`) is
+carried too: the engine terminates the browser's DTLS and keys the callee with its
+own `a=crypto`, so neither side sees the other's keying (see
+[Secure media with SRTP](secure-srtp.md)). Video, a hold or split and a
+conference seat are not carried on such a call yet.
+
+Refused with `secure-offerer-unsupported`: a DTLS far leg (`UDP/TLS` without
+`dtls: off`), a caller without `a=rtcp-mux`, and an `answer`
 that needs the decoded audio (a codec change, recording, noise suppression, echo
 cancellation or beep detection). An offer without `a=fingerprint` is refused
 with `secure-offerer-unkeyable`, and its ports are freed.

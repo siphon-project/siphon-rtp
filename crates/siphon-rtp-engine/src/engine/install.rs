@@ -283,6 +283,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             PipelineKind::Dtls => self.install_dtls_bridge(wiring)?,
             PipelineKind::DtlsOfferer => self.install_dtls_offerer_bridge(wiring)?,
+            PipelineKind::DtlsOffererTranscrypt => {
+                self.install_dtls_offerer_transcrypt_bridge(wiring, far_local_crypto)?;
+            }
+            PipelineKind::DtlsOffererTranscryptMedia => {
+                self.install_dtls_offerer_transcrypt_media(wiring, far_local_crypto, owner_events)?;
+            }
             PipelineKind::DtlsMedia => self.install_dtls_media(wiring, owner_events)?,
             PipelineKind::DtlsOffererMedia => {
                 self.install_dtls_offerer_media(wiring, owner_events)?;
@@ -526,27 +532,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         )?;
         let mut redirected = vec![near.rtp.id, far.rtp.id];
-        // Carry the live actor's SRTP rollover into the rebuilt leg (RFC 3711 §3.3.1) — see the SDES
-        // bridge; a renegotiation must not restart either counter at 0.
-        // A call held for a split hands its live leg to the replacement (promote/secure_release.rs).
-        let leg = self
-            .carried_sdes_leg(wiring.call_id, true, (&far_local, &far_remote))
-            .or_else(|| {
-                // A re-answer that repeats a key keeps the actor's live leg, and so its send window
-                // (RFC 3711 §9.1); only a changed key is replaced, in place.
-                let live = self.media.secure_legs(wiring.call_id).1?;
-                live.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .adopt(Some(&far_local.key), Some(&far_remote.key));
-                Some(live)
-            })
-            .unwrap_or_else(|| {
-                let mut secure_leg = SecureLeg::new(&far_local.key, &far_remote.key);
-                if let Some(rollover) = self.media.rollover_snapshot(wiring.call_id) {
-                    secure_leg.seed_rollover(&rollover);
-                }
-                Arc::new(Mutex::new(secure_leg))
-            });
+        let leg = self.media_far_sdes_leg(wiring, &far_local, &far_remote);
         // Non-muxed companion RTCP: relayed through the shared SecureLeg — A's RTCP encrypted toward
         // secure B, B's SRTCP decrypted toward plaintext A — so a non-muxed secure-transcode leg keeps
         // RTCP flowing (RFC 3711 SRTCP; RFC 5761 keeps it on its own port). Muxed calls leave this empty.

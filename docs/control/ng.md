@@ -114,7 +114,7 @@ The rest of the rtpengine flag surface the parser maps:
 
 | Key | Meaning |
 |---|---|
-| `transport-protocol` | Far-leg transport (`RTP/AVP`, `RTP/SAVP`, `UDP/TLS/RTP/SAVPF`, ...). |
+| `transport-protocol` | Far-leg transport (`RTP/AVP`, `RTP/SAVP`, `UDP/TLS/RTP/SAVPF`, ...). A DTLS-SRTP caller (`UDP/TLS/RTP/SAVPF`) with `RTP/SAVP` here is terminated and the callee keyed with the engine's own SDES key; with `UDP/TLS/RTP/SAVPF` it is refused (`secure-offerer-unsupported`). |
 | `ICE` | `remove` \| `force` \| `force-relay`. |
 | `DTLS` | `passive` \| `active` \| `off`. |
 | `replace` | SDP rewrite list, e.g. `origin`. |

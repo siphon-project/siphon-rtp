@@ -290,20 +290,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // DTLS directive its keying passes through to B untouched, as before: two DTLS peers may run
         // their association end to end through the relay. Asking for a plaintext far leg (`dtls: off`,
         // or a transport that is not a secure profile) terminates it instead: the engine becomes A's
-        // DTLS peer, answers A with its own fingerprint, and presents B plain RTP. Asking for a secure
-        // far leg is refused: SDES toward B would need a transcrypt between two keys, and a DTLS far leg
-        // a second association, and neither exists.
+        // DTLS peer, answers A with its own fingerprint, and presents B plain RTP. Asking for an SDES
+        // far leg (`RTP/SAVP`, RFC 4568) terminates it the same way and keys B with the engine's own
+        // SDES key (`PipelineKind::DtlsOffererTranscrypt`), so neither party's keying reaches the
+        // other. Only a DTLS far leg is refused: that would be a second association.
         let near_dtls = if info.dtls {
-            if far_sdes || far_dtls {
+            if far_dtls {
                 return Err(Box::new(error_result(
                     "offer",
-                    &"secure-offerer-unsupported: a DTLS-SRTP offerer toward a secure far leg needs a \
-                      transcrypt between two keys; a DTLS caller toward a plain callee is supported",
+                    &"secure-offerer-unsupported: a DTLS-SRTP offerer toward a DTLS-SRTP far leg \
+                      needs a second DTLS association; a DTLS caller toward an SDES (RTP/SAVP) or a \
+                      plain callee is supported",
                 )));
             }
             let plain_far =
                 dtls_off || (!far_transport.is_empty() && !far_transport.contains("SAVP"));
-            if plain_far {
+            if plain_far || far_sdes {
                 // RFC 5763 §5: "The endpoint MUST use the certificate fingerprint attribute". Without
                 // one there is nothing to authenticate the handshake against.
                 let Some(peer_fingerprint) = info.fingerprint.clone() else {

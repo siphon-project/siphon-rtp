@@ -58,6 +58,7 @@ mod conference_dtmf;
 mod conference_received_from;
 mod conference_seat;
 mod conference_seat_call;
+mod dtls_sdes_transcrypt;
 mod floor_call_rtcp;
 mod floor_checkpoint;
 mod floor_security_refusals;
@@ -13889,40 +13890,35 @@ async fn a_dtls_offerer_that_does_not_multiplex_rtcp_is_refused_and_frees_its_po
 }
 
 #[tokio::test]
-async fn a_dtls_offerer_toward_a_secure_callee_is_refused() {
-    // Terminating A's DTLS toward a secure B would need a transcrypt between two keys, which does not
-    // exist; offering B the engine's own keying while answering A in plain is worse. Refuse both.
-    for transport in ["RTP/SAVP", "UDP/TLS/RTP/SAVPF"] {
-        let engine = Engine::new(UdpLoopbackDatapath::new());
-        let (_phone_a, addr_a) = phone().await;
-        let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
-        let offer = engine
-            .handle(
-                CLIENT,
-                Command::Offer {
-                    call_id: "dtls-to-secure".into(),
-                    from_tag: "a".into(),
-                    sdp: dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
-                    profile: ProfileFlags {
-                        transport_protocol: Some(transport.into()),
-                        ..Default::default()
-                    },
+async fn a_dtls_offerer_toward_a_dtls_callee_is_refused() {
+    // Terminating A's DTLS toward a DTLS B would need two associations, which the engine does not
+    // run. (An SDES callee, `RTP/SAVP`, is carried: see `dtls_sdes_transcrypt`.)
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let (_phone_a, addr_a) = phone().await;
+    let caller = siphon_rtp_dtls::DtlsCertificate::generate().expect("caller cert");
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "dtls-to-dtls".into(),
+                from_tag: "a".into(),
+                sdp: dtls_offerer_sdp(addr_a, &caller.fingerprint(), "actpass"),
+                profile: ProfileFlags {
+                    transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                    ..Default::default()
                 },
-            )
-            .await;
-        match offer {
-            CmdResult::Error { reason } => assert!(
-                reason.contains("secure-offerer-unsupported"),
-                "{transport}: {reason}"
-            ),
-            other => panic!("{transport}: expected a refusal, got {other:?}"),
-        }
-        assert_eq!(
-            engine.session_count(),
-            0,
-            "{transport}: nothing left behind"
-        );
+            },
+        )
+        .await;
+    match offer {
+        CmdResult::Error { reason } => assert!(
+            reason.contains("secure-offerer-unsupported"),
+            "refused by name: {reason}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
     }
+    assert_eq!(engine.session_count(), 0, "nothing left behind");
+    assert!(engine.endpoint_calls.is_empty(), "and no port is held");
 }
 
 #[tokio::test]

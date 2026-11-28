@@ -12,7 +12,8 @@
 //!
 //! Anything else is declined with the reason, never relayed unkeyed: unbundled with ICE (ICE would run
 //! per `m=` line), video without `a=rtcp-mux` (an association protects one port pair, RFC 5764 §5.1.2),
-//! DTLS toward SDES (a transcrypt between two keying mechanisms), a DTLS leg whose DTLS the engine does
+//! video of a DTLS caller toward an SDES callee (the audio is transcrypted, see
+//! `PipelineKind::DtlsOffererTranscrypt`, the video is not), a DTLS leg whose DTLS the engine does
 //! not terminate, and a bundled leg whose audio the media pipeline owns.
 
 use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction};
@@ -138,10 +139,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             )
         } else if party == Party::Far && !far_dtls {
             Err("DTLS-SRTP video was answered where the engine offered none")
-        } else if call.video.keys.is_secure() {
+        } else if call.video.keys.is_secure() || call.far_local_crypto.is_some() {
+            // The audio of a DTLS caller toward an SDES callee is carried (a DTLS bridge whose plain
+            // side is keyed by SDES), and the video is not: it would need the same transcrypt on the
+            // video endpoints, which the bundled flow does not run. Declined with this reason rather
+            // than relayed under either keying alone.
             Err(
                 "DTLS-SRTP video toward an SDES-SRTP leg needs a transcrypt between two keying \
-                 mechanisms, which is not carried",
+                 mechanisms, which is carried for audio only",
             )
         } else if !stream.rtcp_mux {
             Err(

@@ -47,6 +47,9 @@ pub(in crate::engine) const ANSWER_LOCAL: &str = "ws-split-answer-local";
 pub(in crate::engine) const ALREADY_BRIDGED: &str = "ws-split-already-bridged";
 /// The refusal token for a call with no far party answered yet.
 pub(in crate::engine) const NOT_ANSWERED: &str = "ws-split-not-answered";
+/// The refusal token for a DTLS caller bridged to an SDES callee, whose two keyings the hold does not
+/// carry into the actor yet.
+pub(in crate::engine) const TRANSCRYPT_HOLD: &str = "secure-transcrypt-hold-unsupported";
 
 /// What a call remembers while a crypto bridge is held in the decoding actor.
 #[derive(Clone)]
@@ -139,6 +142,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         ALREADY_BRIDGED,
                         "the call already has a WebSocket takeover or a split",
                     ))
+                } else if matches!(
+                    call.pipeline,
+                    PipelineKind::DtlsOffererTranscrypt | PipelineKind::DtlsOffererTranscryptMedia
+                ) {
+                    Some((
+                        TRANSCRYPT_HOLD,
+                        "a DTLS caller bridged to an SDES callee cannot be held or split yet (the split of its transcode twin is not proven end to end)",
+                    ))
                 } else if call.is_single_leg() || call.far_codec.is_none() {
                     Some((NOT_ANSWERED, "the call has no answered far party"))
                 } else {
@@ -226,6 +237,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             PipelineKind::Dtls | PipelineKind::DtlsOfferer => {
                 self.hold_dtls_bridge(call_id, inputs).await
             }
+            PipelineKind::DtlsOffererTranscrypt => Err(format!(
+                "{TRANSCRYPT_HOLD}: a DTLS caller bridged to an SDES callee cannot be held yet"
+            )),
             other => Err(format!("a {other:?} call is not on a crypto bridge")),
         }
     }

@@ -670,9 +670,10 @@ async fn dtls_video_whose_audio_dtls_passes_through_is_declined_with_the_reason(
 }
 
 #[tokio::test]
-async fn a_dtls_caller_toward_an_sdes_callee_is_refused_as_audio_is() {
-    // Audio refuses the posture at the offer, so no video of it is ever negotiated: two keying
-    // mechanisms need a transcrypt, which is not carried.
+async fn a_dtls_callers_video_toward_an_sdes_callee_is_declined_while_its_audio_is_carried() {
+    // The audio of a DTLS caller toward an SDES callee is transcrypted by the DTLS bridge. The video
+    // is not: it would need the same re-keying on the video endpoints, so it is declined with the
+    // reason rather than relayed under either keying alone.
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let (_a, a_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
     let caller = DtlsCertificate::generate().expect("cert");
@@ -690,10 +691,20 @@ async fn a_dtls_caller_toward_an_sdes_callee_is_refused_as_audio_is() {
             },
         )
         .await;
-    let CmdResult::Error { reason } = offered else {
+    let CmdResult::Ok {
+        video_declined,
+        sdp: Some(toward_b),
+        ..
+    } = offered
+    else {
         panic!("{offered:?}");
     };
-    assert!(reason.contains("secure-offerer-unsupported"), "{reason}");
+    let reason = video_declined.expect("the video is declined");
+    assert!(reason.contains("transcrypt"), "{reason}");
+    assert!(
+        !toward_b.contains("m=video") || toward_b.contains("m=video 0 "),
+        "B is offered no live video: {toward_b}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

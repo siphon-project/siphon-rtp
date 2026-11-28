@@ -21,6 +21,10 @@
 //!   the steady state, and the renumbering a released call keeps for the rest of its life (a copy of
 //!   the packet into the bridge's own buffer and two header writes). Both are already inside every
 //!   `handle` point above; these two isolate them.
+//! - `transcrypt_plain_rtp_to_secure` and `transcrypt_secure_rtp_to_plain` — the same two paths on a
+//!   call whose plain peer is keyed by SDES (`PipelineKind::DtlsOffererTranscrypt`): a second SRTP
+//!   transform per packet, RFC 3711 under two keyings. The delta against `plain_rtp_to_secure` and
+//!   `secure_rtp_to_plain` is what the second transform costs.
 //! - `unkeyed_drop` — SRTP arriving before any handshake has keyed the leg. It has to stay cheaper
 //!   than a keyed packet: a peer that floods before the handshake must not cost more than one that
 //!   completes it.
@@ -53,6 +57,8 @@ use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, DtlsSession, Fingerprint};
 use siphon_rtp_engine::dtls_bridge::{DtlsBridge, DtlsCallPlan, DtlsVideoPlan, PlainRtcp};
 use siphon_rtp_engine::egress_track::{continue_stream, EgressTrack, StreamPosition};
 use siphon_rtp_srtp::leg::SecureLeg;
+use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
+use siphon_rtp_srtp::SrtpContext;
 use tokio::net::UdpSocket;
 
 /// 8 kHz / 20 ms of µ-law.
@@ -451,5 +457,142 @@ fn egress_track(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, dtls_bridge_handle, egress_track);
+/// The double-transform points: the DTLS peer on the secure endpoint, an SDES desk phone on the plain one.
+fn dtls_bridge_transcrypt(criterion: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let _guard = runtime.enter();
+
+    let datapath = UdpLoopbackDatapath::new();
+    let (plain, secure) = runtime.block_on(async {
+        (
+            datapath.alloc_endpoint().await.expect("plain"),
+            datapath.alloc_endpoint().await.expect("secure"),
+        )
+    });
+    datapath
+        .install_flow(secure.id, FlowAction::Redirect)
+        .expect("redirect secure");
+    let (desk, peer_b) = runtime.block_on(async {
+        (
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+                .await
+                .expect("bind desk"),
+            Arc::new(
+                UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                    .await
+                    .expect("bind b"),
+            ),
+        )
+    });
+    let (addr_desk, addr_b) = (
+        desk.local_addr().expect("addr"),
+        peer_b.local_addr().expect("addr"),
+    );
+    let engine_cert = DtlsCertificate::generate().expect("engine cert");
+    let peer_cert = DtlsCertificate::generate().expect("peer cert");
+    let toward_desk = SrtpKeyMaterial::generate().expect("key");
+    let from_desk = SrtpKeyMaterial::generate().expect("key");
+    let bridge = Arc::new(DtlsBridge::new(datapath.clone()));
+    bridge.register(DtlsCallPlan {
+        plain_endpoint: plain.id,
+        plain_source: SourceFilter::Exact(addr_desk.ip()),
+        plain_dst: addr_desk,
+        secure_endpoint: secure.id,
+        secure_source: SourceFilter::Exact(addr_b.ip()),
+        secure_dst: addr_b,
+        secure_local: secure.local_addr,
+        certificate: engine_cert.clone(),
+        role: DtlsRole::Server,
+        peer_fingerprint: peer_cert.fingerprint(),
+        gate_on_ice: false,
+        ice_validated: None,
+        plain_rtcp: None,
+    });
+    assert!(bridge.set_plain_leg(
+        secure.id,
+        Arc::new(std::sync::Mutex::new(SecureLeg::new(
+            &toward_desk,
+            &from_desk
+        )))
+    ));
+    let mut peer_leg = runtime.block_on(async {
+        let rx = datapath.rx();
+        let dispatch = bridge.clone();
+        let dispatcher = tokio::spawn(async move {
+            while let Ok(packet) = rx.recv_async().await {
+                dispatch.handle(packet).await;
+            }
+        });
+        let mut leg = peer_handshake(
+            peer_b.clone(),
+            secure.local_addr,
+            &peer_cert,
+            &engine_cert.fingerprint(),
+        )
+        .await;
+        dispatcher.abort();
+        let mut buffer = [0u8; 2048];
+        for sequence in 0..50u16 {
+            let mut sealed = Vec::new();
+            leg.protect(&rtp_packet(sequence, 0x0B0B_0B0B), &mut sealed)
+                .expect("peer protect");
+            bridge
+                .handle(packet(secure.id, addr_b, Bytes::from(sealed)))
+                .await;
+            if tokio::time::timeout(Duration::from_millis(100), desk.recv_from(&mut buffer))
+                .await
+                .is_ok()
+            {
+                return leg;
+            }
+        }
+        panic!("the bridge never keyed its leg");
+    });
+
+    let mut desk_out = SrtpContext::from_key_material(&from_desk);
+    let mut group = criterion.benchmark_group("dtls_bridge_handle");
+    let mut sequence = 1_000u16;
+    group.bench_function("transcrypt_plain_rtp_to_secure", |bencher| {
+        bencher.iter_batched(
+            || {
+                sequence = sequence.wrapping_add(1);
+                let mut sealed = Vec::new();
+                desk_out
+                    .protect(&rtp_packet(sequence, 0x0A0A_0A0A), &mut sealed)
+                    .expect("desk protect");
+                Bytes::from(sealed)
+            },
+            |sealed| {
+                runtime.block_on(bridge.handle(black_box(packet(plain.id, addr_desk, sealed))))
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    let mut sequence = 1_000u16;
+    group.bench_function("transcrypt_secure_rtp_to_plain", |bencher| {
+        bencher.iter_batched(
+            || {
+                sequence = sequence.wrapping_add(1);
+                let mut sealed = Vec::new();
+                peer_leg
+                    .protect(&rtp_packet(sequence, 0x0B0B_0B0B), &mut sealed)
+                    .expect("peer protect rtp");
+                Bytes::from(sealed)
+            },
+            |sealed| runtime.block_on(bridge.handle(black_box(packet(secure.id, addr_b, sealed)))),
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    dtls_bridge_handle,
+    dtls_bridge_transcrypt,
+    egress_track
+);
 criterion_main!(benches);

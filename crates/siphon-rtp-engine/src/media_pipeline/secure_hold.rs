@@ -171,6 +171,14 @@ impl MediaCall {
         }
     }
 
+    /// Send the RTCP A multiplexes onto its RTP port to B's own RTCP port, for a callee that does not
+    /// multiplex (RFC 5761 §5.1.1). The same destination a held call's resume sets, applied at build.
+    #[must_use]
+    pub fn with_rtcp_toward_b(mut self, port: Option<(EndpointId, SocketAddr)>) -> Self {
+        self.a_to_b.rtcp_out = port;
+        self
+    }
+
     /// What goes back to a bridge: A's side (the `a_to_b` direction) and B's (the `b_to_a`).
     pub fn held_back(&mut self) -> [HeldBack; 2] {
         let held = [self.a_to_b.held_back(), self.b_to_a.held_back()];

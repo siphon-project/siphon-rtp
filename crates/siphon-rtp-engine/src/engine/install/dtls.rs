@@ -5,9 +5,13 @@
 use siphon_rtp_datapath::{Datapath, SourceFilter};
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_proto::{CmdResult, Event};
+use siphon_rtp_srtp::leg::SecureLeg;
+use siphon_rtp_srtp::sdes::CryptoAttribute;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use crate::dtls_bridge::DtlsCallPlan;
+use crate::media_pipeline::{RtcpRelay, SecureSide};
 use crate::sdp;
 
 use super::super::negotiate::{bridge_source_filter, build_transcode_pair, RtcpKeying};
@@ -442,6 +446,247 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             || {
                 self.media.deregister(wiring.call_id);
                 self.dtls_bridge().deregister(redirected);
+            },
+        )
+    }
+
+    /// The engine's SDES-SRTP leg toward the secure far (B) party of a transcoding call: the live
+    /// actor's own when the answer repeats its keys (so its send window survives, RFC 3711 §9.1),
+    /// rekeyed in place for a key that changed, the leg a held call handed over, or a new one seeded
+    /// with the rollover of whatever ran before (RFC 3711 §3.3.1: a renegotiation must not restart
+    /// either counter at 0).
+    pub(super) fn media_far_sdes_leg(
+        &self,
+        wiring: &AnswerWiring<'_>,
+        far_local: &CryptoAttribute,
+        far_remote: &CryptoAttribute,
+    ) -> Arc<Mutex<SecureLeg>> {
+        // A call held for a split hands its live leg to the replacement (promote/secure_release.rs).
+        self.carried_sdes_leg(wiring.call_id, true, (far_local, far_remote))
+            .or_else(|| {
+                let live = self.media.secure_legs(wiring.call_id).1?;
+                live.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .adopt(Some(&far_local.key), Some(&far_remote.key));
+                Some(live)
+            })
+            .unwrap_or_else(|| {
+                let mut secure_leg = SecureLeg::new(&far_local.key, &far_remote.key);
+                if let Some(rollover) = self.media.rollover_snapshot(wiring.call_id) {
+                    secure_leg.seed_rollover(&rollover);
+                }
+                Arc::new(Mutex::new(secure_leg))
+            })
+    }
+
+    /// B's keys on a DTLS caller toward an SDES callee: the engine's own key toward B (minted at offer,
+    /// RFC 4568 §6.1) and the key B answered with, or the refusal under `context`.
+    fn transcrypt_far_keys(
+        wiring: &AnswerWiring<'_>,
+        far_local_crypto: Option<CryptoAttribute>,
+        context: &str,
+    ) -> Result<(CryptoAttribute, CryptoAttribute), Box<CmdResult>> {
+        // `resolve_pipeline_kind` only yields a transcrypt kind when `far_local_crypto` is set, so its
+        // absence is an internal invariant: refuse rather than key B against nothing.
+        let Some(far_local) = far_local_crypto else {
+            return Err(boxed_error_result(
+                context,
+                &"far leg has no local crypto (internal)",
+            ));
+        };
+        let Some(far_remote) = wiring.info.crypto.first().copied() else {
+            return Err(boxed_error_result(
+                "SAVP answer",
+                &"missing a=crypto in the answer",
+            ));
+        };
+        Ok((far_local, far_remote))
+    }
+
+    /// A terminated DTLS-SRTP **offerer** (A) toward an SDES-SRTP callee (B) → the DTLS bridge with B's
+    /// plain side re-keyed by SDES (`PipelineKind::DtlsOffererTranscrypt`): the handshake keys A's leg
+    /// as for [`Self::install_dtls_offerer_bridge`], and B's SDES leg (RFC 4568) is installed on the
+    /// association so each datagram is unprotected under one keying and protected under the other
+    /// (RFC 3711), the plaintext between them seen only by the taps. B's separate RTCP port, when it
+    /// does not multiplex, is bridged on the same leg (RFC 5761 §5.1.1).
+    pub(super) fn install_dtls_offerer_transcrypt_bridge(
+        &self,
+        wiring: &AnswerWiring<'_>,
+        far_local_crypto: Option<CryptoAttribute>,
+    ) -> Result<(), Box<CmdResult>> {
+        let Some(certificate) = self.dtls_certificate.clone() else {
+            return Err(boxed_error_result(
+                "DTLS-SRTP offerer",
+                &"engine has no DTLS certificate",
+            ));
+        };
+        let Some((peer_fingerprint, role)) = wiring.near_dtls else {
+            return Err(boxed_error_result(
+                "DTLS-SRTP offerer",
+                &"no stored keying for the offerer (internal)",
+            ));
+        };
+        let Some(a_rtp) = wiring.near.remote_rtp else {
+            return Err(boxed_error_result(
+                "DTLS bridge",
+                &"near leg has no signalled address",
+            ));
+        };
+        let (far_local, far_remote) =
+            Self::transcrypt_far_keys(wiring, far_local_crypto, "DTLS-SRTP offerer transcrypt")?;
+        self.attach_offerer_data_channel(wiring);
+        let plan = wiring.offerer_dtls_call_plan(
+            a_rtp,
+            certificate,
+            peer_fingerprint,
+            role,
+            self.datapath.watch_ice_validated(wiring.near.rtp.id),
+        );
+        let redirected: Vec<siphon_rtp_datapath::EndpointId> =
+            [wiring.near.rtp.id, wiring.far.rtp.id]
+                .into_iter()
+                .chain(plan.plain_rtcp.map(|rtcp| rtcp.endpoint))
+                .collect();
+        let secure_endpoint = wiring.near.rtp.id;
+        // B's SDES leg belongs to the call, not to one association: a re-answer that repeats its keys
+        // keeps the live leg and with it its send window and rollover (RFC 3711 §3.3.1, §9.1), and only
+        // a key that changed is replaced, in place. It is read before the association is registered,
+        // which rebuilds the flows but carries the leg.
+        let leg = match self.dtls_bridge().plain_leg(secure_endpoint) {
+            Some(live) => {
+                // Key identity, not the whole `a=crypto` line: the replay state belongs to the key
+                // (RFC 3711 §3.3.2, §3.4), so the same master key and salt under another tag, or with
+                // another MKI, keeps its contexts and only a changed key is replaced.
+                live.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .adopt(Some(&far_local.key), Some(&far_remote.key));
+                live
+            }
+            None => Arc::new(Mutex::new(SecureLeg::new(&far_local.key, &far_remote.key))),
+        };
+        // As for a plain callee: a renegotiation that keeps A's association re-points it rather than
+        // waiting for a handshake A will never start again (RFC 8842 §5.5).
+        if !self.dtls_bridge().renegotiate(&plan) {
+            self.dtls_bridge().register(plan);
+        }
+        // Before the redirect: a datagram relayed without B's transform would reach B in the clear (or
+        // A as B's ciphertext).
+        if !self.dtls_bridge().set_plain_leg(secure_endpoint, leg) {
+            self.dtls_bridge().deregister(redirected.iter().copied());
+            return Err(boxed_error_result(
+                "DTLS-SRTP offerer transcrypt",
+                &"the association did not take the callee's SDES leg (internal)",
+            ));
+        }
+        self.redirect_registered(
+            redirected.iter().copied(),
+            "install DTLS offerer transcrypt redirect",
+            || self.dtls_bridge().deregister(redirected.iter().copied()),
+        )
+    }
+
+    /// The transcode twin of [`Self::install_dtls_offerer_transcrypt_bridge`]
+    /// (`PipelineKind::DtlsOffererTranscryptMedia`): [`Self::install_dtls_offerer_media`] with B's SDES
+    /// leg held by the actor from the start. A's directions stay pending until the handshake delivers
+    /// A's leg; B's leg is keyed already, so B's ingress is decrypted from the first packet but nothing
+    /// is relayed either way before A is keyed (RFC 5764: no key, no traffic).
+    ///
+    /// B's separate RTCP port, when it does not multiplex, is relayed here too: B's SRTCP is opened
+    /// under B's key and sealed for A once A's leg arrives, and A's multiplexed RTCP is sent to that
+    /// port (RFC 5761 §5.1.1), which the plain-callee twin leaves to a held call's carry.
+    pub(super) fn install_dtls_offerer_transcrypt_media(
+        &self,
+        wiring: &AnswerWiring<'_>,
+        far_local_crypto: Option<CryptoAttribute>,
+        owner_events: Option<flume::Sender<Event>>,
+    ) -> Result<(), Box<CmdResult>> {
+        let AnswerWiring { near, far, .. } = *wiring;
+        let Some(certificate) = self.dtls_certificate.clone() else {
+            return Err(boxed_error_result(
+                "DTLS-SRTP offerer transcrypt transcode",
+                &"engine has no DTLS certificate",
+            ));
+        };
+        let Some((peer_fingerprint, role)) = wiring.near_dtls else {
+            return Err(boxed_error_result(
+                "DTLS-SRTP offerer transcrypt transcode",
+                &"no stored keying for the offerer (internal)",
+            ));
+        };
+        let (far_local, far_remote) = Self::transcrypt_far_keys(
+            wiring,
+            far_local_crypto,
+            "DTLS-SRTP offerer transcrypt transcode",
+        )?;
+        let inputs = wiring.transcode_inputs("DTLS-SRTP offerer transcrypt transcode")?;
+        let directions = build_transcode_pair(&wiring.transcode_pair(&inputs)).map_err(
+            |(direction, reason)| {
+                boxed_error_result(
+                    &format!("DTLS-SRTP offerer transcrypt transcode ({direction})"),
+                    &reason,
+                )
+            },
+        )?;
+        let mut redirected = vec![near.rtp.id, far.rtp.id];
+        let a_destination = wiring.near_media_dst.unwrap_or(inputs.a_rtp);
+        let far_leg = self.media_far_sdes_leg(wiring, &far_local, &far_remote);
+        let mut call = wiring
+            .media_call(directions)
+            .with_far_secure_leg(far_leg.clone())
+            .with_caller_secure_pending();
+        // B's own RTCP port: its SRTCP toward A (A's leg is pending, as A's RTP directions are), and
+        // A's multiplexed RTCP toward B's port.
+        if let Some(plain_rtcp) = wiring.far_plain_rtcp() {
+            redirected.push(plain_rtcp.endpoint);
+            call = call
+                .with_rtcp_relays(vec![RtcpRelay::new(
+                    plain_rtcp.endpoint,
+                    plain_rtcp.source,
+                    near.rtp.id,
+                    a_destination,
+                )
+                .with_secure_ingress(far_leg)
+                .with_pending_secure(SecureSide::Egress)])
+                .with_rtcp_toward_b(Some((plain_rtcp.endpoint, plain_rtcp.dst)));
+        }
+        let call = self.apply_hold_carry(
+            wiring.call_id,
+            call,
+            Some((near.rtp.id, a_destination, true, wiring.far_plain_rtcp())),
+            (wiring.near.remote_rtp, Some(wiring.info.remote_rtp)),
+        );
+        // A rebuilt actor on an intercepted call is tapped before it can take its first packet, not
+        // once the carry that follows the answer puts the taps back (ETSI TS 103 221-2 §5.2).
+        let mut call = call;
+        self.pretap_relay(wiring.call_id, &mut call);
+        self.media
+            .register(call, self.datapath.clone(), owner_events);
+        self.attach_offerer_data_channel(wiring);
+        let plan = wiring.offerer_dtls_call_plan(
+            inputs.a_rtp,
+            certificate,
+            peer_fingerprint,
+            role,
+            self.datapath.watch_ice_validated(near.rtp.id),
+        );
+        // A renegotiation that keeps A's association re-keys the actor this answer just rebuilt,
+        // rather than waiting for a handshake A will never start again (RFC 8842 §5.5).
+        if !self.dtls_bridge().renegotiate(&plan) {
+            self.dtls_bridge().register_for_pipeline(
+                plan,
+                crate::dtls_bridge::PipelineTarget::Call {
+                    media: self.media.clone(),
+                    call_id: wiring.call_id.to_string(),
+                    party: crate::dtls_bridge::KeyedParty::Caller,
+                },
+            );
+        }
+        self.redirect_registered(
+            redirected.clone(),
+            "install DTLS offerer transcrypt transcode redirect",
+            || {
+                self.media.deregister(wiring.call_id);
+                self.dtls_bridge().deregister(redirected.iter().copied());
             },
         )
     }

@@ -183,7 +183,9 @@ pub(super) fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSn
         PipelineKind::Dtls
         | PipelineKind::DtlsMedia
         | PipelineKind::DtlsOfferer
-        | PipelineKind::DtlsOffererMedia => PipelineSnapshot::Dtls,
+        | PipelineKind::DtlsOffererMedia
+        | PipelineKind::DtlsOffererTranscrypt
+        | PipelineKind::DtlsOffererTranscryptMedia => PipelineSnapshot::Dtls,
     }
 }
 

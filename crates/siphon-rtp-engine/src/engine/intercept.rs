@@ -584,7 +584,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             | PipelineKind::SrtpOfferer
             | PipelineKind::SrtpTranscrypt
             | PipelineKind::Dtls
-            | PipelineKind::DtlsOfferer => {
+            | PipelineKind::DtlsOfferer
+            | PipelineKind::DtlsOffererTranscrypt => {
                 let Some(b_endpoint) = b_endpoint else {
                     return Err("the call has no answered second leg to intercept".to_string());
                 };
@@ -609,7 +610,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             | PipelineKind::SrtpTranscryptMedia
             | PipelineKind::SrtpOffererMedia
             | PipelineKind::DtlsMedia
-            | PipelineKind::DtlsOffererMedia => {
+            | PipelineKind::DtlsOffererMedia
+            | PipelineKind::DtlsOffererTranscryptMedia => {
                 self.hold_in_userspace(call_id, PromotionReason::X3, PromoteMode::RelayOnly)
                     .await?;
                 if !self
