@@ -831,3 +831,61 @@ async fn node_info_advertises_seat_reception() {
         .iter()
         .any(|name| name == "forward_seat_reception"));
 }
+
+#[tokio::test]
+async fn a_plain_participant_joining_with_ice_force_is_forwarded_and_not_ice_gated() {
+    // `ice: force` mints credentials, but a participant that offered no ICE never sends a check, so
+    // its seat must stay on the signalled-source gate (RFC 8839 §4.2), the answer must not present
+    // ICE to it, and the lite/full statement must match what runs (RFC 8445 §5.1.1).
+    let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+    tokio::spawn(run_redirect_dispatcher(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let (phone_a, addr_a) = phone().await;
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::ForwardJoin {
+                media: siphon_rtp_proto::ForwardMedia::Translate,
+                conference_id: ROOM.into(),
+                from_tag: "a".into(),
+                sdp: amr_wb_sdp(addr_a, 96, "octet-align=1"),
+                profile: ProfileFlags {
+                    ice: Some("force".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    let answer = ok_sdp_text(&answer);
+    assert!(
+        !answer.contains("a=ice-ufrag") && !answer.contains("a=ice-lite"),
+        "no ICE toward a participant that offered none: {answer}"
+    );
+    let port_a = sdp::parse(&answer).expect("answer").remote_rtp;
+    let (phone_b, _) = seat(&engine, "b", 96).await;
+    assert_eq!(set_source(&engine, Some("a")).await, ok_empty());
+    // A stranger (another source address) is not the seat, and does not latch it.
+    let stranger = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+        .await
+        .expect("bind");
+    stranger
+        .send_to(&media(96, 1, 0, 0x0BAD_0BAD, &[1, 2, 3]), port_a)
+        .await
+        .expect("send");
+    assert!(
+        recv_rtp(&phone_b, NEGATIVE).await.is_none(),
+        "a stranger's media is not forwarded"
+    );
+    phone_a
+        .send_to(&media(96, 500, 16_000, 0xA0A0_A0A0, &[0xF1, 0x23]), port_a)
+        .await
+        .expect("send");
+    let heard = hear(&phone_b).await;
+    assert_eq!(heard.payload, [0xF1, 0x23]);
+}

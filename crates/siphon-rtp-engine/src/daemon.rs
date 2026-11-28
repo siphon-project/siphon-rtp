@@ -377,7 +377,7 @@ pub struct EngineArgs {
     /// checks, tearing a call down when its peer stops responding on the validated path.
     ///
     /// Off by default on purpose: RFC 7675 §4 says an ICE-**lite** agent does not generate consent
-    /// checks, and `a=ice-lite` is what the engine advertises today, so initiating them is a
+    /// checks, and `a=ice-lite` is what the engine advertises without `--ice-full`, so initiating them is a
     /// deviation the operator opts into. Requires a datapath with the full-agent seam (the UDP
     /// backend); the XDP fast path logs a warning and keeps responder-only behaviour.
     #[arg(long, default_value_t = false)]

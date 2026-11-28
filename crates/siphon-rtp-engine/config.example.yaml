@@ -232,7 +232,7 @@ control: "127.0.0.1:8080"
 # answering (CLI: --ice-consent). Default: false.
 #
 # Off by default on purpose: RFC 7675 §4 says an ICE-LITE agent responds to consent checks and does
-# not generate them, and `a=ice-lite` is what the engine advertises today — so initiating them is a
+# not generate them, and `a=ice-lite` is what the engine advertises without `ice_full` — so initiating them is a
 # deviation you opt into. Checks are always sent to the STUN-VALIDATED source, never to the peer's
 # signalled c= address (which for a NATed peer is unusable, and probing it would reap live calls).
 # Needs a datapath with the full-agent seam: the UDP backend has it; the XDP fast path logs a warning

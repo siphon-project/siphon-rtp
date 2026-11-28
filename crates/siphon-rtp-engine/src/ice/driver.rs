@@ -612,7 +612,14 @@ impl AgentSupervisor {
         self.agents.is_empty()
     }
 
-    /// Start an agent on `endpoint`.
+    /// Start an agent on `endpoint`, whose socket is bound at `local`.
+    ///
+    /// The agent knows the endpoint by its **host candidate**, which carries the *advertised*
+    /// address (RFC 8445 §5.1.1.1), not by the socket's bound address: behind a 1:1 NAT or on an
+    /// interface with an advertised override the two differ. A datagram that reached the socket
+    /// reached that candidate (the socket is its base, RFC 8445 §5.1.1.2), so the agent is told it
+    /// arrived there. Left as the bound address, no inbound check would match a pair or a local
+    /// candidate and every one would be dropped unanswered (§7.3.1.3).
     pub fn register(
         &self,
         endpoint: EndpointId,
@@ -621,6 +628,11 @@ impl AgentSupervisor {
         config: AgentConfig,
         now_ms: u64,
     ) {
+        let local = config
+            .local_candidates
+            .iter()
+            .find(|candidate| candidate.kind == siphon_rtp_ice::CandidateKind::Host)
+            .map_or(local, |host| host.address);
         // RFC 8656: an allocation gathered before this agent existed shares its 5-tuple, so its
         // responses must reach the allocation, not this agent's checklist.
         let turn_server = self.turn_servers.get(&endpoint).map(|server| *server);
@@ -634,6 +646,30 @@ impl AgentSupervisor {
                 turn_server,
             },
         );
+    }
+
+    /// Keep the agent already running on `endpoint` when the exchange has not restarted (RFC 8839
+    /// §4.4.1.1, RFC 8445 §9): the same local and remote credentials mean the same session, so its
+    /// checklist, learned peer-reflexive pairs and selected pair must survive a re-answer. Any
+    /// `remote_candidates` the re-answer signals are added to it. Returns whether such an agent
+    /// existed (and so whether a new one must not replace it).
+    pub fn keep_running(
+        &self,
+        endpoint: EndpointId,
+        local: &siphon_rtp_ice::agent::Credentials,
+        remote: &siphon_rtp_ice::agent::Credentials,
+        remote_candidates: &[siphon_rtp_ice::Candidate],
+    ) -> bool {
+        let Some(mut entry) = self.agents.get_mut(&endpoint) else {
+            return false;
+        };
+        if !entry.agent.runs_session(local, remote) {
+            return false;
+        }
+        for candidate in remote_candidates {
+            entry.agent.add_remote_candidate(candidate);
+        }
+        true
     }
 
     /// Stop every agent belonging to `call_id`.
@@ -791,5 +827,96 @@ impl AgentSupervisor {
                 AgentAction::StateChanged(_) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_supervisor_tests {
+    use super::*;
+    use siphon_rtp_ice::agent::Credentials;
+    use siphon_rtp_ice::{Candidate, CandidateKind};
+
+    fn address(text: &str) -> SocketAddr {
+        text.parse().expect("socket address")
+    }
+
+    fn agent_config(
+        local: &str,
+        local_ufrag: &str,
+        remote: &str,
+        remote_ufrag: &str,
+        controlling: bool,
+    ) -> AgentConfig {
+        AgentConfig::new(
+            Credentials::new(local_ufrag, format!("{local_ufrag}passwordpasswordpw")),
+            Credentials::new(remote_ufrag, format!("{remote_ufrag}passwordpasswordpw")),
+            controlling,
+            if controlling { 1 } else { 2 },
+        )
+        .with_candidates(
+            vec![Candidate::new(
+                "h".to_string(),
+                1,
+                address(local),
+                CandidateKind::Host,
+                65535,
+            )],
+            vec![Candidate::new(
+                "h".to_string(),
+                1,
+                address(remote),
+                CandidateKind::Host,
+                65535,
+            )],
+        )
+    }
+
+    /// RFC 8445 §5.1.1.1 / §7.3.1.3: the host candidate carries the advertised address while the
+    /// socket is bound elsewhere (a 1:1 NAT). A check that reached the socket reached that
+    /// candidate, so the agent must answer it rather than drop it for matching no local candidate.
+    #[test]
+    fn a_check_on_a_socket_bound_away_from_its_advertised_candidate_is_answered() {
+        let supervisor = AgentSupervisor::new();
+        let endpoint = EndpointId(7);
+        let advertised = "203.0.113.7:40000";
+        let bound = address("192.0.2.5:40000");
+        let peer_address = "198.51.100.9:50000";
+        supervisor.register(
+            endpoint,
+            "call",
+            bound,
+            agent_config(advertised, "ENGINE", peer_address, "PEER", false),
+            0,
+        );
+        // The peer, controlling, probes the advertised address.
+        let mut peer = IceAgent::new(
+            agent_config(peer_address, "PEER", advertised, "ENGINE", true),
+            0,
+        );
+        let check = peer
+            .poll(0)
+            .into_iter()
+            .find_map(|action| match action {
+                AgentAction::Send { datagram, .. } => Some(datagram),
+                _ => None,
+            })
+            .expect("the peer probes");
+        supervisor
+            .events()
+            .send(IceDatapathEvent {
+                endpoint,
+                source: address(peer_address),
+                arrival_tick: 0,
+                datagram: check.into(),
+            })
+            .expect("queue");
+        let outcomes = supervisor.drain_events(0);
+        assert!(
+            outcomes.iter().any(|outcome| matches!(
+                outcome,
+                AgentOutcome::Send { dst, .. } if *dst == address(peer_address)
+            )),
+            "the check is answered: {outcomes:?}"
+        );
     }
 }

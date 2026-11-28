@@ -63,13 +63,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         info: &sdp::MediaInfo,
         ice_config: Option<&IceConfig>,
         ice_candidates: &[siphon_rtp_ice::Candidate],
+        engine_offered: bool,
     ) -> bool {
         let peer_ice = peer_ice_credentials(info);
         let mut ice_pending = false;
         if let Some(config) = ice_config {
             let full_agent = self.ice_agents.as_ref().and_then(|agents| {
+                // Credentials alone start the agent; candidates may still trickle in (RFC 8838) or
+                // be discovered from the peer's checks (RFC 8445 §7.3.1.3).
                 let peer = peer_ice.as_ref()?;
-                (!info.candidates.is_empty()).then(|| (agents.clone(), peer.clone()))
+                Some((agents.clone(), peer.clone()))
             });
             match full_agent {
                 Some((agents, peer)) => {
@@ -82,15 +85,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             peer.ufrag.clone(),
                             peer.pwd.clone(),
                         ),
-                        // RFC 8445 §6.1.1: the offerer controls. The participant offered, so it
-                        // controls — unless it is a lite agent, which can never control.
-                        info.ice_lite,
+                        // RFC 8445 §6.1.1: the offerer controls, unless it is a lite agent, which
+                        // can never control. When the participant offered, it controls unless it
+                        // is lite; when the engine offered (a dial-out) the engine controls, as
+                        // the full agent that no longer claims lite and whatever the answerer is.
+                        engine_offered || info.ice_lite,
                         ice_tie_breaker(),
                     )
                     .with_candidates(
                         filter_component(ice_candidates, 1),
                         filter_component(&info.candidates, 1),
-                    );
+                    )
+                    .awaiting_candidates(info.candidates.is_empty());
                     self.datapath.set_ice_agent(
                         endpoint.id,
                         config.clone(),

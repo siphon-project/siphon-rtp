@@ -22,6 +22,7 @@ mod data_channel;
 mod decline;
 mod direction;
 pub(crate) mod floor;
+mod ice_advertisement;
 mod key_mgmt;
 mod local_offer;
 mod offer;
@@ -47,6 +48,7 @@ pub use floor::{
     anchor_floor, decline_floor, parse_floor, validate_floor_fmtp, FloorFmtpError, FloorMediaInfo,
     FloorRewrite,
 };
+pub use ice_advertisement::IceAdvertisement;
 pub use key_mgmt::{apply_key_mgmt, terminates_keying};
 pub use stream_identity::{own_stream_identity, OwnSsrc};
 mod telephone_event;
@@ -1322,20 +1324,6 @@ pub fn rewrite_image_only(
     })
 }
 
-/// The engine's ICE identity to advertise in a rewritten SDP: `a=ice-lite` (session-level) plus
-/// `a=ice-ufrag` / `a=ice-pwd` and the **gathered** candidate set.
-#[derive(Debug, Clone, Copy)]
-pub struct IceAdvertisement<'a> {
-    /// The engine's local ICE username fragment.
-    pub ufrag: &'a str,
-    /// The engine's local ICE password.
-    pub pwd: &'a str,
-    /// The candidates gathered for this leg (RFC 8445 §5.1.1), emitted in order as `a=candidate`
-    /// lines. Always at least the host candidate — gathering produces that without touching the
-    /// network — plus a server-reflexive one per STUN server that answered.
-    pub candidates: &'a [Candidate],
-}
-
 /// How [`rewrite`] treats the audio stream's ICE attributes (RFC 8445 / RFC 8839 §5). Decouples the
 /// two ICE actions that used to be one `Option`: dropping the peer's ICE and re-originating our own.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1794,8 +1782,12 @@ pub fn rewrite(
             }
         } else if index == media_index {
             // `a=ice-lite` is session-level — emit it just before the media line (end of session),
-            // so it goes out *before* the audio section is opened.
-            if matches!(ice, IceRewrite::Reoriginate(_)) {
+            // so it goes out *before* the audio section is opened. Only for a leg the lite
+            // responder serves (RFC 8445 §5.1.1): a full agent does not claim to be lite.
+            if matches!(
+                ice,
+                IceRewrite::Reoriginate(IceAdvertisement { lite: true, .. })
+            ) {
                 writer.push("a=ice-lite".to_string());
             }
             // The engine re-originates this section wholesale, so everything below belongs in its
@@ -3361,6 +3353,7 @@ mod tests {
         let engine = EngineMedia::new("[::1]:40000".parse::<SocketAddr>().unwrap(), None);
         let candidates = gathered_host_candidates("[::1]:40000");
         let advert = IceAdvertisement {
+            lite: true,
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
             candidates: &candidates,
@@ -3479,11 +3472,41 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_re_originates_ice_as_a_full_agent_without_ice_lite() {
+        // RFC 8445 §5.1.1: `a=ice-lite` belongs to the lite responder only.
+        let sdp = ice_offer("203.0.113.7", 49170);
+        let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
+        let candidates = gathered_host_candidates("127.0.0.1:40000");
+        let advert = IceAdvertisement {
+            lite: false,
+            ufrag: "ENGUF",
+            pwd: "engpassword01234567",
+            candidates: &candidates,
+        };
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Reoriginate(advert),
+            None,
+            None,
+            TextRewrite::None,
+            ImageRewrite::None,
+        )
+        .expect("rewrite");
+        assert!(!result.sdp.contains("a=ice-lite"), "{}", result.sdp);
+        assert!(result.sdp.contains("a=ice-ufrag:ENGUF"));
+        assert!(result.sdp.contains("a=ice-pwd:engpassword01234567"));
+        assert!(result.sdp.contains("a=candidate:"));
+        assert!(result.sdp.contains("a=end-of-candidates"));
+    }
+
+    #[test]
     fn rewrite_re_originates_ice_as_ice_lite() {
         let sdp = ice_offer("203.0.113.7", 49170);
         let engine = EngineMedia::new("127.0.0.1:40000".parse::<SocketAddr>().unwrap(), None);
         let candidates = gathered_host_candidates("127.0.0.1:40000");
         let advert = IceAdvertisement {
+            lite: true,
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
             candidates: &candidates,
@@ -5293,6 +5316,7 @@ mod tests {
         let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
         let candidates = gathered_host_candidates("127.0.0.1:30168");
         let advert = IceAdvertisement {
+            lite: true,
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
             candidates: &candidates,
@@ -5338,6 +5362,7 @@ mod tests {
         let engine = EngineMedia::new("127.0.0.1:30168".parse::<SocketAddr>().unwrap(), None);
         let candidates = gathered_host_candidates("127.0.0.1:30168");
         let advert = IceAdvertisement {
+            lite: true,
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
             candidates: &candidates,

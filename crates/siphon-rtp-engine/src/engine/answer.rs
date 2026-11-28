@@ -12,9 +12,9 @@ use crate::sdp::{self, IceRewrite, SecurityAdvertisement, TextRewrite};
 
 use super::install::{AnswerIce, AnswerText, AnswerWiring, AnsweredText};
 use super::negotiate::{
-    answer_gate_addresses, answer_ice_rewrite, cannot_bridge, describe_codec,
-    far_received_from_hint, far_security, near_security, peer_ice_credentials, present_leg,
-    same_codec, setup_for_role, CodecPresentation, LegPresentation, NearDtlsAnswer,
+    answer_gate_addresses, answered_ice, cannot_bridge, describe_codec, far_received_from_hint,
+    far_security, near_security, peer_ice_credentials, present_leg, same_codec, setup_for_role,
+    CodecPresentation, LegPresentation, NearDtlsAnswer,
 };
 use super::takeover::AnswerTakeover;
 
@@ -349,7 +349,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // secure (SDES or DTLS) far leg A's side is plain.
             None => LegPresentation {
                 engine: near.engine_media(),
-                ice: answer_ice_rewrite(ice_creds, near_ice_candidates),
+                ice: self.answer_ice_presentation(ice_creds, near_ice_candidates),
                 security: near_security(
                     near_local_crypto,
                     near_dtls_presentation.cloned(),
@@ -410,7 +410,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ice: if far_ice_removed {
                         IceRewrite::Strip
                     } else {
-                        answer_ice_rewrite(ice_creds, far_ice_candidates)
+                        self.answer_ice_presentation(ice_creds, far_ice_candidates)
                     },
                     // A's answer is rewritten for B, so when the engine terminates A's keying (SDES or
                     // DTLS) none of it may reach B: B's leg is plaintext unless B has keying of its own,
@@ -1139,7 +1139,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ptime_override,
             near_telephone_event,
             transcoding,
-            ice_creds: ice_creds.as_ref(),
+            ice_creds: answered_ice(&ice_creds, reversed.is_some(), &near_remote_ice, &info),
             near_ice_candidates: &near_ice_candidates,
             far_ice_candidates: &far_ice_candidates,
             far_ice_removed,
@@ -1187,10 +1187,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .await;
         }
 
-        // ICE applies to a leg only when both ends use it: `near` faces A (which offered ICE iff we
-        // minted creds), `far` faces B (ICE iff its answer carries ICE and `ice: remove` left ICE on
-        // B's leg — the credentials alone do not say, since `remove` still mints them for A).
-        let near_ice = ice_creds.is_some();
+        // ICE applies to a leg only when both ends use it: `near` faces A (ICE iff A offered it, since
+        // `ice: force` mints creds for B alone), `far` faces B (ICE iff its answer carries ICE and
+        // `ice: remove` left ICE on B's leg — the credentials alone do not say).
+        let near_ice = ice_creds.is_some() && near_remote_ice.is_some();
         let far_ice = ice_creds.is_some() && info.is_ice() && !far_ice_removed;
 
         // Enable the ICE connectivity-check responder on the endpoints facing an ICE peer *before*

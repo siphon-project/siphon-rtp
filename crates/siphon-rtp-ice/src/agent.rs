@@ -42,6 +42,12 @@ use crate::checklist::{CandidatePair, Checklist, PairState};
 pub const DEFAULT_PACING_MS: u64 = 50;
 /// RFC 8489 §6.2.1 initial RTO for a connectivity check.
 pub const DEFAULT_RTO_MS: u64 = 500;
+/// How long an agent that has nothing to check waits for a candidate before it fails: the peer gave
+/// credentials but no candidate (RFC 8838 trickle) and has neither trickled one nor sent a check that
+/// revealed a peer-reflexive one (RFC 8445 §7.3.1.3). RFC 8445 fixes no number for this; 30 s is the
+/// RFC 7675 §5.1 consent expiry, the longest the engine already lets a peer be silent before it ends a
+/// call, and the same bound is what a trickle peer's first candidate has to beat.
+pub const DEFAULT_ESTABLISHMENT_TIMEOUT_MS: u64 = 30_000;
 /// RFC 8445 §7.3.1.1 error code for a role conflict.
 const ERROR_ROLE_CONFLICT: u16 = 487;
 
@@ -121,6 +127,16 @@ pub struct AgentConfig {
     pub pacing_ms: u64,
     /// Initial RTO per check, in milliseconds.
     pub rto_ms: u64,
+    /// How long, from the first [`IceAgent::poll`], an agent that [`awaits_candidates`] and still has
+    /// an empty checklist waits for a candidate before it fails. See
+    /// [`DEFAULT_ESTABLISHMENT_TIMEOUT_MS`].
+    ///
+    /// [`awaits_candidates`]: Self::awaits_candidates
+    pub establishment_timeout_ms: u64,
+    /// The peer gave credentials and no candidates at all (RFC 8838 trickle), so an empty checklist
+    /// means "wait", not "no path". Without it an empty checklist fails at once, as it does for a
+    /// component the peer offered no candidate for (an RTCP endpoint against an RTP-only offer).
+    pub awaits_candidates: bool,
 }
 
 impl AgentConfig {
@@ -141,7 +157,17 @@ impl AgentConfig {
             tie_breaker,
             pacing_ms: DEFAULT_PACING_MS,
             rto_ms: DEFAULT_RTO_MS,
+            establishment_timeout_ms: DEFAULT_ESTABLISHMENT_TIMEOUT_MS,
+            awaits_candidates: false,
         }
+    }
+
+    /// Mark the peer as one that has yet to deliver any candidate (RFC 8838 trickle): the agent waits
+    /// for one, up to the establishment deadline, instead of failing on its empty checklist.
+    #[must_use]
+    pub fn awaiting_candidates(mut self, awaits: bool) -> Self {
+        self.awaits_candidates = awaits;
+        self
     }
 
     /// Set the candidate sets.
@@ -183,6 +209,9 @@ pub struct IceAgent {
     selected: Option<usize>,
     /// Set while we have nominated a pair and are awaiting its check (controlling side).
     nomination_sent: bool,
+    /// The `now_ms` of the first poll: the establishment deadline runs from it, not from creation,
+    /// because the caller's clock is not the agent's birth time.
+    first_poll_ms: Option<u64>,
 }
 
 impl IceAgent {
@@ -194,7 +223,10 @@ impl IceAgent {
             &config.remote_candidates,
             config.controlling,
         );
-        let state = if checklist.is_empty() {
+        // An empty checklist is a failure unless the peer has yet to give any candidate (RFC 8838
+        // trickle): that peer is waited for, its candidates arriving through `add_remote_candidate`
+        // or its own checks revealing peer-reflexive ones (RFC 8445 §7.3.1.3).
+        let state = if checklist.is_empty() && !config.awaits_candidates {
             IceState::Failed
         } else {
             IceState::Running
@@ -210,6 +242,7 @@ impl IceAgent {
             next_check_ms: now_ms,
             selected: None,
             nomination_sent: false,
+            first_poll_ms: None,
         }
     }
 
@@ -223,6 +256,13 @@ impl IceAgent {
     #[must_use]
     pub fn is_controlling(&self) -> bool {
         self.config.controlling
+    }
+
+    /// Whether this agent runs the exchange these credentials identify (RFC 8445 §9: a restart is a
+    /// change of either side's ufrag or pwd; anything else continues the session).
+    #[must_use]
+    pub fn runs_session(&self, local: &Credentials, remote: &Credentials) -> bool {
+        self.config.local_credentials == *local && self.config.remote_credentials == *remote
     }
 
     /// The selected pair's transport addresses, once ICE has completed.
@@ -258,6 +298,17 @@ impl IceAgent {
     pub fn poll(&mut self, now_ms: u64) -> Vec<AgentAction> {
         let mut actions = Vec::new();
         if matches!(self.state, IceState::Failed | IceState::Completed) {
+            return actions;
+        }
+        // An agent with no pair to check is waiting for a candidate (trickle, or a peer-reflexive one
+        // from the peer's own check). It does not wait forever: a peer that never delivers either has
+        // no reachable path, which is a failure like every pair failing (RFC 8445 §8.1.2).
+        let first_poll = *self.first_poll_ms.get_or_insert(now_ms);
+        if self.config.awaits_candidates
+            && self.checklist.is_empty()
+            && now_ms.saturating_sub(first_poll) >= self.config.establishment_timeout_ms
+        {
+            self.set_state(IceState::Failed, &mut actions);
             return actions;
         }
 
@@ -1115,6 +1166,77 @@ mod tests {
         );
         assert_eq!(agent.state(), IceState::Failed);
         assert!(agent.checklist().is_empty());
+    }
+
+    #[test]
+    fn an_agent_given_no_remote_candidates_waits_instead_of_failing() {
+        // RFC 8838: a trickle peer sends credentials first. The agent neither fails nor spins, and a
+        // candidate that arrives later is paired and checked.
+        let mut agent = IceAgent::new(
+            AgentConfig::new(
+                Credentials::new("A", "passwordpasswordpasswo"),
+                Credentials::new("B", "passwordpasswordpasswo"),
+                true,
+                1,
+            )
+            .with_candidates(vec![host(LEFT_ADDR, "l1")], Vec::new())
+            .awaiting_candidates(true),
+            0,
+        );
+        assert_eq!(agent.state(), IceState::Running);
+        assert!(agent.poll(0).is_empty() && agent.poll(10_000).is_empty());
+        assert_eq!(agent.state(), IceState::Running);
+        assert_eq!(agent.add_remote_candidate(&host(RIGHT_ADDR, "r1")), 1);
+        assert!(
+            !agent.poll(10_020).is_empty(),
+            "the trickled pair is checked"
+        );
+    }
+
+    fn waiting_agent() -> IceAgent {
+        IceAgent::new(
+            AgentConfig::new(
+                Credentials::new("A", "passwordpasswordpasswo"),
+                Credentials::new("B", "passwordpasswordpasswo"),
+                true,
+                1,
+            )
+            .with_candidates(vec![host(LEFT_ADDR, "l1")], Vec::new())
+            .awaiting_candidates(true),
+            0,
+        )
+    }
+
+    #[test]
+    fn an_agent_that_never_gets_a_candidate_fails_at_the_establishment_deadline() {
+        let mut agent = waiting_agent();
+        // The deadline runs from the first poll, not from creation: the driver's clock is not zero
+        // when an agent is registered late in the process's life.
+        assert!(agent.poll(100_000).is_empty());
+        assert!(agent
+            .poll(100_000 + DEFAULT_ESTABLISHMENT_TIMEOUT_MS - 1)
+            .is_empty());
+        assert_eq!(agent.state(), IceState::Running);
+        let actions = agent.poll(100_000 + DEFAULT_ESTABLISHMENT_TIMEOUT_MS);
+        assert_eq!(actions, vec![AgentAction::StateChanged(IceState::Failed)]);
+        assert_eq!(agent.state(), IceState::Failed);
+        assert!(agent.poll(500_000).is_empty(), "a failed agent stays quiet");
+    }
+
+    #[test]
+    fn a_candidate_that_arrives_before_the_deadline_cancels_it() {
+        let mut agent = waiting_agent();
+        assert!(agent.poll(0).is_empty());
+        assert_eq!(agent.add_remote_candidate(&host(RIGHT_ADDR, "r1")), 1);
+        // Past the old deadline the agent is checking, not failed.
+        let actions = agent.poll(DEFAULT_ESTABLISHMENT_TIMEOUT_MS + 1);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, AgentAction::Send { .. })),
+            "{actions:?}"
+        );
+        assert_eq!(agent.state(), IceState::Running);
     }
 
     #[test]

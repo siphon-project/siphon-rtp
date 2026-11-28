@@ -11,8 +11,8 @@ use std::net::IpAddr;
 
 use super::negotiate::{
     bridge_source_filter, dtls_directive, far_security, held_on_withheld_codec, ice_directive,
-    offer_ice_rewrite, offered_dtls_setup, parse_codec_flags, peer_ice_credentials, present_leg,
-    resolve_rtcp_mux, same_codec, CodecPresentation, DtlsDirective, IceDirective, LegPresentation,
+    offered_dtls_setup, parse_codec_flags, peer_ice_credentials, present_leg, resolve_rtcp_mux,
+    same_codec, CodecPresentation, DtlsDirective, IceDirective, LegPresentation,
 };
 use super::takeover::{ws_takeover_media_address, WsBridgeProcessing, WsBridgeSetup};
 use super::{
@@ -808,7 +808,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let far_ice_candidates = self
             .far_offer_candidates(&far_leg, ice_creds.as_ref(), far_ice_removed)
             .await;
-        let ice_rewrite = offer_ice_rewrite(
+        let ice_rewrite = self.offer_ice_presentation(
             ice_creds.as_ref(),
             &far_ice_candidates,
             ice_mismatch,

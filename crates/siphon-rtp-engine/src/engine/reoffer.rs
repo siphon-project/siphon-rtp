@@ -11,9 +11,9 @@ use crate::ice::{self, IceCredentials};
 use crate::sdp::{self, TextRewrite};
 
 use super::negotiate::{
-    answer_ice_rewrite, dtls_directive, far_security, filter_component, ice_directive,
-    ice_tie_breaker, near_security, offer_ice_rewrite, offered_dtls_setup, parse_codec_flags,
-    peer_ice_credentials, same_codec, CodecPresentation, IceDirective, LegPresentation,
+    dtls_directive, far_security, filter_component, ice_directive, ice_tie_breaker, near_security,
+    offered_dtls_setup, parse_codec_flags, peer_ice_credentials, same_codec, CodecPresentation,
+    IceDirective, LegPresentation,
 };
 use super::{error_result, unknown_call, Call, ClientId, Engine, Leg, Party};
 
@@ -412,7 +412,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_creds.as_ref(),
             new_remote_ice.as_ref(),
         ) {
-            if ice_restart && !info.candidates.is_empty() {
+            // A restart always replaces the agent, with or without candidates (RFC 8839 §4.4.1.1): a
+            // candidate-less one starts a fresh wait (RFC 8838), not the old exchange's deadline.
+            if ice_restart {
                 let config = IceConfig {
                     local_ufrag: creds.ufrag.clone(),
                     local_pwd: creds.pwd.clone(),
@@ -421,11 +423,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     let Some(local_addr) = self.endpoint_address(endpoint) else {
                         continue;
                     };
-                    let component = if endpoint == offering_leg.rtp.id {
-                        1
-                    } else {
-                        2
-                    };
+                    // RFC 5245 §4.1.2.1 component id: 1 = RTP, 2 = RTCP.
+                    let component = 1 + u16::from(endpoint != offering_leg.rtp.id);
                     let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
                         siphon_rtp_ice::agent::Credentials::new(
                             creds.ufrag.clone(),
@@ -443,7 +442,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .with_candidates(
                         filter_component(&offering_candidates, component),
                         filter_component(&info.candidates, component),
-                    );
+                    )
+                    .awaiting_candidates(info.candidates.is_empty());
                     self.datapath.set_ice_agent(
                         endpoint,
                         config.clone(),
@@ -573,7 +573,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     engine: presented_media,
                     image: presented_leg.image_rewrite(info.image.is_some()),
                     floor: presented_leg.floor_rewrite(floor_fmtp),
-                    ice: offer_ice_rewrite(
+                    ice: self.offer_ice_presentation(
                         ice_creds.as_ref(),
                         &presented_candidates,
                         ice_mismatch,
@@ -619,7 +619,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     engine: presented_media,
                     image: presented_leg.image_rewrite(info.image.is_some()),
                     floor: presented_leg.floor_rewrite(floor_fmtp),
-                    ice: answer_ice_rewrite(ice_creds.as_ref(), &presented_candidates),
+                    ice: self.answer_ice_presentation(ice_creds.as_ref(), &presented_candidates),
                     security: near_security(
                         state.near_local_crypto,
                         // A terminated DTLS offerer is offered the engine's own fingerprint again

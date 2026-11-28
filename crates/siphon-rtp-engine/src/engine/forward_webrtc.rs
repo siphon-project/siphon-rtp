@@ -6,8 +6,9 @@
 //! offerer (RFC 3264 §5) and writes a WebRTC offer ([`sdp::webrtc_seat_offer`]):
 //!
 //! * `UDP/TLS/RTP/SAVPF` with the engine's certificate fingerprint and `a=setup:actpass` (RFC 5763 §5);
-//! * `a=ice-lite` with credentials and candidates minted for the seat (RFC 8445 §2.5): the engine is
-//!   the lite agent, so the browser controls and nominates (RFC 8445 §6.1.1);
+//! * credentials and candidates minted for the seat, and `a=ice-lite` (RFC 8445 §2.5) while the
+//!   engine is the lite agent, so the browser controls and nominates (RFC 8445 §6.1.1); under a full
+//!   agent the engine says nothing of the kind and controls as the offerer;
 //! * when the room carries floor control, a bundled `m=application ... webrtc-datachannel` section
 //!   (RFC 8841) in place of the UDP floor section, because a browser cannot send RTCP APP;
 //! * when the profile carries video, a bundled `m=video ... UDP/TLS/RTP/SAVPF` section (RFC 8843):
@@ -161,6 +162,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ufrag: &credentials.ufrag,
                 pwd: &credentials.pwd,
                 candidates: &candidates,
+                lite: self.advertises_lite(),
                 fingerprint: &fingerprint,
                 data_channel,
                 video,

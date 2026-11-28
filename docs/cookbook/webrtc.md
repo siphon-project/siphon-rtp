@@ -9,7 +9,8 @@ Rust, at different levels of maturity. This page says exactly which level.
 
 - DTLS-SRTP termination on a call leg: the offer advertises `a=fingerprint` +
   `a=setup:actpass`, the handshake keys the leg (webrtc-dtls, pure RustCrypto).
-- ICE-lite server posture: per-call credentials, `a=ice-lite` plus a gathered
+- ICE-lite server posture (the default; under `--ice-full` the engine is a full agent and says no
+  `a=ice-lite`): per-call credentials, `a=ice-lite` plus a gathered
   candidate list in the rewritten SDP (host per component, and a server-reflexive
   candidate per `--stun-server` that answers), and a STUN Binding responder on the
   media port (MESSAGE-INTEGRITY + FINGERPRINT validated and returned).
@@ -184,6 +185,13 @@ a=ice-ufrag:mJq2X9dK
 a=ice-pwd:H7f2kQ91bXcR3sT8wLpZv0Ay
 a=candidate:1 1 UDP 2130706431 203.0.113.10 40002 typ host
 ```
+
+Under `--ice-full` the engine runs the full RFC 8445 agent instead, and the same SDP is written
+**without** `a=ice-lite`: the attribute is a statement about the implementation on the leg
+(RFC 8445 §5.1.1, RFC 8839 §5.3), and a peer that reads it takes the controlling role against a
+"lite" engine (§6.1.1), which would leave both ends controlling. The offerer controls: when the engine
+offers (a call that rings a browser, a dial-out seat) it is controlling, and when the browser offers the
+engine is controlled.
 
 An ICE-lite engine answers every valid connectivity check but selects only the
 pair a check nominates with `USE-CANDIDATE` (RFC 8445 §7.3.1.5). A browser with
@@ -367,9 +375,9 @@ the controller gets the same `Event::MediaTimeout` it already handles for a dead
 path.
 
 Why off by default: RFC 7675 §4 says an ICE-lite agent responds to consent checks
-and does not generate them, and `a=ice-lite` is what the engine advertises. So
-initiating them is a deliberate deviation you opt into, not something we do
-behind your back. It becomes the default for legs that stop claiming lite.
+and does not generate them, and `a=ice-lite` is what the engine advertises without
+`--ice-full`. So initiating them there is a deliberate deviation you opt into, not
+something we do behind your back. Under `--ice-full` the legs no longer claim lite.
 
 Two limits worth knowing. A datapath backend without the full-agent seam (the XDP
 fast path) logs a warning per endpoint and stays responder-only — no silent

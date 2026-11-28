@@ -441,6 +441,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &answered.info,
                 answered.info.is_ice().then_some(&ice_config),
                 &offered.candidates,
+                true,
             );
         }
         let config = ForwardSeatConfig {

@@ -165,6 +165,7 @@ fn sdp_rewrite(criterion: &mut Criterion) {
                 black_box(&ice_offer),
                 muxed_engine(),
                 IceRewrite::Reoriginate(IceAdvertisement {
+                    lite: true,
                     ufrag: "ENGUF",
                     pwd: "engpassword01234567",
                     candidates: &candidates,

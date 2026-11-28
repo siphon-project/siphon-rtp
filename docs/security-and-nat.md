@@ -343,7 +343,13 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > mints credentials from the OS CSPRNG, and at offer/answer the engine re-originates ICE as
 > **ICE-lite** — advertising `a=ice-lite` + its own ufrag/pwd + a host candidate and calling
 > `set_ice` on the ICE legs, which then answer checks and adopt the nominated source; end-to-end
-> tested. **Consent freshness (RFC 7675) is now wired and runnable** — see the bullet below.
+> tested. **`a=ice-lite` is only ever advertised for a leg the lite responder serves**
+> (RFC 8445 §5.1.1, RFC 8839 §5.3): under `--ice-full` the engine writes the same credentials and
+> candidates without it, because a peer that reads `a=ice-lite` takes the controlling role against a
+> "lite" engine (§6.1.1) and the full agent, controlling as the offerer, then contends with it for the
+> role. The emitters take the fact as data (`IceAdvertisement::lite`, `WebrtcOffer::lite`) from
+> `Engine::advertises_ice_lite`, and a full-agent seat the engine offered to controls
+> (`arm_seat_ice`). **Consent freshness (RFC 7675) is now wired and runnable** — see the bullet below.
 > **Candidate gathering (RFC 8445 §5.1.1) is wired**: the advertised candidate list is gathered per
 > leg and per component rather than being one hardcoded host line — host always, plus a
 > server-reflexive candidate per `--stun-server` that answers. **The full RFC 8445 agent is wired too**
@@ -565,9 +571,9 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     still covers a leg that never comes up). A *media* latch on a non-ICE endpoint is never reported
     as validated — only an authenticated check moves that source.
   - **Off by default, deliberately.** RFC 7675 §4 states that an ICE-lite agent does not generate
-    consent checks, only responds to them, and `a=ice-lite` is what the engine advertises today.
-    Initiating them while claiming lite is a deviation, so it is an operator opt-in; the full-agent
-    work turns it on for legs that no longer claim lite.
+    consent checks, only responds to them, and `a=ice-lite` is what the engine advertises without
+    `--ice-full`. Initiating them while claiming lite is a deviation, so it is an operator opt-in;
+    under `--ice-full` the legs no longer claim lite.
   - **Backend support.** Both datapaths implement the seam — the UDP one in its `recv_loop` (`Inner::receive`), the XDP
     one in the datapath thread's ICE demux, on STUN the kernel redirects up for exactly this purpose.
     A backend that did not would take the defaulted `set_ice_agent`, which **logs a warning per
@@ -1338,7 +1344,7 @@ the routing order is unchanged: bridge → media → text → udptl → ws → c
   answer is accepted. Every path out of the pending state frees its endpoints (answer, refusal,
   `forward_leave`, setup-timeout sweep). A dial-out seat whose profile asks for
   `transport_protocol: "UDP/TLS/RTP/SAVPF"` is the engine-offers form of the DTLS-SRTP join: the offer is
-  ICE-lite (RFC 8445 §2.5, the browser controls) with `a=setup:actpass` and the engine's fingerprint
+  ICE-lite (RFC 8445 §2.5, the browser controls; under `--ice-full` no `a=ice-lite` and the engine controls as the offerer) with `a=setup:actpass` and the engine's fingerprint
   (RFC 5763 §5), and the pending seat keeps the certificate and ICE credentials it advertised. The answer
   is accepted only as `UDP/TLS/RTP/SAVPF` with an `a=fingerprint` (the handshake is trusted against it,
   RFC 5763 §5) and an `active`/`passive` `a=setup` (the engine's DTLS role is its complement); a plain

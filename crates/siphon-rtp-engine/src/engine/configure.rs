@@ -223,12 +223,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         })
     }
 
-    /// Run a full RFC 8445 ICE agent on every ICE leg instead of the ICE-lite responder: the engine
-    /// forms checklists, sends connectivity checks, resolves role conflicts, discovers peer-reflexive
-    /// candidates, and nominates a pair — and media only starts once a pair is selected.
-    ///
-    /// Off by default: `a=ice-lite` is what the engine advertises, and a lite agent is a valid and
-    /// simpler posture for a server on a routable address. Builder-style consuming setter.
+    /// Whether the SDP the engine writes says `a=ice-lite`: it does while the ICE-lite responder
+    /// serves its legs, and does not once [`Self::with_full_ice`] puts a full agent on them. The
+    /// attribute is a statement about the implementation on the leg (RFC 8445 §5.1.1, RFC 8839
+    /// §5.3), and the peer's role follows from it (§6.1.1: a full agent facing a lite peer
+    /// controls), so claiming lite while running a full agent makes both ends controlling.
+    pub(super) fn advertises_lite(&self) -> bool {
+        self.ice_agents.is_none()
+    }
+
     /// Size the decoded-prompt cache, in bytes. `0` disables caching — every `play_media` on a file
     /// then reads and decodes it afresh, which is exactly the behaviour before the cache existed.
     ///
@@ -245,6 +248,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         &self.prompts
     }
 
+    /// Run a full RFC 8445 ICE agent on every ICE leg instead of the ICE-lite responder: the engine
+    /// forms checklists, sends connectivity checks, resolves role conflicts, discovers peer-reflexive
+    /// candidates, and nominates a pair — and media only starts once a pair is selected. The SDP the
+    /// engine writes then no longer says `a=ice-lite`.
+    ///
+    /// Off by default: a lite agent (`a=ice-lite`) is a valid and simpler posture for a server on a
+    /// routable address. Builder-style consuming setter.
     #[must_use]
     pub fn with_full_ice(mut self) -> Self {
         self.ice_agents = Some(Arc::new(AgentSupervisor::new()));
@@ -257,9 +267,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ///
     /// **Off by default, deliberately.** RFC 7675 §4 is explicit that an ICE-**lite** agent does not
     /// generate consent checks, it only responds to them — and ice-lite is what the engine advertises
-    /// (`a=ice-lite`) until the full agent lands. Initiating checks while advertising lite is a
-    /// deviation, so it is the operator's opt-in rather than the default; the full-agent work turns it
-    /// on unconditionally for legs that no longer claim lite. Builder-style consuming setter,
+    /// (`a=ice-lite`) unless [`Self::with_full_ice`] is set. Initiating checks while advertising lite
+    /// is a deviation, so it is the operator's opt-in rather than the default. Builder-style consuming setter,
     /// mirroring [`Self::with_cluster`].
     #[must_use]
     pub fn with_consent(mut self, config: crate::ice::driver::ConsentConfig) -> Self {
