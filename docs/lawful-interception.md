@@ -132,12 +132,19 @@ can attribute an event from the moment it sends the attach, before its reply arr
 deliveries are installed again as a whole, so their connections, Correlation IDs and sequence counters
 carry straight on.
 
+`detach_x3` answers only after the call's media actor has **applied** the removal of the withdrawn
+delivery's taps (the control is confirmed through the actor's mailbox, not just queued). Nothing the
+actor puts on the wire after the reply reaches a withdrawn warrant, on any pipeline shape, split
+included. The delivery task is aborted and awaited before the reply, so content captured before the
+withdrawal but still in its buffer is discarded, not sent. If the actor cannot confirm in time the engine logs an `error!` on the
+`siphon_rtp::li` target and still ends the delivery.
+
 The deliveries of a call move together. Whatever rebuilds the call's media path (a re-offer and its
 answer, `conference_seat`, `offer_far`, a re-answer of the same dialog) installs the taps of **all**
 of them in one step, so a carry can never move some deliveries and drop others; if the taps cannot be
 put back, every delivery of the call ends with `transport_error`, loudly. The userspace hold an
 interception keeps on a plain relay is released only when the last delivery goes. During the hand-over
-of a re-answer a `detach_x3` is honoured for the deliveries it names only. A joined conference seat
+of a re-answer a `detach_x3` ends the deliveries it names only, at once. A joined conference seat
 carries several deliveries in the same way. The call ending ends every delivery (`call_ended`), one
 `x3_ended` each. `node_info` lists `x3_multi_delivery` on a node provisioned for X3.
 
@@ -246,8 +253,11 @@ ID and PDU sequence:
   `from_tag` or from another client is a different call and ends the interception with `call_ended`.
   A re-answer into a WebSocket takeover (`ws_uri`) carries it onto the bridge
   ([WebSocket takeover calls](#websocket-takeover-calls)). The hand-over is atomic as far as `detach_x3` can tell: the session stays registered while the old call is
-  torn down and the new one is registered, a `detach_x3` that lands meanwhile is accepted and honoured the
-  moment the replacement exists (`detached`, one `x3_ended`), and `attach_x3` in that window is refused
+  torn down and the new one is registered, a `detach_x3` that lands meanwhile ends only the withdrawn delivery before it answers (transport
+  aborted and awaited, so its delivery channel closes and nothing captured afterwards can reach it;
+  `detached`, one `x3_ended`). The old call is already gone, so the other deliveries are not
+  re-tapped there: they stay marked and are carried to the replacement, which never inherits the
+  withdrawn one, and `attach_x3` in that window is refused
   with a retry reason. The first comfort-noise frame a rebuilt pipeline sends can precede its taps by a
   moment; the caller's own media is never missed, because it only arrives after the answer.
 

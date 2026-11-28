@@ -525,7 +525,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // actor being stopped, and the pipeline that replaces it (the relay the far answer installs,
         // or the local one again) is tapped from the same session, so the delivery connection,
         // Correlation ID and sequence carry straight on.
-        self.stop_x3_call_taps(call_id);
+        self.stop_x3_call_taps(call_id).await;
         // Awaited, so the old actor never sends on the caller's endpoint beside the new one.
         self.media.stop(call_id).await;
         let near = self.calls.get(call_id).map(|call| call.near);

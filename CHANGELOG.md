@@ -76,6 +76,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   callee's included (RFC 8839 §4.2). The caller's leg uses the signalled-source gate. The same rule
   holds for a conference or forwarding participant that joins with `ice: force` without having
   offered ICE: it is answered without ICE and its media is not ICE-gated.
+- **`detach_x3` no longer answers before the media actor has dropped the withdrawn warrant's taps.**
+  The taps were removed by a `try_send` into the call's mailbox whose result was ignored, and the
+  reply did not wait for the actor, so the actor could still deliver content to a withdrawn warrant
+  after `detach_x3` returned `ok` (and under load a full mailbox lost the removal altogether). The
+  removal, and the install of the remaining deliveries' taps, now wait for the actor to apply it;
+  attach on a single-leg call does the same.
 
 ## [0.30.0] — 2026-11-27
 

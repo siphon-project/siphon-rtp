@@ -154,7 +154,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ended,
                 joined_endpoint: Some(endpoint),
                 handing_over: Default::default(),
-                detach_requested: Default::default(),
             });
         self.push_event(
             client,
