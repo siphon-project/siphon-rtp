@@ -18,10 +18,15 @@ repository.workspace = true
 homepage.workspace = true
 description = "Relay capacity harness for siphon-rtp (development tool, not published)"
 publish = false
+default-run = "siphon-rtp-loadgen"
 
 [[bin]]
 name = "siphon-rtp-loadgen"
 path = "src/main.rs"
+
+[[bin]]
+name = "siphon-rtp-sipload"
+path = "src/bin/sipload.rs"
 
 [lib]
 name = "siphon_rtp_loadgen"
@@ -34,6 +39,7 @@ path = "src/lib.rs"
 # `siphon_rtp_engine`, which is what the `use` paths below name.
 siphon-rtp = { path = "../siphon-rtp-engine" }
 siphon-rtp-datapath = { path = "../siphon-rtp-datapath" }
+siphon-rtp-stun = { path = "../siphon-rtp-stun" }
 siphon-rtp-proto = { path = "../siphon-rtp-proto" }
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -55,6 +61,7 @@ futures-util = { workspace = true }
 # `libc` is needed directly for the syscall-mode control arm (setsockopt/recvfrom/sendto) and for the
 # msghdr/iovec/sockaddr plumbing io_uring submissions point at.
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 io-uring = { version = "0.7", default-features = false }
 libc = "0.2"
 

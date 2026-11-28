@@ -163,6 +163,26 @@ impl StreamReceiver {
     }
 }
 
+/// RFC 3550 §6.4.1 interarrival jitter, expressed in microseconds rather than RTP ticks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InterarrivalJitter {
+    previous_transit: Option<i128>,
+    estimate: f64,
+}
+impl InterarrivalJitter {
+    /// Both timestamps use the run's monotonic epoch. Signed transit differences tolerate reorder.
+    pub fn record(&mut self, sent_microseconds: u64, arrival_microseconds: u64) {
+        let transit = i128::from(arrival_microseconds) - i128::from(sent_microseconds);
+        if let Some(previous) = self.previous_transit {
+            self.estimate += ((transit - previous).abs() as f64 - self.estimate) / 16.0;
+        }
+        self.previous_transit = Some(transit);
+    }
+    pub fn microseconds(&self) -> f64 {
+        self.estimate
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +335,22 @@ mod tests {
         let mut receiver = StreamReceiver::default();
         assert!(!receiver.accept(7));
         assert!(!receiver.accept(7));
+    }
+}
+
+#[cfg(test)]
+mod jitter_tests {
+    use super::InterarrivalJitter;
+    #[test]
+    fn rfc3550_estimator_has_known_synthetic_answer() {
+        let mut jitter = InterarrivalJitter::default();
+        jitter.record(0, 10_000);
+        assert_eq!(jitter.microseconds(), 0.0);
+        jitter.record(20_000, 31_600);
+        assert_eq!(jitter.microseconds(), 100.0);
+        jitter.record(40_000, 50_000);
+        assert_eq!(jitter.microseconds(), 193.75);
+        jitter.record(60_000, 70_000);
+        assert_eq!(jitter.microseconds(), 181.640625);
     }
 }

@@ -31,4 +31,6 @@ pub mod cpu;
 pub mod probe;
 pub mod report;
 pub mod runner;
+pub mod sip;
+pub mod sipload;
 pub mod stats;
