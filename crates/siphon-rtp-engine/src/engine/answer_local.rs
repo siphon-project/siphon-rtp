@@ -1014,6 +1014,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let ice_rewrite = local_ice_rewrite(
             ice_credentials.as_ref(),
             &ice_candidates,
+            self.advertises_lite(),
             ice_mismatch,
             &info,
         );
@@ -1456,11 +1457,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 fn local_ice_rewrite<'a>(
     credentials: Option<&'a ice::IceCredentials>,
     candidates: &'a [siphon_rtp_ice::Candidate],
+    lite: bool,
     ice_mismatch: bool,
     info: &sdp::MediaInfo,
 ) -> IceRewrite<'a> {
     match credentials {
         Some(credentials) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+            lite,
             ufrag: credentials.ufrag.as_str(),
             pwd: credentials.pwd.as_str(),
             candidates,

@@ -472,8 +472,8 @@ A browser can be a pre-arranged member the room calls, not only one that calls t
             "floor_fmtp":"mc_queueing;mc_priority=5;mc_granted"}}
 ```
 
-The offer is `UDP/TLS/RTP/SAVPF` with the engine's `a=fingerprint`, `a=setup:actpass`, `a=ice-lite`
-with the seat's credentials and candidates, `a=rtcp-mux`, and one `a=group:BUNDLE`. Because the profile
+The offer is `UDP/TLS/RTP/SAVPF` with the engine's `a=fingerprint`, `a=setup:actpass`, the seat's
+credentials and candidates (with `a=ice-lite` unless `--ice-full` runs the full agent, which then controls), `a=rtcp-mux`, and one `a=group:BUNDLE`. Because the profile
 carries `floor_fmtp` the floor control is the bundled `m=application … webrtc-datachannel` section; leave
 `floor_fmtp` out for an audio-only seat. Hand the SDP to the page, then send its answer back:
 

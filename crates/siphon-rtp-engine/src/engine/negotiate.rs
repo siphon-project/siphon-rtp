@@ -1,7 +1,7 @@
 //! SDP presentation, security, ICE, DTLS and codec-policy helpers shared by the negotiation verbs.
 
 use siphon_rtp_codec::factory::{self, CodecSpec};
-use siphon_rtp_datapath::{EndpointId, SourceFilter};
+use siphon_rtp_datapath::{Datapath, EndpointId, SourceFilter};
 use siphon_rtp_proto::ProfileFlags;
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
@@ -12,7 +12,7 @@ use crate::media_pipeline::{DirectionConfig, RtcpRelay, SecureSide};
 use crate::sdp::{self, EngineMedia, IceRewrite, ImageRewrite, SecurityAdvertisement, TextRewrite};
 use std::net::SocketAddr;
 
-use super::{Leg, PipelineKind};
+use super::{Engine, Leg, PipelineKind};
 
 /// What the engine shows one party about the leg that faces it. Every SDP the engine hands a party is
 /// built from one of these and [`present_leg`]: `offer` presents the far leg to B, `answer` the near
@@ -339,8 +339,9 @@ pub(super) fn near_dtls_answer(
 /// The ICE posture an **offer** presents for the far leg (RFC 8839 §5): `a=ice-mismatch` when the call
 /// holds no credentials because the offerer's SDP was altered in transit (§5.3, so it stops waiting for
 /// checks that will never come); the offerer's ICE stripped when `ice: remove` took ICE off the far
-/// leg; ICE-lite re-originated with the engine's credentials and the leg's gathered candidates when the
-/// call has credentials; otherwise passed through.
+/// leg; ICE re-originated with the engine's credentials and the leg's gathered candidates when the
+/// call has credentials (`lite` says whether as the ICE-lite responder or as a full agent, RFC 8445
+/// §5.1.1); otherwise passed through.
 ///
 /// `far_ice_removed` wins over the credentials. Under `remove` they exist only for an ICE offerer,
 /// which still needs the engine's `a=ice-ufrag`/`a=ice-pwd` in its answer to use ICE at all (RFC 8839
@@ -349,6 +350,7 @@ pub(super) fn near_dtls_answer(
 pub(super) fn offer_ice_rewrite<'a>(
     credentials: Option<&'a IceCredentials>,
     candidates: &'a [siphon_rtp_ice::Candidate],
+    lite: bool,
     mismatch: bool,
     far_ice_removed: bool,
 ) -> IceRewrite<'a> {
@@ -356,6 +358,7 @@ pub(super) fn offer_ice_rewrite<'a>(
         None if mismatch => IceRewrite::Mismatch,
         _ if far_ice_removed => IceRewrite::Strip,
         Some(credentials) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+            lite,
             ufrag: credentials.ufrag.as_str(),
             pwd: credentials.pwd.as_str(),
             candidates,
@@ -364,21 +367,73 @@ pub(super) fn offer_ice_rewrite<'a>(
     }
 }
 
+/// The credentials an answer may present: ICE is answered only to a party that offered it (RFC 8839
+/// §4.2: an answer carries ICE only in reply to an offer that did), and the engine mints credentials
+/// for the call under `ice: force` toward B alone. The answer goes to A (`near_remote_ice` says
+/// whether A offered ICE), or to B when A answers B's re-offer (`reversed`, `info` is that offer).
+pub(super) fn answered_ice<'a>(
+    credentials: &'a Option<IceCredentials>,
+    reversed: bool,
+    near_remote_ice: &Option<IceCredentials>,
+    info: &sdp::MediaInfo,
+) -> Option<&'a IceCredentials> {
+    credentials.as_ref().filter(|_| {
+        if reversed {
+            info.is_ice()
+        } else {
+            near_remote_ice.is_some()
+        }
+    })
+}
+
 /// The ICE posture `answer` presents for a leg, and so the one a leg re-presented as it was answered
-/// keeps: ICE-lite re-originated with the engine's credentials and the leg's candidates when the call
-/// has credentials (its ICE posture was decided at offer), the other party's ICE passed through
-/// otherwise.
+/// keeps: ICE re-originated with the engine's credentials and the leg's candidates (as the lite
+/// responder when `lite`, RFC 8445 §5.1.1) when the call has credentials (its ICE posture was decided
+/// at offer), stripped otherwise.
 pub(super) fn answer_ice_rewrite<'a>(
     credentials: Option<&'a IceCredentials>,
     candidates: &'a [siphon_rtp_ice::Candidate],
+    lite: bool,
 ) -> IceRewrite<'a> {
     match credentials {
         Some(credentials) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+            lite,
             ufrag: credentials.ufrag.as_str(),
             pwd: credentials.pwd.as_str(),
             candidates,
         }),
-        None => IceRewrite::Keep,
+        // No credentials: the party offered no ICE (or its ICE was altered in transit), and an answer
+        // carries ICE only in reply to an offer that did (RFC 8839 §4.2), so the other party's is
+        // not echoed to it.
+        None => IceRewrite::Strip,
+    }
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// [`offer_ice_rewrite`] for this engine: `a=ice-lite` only while the lite responder serves its legs.
+    pub(super) fn offer_ice_presentation<'a>(
+        &self,
+        credentials: Option<&'a IceCredentials>,
+        candidates: &'a [siphon_rtp_ice::Candidate],
+        mismatch: bool,
+        far_ice_removed: bool,
+    ) -> IceRewrite<'a> {
+        offer_ice_rewrite(
+            credentials,
+            candidates,
+            self.advertises_lite(),
+            mismatch,
+            far_ice_removed,
+        )
+    }
+
+    /// [`answer_ice_rewrite`] for this engine: `a=ice-lite` only while the lite responder serves its legs.
+    pub(super) fn answer_ice_presentation<'a>(
+        &self,
+        credentials: Option<&'a IceCredentials>,
+        candidates: &'a [siphon_rtp_ice::Candidate],
+    ) -> IceRewrite<'a> {
+        answer_ice_rewrite(credentials, candidates, self.advertises_lite())
     }
 }
 

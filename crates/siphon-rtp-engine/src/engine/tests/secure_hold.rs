@@ -758,23 +758,7 @@ pub(super) async fn dtls_ice_rig() -> Rig {
         .send_to(&check, offered.remote_rtp)
         .await
         .expect("check");
-    // A is a plain phone, but `ice: force` gates both of the engine's legs on a check.
-    let near_check = nominating_binding_request(
-        &[8u8; 12],
-        &format!(
-            "{}:{A_UFRAG}",
-            answered.ice_ufrag.clone().expect("engine ufrag toward A")
-        ),
-        answered
-            .ice_pwd
-            .clone()
-            .expect("engine pwd toward A")
-            .as_bytes(),
-    );
-    phone_a
-        .send_to(&near_check, answered.remote_rtp)
-        .await
-        .expect("A's check");
+    // A is a plain phone: `ice: force` is for B's leg only, so A's stays on the signalled-source gate.
     let leg = drive_peer_dtls(
         peer_b.clone(),
         offered.remote_rtp,
@@ -1610,15 +1594,6 @@ pub(super) async fn srtp_ice_rig() -> Rig {
     );
     phone_b
         .send_to(&check_b, offered.remote_rtp)
-        .await
-        .expect("check");
-    let check_a = nominating_binding_request(
-        &[8u8; 12],
-        &format!("{}:{A_UFRAG}", answered.ice_ufrag.clone().expect("ufrag")),
-        answered.ice_pwd.clone().expect("pwd").as_bytes(),
-    );
-    phone_a
-        .send_to(&check_a, answered.remote_rtp)
         .await
         .expect("check");
     let mut b = Phone::new(

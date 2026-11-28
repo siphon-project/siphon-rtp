@@ -1013,8 +1013,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.datapath.set_ice(endpoint, None);
             }
         }
+        // A's leg uses ICE only when A itself offered it: the engine mints credentials for the call
+        // under `ice: force` too, toward B, and A's plain endpoints must not be armed on that account
+        // — the layer-4 gate would drop every packet of a peer that never sends a check.
+        if near_remote_ice.is_none() {
+            for endpoint in near.endpoint_ids() {
+                self.datapath.set_ice(endpoint, None);
+            }
+        }
         let sides = [
-            (near.endpoint_ids().collect::<Vec<_>>(), near_remote_ice),
+            (
+                if near_remote_ice.is_some() {
+                    near.endpoint_ids().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                },
+                near_remote_ice,
+            ),
             (
                 if far_uses_ice {
                     far.endpoint_ids().collect::<Vec<_>>()
@@ -1061,7 +1076,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             for (endpoints, remote, remote_candidates, local_candidates, controlling) in
                 full_ice_sides
             {
-                let (Some(remote), false) = (remote, remote_candidates.is_empty()) else {
+                // A peer with credentials and no candidates yet (RFC 8838 trickle) still gets the
+                // agent: the SDP said "full", so the agent must be there. It waits for a trickled
+                // candidate or a peer-reflexive one from the peer's own checks (RFC 8445 §7.3.1.3).
+                let Some(remote) = remote else {
                     continue;
                 };
                 for endpoint in endpoints {
@@ -1074,22 +1092,38 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     } else {
                         2
                     };
+                    let local_credentials = siphon_rtp_ice::agent::Credentials::new(
+                        creds.ufrag.clone(),
+                        creds.pwd.clone(),
+                    );
+                    let remote_credentials = siphon_rtp_ice::agent::Credentials::new(
+                        remote.ufrag.clone(),
+                        remote.pwd.clone(),
+                    );
+                    // The same credentials are the same session (RFC 8445 §9): a re-answer keeps the
+                    // running agent, with what it has learned and selected, and only adds candidates.
+                    if agents.keep_running(
+                        endpoint,
+                        &local_credentials,
+                        &remote_credentials,
+                        &filter_component(remote_candidates, component),
+                    ) {
+                        agent_endpoints.push(endpoint);
+                        continue;
+                    }
                     let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
-                        siphon_rtp_ice::agent::Credentials::new(
-                            creds.ufrag.clone(),
-                            creds.pwd.clone(),
-                        ),
-                        siphon_rtp_ice::agent::Credentials::new(
-                            remote.ufrag.clone(),
-                            remote.pwd.clone(),
-                        ),
+                        local_credentials,
+                        remote_credentials,
                         controlling,
                         ice_tie_breaker(),
                     )
                     .with_candidates(
                         filter_component(local_candidates, component),
                         filter_component(remote_candidates, component),
-                    );
+                    )
+                    // No candidate at all yet (RFC 8838 trickle) is waited for; a component the
+                    // peer's candidates simply do not cover (RTCP against an RTP-only offer) is not.
+                    .awaiting_candidates(remote_candidates.is_empty());
                     self.datapath.set_ice_agent(
                         endpoint,
                         config.clone(),

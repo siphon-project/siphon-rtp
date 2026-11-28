@@ -49,6 +49,34 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   six map read locks shared by every receive task, plus a reference-count round trip on the backend.
   Engine CPU per relayed packet fell 7% (12.8 to 11.9 us) at 3,200 concurrent G.711 calls.
 
+### Fixed
+
+- **`--ice-full` no longer writes `a=ice-lite`.** The engine kept advertising lite in every SDP it
+  originated while a full RFC 8445 agent ran on the leg, so a browser that read it took the controlling
+  role against a "lite" peer (§6.1.1) and the engine's own agent, controlling as the offerer, contended
+  with it. `a=ice-lite` is now written only for a leg the lite responder serves (RFC 8445 §5.1.1), in
+  offers, answers, re-offers and the WebRTC seat offer. A full-agent dial-out seat now controls, as the
+  offerer. A peer that gives ICE credentials but no
+  candidates yet (trickle, RFC 8838) now gets the full agent too, which waits for a trickled or
+  peer-reflexive candidate, so the SDP and the implementation on the leg agree. Such an agent
+  fails after 30 s (the RFC 7675 consent expiry) if no candidate arrives and no check reveals one, and
+  the call or seat is torn down like any other ICE failure. A re-answer with unchanged credentials keeps the
+  running agent and what it learned, an ICE restart always replaces it (with a fresh deadline), and a
+  removed seat's agent is unregistered with its endpoint instead of being polled for ever.
+- **A full agent answered no connectivity check on a leg advertised at a different address than it is
+  bound.** The agent knew the endpoint by its bound address while its host candidate carries the
+  advertised one (a 1:1 NAT, an interface with an advertised override), so every inbound check matched
+  no pair and no local candidate and was dropped without an answer, not even a 487. Nothing was ever
+  selected, so media and DTLS never started. The agent now takes the endpoint to be its host candidate.
+- **`ice: force` toward a callee no longer blackholes a caller that offered no ICE.** The engine mints
+  ICE credentials for the call to present to the callee, and arming the caller's endpoints on that
+  account put the datapath's layer-4 ICE gate on a leg that never sends a check, so every one of the
+  caller's packets was dropped. A leg is now armed (and any responder from the offer cleared) only when
+  its own party offered ICE, and the answer to a caller that offered none no longer carries ICE, the
+  callee's included (RFC 8839 §4.2). The caller's leg uses the signalled-source gate. The same rule
+  holds for a conference or forwarding participant that joins with `ice: force` without having
+  offered ICE: it is answered without ICE and its media is not ICE-gated.
+
 ## [0.30.0] — 2026-11-27
 
 ### Added

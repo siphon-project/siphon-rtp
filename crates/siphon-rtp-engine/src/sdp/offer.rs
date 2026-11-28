@@ -101,6 +101,9 @@ pub struct WebrtcOffer<'a> {
     pub pwd: &'a str,
     /// The candidates gathered for the seat (RFC 8445 §5.1.1), written as `a=candidate` lines.
     pub candidates: &'a [Candidate],
+    /// Whether the seat is served by the ICE-lite responder and so says `a=ice-lite`. A full agent
+    /// does not (RFC 8445 §5.1.1), and then controls as the offerer (§6.1.1).
+    pub lite: bool,
     /// The engine's DTLS certificate fingerprint (RFC 8122 §5, RFC 5763 §5).
     pub fingerprint: &'a Fingerprint,
     /// Offer `m=application ... UDP/DTLS/SCTP webrtc-datachannel` (RFC 8841) bundled with the audio.
@@ -132,10 +135,11 @@ pub const WEBRTC_VIDEO_MID: &str = "2";
 ///   `a=crypto`.
 /// - RFC 5763 §5 / RFC 8842 §5.1: `a=fingerprint` of the engine's certificate and `a=setup:actpass`,
 ///   leaving the answerer to pick the DTLS role.
-/// - RFC 8839 §5.1 / RFC 8445 §2.5: `a=ice-lite` (session level) with the seat's `a=ice-ufrag` /
-///   `a=ice-pwd` and gathered candidates, closed by `a=end-of-candidates` (RFC 8838 §14) because
-///   gathering ran to completion before the offer was written. The engine is a lite agent, so the
-///   answerer controls (RFC 8445 §6.1.1).
+/// - RFC 8839 §5.1 / RFC 8445 §2.5: the seat's `a=ice-ufrag` / `a=ice-pwd` and gathered candidates,
+///   closed by `a=end-of-candidates` (RFC 8838 §14) because gathering ran to completion before the
+///   offer was written, and `a=ice-lite` (session level) when the seat is served by the lite
+///   responder, so the answerer controls (RFC 8445 §6.1.1). A full agent says nothing of the kind:
+///   it controls as the offerer.
 /// - RFC 8843 §7.2: the offerer puts every section in one `a=group:BUNDLE`, each with an `a=mid`,
 ///   and repeats the transport attributes in each so the answerer can read either.
 /// - RFC 8841 §5: the data channel section is `m=application <audio port> UDP/DTLS/SCTP
@@ -160,8 +164,11 @@ pub fn webrtc_seat_offer(
     let mut sdp = String::with_capacity(1024);
     let _ = write!(
         sdp,
-        "v=0{CRLF}o=- {session_id} 1 IN {addrtype} {advertised}{CRLF}s=-{CRLF}t=0 0{CRLF}a=ice-lite{CRLF}"
+        "v=0{CRLF}o=- {session_id} 1 IN {addrtype} {advertised}{CRLF}s=-{CRLF}t=0 0{CRLF}"
     );
+    if webrtc.lite {
+        let _ = write!(sdp, "a=ice-lite{CRLF}");
+    }
     let _ = write!(sdp, "a=group:BUNDLE {WEBRTC_AUDIO_MID}");
     if webrtc.data_channel {
         let _ = write!(sdp, " {WEBRTC_DATA_CHANNEL_MID}");
@@ -323,6 +330,14 @@ mod tests {
     }
 
     fn webrtc_offer_with(data_channel: bool, video: Option<WebrtcVideoOffer<'_>>) -> String {
+        webrtc_offer_as(data_channel, video, true)
+    }
+
+    fn webrtc_offer_as(
+        data_channel: bool,
+        video: Option<WebrtcVideoOffer<'_>>,
+        lite: bool,
+    ) -> String {
         let address: SocketAddr = "127.0.0.1:30000".parse().expect("address");
         let mut gatherer =
             siphon_rtp_ice::Gatherer::new(siphon_rtp_ice::GatherConfig::host_only(address), 0);
@@ -342,6 +357,7 @@ mod tests {
                 ufrag: "ENGUF",
                 pwd: "engpassword01234567",
                 candidates: &candidates,
+                lite,
                 fingerprint: &fingerprint,
                 data_channel,
                 video,
@@ -390,6 +406,18 @@ mod tests {
         assert_eq!(sdp.matches("a=setup:actpass").count(), 2, "{sdp}");
         assert_eq!(sdp.matches("a=ice-ufrag:ENGUF").count(), 2, "{sdp}");
         assert!(sdp.contains("a=candidate:"), "{sdp}");
+    }
+
+    #[test]
+    fn a_full_agent_webrtc_offer_carries_the_ice_identity_but_not_ice_lite() {
+        // RFC 8445 §5.1.1 / §6.1.1: `a=ice-lite` is the lite responder's statement. A full agent that
+        // made it would have the answerer take the controlling role against it.
+        let sdp = webrtc_offer_as(true, None, false);
+        assert!(!sdp.contains("a=ice-lite"), "{sdp}");
+        assert!(sdp.contains("a=ice-ufrag:ENGUF"), "{sdp}");
+        assert!(sdp.contains("a=candidate:"), "{sdp}");
+        let info = super::super::parse(&sdp).expect("parse");
+        assert!(info.is_ice() && !info.ice_lite, "{info:?}");
     }
 
     #[test]

@@ -220,6 +220,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Not live from here on: the TURN server stops relaying to its address before the socket
         // goes, so a port the OS hands to something else next is never reachable through it.
         self.media_endpoints.release(endpoint);
+        // The endpoint's ICE agent goes with it: it can never send or receive again, and one left
+        // registered (a seat removed after its agent failed or completed, a leg left by its room) is
+        // polled for ever.
+        if let Some(agents) = &self.ice_agents {
+            agents.unregister(endpoint);
+        }
         self.release_turn_allocation(endpoint).await;
         self.datapath.remove_endpoint(endpoint).await;
     }

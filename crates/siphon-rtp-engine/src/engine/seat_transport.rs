@@ -117,9 +117,10 @@ impl SeatTransport {
     }
 
     /// How the answer presents the offer's ICE (RFC 8839 §5).
-    fn ice_rewrite(&self, profile: &ProfileFlags) -> IceRewrite<'_> {
+    fn ice_rewrite(&self, profile: &ProfileFlags, lite: bool) -> IceRewrite<'_> {
         match (self.ice_credentials.as_ref(), ice_directive(profile)) {
             (Some(credentials), _) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+                lite,
                 ufrag: credentials.ufrag.as_str(),
                 pwd: credentials.pwd.as_str(),
                 candidates: &self.ice_candidates,
@@ -174,11 +175,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // signalled address rather than negotiate ICE we cannot trust.
         let ice_mismatch = siphon_rtp_ice::is_ice_mismatch(info.remote_rtp, &info.candidates)
             && ice_directive(profile) != Some(IceDirective::Force);
+        // ICE is answered only to a participant that offered it with usable credentials (RFC 8839
+        // §4.2), so `ice: force` cannot arm a seat whose participant never sends a check: the layer-4
+        // gate would drop all of its media, and a full engine would say "full" while the lite
+        // responder ran. Credentials are what the seat's full agent (or responder) is armed against.
+        let offered_ice = super::negotiate::peer_ice_credentials(info).is_some();
         let want_ice = match ice_directive(profile) {
             _ if ice_mismatch => false,
-            Some(IceDirective::Force) => true,
             Some(IceDirective::Remove) => false,
-            None => info.is_ice(),
+            Some(IceDirective::Force) | None => offered_ice,
         };
         let ice_credentials = if want_ice {
             ice::generate_credentials()
@@ -278,6 +283,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             info,
             ice_config.as_ref(),
             &ice_candidates,
+            false,
         );
 
         // SDES-SRTP (RTP/SAVP): mint our own key, build the secure leg (decrypt inbound with theirs,
@@ -460,7 +466,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             advertised_ip: transport.advertised,
         };
         let security = transport.security.take();
-        let ice = transport.ice_rewrite(profile);
+        let ice = transport.ice_rewrite(profile, self.advertises_lite());
         sdp::rewrite(offer, engine, ice, security, None, text, ImageRewrite::None)
             // The answer is written from the offer, which describes the offerer: drop its own
             // `a=ssrc` / `a=msid` / `a=extmap` (RFC 5576 §4.1, RFC 8830 §2, RFC 8285 §5) so it is
