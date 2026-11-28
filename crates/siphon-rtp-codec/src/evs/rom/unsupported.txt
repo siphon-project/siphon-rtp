@@ -1,0 +1,11 @@
+tnsEnabledSWBTCX10BitMap	pointer 0x4c11 outside every table
+tnsEnabledSWBTCX20BitMap	pointer 0x4c11 outside every table
+tnsEnabledWBTCX20BitMap	pointer 0x4c1c outside every table
+tnsSWBTCX10BitMap	pointer 0x4bf0 outside every table
+tnsSWBTCX10FilterBitMap	pointer 0x4c48 outside every table
+tnsSWBTCX10FilterCoeffBitMap	pointer 0x4bfb outside every table
+tnsSWBTCX20BitMap	pointer 0x4bf0 outside every table
+tnsSWBTCX20FilterBitMap	pointer 0x4c53 outside every table
+tnsSWBTCX20FilterCoeffBitMap	function pointer
+tnsWBTCX20FilterBitMap	pointer 0x4c3d outside every table
+tnsWBTCX20FilterCoeffBitMap	pointer 0x4c5e outside every table

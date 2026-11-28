@@ -34,6 +34,7 @@ use crate::amr::nb::gains::{gc_pred, gc_pred_update, GcPredState};
 use crate::amr::nb::math_nb::sqrt_l_exp;
 use crate::amr::oper_32b::{l_comp, l_extract, mpy_32_16};
 use crate::amr::AmrNbMode;
+use crate::itu::oper_32b::{mac_32, mac_32_16};
 use crate::CodecError;
 
 /// `gains.tab` `NB_QUA_PITCH` — pitch-gain scalar quantizer size.
@@ -64,15 +65,6 @@ const MAX_QUA_ENER: i16 = 3037;
 /// Maximum allowed gain-code prediction error (`qgain475.c` `MAX_QUA_ENER_MR122`),
 /// Q10 `20*log10(7.8125)`.
 const MAX_QUA_ENER_MR122: i16 = 18284;
-
-/// `Mac_32_16(L_32, hi, lo, n)` (`mac_32.c`): `L_32 + (hi*n)<<1 + ((lo*n)>>15)<<1`, saturating in
-/// the reference order (two `L_mac`s — **not** `L_add(L_32, Mpy_32_16(..))`, which rounds
-/// differently).
-#[inline]
-fn mac_32_16(l_32: i32, hi: i16, lo: i16, n: i16) -> i32 {
-    let l_32 = l_mac(l_32, hi, n);
-    l_mac(l_32, mult(lo, n), 1)
-}
 
 /// Copy the MA gain-predictor memories (`gc_pred.c` `gc_pred_copy`).
 #[inline]
@@ -915,15 +907,6 @@ fn mr475_gain_quant(
 // =============================================================================================
 //  MR795 gain quantization (qgain795.c + g_adapt.c + q_gain_p.c + calc_en.c)
 // =============================================================================================
-
-/// `Mac_32(L_32, hi1, lo1, hi2, lo2)` (`mac_32.c`) — accumulate a 32×32 DPF product:
-/// `L_32 + hi1·hi2·2 + (mult(hi1,lo2) + mult(lo1,hi2))·2`, in the reference's saturating order.
-#[inline]
-fn mac_32(l_32: i32, hi1: i16, lo1: i16, hi2: i16, lo2: i16) -> i32 {
-    let l_32 = l_mac(l_32, hi1, hi2);
-    let l_32 = l_mac(l_32, mult(hi1, lo2), 1);
-    l_mac(l_32, mult(lo1, hi2), 1)
-}
 
 /// N-point median (`gmed_n.c` `gmed_n`) — the value of the median element (odd `n <= 9`), ties
 /// breaking toward the earlier index (`>=` in the max scan), exactly as the reference.

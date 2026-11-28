@@ -41,6 +41,30 @@ pub fn mpy_32_16(hi: i16, lo: i16, n: i16) -> i32 {
     l_32
 }
 
+/// `Mac_32`: `L_32 + (hi1, lo1)·(hi2, lo2)` on DPF values, in the reference's saturating order
+/// (`hi1·hi2`, then `mult(hi1, lo2)`, then `mult(lo1, hi2)`). Identical in the AMR (`mac_32.c`) and
+/// EVS (`basic_math/oper_32b.c`) references.
+#[must_use]
+pub fn mac_32(l_32: i32, hi1: i16, lo1: i16, hi2: i16, lo2: i16) -> i32 {
+    let l_32 = l_mac(l_32, hi1, hi2);
+    let l_32 = l_mac(l_32, mult(hi1, lo2), 1);
+    l_mac(l_32, mult(lo1, hi2), 1)
+}
+
+/// `Mac_32_16`: `L_32 + (hi, lo)·n`, as two `L_mac`s (not `L_add(L_32, Mpy_32_16(..))`, which rounds
+/// differently). Identical in the AMR and EVS references.
+#[must_use]
+pub fn mac_32_16(l_32: i32, hi: i16, lo: i16, n: i16) -> i32 {
+    let l_32 = l_mac(l_32, hi, n);
+    l_mac(l_32, mult(lo, n), 1)
+}
+
+/// `Sqr_32`: the square of a DPF value, `hi·hi + 2·mult(hi, lo)`, Q31 (EVS `basic_math/oper_32b.c`).
+#[must_use]
+pub fn sqr_32(hi: i16, lo: i16) -> i32 {
+    l_mac(l_mult(hi, hi), mult(hi, lo), 2)
+}
+
 /// Fractional 32-bit division `L_num / L_denom` (~24-bit precision). Requires `0 < L_num < L_denom`,
 /// `L_denom = denom_hi<<16 + denom_lo<<1` with `denom_hi` normalized (`0x4000 < denom_hi < 0x7fff`).
 #[must_use]
